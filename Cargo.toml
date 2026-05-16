@@ -1,0 +1,22 @@
+[package]
+name = "aletheia-codegraph"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Aletheia Codegraph Contributors"]
+description = "Tree-sitter powered codebase graph extraction for AletheiaDB agent memory"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/madmax983/aletheia-codegraph"
+keywords = ["codegraph", "tree-sitter", "aletheiadb", "agents"]
+categories = ["development-tools", "parser-implementations"]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+
+[dependencies]
