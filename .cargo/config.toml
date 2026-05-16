@@ -1,0 +1,5 @@
+[env]
+# AletheiaDB's optional `embeddings` feature pulls `embed_anything`, which pulls
+# tokenizers and native C++ code. On MSVC, `esaxx-rs` builds with the static CRT;
+# make `cxx`/tokenizers use the same runtime so all-features tests link.
+CXXFLAGS_x86_64_pc_windows_msvc = "/MT"
