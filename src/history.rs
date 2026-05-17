@@ -1,7 +1,7 @@
 //! Git history replay for bi-temporal code graph records.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -207,6 +207,7 @@ fn list_changes(repo_root: &Path, commit: &GitCommit) -> Result<Vec<GitChange>> 
         repo_root,
         &[
             "diff-tree",
+            "-m",
             "--no-commit-id",
             "--name-status",
             "-r",
@@ -214,9 +215,11 @@ fn list_changes(repo_root: &Path, commit: &GitCommit) -> Result<Vec<GitChange>> 
             &commit.sha,
         ],
     )?;
+    let mut seen = BTreeSet::new();
     Ok(output
         .lines()
         .filter_map(parse_change_line)
+        .filter(|change| seen.insert((change.status.clone(), change.path.clone())))
         .collect::<Vec<_>>())
 }
 

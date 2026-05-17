@@ -100,6 +100,24 @@ fn changed_in_commit_edges_only_target_changed_paths() {
     assert_path_has_no_changed_source(&records, &changed_sources, "src/b.rs");
 }
 
+#[test]
+fn merge_commits_with_rust_resolutions_keep_commit_changed_in_edges() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let merge = seed_conflict_resolution_merge_repo(&repo);
+
+    let jsonl = scan_repository_history(&repo)
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let records = parse_jsonl(&jsonl);
+    let merge_commit_id = stable_id(&["node", "commit", "repo", &merge]);
+    let changed_sources = changed_in_sources_targeting(&records, &merge_commit_id);
+
+    assert_path_has_changed_source(&records, &changed_sources, "src/lib.rs");
+}
+
 fn seed_history_repo(repo: &Path) -> [String; 3] {
     git(repo, ["init"]);
     git(repo, ["config", "user.email", "codegraph@example.invalid"]);
@@ -136,6 +154,42 @@ fn seed_two_file_history_repo(repo: &Path) -> [String; 2] {
     let second = commit(repo, "change only a", "2026-02-02T00:00:00Z");
 
     [first, second]
+}
+
+fn seed_conflict_resolution_merge_repo(repo: &Path) -> String {
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "codegraph@example.invalid"]);
+    git(repo, ["config", "user.name", "Codegraph Test"]);
+    git(repo, ["config", "core.autocrlf", "false"]);
+
+    write(repo, "src/lib.rs", "pub fn value() -> u32 { 1 }\n");
+    commit(repo, "base value", "2026-03-01T00:00:00Z");
+    let base_branch = git_output(repo, ["branch", "--show-current"]);
+
+    git(repo, ["checkout", "-b", "feature"]);
+    write(repo, "src/lib.rs", "pub fn value() -> u32 { 2 }\n");
+    commit(repo, "feature value", "2026-03-02T00:00:00Z");
+
+    git(repo, ["checkout", &base_branch]);
+    write(repo, "src/lib.rs", "pub fn value() -> u32 { 3 }\n");
+    commit(repo, "main value", "2026-03-03T00:00:00Z");
+
+    let merge = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge", "feature"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("git merge should execute");
+    assert!(
+        !merge.status.success(),
+        "merge should require a conflict resolution\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&merge.stdout),
+        String::from_utf8_lossy(&merge.stderr)
+    );
+
+    write(repo, "src/lib.rs", "pub fn value() -> u32 { 4 }\n");
+    commit(repo, "merge resolved value", "2026-03-04T00:00:00Z")
 }
 
 fn write(repo: &Path, relative: &str, contents: &str) {
