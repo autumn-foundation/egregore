@@ -62,21 +62,25 @@ impl NodeLookupIndex {
             storage_id: node_id,
             temporal_key: temporal_key.clone(),
         };
-        if should_replace_read_back_candidate(
-            self.latest.get(&record_id),
-            candidate.temporal_key.as_ref(),
-        ) {
+        if should_replace_read_back_candidate(self.latest.get(&record_id), &candidate) {
             self.latest.insert(record_id.clone(), candidate.clone());
         }
 
         if let Some(key) = temporal_key {
             let commit_candidates = self.by_commit.entry(record_id).or_default();
-            let commit = key.git_commit.clone();
-            if should_replace_read_back_candidate(commit_candidates.get(&commit), Some(&key)) {
+            let commit = key.git_commit;
+            if should_replace_read_back_candidate(commit_candidates.get(&commit), &candidate) {
                 commit_candidates.insert(commit, candidate);
             }
         } else {
-            self.non_temporal.entry(record_id).or_insert(node_id);
+            self.non_temporal
+                .entry(record_id)
+                .and_modify(|current| {
+                    if node_id > *current {
+                        *current = node_id;
+                    }
+                })
+                .or_insert(node_id);
         }
     }
 
@@ -592,13 +596,14 @@ impl EmbeddedAletheiaSink {
                 .as_deref()
                     == Some(record_id)
                 {
-                    let temporal_key =
-                        temporal_read_key_from_properties(record_id, |key| edge.get_property(key))?;
-                    if should_replace_read_back_candidate(found.as_ref(), temporal_key.as_ref()) {
-                        found = Some(ReadBackCandidate {
-                            storage_id: edge_id,
-                            temporal_key,
-                        });
+                    let candidate = ReadBackCandidate {
+                        storage_id: edge_id,
+                        temporal_key: temporal_read_key_from_properties(record_id, |key| {
+                            edge.get_property(key)
+                        })?,
+                    };
+                    if should_replace_read_back_candidate(found.as_ref(), &candidate) {
+                        found = Some(candidate);
                     }
                 }
             }
@@ -906,18 +911,22 @@ fn required_rfc3339_property(
         })
 }
 
-fn should_replace_read_back_candidate<Id>(
+fn should_replace_read_back_candidate<Id: Ord>(
     current: Option<&ReadBackCandidate<Id>>,
-    candidate_key: Option<&TemporalReadKey>,
+    candidate: &ReadBackCandidate<Id>,
 ) -> bool {
     let Some(current) = current else {
         return true;
     };
 
-    match (&current.temporal_key, candidate_key) {
+    match (&current.temporal_key, candidate.temporal_key.as_ref()) {
+        (None, None) => candidate.storage_id > current.storage_id,
         (None, Some(_)) => true,
-        (Some(current_key), Some(candidate_key)) => candidate_key > current_key,
-        (None | Some(_), None) => false,
+        (Some(current_key), Some(candidate_key)) => {
+            candidate_key > current_key
+                || (candidate_key == current_key && candidate.storage_id > current.storage_id)
+        }
+        (Some(_), None) => false,
     }
 }
 
@@ -1151,6 +1160,82 @@ mod tests {
                 .is_some(),
             "reopened sink should index every persisted temporal observation once"
         );
+    }
+
+    #[test]
+    fn duplicate_non_temporal_nodes_replace_endpoint_index_candidate() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("duplicate-current-node-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+        let original_file = file_record(&file_id, "original current file");
+        let updated_file = file_record(&file_id, "updated current file");
+        let original_symbol = current_symbol_record(&symbol_id, "original current symbol", 20);
+        let updated_symbol = current_symbol_record(&symbol_id, "updated current symbol", 42);
+        let edge = GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id,
+            symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "updated current edge".to_owned(),
+        );
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+        sink.write_record(&original_file)
+            .expect("original file should write");
+        sink.write_record(&original_symbol)
+            .expect("original symbol should write");
+        sink.write_record(&updated_file)
+            .expect("updated file should write");
+        sink.write_record(&updated_symbol)
+            .expect("updated symbol should write");
+        let StoredRecord::Node(updated_symbol_node_id) = sink.record_handles[updated_symbol.id()]
+        else {
+            panic!("updated symbol handle should point at a node");
+        };
+
+        assert_eq!(
+            sink.node_lookup.latest_node(&symbol_id),
+            Some(updated_symbol_node_id)
+        );
+
+        sink.write_record(&edge).expect("edge should write");
+        let StoredRecord::Edge(edge_id) = sink.record_handles[edge.id()] else {
+            panic!("edge handle should point at an edge");
+        };
+        let edge_target = sink
+            .db
+            .get_edge_target(edge_id)
+            .expect("edge target should be readable");
+
+        assert_eq!(edge_target, updated_symbol_node_id);
+    }
+
+    fn file_record(id: &str, summary: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::File,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("src/lib.rs".to_owned()),
+            summary.to_owned(),
+        )
+    }
+
+    fn current_symbol_record(id: &str, summary: &str, end_byte: usize) -> GraphRecord {
+        GraphRecord::symbol(
+            id.to_owned(),
+            "function",
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte,
+                start_line: 1,
+                end_line: 1,
+            },
+            "stable".to_owned(),
+            summary.to_owned(),
+        )
     }
 
     fn symbol_record(id: &str, summary: &str, temporal: TemporalMetadata) -> GraphRecord {

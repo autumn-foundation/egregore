@@ -232,6 +232,59 @@ fn embedded_read_back_reconstructs_persisted_node_and_edge_after_reopen() {
 
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
+fn embedded_repeated_current_tree_ingest_replaces_duplicate_records_after_reopen() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("repeated-current-tree-store");
+    let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+    let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+    let original_records = [
+        current_file_record(&file_id, "original current file"),
+        current_symbol_record(&symbol_id, "stable", "original current symbol", 20),
+        current_defines_edge(&file_id, &symbol_id, "original current edge"),
+    ];
+    let updated_symbol = current_symbol_record(&symbol_id, "stable", "updated current symbol", 42);
+    let updated_edge = current_defines_edge(&file_id, &symbol_id, "updated current edge");
+    let updated_records = [
+        current_file_record(&file_id, "updated current file"),
+        updated_symbol.clone(),
+        updated_edge.clone(),
+    ];
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+    let first_report = ingest_records(&original_records, &mut sink);
+    assert!(first_report.is_success(), "{first_report:?}");
+    let second_report = ingest_records(&updated_records, &mut sink);
+    assert!(second_report.is_success(), "{second_report:?}");
+    assert_eq!(
+        sink.read_back(&symbol_id)
+            .expect("same-process node read-back"),
+        Some(updated_symbol.clone())
+    );
+    assert_eq!(
+        sink.read_back(updated_edge.id())
+            .expect("same-process edge read-back"),
+        Some(updated_edge.clone())
+    );
+    sink.persist_indexes()
+        .expect("embedded indexes should persist");
+    drop(sink);
+
+    let reopened = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+
+    assert_eq!(
+        reopened.read_back(&symbol_id).expect("node read-back"),
+        Some(updated_symbol)
+    );
+    assert_eq!(
+        reopened
+            .read_back(updated_edge.id())
+            .expect("edge read-back"),
+        Some(updated_edge)
+    );
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
 fn embedded_read_back_after_reopen_uses_latest_temporal_observation() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("temporal-read-back-store");
@@ -559,6 +612,18 @@ fn file_record(id: &str, temporal: TemporalMetadata) -> GraphRecord {
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
+fn current_file_record(id: &str, summary: &str) -> GraphRecord {
+    GraphRecord::node(
+        id.to_owned(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("src/lib.rs".to_owned()),
+        summary.to_owned(),
+    )
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
 fn symbol_record(id: &str, name: &str, summary: &str, temporal: TemporalMetadata) -> GraphRecord {
     GraphRecord::symbol(
         id.to_owned(),
@@ -577,6 +642,23 @@ fn symbol_record(id: &str, name: &str, summary: &str, temporal: TemporalMetadata
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
+fn current_symbol_record(id: &str, name: &str, summary: &str, end_byte: usize) -> GraphRecord {
+    GraphRecord::symbol(
+        id.to_owned(),
+        "function",
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 0,
+            end_byte,
+            start_line: 1,
+            end_line: 1,
+        },
+        name.to_owned(),
+        summary.to_owned(),
+    )
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
 fn defines_edge(
     source: &str,
     target: &str,
@@ -591,6 +673,17 @@ fn defines_edge(
         summary.to_owned(),
     )
     .with_temporal(temporal)
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn current_defines_edge(source: &str, target: &str, summary: &str) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::Defines,
+        source.to_owned(),
+        target.to_owned(),
+        Some("1.0".to_owned()),
+        summary.to_owned(),
+    )
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
