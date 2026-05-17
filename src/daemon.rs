@@ -27,7 +27,7 @@ use crate::{
     ir::{EdgeLabel, GraphRecord, NodeKind, stable_id},
 };
 
-const RUNTIME_DIR: &str = ".egregore";
+const RUNTIME_DIR_SUFFIX: &str = ".egregore-runtime";
 const LOCK_FILE: &str = "egregored.lock";
 const METADATA_FILE: &str = "egregored.json";
 const IDEMPOTENCY_FILE: &str = "idempotency.json";
@@ -166,13 +166,23 @@ impl IdempotencyStore {
     }
 }
 
-struct StoreLease {
+/// Exclusive embedded-store lease for one data directory.
+///
+/// Holding this value means the current process is the only process that should
+/// open the embedded `AletheiaDB` store for mutation.
+pub struct StoreLease {
     file: File,
     path: PathBuf,
 }
 
 impl StoreLease {
-    fn acquire(data_dir: &Path) -> Result<Self> {
+    /// Acquires the embedded-store lease for a data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the runtime directory or lock file cannot be opened,
+    /// or another process already holds the lease.
+    pub fn acquire(data_dir: &Path) -> Result<Self> {
         let runtime_dir = runtime_dir(data_dir);
         fs::create_dir_all(&runtime_dir)
             .with_context(|| format!("failed to create {}", runtime_dir.display()))?;
@@ -184,8 +194,12 @@ impl StoreLease {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
-        file.try_lock()
-            .with_context(|| format!("daemon already running for {}", data_dir.display()))?;
+        file.try_lock().with_context(|| {
+            format!(
+                "embedded store is already leased for {}",
+                data_dir.display()
+            )
+        })?;
         Ok(Self { file, path })
     }
 
@@ -425,7 +439,8 @@ pub fn start_background(config: &DaemonConfig) -> Result<DaemonMetadata> {
 pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
     fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("failed to create {}", config.data_dir.display()))?;
-    let mut lease = StoreLease::acquire(&config.data_dir)?;
+    let mut lease = StoreLease::acquire(&config.data_dir)
+        .with_context(|| format!("daemon already running for {}", config.data_dir.display()))?;
     let sink = EmbeddedAletheiaSink::open(&config.data_dir).with_context(|| {
         format!(
             "failed to open embedded store {}",
@@ -653,6 +668,9 @@ fn apply_write(
             response.idempotent = true;
             return Ok(response);
         }
+        store
+            .persist()
+            .map_err(|error| ApiError::internal(error.to_string()))?;
     }
 
     let record_ids = command
@@ -683,9 +701,9 @@ fn apply_write(
                 response: response.clone(),
             },
         );
-        store
-            .persist()
-            .map_err(|error| ApiError::internal(error.to_string()))?;
+        if let Err(error) = store.persist() {
+            eprintln!("failed to persist idempotency receipt after commit: {error}");
+        }
     }
     Ok(response)
 }
@@ -1244,7 +1262,14 @@ fn metadata_path(data_dir: &Path) -> PathBuf {
 }
 
 fn runtime_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join(RUNTIME_DIR)
+    data_dir.file_name().map_or_else(
+        || data_dir.join(RUNTIME_DIR_SUFFIX),
+        |file_name| {
+            let mut runtime_name = file_name.to_os_string();
+            runtime_name.push(RUNTIME_DIR_SUFFIX);
+            data_dir.with_file_name(runtime_name)
+        },
+    )
 }
 
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {

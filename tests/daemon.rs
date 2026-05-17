@@ -21,6 +21,7 @@ fn fixture_repo() -> PathBuf {
 
 #[derive(Debug, Deserialize)]
 struct DaemonMetadata {
+    pid: u32,
     address: String,
     token: String,
 }
@@ -81,7 +82,7 @@ fn second_daemon_for_same_data_dir_fails() {
 fn daemon_stop_cleans_stale_metadata() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
-    let runtime_dir = data_dir.join(".egregore");
+    let runtime_dir = runtime_dir(&data_dir);
     fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
     let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral port should bind");
     let address = listener
@@ -147,8 +148,43 @@ fn embedded_cli_ingest_refuses_while_daemon_owns_data_dir() {
         .arg(&data_dir)
         .assert()
         .failure()
-        .stderr(predicate::str::contains("daemon owns embedded store"));
+        .stderr(predicate::str::contains("embedded store is already leased"));
 
+    daemon.stop();
+}
+
+#[test]
+fn embedded_cli_ingest_refuses_when_daemon_lock_exists_without_metadata() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("graph.jsonl");
+    let mut daemon = start_daemon(&data_dir);
+
+    let metadata_path = runtime_dir(&data_dir).join("egregored.json");
+    let metadata = fs::read_to_string(&metadata_path).expect("metadata should be readable");
+    fs::remove_file(&metadata_path).expect("metadata should be removable");
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(fixture_repo())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("embedded")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("embedded store is already leased"));
+
+    fs::write(metadata_path, metadata).expect("metadata should be restored for shutdown");
     daemon.stop();
 }
 
@@ -231,6 +267,63 @@ fn daemon_ingest_reads_back_records_and_deduplicates_retries() {
         "record read-back should succeed, got {response}"
     );
     assert!(response.contains(&first_record_id));
+
+    daemon.stop();
+}
+
+#[test]
+fn daemon_does_not_commit_when_idempotency_receipt_reservation_fails() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("graph.jsonl");
+    let mut daemon = start_daemon(&data_dir);
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(fixture_repo())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let metadata = read_metadata(&data_dir);
+    let idempotency_path = runtime_dir(&data_dir).join("idempotency.json");
+    let blocked_tmp_path = idempotency_path.with_extension(format!("tmp.{}", metadata.pid));
+    fs::create_dir(&blocked_tmp_path).expect("idempotency temp path should be blocked");
+    let first_record_id = first_record_id(&graph_path);
+    let records = graph_records_json(&graph_path);
+    let ingest_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "locked-idempotency",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "locked-idempotency",
+            "domain": "codegraph",
+            "created_at": "2026-05-17T00:00:00Z",
+            "payload": { "records": records }
+        }),
+    );
+    assert!(
+        ingest_response.starts_with("HTTP/1.1 500"),
+        "blocked idempotency receipt should fail before commit, got {ingest_response}"
+    );
+    fs::remove_dir(&blocked_tmp_path).expect("blocked temp path should be removable");
+
+    let read_response = http_request(
+        &metadata.address,
+        &format!(
+            "GET /v1/records/{first_record_id} HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    );
+    assert!(
+        read_response.contains("\"record\":null"),
+        "record should not commit when receipt reservation fails, got {read_response}"
+    );
 
     daemon.stop();
 }
@@ -384,7 +477,7 @@ fn stop_daemon(data_dir: &Path) {
 }
 
 fn read_metadata(data_dir: &Path) -> DaemonMetadata {
-    let metadata_path = data_dir.join(".egregore").join("egregored.json");
+    let metadata_path = runtime_dir(data_dir).join("egregored.json");
     let start = Instant::now();
     loop {
         if let Ok(contents) = fs::read_to_string(&metadata_path)
@@ -399,6 +492,17 @@ fn read_metadata(data_dir: &Path) -> DaemonMetadata {
         );
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn runtime_dir(data_dir: &Path) -> PathBuf {
+    data_dir.file_name().map_or_else(
+        || data_dir.join(".egregore-runtime"),
+        |file_name| {
+            let mut runtime_name = file_name.to_os_string();
+            runtime_name.push(".egregore-runtime");
+            data_dir.with_file_name(runtime_name)
+        },
+    )
 }
 
 fn http_json(

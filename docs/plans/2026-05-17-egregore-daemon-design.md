@@ -69,17 +69,19 @@ driver too early.
 
 ## Store Ownership and Locking
 
-On startup, `egregored` acquires an exclusive advisory file lock inside the data
-directory, for example:
+On startup, `egregored` acquires an exclusive advisory file lock in an adjacent
+runtime sidecar directory, for example:
 
 ```text
-<data-dir>/.egregore/egregored.lock
+<data-dir>.egregore-runtime/egregored.lock
 ```
 
-The lock file contains metadata only: pid, executable path, daemon version,
-started_at, data_dir, and API address. Correctness comes from the OS-level file
-lock, not from trusting the pid file. On Windows this should use a real file
-locking primitive rather than a best-effort "create a file and hope" ritual.
+The runtime directory also stores daemon metadata and idempotency receipts. It
+is adjacent to the `AletheiaDB` data directory rather than nested inside it so
+daemon control files do not look like database files. Correctness comes from the
+OS-level file lock, not from trusting the pid file. On Windows this should use a
+real file locking primitive rather than a best-effort "create a file and hope"
+ritual.
 
 Embedded CLI writes must check the daemon lease. If a daemon owns the store, the
 CLI should refuse direct embedded writes and tell the user to use the daemon
