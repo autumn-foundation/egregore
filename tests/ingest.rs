@@ -12,8 +12,8 @@ use std::{
 use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink, records_from_jsonl};
 #[cfg(feature = "embedded-aletheiadb")]
 use aletheia_egregore::{
-    EdgeLabel, GraphRecord, NodeKind, SourceSpan, TemporalMetadata, scan_repository_history,
-    stable_id,
+    EdgeLabel, GraphRecord, NodeKind, SCHEMA_VERSION, SourceSpan, TemporalMetadata,
+    scan_repository_history, stable_id,
 };
 use aletheia_egregore::{
     adapters::{FakeSink, ingest_records},
@@ -378,6 +378,42 @@ fn embedded_history_edges_attach_to_matching_temporal_symbol_node() {
     assert!(
         !symbol_observation_commits.contains(&second),
         "first commit was wired to a later stable symbol observation: {symbol_observation_commits:?}"
+    );
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn embedded_tombstone_read_back_survives_persist_and_reopen() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("tombstone-store");
+    let deleted_id = stable_id(&["node", "file", "src/deleted.rs"]);
+    let tombstone = GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", "file", "src/deleted.rs", &deleted_id]),
+        schema_version: SCHEMA_VERSION,
+        deleted_id,
+        summary: "Removed source file src/deleted.rs".to_owned(),
+    };
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+    let report = ingest_records(std::slice::from_ref(&tombstone), &mut sink);
+
+    assert!(report.is_success(), "{report:?}");
+    assert_eq!(
+        sink.read_back(tombstone.id())
+            .expect("same-process read-back"),
+        Some(tombstone.clone())
+    );
+    sink.persist_indexes()
+        .expect("embedded indexes should persist");
+    drop(sink);
+
+    let reopened = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+
+    assert_eq!(
+        reopened
+            .read_back(tombstone.id())
+            .expect("reopened tombstone read-back"),
+        Some(tombstone)
     );
 }
 

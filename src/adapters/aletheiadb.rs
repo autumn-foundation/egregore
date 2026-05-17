@@ -15,13 +15,13 @@ pub struct EmbeddedAletheiaSink {
     node_ids: BTreeMap<String, ::aletheiadb::NodeId>,
     node_observations: BTreeMap<String, Vec<NodeObservation>>,
     record_handles: BTreeMap<String, StoredRecord>,
-    tombstones: BTreeMap<String, GraphRecord>,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum StoredRecord {
     Node(::aletheiadb::NodeId),
     Edge(::aletheiadb::EdgeId),
+    Tombstone(::aletheiadb::NodeId),
 }
 
 #[derive(Debug, Clone)]
@@ -66,7 +66,6 @@ impl EmbeddedAletheiaSink {
             node_ids: BTreeMap::new(),
             node_observations: BTreeMap::new(),
             record_handles: BTreeMap::new(),
-            tombstones: BTreeMap::new(),
         })
     }
 
@@ -202,11 +201,7 @@ impl GraphSink for EmbeddedAletheiaSink {
         match record {
             GraphRecord::Node { .. } => self.write_node(record),
             GraphRecord::Edge { .. } => self.write_edge(record),
-            GraphRecord::Tombstone { .. } => {
-                self.tombstones
-                    .insert(record.id().to_owned(), record.clone());
-                Ok(())
-            }
+            GraphRecord::Tombstone { .. } => self.write_tombstone(record),
         }
     }
 
@@ -214,11 +209,10 @@ impl GraphSink for EmbeddedAletheiaSink {
         if let Some(handle) = self.record_handles.get(record_id).copied() {
             return self.read_handle(record_id, handle).map(Some);
         }
-        if let Some(tombstone) = self.tombstones.get(record_id) {
-            return Ok(Some(tombstone.clone()));
-        }
         if let Some(node_id) = self.find_node_id_by_codegraph_id(record_id)? {
-            return self.read_node_record(record_id, node_id).map(Some);
+            return self
+                .read_node_or_tombstone_record(record_id, node_id)
+                .map(Some);
         }
         if let Some(edge_id) = self.find_edge_id_by_codegraph_id(record_id)? {
             return self.read_edge_record(record_id, edge_id).map(Some);
@@ -295,6 +289,49 @@ impl EmbeddedAletheiaSink {
             });
         self.record_handles
             .insert(id.clone(), StoredRecord::Node(node_id));
+        Ok(())
+    }
+
+    fn write_tombstone(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+        let GraphRecord::Tombstone {
+            id,
+            schema_version,
+            deleted_id,
+            summary,
+        } = record
+        else {
+            unreachable!("write_tombstone called with non-tombstone record");
+        };
+        let properties = base_properties(id, "tombstone", *schema_version, summary)
+            .insert("deleted_id", deleted_id.as_str())
+            .build();
+        let node_id = self
+            .db
+            .create_node("Tombstone", properties)
+            .map_err(|error| AdapterError::Rejected {
+                record_id: id.clone(),
+                message: error.to_string(),
+            })?;
+        let node = self
+            .db
+            .get_node(node_id)
+            .map_err(|error| AdapterError::ReadBack {
+                record_id: id.clone(),
+                message: error.to_string(),
+            })?;
+        if node
+            .get_property("codegraph_id")
+            .and_then(|value| value.as_str())
+            != Some(id.as_str())
+        {
+            return Err(AdapterError::ReadBack {
+                record_id: id.clone(),
+                message: "embedded tombstone codegraph_id mismatch".to_owned(),
+            });
+        }
+
+        self.record_handles
+            .insert(id.clone(), StoredRecord::Tombstone(node_id));
         Ok(())
     }
 
@@ -402,6 +439,7 @@ impl EmbeddedAletheiaSink {
         match handle {
             StoredRecord::Node(node_id) => self.read_node_record(record_id, node_id),
             StoredRecord::Edge(edge_id) => self.read_edge_record(record_id, edge_id),
+            StoredRecord::Tombstone(node_id) => self.read_tombstone_record(record_id, node_id),
         }
     }
 
@@ -511,6 +549,69 @@ impl EmbeddedAletheiaSink {
             semantic_drift: semantic_drift_from_properties(record_id, |key| {
                 node.get_property(key)
             })?,
+            summary: required_str_property(record_id, "summary", node.get_property("summary"))?,
+        })
+    }
+
+    fn read_node_or_tombstone_record(
+        &self,
+        record_id: &str,
+        node_id: ::aletheiadb::NodeId,
+    ) -> AdapterResult<GraphRecord> {
+        let node = self
+            .db
+            .get_node(node_id)
+            .map_err(|error| read_back_error(record_id, error.to_string()))?;
+        let record_type =
+            required_str_property(record_id, "record_type", node.get_property("record_type"))?;
+        match record_type.as_str() {
+            "node" => self.read_node_record(record_id, node_id),
+            "tombstone" => self.read_tombstone_record(record_id, node_id),
+            _ => Err(read_back_error(
+                record_id,
+                format!("unknown embedded node record_type {record_type}"),
+            )),
+        }
+    }
+
+    fn read_tombstone_record(
+        &self,
+        record_id: &str,
+        node_id: ::aletheiadb::NodeId,
+    ) -> AdapterResult<GraphRecord> {
+        let node = self
+            .db
+            .get_node(node_id)
+            .map_err(|error| read_back_error(record_id, error.to_string()))?;
+        let id =
+            required_str_property(record_id, "codegraph_id", node.get_property("codegraph_id"))?;
+        if id != record_id {
+            return Err(read_back_error(
+                record_id,
+                format!("embedded tombstone codegraph_id mismatch: {id}"),
+            ));
+        }
+        let record_type =
+            required_str_property(record_id, "record_type", node.get_property("record_type"))?;
+        if record_type != "tombstone" {
+            return Err(read_back_error(
+                record_id,
+                format!("embedded tombstone record_type mismatch: {record_type}"),
+            ));
+        }
+
+        Ok(GraphRecord::Tombstone {
+            id,
+            schema_version: required_u32_property(
+                record_id,
+                "schema_version",
+                node.get_property("schema_version"),
+            )?,
+            deleted_id: required_str_property(
+                record_id,
+                "deleted_id",
+                node.get_property("deleted_id"),
+            )?,
             summary: required_str_property(record_id, "summary", node.get_property("summary"))?,
         })
     }

@@ -14,6 +14,9 @@ use crate::{
     repository_record, scan_source_file_records,
 };
 
+/// Incremental cache schema for extractor output stored on disk.
+const CACHE_SCHEMA_VERSION: u32 = 2;
+
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct IncrementalScan {
@@ -47,6 +50,7 @@ pub fn scan_repository_incremental(
         .unwrap_or("repository");
     let (repository_id, repository) = repository_record(repo_name);
     let previous_cache = CacheFile::load(cache_path.as_ref())?;
+    let can_reuse_cache_records = previous_cache.schema_version == CACHE_SCHEMA_VERSION;
     let mut next_cache = CacheFile::default();
     let mut graph = Graph::new();
     let mut rebuilt_files = Vec::new();
@@ -58,7 +62,11 @@ pub fn scan_repository_incremental(
     for source_file in crate::fs::discover_rust_source_files(repo_root)? {
         let hash = file_hash(&source_file.path)?;
         seen_files.insert(source_file.repo_relative_path.clone());
-        let cached = previous_cache.files.get(&source_file.repo_relative_path);
+        let cached = if can_reuse_cache_records {
+            previous_cache.files.get(&source_file.repo_relative_path)
+        } else {
+            None
+        };
 
         let records = if let Some(cached) = cached.filter(|entry| entry.hash == hash) {
             reused_files.push(source_file.repo_relative_path.clone());
@@ -103,7 +111,7 @@ struct CacheFile {
 impl Default for CacheFile {
     fn default() -> Self {
         Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: CACHE_SCHEMA_VERSION,
             files: BTreeMap::new(),
         }
     }
