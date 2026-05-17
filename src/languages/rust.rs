@@ -451,11 +451,35 @@ fn file_module_path(repo_relative_path: &str) -> Vec<String> {
         .split(['/', '\\'])
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
-    if parts.first() != Some(&"src") || parts.get(1) == Some(&"bin") {
+    if parts.first() != Some(&"src") {
         return Vec::new();
     }
 
-    let mut module_parts = parts.into_iter().skip(1).collect::<Vec<_>>();
+    if parts.get(1) == Some(&"bin") {
+        return binary_module_path(&parts);
+    }
+
+    module_path_from_file_parts(&parts[1..])
+}
+
+fn binary_module_path(parts: &[&str]) -> Vec<String> {
+    let Some(parts_after_bin) = parts.get(2..) else {
+        return Vec::new();
+    };
+    if parts_after_bin.len() <= 1 {
+        return Vec::new();
+    }
+
+    let parts_after_target = &parts_after_bin[1..];
+    if matches!(parts_after_target, ["main.rs" | "mod.rs"]) {
+        return Vec::new();
+    }
+
+    module_path_from_file_parts(parts_after_target)
+}
+
+fn module_path_from_file_parts(parts: &[&str]) -> Vec<String> {
+    let mut module_parts = parts.to_vec();
     let Some(last) = module_parts.pop() else {
         return Vec::new();
     };

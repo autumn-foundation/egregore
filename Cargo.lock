@@ -83,6 +83,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "blake3",
+ "chrono",
  "clap",
  "predicates",
  "serde",

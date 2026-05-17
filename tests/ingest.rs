@@ -237,8 +237,8 @@ fn embedded_read_back_after_reopen_uses_latest_temporal_observation() {
     let data_dir = temp.path().join("temporal-read-back-store");
     let file_id = stable_id(&["node", "file", "src/lib.rs"]);
     let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
-    let latest = temporal("aaaaaaaa", "2026-01-02T00:00:00Z");
-    let older = temporal("zzzzzzzz", "2026-01-01T00:00:00Z");
+    let latest = temporal("aaaaaaaa", "2026-01-01T23:00:00-05:00");
+    let older = temporal("zzzzzzzz", "2026-01-02T01:00:00+00:00");
     let latest_file = file_record(&file_id, latest.clone());
     let older_file = file_record(&file_id, older.clone());
     let latest_symbol = symbol_record(&symbol_id, "stable", "latest stable symbol", latest.clone());

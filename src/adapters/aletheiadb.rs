@@ -2,6 +2,8 @@
 
 use std::{collections::BTreeMap, fs, path::Path};
 
+use chrono::{DateTime, Utc};
+
 use crate::{
     adapters::{AdapterError, AdapterResult, GraphSink},
     ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan, TemporalMetadata},
@@ -30,9 +32,9 @@ struct NodeObservation {
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct TemporalReadKey {
-    valid_time: String,
+    valid_time: DateTime<Utc>,
     git_commit: String,
-    observed_at: String,
+    observed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -699,10 +701,26 @@ fn temporal_read_key_from_properties<'a>(
     };
 
     Ok(Some(TemporalReadKey {
-        valid_time: required_str_property(record_id, "valid_time", get("valid_time"))?,
+        valid_time: required_rfc3339_property(record_id, "valid_time", get("valid_time"))?,
         git_commit,
-        observed_at: required_str_property(record_id, "observed_at", get("observed_at"))?,
+        observed_at: required_rfc3339_property(record_id, "observed_at", get("observed_at"))?,
     }))
+}
+
+fn required_rfc3339_property(
+    record_id: &str,
+    key: &str,
+    value: Option<&::aletheiadb::PropertyValue>,
+) -> AdapterResult<DateTime<Utc>> {
+    let raw = required_str_property(record_id, key, value)?;
+    DateTime::parse_from_rfc3339(&raw)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| {
+            read_back_error(
+                record_id,
+                format!("embedded timestamp property {key} is not RFC3339: {error}"),
+            )
+        })
 }
 
 fn should_replace_read_back_candidate<Id>(
