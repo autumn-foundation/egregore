@@ -9,10 +9,10 @@ use std::{
 };
 
 #[cfg(feature = "embedded-aletheiadb")]
-use aletheia_codegraph::adapters::{EmbeddedAletheiaSink, records_from_jsonl};
+use aletheia_egregore::adapters::{EmbeddedAletheiaSink, records_from_jsonl};
 #[cfg(feature = "embedded-aletheiadb")]
-use aletheia_codegraph::scan_repository_history;
-use aletheia_codegraph::{
+use aletheia_egregore::{EdgeLabel, GraphRecord, NodeKind, scan_repository_history, stable_id};
+use aletheia_egregore::{
     adapters::{FakeSink, ingest_records},
     scan_repository,
 };
@@ -47,7 +47,7 @@ fn dry_run_ingest_preserves_jsonl_for_retry() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let graph_path = temp.path().join("graph.jsonl");
 
-    Command::cargo_bin("aletheia-codegraph")
+    Command::cargo_bin("egregore")
         .expect("binary should run")
         .arg("scan")
         .arg(fixture_repo())
@@ -58,7 +58,7 @@ fn dry_run_ingest_preserves_jsonl_for_retry() {
 
     let before = fs::read_to_string(&graph_path).expect("scan should write graph JSONL");
 
-    Command::cargo_bin("aletheia-codegraph")
+    Command::cargo_bin("egregore")
         .expect("binary should run")
         .arg("ingest")
         .arg(&graph_path)
@@ -82,7 +82,7 @@ fn embedded_cli_ingest_accepts_data_dir() {
     let graph_path = temp.path().join("graph.jsonl");
     let data_dir = temp.path().join("aletheia-store");
 
-    Command::cargo_bin("aletheia-codegraph")
+    Command::cargo_bin("egregore")
         .expect("binary should run")
         .arg("scan")
         .arg(fixture_repo())
@@ -91,7 +91,7 @@ fn embedded_cli_ingest_accepts_data_dir() {
         .assert()
         .success();
 
-    Command::cargo_bin("aletheia-codegraph")
+    Command::cargo_bin("egregore")
         .expect("binary should run")
         .arg("ingest")
         .arg(&graph_path)
@@ -163,6 +163,107 @@ fn embedded_history_ingest_traverses_commit_change_symbol() {
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn embedded_read_back_reconstructs_persisted_node_and_edge_after_reopen() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    seed_history_repo(&repo);
+    let records = scan_repository_history(&repo)
+        .expect("history should scan")
+        .records()
+        .to_vec();
+    let data_dir = temp.path().join("store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+    let report = ingest_records(&records, &mut sink);
+
+    assert!(report.is_success(), "{report:?}");
+    sink.persist_indexes()
+        .expect("embedded indexes should persist");
+    drop(sink);
+
+    let reopened = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let symbol = records
+        .iter()
+        .find(|record| {
+            matches!(
+                record,
+                GraphRecord::Node {
+                    kind: NodeKind::Symbol,
+                    name: Some(name),
+                    temporal: Some(_),
+                    span: Some(_),
+                    symbol_kind: Some(_),
+                    ..
+                } if name == "renamed"
+            )
+        })
+        .expect("history should include renamed symbol");
+    let defines_edge = records
+        .iter()
+        .find(|record| {
+            matches!(
+                record,
+                GraphRecord::Edge {
+                    label: EdgeLabel::Defines,
+                    target,
+                    temporal: Some(_),
+                    ..
+                } if target == symbol.id()
+            )
+        })
+        .expect("history should include a temporal DEFINES edge");
+
+    assert_eq!(
+        reopened.read_back(symbol.id()).expect("node read-back"),
+        Some(symbol.clone())
+    );
+    assert_eq!(
+        reopened
+            .read_back(defines_edge.id())
+            .expect("edge read-back"),
+        Some(defines_edge.clone())
+    );
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn embedded_history_edges_attach_to_matching_temporal_symbol_node() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let [first, second] = seed_stable_symbol_history_repo(&repo);
+    let records = scan_repository_history(&repo)
+        .expect("history should scan")
+        .records()
+        .to_vec();
+    let data_dir = temp.path().join("temporal-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+    let report = ingest_records(&records, &mut sink);
+
+    assert!(report.is_success(), "{report:?}");
+    sink.persist_indexes()
+        .expect("embedded indexes should persist");
+    drop(sink);
+
+    let db = reopen_embedded_db(&data_dir);
+    let first_commit_id = stable_id(&["node", "commit", "repo", &first]);
+    let symbol_observation_commits =
+        changed_symbol_git_commits_for_commit(&db, &first_commit_id, "stable");
+
+    assert!(
+        symbol_observation_commits.contains(&first),
+        "first commit should point at the first temporal stable symbol, got {symbol_observation_commits:?}"
+    );
+    assert!(
+        !symbol_observation_commits.contains(&second),
+        "first commit was wired to a later stable symbol observation: {symbol_observation_commits:?}"
+    );
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
 fn seed_history_repo(repo: &Path) {
     git(repo, ["init"]);
     git(repo, ["config", "user.email", "codegraph@example.invalid"]);
@@ -174,6 +275,87 @@ fn seed_history_repo(repo: &Path) {
 
     write(repo, "src/lib.rs", "pub fn renamed() -> u32 { 2 }\n");
     commit(repo, "rename symbol", "2026-01-02T00:00:00Z");
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn seed_stable_symbol_history_repo(repo: &Path) -> [String; 2] {
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "codegraph@example.invalid"]);
+    git(repo, ["config", "user.name", "Codegraph Test"]);
+    git(repo, ["config", "core.autocrlf", "false"]);
+
+    write(repo, "src/lib.rs", "pub fn stable() -> u32 { 1 }\n");
+    let first = commit_with_sha(repo, "initial stable symbol", "2026-03-01T00:00:00Z");
+
+    write(repo, "src/lib.rs", "pub fn stable() -> u32 { 2 }\n");
+    let second = commit_with_sha(repo, "change stable symbol body", "2026-03-02T00:00:00Z");
+
+    [first, second]
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn reopen_embedded_db(data_dir: &Path) -> ::aletheiadb::AletheiaDB {
+    let config = ::aletheiadb::config::durable_config_for_data_dir(data_dir);
+    ::aletheiadb::AletheiaDB::with_unified_config(config)
+        .expect("embedded AletheiaDB store should reopen")
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn changed_symbol_git_commits_for_commit(
+    db: &::aletheiadb::AletheiaDB,
+    commit_record_id: &str,
+    symbol_name: &str,
+) -> Vec<String> {
+    let commit_node_id = node_id_by_codegraph_id(db, commit_record_id);
+    let mut commits = Vec::new();
+    for contains_edge_id in db.get_outgoing_edges_with_label(commit_node_id, "CONTAINS") {
+        let change_node_id = db
+            .get_edge_target(contains_edge_id)
+            .expect("CONTAINS edge should have a target");
+        let change = db
+            .get_node(change_node_id)
+            .expect("CONTAINS target should be readable");
+        if node_property(&change, "kind") != Some("Change") {
+            continue;
+        }
+
+        for changed_edge_id in db.get_incoming_edges_with_label(change_node_id, "CHANGED_IN") {
+            let source_node_id = db
+                .get_edge_source(changed_edge_id)
+                .expect("CHANGED_IN edge should have a source");
+            let source = db
+                .get_node(source_node_id)
+                .expect("CHANGED_IN source should be readable");
+            if node_property(&source, "kind") == Some("Symbol")
+                && node_property(&source, "name") == Some(symbol_name)
+                && let Some(git_commit) = node_property(&source, "git_commit")
+            {
+                commits.push(git_commit.to_owned());
+            }
+        }
+    }
+    commits.sort();
+    commits.dedup();
+    commits
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn node_id_by_codegraph_id(db: &::aletheiadb::AletheiaDB, record_id: &str) -> ::aletheiadb::NodeId {
+    db.get_all_node_ids()
+        .into_iter()
+        .find(|node_id| {
+            db.get_node(*node_id)
+                .expect("node should be readable")
+                .get_property("codegraph_id")
+                .and_then(|value| value.as_str())
+                == Some(record_id)
+        })
+        .unwrap_or_else(|| panic!("missing embedded node for {record_id}"))
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn node_property<'a>(node: &'a ::aletheiadb::Node, key: &str) -> Option<&'a str> {
+    node.get_property(key).and_then(|value| value.as_str())
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
@@ -205,6 +387,12 @@ fn commit(repo: &Path, message: &str, date: &str) {
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
+fn commit_with_sha(repo: &Path, message: &str, date: &str) -> String {
+    commit(repo, message, date);
+    git_output(repo, ["rev-parse", "HEAD"])
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
 fn git<const N: usize>(repo: &Path, args: [&str; N]) {
     let output = ProcessCommand::new("git")
         .arg("-C")
@@ -219,4 +407,25 @@ fn git<const N: usize>(repo: &Path, args: [&str; N]) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn git_output<const N: usize>(repo: &Path, args: [&str; N]) -> String {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("git should execute");
+    assert!(
+        output.status.success(),
+        "git command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output should be utf-8")
+        .trim()
+        .to_owned()
 }

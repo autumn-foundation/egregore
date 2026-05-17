@@ -77,7 +77,7 @@ Expected: PASS.
 
 **Step 1: Write failing tests**
 
-Use `assert_cmd` to run `aletheia-codegraph scan <fixture> --out graph.jsonl` and `inspect graph.jsonl`.
+Use `assert_cmd` to run `egregore scan <fixture> --out graph.jsonl` and `inspect graph.jsonl`.
 
 **Step 2: Verify red**
 
@@ -211,7 +211,7 @@ Expected: PASS.
 
 **Step 1: Write failing tests**
 
-Assert `aletheia-codegraph ingest history.graph.jsonl --adapter embedded --data-dir <tmp>` stores commit-backed records and can traverse `Commit -> Change -> Symbol` or equivalent temporal handles from the embedded store.
+Assert `egregore ingest history.graph.jsonl --adapter embedded --data-dir <tmp>` stores commit-backed records and can traverse `Commit -> Change -> Symbol` or equivalent temporal handles from the embedded store.
 
 **Step 2: Verify red**
 

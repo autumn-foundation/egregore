@@ -1,4 +1,4 @@
-# ADR 0001: Keep Codegraph Extraction in a Standalone Repo
+# ADR 0001: Keep Egregore Separate From AletheiaDB
 
 ## Status
 
@@ -6,22 +6,22 @@ Accepted
 
 ## Context
 
-Aletheia Codegraph needs to experiment with Tree-sitter parsing, graph schemas, incremental indexing, and AletheiaDB ingestion. Putting that work directly inside AletheiaDB would couple parser churn and CLI experiments to the database crate release path.
+Egregore needs to experiment with Tree-sitter parsing, graph schemas, incremental indexing, agent memory schemas, project/task memory, and AletheiaDB ingestion. Putting that work directly inside AletheiaDB would couple agentic SWE product churn to the database crate release path.
 
 The system still needs a clear AletheiaDB integration contract because the end goal is durable agent memory, not a disconnected analyzer.
 
 ## Decision
 
-Build Aletheia Codegraph as a standalone Rust repository.
+Build Egregore as a standalone Rust repository.
 
-Use explicit schema and adapter boundaries for integration with AletheiaDB. The extractor produces a stable intermediate graph; adapters decide how to persist that graph through CLI, daemon/API, SDK, or dry-run JSONL.
+Use explicit schema and adapter boundaries for integration with AletheiaDB. The code graph extractor produces a stable intermediate graph; later agent memory, project/task, artifact, and verification domains must attach through typed records and evidence links rather than AletheiaDB crate-private internals.
 
 ## Consequences
 
 Positive:
 
 - Parser and schema experiments can move without blocking AletheiaDB releases.
-- The extractor can be tested without a running database.
+- The extractor and future memory domains can be tested without a running database.
 - AletheiaDB integration remains swappable as the CLI/daemon/MCP surface evolves.
 
 Negative:

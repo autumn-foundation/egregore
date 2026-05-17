@@ -2,7 +2,7 @@
 
 use std::fs;
 
-use aletheia_codegraph::incremental::scan_repository_incremental;
+use aletheia_egregore::incremental::scan_repository_incremental;
 
 #[test]
 fn incremental_reuses_unchanged_files_and_tombstones_removed_files() {

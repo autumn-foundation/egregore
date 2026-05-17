@@ -91,7 +91,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             file_id,
             graph,
             source,
-            module_names: Vec::new(),
+            module_names: file_module_path(&file.repo_relative_path),
             owner_ids: vec![file_id.to_owned()],
             impl_context: None,
             definitions: BTreeMap::new(),
@@ -444,6 +444,30 @@ fn looks_like_call(text: &str, name: &str) -> bool {
     let associated = format!("::{simple_name}(");
     let method = format!(".{simple_name}(");
     text.contains(&direct) || text.contains(&associated) || text.contains(&method)
+}
+
+fn file_module_path(repo_relative_path: &str) -> Vec<String> {
+    let mut parts = repo_relative_path
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.first() == Some(&"src") {
+        parts.remove(0);
+    }
+
+    let Some(last) = parts.pop() else {
+        return Vec::new();
+    };
+    match last {
+        "lib.rs" | "main.rs" | "mod.rs" => {}
+        file_name => {
+            if let Some(stem) = file_name.strip_suffix(".rs") {
+                parts.push(stem);
+            }
+        }
+    }
+
+    parts.into_iter().map(ToOwned::to_owned).collect()
 }
 
 #[allow(dead_code)]

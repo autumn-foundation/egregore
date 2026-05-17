@@ -1,12 +1,13 @@
 #![allow(missing_docs)]
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::Path,
     process::{Command, Stdio},
 };
 
-use aletheia_codegraph::scan_repository_history;
+use aletheia_egregore::{scan_repository_history, stable_id};
 use assert_cmd::Command as CargoCommand;
 use predicates::prelude::*;
 use serde_json::Value;
@@ -61,7 +62,7 @@ fn scan_history_cli_writes_temporal_jsonl() {
     seed_history_repo(&repo);
     let graph_path = temp.path().join("history.graph.jsonl");
 
-    CargoCommand::cargo_bin("aletheia-codegraph")
+    CargoCommand::cargo_bin("egregore")
         .expect("binary should run")
         .arg("scan-history")
         .arg(&repo)
@@ -78,6 +79,25 @@ fn scan_history_cli_writes_temporal_jsonl() {
     assert!(jsonl.contains(r#""label":"PARENT_OF""#));
     assert!(jsonl.contains(r#""label":"CHANGED_IN""#));
     assert!(jsonl.contains(r#""valid_time":"2026-01-02T00:00:00Z""#));
+}
+
+#[test]
+fn changed_in_commit_edges_only_target_changed_paths() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let [_first, second] = seed_two_file_history_repo(&repo);
+
+    let jsonl = scan_repository_history(&repo)
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let records = parse_jsonl(&jsonl);
+    let second_commit_id = stable_id(&["node", "commit", "repo", &second]);
+    let changed_sources = changed_in_sources_targeting(&records, &second_commit_id);
+
+    assert_path_has_changed_source(&records, &changed_sources, "src/a.rs");
+    assert_path_has_no_changed_source(&records, &changed_sources, "src/b.rs");
 }
 
 fn seed_history_repo(repo: &Path) -> [String; 3] {
@@ -100,6 +120,22 @@ fn seed_history_repo(repo: &Path) -> [String; 3] {
     let third = commit(repo, "add extra module", "2026-01-03T00:00:00Z");
 
     [first, second, third]
+}
+
+fn seed_two_file_history_repo(repo: &Path) -> [String; 2] {
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "codegraph@example.invalid"]);
+    git(repo, ["config", "user.name", "Codegraph Test"]);
+    git(repo, ["config", "core.autocrlf", "false"]);
+
+    write(repo, "src/a.rs", "pub fn a() -> u32 { 1 }\n");
+    write(repo, "src/b.rs", "pub fn b() -> u32 { 1 }\n");
+    let first = commit(repo, "initial files", "2026-02-01T00:00:00Z");
+
+    write(repo, "src/a.rs", "pub fn a() -> u32 { 2 }\n");
+    let second = commit(repo, "change only a", "2026-02-02T00:00:00Z");
+
+    [first, second]
 }
 
 fn write(repo: &Path, relative: &str, contents: &str) {
@@ -186,6 +222,58 @@ fn assert_edge_label(records: &[Value], label: &str) {
             .any(|record| record["record_type"] == "edge" && record["label"] == label),
         "missing {label} edge"
     );
+}
+
+fn changed_in_sources_targeting(records: &[Value], target_id: &str) -> BTreeSet<String> {
+    records
+        .iter()
+        .filter(|record| {
+            record["record_type"] == "edge"
+                && record["label"] == "CHANGED_IN"
+                && record["target"] == target_id
+        })
+        .filter_map(|record| record["source"].as_str().map(ToOwned::to_owned))
+        .collect()
+}
+
+fn assert_path_has_changed_source(
+    records: &[Value],
+    changed_sources: &BTreeSet<String>,
+    path: &str,
+) {
+    assert!(
+        path_changed_sources(records, changed_sources, path).count() > 0,
+        "expected {path} to be attributed to the changed commit"
+    );
+}
+
+fn assert_path_has_no_changed_source(
+    records: &[Value],
+    changed_sources: &BTreeSet<String>,
+    path: &str,
+) {
+    let unexpected = path_changed_sources(records, changed_sources, path)
+        .map(|record| format!("{} {}", record["kind"], record["name"]))
+        .collect::<Vec<_>>();
+    assert!(
+        unexpected.is_empty(),
+        "unchanged path {path} was attributed to the commit: {unexpected:?}"
+    );
+}
+
+fn path_changed_sources<'a>(
+    records: &'a [Value],
+    changed_sources: &'a BTreeSet<String>,
+    path: &'a str,
+) -> impl Iterator<Item = &'a Value> {
+    records.iter().filter(move |record| {
+        record["record_type"] == "node"
+            && matches!(record["kind"].as_str(), Some("File" | "Symbol"))
+            && record["repo_relative_path"] == path
+            && record["id"]
+                .as_str()
+                .is_some_and(|id| changed_sources.contains(id))
+    })
 }
 
 fn assert_commit_node(records: &[Value], sha: &str, valid_time: &str) {

@@ -1,6 +1,6 @@
 use std::{io, path::PathBuf};
 
-/// Result type used by Aletheia Codegraph operations.
+/// Result type used by Egregore code graph operations.
 pub type Result<T> = std::result::Result<T, CodegraphError>;
 
 /// Errors produced while extracting or serializing a code graph.

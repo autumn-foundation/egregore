@@ -1,14 +1,22 @@
 [package]
-name = "aletheia-codegraph"
+name = "aletheia-egregore"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
-authors = ["Aletheia Codegraph Contributors"]
-description = "Tree-sitter powered codebase graph extraction for AletheiaDB agent memory"
+authors = ["Egregore Contributors"]
+description = "AletheiaDB-backed knowledge graph substrate for agentic software engineering"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/madmax983/aletheia-codegraph"
-keywords = ["codegraph", "tree-sitter", "aletheiadb", "agents"]
+repository = "https://github.com/madmax983/aletheia-egregore"
+keywords = ["agents", "codegraph", "knowledge-graph", "aletheiadb"]
 categories = ["development-tools", "parser-implementations"]
+
+[[bin]]
+name = "egregore"
+path = "src/main.rs"
+
+[[bin]]
+name = "eg"
+path = "src/bin/eg.rs"
 
 [features]
 default = ["embedded-aletheiadb"]

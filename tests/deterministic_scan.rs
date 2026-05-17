@@ -1,8 +1,8 @@
 #![allow(missing_docs)]
 
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
-use aletheia_codegraph::scan_repository;
+use aletheia_egregore::scan_repository;
 use serde_json::Value;
 
 fn fixture_repo() -> PathBuf {
@@ -80,6 +80,29 @@ fn rust_fixture_covers_common_symbols() {
     assert_edge_label(&records, "MENTIONS");
 }
 
+#[test]
+fn split_module_file_symbols_are_qualified_from_repo_path() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    fs::create_dir_all(repo.join("src")).expect("src dir should be created");
+    fs::write(repo.join("src/lib.rs"), "pub mod foo;\npub fn bar() {}\n")
+        .expect("lib.rs should be written");
+    fs::write(repo.join("src/foo.rs"), "pub fn bar() {}\n").expect("foo.rs should be written");
+
+    let jsonl = scan_repository(repo)
+        .expect("fixture repo should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let records = parse_jsonl(&jsonl);
+
+    assert_symbol_in_path(&records, "function", "bar", "src/lib.rs");
+    assert_symbol_in_path(&records, "function", "foo::bar", "src/foo.rs");
+    assert!(
+        !has_symbol_in_path(&records, "function", "bar", "src/foo.rs"),
+        "split module function should not collide with root bar"
+    );
+}
+
 fn parse_jsonl(jsonl: &str) -> Vec<Value> {
     jsonl
         .lines()
@@ -110,15 +133,23 @@ fn assert_import(records: &[Value], name: &str) {
 }
 
 fn assert_symbol(records: &[Value], symbol_kind: &str, name: &str) {
-    let found = records.iter().any(|record| {
+    assert_symbol_in_path(records, symbol_kind, name, "src/lib.rs");
+}
+
+fn assert_symbol_in_path(records: &[Value], symbol_kind: &str, name: &str, path: &str) {
+    let found = has_symbol_in_path(records, symbol_kind, name, path);
+    assert!(found, "missing {symbol_kind} symbol named {name} in {path}");
+}
+
+fn has_symbol_in_path(records: &[Value], symbol_kind: &str, name: &str, path: &str) -> bool {
+    records.iter().any(|record| {
         record["record_type"] == "node"
             && record["kind"] == "Symbol"
             && record["symbol_kind"] == symbol_kind
             && record["name"] == name
-            && record["repo_relative_path"] == "src/lib.rs"
+            && record["repo_relative_path"] == path
             && record.get("span").is_some()
-    });
-    assert!(found, "missing {symbol_kind} symbol named {name}");
+    })
 }
 
 fn assert_diagnostic(records: &[Value], summary_fragment: &str) {
