@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use aletheia_egregore::ir::{GraphRecord, NodeKind};
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde::Deserialize;
@@ -318,6 +319,7 @@ fn daemon_recovers_pending_idempotency_receipt_after_restart() {
         "state": "pending",
         "payload_hash": payload_hash,
         "record_ids": record_ids,
+        "records": graph_records_json(&graph_path),
     });
     fs::write(
         &idempotency_path,
@@ -347,6 +349,106 @@ fn daemon_recovers_pending_idempotency_receipt_after_restart() {
     assert_eq!(
         recovered_json["entries"]["restart-recovery"]["state"],
         "committed"
+    );
+
+    restarted.stop();
+}
+
+#[test]
+fn daemon_pending_recovery_does_not_skip_same_id_update() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+
+    let first = GraphRecord::node(
+        "codegraph:v1:same-id-node".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "old".to_owned(),
+    );
+    let second = GraphRecord::node(
+        "codegraph:v1:same-id-node".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "new".to_owned(),
+    );
+
+    let metadata = read_metadata(&data_dir);
+    let first_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "same-id-first",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "same-id-first",
+            "domain": "codegraph",
+            "created_at": "2026-05-17T00:00:00Z",
+            "payload": { "records": [first] }
+        }),
+    );
+    assert!(
+        first_response.starts_with("HTTP/1.1 200"),
+        "first same-id ingest should succeed, got {first_response}"
+    );
+    daemon.stop();
+
+    let second_hash = blake3::hash(
+        &serde_json::to_vec(&vec![second.clone()]).expect("record JSON should serialize"),
+    )
+    .to_hex()
+    .to_string();
+    let idempotency_path = runtime_dir(&data_dir).join("idempotency.json");
+    let mut idempotency_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&idempotency_path).expect("idempotency file should be readable"),
+    )
+    .expect("idempotency file should parse");
+    idempotency_json["entries"]["same-id-second"] = serde_json::json!({
+        "state": "pending",
+        "payload_hash": second_hash,
+        "record_ids": ["codegraph:v1:same-id-node"],
+        "records": [second],
+    });
+    fs::write(
+        &idempotency_path,
+        serde_json::to_vec_pretty(&idempotency_json).expect("idempotency JSON should serialize"),
+    )
+    .expect("pending same-id idempotency file should write");
+
+    let mut restarted = start_daemon(&data_dir);
+    let graph_path = temp.path().join("same-id-update.jsonl");
+    fs::write(&graph_path, serde_json::to_string(&second).unwrap() + "\n")
+        .expect("same-id update graph should write");
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--idempotency-key")
+        .arg("same-id-second")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("idempotent: false"));
+
+    let metadata = read_metadata(&data_dir);
+    let read_response = http_request(
+        &metadata.address,
+        &format!(
+            "GET /v1/records/codegraph:v1:same-id-node HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    );
+    assert!(
+        read_response.contains("\"summary\":\"new\""),
+        "same-id update should be written, got {read_response}"
     );
 
     restarted.stop();

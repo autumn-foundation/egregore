@@ -131,6 +131,7 @@ enum IdempotencyEntry {
     Pending {
         payload_hash: String,
         record_ids: Vec<String>,
+        records: Vec<GraphRecord>,
     },
     Committed {
         payload_hash: String,
@@ -676,7 +677,7 @@ fn apply_write(
         .iter()
         .map(|record| record.id().to_owned())
         .collect::<Vec<_>>();
-    let pending_record_ids = {
+    let pending_records = {
         let mut store = idempotency
             .lock()
             .map_err(|_| ApiError::internal("idempotency store lock poisoned"))?;
@@ -692,7 +693,7 @@ fn apply_write(
                     response.idempotent = true;
                     return Ok(response);
                 }
-                IdempotencyEntry::Pending { record_ids, .. } => Some(record_ids.clone()),
+                IdempotencyEntry::Pending { records, .. } => Some(records.clone()),
             }
         } else {
             store.entries.insert(
@@ -700,6 +701,7 @@ fn apply_write(
                 IdempotencyEntry::Pending {
                     payload_hash: command.payload_hash.clone(),
                     record_ids: record_ids.clone(),
+                    records: command.records.clone(),
                 },
             );
             store
@@ -708,11 +710,11 @@ fn apply_write(
             None
         }
     };
-    if let Some(pending_record_ids) = pending_record_ids
+    if let Some(pending_records) = pending_records
         && let Some(response) = recover_pending_write(
             &command.idempotency_key,
             &command.payload_hash,
-            &pending_record_ids,
+            &pending_records,
             sink,
             idempotency,
         )?
@@ -744,45 +746,60 @@ fn apply_write(
 fn recover_pending_write(
     idempotency_key: &str,
     payload_hash: &str,
-    record_ids: &[String],
+    records: &[GraphRecord],
     sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
     idempotency: &Arc<Mutex<IdempotencyStore>>,
 ) -> WriteResult<Option<DaemonIngestResponse>> {
-    let present = {
+    let expected_by_id = expected_records_by_id(records);
+    let matched = {
         let sink = sink
             .read()
             .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
-        let mut present = 0;
-        for record_id in record_ids {
+        let mut matched = 0;
+        for (record_id, expected_records) in &expected_by_id {
             match sink.read_back(record_id) {
-                Ok(Some(_)) => present += 1,
-                Ok(None) => {}
+                Ok(Some(persisted)) if expected_records.contains(&persisted) => matched += 1,
+                Ok(Some(_) | None) => {}
                 Err(error) => return Err(ApiError::internal(error.to_string())),
             }
         }
-        present
+        matched
     };
-    if present == 0 {
+    if matched == 0 {
         return Ok(None);
     }
-    if present != record_ids.len() {
+    if matched != expected_by_id.len() {
         return Err(ApiError::conflict(
             "idempotency key has a partial committed write; manual repair is required",
         ));
     }
 
     let response = DaemonIngestResponse {
-        attempted: record_ids.len(),
-        succeeded: record_ids.len(),
+        attempted: records.len(),
+        succeeded: records.len(),
         failed: 0,
         failures: Vec::new(),
-        record_ids: record_ids.to_vec(),
+        record_ids: records
+            .iter()
+            .map(|record| record.id().to_owned())
+            .collect::<Vec<_>>(),
         idempotent: false,
     };
     complete_idempotency_entry(idempotency_key, payload_hash, &response, idempotency)?;
     let mut response = response;
     response.idempotent = true;
     Ok(Some(response))
+}
+
+fn expected_records_by_id(records: &[GraphRecord]) -> BTreeMap<String, Vec<GraphRecord>> {
+    let mut expected = BTreeMap::<String, Vec<GraphRecord>>::new();
+    for record in records {
+        expected
+            .entry(record.id().to_owned())
+            .or_default()
+            .push(record.clone());
+    }
+    expected
 }
 
 fn complete_idempotency_entry(
