@@ -2,6 +2,7 @@
 name = "aletheia-egregore"
 version = "0.1.0"
 edition = "2024"
+default-run = "egregore"
 rust-version = "1.92"
 authors = ["Egregore Contributors"]
 description = "AletheiaDB-backed knowledge graph substrate for agentic software engineering"

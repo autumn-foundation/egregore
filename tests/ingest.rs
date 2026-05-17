@@ -9,9 +9,12 @@ use std::{
 };
 
 #[cfg(feature = "embedded-aletheiadb")]
-use aletheia_egregore::adapters::{EmbeddedAletheiaSink, records_from_jsonl};
+use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink, records_from_jsonl};
 #[cfg(feature = "embedded-aletheiadb")]
-use aletheia_egregore::{EdgeLabel, GraphRecord, NodeKind, scan_repository_history, stable_id};
+use aletheia_egregore::{
+    EdgeLabel, GraphRecord, NodeKind, SourceSpan, TemporalMetadata, scan_repository_history,
+    stable_id,
+};
 use aletheia_egregore::{
     adapters::{FakeSink, ingest_records},
     scan_repository,
@@ -229,6 +232,121 @@ fn embedded_read_back_reconstructs_persisted_node_and_edge_after_reopen() {
 
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
+fn embedded_read_back_after_reopen_uses_latest_temporal_observation() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("temporal-read-back-store");
+    let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+    let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+    let latest = temporal("aaaaaaaa", "2026-01-02T00:00:00Z");
+    let older = temporal("zzzzzzzz", "2026-01-01T00:00:00Z");
+    let latest_file = file_record(&file_id, latest.clone());
+    let older_file = file_record(&file_id, older.clone());
+    let latest_symbol = symbol_record(&symbol_id, "stable", "latest stable symbol", latest.clone());
+    let older_symbol = symbol_record(&symbol_id, "stable", "older stable symbol", older.clone());
+    let latest_edge = defines_edge(&file_id, &symbol_id, "latest defines edge", latest);
+    let older_edge = defines_edge(&file_id, &symbol_id, "older defines edge", older);
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+    // Write newest first so a read-back implementation that falls through to
+    // storage iteration or insertion order will reconstruct the wrong commit.
+    for record in [
+        &latest_file,
+        &latest_symbol,
+        &latest_edge,
+        &older_file,
+        &older_symbol,
+        &older_edge,
+    ] {
+        sink.write_record(record).expect("record should write");
+    }
+    sink.persist_indexes()
+        .expect("embedded indexes should persist");
+    drop(sink);
+
+    let reopened = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+
+    assert_eq!(
+        reopened.read_back(&symbol_id).expect("node read-back"),
+        Some(latest_symbol)
+    );
+    assert_eq!(
+        reopened
+            .read_back(latest_edge.id())
+            .expect("edge read-back"),
+        Some(latest_edge)
+    );
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn embedded_read_back_after_reopen_matches_latest_history_jsonl_observation() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let [_first, second] = seed_stable_symbol_history_repo(&repo);
+    let jsonl = scan_repository_history(&repo)
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history should serialize");
+    let records = records_from_jsonl(&jsonl).expect("history JSONL should parse");
+    let latest_symbol = records
+        .iter()
+        .find(|record| {
+            matches!(
+                record,
+                GraphRecord::Node {
+                    kind: NodeKind::Symbol,
+                    name: Some(name),
+                    temporal: Some(temporal),
+                    ..
+                } if name == "stable" && temporal.git_commit == second
+            )
+        })
+        .expect("history should include latest stable symbol")
+        .clone();
+    let latest_defines_edge = records
+        .iter()
+        .find(|record| {
+            matches!(
+                record,
+                GraphRecord::Edge {
+                    label: EdgeLabel::Defines,
+                    target,
+                    temporal: Some(temporal),
+                    ..
+                } if target == latest_symbol.id() && temporal.git_commit == second
+            )
+        })
+        .expect("history should include latest temporal DEFINES edge")
+        .clone();
+    let data_dir = temp.path().join("history-jsonl-store");
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+    let report = ingest_records(&records, &mut sink);
+
+    assert!(report.is_success(), "{report:?}");
+    sink.persist_indexes()
+        .expect("embedded indexes should persist");
+    drop(sink);
+
+    let reopened = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+
+    assert_eq!(
+        reopened
+            .read_back(latest_symbol.id())
+            .expect("node read-back"),
+        Some(latest_symbol)
+    );
+    assert_eq!(
+        reopened
+            .read_back(latest_defines_edge.id())
+            .expect("edge read-back"),
+        Some(latest_defines_edge)
+    );
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
 fn embedded_history_edges_attach_to_matching_temporal_symbol_node() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path().join("repo");
@@ -261,6 +379,65 @@ fn embedded_history_edges_attach_to_matching_temporal_symbol_node() {
         !symbol_observation_commits.contains(&second),
         "first commit was wired to a later stable symbol observation: {symbol_observation_commits:?}"
     );
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn file_record(id: &str, temporal: TemporalMetadata) -> GraphRecord {
+    GraphRecord::node(
+        id.to_owned(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("src/lib.rs".to_owned()),
+        "Rust source file src/lib.rs".to_owned(),
+    )
+    .with_temporal(temporal)
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn symbol_record(id: &str, name: &str, summary: &str, temporal: TemporalMetadata) -> GraphRecord {
+    GraphRecord::symbol(
+        id.to_owned(),
+        "function",
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 0,
+            end_byte: 20,
+            start_line: 1,
+            end_line: 1,
+        },
+        name.to_owned(),
+        summary.to_owned(),
+    )
+    .with_temporal(temporal)
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn defines_edge(
+    source: &str,
+    target: &str,
+    summary: &str,
+    temporal: TemporalMetadata,
+) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::Defines,
+        source.to_owned(),
+        target.to_owned(),
+        Some("1.0".to_owned()),
+        summary.to_owned(),
+    )
+    .with_temporal(temporal)
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn temporal(git_commit: &str, valid_time: &str) -> TemporalMetadata {
+    TemporalMetadata {
+        git_commit: git_commit.to_owned(),
+        git_parent_commits: Vec::new(),
+        valid_time: valid_time.to_owned(),
+        author_time: Some(valid_time.to_owned()),
+        observed_at: valid_time.to_owned(),
+    }
 }
 
 #[cfg(feature = "embedded-aletheiadb")]

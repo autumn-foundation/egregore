@@ -447,27 +447,28 @@ fn looks_like_call(text: &str, name: &str) -> bool {
 }
 
 fn file_module_path(repo_relative_path: &str) -> Vec<String> {
-    let mut parts = repo_relative_path
+    let parts = repo_relative_path
         .split(['/', '\\'])
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
-    if parts.first() == Some(&"src") {
-        parts.remove(0);
+    if parts.first() != Some(&"src") || parts.get(1) == Some(&"bin") {
+        return Vec::new();
     }
 
-    let Some(last) = parts.pop() else {
+    let mut module_parts = parts.into_iter().skip(1).collect::<Vec<_>>();
+    let Some(last) = module_parts.pop() else {
         return Vec::new();
     };
     match last {
         "lib.rs" | "main.rs" | "mod.rs" => {}
         file_name => {
             if let Some(stem) = file_name.strip_suffix(".rs") {
-                parts.push(stem);
+                module_parts.push(stem);
             }
         }
     }
 
-    parts.into_iter().map(ToOwned::to_owned).collect()
+    module_parts.into_iter().map(ToOwned::to_owned).collect()
 }
 
 #[allow(dead_code)]

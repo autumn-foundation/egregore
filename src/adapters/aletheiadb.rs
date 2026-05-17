@@ -28,6 +28,19 @@ struct NodeObservation {
     git_commit: Option<String>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct TemporalReadKey {
+    valid_time: String,
+    git_commit: String,
+    observed_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReadBackCandidate<Id> {
+    storage_id: Id,
+    temporal_key: Option<TemporalReadKey>,
+}
+
 impl EmbeddedAletheiaSink {
     /// Opens an embedded `AletheiaDB` store rooted at `data_dir`.
     ///
@@ -404,10 +417,17 @@ impl EmbeddedAletheiaSink {
                 .as_deref()
                 == Some(record_id)
             {
-                found = Some(node_id);
+                let temporal_key =
+                    temporal_read_key_from_properties(record_id, |key| node.get_property(key))?;
+                if should_replace_read_back_candidate(found.as_ref(), temporal_key.as_ref()) {
+                    found = Some(ReadBackCandidate {
+                        storage_id: node_id,
+                        temporal_key,
+                    });
+                }
             }
         }
-        Ok(found)
+        Ok(found.map(|candidate| candidate.storage_id))
     }
 
     fn find_edge_id_by_codegraph_id(
@@ -429,11 +449,18 @@ impl EmbeddedAletheiaSink {
                 .as_deref()
                     == Some(record_id)
                 {
-                    found = Some(edge_id);
+                    let temporal_key =
+                        temporal_read_key_from_properties(record_id, |key| edge.get_property(key))?;
+                    if should_replace_read_back_candidate(found.as_ref(), temporal_key.as_ref()) {
+                        found = Some(ReadBackCandidate {
+                            storage_id: edge_id,
+                            temporal_key,
+                        });
+                    }
                 }
             }
         }
-        Ok(found)
+        Ok(found.map(|candidate| candidate.storage_id))
     }
 
     fn read_node_record(
@@ -660,6 +687,37 @@ fn temporal_from_properties<'a>(
         author_time: optional_str_property(record_id, "author_time", get("author_time"))?,
         observed_at: required_str_property(record_id, "observed_at", get("observed_at"))?,
     }))
+}
+
+fn temporal_read_key_from_properties<'a>(
+    record_id: &str,
+    get: impl Fn(&str) -> Option<&'a ::aletheiadb::PropertyValue>,
+) -> AdapterResult<Option<TemporalReadKey>> {
+    let Some(git_commit) = optional_str_property(record_id, "git_commit", get("git_commit"))?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(TemporalReadKey {
+        valid_time: required_str_property(record_id, "valid_time", get("valid_time"))?,
+        git_commit,
+        observed_at: required_str_property(record_id, "observed_at", get("observed_at"))?,
+    }))
+}
+
+fn should_replace_read_back_candidate<Id>(
+    current: Option<&ReadBackCandidate<Id>>,
+    candidate_key: Option<&TemporalReadKey>,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+
+    match (&current.temporal_key, candidate_key) {
+        (None, Some(_)) => true,
+        (Some(current_key), Some(candidate_key)) => candidate_key > current_key,
+        (None | Some(_), None) => false,
+    }
 }
 
 fn semantic_drift_from_properties<'a>(

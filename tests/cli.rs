@@ -54,3 +54,18 @@ fn eg_alias_runs_cli() {
             "Manage agentic SWE knowledge graphs",
         ));
 }
+
+#[test]
+fn cargo_run_defaults_to_egregore_binary() {
+    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = fs::read_to_string(manifest_path).expect("manifest should be readable");
+    let package_section = manifest
+        .split("[[bin]]")
+        .next()
+        .expect("package section should exist before binary declarations");
+
+    assert!(
+        package_section.contains(r#"default-run = "egregore""#),
+        "Cargo.toml must set default-run so documented `cargo run -- ...` commands select the primary binary"
+    );
+}
