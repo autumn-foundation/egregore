@@ -14,6 +14,9 @@ use crate::{
     repository_record, scan_source_file_records,
 };
 
+/// Incremental cache schema for extractor output stored on disk.
+const CACHE_SCHEMA_VERSION: u32 = 2;
+
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct IncrementalScan {
@@ -47,6 +50,7 @@ pub fn scan_repository_incremental(
         .unwrap_or("repository");
     let (repository_id, repository) = repository_record(repo_name);
     let previous_cache = CacheFile::load(cache_path.as_ref())?;
+    let can_reuse_cache_records = previous_cache.schema_version == CACHE_SCHEMA_VERSION;
     let mut next_cache = CacheFile::default();
     let mut graph = Graph::new();
     let mut rebuilt_files = Vec::new();
@@ -58,14 +62,25 @@ pub fn scan_repository_incremental(
     for source_file in crate::fs::discover_rust_source_files(repo_root)? {
         let hash = file_hash(&source_file.path)?;
         seen_files.insert(source_file.repo_relative_path.clone());
-        let cached = previous_cache.files.get(&source_file.repo_relative_path);
+        let previous_entry = previous_cache.files.get(&source_file.repo_relative_path);
+        let cached = previous_entry.filter(|_| can_reuse_cache_records);
 
         let records = if let Some(cached) = cached.filter(|entry| entry.hash == hash) {
             reused_files.push(source_file.repo_relative_path.clone());
             cached.records.clone()
         } else {
             rebuilt_files.push(source_file.repo_relative_path.clone());
-            scan_source_file_records(&source_file, &repository_id)?
+            let records = scan_source_file_records(&source_file, &repository_id)?;
+            if !can_reuse_cache_records && let Some(invalidated) = previous_entry {
+                for tombstone in invalidated_record_tombstones(
+                    &source_file.repo_relative_path,
+                    &invalidated.records,
+                    &records,
+                ) {
+                    graph.push(tombstone);
+                }
+            }
+            records
         };
 
         for record in &records {
@@ -103,7 +118,7 @@ struct CacheFile {
 impl Default for CacheFile {
     fn default() -> Self {
         Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: CACHE_SCHEMA_VERSION,
             files: BTreeMap::new(),
         }
     }
@@ -157,5 +172,30 @@ fn file_tombstone(repo_relative_path: &str) -> GraphRecord {
         schema_version: SCHEMA_VERSION,
         deleted_id,
         summary: format!("Removed source file {repo_relative_path}"),
+    }
+}
+
+fn invalidated_record_tombstones(
+    repo_relative_path: &str,
+    old_records: &[GraphRecord],
+    rebuilt_records: &[GraphRecord],
+) -> Vec<GraphRecord> {
+    let rebuilt_ids = rebuilt_records
+        .iter()
+        .map(GraphRecord::id)
+        .collect::<BTreeSet<_>>();
+    old_records
+        .iter()
+        .filter(|record| !rebuilt_ids.contains(record.id()))
+        .map(|record| invalidated_record_tombstone(repo_relative_path, record.id()))
+        .collect()
+}
+
+fn invalidated_record_tombstone(repo_relative_path: &str, deleted_id: &str) -> GraphRecord {
+    GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", "cache-schema", repo_relative_path, deleted_id]),
+        schema_version: SCHEMA_VERSION,
+        deleted_id: deleted_id.to_owned(),
+        summary: format!("Invalidated stale cached record {deleted_id} from {repo_relative_path}"),
     }
 }

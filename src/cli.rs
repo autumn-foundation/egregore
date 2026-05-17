@@ -1,4 +1,4 @@
-//! Command-line interface for Aletheia Codegraph.
+//! Command-line interface for Egregore.
 
 use std::{
     fs,
@@ -19,8 +19,8 @@ use crate::adapters::EmbeddedAletheiaSink;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "aletheia-codegraph",
-    about = "Extract deterministic code knowledge graphs for agents"
+    name = "egregore",
+    about = "Manage agentic SWE knowledge graphs on AletheiaDB"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -143,8 +143,7 @@ fn ingest(graph: &Path, adapter: IngestAdapter, data_dir: Option<&Path>) -> Resu
         }
         #[cfg(feature = "embedded-aletheiadb")]
         IngestAdapter::Embedded => {
-            let data_dir =
-                data_dir.map_or_else(|| PathBuf::from(".aletheia-codegraph"), Path::to_path_buf);
+            let data_dir = data_dir.map_or_else(|| PathBuf::from(".egregore"), Path::to_path_buf);
             let mut sink = EmbeddedAletheiaSink::open(&data_dir)
                 .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
             let report = ingest_records(&records, &mut sink);

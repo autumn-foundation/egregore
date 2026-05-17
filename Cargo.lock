@@ -76,13 +76,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "aletheia-codegraph"
+name = "aletheia-egregore"
 version = "0.1.0"
 dependencies = [
  "aletheiadb",
  "anyhow",
  "assert_cmd",
  "blake3",
+ "chrono",
  "clap",
  "predicates",
  "serde",

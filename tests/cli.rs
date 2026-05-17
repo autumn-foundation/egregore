@@ -14,7 +14,7 @@ fn scan_and_inspect_work_without_aletheiadb() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let graph_path = temp.path().join("graph.jsonl");
 
-    Command::cargo_bin("aletheia-codegraph")
+    Command::cargo_bin("egregore")
         .expect("binary should run")
         .arg("scan")
         .arg(fixture_repo())
@@ -30,7 +30,7 @@ fn scan_and_inspect_work_without_aletheiadb() {
     assert!(jsonl.contains(r#""kind":"Symbol""#));
     assert!(jsonl.contains(r#""label":"DEFINES""#));
 
-    Command::cargo_bin("aletheia-codegraph")
+    Command::cargo_bin("egregore")
         .expect("binary should run")
         .arg("inspect")
         .arg(&graph_path)
@@ -41,4 +41,31 @@ fn scan_and_inspect_work_without_aletheiadb() {
         .stdout(predicate::str::contains("edges:"))
         .stdout(predicate::str::contains("diagnostics:"))
         .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn eg_alias_runs_cli() {
+    Command::cargo_bin("eg")
+        .expect("short alias binary should run")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Manage agentic SWE knowledge graphs",
+        ));
+}
+
+#[test]
+fn cargo_run_defaults_to_egregore_binary() {
+    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = fs::read_to_string(manifest_path).expect("manifest should be readable");
+    let package_section = manifest
+        .split("[[bin]]")
+        .next()
+        .expect("package section should exist before binary declarations");
+
+    assert!(
+        package_section.contains(r#"default-run = "egregore""#),
+        "Cargo.toml must set default-run so documented `cargo run -- ...` commands select the primary binary"
+    );
 }

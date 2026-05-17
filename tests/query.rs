@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use aletheia_codegraph::{
+use aletheia_egregore::{
     GraphRecord, NodeKind, SemanticDriftMetadata, TemporalMetadata,
     query::{largest_semantic_drifts, symbol_at_commit},
 };
@@ -38,7 +38,7 @@ fn largest_semantic_drifts_rank_drift_nodes_by_score() {
     let small = drift("drift:small", "answer", "aaaaaaaa", "bbbbbbbb", "0.250000");
     let large = drift("drift:large", "answer", "bbbbbbbb", "cccccccc", "0.900000");
     let edge = GraphRecord::edge(
-        aletheia_codegraph::EdgeLabel::DriftsFrom,
+        aletheia_egregore::EdgeLabel::DriftsFrom,
         "drift:large".to_owned(),
         "symbol:answer".to_owned(),
         Some("1.0".to_owned()),
@@ -83,8 +83,8 @@ fn temporal(commit: &str, valid_time: &str) -> TemporalMetadata {
     }
 }
 
-const fn span(start_line: usize, end_line: usize) -> aletheia_codegraph::SourceSpan {
-    aletheia_codegraph::SourceSpan {
+const fn span(start_line: usize, end_line: usize) -> aletheia_egregore::SourceSpan {
+    aletheia_egregore::SourceSpan {
         start_byte: 0,
         end_byte: 10,
         start_line,

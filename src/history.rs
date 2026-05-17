@@ -1,7 +1,7 @@
 //! Git history replay for bi-temporal code graph records.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -91,6 +91,7 @@ pub fn scan_repository_history(repo_path: impl AsRef<Path>) -> Result<Graph> {
         }
 
         for path in list_rust_files(repo_root, &commit.sha)? {
+            let change_id = change_ids_by_path.get(&path);
             let source = git_blob(repo_root, &commit.sha, &path)?;
             let source_file = SourceFile {
                 path: repo_root.join(&path),
@@ -101,17 +102,17 @@ pub fn scan_repository_history(repo_path: impl AsRef<Path>) -> Result<Graph> {
                 if is_temporal_change_target(&record) {
                     let source_id = record.id().to_owned();
                     graph.push(record);
-                    graph.push(
-                        GraphRecord::edge(
-                            EdgeLabel::ChangedIn,
-                            source_id.clone(),
-                            commit_id.clone(),
-                            Some("1.0".to_owned()),
-                            format!("{path} changed in commit {}", commit.short_sha()),
-                        )
-                        .with_temporal(commit.temporal()),
-                    );
-                    if let Some(change_id) = change_ids_by_path.get(&path) {
+                    if let Some(change_id) = change_id {
+                        graph.push(
+                            GraphRecord::edge(
+                                EdgeLabel::ChangedIn,
+                                source_id.clone(),
+                                commit_id.clone(),
+                                Some("1.0".to_owned()),
+                                format!("{path} changed in commit {}", commit.short_sha()),
+                            )
+                            .with_temporal(commit.temporal()),
+                        );
                         graph.push(
                             GraphRecord::edge(
                                 EdgeLabel::ChangedIn,
@@ -206,6 +207,7 @@ fn list_changes(repo_root: &Path, commit: &GitCommit) -> Result<Vec<GitChange>> 
         repo_root,
         &[
             "diff-tree",
+            "-m",
             "--no-commit-id",
             "--name-status",
             "-r",
@@ -213,9 +215,11 @@ fn list_changes(repo_root: &Path, commit: &GitCommit) -> Result<Vec<GitChange>> 
             &commit.sha,
         ],
     )?;
+    let mut seen = BTreeSet::new();
     Ok(output
         .lines()
         .filter_map(parse_change_line)
+        .filter(|change| seen.insert((change.status.clone(), change.path.clone())))
         .collect::<Vec<_>>())
 }
 

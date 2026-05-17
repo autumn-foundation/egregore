@@ -1,7 +1,8 @@
-//! Core library for Aletheia Codegraph.
+//! Core library for Egregore.
 //!
-//! The library scans local source repositories into a deterministic graph IR.
-//! Persistence and richer language extraction are layered on top of this core.
+//! The current core scans local source repositories into a deterministic graph
+//! IR. Agent memory, project state, artifacts, and richer domain graphs are
+//! layered on top of the same `AletheiaDB` substrate.
 
 /// Graph ingestion adapters.
 pub mod adapters;

@@ -1,8 +1,10 @@
-# Aletheia Codegraph Agent Guide
+# Egregore Agent Guide
 
 ## Project Shape
 
-Aletheia Codegraph is a standalone Rust project for extracting current and historical codebase structure into an embedded AletheiaDB-compatible graph. Keep the repo independent from AletheiaDB release mechanics; integrate through a thin adapter boundary and documented schema contracts.
+Egregore is a standalone Rust project for building an AletheiaDB-backed knowledge graph substrate for agentic software engineering. Keep the repo independent from AletheiaDB release mechanics; integrate through thin adapter boundaries and documented schema contracts.
+
+The current implemented domain is code graph extraction: current and historical codebase structure becomes deterministic graph records that can share an AletheiaDB store with future agent memory, project/task, artifact, and verification-evidence domains.
 
 ## Current Status
 
@@ -15,14 +17,17 @@ cargo run -- scan . --out graph.jsonl
 cargo run -- scan-history . --out history.graph.jsonl
 cargo run -- inspect graph.jsonl
 cargo run -- ingest graph.jsonl --adapter dry-run
-cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .aletheia-codegraph
+cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .egregore
 ```
+
+The primary binary is `egregore`; `eg` is also built as a short CLI alias.
 
 ## Working Rules
 
 - Use SPEC-PROOF-RED-GREEN-REFACTOR for implementation work.
 - No behavior ships without a test.
 - Keep core graph extraction deterministic and filesystem-local.
+- Keep deterministic code facts separate from agent-authored observations through typed nodes, provenance, and evidence links.
 - History replay must read Git objects without mutating the user's active checkout.
 - Prefer Tree-sitter for syntax parsing rather than ad hoc regex parsing.
 - Keep AletheiaDB writes behind an adapter so embedded, daemon, SDK, or CLI transports can swap without changing the extractor.

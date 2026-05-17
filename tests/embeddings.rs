@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use aletheia_codegraph::{
+use aletheia_egregore::{
     GraphRecord, NodeKind, TemporalMetadata,
     embeddings::{CandidateVector, embedding_candidates, semantic_drift_records},
     scan_repository,

@@ -1,8 +1,10 @@
-# Aletheia Codegraph PRD
+# Egregore Code Graph Domain PRD
+
+This PRD defines the first Egregore domain: deterministic source-derived code facts and Git history. It is subordinate to the broader Egregore product vision, which connects code facts with agent memory, project/task state, artifacts, and verification evidence in the same AletheiaDB-backed graph.
 
 ## Summary
 
-Aletheia Codegraph turns a local source repository and its Git history into a durable, queryable, bi-temporal code graph for coding agents. It parses source files with Tree-sitter, replays repository history commit-by-commit, produces a stable intermediate representation of files, symbols, relationships, and changes, and writes that graph into an embedded AletheiaDB store so future agents can recall not only what the codebase looks like now, but how it became that way.
+Egregore's code graph domain turns a local source repository and its Git history into a durable, queryable, bi-temporal code graph for coding agents. It parses source files with Tree-sitter, replays repository history commit-by-commit, produces a stable intermediate representation of files, symbols, relationships, and changes, and writes that graph into an embedded AletheiaDB store so future agents can recall not only what the codebase looks like now, but how it became that way.
 
 The project starts as a standalone repo. That keeps parser and ingestion experiments out of the AletheiaDB crate release path while preserving a clear integration contract with AletheiaDB.
 
@@ -54,13 +56,15 @@ The maintainer needs deterministic output, focused tests, and clear schema versi
 The MVP should expose a small CLI:
 
 ```text
-aletheia-codegraph scan <repo-path> --out graph.jsonl
-aletheia-codegraph scan-history <repo-path> --out history.graph.jsonl
-aletheia-codegraph inspect graph.jsonl
-aletheia-codegraph ingest graph.jsonl --adapter embedded --data-dir .aletheia-codegraph
+egregore scan <repo-path> --out graph.jsonl
+egregore scan-history <repo-path> --out history.graph.jsonl
+egregore inspect graph.jsonl
+egregore ingest graph.jsonl --adapter embedded --data-dir .egregore
 ```
 
 The CLI should be deterministic: the same repository state and config produce the same graph IDs and JSONL output.
+
+The primary binary is `egregore`; `eg` is a short alias for repeated local use.
 
 `scan` indexes the current working tree. `scan-history` walks Git commits in deterministic topological order, checks out each tree through Git object reads rather than mutating the user's workspace, extracts code graph records for each commit, and emits temporal metadata for AletheiaDB ingestion.
 
@@ -119,7 +123,7 @@ History-backed records must also include:
 
 ### Git History And Bi-Temporal Model
 
-The MVP must treat Git history as first-class input, not just context for incremental indexing. For every indexed commit, Codegraph should extract the same IR shape as the current-tree scan and attach commit metadata to every file-backed and syntax-backed record.
+The MVP must treat Git history as first-class input, not just context for incremental indexing. For every indexed commit, the code graph domain should extract the same IR shape as the current-tree scan and attach commit metadata to every file-backed and syntax-backed record.
 
 Bi-temporal mapping:
 
@@ -131,7 +135,7 @@ History replay must not mutate the user's working tree. Use Git object reads, te
 
 ### Embedded AletheiaDB Ingestion
 
-The MVP adapter writes nodes and edges directly to an embedded AletheiaDB store without relying on MCP, a daemon, or shelling out to the installed `aletheia` CLI. Codegraph owns extraction and schema mapping; AletheiaDB owns durable graph storage, bi-temporal indexing, semantic search, and semantic drift support through its public Rust API.
+The MVP adapter writes nodes and edges directly to an embedded AletheiaDB store without relying on MCP, a daemon, or shelling out to the installed `aletheia` CLI. The Egregore code graph domain owns extraction and schema mapping; AletheiaDB owns durable graph storage, bi-temporal indexing, semantic search, and semantic drift support through its public Rust API.
 
 The ingestion layer must still be isolated behind a trait so tests stay fast and future adapters can target:
 
@@ -141,7 +145,7 @@ The ingestion layer must still be isolated behind a trait so tests stay fast and
 - AletheiaDB CLI compatibility fallback
 - JSONL-only dry runs
 
-Codegraph should enable AletheiaDB's stable `semantic-search` feature and the temporal/diagnostic semantic cohorts needed for drift analysis by default when embedded ingestion is enabled. Full AletheiaDB `nova` should remain an explicit Codegraph feature flag until a concrete workflow needs every experimental cohort.
+Egregore should enable AletheiaDB's stable `semantic-search` feature and the temporal/diagnostic semantic cohorts needed for drift analysis by default when embedded ingestion is enabled. Full AletheiaDB `nova` should remain an explicit Egregore feature flag until a concrete workflow needs every experimental cohort.
 
 ### Incremental Indexing
 
@@ -198,7 +202,7 @@ Acceptance criteria:
 
 ### PR-5: Git History Replay
 
-Codegraph must be able to index a repository's Git history without mutating the user's checkout.
+The code graph domain must be able to index a repository's Git history without mutating the user's checkout.
 
 Acceptance criteria:
 
@@ -220,7 +224,7 @@ Acceptance criteria:
 
 ### PR-7: Temporal Semantic Drift
 
-Codegraph must identify semantic movement in files and symbols over Git history when embeddings are enabled.
+The code graph domain must identify semantic movement in files and symbols over Git history when embeddings are enabled.
 
 Acceptance criteria:
 
@@ -264,7 +268,7 @@ The parser should produce IR, not database writes. The adapter layer owns persis
 
 - Stable IDs are easy to get subtly wrong. Span-only IDs can churn after edits; name-only IDs can collide.
 - Tree-sitter syntax coverage is not the same as compiler semantic truth.
-- AletheiaDB public embedded APIs may not expose every graph update primitive Codegraph wants initially, so ingestion may need append-oriented behavior before true updates.
+- AletheiaDB public embedded APIs may not expose every graph update primitive Egregore wants initially, so ingestion may need append-oriented behavior before true updates.
 - Git history replay can be expensive on large repos; MVP fixtures must prove deterministic ordering first, then optimization can follow.
 - Commit-time semantics are subtle: rebases, cherry-picks, and amended commits can change transaction-time observations without changing the valid-time story.
 - Semantic drift can look impressive while being noisy. The MVP must preserve model ID, target text, and score so agents can explain evidence instead of hallucinating insight.
@@ -335,12 +339,12 @@ The parser should produce IR, not database writes. The adapter layer owns persis
 
 Resolved for the MVP:
 
-- The first binary is `aletheia-codegraph`.
+- The first binary is `egregore`, with `eg` as a short alias.
 - The embedded AletheiaDB schema uses specific codegraph labels such as `Repository`, `File`, `Symbol`, `Commit`, `Change`, and `SemanticDrift`.
 - Semantic embedding candidates attach to both files and symbols.
 - Committer time drives valid-time ordering; author time is preserved as temporal metadata.
 - `semantic-search`, `semantic-temporal`, and `semantic-diagnostics` are default-on with embedded AletheiaDB ingestion.
-- Full `nova` remains an explicit Codegraph feature flag.
+- Full `nova` remains an explicit Egregore feature flag.
 
 Follow-up product decisions:
 

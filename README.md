@@ -1,8 +1,8 @@
-# Aletheia Codegraph
+# Egregore
 
-Aletheia Codegraph turns a local Rust repository and its Git history into a deterministic graph that agents can query through embedded AletheiaDB memory.
+Egregore is an `AletheiaDB`-backed knowledge graph substrate for agentic software engineering. It connects deterministic code facts, agent memory, project state, artifacts, and verification evidence in one temporal graph.
 
-The current slice parses Rust with Tree-sitter, emits stable JSONL graph records, replays Git history without mutating the working checkout, ingests records into an embedded AletheiaDB store, and exposes semantic-drift/query helpers for agent workflows.
+The current implemented slice is the code graph domain: it parses Rust with Tree-sitter, emits stable JSONL graph records, replays Git history without mutating the working checkout, ingests records into an embedded AletheiaDB store, and exposes semantic-drift/query helpers for agent workflows.
 
 ## Status
 
@@ -29,14 +29,18 @@ cargo run -- scan . --out graph.jsonl
 cargo run -- scan-history . --out history.graph.jsonl
 cargo run -- inspect graph.jsonl
 cargo run -- ingest graph.jsonl --adapter dry-run
-cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .aletheia-codegraph
+cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .egregore
 ```
+
+The primary binary is `egregore`; `eg` is also built as a short CLI alias.
 
 ## Primary Documents
 
-- Product requirements: [docs/prd/0001-codebase-knowledge-graph.md](docs/prd/0001-codebase-knowledge-graph.md)
+- Product vision: [docs/prd/0000-egregore-vision.md](docs/prd/0000-egregore-vision.md)
+- Code graph requirements: [docs/prd/0001-codebase-knowledge-graph.md](docs/prd/0001-codebase-knowledge-graph.md)
 - Architecture decisions: [docs/adr/README.md](docs/adr/README.md)
 - Implementation plans: [docs/plans/](docs/plans/)
+- PM issue prompt: [docs/prompts/vantage-egregore.md](docs/prompts/vantage-egregore.md)
 
 ## Development
 

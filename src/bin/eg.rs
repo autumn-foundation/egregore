@@ -1,4 +1,4 @@
-//! Binary entry point for Egregore.
+//! Short binary alias for Egregore.
 
 fn main() {
     if let Err(error) = aletheia_egregore::cli::run() {

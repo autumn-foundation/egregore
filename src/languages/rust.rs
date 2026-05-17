@@ -91,7 +91,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             file_id,
             graph,
             source,
-            module_names: Vec::new(),
+            module_names: file_module_path(&file.repo_relative_path),
             owner_ids: vec![file_id.to_owned()],
             impl_context: None,
             definitions: BTreeMap::new(),
@@ -444,6 +444,55 @@ fn looks_like_call(text: &str, name: &str) -> bool {
     let associated = format!("::{simple_name}(");
     let method = format!(".{simple_name}(");
     text.contains(&direct) || text.contains(&associated) || text.contains(&method)
+}
+
+fn file_module_path(repo_relative_path: &str) -> Vec<String> {
+    let parts = repo_relative_path
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.first() != Some(&"src") {
+        return Vec::new();
+    }
+
+    if parts.get(1) == Some(&"bin") {
+        return binary_module_path(&parts);
+    }
+
+    module_path_from_file_parts(&parts[1..])
+}
+
+fn binary_module_path(parts: &[&str]) -> Vec<String> {
+    let Some(parts_after_bin) = parts.get(2..) else {
+        return Vec::new();
+    };
+    if parts_after_bin.len() <= 1 {
+        return Vec::new();
+    }
+
+    let parts_after_target = &parts_after_bin[1..];
+    if matches!(parts_after_target, ["main.rs" | "mod.rs"]) {
+        return Vec::new();
+    }
+
+    module_path_from_file_parts(parts_after_target)
+}
+
+fn module_path_from_file_parts(parts: &[&str]) -> Vec<String> {
+    let mut module_parts = parts.to_vec();
+    let Some(last) = module_parts.pop() else {
+        return Vec::new();
+    };
+    match last {
+        "lib.rs" | "main.rs" | "mod.rs" => {}
+        file_name => {
+            if let Some(stem) = file_name.strip_suffix(".rs") {
+                module_parts.push(stem);
+            }
+        }
+    }
+
+    module_parts.into_iter().map(ToOwned::to_owned).collect()
 }
 
 #[allow(dead_code)]

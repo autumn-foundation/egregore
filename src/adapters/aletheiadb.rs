@@ -2,16 +2,134 @@
 
 use std::{collections::BTreeMap, fs, path::Path};
 
+use chrono::{DateTime, Utc};
+
 use crate::{
     adapters::{AdapterError, AdapterResult, GraphSink},
-    ir::{EdgeLabel, GraphRecord, NodeKind, SourceSpan},
+    ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan, TemporalMetadata},
 };
 
 /// Graph sink backed by an embedded `AletheiaDB` store.
 pub struct EmbeddedAletheiaSink {
     db: ::aletheiadb::AletheiaDB,
-    node_ids: BTreeMap<String, ::aletheiadb::NodeId>,
-    records: BTreeMap<String, GraphRecord>,
+    node_lookup: NodeLookupIndex,
+    tombstone_ids: BTreeMap<String, ::aletheiadb::NodeId>,
+    record_handles: BTreeMap<String, StoredRecord>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StoredRecord {
+    Node(::aletheiadb::NodeId),
+    Edge(::aletheiadb::EdgeId),
+    Tombstone(::aletheiadb::NodeId),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct TemporalReadKey {
+    valid_time: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+    git_commit: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReadBackCandidate<Id> {
+    storage_id: Id,
+    temporal_key: Option<TemporalReadKey>,
+}
+
+#[derive(Debug, Default)]
+struct NodeLookupIndex {
+    latest: BTreeMap<String, ReadBackCandidate<::aletheiadb::NodeId>>,
+    by_commit: BTreeMap<String, BTreeMap<String, ReadBackCandidate<::aletheiadb::NodeId>>>,
+    non_temporal: BTreeMap<String, ::aletheiadb::NodeId>,
+    single_candidate: BTreeMap<String, ::aletheiadb::NodeId>,
+    candidate_counts: BTreeMap<String, usize>,
+}
+
+impl NodeLookupIndex {
+    fn insert(
+        &mut self,
+        record_id: String,
+        node_id: ::aletheiadb::NodeId,
+        temporal_key: Option<TemporalReadKey>,
+    ) {
+        *self.candidate_counts.entry(record_id.clone()).or_default() += 1;
+        self.single_candidate
+            .entry(record_id.clone())
+            .or_insert(node_id);
+
+        let candidate = ReadBackCandidate {
+            storage_id: node_id,
+            temporal_key: temporal_key.clone(),
+        };
+        if should_replace_read_back_candidate(self.latest.get(&record_id), &candidate) {
+            self.latest.insert(record_id.clone(), candidate.clone());
+        }
+
+        if let Some(key) = temporal_key {
+            let commit_candidates = self.by_commit.entry(record_id).or_default();
+            let commit = key.git_commit;
+            if should_replace_read_back_candidate(commit_candidates.get(&commit), &candidate) {
+                commit_candidates.insert(commit, candidate);
+            }
+        } else {
+            self.non_temporal
+                .entry(record_id)
+                .and_modify(|current| {
+                    if node_id > *current {
+                        *current = node_id;
+                    }
+                })
+                .or_insert(node_id);
+        }
+    }
+
+    fn latest_node(&self, record_id: &str) -> Option<::aletheiadb::NodeId> {
+        self.latest
+            .get(record_id)
+            .map(|candidate| candidate.storage_id)
+    }
+
+    fn node_for_commit(&self, record_id: &str, git_commit: &str) -> Option<::aletheiadb::NodeId> {
+        self.by_commit
+            .get(record_id)
+            .and_then(|commits| commits.get(git_commit))
+            .map(|candidate| candidate.storage_id)
+    }
+
+    fn endpoint_node(
+        &self,
+        record_id: &str,
+        git_commit: Option<&str>,
+    ) -> Result<Option<::aletheiadb::NodeId>, &'static str> {
+        if let Some(git_commit) = git_commit
+            && let Some(node_id) = self.node_for_commit(record_id, git_commit)
+        {
+            return Ok(Some(node_id));
+        }
+        if let Some(node_id) = self.non_temporal.get(record_id).copied() {
+            return Ok(Some(node_id));
+        }
+
+        match self
+            .candidate_counts
+            .get(record_id)
+            .copied()
+            .unwrap_or_default()
+        {
+            0 => Ok(None),
+            1 => Ok(self.single_candidate.get(record_id).copied()),
+            _ => Err("has multiple temporal observations and no matching edge commit"),
+        }
+    }
+
+    #[cfg(test)]
+    fn candidate_count(&self, record_id: &str) -> usize {
+        self.candidate_counts
+            .get(record_id)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 impl EmbeddedAletheiaSink {
@@ -32,11 +150,14 @@ impl EmbeddedAletheiaSink {
                 message: error.to_string(),
             }
         })?;
-        Ok(Self {
+        let mut sink = Self {
             db,
-            node_ids: BTreeMap::new(),
-            records: BTreeMap::new(),
-        })
+            node_lookup: NodeLookupIndex::default(),
+            tombstone_ids: BTreeMap::new(),
+            record_handles: BTreeMap::new(),
+        };
+        sink.rebuild_lookup_indexes()?;
+        Ok(sink)
     }
 
     /// Persists embedded indexes so a subsequent process can reopen without
@@ -69,7 +190,7 @@ impl EmbeddedAletheiaSink {
     ///
     /// Returns an error if an embedded read operation fails.
     pub fn has_repository_file_symbol_path(&self, repository_id: &str) -> AdapterResult<bool> {
-        let Some(repo_node_id) = self.node_ids.get(repository_id).copied() else {
+        let Some(repo_node_id) = self.lookup_node_id_by_codegraph_id(repository_id) else {
             return Ok(false);
         };
 
@@ -114,7 +235,7 @@ impl EmbeddedAletheiaSink {
     ///
     /// Returns an error if an embedded read operation fails.
     pub fn has_commit_change_symbol_path(&self, commit_id: &str) -> AdapterResult<bool> {
-        let Some(commit_node_id) = self.node_ids.get(commit_id).copied() else {
+        let Some(commit_node_id) = self.lookup_node_id_by_codegraph_id(commit_id) else {
             return Ok(false);
         };
 
@@ -171,19 +292,92 @@ impl GraphSink for EmbeddedAletheiaSink {
         match record {
             GraphRecord::Node { .. } => self.write_node(record),
             GraphRecord::Edge { .. } => self.write_edge(record),
-            GraphRecord::Tombstone { .. } => {
-                self.records.insert(record.id().to_owned(), record.clone());
-                Ok(())
-            }
+            GraphRecord::Tombstone { .. } => self.write_tombstone(record),
         }
     }
 
     fn read_back(&self, record_id: &str) -> AdapterResult<Option<GraphRecord>> {
-        Ok(self.records.get(record_id).cloned())
+        if let Some(node_id) = self.node_lookup.latest_node(record_id) {
+            return self.read_node_record(record_id, node_id).map(Some);
+        }
+        if let Some(node_id) = self.tombstone_ids.get(record_id).copied() {
+            return self.read_tombstone_record(record_id, node_id).map(Some);
+        }
+        if let Some(edge_id) = self.find_edge_id_by_codegraph_id(record_id)? {
+            return self.read_edge_record(record_id, edge_id).map(Some);
+        }
+        Ok(None)
+    }
+
+    fn verify_record(&self, record: &GraphRecord) -> AdapterResult<()> {
+        let Some(handle) = self.record_handles.get(record.id()).copied() else {
+            return match self.read_back(record.id())? {
+                Some(read_back) if read_back == *record => Ok(()),
+                Some(_) => Err(AdapterError::ReadBack {
+                    record_id: record.id().to_owned(),
+                    message: "record mismatch".to_owned(),
+                }),
+                None => Err(AdapterError::ReadBack {
+                    record_id: record.id().to_owned(),
+                    message: "record missing after write".to_owned(),
+                }),
+            };
+        };
+
+        match self.read_handle(record.id(), handle)? {
+            read_back if read_back == *record => Ok(()),
+            _ => Err(AdapterError::ReadBack {
+                record_id: record.id().to_owned(),
+                message: "record mismatch".to_owned(),
+            }),
+        }
     }
 }
 
 impl EmbeddedAletheiaSink {
+    fn rebuild_lookup_indexes(&mut self) -> AdapterResult<()> {
+        for node_id in self.db.get_all_node_ids() {
+            self.index_stored_node(node_id, "embedded-store")?;
+        }
+        Ok(())
+    }
+
+    fn index_stored_node(
+        &mut self,
+        node_id: ::aletheiadb::NodeId,
+        error_record_id: &str,
+    ) -> AdapterResult<()> {
+        let node = self
+            .db
+            .get_node(node_id)
+            .map_err(|error| read_back_error(error_record_id, error.to_string()))?;
+        let Some(record_id) = optional_str_property(
+            error_record_id,
+            "codegraph_id",
+            node.get_property("codegraph_id"),
+        )?
+        else {
+            return Ok(());
+        };
+        let record_type = optional_str_property(
+            error_record_id,
+            "record_type",
+            node.get_property("record_type"),
+        )?;
+        match record_type.as_deref() {
+            Some("node") => {
+                let temporal_key =
+                    temporal_read_key_from_properties(&record_id, |key| node.get_property(key))?;
+                self.node_lookup.insert(record_id, node_id, temporal_key);
+            }
+            Some("tombstone") => {
+                self.tombstone_ids.insert(record_id, node_id);
+            }
+            Some(_) | None => {}
+        }
+        Ok(())
+    }
+
     fn write_node(&mut self, record: &GraphRecord) -> AdapterResult<()> {
         let GraphRecord::Node {
             id,
@@ -239,8 +433,54 @@ impl EmbeddedAletheiaSink {
             });
         }
 
-        self.node_ids.insert(id.clone(), node_id);
-        self.records.insert(id.clone(), record.clone());
+        let temporal_key = temporal_read_key_from_properties(id, |key| node.get_property(key))?;
+        self.node_lookup.insert(id.clone(), node_id, temporal_key);
+        self.record_handles
+            .insert(id.clone(), StoredRecord::Node(node_id));
+        Ok(())
+    }
+
+    fn write_tombstone(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+        let GraphRecord::Tombstone {
+            id,
+            schema_version,
+            deleted_id,
+            summary,
+        } = record
+        else {
+            unreachable!("write_tombstone called with non-tombstone record");
+        };
+        let properties = base_properties(id, "tombstone", *schema_version, summary)
+            .insert("deleted_id", deleted_id.as_str())
+            .build();
+        let node_id = self
+            .db
+            .create_node("Tombstone", properties)
+            .map_err(|error| AdapterError::Rejected {
+                record_id: id.clone(),
+                message: error.to_string(),
+            })?;
+        let node = self
+            .db
+            .get_node(node_id)
+            .map_err(|error| AdapterError::ReadBack {
+                record_id: id.clone(),
+                message: error.to_string(),
+            })?;
+        if node
+            .get_property("codegraph_id")
+            .and_then(|value| value.as_str())
+            != Some(id.as_str())
+        {
+            return Err(AdapterError::ReadBack {
+                record_id: id.clone(),
+                message: "embedded tombstone codegraph_id mismatch".to_owned(),
+            });
+        }
+
+        self.tombstone_ids.insert(id.clone(), node_id);
+        self.record_handles
+            .insert(id.clone(), StoredRecord::Tombstone(node_id));
         Ok(())
     }
 
@@ -258,22 +498,8 @@ impl EmbeddedAletheiaSink {
         else {
             unreachable!("write_edge called with non-edge record");
         };
-        let source_id =
-            self.node_ids
-                .get(source)
-                .copied()
-                .ok_or_else(|| AdapterError::Rejected {
-                    record_id: id.clone(),
-                    message: format!("source node {source} has not been written"),
-                })?;
-        let target_id =
-            self.node_ids
-                .get(target)
-                .copied()
-                .ok_or_else(|| AdapterError::Rejected {
-                    record_id: id.clone(),
-                    message: format!("target node {target} has not been written"),
-                })?;
+        let source_id = self.resolve_node_id(id, source, temporal.as_ref(), "source")?;
+        let target_id = self.resolve_node_id(id, target, temporal.as_ref(), "target")?;
         let mut builder = base_properties(id, "edge", *schema_version, summary)
             .insert("label", label.as_str())
             .insert("source_codegraph_id", source.as_str())
@@ -309,8 +535,476 @@ impl EmbeddedAletheiaSink {
             });
         }
 
-        self.records.insert(id.clone(), record.clone());
+        self.record_handles
+            .insert(id.clone(), StoredRecord::Edge(edge_id));
         Ok(())
+    }
+
+    fn resolve_node_id(
+        &self,
+        edge_id: &str,
+        record_id: &str,
+        temporal: Option<&TemporalMetadata>,
+        endpoint: &str,
+    ) -> AdapterResult<::aletheiadb::NodeId> {
+        let edge_git_commit = temporal.map(|metadata| metadata.git_commit.as_str());
+        if let Some(node_id) = self
+            .node_lookup
+            .endpoint_node(record_id, edge_git_commit)
+            .map_err(|message| AdapterError::Rejected {
+                record_id: edge_id.to_owned(),
+                message: format!("{endpoint} node {record_id} {message}"),
+            })?
+        {
+            return Ok(node_id);
+        }
+
+        Err(AdapterError::Rejected {
+            record_id: edge_id.to_owned(),
+            message: format!("{endpoint} node {record_id} has not been written"),
+        })
+    }
+
+    fn read_handle(&self, record_id: &str, handle: StoredRecord) -> AdapterResult<GraphRecord> {
+        match handle {
+            StoredRecord::Node(node_id) => self.read_node_record(record_id, node_id),
+            StoredRecord::Edge(edge_id) => self.read_edge_record(record_id, edge_id),
+            StoredRecord::Tombstone(node_id) => self.read_tombstone_record(record_id, node_id),
+        }
+    }
+
+    fn lookup_node_id_by_codegraph_id(&self, record_id: &str) -> Option<::aletheiadb::NodeId> {
+        self.node_lookup.latest_node(record_id)
+    }
+
+    fn find_edge_id_by_codegraph_id(
+        &self,
+        record_id: &str,
+    ) -> AdapterResult<Option<::aletheiadb::EdgeId>> {
+        let mut found = None;
+        for node_id in self.db.get_all_node_ids() {
+            for edge_id in self.db.get_outgoing_edges(node_id) {
+                let edge = self
+                    .db
+                    .get_edge(edge_id)
+                    .map_err(|error| read_back_error(record_id, error.to_string()))?;
+                if optional_str_property(
+                    record_id,
+                    "codegraph_id",
+                    edge.get_property("codegraph_id"),
+                )?
+                .as_deref()
+                    == Some(record_id)
+                {
+                    let candidate = ReadBackCandidate {
+                        storage_id: edge_id,
+                        temporal_key: temporal_read_key_from_properties(record_id, |key| {
+                            edge.get_property(key)
+                        })?,
+                    };
+                    if should_replace_read_back_candidate(found.as_ref(), &candidate) {
+                        found = Some(candidate);
+                    }
+                }
+            }
+        }
+        Ok(found.map(|candidate| candidate.storage_id))
+    }
+
+    fn read_node_record(
+        &self,
+        record_id: &str,
+        node_id: ::aletheiadb::NodeId,
+    ) -> AdapterResult<GraphRecord> {
+        let node = self
+            .db
+            .get_node(node_id)
+            .map_err(|error| read_back_error(record_id, error.to_string()))?;
+        let id =
+            required_str_property(record_id, "codegraph_id", node.get_property("codegraph_id"))?;
+        if id != record_id {
+            return Err(read_back_error(
+                record_id,
+                format!("embedded node codegraph_id mismatch: {id}"),
+            ));
+        }
+
+        Ok(GraphRecord::Node {
+            id,
+            kind: parse_node_kind(
+                record_id,
+                &required_str_property(record_id, "kind", node.get_property("kind"))?,
+            )?,
+            schema_version: required_u32_property(
+                record_id,
+                "schema_version",
+                node.get_property("schema_version"),
+            )?,
+            repo_relative_path: optional_str_property(
+                record_id,
+                "repo_relative_path",
+                node.get_property("repo_relative_path"),
+            )?,
+            span: source_span_from_properties(record_id, |key| node.get_property(key))?,
+            name: optional_str_property(record_id, "name", node.get_property("name"))?,
+            language: optional_str_property(record_id, "language", node.get_property("language"))?,
+            symbol_kind: optional_str_property(
+                record_id,
+                "symbol_kind",
+                node.get_property("symbol_kind"),
+            )?,
+            temporal: temporal_from_properties(record_id, |key| node.get_property(key))?,
+            semantic_drift: semantic_drift_from_properties(record_id, |key| {
+                node.get_property(key)
+            })?,
+            summary: required_str_property(record_id, "summary", node.get_property("summary"))?,
+        })
+    }
+
+    fn read_tombstone_record(
+        &self,
+        record_id: &str,
+        node_id: ::aletheiadb::NodeId,
+    ) -> AdapterResult<GraphRecord> {
+        let node = self
+            .db
+            .get_node(node_id)
+            .map_err(|error| read_back_error(record_id, error.to_string()))?;
+        let id =
+            required_str_property(record_id, "codegraph_id", node.get_property("codegraph_id"))?;
+        if id != record_id {
+            return Err(read_back_error(
+                record_id,
+                format!("embedded tombstone codegraph_id mismatch: {id}"),
+            ));
+        }
+        let record_type =
+            required_str_property(record_id, "record_type", node.get_property("record_type"))?;
+        if record_type != "tombstone" {
+            return Err(read_back_error(
+                record_id,
+                format!("embedded tombstone record_type mismatch: {record_type}"),
+            ));
+        }
+
+        Ok(GraphRecord::Tombstone {
+            id,
+            schema_version: required_u32_property(
+                record_id,
+                "schema_version",
+                node.get_property("schema_version"),
+            )?,
+            deleted_id: required_str_property(
+                record_id,
+                "deleted_id",
+                node.get_property("deleted_id"),
+            )?,
+            summary: required_str_property(record_id, "summary", node.get_property("summary"))?,
+        })
+    }
+
+    fn read_edge_record(
+        &self,
+        record_id: &str,
+        edge_id: ::aletheiadb::EdgeId,
+    ) -> AdapterResult<GraphRecord> {
+        let edge = self
+            .db
+            .get_edge(edge_id)
+            .map_err(|error| read_back_error(record_id, error.to_string()))?;
+        let id =
+            required_str_property(record_id, "codegraph_id", edge.get_property("codegraph_id"))?;
+        if id != record_id {
+            return Err(read_back_error(
+                record_id,
+                format!("embedded edge codegraph_id mismatch: {id}"),
+            ));
+        }
+
+        Ok(GraphRecord::Edge {
+            id,
+            schema_version: required_u32_property(
+                record_id,
+                "schema_version",
+                edge.get_property("schema_version"),
+            )?,
+            label: parse_edge_label(
+                record_id,
+                &required_str_property(record_id, "label", edge.get_property("label"))?,
+            )?,
+            source: required_str_property(
+                record_id,
+                "source_codegraph_id",
+                edge.get_property("source_codegraph_id"),
+            )?,
+            target: required_str_property(
+                record_id,
+                "target_codegraph_id",
+                edge.get_property("target_codegraph_id"),
+            )?,
+            confidence: optional_str_property(
+                record_id,
+                "confidence",
+                edge.get_property("confidence"),
+            )?,
+            temporal: temporal_from_properties(record_id, |key| edge.get_property(key))?,
+            summary: required_str_property(record_id, "summary", edge.get_property("summary"))?,
+        })
+    }
+}
+
+fn read_back_error(record_id: &str, message: impl Into<String>) -> AdapterError {
+    AdapterError::ReadBack {
+        record_id: record_id.to_owned(),
+        message: message.into(),
+    }
+}
+
+fn required_str_property(
+    record_id: &str,
+    key: &str,
+    value: Option<&::aletheiadb::PropertyValue>,
+) -> AdapterResult<String> {
+    optional_str_property(record_id, key, value)?.ok_or_else(|| {
+        read_back_error(record_id, format!("missing embedded string property {key}"))
+    })
+}
+
+fn optional_str_property(
+    record_id: &str,
+    key: &str,
+    value: Option<&::aletheiadb::PropertyValue>,
+) -> AdapterResult<Option<String>> {
+    value.map_or(Ok(None), |value| {
+        value
+            .as_str()
+            .map(|value| Some(value.to_owned()))
+            .ok_or_else(|| {
+                read_back_error(
+                    record_id,
+                    format!("embedded property {key} is not a string"),
+                )
+            })
+    })
+}
+
+fn required_u32_property(
+    record_id: &str,
+    key: &str,
+    value: Option<&::aletheiadb::PropertyValue>,
+) -> AdapterResult<u32> {
+    let raw = value
+        .and_then(::aletheiadb::PropertyValue::as_int)
+        .ok_or_else(|| {
+            read_back_error(
+                record_id,
+                format!("missing embedded integer property {key}"),
+            )
+        })?;
+    u32::try_from(raw).map_err(|error| {
+        read_back_error(
+            record_id,
+            format!("embedded integer property {key} is out of range: {error}"),
+        )
+    })
+}
+
+fn optional_usize_property(
+    record_id: &str,
+    key: &str,
+    value: Option<&::aletheiadb::PropertyValue>,
+) -> AdapterResult<Option<usize>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let raw = value.as_int().ok_or_else(|| {
+        read_back_error(
+            record_id,
+            format!("embedded property {key} is not an integer"),
+        )
+    })?;
+    usize::try_from(raw).map(Some).map_err(|error| {
+        read_back_error(
+            record_id,
+            format!("embedded integer property {key} is out of range: {error}"),
+        )
+    })
+}
+
+fn source_span_from_properties<'a>(
+    record_id: &str,
+    get: impl Fn(&str) -> Option<&'a ::aletheiadb::PropertyValue>,
+) -> AdapterResult<Option<SourceSpan>> {
+    let start_byte = optional_usize_property(record_id, "start_byte", get("start_byte"))?;
+    let end_byte = optional_usize_property(record_id, "end_byte", get("end_byte"))?;
+    let start_line = optional_usize_property(record_id, "start_line", get("start_line"))?;
+    let end_line = optional_usize_property(record_id, "end_line", get("end_line"))?;
+
+    match (start_byte, end_byte, start_line, end_line) {
+        (None, None, None, None) => Ok(None),
+        (Some(start_byte), Some(end_byte), Some(start_line), Some(end_line)) => {
+            Ok(Some(SourceSpan {
+                start_byte,
+                end_byte,
+                start_line,
+                end_line,
+            }))
+        }
+        _ => Err(read_back_error(
+            record_id,
+            "embedded source span is only partially present",
+        )),
+    }
+}
+
+fn temporal_from_properties<'a>(
+    record_id: &str,
+    get: impl Fn(&str) -> Option<&'a ::aletheiadb::PropertyValue>,
+) -> AdapterResult<Option<TemporalMetadata>> {
+    let Some(git_commit) = optional_str_property(record_id, "git_commit", get("git_commit"))?
+    else {
+        return Ok(None);
+    };
+    let parents =
+        optional_str_property(record_id, "git_parent_commits", get("git_parent_commits"))?
+            .map(|parents| parents.split_whitespace().map(ToOwned::to_owned).collect())
+            .unwrap_or_default();
+
+    Ok(Some(TemporalMetadata {
+        git_commit,
+        git_parent_commits: parents,
+        valid_time: required_str_property(record_id, "valid_time", get("valid_time"))?,
+        author_time: optional_str_property(record_id, "author_time", get("author_time"))?,
+        observed_at: required_str_property(record_id, "observed_at", get("observed_at"))?,
+    }))
+}
+
+fn temporal_read_key_from_properties<'a>(
+    record_id: &str,
+    get: impl Fn(&str) -> Option<&'a ::aletheiadb::PropertyValue>,
+) -> AdapterResult<Option<TemporalReadKey>> {
+    let Some(git_commit) = optional_str_property(record_id, "git_commit", get("git_commit"))?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(TemporalReadKey {
+        valid_time: required_rfc3339_property(record_id, "valid_time", get("valid_time"))?,
+        observed_at: required_rfc3339_property(record_id, "observed_at", get("observed_at"))?,
+        git_commit,
+    }))
+}
+
+fn required_rfc3339_property(
+    record_id: &str,
+    key: &str,
+    value: Option<&::aletheiadb::PropertyValue>,
+) -> AdapterResult<DateTime<Utc>> {
+    let raw = required_str_property(record_id, key, value)?;
+    DateTime::parse_from_rfc3339(&raw)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| {
+            read_back_error(
+                record_id,
+                format!("embedded timestamp property {key} is not RFC3339: {error}"),
+            )
+        })
+}
+
+fn should_replace_read_back_candidate<Id: Ord>(
+    current: Option<&ReadBackCandidate<Id>>,
+    candidate: &ReadBackCandidate<Id>,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+
+    match (&current.temporal_key, candidate.temporal_key.as_ref()) {
+        (None, None) => candidate.storage_id > current.storage_id,
+        (None, Some(_)) => true,
+        (Some(current_key), Some(candidate_key)) => {
+            candidate_key > current_key
+                || (candidate_key == current_key && candidate.storage_id > current.storage_id)
+        }
+        (Some(_), None) => false,
+    }
+}
+
+fn semantic_drift_from_properties<'a>(
+    record_id: &str,
+    get: impl Fn(&str) -> Option<&'a ::aletheiadb::PropertyValue>,
+) -> AdapterResult<Option<Box<SemanticDriftMetadata>>> {
+    let Some(model_id) =
+        optional_str_property(record_id, "semantic_model_id", get("semantic_model_id"))?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(Box::new(SemanticDriftMetadata {
+        model_id,
+        target_record_id: required_str_property(
+            record_id,
+            "drift_target_record_id",
+            get("drift_target_record_id"),
+        )?,
+        before_git_commit: required_str_property(
+            record_id,
+            "before_git_commit",
+            get("before_git_commit"),
+        )?,
+        after_git_commit: required_str_property(
+            record_id,
+            "after_git_commit",
+            get("after_git_commit"),
+        )?,
+        before_valid_time: required_str_property(
+            record_id,
+            "before_valid_time",
+            get("before_valid_time"),
+        )?,
+        after_valid_time: required_str_property(
+            record_id,
+            "after_valid_time",
+            get("after_valid_time"),
+        )?,
+        score: required_str_property(record_id, "drift_score", get("drift_score"))?,
+    })))
+}
+
+fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
+    match kind {
+        "Repository" => Ok(NodeKind::Repository),
+        "File" => Ok(NodeKind::File),
+        "Module" => Ok(NodeKind::Module),
+        "Symbol" => Ok(NodeKind::Symbol),
+        "Import" => Ok(NodeKind::Import),
+        "Diagnostic" => Ok(NodeKind::Diagnostic),
+        "Commit" => Ok(NodeKind::Commit),
+        "Change" => Ok(NodeKind::Change),
+        "SemanticDrift" => Ok(NodeKind::SemanticDrift),
+        _ => Err(read_back_error(
+            record_id,
+            format!("unknown embedded node kind {kind}"),
+        )),
+    }
+}
+
+fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
+    match label {
+        "CONTAINS" => Ok(EdgeLabel::Contains),
+        "DEFINES" => Ok(EdgeLabel::Defines),
+        "IMPORTS" => Ok(EdgeLabel::Imports),
+        "REFERENCES" => Ok(EdgeLabel::References),
+        "CALLS" => Ok(EdgeLabel::Calls),
+        "IMPLEMENTS" => Ok(EdgeLabel::Implements),
+        "MENTIONS" => Ok(EdgeLabel::Mentions),
+        "CHANGED_IN" => Ok(EdgeLabel::ChangedIn),
+        "PARENT_OF" => Ok(EdgeLabel::ParentOf),
+        "DRIFTS_FROM" => Ok(EdgeLabel::DriftsFrom),
+        _ => Err(read_back_error(
+            record_id,
+            format!("unknown embedded edge label {label}"),
+        )),
     }
 }
 
@@ -416,5 +1110,162 @@ fn is_fresh_data_dir(data_dir: &Path) -> bool {
         Ok(mut entries) => entries.next().is_none(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{GraphRecord, SourceSpan, TemporalMetadata, stable_id};
+
+    #[test]
+    fn open_rebuilds_endpoint_index_from_persisted_nodes() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("endpoint-index-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+        let older_symbol = symbol_record(
+            &symbol_id,
+            "older observed symbol",
+            temporal_observed("zzzzzzzz", "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z"),
+        );
+        let later_symbol = symbol_record(
+            &symbol_id,
+            "later observed symbol",
+            temporal_observed("aaaaaaaa", "2026-01-01T00:00:00Z", "2026-01-01T00:00:02Z"),
+        );
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+        sink.write_record(&older_symbol)
+            .expect("older symbol should write");
+        sink.write_record(&later_symbol)
+            .expect("later symbol should write");
+        sink.persist_indexes()
+            .expect("embedded indexes should persist");
+        drop(sink);
+
+        let reopened = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+
+        assert_eq!(reopened.node_lookup.candidate_count(&symbol_id), 2);
+        assert!(
+            reopened
+                .node_lookup
+                .node_for_commit(&symbol_id, "aaaaaaaa")
+                .is_some(),
+            "reopened sink should resolve exact commit endpoints from a rebuilt index"
+        );
+        assert!(
+            reopened
+                .node_lookup
+                .node_for_commit(&symbol_id, "zzzzzzzz")
+                .is_some(),
+            "reopened sink should index every persisted temporal observation once"
+        );
+    }
+
+    #[test]
+    fn duplicate_non_temporal_nodes_replace_endpoint_index_candidate() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("duplicate-current-node-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+        let original_file = file_record(&file_id, "original current file");
+        let updated_file = file_record(&file_id, "updated current file");
+        let original_symbol = current_symbol_record(&symbol_id, "original current symbol", 20);
+        let updated_symbol = current_symbol_record(&symbol_id, "updated current symbol", 42);
+        let edge = GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id,
+            symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "updated current edge".to_owned(),
+        );
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+        sink.write_record(&original_file)
+            .expect("original file should write");
+        sink.write_record(&original_symbol)
+            .expect("original symbol should write");
+        sink.write_record(&updated_file)
+            .expect("updated file should write");
+        sink.write_record(&updated_symbol)
+            .expect("updated symbol should write");
+        let StoredRecord::Node(updated_symbol_node_id) = sink.record_handles[updated_symbol.id()]
+        else {
+            panic!("updated symbol handle should point at a node");
+        };
+
+        assert_eq!(
+            sink.node_lookup.latest_node(&symbol_id),
+            Some(updated_symbol_node_id)
+        );
+
+        sink.write_record(&edge).expect("edge should write");
+        let StoredRecord::Edge(edge_id) = sink.record_handles[edge.id()] else {
+            panic!("edge handle should point at an edge");
+        };
+        let edge_target = sink
+            .db
+            .get_edge_target(edge_id)
+            .expect("edge target should be readable");
+
+        assert_eq!(edge_target, updated_symbol_node_id);
+    }
+
+    fn file_record(id: &str, summary: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::File,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("src/lib.rs".to_owned()),
+            summary.to_owned(),
+        )
+    }
+
+    fn current_symbol_record(id: &str, summary: &str, end_byte: usize) -> GraphRecord {
+        GraphRecord::symbol(
+            id.to_owned(),
+            "function",
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte,
+                start_line: 1,
+                end_line: 1,
+            },
+            "stable".to_owned(),
+            summary.to_owned(),
+        )
+    }
+
+    fn symbol_record(id: &str, summary: &str, temporal: TemporalMetadata) -> GraphRecord {
+        GraphRecord::symbol(
+            id.to_owned(),
+            "function",
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte: 20,
+                start_line: 1,
+                end_line: 1,
+            },
+            "stable".to_owned(),
+            summary.to_owned(),
+        )
+        .with_temporal(temporal)
+    }
+
+    fn temporal_observed(
+        git_commit: &str,
+        valid_time: &str,
+        observed_at: &str,
+    ) -> TemporalMetadata {
+        TemporalMetadata {
+            git_commit: git_commit.to_owned(),
+            git_parent_commits: Vec::new(),
+            valid_time: valid_time.to_owned(),
+            author_time: Some(valid_time.to_owned()),
+            observed_at: observed_at.to_owned(),
+        }
     }
 }
