@@ -13,7 +13,6 @@ use crate::{
 pub struct EmbeddedAletheiaSink {
     db: ::aletheiadb::AletheiaDB,
     node_ids: BTreeMap<String, ::aletheiadb::NodeId>,
-    node_observations: BTreeMap<String, Vec<NodeObservation>>,
     record_handles: BTreeMap<String, StoredRecord>,
 }
 
@@ -22,12 +21,6 @@ enum StoredRecord {
     Node(::aletheiadb::NodeId),
     Edge(::aletheiadb::EdgeId),
     Tombstone(::aletheiadb::NodeId),
-}
-
-#[derive(Debug, Clone)]
-struct NodeObservation {
-    node_id: ::aletheiadb::NodeId,
-    git_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -64,7 +57,6 @@ impl EmbeddedAletheiaSink {
         Ok(Self {
             db,
             node_ids: BTreeMap::new(),
-            node_observations: BTreeMap::new(),
             record_handles: BTreeMap::new(),
         })
     }
@@ -99,7 +91,7 @@ impl EmbeddedAletheiaSink {
     ///
     /// Returns an error if an embedded read operation fails.
     pub fn has_repository_file_symbol_path(&self, repository_id: &str) -> AdapterResult<bool> {
-        let Some(repo_node_id) = self.node_ids.get(repository_id).copied() else {
+        let Some(repo_node_id) = self.lookup_node_id_by_codegraph_id(repository_id)? else {
             return Ok(false);
         };
 
@@ -144,7 +136,7 @@ impl EmbeddedAletheiaSink {
     ///
     /// Returns an error if an embedded read operation fails.
     pub fn has_commit_change_symbol_path(&self, commit_id: &str) -> AdapterResult<bool> {
-        let Some(commit_node_id) = self.node_ids.get(commit_id).copied() else {
+        let Some(commit_node_id) = self.lookup_node_id_by_codegraph_id(commit_id)? else {
             return Ok(false);
         };
 
@@ -206,9 +198,6 @@ impl GraphSink for EmbeddedAletheiaSink {
     }
 
     fn read_back(&self, record_id: &str) -> AdapterResult<Option<GraphRecord>> {
-        if let Some(handle) = self.record_handles.get(record_id).copied() {
-            return self.read_handle(record_id, handle).map(Some);
-        }
         if let Some(node_id) = self.find_node_id_by_codegraph_id(record_id)? {
             return self
                 .read_node_or_tombstone_record(record_id, node_id)
@@ -218,6 +207,30 @@ impl GraphSink for EmbeddedAletheiaSink {
             return self.read_edge_record(record_id, edge_id).map(Some);
         }
         Ok(None)
+    }
+
+    fn verify_record(&self, record: &GraphRecord) -> AdapterResult<()> {
+        let Some(handle) = self.record_handles.get(record.id()).copied() else {
+            return match self.read_back(record.id())? {
+                Some(read_back) if read_back == *record => Ok(()),
+                Some(_) => Err(AdapterError::ReadBack {
+                    record_id: record.id().to_owned(),
+                    message: "record mismatch".to_owned(),
+                }),
+                None => Err(AdapterError::ReadBack {
+                    record_id: record.id().to_owned(),
+                    message: "record missing after write".to_owned(),
+                }),
+            };
+        };
+
+        match self.read_handle(record.id(), handle)? {
+            read_back if read_back == *record => Ok(()),
+            _ => Err(AdapterError::ReadBack {
+                record_id: record.id().to_owned(),
+                message: "record mismatch".to_owned(),
+            }),
+        }
     }
 }
 
@@ -278,15 +291,6 @@ impl EmbeddedAletheiaSink {
         }
 
         self.node_ids.insert(id.clone(), node_id);
-        self.node_observations
-            .entry(id.clone())
-            .or_default()
-            .push(NodeObservation {
-                node_id,
-                git_commit: temporal
-                    .as_ref()
-                    .map(|metadata| metadata.git_commit.clone()),
-            });
         self.record_handles
             .insert(id.clone(), StoredRecord::Node(node_id));
         Ok(())
@@ -398,40 +402,15 @@ impl EmbeddedAletheiaSink {
         temporal: Option<&TemporalMetadata>,
         endpoint: &str,
     ) -> AdapterResult<::aletheiadb::NodeId> {
-        let observations =
-            self.node_observations
-                .get(record_id)
-                .ok_or_else(|| AdapterError::Rejected {
-                    record_id: edge_id.to_owned(),
-                    message: format!("{endpoint} node {record_id} has not been written"),
-                })?;
-
-        if let Some(git_commit) = temporal.map(|metadata| metadata.git_commit.as_str())
-            && let Some(observation) = observations
-                .iter()
-                .rev()
-                .find(|observation| observation.git_commit.as_deref() == Some(git_commit))
+        if let Some(node_id) =
+            self.find_endpoint_node_id_by_codegraph_id(edge_id, record_id, temporal, endpoint)?
         {
-            return Ok(observation.node_id);
-        }
-
-        if let Some(observation) = observations
-            .iter()
-            .rev()
-            .find(|observation| observation.git_commit.is_none())
-        {
-            return Ok(observation.node_id);
-        }
-
-        if let [observation] = observations.as_slice() {
-            return Ok(observation.node_id);
+            return Ok(node_id);
         }
 
         Err(AdapterError::Rejected {
             record_id: edge_id.to_owned(),
-            message: format!(
-                "{endpoint} node {record_id} has multiple temporal observations and no matching edge commit"
-            ),
+            message: format!("{endpoint} node {record_id} has not been written"),
         })
     }
 
@@ -468,6 +447,94 @@ impl EmbeddedAletheiaSink {
             }
         }
         Ok(found.map(|candidate| candidate.storage_id))
+    }
+
+    fn lookup_node_id_by_codegraph_id(
+        &self,
+        record_id: &str,
+    ) -> AdapterResult<Option<::aletheiadb::NodeId>> {
+        if let Some(node_id) = self.node_ids.get(record_id).copied() {
+            return Ok(Some(node_id));
+        }
+        self.find_node_id_by_codegraph_id(record_id)
+    }
+
+    fn find_endpoint_node_id_by_codegraph_id(
+        &self,
+        edge_id: &str,
+        record_id: &str,
+        temporal: Option<&TemporalMetadata>,
+        endpoint: &str,
+    ) -> AdapterResult<Option<::aletheiadb::NodeId>> {
+        let edge_git_commit = temporal.map(|metadata| metadata.git_commit.as_str());
+        let mut matching_commit = None;
+        let mut non_temporal = None;
+        let mut single_candidate = None;
+        let mut candidate_count = 0_usize;
+
+        for node_id in self.db.get_all_node_ids() {
+            let node = self
+                .db
+                .get_node(node_id)
+                .map_err(|error| read_back_error(edge_id, error.to_string()))?;
+            if optional_str_property(edge_id, "codegraph_id", node.get_property("codegraph_id"))?
+                .as_deref()
+                != Some(record_id)
+            {
+                continue;
+            }
+            if optional_str_property(edge_id, "record_type", node.get_property("record_type"))?
+                .as_deref()
+                != Some("node")
+            {
+                continue;
+            }
+
+            candidate_count += 1;
+            if single_candidate.is_none() {
+                single_candidate = Some(node_id);
+            }
+
+            let temporal_key =
+                temporal_read_key_from_properties(edge_id, |key| node.get_property(key))?;
+            if let Some(git_commit) = edge_git_commit
+                && temporal_key
+                    .as_ref()
+                    .is_some_and(|key| key.git_commit == git_commit)
+                && should_replace_read_back_candidate(
+                    matching_commit.as_ref(),
+                    temporal_key.as_ref(),
+                )
+            {
+                matching_commit = Some(ReadBackCandidate {
+                    storage_id: node_id,
+                    temporal_key: temporal_key.clone(),
+                });
+            }
+            if temporal_key.is_none() && non_temporal.is_none() {
+                non_temporal = Some(node_id);
+            }
+        }
+
+        if let Some(candidate) = matching_commit {
+            return Ok(Some(candidate.storage_id));
+        }
+        if let Some(node_id) = non_temporal {
+            return Ok(Some(node_id));
+        }
+        if candidate_count == 1 {
+            return Ok(single_candidate);
+        }
+        if candidate_count == 0 {
+            return Ok(None);
+        }
+
+        Err(AdapterError::Rejected {
+            record_id: edge_id.to_owned(),
+            message: format!(
+                "{endpoint} node {record_id} has multiple temporal observations and no matching edge commit"
+            ),
+        })
     }
 
     fn find_edge_id_by_codegraph_id(

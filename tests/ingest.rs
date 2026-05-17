@@ -279,6 +279,90 @@ fn embedded_read_back_after_reopen_uses_latest_temporal_observation() {
 
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
+fn embedded_same_process_read_back_uses_latest_temporal_observation() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("same-process-temporal-read-back-store");
+    let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+    let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+    let latest = temporal("aaaaaaaa", "2026-01-01T23:00:00-05:00");
+    let older = temporal("zzzzzzzz", "2026-01-02T01:00:00+00:00");
+    let latest_file = file_record(&file_id, latest.clone());
+    let older_file = file_record(&file_id, older.clone());
+    let latest_symbol = symbol_record(&symbol_id, "stable", "latest stable symbol", latest.clone());
+    let older_symbol = symbol_record(&symbol_id, "stable", "older stable symbol", older.clone());
+    let latest_edge = defines_edge(&file_id, &symbol_id, "latest defines edge", latest);
+    let older_edge = defines_edge(&file_id, &symbol_id, "older defines edge", older);
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+    for record in [
+        &latest_file,
+        &latest_symbol,
+        &latest_edge,
+        &older_file,
+        &older_symbol,
+        &older_edge,
+    ] {
+        sink.write_record(record).expect("record should write");
+    }
+
+    assert_eq!(
+        sink.read_back(&symbol_id).expect("node read-back"),
+        Some(latest_symbol)
+    );
+    assert_eq!(
+        sink.read_back(latest_edge.id()).expect("edge read-back"),
+        Some(latest_edge)
+    );
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn embedded_reopened_sink_appends_temporal_edge_for_persisted_nodes() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("append-after-reopen-store");
+    let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+    let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+    let latest = temporal("aaaaaaaa", "2026-01-01T23:00:00-05:00");
+    let older = temporal("zzzzzzzz", "2026-01-02T01:00:00+00:00");
+    let latest_file = file_record(&file_id, latest.clone());
+    let older_file = file_record(&file_id, older);
+    let latest_symbol = symbol_record(&symbol_id, "stable", "latest stable symbol", latest.clone());
+    let older_symbol = symbol_record(
+        &symbol_id,
+        "stable",
+        "older stable symbol",
+        temporal("zzzzzzzz", "2026-01-02T01:00:00+00:00"),
+    );
+    let appended_edge = defines_edge(&file_id, &symbol_id, "appended after reopen", latest);
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+    for record in [&latest_file, &latest_symbol, &older_file, &older_symbol] {
+        sink.write_record(record).expect("node record should write");
+    }
+    sink.persist_indexes()
+        .expect("embedded indexes should persist");
+    drop(sink);
+
+    let mut reopened = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    reopened
+        .write_record(&appended_edge)
+        .expect("edge should resolve persisted endpoint nodes after reopen");
+    reopened
+        .persist_indexes()
+        .expect("appended edge should persist");
+    drop(reopened);
+
+    let db = reopen_embedded_db(&data_dir);
+    let edge_id = edge_id_by_codegraph_id(&db, appended_edge.id());
+    let source_commit = edge_endpoint_git_commit(&db, edge_id, EdgeEndpoint::Source);
+    let target_commit = edge_endpoint_git_commit(&db, edge_id, EdgeEndpoint::Target);
+
+    assert_eq!(source_commit.as_deref(), Some("aaaaaaaa"));
+    assert_eq!(target_commit.as_deref(), Some("aaaaaaaa"));
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
 fn embedded_read_back_after_reopen_matches_latest_history_jsonl_observation() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path().join("repo");
@@ -564,6 +648,49 @@ fn node_id_by_codegraph_id(db: &::aletheiadb::AletheiaDB, record_id: &str) -> ::
                 == Some(record_id)
         })
         .unwrap_or_else(|| panic!("missing embedded node for {record_id}"))
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[derive(Debug, Clone, Copy)]
+enum EdgeEndpoint {
+    Source,
+    Target,
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn edge_id_by_codegraph_id(db: &::aletheiadb::AletheiaDB, record_id: &str) -> ::aletheiadb::EdgeId {
+    db.get_all_node_ids()
+        .into_iter()
+        .flat_map(|node_id| db.get_outgoing_edges(node_id))
+        .find(|edge_id| {
+            db.get_edge(*edge_id)
+                .expect("edge should be readable")
+                .get_property("codegraph_id")
+                .and_then(|value| value.as_str())
+                == Some(record_id)
+        })
+        .unwrap_or_else(|| panic!("missing embedded edge for {record_id}"))
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn edge_endpoint_git_commit(
+    db: &::aletheiadb::AletheiaDB,
+    edge_id: ::aletheiadb::EdgeId,
+    endpoint: EdgeEndpoint,
+) -> Option<String> {
+    let node_id = match endpoint {
+        EdgeEndpoint::Source => db
+            .get_edge_source(edge_id)
+            .expect("edge source should be readable"),
+        EdgeEndpoint::Target => db
+            .get_edge_target(edge_id)
+            .expect("edge target should be readable"),
+    };
+    db.get_node(node_id)
+        .expect("edge endpoint node should be readable")
+        .get_property("git_commit")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(feature = "embedded-aletheiadb")]

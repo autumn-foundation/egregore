@@ -59,6 +59,25 @@ pub trait GraphSink {
     ///
     /// Returns an error if the sink cannot perform read-back verification.
     fn read_back(&self, record_id: &str) -> AdapterResult<Option<GraphRecord>>;
+
+    /// Verifies that a just-written graph record can be reconstructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if read-back is missing or does not match the record.
+    fn verify_record(&self, record: &GraphRecord) -> AdapterResult<()> {
+        match self.read_back(record.id())? {
+            Some(read_back) if read_back == *record => Ok(()),
+            Some(_) => Err(AdapterError::ReadBack {
+                record_id: record.id().to_owned(),
+                message: "record mismatch".to_owned(),
+            }),
+            None => Err(AdapterError::ReadBack {
+                record_id: record.id().to_owned(),
+                message: "record missing after write".to_owned(),
+            }),
+        }
+    }
 }
 
 /// Summary of an ingest attempt.
@@ -188,17 +207,7 @@ impl GraphSink for FakeSink {
 
 fn write_and_verify<S: GraphSink>(record: &GraphRecord, sink: &mut S) -> AdapterResult<()> {
     sink.write_record(record)?;
-    match sink.read_back(record.id())? {
-        Some(read_back) if read_back == *record => Ok(()),
-        Some(_) => Err(AdapterError::ReadBack {
-            record_id: record.id().to_owned(),
-            message: "record mismatch".to_owned(),
-        }),
-        None => Err(AdapterError::ReadBack {
-            record_id: record.id().to_owned(),
-            message: "record missing after write".to_owned(),
-        }),
-    }
+    sink.verify_record(record)
 }
 
 fn ordered_records(records: &[GraphRecord]) -> Vec<&GraphRecord> {
