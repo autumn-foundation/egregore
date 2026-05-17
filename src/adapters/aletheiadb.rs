@@ -982,6 +982,13 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "Commit" => Ok(NodeKind::Commit),
         "Change" => Ok(NodeKind::Change),
         "SemanticDrift" => Ok(NodeKind::SemanticDrift),
+        "Agent" => Ok(NodeKind::Agent),
+        "AgentSession" => Ok(NodeKind::AgentSession),
+        "Observation" => Ok(NodeKind::Observation),
+        "Task" => Ok(NodeKind::Task),
+        "Artifact" => Ok(NodeKind::Artifact),
+        "Verification" => Ok(NodeKind::Verification),
+        "CommandEvidence" => Ok(NodeKind::CommandEvidence),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded node kind {kind}"),
@@ -1001,6 +1008,9 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "CHANGED_IN" => Ok(EdgeLabel::ChangedIn),
         "PARENT_OF" => Ok(EdgeLabel::ParentOf),
         "DRIFTS_FROM" => Ok(EdgeLabel::DriftsFrom),
+        "SESSION_OF" => Ok(EdgeLabel::SessionOf),
+        "AUTHORED_BY" => Ok(EdgeLabel::AuthoredBy),
+        "HAS_EVIDENCE" => Ok(EdgeLabel::HasEvidence),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded edge label {label}"),
@@ -1096,7 +1106,14 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::Diagnostic
         | NodeKind::Commit
         | NodeKind::Change
-        | NodeKind::SemanticDrift => kind.as_str(),
+        | NodeKind::SemanticDrift
+        | NodeKind::Agent
+        | NodeKind::AgentSession
+        | NodeKind::Observation
+        | NodeKind::Task
+        | NodeKind::Artifact
+        | NodeKind::Verification
+        | NodeKind::CommandEvidence => kind.as_str(),
     }
 }
 

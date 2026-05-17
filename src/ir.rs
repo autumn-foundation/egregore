@@ -322,6 +322,20 @@ pub enum NodeKind {
     Change,
     /// Semantic movement for a file or symbol over time.
     SemanticDrift,
+    /// Agent process or human actor writing observations.
+    Agent,
+    /// One agent run or conversation session.
+    AgentSession,
+    /// Agent-authored memory or discovery.
+    Observation,
+    /// Work item tracked by an agent.
+    Task,
+    /// File, patch, report, or generated output linked to work.
+    Artifact,
+    /// Evidence for a claim, test, or check.
+    Verification,
+    /// Command output or terminal evidence.
+    CommandEvidence,
 }
 
 impl NodeKind {
@@ -338,6 +352,13 @@ impl NodeKind {
             Self::Commit => "Commit",
             Self::Change => "Change",
             Self::SemanticDrift => "SemanticDrift",
+            Self::Agent => "Agent",
+            Self::AgentSession => "AgentSession",
+            Self::Observation => "Observation",
+            Self::Task => "Task",
+            Self::Artifact => "Artifact",
+            Self::Verification => "Verification",
+            Self::CommandEvidence => "CommandEvidence",
         }
     }
 }
@@ -366,6 +387,12 @@ pub enum EdgeLabel {
     ParentOf,
     /// Semantic drift measurement target.
     DriftsFrom,
+    /// Agent session belongs to an agent.
+    SessionOf,
+    /// Entity was authored by an agent session.
+    AuthoredBy,
+    /// Entity has supporting evidence.
+    HasEvidence,
 }
 
 impl EdgeLabel {
@@ -383,6 +410,9 @@ impl EdgeLabel {
             Self::ChangedIn => "CHANGED_IN",
             Self::ParentOf => "PARENT_OF",
             Self::DriftsFrom => "DRIFTS_FROM",
+            Self::SessionOf => "SESSION_OF",
+            Self::AuthoredBy => "AUTHORED_BY",
+            Self::HasEvidence => "HAS_EVIDENCE",
         }
     }
 }

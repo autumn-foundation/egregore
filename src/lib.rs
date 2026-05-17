@@ -8,6 +8,9 @@
 pub mod adapters;
 /// Command-line interface.
 pub mod cli;
+/// Local daemon for shared multi-agent store access.
+#[cfg(feature = "embedded-aletheiadb")]
+pub mod daemon;
 /// Semantic enrichment and embedding boundaries.
 pub mod embeddings;
 /// Error and result types.

@@ -1,0 +1,1285 @@
+//! Local daemon for shared Egregore store access.
+
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt::Write as _,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Seek, SeekFrom, Write},
+    net::{TcpListener, TcpStream},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result, anyhow};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use crate::{
+    adapters::{EmbeddedAletheiaSink, IngestReport, ingest_records},
+    ir::{EdgeLabel, GraphRecord, NodeKind, stable_id},
+};
+
+const RUNTIME_DIR: &str = ".egregore";
+const LOCK_FILE: &str = "egregored.lock";
+const METADATA_FILE: &str = "egregored.json";
+const IDEMPOTENCY_FILE: &str = "idempotency.json";
+const DEFAULT_HOST: &str = "127.0.0.1";
+const DEFAULT_PORT: u16 = 37_383;
+const START_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_LIMIT: usize = 1024 * 1024 * 32;
+
+/// Configuration for launching the daemon.
+#[derive(Debug, Clone)]
+pub struct DaemonConfig {
+    /// `AletheiaDB` data directory.
+    pub data_dir: PathBuf,
+    /// Loopback host to bind.
+    pub host: String,
+    /// TCP port. `0` asks the OS to choose.
+    pub port: u16,
+    /// Bounded write queue capacity.
+    pub write_queue_capacity: usize,
+}
+
+impl DaemonConfig {
+    /// Creates a daemon config for a data directory.
+    #[must_use]
+    pub fn new(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir,
+            host: DEFAULT_HOST.to_owned(),
+            port: DEFAULT_PORT,
+            write_queue_capacity: 64,
+        }
+    }
+}
+
+/// Metadata written by a running daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonMetadata {
+    /// Daemon process ID.
+    pub pid: u32,
+    /// Bound TCP address.
+    pub address: String,
+    /// Local bearer token.
+    pub token: String,
+    /// Store data directory.
+    pub data_dir: PathBuf,
+    /// Daemon version.
+    pub version: String,
+    /// Unix milliseconds when the daemon started.
+    pub started_at_unix_ms: u128,
+}
+
+/// Response returned by daemon-backed ingestion.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DaemonIngestResponse {
+    /// Number of records attempted.
+    pub attempted: usize,
+    /// Number of records written and read back.
+    pub succeeded: usize,
+    /// Number of failed records.
+    pub failed: usize,
+    /// Per-record failures.
+    pub failures: Vec<DaemonIngestFailure>,
+    /// Record IDs included in the request.
+    pub record_ids: Vec<String>,
+    /// True when returned from the idempotency cache.
+    pub idempotent: bool,
+}
+
+/// One daemon ingest failure.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DaemonIngestFailure {
+    /// Stable record ID.
+    pub record_id: String,
+    /// Failure message.
+    pub message: String,
+}
+
+impl DaemonIngestResponse {
+    fn from_report(report: IngestReport, record_ids: Vec<String>, idempotent: bool) -> Self {
+        Self {
+            attempted: report.attempted,
+            succeeded: report.succeeded,
+            failed: report.failed,
+            failures: report
+                .failures
+                .into_iter()
+                .map(|failure| DaemonIngestFailure {
+                    record_id: failure.record_id,
+                    message: failure.message,
+                })
+                .collect(),
+            record_ids,
+            idempotent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IdempotencyEntry {
+    payload_hash: String,
+    response: DaemonIngestResponse,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct IdempotencyFile {
+    entries: BTreeMap<String, IdempotencyEntry>,
+}
+
+struct IdempotencyStore {
+    path: PathBuf,
+    entries: BTreeMap<String, IdempotencyEntry>,
+}
+
+impl IdempotencyStore {
+    fn load(path: PathBuf) -> Result<Self> {
+        let entries = match fs::read_to_string(&path) {
+            Ok(contents) => {
+                serde_json::from_str::<IdempotencyFile>(&contents)
+                    .with_context(|| format!("failed to parse {}", path.display()))?
+                    .entries
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+        Ok(Self { path, entries })
+    }
+
+    fn persist(&self) -> Result<()> {
+        let file = IdempotencyFile {
+            entries: self.entries.clone(),
+        };
+        let json = serde_json::to_vec_pretty(&file)?;
+        atomic_write(&self.path, &json)
+    }
+}
+
+struct StoreLease {
+    file: File,
+    path: PathBuf,
+}
+
+impl StoreLease {
+    fn acquire(data_dir: &Path) -> Result<Self> {
+        let runtime_dir = runtime_dir(data_dir);
+        fs::create_dir_all(&runtime_dir)
+            .with_context(|| format!("failed to create {}", runtime_dir.display()))?;
+        let path = runtime_dir.join(LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        file.try_lock()
+            .with_context(|| format!("daemon already running for {}", data_dir.display()))?;
+        Ok(Self { file, path })
+    }
+
+    fn write_metadata(&mut self, metadata: &DaemonMetadata) -> Result<()> {
+        let contents = serde_json::to_vec_pretty(metadata)?;
+        self.file
+            .set_len(0)
+            .with_context(|| format!("failed to truncate {}", self.path.display()))?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .with_context(|| format!("failed to seek {}", self.path.display()))?;
+        self.file
+            .write_all(&contents)
+            .with_context(|| format!("failed to write {}", self.path.display()))?;
+        self.file
+            .sync_all()
+            .with_context(|| format!("failed to sync {}", self.path.display()))
+    }
+}
+
+impl Drop for StoreLease {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+#[derive(Clone)]
+struct ServerState {
+    token: String,
+    sink: Arc<RwLock<EmbeddedAletheiaSink>>,
+    write_tx: mpsc::SyncSender<WriteCommand>,
+    jobs: Arc<Mutex<BTreeMap<String, JobStatus>>>,
+    agents: Arc<Mutex<BTreeMap<String, AgentStatus>>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+struct WriteCommand {
+    idempotency_key: String,
+    payload_hash: String,
+    records: Vec<GraphRecord>,
+    response_tx: mpsc::Sender<WriteResult>,
+}
+
+type WriteResult = std::result::Result<DaemonIngestResponse, ApiError>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentStatus {
+    agent_id: String,
+    session_id: String,
+    agent_kind: String,
+    project_scope: String,
+    last_seen_unix_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobStatus {
+    job_id: String,
+    status: String,
+    report: Option<DaemonIngestResponse>,
+    events: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ApiError {
+    status: u16,
+    code: &'static str,
+    message: String,
+}
+
+impl ApiError {
+    fn new(status: u16, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(400, "bad_request", message)
+    }
+
+    fn unauthorized() -> Self {
+        Self::new(401, "unauthorized", "missing or invalid bearer token")
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::new(404, "not_found", message)
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self::new(409, "idempotency_conflict", message)
+    }
+
+    fn overloaded() -> Self {
+        Self::new(429, "queue_full", "write queue is full")
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::new(500, "internal", message)
+    }
+}
+
+#[derive(Debug)]
+struct HttpRequest {
+    method: String,
+    path: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct HttpResponse {
+    status: u16,
+    body: serde_json::Value,
+}
+
+impl HttpResponse {
+    const fn json(status: u16, body: serde_json::Value) -> Self {
+        Self { status, body }
+    }
+
+    fn error(error: ApiError) -> Self {
+        let ApiError {
+            status,
+            code,
+            message,
+        } = error;
+        Self::json(
+            status,
+            json!({
+                "error": code,
+                "message": message,
+            }),
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestEnvelope {
+    request_id: String,
+    agent_id: String,
+    session_id: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct IngestPayload {
+    records: Vec<GraphRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentRegisterRequest {
+    request_id: String,
+    agent_id: String,
+    session_id: String,
+    agent_kind: String,
+    project_scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentHeartbeatRequest {
+    agent_id: String,
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryRequest {
+    request_id: String,
+    agent_id: String,
+    session_id: String,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    record_ids: Vec<String>,
+}
+
+/// Starts a daemon in the background and waits until it responds.
+///
+/// # Errors
+///
+/// Returns an error if another daemon is running, the child cannot be spawned,
+/// or the daemon does not become healthy before the startup timeout.
+pub fn start_background(config: &DaemonConfig) -> Result<DaemonMetadata> {
+    if let Some(metadata) = active_metadata(&config.data_dir) {
+        return Err(anyhow!("daemon already running at {}", metadata.address));
+    }
+    let metadata_path = metadata_path(&config.data_dir);
+    if metadata_path.exists() {
+        fs::remove_file(&metadata_path)
+            .with_context(|| format!("failed to remove stale {}", metadata_path.display()))?;
+    }
+
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("daemon")
+        .arg("run")
+        .arg("--data-dir")
+        .arg(&config.data_dir)
+        .arg("--host")
+        .arg(&config.host)
+        .arg("--port")
+        .arg(config.port.to_string())
+        .arg("--write-queue-capacity")
+        .arg(config.write_queue_capacity.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+
+    command.spawn().context("failed to spawn egregore daemon")?;
+    wait_until_running(&config.data_dir)
+}
+
+/// Runs the daemon in the current process.
+///
+/// # Errors
+///
+/// Returns an error if the store cannot be opened, the data-dir lease cannot be
+/// acquired, or the HTTP listener fails.
+pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
+    fs::create_dir_all(&config.data_dir)
+        .with_context(|| format!("failed to create {}", config.data_dir.display()))?;
+    let mut lease = StoreLease::acquire(&config.data_dir)?;
+    let sink = EmbeddedAletheiaSink::open(&config.data_dir).with_context(|| {
+        format!(
+            "failed to open embedded store {}",
+            config.data_dir.display()
+        )
+    })?;
+    let listener = TcpListener::bind((config.host.as_str(), config.port))
+        .with_context(|| format!("failed to bind {}:{}", config.host, config.port))?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to configure daemon listener")?;
+    let address = listener
+        .local_addr()
+        .context("failed to read daemon listener address")?
+        .to_string();
+    let token = random_token();
+    let metadata = DaemonMetadata {
+        pid: std::process::id(),
+        address,
+        token: token.clone(),
+        data_dir: config.data_dir.clone(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        started_at_unix_ms: unix_ms(),
+    };
+    write_metadata(&config.data_dir, &metadata)?;
+    lease.write_metadata(&metadata)?;
+
+    let sink = Arc::new(RwLock::new(sink));
+    let (write_tx, write_rx) = mpsc::sync_channel(config.write_queue_capacity);
+    let idempotency_path = runtime_dir(&config.data_dir).join(IDEMPOTENCY_FILE);
+    let idempotency = Arc::new(Mutex::new(IdempotencyStore::load(idempotency_path)?));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(ServerState {
+        token,
+        sink: Arc::clone(&sink),
+        write_tx,
+        jobs: Arc::new(Mutex::new(BTreeMap::new())),
+        agents: Arc::new(Mutex::new(BTreeMap::new())),
+        shutdown: Arc::clone(&shutdown),
+    });
+    let worker = spawn_write_worker(write_rx, sink, idempotency);
+
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let state = Arc::clone(&state);
+                thread::spawn(move || handle_connection(stream, state));
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error).context("daemon listener failed"),
+        }
+    }
+
+    drop(state);
+    let _ = worker.join();
+    let _ = fs::remove_file(metadata_path(&config.data_dir));
+    Ok(())
+}
+
+/// Returns active daemon metadata for a data directory if the daemon responds.
+#[must_use]
+pub fn active_metadata(data_dir: &Path) -> Option<DaemonMetadata> {
+    let metadata = read_metadata(data_dir).ok()?;
+    let client = DaemonClient::new(metadata.clone());
+    client.health().ok()?;
+    Some(metadata)
+}
+
+/// Stops the running daemon for a data directory.
+///
+/// # Errors
+///
+/// Returns an error if metadata is missing or the shutdown request fails.
+pub fn stop(data_dir: &Path) -> Result<()> {
+    let metadata = read_metadata(data_dir)
+        .with_context(|| format!("no daemon metadata found for {}", data_dir.display()))?;
+    let client = DaemonClient::new(metadata);
+    if let Err(error) = client.shutdown() {
+        if active_metadata(data_dir).is_none() {
+            let _ = fs::remove_file(metadata_path(data_dir));
+            return Ok(());
+        }
+        return Err(error);
+    }
+    wait_until_stopped(data_dir)
+}
+
+/// Client for the local Egregore daemon.
+#[derive(Debug, Clone)]
+pub struct DaemonClient {
+    metadata: DaemonMetadata,
+}
+
+impl DaemonClient {
+    /// Creates a client from daemon metadata.
+    #[must_use]
+    pub const fn new(metadata: DaemonMetadata) -> Self {
+        Self { metadata }
+    }
+
+    /// Loads metadata from a data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon metadata cannot be read.
+    pub fn from_data_dir(data_dir: &Path) -> Result<Self> {
+        Ok(Self::new(read_metadata(data_dir)?))
+    }
+
+    /// Sends graph records to the daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon rejects the request or cannot be reached.
+    pub fn ingest_records(
+        &self,
+        records: &[GraphRecord],
+        agent_id: &str,
+        session_id: &str,
+        idempotency_key: &str,
+    ) -> Result<DaemonIngestResponse> {
+        let body = json!({
+            "request_id": request_id("ingest", idempotency_key),
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "idempotency_key": idempotency_key,
+            "domain": "codegraph",
+            "created_at": unix_ms().to_string(),
+            "payload": { "records": records },
+        });
+        let (status, body) = self.request("POST", "/v1/records/ingest", Some(body))?;
+        if status != 200 {
+            return Err(anyhow!("daemon ingest failed with HTTP {status}: {body}"));
+        }
+        serde_json::from_str(&body).context("failed to parse daemon ingest response")
+    }
+
+    /// Checks daemon health.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon does not respond successfully.
+    pub fn health(&self) -> Result<()> {
+        let (status, body) = self.request("GET", "/v1/health", None)?;
+        if status == 200 {
+            Ok(())
+        } else {
+            Err(anyhow!("daemon health failed with HTTP {status}: {body}"))
+        }
+    }
+
+    /// Requests daemon shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon does not accept shutdown.
+    pub fn shutdown(&self) -> Result<()> {
+        let (status, body) = self.request("POST", "/v1/admin/shutdown", None)?;
+        if status == 200 {
+            Ok(())
+        } else {
+            Err(anyhow!("daemon shutdown failed with HTTP {status}: {body}"))
+        }
+    }
+
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<(u16, String)> {
+        let body = body
+            .map(|value| serde_json::to_string(&value))
+            .transpose()?;
+        let body_text = body.as_deref().unwrap_or("");
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_text}",
+            self.metadata.token,
+            body_text.len()
+        );
+        let mut stream = TcpStream::connect(&self.metadata.address)
+            .with_context(|| format!("failed to connect to {}", self.metadata.address))?;
+        stream
+            .write_all(request.as_bytes())
+            .context("failed to write daemon request")?;
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .context("failed to read daemon response")?;
+        parse_http_response(&response)
+    }
+}
+
+fn spawn_write_worker(
+    write_rx: mpsc::Receiver<WriteCommand>,
+    sink: Arc<RwLock<EmbeddedAletheiaSink>>,
+    idempotency: Arc<Mutex<IdempotencyStore>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while let Ok(command) = write_rx.recv() {
+            let result = apply_write(&command, &sink, &idempotency);
+            let _ = command.response_tx.send(result);
+        }
+    })
+}
+
+fn apply_write(
+    command: &WriteCommand,
+    sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
+    idempotency: &Arc<Mutex<IdempotencyStore>>,
+) -> WriteResult {
+    {
+        let store = idempotency
+            .lock()
+            .map_err(|_| ApiError::internal("idempotency store lock poisoned"))?;
+        if let Some(entry) = store.entries.get(&command.idempotency_key) {
+            if entry.payload_hash != command.payload_hash {
+                return Err(ApiError::conflict(
+                    "idempotency key reused with different payload",
+                ));
+            }
+            let mut response = entry.response.clone();
+            response.idempotent = true;
+            return Ok(response);
+        }
+    }
+
+    let record_ids = command
+        .records
+        .iter()
+        .map(|record| record.id().to_owned())
+        .collect::<Vec<_>>();
+    let report = {
+        let mut sink = sink
+            .write()
+            .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
+        let report = ingest_records(&command.records, &mut *sink);
+        if report.succeeded > 0 {
+            sink.persist_indexes()
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
+        report
+    };
+    let response = DaemonIngestResponse::from_report(report, record_ids, false);
+    {
+        let mut store = idempotency
+            .lock()
+            .map_err(|_| ApiError::internal("idempotency store lock poisoned"))?;
+        store.entries.insert(
+            command.idempotency_key.clone(),
+            IdempotencyEntry {
+                payload_hash: command.payload_hash.clone(),
+                response: response.clone(),
+            },
+        );
+        store
+            .persist()
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
+    Ok(response)
+}
+
+fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
+    let response = match read_http_request(&mut stream) {
+        Ok(request) => handle_request(&request, &state),
+        Err(error) => HttpResponse::error(ApiError::bad_request(error.to_string())),
+    };
+    let _ = write_http_response(&mut stream, &response);
+    drop(state);
+}
+
+fn handle_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
+    if !is_authorized(request, &state.token) {
+        return HttpResponse::error(ApiError::unauthorized());
+    }
+
+    match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/v1/health") => HttpResponse::json(
+            200,
+            json!({
+                "status": "ok",
+                "version": env!("CARGO_PKG_VERSION"),
+            }),
+        ),
+        ("GET", "/v1/status") => handle_status(state),
+        ("POST", "/v1/records/ingest") => handle_ingest(request, state),
+        ("POST", "/v1/query") => handle_query(request, state),
+        ("POST", "/v1/agents/register") => handle_agent_register(request, state),
+        ("POST", "/v1/agents/heartbeat") => handle_agent_heartbeat(request, state),
+        ("POST", "/v1/jobs/ingest") => handle_job_ingest(request, state),
+        ("POST", "/v1/admin/checkpoint") => handle_checkpoint(state),
+        ("POST", "/v1/admin/shutdown") => {
+            state.shutdown.store(true, Ordering::SeqCst);
+            HttpResponse::json(200, json!({ "status": "stopping" }))
+        }
+        _ if request.method == "GET" && request.path.starts_with("/v1/records/") => {
+            let record_id = request.path.trim_start_matches("/v1/records/");
+            handle_get_record(record_id, state)
+        }
+        _ if request.method == "GET" && request.path.starts_with("/v1/jobs/") => {
+            handle_get_job(&request.path, state)
+        }
+        _ => HttpResponse::error(ApiError::not_found("unknown daemon endpoint")),
+    }
+}
+
+fn handle_status(state: &ServerState) -> HttpResponse {
+    let jobs = match state.jobs.lock() {
+        Ok(jobs) => jobs.len(),
+        Err(_) => return HttpResponse::error(ApiError::internal("jobs lock poisoned")),
+    };
+    let agents = match state.agents.lock() {
+        Ok(agents) => agents.len(),
+        Err(_) => return HttpResponse::error(ApiError::internal("agents lock poisoned")),
+    };
+    HttpResponse::json(
+        200,
+        json!({
+            "status": "running",
+            "jobs": jobs,
+            "agents": agents,
+        }),
+    )
+}
+
+fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
+    let envelope = match parse_json::<RequestEnvelope>(&request.body) {
+        Ok(envelope) => envelope,
+        Err(error) => return HttpResponse::error(error),
+    };
+    let Some(idempotency_key) = envelope.idempotency_key.clone() else {
+        return HttpResponse::error(ApiError::bad_request("idempotency_key is required"));
+    };
+    if envelope.agent_id.trim().is_empty() || envelope.session_id.trim().is_empty() {
+        return HttpResponse::error(ApiError::bad_request(
+            "agent_id and session_id are required",
+        ));
+    }
+    if envelope.domain.as_deref() != Some("codegraph") {
+        return HttpResponse::error(ApiError::bad_request("domain must be codegraph"));
+    }
+    if envelope.created_at.as_deref().is_none_or(str::is_empty) {
+        return HttpResponse::error(ApiError::bad_request("created_at is required"));
+    }
+    let payload = match serde_json::from_value::<IngestPayload>(envelope.payload) {
+        Ok(payload) => payload,
+        Err(error) => return HttpResponse::error(ApiError::bad_request(error.to_string())),
+    };
+    let response = enqueue_write(
+        state,
+        idempotency_key,
+        payload.records,
+        &envelope.request_id,
+    );
+    match response {
+        Ok(response) => HttpResponse::json(200, json!(response)),
+        Err(error) => HttpResponse::error(error),
+    }
+}
+
+fn handle_get_record(record_id: &str, state: &ServerState) -> HttpResponse {
+    let Ok(sink) = state.sink.read() else {
+        return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
+    };
+    match sink.read_back(record_id) {
+        Ok(record) => HttpResponse::json(200, json!({ "record": record })),
+        Err(error) => HttpResponse::error(ApiError::internal(error.to_string())),
+    }
+}
+
+fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
+    let query = match parse_json::<QueryRequest>(&request.body) {
+        Ok(query) => query,
+        Err(error) => return HttpResponse::error(error),
+    };
+    if query.timeout_ms == Some(0) {
+        return HttpResponse::error(ApiError::new(408, "timeout", "query budget expired"));
+    }
+    let limit = query.limit.unwrap_or(100).min(1000);
+    let Ok(sink) = state.sink.read() else {
+        return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
+    };
+    let mut records = Vec::new();
+    for record_id in query.record_ids.iter().take(limit) {
+        match sink.read_back(record_id) {
+            Ok(Some(record)) => records.push(record),
+            Ok(None) => {}
+            Err(error) => return HttpResponse::error(ApiError::internal(error.to_string())),
+        }
+    }
+    HttpResponse::json(
+        200,
+        json!({
+            "request_id": query.request_id,
+            "agent_id": query.agent_id,
+            "session_id": query.session_id,
+            "domain": query.domain,
+            "records": records,
+            "snapshot": unix_ms().to_string(),
+        }),
+    )
+}
+
+fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResponse {
+    let registration = match parse_json::<AgentRegisterRequest>(&request.body) {
+        Ok(registration) => registration,
+        Err(error) => return HttpResponse::error(error),
+    };
+    let agent_status = AgentStatus {
+        agent_id: registration.agent_id.clone(),
+        session_id: registration.session_id.clone(),
+        agent_kind: registration.agent_kind.clone(),
+        project_scope: registration.project_scope.clone(),
+        last_seen_unix_ms: unix_ms(),
+    };
+    if let Ok(mut agents) = state.agents.lock() {
+        agents.insert(
+            format!("{}:{}", registration.agent_id, registration.session_id),
+            agent_status,
+        );
+    } else {
+        return HttpResponse::error(ApiError::internal("agents lock poisoned"));
+    }
+
+    let records = agent_registration_records(&registration);
+    let idempotency_key = format!(
+        "agent-register:{}:{}",
+        registration.agent_id, registration.session_id
+    );
+    match enqueue_write(state, idempotency_key, records, &registration.request_id) {
+        Ok(response) => HttpResponse::json(
+            200,
+            json!({
+                "status": "registered",
+                "record_ids": response.record_ids,
+                "node_kinds": ["Agent", "AgentSession"],
+            }),
+        ),
+        Err(error) => HttpResponse::error(error),
+    }
+}
+
+fn handle_agent_heartbeat(request: &HttpRequest, state: &ServerState) -> HttpResponse {
+    let heartbeat = match parse_json::<AgentHeartbeatRequest>(&request.body) {
+        Ok(heartbeat) => heartbeat,
+        Err(error) => return HttpResponse::error(error),
+    };
+    let key = format!("{}:{}", heartbeat.agent_id, heartbeat.session_id);
+    let Ok(mut agents) = state.agents.lock() else {
+        return HttpResponse::error(ApiError::internal("agents lock poisoned"));
+    };
+    if let Some(agent) = agents.get_mut(&key) {
+        agent.last_seen_unix_ms = unix_ms();
+    }
+    drop(agents);
+    HttpResponse::json(200, json!({ "status": "ok" }))
+}
+
+fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
+    let envelope = match parse_json::<RequestEnvelope>(&request.body) {
+        Ok(envelope) => envelope,
+        Err(error) => return HttpResponse::error(error),
+    };
+    let Some(idempotency_key) = envelope.idempotency_key.clone() else {
+        return HttpResponse::error(ApiError::bad_request("idempotency_key is required"));
+    };
+    if envelope.agent_id.trim().is_empty() || envelope.session_id.trim().is_empty() {
+        return HttpResponse::error(ApiError::bad_request(
+            "agent_id and session_id are required",
+        ));
+    }
+    if envelope.domain.as_deref() != Some("codegraph") {
+        return HttpResponse::error(ApiError::bad_request("domain must be codegraph"));
+    }
+    if envelope.created_at.as_deref().is_none_or(str::is_empty) {
+        return HttpResponse::error(ApiError::bad_request("created_at is required"));
+    }
+    let payload = match serde_json::from_value::<IngestPayload>(envelope.payload) {
+        Ok(payload) => payload,
+        Err(error) => return HttpResponse::error(ApiError::bad_request(error.to_string())),
+    };
+    let job_id = request_id("job", &format!("{}:{idempotency_key}", envelope.request_id));
+    let job = JobStatus {
+        job_id: job_id.clone(),
+        status: "queued".to_owned(),
+        report: None,
+        events: vec!["queued".to_owned()],
+    };
+    match state.jobs.lock() {
+        Ok(mut jobs) => {
+            jobs.insert(job_id.clone(), job);
+        }
+        Err(_) => return HttpResponse::error(ApiError::internal("jobs lock poisoned")),
+    }
+
+    let state = state.clone();
+    let job_id_for_thread = job_id.clone();
+    thread::spawn(move || {
+        update_job(&state, &job_id_for_thread, "running", "started", None);
+        let response = enqueue_write(
+            &state,
+            idempotency_key,
+            payload.records,
+            &envelope.request_id,
+        );
+        match response {
+            Ok(report) => update_job(
+                &state,
+                &job_id_for_thread,
+                "completed",
+                "completed",
+                Some(report),
+            ),
+            Err(error) => {
+                let report = DaemonIngestResponse {
+                    attempted: 0,
+                    succeeded: 0,
+                    failed: 1,
+                    failures: vec![DaemonIngestFailure {
+                        record_id: job_id_for_thread.clone(),
+                        message: error.message,
+                    }],
+                    record_ids: Vec::new(),
+                    idempotent: false,
+                };
+                update_job(&state, &job_id_for_thread, "failed", "failed", Some(report));
+            }
+        }
+    });
+
+    HttpResponse::json(202, json!({ "job_id": job_id, "status": "queued" }))
+}
+
+fn handle_get_job(path: &str, state: &ServerState) -> HttpResponse {
+    let suffix = path.trim_start_matches("/v1/jobs/");
+    let (job_id, events_only) = suffix
+        .strip_suffix("/events")
+        .map_or((suffix, false), |job_id| (job_id, true));
+    let Ok(jobs) = state.jobs.lock() else {
+        return HttpResponse::error(ApiError::internal("jobs lock poisoned"));
+    };
+    let Some(job) = jobs.get(job_id) else {
+        return HttpResponse::error(ApiError::not_found("job not found"));
+    };
+    let response = if events_only {
+        HttpResponse::json(200, json!({ "job_id": job.job_id, "events": job.events }))
+    } else {
+        HttpResponse::json(200, json!(job))
+    };
+    drop(jobs);
+    response
+}
+
+fn handle_checkpoint(state: &ServerState) -> HttpResponse {
+    let Ok(sink) = state.sink.read() else {
+        return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
+    };
+    match sink.persist_indexes() {
+        Ok(()) => HttpResponse::json(200, json!({ "status": "checkpointed" })),
+        Err(error) => HttpResponse::error(ApiError::internal(error.to_string())),
+    }
+}
+
+fn enqueue_write(
+    state: &ServerState,
+    idempotency_key: String,
+    records: Vec<GraphRecord>,
+    request_id: &str,
+) -> WriteResult {
+    let payload_hash =
+        records_hash(&records).map_err(|error| ApiError::internal(error.to_string()))?;
+    let (response_tx, response_rx) = mpsc::channel();
+    let command = WriteCommand {
+        idempotency_key,
+        payload_hash,
+        records,
+        response_tx,
+    };
+    match state.write_tx.try_send(command) {
+        Ok(()) => response_rx.recv().map_err(|_| {
+            ApiError::internal(format!("write worker dropped request {request_id}"))
+        })?,
+        Err(mpsc::TrySendError::Full(_)) => Err(ApiError::overloaded()),
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err(ApiError::internal("write worker disconnected"))
+        }
+    }
+}
+
+fn update_job(
+    state: &ServerState,
+    job_id: &str,
+    status: &str,
+    event: &str,
+    report: Option<DaemonIngestResponse>,
+) {
+    if let Ok(mut jobs) = state.jobs.lock()
+        && let Some(job) = jobs.get_mut(job_id)
+    {
+        status.clone_into(&mut job.status);
+        job.events.push(event.to_owned());
+        if let Some(report) = report {
+            job.report = Some(report);
+        }
+    }
+}
+
+fn agent_registration_records(registration: &AgentRegisterRequest) -> Vec<GraphRecord> {
+    let agent_node_id = stable_id(&["node", "agent", &registration.agent_id]);
+    let session_node_id = stable_id(&[
+        "node",
+        "agent_session",
+        &registration.agent_id,
+        &registration.session_id,
+    ]);
+    vec![
+        GraphRecord::node(
+            agent_node_id.clone(),
+            NodeKind::Agent,
+            None,
+            None,
+            Some(registration.agent_id.clone()),
+            format!(
+                "Agent {} ({}) scoped to {}",
+                registration.agent_id, registration.agent_kind, registration.project_scope
+            ),
+        ),
+        GraphRecord::node(
+            session_node_id.clone(),
+            NodeKind::AgentSession,
+            None,
+            None,
+            Some(registration.session_id.clone()),
+            format!(
+                "Session {} for agent {}",
+                registration.session_id, registration.agent_id
+            ),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::SessionOf,
+            session_node_id,
+            agent_node_id,
+            Some("explicit".to_owned()),
+            "Agent session belongs to agent".to_owned(),
+        ),
+    ]
+}
+
+fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> std::result::Result<T, ApiError> {
+    serde_json::from_slice(body).map_err(|error| ApiError::bad_request(error.to_string()))
+}
+
+fn is_authorized(request: &HttpRequest, token: &str) -> bool {
+    request
+        .headers
+        .get("authorization")
+        .is_some_and(|header| header == &format!("Bearer {token}"))
+}
+
+fn read_http_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    let header_end = loop {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before headers",
+            ));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.len() > REQUEST_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request too large",
+            ));
+        }
+        if let Some(index) = find_header_end(&buffer) {
+            break index;
+        }
+    };
+
+    let header_text = String::from_utf8(buffer[..header_end].to_vec())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing request line"))?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing method"))?
+        .to_owned();
+    let path = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing path"))?
+        .to_owned();
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+        .collect::<HashMap<_, _>>();
+    let content_length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_default();
+    let body_start = header_end + 4;
+    let mut body = buffer[body_start..].to_vec();
+    while body.len() < content_length {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before body",
+            ));
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length);
+    Ok(HttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
+fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> io::Result<()> {
+    let body = serde_json::to_string(&response.body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let status_text = status_text(response.status);
+    let response_text = format!(
+        "HTTP/1.1 {} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        response.status,
+        body.len()
+    );
+    stream.write_all(response_text.as_bytes())
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+const fn status_text(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        202 => "Accepted",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        _ => "Unknown",
+    }
+}
+
+fn parse_http_response(response: &str) -> Result<(u16, String)> {
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| anyhow!("invalid HTTP response"))?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| anyhow!("missing HTTP status"))?
+        .parse::<u16>()
+        .context("invalid HTTP status")?;
+    Ok((status, body.to_owned()))
+}
+
+fn wait_until_running(data_dir: &Path) -> Result<DaemonMetadata> {
+    let start = Instant::now();
+    loop {
+        if let Some(metadata) = active_metadata(data_dir) {
+            return Ok(metadata);
+        }
+        if start.elapsed() > START_TIMEOUT {
+            return Err(anyhow!("daemon failed to start for {}", data_dir.display()));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_until_stopped(data_dir: &Path) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        if active_metadata(data_dir).is_none() {
+            return Ok(());
+        }
+        if start.elapsed() > START_TIMEOUT {
+            return Err(anyhow!("daemon did not stop for {}", data_dir.display()));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn read_metadata(data_dir: &Path) -> Result<DaemonMetadata> {
+    let path = metadata_path(data_dir);
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn write_metadata(data_dir: &Path, metadata: &DaemonMetadata) -> Result<()> {
+    let path = metadata_path(data_dir);
+    let json = serde_json::to_vec_pretty(metadata)?;
+    atomic_write(&path, &json)
+}
+
+fn metadata_path(data_dir: &Path) -> PathBuf {
+    runtime_dir(data_dir).join(METADATA_FILE)
+}
+
+fn runtime_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(RUNTIME_DIR)
+}
+
+fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&tmp, data).with_context(|| format!("failed to write {}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("failed to rename {} to {}", tmp.display(), path.display()))
+}
+
+fn random_token() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(token, "{byte:02x}");
+    }
+    token
+}
+
+fn records_hash(records: &[GraphRecord]) -> Result<String> {
+    let bytes = serde_json::to_vec(records)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn request_id(prefix: &str, value: &str) -> String {
+    let input = format!("{prefix}:{value}:{}", unix_ms());
+    format!("{prefix}-{}", blake3::hash(input.as_bytes()).to_hex())
+}
+
+fn unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis())
+}
