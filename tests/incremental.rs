@@ -81,6 +81,7 @@ fn incremental_ignores_old_cache_when_extractor_output_schema_changes() {
         "bar".to_owned(),
         "Rust function bar".to_owned(),
     );
+    let stale_symbol_id = stale_symbol.id().to_owned();
     let stale_cache = serde_json::json!({
         "schema_version": 1,
         "files": {
@@ -120,5 +121,15 @@ fn incremental_ignores_old_cache_when_extractor_output_schema_changes() {
             } if name == "bar"
         )),
         "stale unqualified cached symbol must not survive cache schema invalidation"
+    );
+    assert!(
+        scan.graph.records().iter().any(|record| matches!(
+            record,
+            GraphRecord::Tombstone {
+                deleted_id,
+                ..
+            } if deleted_id == &stale_symbol_id
+        )),
+        "invalidated cached symbol IDs must be tombstoned so persisted stores can retire stale records"
     );
 }

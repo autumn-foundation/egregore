@@ -317,6 +317,50 @@ fn embedded_same_process_read_back_uses_latest_temporal_observation() {
 
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
+fn embedded_read_back_breaks_valid_time_ties_by_observed_at() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("temporal-tie-read-back-store");
+    let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+    let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+    let valid_time = "2026-01-01T00:00:00Z";
+    let older = temporal_observed("zzzzzzzz", valid_time, "2026-01-01T00:00:01Z");
+    let later = temporal_observed("aaaaaaaa", valid_time, "2026-01-01T00:00:02Z");
+    let older_file = file_record(&file_id, older.clone());
+    let later_file = file_record(&file_id, later.clone());
+    let older_symbol = symbol_record(&symbol_id, "stable", "older observed symbol", older.clone());
+    let later_symbol = symbol_record(&symbol_id, "stable", "later observed symbol", later.clone());
+    let older_edge = defines_edge(&file_id, &symbol_id, "older observed edge", older);
+    let later_edge = defines_edge(&file_id, &symbol_id, "later observed edge", later);
+    let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+    for record in [
+        &older_file,
+        &older_symbol,
+        &older_edge,
+        &later_file,
+        &later_symbol,
+        &later_edge,
+    ] {
+        sink.write_record(record).expect("record should write");
+    }
+    sink.persist_indexes()
+        .expect("embedded indexes should persist");
+    drop(sink);
+
+    let reopened = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+
+    assert_eq!(
+        reopened.read_back(&symbol_id).expect("node read-back"),
+        Some(later_symbol)
+    );
+    assert_eq!(
+        reopened.read_back(later_edge.id()).expect("edge read-back"),
+        Some(later_edge)
+    );
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
 fn embedded_reopened_sink_appends_temporal_edge_for_persisted_nodes() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("append-after-reopen-store");
@@ -551,12 +595,17 @@ fn defines_edge(
 
 #[cfg(feature = "embedded-aletheiadb")]
 fn temporal(git_commit: &str, valid_time: &str) -> TemporalMetadata {
+    temporal_observed(git_commit, valid_time, valid_time)
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn temporal_observed(git_commit: &str, valid_time: &str, observed_at: &str) -> TemporalMetadata {
     TemporalMetadata {
         git_commit: git_commit.to_owned(),
         git_parent_commits: Vec::new(),
         valid_time: valid_time.to_owned(),
         author_time: Some(valid_time.to_owned()),
-        observed_at: valid_time.to_owned(),
+        observed_at: observed_at.to_owned(),
     }
 }
 
