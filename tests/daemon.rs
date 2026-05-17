@@ -272,6 +272,87 @@ fn daemon_ingest_reads_back_records_and_deduplicates_retries() {
 }
 
 #[test]
+fn daemon_recovers_pending_idempotency_receipt_after_restart() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("graph.jsonl");
+    let mut daemon = start_daemon(&data_dir);
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(fixture_repo())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--idempotency-key")
+        .arg("restart-recovery")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("idempotent: false"));
+
+    daemon.stop();
+
+    let idempotency_path = runtime_dir(&data_dir).join("idempotency.json");
+    let mut idempotency_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&idempotency_path).expect("idempotency file should be readable"),
+    )
+    .expect("idempotency file should parse");
+    let entry = &mut idempotency_json["entries"]["restart-recovery"];
+    let payload_hash = entry["payload_hash"]
+        .as_str()
+        .expect("entry should include payload hash")
+        .to_owned();
+    let record_ids = entry["response"]["record_ids"].clone();
+    *entry = serde_json::json!({
+        "state": "pending",
+        "payload_hash": payload_hash,
+        "record_ids": record_ids,
+    });
+    fs::write(
+        &idempotency_path,
+        serde_json::to_vec_pretty(&idempotency_json).expect("idempotency JSON should serialize"),
+    )
+    .expect("pending idempotency file should write");
+
+    let mut restarted = start_daemon(&data_dir);
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--idempotency-key")
+        .arg("restart-recovery")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("idempotent: true"));
+
+    let recovered_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&idempotency_path).expect("idempotency file should be readable"),
+    )
+    .expect("idempotency file should parse");
+    assert_eq!(
+        recovered_json["entries"]["restart-recovery"]["state"],
+        "committed"
+    );
+
+    restarted.stop();
+}
+
+#[test]
 fn daemon_does_not_commit_when_idempotency_receipt_reservation_fails() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");

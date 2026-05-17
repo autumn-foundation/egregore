@@ -126,9 +126,26 @@ impl DaemonIngestResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct IdempotencyEntry {
-    payload_hash: String,
-    response: DaemonIngestResponse,
+#[serde(tag = "state", rename_all = "snake_case")]
+enum IdempotencyEntry {
+    Pending {
+        payload_hash: String,
+        record_ids: Vec<String>,
+    },
+    Committed {
+        payload_hash: String,
+        response: DaemonIngestResponse,
+    },
+}
+
+impl IdempotencyEntry {
+    fn payload_hash(&self) -> &str {
+        match self {
+            Self::Pending { payload_hash, .. } | Self::Committed { payload_hash, .. } => {
+                payload_hash
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -243,7 +260,7 @@ struct WriteCommand {
     response_tx: mpsc::Sender<WriteResult>,
 }
 
-type WriteResult = std::result::Result<DaemonIngestResponse, ApiError>;
+type WriteResult<T = DaemonIngestResponse> = std::result::Result<T, ApiError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentStatus {
@@ -654,30 +671,55 @@ fn apply_write(
     sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
     idempotency: &Arc<Mutex<IdempotencyStore>>,
 ) -> WriteResult {
-    {
-        let store = idempotency
-            .lock()
-            .map_err(|_| ApiError::internal("idempotency store lock poisoned"))?;
-        if let Some(entry) = store.entries.get(&command.idempotency_key) {
-            if entry.payload_hash != command.payload_hash {
-                return Err(ApiError::conflict(
-                    "idempotency key reused with different payload",
-                ));
-            }
-            let mut response = entry.response.clone();
-            response.idempotent = true;
-            return Ok(response);
-        }
-        store
-            .persist()
-            .map_err(|error| ApiError::internal(error.to_string()))?;
-    }
-
     let record_ids = command
         .records
         .iter()
         .map(|record| record.id().to_owned())
         .collect::<Vec<_>>();
+    let pending_record_ids = {
+        let mut store = idempotency
+            .lock()
+            .map_err(|_| ApiError::internal("idempotency store lock poisoned"))?;
+        if let Some(entry) = store.entries.get(&command.idempotency_key) {
+            if entry.payload_hash() != command.payload_hash {
+                return Err(ApiError::conflict(
+                    "idempotency key reused with different payload",
+                ));
+            }
+            match entry {
+                IdempotencyEntry::Committed { response, .. } => {
+                    let mut response = response.clone();
+                    response.idempotent = true;
+                    return Ok(response);
+                }
+                IdempotencyEntry::Pending { record_ids, .. } => Some(record_ids.clone()),
+            }
+        } else {
+            store.entries.insert(
+                command.idempotency_key.clone(),
+                IdempotencyEntry::Pending {
+                    payload_hash: command.payload_hash.clone(),
+                    record_ids: record_ids.clone(),
+                },
+            );
+            store
+                .persist()
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            None
+        }
+    };
+    if let Some(pending_record_ids) = pending_record_ids
+        && let Some(response) = recover_pending_write(
+            &command.idempotency_key,
+            &command.payload_hash,
+            &pending_record_ids,
+            sink,
+            idempotency,
+        )?
+    {
+        return Ok(response);
+    }
+
     let report = {
         let mut sink = sink
             .write()
@@ -690,14 +732,73 @@ fn apply_write(
         report
     };
     let response = DaemonIngestResponse::from_report(report, record_ids, false);
+    complete_idempotency_entry(
+        &command.idempotency_key,
+        &command.payload_hash,
+        &response,
+        idempotency,
+    )?;
+    Ok(response)
+}
+
+fn recover_pending_write(
+    idempotency_key: &str,
+    payload_hash: &str,
+    record_ids: &[String],
+    sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
+    idempotency: &Arc<Mutex<IdempotencyStore>>,
+) -> WriteResult<Option<DaemonIngestResponse>> {
+    let present = {
+        let sink = sink
+            .read()
+            .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
+        let mut present = 0;
+        for record_id in record_ids {
+            match sink.read_back(record_id) {
+                Ok(Some(_)) => present += 1,
+                Ok(None) => {}
+                Err(error) => return Err(ApiError::internal(error.to_string())),
+            }
+        }
+        present
+    };
+    if present == 0 {
+        return Ok(None);
+    }
+    if present != record_ids.len() {
+        return Err(ApiError::conflict(
+            "idempotency key has a partial committed write; manual repair is required",
+        ));
+    }
+
+    let response = DaemonIngestResponse {
+        attempted: record_ids.len(),
+        succeeded: record_ids.len(),
+        failed: 0,
+        failures: Vec::new(),
+        record_ids: record_ids.to_vec(),
+        idempotent: false,
+    };
+    complete_idempotency_entry(idempotency_key, payload_hash, &response, idempotency)?;
+    let mut response = response;
+    response.idempotent = true;
+    Ok(Some(response))
+}
+
+fn complete_idempotency_entry(
+    idempotency_key: &str,
+    payload_hash: &str,
+    response: &DaemonIngestResponse,
+    idempotency: &Arc<Mutex<IdempotencyStore>>,
+) -> WriteResult<()> {
     {
         let mut store = idempotency
             .lock()
             .map_err(|_| ApiError::internal("idempotency store lock poisoned"))?;
         store.entries.insert(
-            command.idempotency_key.clone(),
-            IdempotencyEntry {
-                payload_hash: command.payload_hash.clone(),
+            idempotency_key.to_owned(),
+            IdempotencyEntry::Committed {
+                payload_hash: payload_hash.to_owned(),
                 response: response.clone(),
             },
         );
@@ -705,7 +806,7 @@ fn apply_write(
             eprintln!("failed to persist idempotency receipt after commit: {error}");
         }
     }
-    Ok(response)
+    Ok(())
 }
 
 fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
