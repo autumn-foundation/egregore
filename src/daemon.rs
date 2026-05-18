@@ -329,6 +329,8 @@ struct JobStatus {
     status: String,
     report: Option<DaemonIngestResponse>,
     events: Vec<String>,
+    #[serde(skip)]
+    payload_hash: String,
 }
 
 #[derive(Debug)]
@@ -1090,6 +1092,8 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         Ok(payload) => payload,
         Err(error) => return HttpResponse::error(ApiError::bad_request(error.to_string())),
     };
+    let idempotency_key =
+        scoped_idempotency_key(&envelope.agent_id, &envelope.session_id, &idempotency_key);
     let response = enqueue_write(
         state,
         idempotency_key,
@@ -1277,16 +1281,29 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         Ok(payload) => payload,
         Err(error) => return HttpResponse::error(ApiError::bad_request(error.to_string())),
     };
-    let job_id = stable_job_id(&envelope.request_id, &idempotency_key);
+    let scoped_idempotency_key =
+        scoped_idempotency_key(&envelope.agent_id, &envelope.session_id, &idempotency_key);
+    let payload_hash = match records_hash(&payload.records) {
+        Ok(hash) => hash,
+        Err(error) => return HttpResponse::error(ApiError::internal(error.to_string())),
+    };
+
+    let job_id = stable_job_id(&scoped_idempotency_key);
     let job = JobStatus {
         job_id: job_id.clone(),
         status: "queued".to_owned(),
         report: None,
         events: vec!["queued".to_owned()],
+        payload_hash: payload_hash.clone(),
     };
     match state.jobs.lock() {
         Ok(mut jobs) => {
             if let Some(job) = jobs.get(&job_id) {
+                if job.payload_hash != payload_hash {
+                    return HttpResponse::error(ApiError::conflict(
+                        "idempotency key reused with different payload",
+                    ));
+                }
                 return HttpResponse::json(
                     202,
                     json!({ "job_id": job.job_id, "status": job.status }),
@@ -1303,7 +1320,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         update_job(&state, &job_id_for_thread, "running", "started", None);
         let response = enqueue_write(
             &state,
-            idempotency_key,
+            scoped_idempotency_key,
             payload.records,
             &envelope.request_id,
         );
@@ -1707,9 +1724,15 @@ fn request_id(prefix: &str, value: &str) -> String {
     format!("{prefix}-{}", blake3::hash(input.as_bytes()).to_hex())
 }
 
-fn stable_job_id(request_id: &str, idempotency_key: &str) -> String {
-    let key = stable_pair_key("job", request_id, idempotency_key);
-    format!("job-{}", blake3::hash(key.as_bytes()).to_hex())
+fn stable_job_id(scoped_idempotency_key: &str) -> String {
+    format!(
+        "job-{}",
+        blake3::hash(scoped_idempotency_key.as_bytes()).to_hex()
+    )
+}
+
+fn scoped_idempotency_key(agent_id: &str, session_id: &str, idempotency_key: &str) -> String {
+    stable_triple_key("idempotency", agent_id, session_id, idempotency_key)
 }
 
 fn stable_pair_key(prefix: &str, left: &str, right: &str) -> String {
@@ -1717,6 +1740,22 @@ fn stable_pair_key(prefix: &str, left: &str, right: &str) -> String {
     let _ = write!(&mut key, "{prefix}:{}:{}:", left.len(), right.len());
     key.push_str(left);
     key.push_str(right);
+    key
+}
+
+fn stable_triple_key(prefix: &str, first: &str, second: &str, third: &str) -> String {
+    let mut key =
+        String::with_capacity(prefix.len() + first.len() + second.len() + third.len() + 48);
+    let _ = write!(
+        &mut key,
+        "{prefix}:{}:{}:{}:",
+        first.len(),
+        second.len(),
+        third.len()
+    );
+    key.push_str(first);
+    key.push_str(second);
+    key.push_str(third);
     key
 }
 

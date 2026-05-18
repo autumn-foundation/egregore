@@ -711,7 +711,8 @@ fn daemon_recovers_pending_idempotency_receipt_after_restart() {
         &fs::read_to_string(&idempotency_path).expect("idempotency file should be readable"),
     )
     .expect("idempotency file should parse");
-    let entry = &mut idempotency_json["entries"]["restart-recovery"];
+    let restart_recovery_key = cli_scoped_idempotency_key("restart-recovery");
+    let entry = &mut idempotency_json["entries"][restart_recovery_key.as_str()];
     let payload_hash = entry["payload_hash"]
         .as_str()
         .expect("entry should include payload hash")
@@ -749,7 +750,7 @@ fn daemon_recovers_pending_idempotency_receipt_after_restart() {
     )
     .expect("idempotency file should parse");
     assert_eq!(
-        recovered_json["entries"]["restart-recovery"]["state"],
+        recovered_json["entries"][restart_recovery_key.as_str()]["state"],
         "committed"
     );
 
@@ -810,7 +811,8 @@ fn daemon_pending_recovery_rejects_same_id_mismatch() {
         &fs::read_to_string(&idempotency_path).expect("idempotency file should be readable"),
     )
     .expect("idempotency file should parse");
-    idempotency_json["entries"]["same-id-second"] = serde_json::json!({
+    let same_id_second_key = cli_scoped_idempotency_key("same-id-second");
+    idempotency_json["entries"][same_id_second_key.as_str()] = serde_json::json!({
         "state": "pending",
         "payload_hash": second_hash,
         "record_ids": ["codegraph:v1:same-id-node"],
@@ -889,11 +891,12 @@ fn daemon_pending_recovery_rejects_stale_same_id_replay() {
             .to_string();
     let runtime_dir = runtime_dir(&data_dir);
     fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let stale_old_key = cli_scoped_idempotency_key("stale-old");
     fs::write(
         runtime_dir.join("idempotency.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "entries": {
-                "stale-old": {
+                stale_old_key: {
                     "state": "pending",
                     "payload_hash": old_hash,
                     "record_ids": ["codegraph:v1:stale-pending-node"],
@@ -995,11 +998,12 @@ fn daemon_pending_recovery_rejects_duplicate_id_batches() {
             .to_string();
     let runtime_dir = runtime_dir(&data_dir);
     fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let duplicate_pending_key = cli_scoped_idempotency_key("duplicate-pending");
     fs::write(
         runtime_dir.join("idempotency.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "entries": {
-                "duplicate-pending": {
+                duplicate_pending_key: {
                     "state": "pending",
                     "payload_hash": payload_hash,
                     "record_ids": [
@@ -1500,7 +1504,9 @@ fn daemon_job_ingest_retry_returns_original_job_handle() {
         .expect("first job response should include id")
         .to_owned();
     thread::sleep(Duration::from_millis(5));
-    let retry_response = http_json(&metadata, "POST", "/v1/jobs/ingest", &request_body);
+    let mut retry_body_value = request_body;
+    retry_body_value["request_id"] = serde_json::json!("retryable-job-fresh-request");
+    let retry_response = http_json(&metadata, "POST", "/v1/jobs/ingest", &retry_body_value);
     assert!(
         retry_response.starts_with("HTTP/1.1 202"),
         "job ingest retry should be accepted, got {retry_response}"
@@ -1514,6 +1520,112 @@ fn daemon_job_ingest_retry_returns_original_job_handle() {
     let job_status = wait_for_job(&metadata, &first_job_id);
     assert_eq!(job_status["status"], "completed");
     assert_eq!(job_status["report"]["failed"], 0);
+
+    daemon.stop();
+}
+
+#[test]
+fn daemon_job_ingest_rejects_same_key_with_different_payload() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let first_record = GraphRecord::node(
+        "codegraph:v1:job-conflict-first".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "job conflict first".to_owned(),
+    );
+    let second_record = GraphRecord::node(
+        "codegraph:v1:job-conflict-second".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "job conflict second".to_owned(),
+    );
+    let first_body = serde_json::json!({
+        "request_id": "conflicting-job",
+        "agent_id": "test-agent",
+        "session_id": "test-session",
+        "idempotency_key": "conflicting-job-ingest",
+        "domain": "codegraph",
+        "created_at": "2026-05-17T00:00:00Z",
+        "payload": { "records": [first_record] }
+    });
+    let second_body = serde_json::json!({
+        "request_id": "conflicting-job",
+        "agent_id": "test-agent",
+        "session_id": "test-session",
+        "idempotency_key": "conflicting-job-ingest",
+        "domain": "codegraph",
+        "created_at": "2026-05-17T00:00:00Z",
+        "payload": { "records": [second_record] }
+    });
+
+    let first_response = http_json(&metadata, "POST", "/v1/jobs/ingest", &first_body);
+    assert!(
+        first_response.starts_with("HTTP/1.1 202"),
+        "first job ingest should be accepted, got {first_response}"
+    );
+    let second_response = http_json(&metadata, "POST", "/v1/jobs/ingest", &second_body);
+    assert!(
+        second_response.starts_with("HTTP/1.1 409"),
+        "same job idempotency key with different payload should conflict, got {second_response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn daemon_ingest_idempotency_keys_are_scoped_by_agent_session() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let shared_key = "shared-scan-key";
+    let first_record = GraphRecord::node(
+        "codegraph:v1:agent-scope-first".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "agent scoped first".to_owned(),
+    );
+    let second_record = GraphRecord::node(
+        "codegraph:v1:agent-scope-second".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "agent scoped second".to_owned(),
+    );
+    for (request_id, agent_id, session_id, record) in [
+        ("agent-scope-1", "agent-a", "session", first_record),
+        ("agent-scope-2", "agent", "a:session", second_record),
+    ] {
+        let response = http_json(
+            &metadata,
+            "POST",
+            "/v1/records/ingest",
+            &serde_json::json!({
+                "request_id": request_id,
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "idempotency_key": shared_key,
+                "domain": "codegraph",
+                "created_at": "2026-05-17T00:00:00Z",
+                "payload": { "records": [record] }
+            }),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "same local idempotency key should be independent per agent session, got {response}"
+        );
+        assert_eq!(response_json(&response)["failed"], 0);
+    }
 
     daemon.stop();
 }
@@ -1776,6 +1888,7 @@ fn write_pending_idempotency(data_dir: &Path, idempotency_key: &str, records: &[
             .to_hex()
             .to_string();
     let record_ids = records.iter().map(GraphRecord::id).collect::<Vec<_>>();
+    let idempotency_key = cli_scoped_idempotency_key(idempotency_key);
     fs::write(
         runtime_dir.join("idempotency.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -1791,6 +1904,25 @@ fn write_pending_idempotency(data_dir: &Path, idempotency_key: &str, records: &[
         .expect("pending idempotency JSON should serialize"),
     )
     .expect("pending idempotency file should write");
+}
+
+fn cli_scoped_idempotency_key(idempotency_key: &str) -> String {
+    scoped_test_idempotency_key("egregore-cli", "egregore-cli", idempotency_key)
+}
+
+fn scoped_test_idempotency_key(agent_id: &str, session_id: &str, idempotency_key: &str) -> String {
+    let mut key = String::new();
+    key.push_str("idempotency:");
+    key.push_str(&agent_id.len().to_string());
+    key.push(':');
+    key.push_str(&session_id.len().to_string());
+    key.push(':');
+    key.push_str(&idempotency_key.len().to_string());
+    key.push(':');
+    key.push_str(agent_id);
+    key.push_str(session_id);
+    key.push_str(idempotency_key);
+    key
 }
 
 fn temporal_node(id: &str, git_commit: &str, valid_time: &str, summary: &str) -> GraphRecord {
