@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 use chrono::{DateTime, Utc};
 
 use crate::{
-    adapters::{AdapterError, AdapterResult, GraphSink},
+    adapters::{AdapterError, AdapterResult, ExpectedRecordState, GraphSink},
     ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan, TemporalMetadata},
 };
 
@@ -182,6 +182,25 @@ impl EmbeddedAletheiaSink {
     /// Returns an error when the embedded store cannot perform read-back.
     pub fn read_back(&self, record_id: &str) -> AdapterResult<Option<GraphRecord>> {
         <Self as GraphSink>::read_back(self, record_id)
+    }
+
+    pub(crate) fn expected_record_state(
+        &self,
+        record: &GraphRecord,
+    ) -> AdapterResult<ExpectedRecordState> {
+        match record {
+            GraphRecord::Node { id, temporal, .. } => {
+                if let Some(temporal) = temporal
+                    && let Some(node_id) =
+                        self.node_lookup.node_for_commit(id, &temporal.git_commit)
+                {
+                    return self.compare_node_record(id, node_id, record);
+                }
+                self.compare_latest_record(record)
+            }
+            GraphRecord::Edge { id, .. } => self.compare_edge_record(id, record),
+            GraphRecord::Tombstone { .. } => self.compare_latest_record(record),
+        }
     }
 
     /// Returns true if the embedded graph contains a Repository -> File -> Symbol path.
@@ -609,6 +628,60 @@ impl EmbeddedAletheiaSink {
             }
         }
         Ok(found.map(|candidate| candidate.storage_id))
+    }
+
+    fn compare_latest_record(&self, record: &GraphRecord) -> AdapterResult<ExpectedRecordState> {
+        match self.read_back(record.id())? {
+            Some(read_back) if read_back == *record => Ok(ExpectedRecordState::Matched),
+            Some(_) => Ok(ExpectedRecordState::Mismatched),
+            None => Ok(ExpectedRecordState::Missing),
+        }
+    }
+
+    fn compare_node_record(
+        &self,
+        record_id: &str,
+        node_id: ::aletheiadb::NodeId,
+        expected: &GraphRecord,
+    ) -> AdapterResult<ExpectedRecordState> {
+        match self.read_node_record(record_id, node_id)? {
+            read_back if read_back == *expected => Ok(ExpectedRecordState::Matched),
+            _ => Ok(ExpectedRecordState::Mismatched),
+        }
+    }
+
+    fn compare_edge_record(
+        &self,
+        record_id: &str,
+        expected: &GraphRecord,
+    ) -> AdapterResult<ExpectedRecordState> {
+        let mut saw_same_id = false;
+        for node_id in self.db.get_all_node_ids() {
+            for edge_id in self.db.get_outgoing_edges(node_id) {
+                let edge = self
+                    .db
+                    .get_edge(edge_id)
+                    .map_err(|error| read_back_error(record_id, error.to_string()))?;
+                if optional_str_property(
+                    record_id,
+                    "codegraph_id",
+                    edge.get_property("codegraph_id"),
+                )?
+                .as_deref()
+                    == Some(record_id)
+                {
+                    saw_same_id = true;
+                    if self.read_edge_record(record_id, edge_id)? == *expected {
+                        return Ok(ExpectedRecordState::Matched);
+                    }
+                }
+            }
+        }
+        if saw_same_id {
+            Ok(ExpectedRecordState::Mismatched)
+        } else {
+            Ok(ExpectedRecordState::Missing)
+        }
     }
 
     fn read_node_record(

@@ -11,7 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aletheia_egregore::ir::{GraphRecord, NodeKind};
+use aletheia_egregore::{
+    daemon::StoreLease,
+    ir::{GraphRecord, NodeKind, TemporalMetadata},
+};
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde::Deserialize;
@@ -219,6 +222,44 @@ fn daemon_status_rejects_wrong_service_health_response() {
     listener_thread
         .join()
         .expect("listener thread should finish");
+}
+
+#[test]
+fn daemon_stop_preserves_unresponsive_metadata_when_store_lease_is_held() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let runtime_dir = runtime_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let _lease = StoreLease::acquire(&data_dir).expect("test should hold store lease");
+    let metadata_path = runtime_dir.join("egregored.json");
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "pid": 999_996,
+            "address": "127.0.0.1:9",
+            "token": "held-lease-token",
+            "data_dir": data_dir,
+            "version": "test",
+            "started_at_unix_ms": 0_u64
+        }))
+        .expect("metadata should serialize"),
+    )
+    .expect("metadata should write");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("daemon")
+        .arg("stop")
+        .arg("--data-dir")
+        .arg(temp.path().join("store"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("store lease is still held"));
+
+    assert!(
+        metadata_path.exists(),
+        "unresponsive owner metadata should not be deleted while the lease is held"
+    );
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
@@ -745,6 +786,56 @@ fn daemon_pending_recovery_rejects_duplicate_id_batches() {
 }
 
 #[test]
+fn daemon_pending_recovery_accepts_temporal_duplicate_ids() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("temporal-duplicates.jsonl");
+    let first = temporal_node(
+        "codegraph:v1:temporal-file",
+        "1111111111111111111111111111111111111111",
+        "2026-05-17T00:00:00Z",
+        "first temporal observation",
+    );
+    let second = temporal_node(
+        "codegraph:v1:temporal-file",
+        "2222222222222222222222222222222222222222",
+        "2026-05-18T00:00:00Z",
+        "second temporal observation",
+    );
+    let records = vec![first, second];
+    write_graph(&graph_path, &records);
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("embedded")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+    write_pending_idempotency(&data_dir, "temporal-pending", &records);
+
+    let mut daemon = start_daemon(&data_dir);
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--idempotency-key")
+        .arg("temporal-pending")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("idempotent: true"));
+
+    daemon.stop();
+}
+
+#[test]
 fn daemon_does_not_commit_when_idempotency_receipt_reservation_fails() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -797,6 +888,62 @@ fn daemon_does_not_commit_when_idempotency_receipt_reservation_fails() {
         read_response.contains("\"record\":null"),
         "record should not commit when receipt reservation fails, got {read_response}"
     );
+
+    daemon.stop();
+}
+
+#[test]
+fn daemon_reports_error_when_committed_receipt_cannot_be_persisted() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("graph.jsonl");
+    let record = GraphRecord::node(
+        "codegraph:v1:blocked-commit-receipt-node".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "blocked committed receipt".to_owned(),
+    );
+    let records = vec![record];
+    write_graph(&graph_path, &records);
+    write_pending_idempotency(&data_dir, "blocked-commit-receipt", &records);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let idempotency_path = runtime_dir(&data_dir).join("idempotency.json");
+    let blocked_tmp_path = idempotency_path.with_extension(format!("tmp.{}", metadata.pid));
+    fs::create_dir(&blocked_tmp_path).expect("idempotency temp path should be blocked");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--idempotency-key")
+        .arg("blocked-commit-receipt")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "daemon ingest failed with HTTP 500",
+        ));
+
+    fs::remove_dir(&blocked_tmp_path).expect("blocked temp path should be removable");
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--idempotency-key")
+        .arg("blocked-commit-receipt")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("idempotent: true"));
 
     daemon.stop();
 }
@@ -1031,6 +1178,59 @@ fn graph_records_json(graph_path: &Path) -> Vec<serde_json::Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("record should parse as JSON"))
         .collect()
+}
+
+fn write_graph(graph_path: &Path, records: &[GraphRecord]) {
+    let jsonl = records
+        .iter()
+        .map(|record| serde_json::to_string(record).expect("record should serialize"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(graph_path, jsonl).expect("graph should write");
+}
+
+fn write_pending_idempotency(data_dir: &Path, idempotency_key: &str, records: &[GraphRecord]) {
+    let runtime_dir = runtime_dir(data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let payload_hash =
+        blake3::hash(&serde_json::to_vec(records).expect("pending records should serialize"))
+            .to_hex()
+            .to_string();
+    let record_ids = records.iter().map(GraphRecord::id).collect::<Vec<_>>();
+    fs::write(
+        runtime_dir.join("idempotency.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "entries": {
+                idempotency_key: {
+                    "state": "pending",
+                    "payload_hash": payload_hash,
+                    "record_ids": record_ids,
+                    "records": records,
+                }
+            }
+        }))
+        .expect("pending idempotency JSON should serialize"),
+    )
+    .expect("pending idempotency file should write");
+}
+
+fn temporal_node(id: &str, git_commit: &str, valid_time: &str, summary: &str) -> GraphRecord {
+    GraphRecord::node(
+        id.to_owned(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("src/lib.rs".to_owned()),
+        summary.to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: git_commit.to_owned(),
+        git_parent_commits: Vec::new(),
+        valid_time: valid_time.to_owned(),
+        author_time: Some(valid_time.to_owned()),
+        observed_at: valid_time.to_owned(),
+    })
 }
 
 fn wait_for_job(metadata: &DaemonMetadata, job_id: &str) -> serde_json::Value {

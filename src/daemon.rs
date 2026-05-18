@@ -1,7 +1,7 @@
 //! Local daemon for shared Egregore store access.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    adapters::{EmbeddedAletheiaSink, IngestReport, ingest_records},
+    adapters::{EmbeddedAletheiaSink, ExpectedRecordState, IngestReport, ingest_records},
     ir::{EdgeLabel, GraphRecord, NodeKind, stable_id},
 };
 
@@ -177,9 +177,17 @@ impl IdempotencyStore {
         Ok(Self { path, entries })
     }
 
-    fn persist(&self) -> Result<()> {
+    fn set_entry_durably(&mut self, key: String, entry: IdempotencyEntry) -> Result<()> {
+        let mut entries = self.entries.clone();
+        entries.insert(key, entry);
+        self.persist_entries(&entries)?;
+        self.entries = entries;
+        Ok(())
+    }
+
+    fn persist_entries(&self, entries: &BTreeMap<String, IdempotencyEntry>) -> Result<()> {
         let file = IdempotencyFile {
-            entries: self.entries.clone(),
+            entries: entries.clone(),
         };
         let json = serde_json::to_vec_pretty(&file)?;
         atomic_write(&self.path, &json)
@@ -243,6 +251,27 @@ impl StoreLease {
 impl Drop for StoreLease {
     fn drop(&mut self) {
         let _ = self.file.unlock();
+    }
+}
+
+fn store_lease_available(data_dir: &Path) -> Result<bool> {
+    let runtime_dir = runtime_dir(data_dir);
+    fs::create_dir_all(&runtime_dir)
+        .with_context(|| format!("failed to create {}", runtime_dir.display()))?;
+    let path = runtime_dir.join(LOCK_FILE);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            Ok(true)
+        }
+        Err(_) => Ok(false),
     }
 }
 
@@ -420,8 +449,20 @@ pub fn start_background(config: &DaemonConfig) -> Result<DaemonMetadata> {
     }
     let metadata_path = metadata_path(&config.data_dir);
     if metadata_path.exists() {
-        fs::remove_file(&metadata_path)
-            .with_context(|| format!("failed to remove stale {}", metadata_path.display()))?;
+        if store_lease_available(&config.data_dir)? {
+            fs::remove_file(&metadata_path)
+                .with_context(|| format!("failed to remove stale {}", metadata_path.display()))?;
+        } else {
+            return Err(anyhow!(
+                "daemon metadata is unresponsive but store lease is still held for {}",
+                config.data_dir.display()
+            ));
+        }
+    } else if !store_lease_available(&config.data_dir)? {
+        return Err(anyhow!(
+            "embedded store lease is still held for {}",
+            config.data_dir.display()
+        ));
     }
 
     let mut command = Command::new(std::env::current_exe()?);
@@ -542,8 +583,14 @@ pub fn stop(data_dir: &Path) -> Result<()> {
     let client = DaemonClient::new(metadata);
     if let Err(error) = client.shutdown() {
         if active_metadata(data_dir).is_none() {
-            let _ = fs::remove_file(metadata_path(data_dir));
-            return Ok(());
+            if store_lease_available(data_dir)? {
+                let _ = fs::remove_file(metadata_path(data_dir));
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "daemon is unresponsive but store lease is still held for {}; refusing to remove metadata: {error}",
+                data_dir.display()
+            ));
         }
         return Err(error);
     }
@@ -722,16 +769,15 @@ fn apply_write(
                 IdempotencyEntry::Pending { records, .. } => Some(records.clone()),
             }
         } else {
-            store.entries.insert(
-                command.idempotency_key.clone(),
-                IdempotencyEntry::Pending {
-                    payload_hash: command.payload_hash.clone(),
-                    record_ids: record_ids.clone(),
-                    records: command.records.clone(),
-                },
-            );
             store
-                .persist()
+                .set_entry_durably(
+                    command.idempotency_key.clone(),
+                    IdempotencyEntry::Pending {
+                        payload_hash: command.payload_hash.clone(),
+                        record_ids: record_ids.clone(),
+                        records: command.records.clone(),
+                    },
+                )
                 .map_err(|error| ApiError::internal(error.to_string()))?;
             None
         }
@@ -776,8 +822,8 @@ fn recover_pending_write(
     sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
     idempotency: &Arc<Mutex<IdempotencyStore>>,
 ) -> WriteResult<Option<DaemonIngestResponse>> {
-    let expected_by_id = expected_records_by_id(records);
-    if expected_by_id.len() != records.len() {
+    let expected_keys = expected_recovery_keys(records);
+    if expected_keys.len() != records.len() {
         return Err(ApiError::conflict(
             "idempotency key has duplicate record IDs in pending recovery; manual repair is required",
         ));
@@ -788,11 +834,11 @@ fn recover_pending_write(
             .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
         let mut matched = 0;
         let mut mismatched = 0;
-        for (record_id, expected_records) in &expected_by_id {
-            match sink.read_back(record_id) {
-                Ok(Some(persisted)) if expected_records.contains(&persisted) => matched += 1,
-                Ok(Some(_)) => mismatched += 1,
-                Ok(None) => {}
+        for record in records {
+            match sink.expected_record_state(record) {
+                Ok(ExpectedRecordState::Matched) => matched += 1,
+                Ok(ExpectedRecordState::Mismatched) => mismatched += 1,
+                Ok(ExpectedRecordState::Missing) => {}
                 Err(error) => return Err(ApiError::internal(error.to_string())),
             }
         }
@@ -807,7 +853,7 @@ fn recover_pending_write(
     if matched == 0 {
         return Ok(None);
     }
-    if matched != expected_by_id.len() {
+    if matched != records.len() {
         return Err(ApiError::conflict(
             "idempotency key has a partial committed write; manual repair is required",
         ));
@@ -830,15 +876,26 @@ fn recover_pending_write(
     Ok(Some(response))
 }
 
-fn expected_records_by_id(records: &[GraphRecord]) -> BTreeMap<String, Vec<GraphRecord>> {
-    let mut expected = BTreeMap::<String, Vec<GraphRecord>>::new();
-    for record in records {
-        expected
-            .entry(record.id().to_owned())
-            .or_default()
-            .push(record.clone());
+fn expected_recovery_keys(records: &[GraphRecord]) -> BTreeSet<String> {
+    records.iter().map(recovery_key).collect()
+}
+
+fn recovery_key(record: &GraphRecord) -> String {
+    match record {
+        GraphRecord::Node {
+            id,
+            temporal: Some(temporal),
+            ..
+        }
+        | GraphRecord::Edge {
+            id,
+            temporal: Some(temporal),
+            ..
+        } => format!("{}\0{}", id, temporal.git_commit),
+        GraphRecord::Node { id, .. }
+        | GraphRecord::Edge { id, .. }
+        | GraphRecord::Tombstone { id, .. } => id.clone(),
     }
-    expected
 }
 
 fn complete_idempotency_entry(
@@ -851,16 +908,15 @@ fn complete_idempotency_entry(
         let mut store = idempotency
             .lock()
             .map_err(|_| ApiError::internal("idempotency store lock poisoned"))?;
-        store.entries.insert(
-            idempotency_key.to_owned(),
-            IdempotencyEntry::Committed {
-                payload_hash: payload_hash.to_owned(),
-                response: response.clone(),
-            },
-        );
-        if let Err(error) = store.persist() {
-            eprintln!("failed to persist idempotency receipt after commit: {error}");
-        }
+        store
+            .set_entry_durably(
+                idempotency_key.to_owned(),
+                IdempotencyEntry::Committed {
+                    payload_hash: payload_hash.to_owned(),
+                    response: response.clone(),
+                },
+            )
+            .map_err(|error| ApiError::internal(error.to_string()))?;
     }
     Ok(())
 }
@@ -1397,7 +1453,8 @@ fn wait_until_running(data_dir: &Path) -> Result<DaemonMetadata> {
 fn wait_until_stopped(data_dir: &Path) -> Result<()> {
     let start = Instant::now();
     loop {
-        if active_metadata(data_dir).is_none() {
+        if active_metadata(data_dir).is_none() && store_lease_available(data_dir)? {
+            let _ = fs::remove_file(metadata_path(data_dir));
             return Ok(());
         }
         if start.elapsed() > START_TIMEOUT {

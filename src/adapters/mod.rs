@@ -13,6 +13,14 @@ pub use aletheiadb::EmbeddedAletheiaSink;
 /// Result type for adapter operations.
 pub type AdapterResult<T> = std::result::Result<T, AdapterError>;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[cfg(feature = "embedded-aletheiadb")]
+pub(crate) enum ExpectedRecordState {
+    Matched,
+    Mismatched,
+    Missing,
+}
+
 /// Adapter-layer errors.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum AdapterError {
