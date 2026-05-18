@@ -246,6 +246,84 @@ fn daemon_status_rejects_wrong_service_health_response() {
 }
 
 #[test]
+fn daemon_ingest_preflights_wrong_service_before_sending_records() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("graph.jsonl");
+    let runtime_dir = runtime_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    write_graph(
+        &graph_path,
+        &[GraphRecord::node(
+            "codegraph:v1:wrong-service-ingest-node".to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("repo".to_owned()),
+            "should not be sent".to_owned(),
+        )],
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral port should bind");
+    let address = listener
+        .local_addr()
+        .expect("ephemeral address should exist")
+        .to_string();
+    let listener_thread = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("health request should arrive");
+        let mut request = [0_u8; 4096];
+        let read = stream
+            .read(&mut request)
+            .expect("health request should read");
+        let request = String::from_utf8_lossy(&request[..read]).to_string();
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        );
+        request
+    });
+    fs::write(
+        runtime_dir.join("egregored.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "pid": 999_994,
+            "address": address,
+            "token": "wrong-service-token",
+            "data_dir": data_dir,
+            "version": "test",
+            "started_at_unix_ms": 0_u64
+        }))
+        .expect("metadata should serialize"),
+    )
+    .expect("wrong-service metadata should write");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(temp.path().join("store"))
+        .arg("--idempotency-key")
+        .arg("wrong-service-ingest")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "daemon health validation failed before ingest",
+        ));
+
+    let request = listener_thread
+        .join()
+        .expect("listener thread should finish");
+    assert!(
+        request.starts_with("GET /v1/health "),
+        "mutating daemon client should preflight health before POST, got {request}"
+    );
+    assert!(
+        !request.contains("wrong-service-token") && !request.contains("record_type"),
+        "health preflight should not send daemon token or graph records, got {request}"
+    );
+}
+
+#[test]
 fn daemon_health_probe_bounds_unroutable_connect() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let client = DaemonClient::new(ClientDaemonMetadata {

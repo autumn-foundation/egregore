@@ -1,6 +1,6 @@
 //! Embedded `AletheiaDB` adapter.
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path, time::Instant};
 
 use chrono::{DateTime, Utc};
 
@@ -184,6 +184,29 @@ impl EmbeddedAletheiaSink {
         <Self as GraphSink>::read_back(self, record_id)
     }
 
+    pub(crate) fn read_back_until(
+        &self,
+        record_id: &str,
+        deadline: Option<Instant>,
+    ) -> AdapterResult<Option<GraphRecord>> {
+        check_read_deadline(record_id, deadline)?;
+        if let Some(node_id) = self.node_lookup.latest_node(record_id) {
+            return self.read_node_record(record_id, node_id).map(Some);
+        }
+        if let Some(node_id) = self.tombstone_ids.get(record_id).copied() {
+            return self.read_tombstone_record(record_id, node_id).map(Some);
+        }
+        if let Some(edge_id) = self.find_edge_id_by_codegraph_id_until(record_id, deadline)? {
+            return self.read_edge_record(record_id, edge_id).map(Some);
+        }
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn node_observation_count_for_test(&self, record_id: &str) -> usize {
+        self.node_lookup.candidate_count(record_id)
+    }
+
     pub(crate) fn expected_record_state(
         &self,
         record: &GraphRecord,
@@ -316,16 +339,7 @@ impl GraphSink for EmbeddedAletheiaSink {
     }
 
     fn read_back(&self, record_id: &str) -> AdapterResult<Option<GraphRecord>> {
-        if let Some(node_id) = self.node_lookup.latest_node(record_id) {
-            return self.read_node_record(record_id, node_id).map(Some);
-        }
-        if let Some(node_id) = self.tombstone_ids.get(record_id).copied() {
-            return self.read_tombstone_record(record_id, node_id).map(Some);
-        }
-        if let Some(edge_id) = self.find_edge_id_by_codegraph_id(record_id)? {
-            return self.read_edge_record(record_id, edge_id).map(Some);
-        }
-        Ok(None)
+        self.read_back_until(record_id, None)
     }
 
     fn verify_record(&self, record: &GraphRecord) -> AdapterResult<()> {
@@ -398,6 +412,9 @@ impl EmbeddedAletheiaSink {
     }
 
     fn write_node(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+        if self.expected_record_state(record)? == ExpectedRecordState::Matched {
+            return Ok(());
+        }
         let GraphRecord::Node {
             id,
             kind,
@@ -460,6 +477,9 @@ impl EmbeddedAletheiaSink {
     }
 
     fn write_tombstone(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+        if self.expected_record_state(record)? == ExpectedRecordState::Matched {
+            return Ok(());
+        }
         let GraphRecord::Tombstone {
             id,
             schema_version,
@@ -596,13 +616,16 @@ impl EmbeddedAletheiaSink {
         self.node_lookup.latest_node(record_id)
     }
 
-    fn find_edge_id_by_codegraph_id(
+    fn find_edge_id_by_codegraph_id_until(
         &self,
         record_id: &str,
+        deadline: Option<Instant>,
     ) -> AdapterResult<Option<::aletheiadb::EdgeId>> {
         let mut found = None;
         for node_id in self.db.get_all_node_ids() {
+            check_read_deadline(record_id, deadline)?;
             for edge_id in self.db.get_outgoing_edges(node_id) {
+                check_read_deadline(record_id, deadline)?;
                 let edge = self
                     .db
                     .get_edge(edge_id)
@@ -831,6 +854,15 @@ fn read_back_error(record_id: &str, message: impl Into<String>) -> AdapterError 
         record_id: record_id.to_owned(),
         message: message.into(),
     }
+}
+
+fn check_read_deadline(record_id: &str, deadline: Option<Instant>) -> AdapterResult<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(AdapterError::TimedOut {
+            record_id: record_id.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn required_str_property(
@@ -1299,6 +1331,48 @@ mod tests {
             .expect("edge target should be readable");
 
         assert_eq!(edge_target, updated_symbol_node_id);
+    }
+
+    #[test]
+    fn identical_non_temporal_node_write_is_noop() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("duplicate-exact-node-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let record = file_record(&file_id, "current file");
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+        sink.write_record(&record)
+            .expect("first write should succeed");
+        sink.write_record(&record)
+            .expect("identical current write should be a no-op");
+
+        assert_eq!(sink.node_lookup.candidate_count(&file_id), 1);
+    }
+
+    #[test]
+    fn read_back_until_honors_expired_deadline_before_edge_scan() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("deadline-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+        let edge = GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id.clone(),
+            symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "current edge".to_owned(),
+        );
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&file_record(&file_id, "file"))
+            .expect("file should write");
+        sink.write_record(&current_symbol_record(&symbol_id, "symbol", 10))
+            .expect("symbol should write");
+        sink.write_record(&edge).expect("edge should write");
+
+        let error = sink
+            .read_back_until("codegraph:v1:missing-edge", Some(Instant::now()))
+            .expect_err("expired deadline should stop the edge scan");
+        assert!(matches!(error, AdapterError::TimedOut { .. }));
     }
 
     fn file_record(id: &str, summary: &str) -> GraphRecord {

@@ -50,6 +50,13 @@ pub enum AdapterError {
         /// Verification failure.
         message: String,
     },
+
+    /// A read-back operation exceeded its caller-supplied budget.
+    #[error("read-back timed out for record {record_id}")]
+    TimedOut {
+        /// Graph record ID.
+        record_id: String,
+    },
 }
 
 /// Destination for graph records.

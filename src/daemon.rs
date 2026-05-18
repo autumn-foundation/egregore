@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    adapters::{EmbeddedAletheiaSink, ExpectedRecordState, IngestReport, ingest_records},
+    adapters::{
+        AdapterError, EmbeddedAletheiaSink, ExpectedRecordState, IngestReport, ingest_records,
+    },
     ir::{EdgeLabel, GraphRecord, NodeKind, stable_id},
 };
 
@@ -628,6 +630,8 @@ impl DaemonClient {
         session_id: &str,
         idempotency_key: &str,
     ) -> Result<DaemonIngestResponse> {
+        self.health()
+            .context("daemon health validation failed before ingest")?;
         let body = json!({
             "request_id": request_id("ingest", idempotency_key),
             "agent_id": agent_id,
@@ -642,6 +646,7 @@ impl DaemonClient {
             "/v1/records/ingest",
             Some(body),
             CLIENT_OPERATION_TIMEOUT,
+            true,
         )?;
         if status != 200 {
             return Err(anyhow!("daemon ingest failed with HTTP {status}: {body}"));
@@ -655,7 +660,7 @@ impl DaemonClient {
     ///
     /// Returns an error if the daemon does not respond successfully.
     pub fn health(&self) -> Result<()> {
-        let (status, body) = self.request("GET", "/v1/health", None, CLIENT_TIMEOUT)?;
+        let (status, body) = self.request("GET", "/v1/health", None, CLIENT_TIMEOUT, false)?;
         if status == 200 {
             let body = serde_json::from_str::<serde_json::Value>(&body)
                 .context("failed to parse daemon health response")?;
@@ -678,7 +683,8 @@ impl DaemonClient {
     ///
     /// Returns an error if the daemon does not accept shutdown.
     pub fn shutdown(&self) -> Result<()> {
-        let (status, body) = self.request("POST", "/v1/admin/shutdown", None, CLIENT_TIMEOUT)?;
+        let (status, body) =
+            self.request("POST", "/v1/admin/shutdown", None, CLIENT_TIMEOUT, true)?;
         if status == 200 {
             Ok(())
         } else {
@@ -692,14 +698,19 @@ impl DaemonClient {
         path: &str,
         body: Option<serde_json::Value>,
         timeout: Duration,
+        include_auth: bool,
     ) -> Result<(u16, String)> {
         let body = body
             .map(|value| serde_json::to_string(&value))
             .transpose()?;
         let body_text = body.as_deref().unwrap_or("");
+        let authorization = if include_auth {
+            format!("Authorization: Bearer {}\r\n", self.metadata.token)
+        } else {
+            String::new()
+        };
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_text}",
-            self.metadata.token,
+            "{method} {path} HTTP/1.1\r\nHost: egregore\r\n{authorization}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_text}",
             body_text.len()
         );
         let address = self
@@ -978,18 +989,20 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
 }
 
 fn handle_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
-    if !is_authorized(request, &state.token) {
-        return HttpResponse::error(ApiError::unauthorized());
-    }
-
-    match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/v1/health") => HttpResponse::json(
+    if request.method == "GET" && request.path == "/v1/health" {
+        return HttpResponse::json(
             200,
             json!({
                 "status": "ok",
                 "version": env!("CARGO_PKG_VERSION"),
             }),
-        ),
+        );
+    }
+    if !is_authorized(request, &state.token) {
+        return HttpResponse::error(ApiError::unauthorized());
+    }
+
+    match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/v1/status") => handle_status(state),
         ("POST", "/v1/records/ingest") => handle_ingest(request, state),
         ("POST", "/v1/query") => handle_query(request, state),
@@ -1086,6 +1099,7 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     if budget == Some(Duration::ZERO) {
         return HttpResponse::error(ApiError::new(408, "timeout", "query budget expired"));
     }
+    let deadline = budget.and_then(|budget| started.checked_add(budget));
     let limit = query.limit.unwrap_or(100).min(1000);
     let mut records = Vec::new();
     for record_id in query.record_ids.iter().take(limit) {
@@ -1097,11 +1111,14 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
                 Ok(sink) => sink,
                 Err(error) => return HttpResponse::error(error),
             };
-            sink.read_back(record_id)
+            sink.read_back_until(record_id, deadline)
         };
         match result {
             Ok(Some(record)) => records.push(record),
             Ok(None) => {}
+            Err(AdapterError::TimedOut { .. }) => {
+                return HttpResponse::error(ApiError::new(408, "timeout", "query budget expired"));
+            }
             Err(error) => return HttpResponse::error(ApiError::internal(error.to_string())),
         }
         if let Err(error) = check_query_budget(started, budget) {
@@ -1688,6 +1705,52 @@ mod tests {
             "query timeout should include waiting for the read lock"
         );
         drop(write_guard);
+        Ok(())
+    }
+
+    #[test]
+    fn cross_key_exact_current_node_replay_does_not_duplicate_observation() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let sink = Arc::new(RwLock::new(
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?,
+        ));
+        let idempotency = Arc::new(Mutex::new(IdempotencyStore {
+            path: temp.path().join("idempotency.json"),
+            entries: BTreeMap::new(),
+        }));
+        let record = GraphRecord::node(
+            "codegraph:v1:cross-key-current-node".to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("repo".to_owned()),
+            "same current node".to_owned(),
+        );
+
+        for idempotency_key in ["first-key", "second-key"] {
+            let (response_tx, response_rx) = mpsc::channel();
+            let command = WriteCommand {
+                idempotency_key: idempotency_key.to_owned(),
+                payload_hash: records_hash(std::slice::from_ref(&record))?,
+                records: vec![record.clone()],
+                response_tx,
+            };
+            let response = apply_write(&command, &sink, &idempotency)
+                .map_err(|error| anyhow!(error.message))?;
+            assert_eq!(response.succeeded, 1);
+            drop(response_rx);
+        }
+
+        {
+            let sink = sink
+                .read()
+                .map_err(|_| anyhow!("embedded sink lock poisoned"))?;
+            assert_eq!(
+                sink.node_observation_count_for_test("codegraph:v1:cross-key-current-node"),
+                1
+            );
+            drop(sink);
+        }
         Ok(())
     }
 }
