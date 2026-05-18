@@ -2,8 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
-/// Current schema version for emitted graph records.
+/// Current schema version for code-graph records.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Schema version for agent-memory records (`Agent`, `AgentSession`, `Observation`, etc.).
+/// Documented in `docs/schema/agent-memory.md`.
+pub const AGENT_MEMORY_SCHEMA_VERSION: u32 = 1;
 
 /// Complete in-memory graph emitted by a scan.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -56,6 +60,28 @@ impl Default for Graph {
     }
 }
 
+/// A typed citation from an agent-memory node to another graph record.
+///
+/// Evidence links are stored both on the source node (for fast read) and as
+/// graph edges (for traversal). Both representations MUST agree at write time;
+/// the daemon write applier is the enforcement point.
+///
+/// Documented in docs/schema/agent-memory.md.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceLink {
+    /// Stable record ID of the cited graph node.
+    pub target_record_id: String,
+    /// Domain of the target record (e.g. `"codegraph"`, `"agent_memory"`).
+    pub target_domain: String,
+    /// Cross-domain edge label (e.g. `"OBSERVES"`, `"MENTIONS_SYMBOL"`).
+    pub relation: String,
+    /// Extraction confidence formatted in `[0.0, 1.0]`.
+    pub confidence: String,
+    /// Git commit SHA anchoring a time-specific citation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub as_of_commit: Option<String>,
+}
+
 /// One JSONL graph record.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "record_type", rename_all = "snake_case")]
@@ -89,6 +115,9 @@ pub enum GraphRecord {
         /// Semantic drift details for drift marker nodes.
         #[serde(skip_serializing_if = "Option::is_none")]
         semantic_drift: Option<Box<SemanticDriftMetadata>>,
+        /// Evidence citations for agent-memory nodes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        evidence_links: Option<Vec<EvidenceLink>>,
         /// Agent-facing summary.
         summary: String,
     },
@@ -165,6 +194,7 @@ impl GraphRecord {
             symbol_kind: None,
             temporal: None,
             semantic_drift: None,
+            evidence_links: None,
             summary,
         }
     }
@@ -191,6 +221,7 @@ impl GraphRecord {
             symbol_kind: None,
             temporal: None,
             semantic_drift: None,
+            evidence_links: None,
             summary,
         }
     }
@@ -216,6 +247,29 @@ impl GraphRecord {
             symbol_kind: Some(symbol_kind.to_owned()),
             temporal: None,
             semantic_drift: None,
+            evidence_links: None,
+            summary,
+        }
+    }
+
+    /// Creates an agent-memory graph edge with the `agent_memory:v1:` ID prefix.
+    #[must_use]
+    pub fn agent_memory_edge(
+        label: EdgeLabel,
+        source: String,
+        target: String,
+        confidence: Option<String>,
+        summary: String,
+    ) -> Self {
+        let id = agent_memory_stable_id(&["edge", label.as_str(), &source, &target]);
+        Self::Edge {
+            id,
+            schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+            label,
+            source,
+            target,
+            confidence,
+            temporal: None,
             summary,
         }
     }
@@ -393,6 +447,29 @@ pub enum EdgeLabel {
     AuthoredBy,
     /// Entity has supporting evidence.
     HasEvidence,
+    // ── Cross-domain edge registry (docs/schema/agent-memory.md) ─────────────
+    /// Agent-memory node observes a code-graph entity.
+    Observes,
+    /// Agent-memory node mentions a specific symbol.
+    MentionsSymbol,
+    /// Agent-memory node cites a file that was touched.
+    TouchedFile,
+    /// Agent-memory node produced a patch artifact.
+    ProducedPatch,
+    /// Agent-memory node is validated by an evidence record.
+    ValidatedBy,
+    /// Agent-memory node describes a failure on a code entity.
+    FailedOn,
+    /// Agent-memory node explains a code change.
+    ExplainsChange,
+    /// Agent-memory node references a task record.
+    ReferencesTask,
+    /// Agent-memory node contradicts another record.
+    Contradicts,
+    /// Agent-memory node supersedes another record.
+    Supersedes,
+    /// Generic weak relationship between any two records.
+    RelatesTo,
 }
 
 impl EdgeLabel {
@@ -413,6 +490,17 @@ impl EdgeLabel {
             Self::SessionOf => "SESSION_OF",
             Self::AuthoredBy => "AUTHORED_BY",
             Self::HasEvidence => "HAS_EVIDENCE",
+            Self::Observes => "OBSERVES",
+            Self::MentionsSymbol => "MENTIONS_SYMBOL",
+            Self::TouchedFile => "TOUCHED_FILE",
+            Self::ProducedPatch => "PRODUCED_PATCH",
+            Self::ValidatedBy => "VALIDATED_BY",
+            Self::FailedOn => "FAILED_ON",
+            Self::ExplainsChange => "EXPLAINS_CHANGE",
+            Self::ReferencesTask => "REFERENCES_TASK",
+            Self::Contradicts => "CONTRADICTS",
+            Self::Supersedes => "SUPERSEDES",
+            Self::RelatesTo => "RELATES_TO",
         }
     }
 }
@@ -430,7 +518,7 @@ pub struct SourceSpan {
     pub end_line: usize,
 }
 
-/// Builds a stable ID from semantic, repo-relative inputs.
+/// Builds a stable code-graph ID from semantic, repo-relative inputs.
 #[must_use]
 pub fn stable_id(parts: &[&str]) -> String {
     let mut hasher = blake3::Hasher::new();
@@ -439,4 +527,22 @@ pub fn stable_id(parts: &[&str]) -> String {
         hasher.update(b"\0");
     }
     format!("codegraph:v{SCHEMA_VERSION}:{}", hasher.finalize().to_hex())
+}
+
+/// Builds a stable agent-memory record ID.
+///
+/// Uses the `agent_memory:v1:` prefix so agent-memory IDs cannot collide with
+/// code-graph `codegraph:v1:` IDs even when the content hashes are identical.
+/// Documented in docs/schema/agent-memory.md.
+#[must_use]
+pub fn agent_memory_stable_id(parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!(
+        "agent_memory:v{AGENT_MEMORY_SCHEMA_VERSION}:{}",
+        hasher.finalize().to_hex()
+    )
 }

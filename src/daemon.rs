@@ -27,7 +27,7 @@ use crate::{
     adapters::{
         AdapterError, EmbeddedAletheiaSink, ExpectedRecordState, IngestReport, ingest_records,
     },
-    ir::{EdgeLabel, GraphRecord, NodeKind, stable_id},
+    ir::{AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, GraphRecord, NodeKind, agent_memory_stable_id},
 };
 
 const RUNTIME_DIR_SUFFIX: &str = ".egregore-runtime";
@@ -355,6 +355,7 @@ enum ErrorCode {
     NotImplemented,
     ShutdownInProgress,
     RedactionRequired,
+    UnresolvedEvidenceTarget,
 }
 
 impl ErrorCode {
@@ -373,6 +374,7 @@ impl ErrorCode {
             Self::NotImplemented => "not_implemented",
             Self::ShutdownInProgress => "shutdown_in_progress",
             Self::RedactionRequired => "redaction_required",
+            Self::UnresolvedEvidenceTarget => "unresolved_evidence_target",
         }
     }
 
@@ -388,7 +390,7 @@ impl ErrorCode {
             Self::InternalError => 500,
             Self::NotImplemented => 501,
             Self::ShutdownInProgress => 503,
-            Self::RedactionRequired => 422,
+            Self::RedactionRequired | Self::UnresolvedEvidenceTarget => 422,
         }
     }
 }
@@ -1007,6 +1009,7 @@ fn apply_write(
     idempotency: &Arc<Mutex<IdempotencyStore>>,
 ) -> WriteResult {
     validate_unique_recovery_keys(&command.records)?;
+    validate_evidence_links(&command.records, sink)?;
     let record_ids = command
         .records
         .iter()
@@ -1142,6 +1145,39 @@ fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {
         return Err(ApiError::conflict(
             "ingest payload has duplicate record IDs that are not idempotently recoverable",
         ));
+    }
+    Ok(())
+}
+
+fn validate_evidence_links(
+    records: &[GraphRecord],
+    sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
+) -> WriteResult<()> {
+    let sink_guard = sink
+        .read()
+        .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
+    for record in records {
+        if let GraphRecord::Node {
+            evidence_links: Some(links),
+            ..
+        } = record
+        {
+            for link in links {
+                match sink_guard.read_back(&link.target_record_id) {
+                    Ok(None) => {
+                        return Err(ApiError::new(
+                            ErrorCode::UnresolvedEvidenceTarget,
+                            format!(
+                                "evidence link target '{}' not found in store",
+                                link.target_record_id
+                            ),
+                        ));
+                    }
+                    Ok(Some(_)) => {}
+                    Err(error) => return Err(ApiError::internal(error.to_string())),
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1931,37 +1967,45 @@ fn update_job(
 }
 
 fn agent_registration_records(registration: &AgentRegisterFull) -> Vec<GraphRecord> {
-    let agent_node_id = stable_id(&["node", "agent", &registration.agent_id]);
-    let session_node_id = stable_id(&[
+    let agent_node_id = agent_memory_stable_id(&["node", "agent", &registration.agent_id]);
+    let session_node_id = agent_memory_stable_id(&[
         "node",
         "agent_session",
         &registration.agent_id,
         &registration.session_id,
     ]);
+    let mut agent_node = GraphRecord::node(
+        agent_node_id.clone(),
+        NodeKind::Agent,
+        None,
+        None,
+        Some(registration.agent_id.clone()),
+        format!(
+            "Agent {} ({}) scoped to {}",
+            registration.agent_id, registration.agent_kind, registration.project_scope
+        ),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut agent_node {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+    }
+    let mut session_node = GraphRecord::node(
+        session_node_id.clone(),
+        NodeKind::AgentSession,
+        None,
+        None,
+        Some(registration.session_id.clone()),
+        format!(
+            "Session {} for agent {}",
+            registration.session_id, registration.agent_id
+        ),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut session_node {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+    }
     vec![
-        GraphRecord::node(
-            agent_node_id.clone(),
-            NodeKind::Agent,
-            None,
-            None,
-            Some(registration.agent_id.clone()),
-            format!(
-                "Agent {} ({}) scoped to {}",
-                registration.agent_id, registration.agent_kind, registration.project_scope
-            ),
-        ),
-        GraphRecord::node(
-            session_node_id.clone(),
-            NodeKind::AgentSession,
-            None,
-            None,
-            Some(registration.session_id.clone()),
-            format!(
-                "Session {} for agent {}",
-                registration.session_id, registration.agent_id
-            ),
-        ),
-        GraphRecord::edge(
+        agent_node,
+        session_node,
+        GraphRecord::agent_memory_edge(
             EdgeLabel::SessionOf,
             session_node_id,
             agent_node_id,

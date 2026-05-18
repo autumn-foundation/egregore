@@ -50,6 +50,8 @@ The maintainer needs schema boundaries, provenance, and deterministic fixtures s
 
 Egregore starts with typed graph domains. Domains share one AletheiaDB store and connect through explicit edge labels.
 
+**Agent-memory schema:** [`docs/schema/agent-memory.md`](../schema/agent-memory.md) is the single source of truth for the agent-memory domain record shapes, provenance fields, `EvidenceLink` type, and cross-domain edge registry.
+
 | Domain | Owns | Examples |
 |--------|------|----------|
 | Code Graph | Source-derived facts | Repository, File, Symbol, Import, Call, Commit, Change, SemanticDrift |

@@ -217,6 +217,12 @@ work should be `--adapter daemon`.
 
 ## Agent Interaction
 
+**Agent-memory schema:** [`docs/schema/agent-memory.md`](../schema/agent-memory.md)
+specifies the record shapes (`Agent`, `AgentSession`, `Observation`, `Decision`,
+`Failure`), required provenance fields, `EvidenceLink` type, and cross-domain
+edge registry that agent writes must conform to. The write applier is the
+enforcement point for `EvidenceLink` target validation.
+
 Agents are not database clients. They are Egregore clients with explicit
 identity and provenance.
 

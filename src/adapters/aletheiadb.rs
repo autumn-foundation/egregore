@@ -592,6 +592,7 @@ impl EmbeddedAletheiaSink {
             temporal,
             semantic_drift,
             summary,
+            ..
         } = record
         else {
             unreachable!("write_node called with non-node record");
@@ -922,6 +923,7 @@ impl EmbeddedAletheiaSink {
             semantic_drift: semantic_drift_from_properties(record_id, |key| {
                 node.get_property(key)
             })?,
+            evidence_links: None,
             summary: required_str_property(record_id, "summary", node.get_property("summary"))?,
         })
     }
