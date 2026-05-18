@@ -847,3 +847,133 @@ fn query_file_returns_nested_symbols_not_directly_defined_by_file() {
     assert_eq!(parsed["kind"], "Symbol");
     assert_eq!(parsed["repo_relative_path"], "src/lib.rs");
 }
+
+// ---------------------------------------------------------------------------
+// Fix A: query drift must resolve target via DRIFTS_FROM edge before fallback
+// ---------------------------------------------------------------------------
+
+/// Fixture where the drift node has a *stale* `target_record_id` that is NOT
+/// present in the slice, but there IS a `DriftsFrom` edge pointing to the
+/// real target symbol.  The resolver must follow the edge.
+fn fixture_graph_with_drift_stale_target_id() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("drift_stale.jsonl");
+
+    let real_target_id = stable_id(&["node", "Symbol", "src/lib.rs", "drifted_fn"]);
+    let drift_id = stable_id(&["node", "SemanticDrift", "stale_target_drift"]);
+
+    let drift_node = GraphRecord::node(
+        drift_id.clone(),
+        NodeKind::SemanticDrift,
+        None, // no path on the drift node itself
+        None,
+        None,
+        "drift with stale target_record_id".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "bbbbbbbb".to_owned(),
+        git_parent_commits: vec![],
+        valid_time: "2026-01-02T00:00:00Z".to_owned(),
+        author_time: None,
+        observed_at: "2026-01-02T00:00:00Z".to_owned(),
+    })
+    .with_semantic_drift(SemanticDriftMetadata {
+        model_id: "test-model-v1".to_owned(),
+        target_record_id: "stale-id-not-in-slice".to_owned(), // stale / missing
+        before_git_commit: "aaaaaaaa".to_owned(),
+        after_git_commit: "bbbbbbbb".to_owned(),
+        before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
+        score: "0.750000".to_owned(),
+    });
+
+    let target_sym = GraphRecord::symbol(
+        real_target_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        span(5, 15),
+        "drifted_fn".to_owned(),
+        "the real target symbol".to_owned(),
+    );
+
+    // DriftsFrom edge: drift → real target (this is the stable contract)
+    let edge = GraphRecord::edge(
+        EdgeLabel::DriftsFrom,
+        drift_id,
+        real_target_id,
+        Some("1.0".to_owned()),
+        "drifts from edge".to_owned(),
+    );
+
+    let mut graph = Graph::new();
+    graph.push(drift_node);
+    graph.push(target_sym);
+    graph.push(edge);
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+
+    (temp, path)
+}
+
+#[test]
+fn query_drift_resolves_target_via_drifts_from_edge_when_target_record_id_is_stale() {
+    let (_temp, graph) = fixture_graph_with_drift_stale_target_id();
+
+    let output = egregore()
+        .args(["query", "drift", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("first line")).expect("valid JSON");
+    assert_eq!(
+        parsed["name"], "drifted_fn",
+        "name must be resolved via DriftsFrom edge"
+    );
+    assert_eq!(
+        parsed["repo_relative_path"], "src/lib.rs",
+        "path must be resolved via DriftsFrom edge"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fix B: missing / empty --data-dir must be an error, not a silent no-match
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_symbol_missing_data_dir_exits_1_with_error() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    // Use a sub-path that is never created — guaranteed not to exist
+    let never_created = temp.path().join("never_created_sub");
+
+    egregore()
+        .args(["query", "symbol", "scan_repository", "--data-dir"])
+        .arg(&never_created)
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_match("error|not found|empty|ingest").unwrap());
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_symbol_empty_data_dir_exits_1_with_error() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let empty_dir = temp.path().join("never_populated");
+    fs::create_dir_all(&empty_dir).expect("create dir");
+
+    egregore()
+        .args(["query", "symbol", "scan_repository", "--data-dir"])
+        .arg(&empty_dir)
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_match("error|not found|empty|ingest").unwrap());
+}

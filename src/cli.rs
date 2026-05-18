@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::{
     adapters::{DryRunSink, ingest_records, records_from_jsonl},
-    ir::{GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan},
+    ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan},
     query, scan_repository, scan_repository_history,
 };
 
@@ -482,6 +482,27 @@ fn load_records_from_jsonl(graph: &Path) -> Result<Vec<GraphRecord>> {
 fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
     #[cfg(feature = "embedded-aletheiadb")]
     {
+        // Reject missing or empty directories before opening — a fresh/nonexistent
+        // directory means the caller made a typo or forgot to run `eg ingest` first.
+        match std::fs::read_dir(data_dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::bail!(
+                    "error: embedded store not found at {} — \
+                     run `eg ingest --adapter embedded --data-dir <path>` first",
+                    data_dir.display()
+                );
+            }
+            Ok(mut entries) => {
+                if entries.next().is_none() {
+                    anyhow::bail!(
+                        "error: embedded store at {} is empty — \
+                         run `eg ingest --adapter embedded --data-dir <path>` first",
+                        data_dir.display()
+                    );
+                }
+            }
+            Err(_) => {}
+        }
         let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
             .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
         sink.read_all_records()
@@ -683,8 +704,13 @@ fn query_drift(records: &[GraphRecord], limit: usize, format: OutputFormat) -> R
             continue;
         };
 
-        let (resolved_path, resolved_name) =
-            resolve_drift_target(records, drift, drift_path.as_deref(), drift_name.as_deref());
+        let (resolved_path, resolved_name) = resolve_drift_target(
+            records,
+            id,
+            drift,
+            drift_path.as_deref(),
+            drift_name.as_deref(),
+        );
 
         let result = DriftResult {
             record_id: id,
@@ -702,15 +728,38 @@ fn query_drift(records: &[GraphRecord], limit: usize, format: OutputFormat) -> R
 
 fn resolve_drift_target<'a>(
     records: &'a [GraphRecord],
+    drift_id: &str,
     drift: &'a SemanticDriftMetadata,
     drift_path: Option<&'a str>,
     drift_name: Option<&'a str>,
 ) -> (Option<&'a str>, Option<&'a str>) {
+    // Follow DriftsFrom edge first (stable contract per CLI docs); fall back to
+    // target_record_id when no edge is present in this slice.
+    let target_id = records
+        .iter()
+        .find_map(|r| {
+            let GraphRecord::Edge {
+                label: EdgeLabel::DriftsFrom,
+                source,
+                target,
+                ..
+            } = r
+            else {
+                return None;
+            };
+            if source == drift_id {
+                Some(target.as_str())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(drift.target_record_id.as_str());
+
     if let Some(GraphRecord::Node {
         repo_relative_path,
         name,
         ..
-    }) = records.iter().find(|r| r.id() == drift.target_record_id)
+    }) = records.iter().find(|r| r.id() == target_id)
     {
         return (repo_relative_path.as_deref(), name.as_deref());
     }
