@@ -1688,7 +1688,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
                 }
                 return HttpResponse::success(
                     &request_id,
-                    202,
+                    200,
                     json!({ "job_id": existing.job_id, "status": existing.status }),
                 );
             }
@@ -1917,12 +1917,6 @@ fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequ
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_default();
-    if content_length > REQUEST_LIMIT {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "request body too large",
-        ));
-    }
     if !headers_authorized(&headers, token) {
         return Ok(HttpRequest {
             method,
@@ -1930,6 +1924,12 @@ fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequ
             headers,
             body: Vec::new(),
         });
+    }
+    if content_length > REQUEST_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request body too large",
+        ));
     }
     let body_start = header_end + 4;
     let mut body = buffer[body_start..].to_vec();

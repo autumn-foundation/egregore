@@ -1360,8 +1360,8 @@ fn daemon_rejects_oversized_unauthorized_body_before_reading_it() {
         "POST /v1/status HTTP/1.1\r\nHost: egregore\r\nContent-Length: 33554433\r\nConnection: close\r\n\r\n",
     );
     assert!(
-        response.starts_with("HTTP/1.1 413"),
-        "oversized unauthorized body should be rejected with 413, got {response}"
+        response.starts_with("HTTP/1.1 401"),
+        "oversized unauthorized body should be rejected with 401 (auth precedes size check), got {response}"
     );
 
     daemon.stop();
@@ -1509,8 +1509,8 @@ fn daemon_job_ingest_retry_returns_original_job_handle() {
     retry_body_value["request_id"] = serde_json::json!("retryable-job-fresh-request");
     let retry_response = http_json(&metadata, "POST", "/v1/jobs/ingest", &retry_body_value);
     assert!(
-        retry_response.starts_with("HTTP/1.1 202"),
-        "job ingest retry should be accepted, got {retry_response}"
+        retry_response.starts_with("HTTP/1.1 200"),
+        "job ingest idempotent replay should return 200, got {retry_response}"
     );
     let retry_body = response_json(&retry_response);
     let retry_job_id = retry_body["result"]["job_id"]
