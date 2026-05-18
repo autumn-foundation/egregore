@@ -517,8 +517,9 @@ impl HttpResponse {
     }
 
     /// Standard success envelope: `{ ok: true, request_id, result }`.
+    /// Pass `None` for endpoints that do not echo a parsed request ID.
     #[allow(clippy::needless_pass_by_value)]
-    fn success(request_id: &str, status: u16, result: serde_json::Value) -> Self {
+    fn success(request_id: Option<&str>, status: u16, result: serde_json::Value) -> Self {
         Self {
             status,
             body: json!({
@@ -1245,7 +1246,7 @@ fn handle_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     // succeed even after the flag is set (idempotent drain behavior).
     if request.method == "POST" && request.path == "/v1/admin/shutdown" {
         state.shutdown.store(true, Ordering::SeqCst);
-        return HttpResponse::success("", 200, json!({ "status": "stopping" }));
+        return HttpResponse::success(None, 200, json!({ "status": "stopping" }));
     }
     if state.shutdown.load(Ordering::SeqCst) {
         return HttpResponse::error(ApiError::shutdown_in_progress());
@@ -1331,7 +1332,11 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         }
         _ => {}
     }
-    match envelope.created_at.as_deref().and_then(|s| non_empty(Some(s))) {
+    match envelope
+        .created_at
+        .as_deref()
+        .and_then(|s| non_empty(Some(s)))
+    {
         None => {
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("created_at"));
         }
@@ -1357,7 +1362,7 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     };
     let scoped_key = scoped_idempotency_key(&agent_id, "records/ingest", &idempotency_key);
     match enqueue_write(state, scoped_key, payload.records, &request_id) {
-        Ok(response) => HttpResponse::success(&request_id, 200, json!(response)),
+        Ok(response) => HttpResponse::success(Some(&request_id), 200, json!(response)),
         Err(error) => HttpResponse::error_with_id(&request_id, error),
     }
 }
@@ -1367,7 +1372,7 @@ fn handle_get_record(record_id: &str, state: &ServerState) -> HttpResponse {
         return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
     };
     match sink.read_back(record_id) {
-        Ok(record) => HttpResponse::success("", 200, json!({ "record": record })),
+        Ok(record) => HttpResponse::success(None, 200, json!({ "record": record })),
         Err(error) => HttpResponse::error(ApiError::internal(error.to_string())),
     }
 }
@@ -1400,10 +1405,16 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         return HttpResponse::error_with_id(&request_id, ApiError::missing_field("payload"));
     };
 
-    let (limit, timeout_ms) = payload.budget.as_ref().map_or(
-        (DEFAULT_QUERY_MAX_RESULTS, None),
-        |b| (b.max_results.unwrap_or(DEFAULT_QUERY_MAX_RESULTS), b.timeout_ms),
-    );
+    let (limit, timeout_ms) =
+        payload
+            .budget
+            .as_ref()
+            .map_or((DEFAULT_QUERY_MAX_RESULTS, None), |b| {
+                (
+                    b.max_results.unwrap_or(DEFAULT_QUERY_MAX_RESULTS),
+                    b.timeout_ms,
+                )
+            });
     let limit = limit.min(DEFAULT_QUERY_MAX_RESULTS);
     let budget = timeout_ms
         .or(Some(DEFAULT_QUERY_TIMEOUT_MS))
@@ -1443,7 +1454,7 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         }
     }
     HttpResponse::success(
-        &request_id,
+        Some(&request_id),
         200,
         json!({
             "agent_id": agent_id,
@@ -1513,10 +1524,7 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
     let agent_kind = match non_empty(registration.agent_kind.as_deref()) {
         Some(kind) => kind.to_owned(),
         None => {
-            return HttpResponse::error_with_id(
-                &request_id,
-                ApiError::missing_field("agent_kind"),
-            );
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("agent_kind"));
         }
     };
     let project_scope = match non_empty(registration.project_scope.as_deref()) {
@@ -1558,7 +1566,7 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
     let idempotency_key = stable_pair_key("agent-register", &reg.agent_id, &reg.session_id);
     match enqueue_write(state, idempotency_key, records, &request_id) {
         Ok(response) => HttpResponse::success(
-            &request_id,
+            Some(&request_id),
             200,
             json!({
                 "status": "registered",
@@ -1602,7 +1610,7 @@ fn handle_agent_heartbeat(request: &HttpRequest, state: &ServerState) -> HttpRes
         agent.last_seen_unix_ms = unix_ms();
     }
     drop(agents);
-    HttpResponse::success(&request_id, 200, json!({ "status": "ok" }))
+    HttpResponse::success(Some(&request_id), 200, json!({ "status": "ok" }))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1642,7 +1650,11 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         }
         _ => {}
     }
-    match envelope.created_at.as_deref().and_then(|s| non_empty(Some(s))) {
+    match envelope
+        .created_at
+        .as_deref()
+        .and_then(|s| non_empty(Some(s)))
+    {
         None => {
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("created_at"));
         }
@@ -1685,7 +1697,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
 
     // Check persisted idempotency first to handle post-restart replays.
     let persisted = match state.idempotency.lock() {
-        Ok(store) => store.entries.get(&scoped_key).map(|e| e.payload_hash().to_owned()),
+        Ok(store) => store.entries.get(&scoped_key).cloned(),
         Err(_) => {
             return HttpResponse::error_with_id(
                 &request_id,
@@ -1693,16 +1705,88 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
             );
         }
     };
-    if let Some(stored_hash) = persisted {
-        if stored_hash != payload_hash {
+    if let Some(entry) = persisted {
+        if entry.payload_hash() != payload_hash {
             return HttpResponse::error_with_id(
                 &request_id,
                 ApiError::conflict("idempotency key reused with different payload"),
             );
         }
-        // Same payload — return the original accepted result regardless of Pending/Committed.
+        // Rehydrate job into state.jobs so GET /v1/jobs/{id} works after restart.
+        match &entry {
+            IdempotencyEntry::Committed { response, .. } => {
+                if let Ok(mut jobs) = state.jobs.lock() {
+                    jobs.entry(job_id.clone()).or_insert_with(|| JobStatus {
+                        job_id: job_id.clone(),
+                        status: "completed".to_owned(),
+                        report: Some(response.clone()),
+                        events: vec![
+                            "queued".to_owned(),
+                            "started".to_owned(),
+                            "completed".to_owned(),
+                        ],
+                        payload_hash: payload_hash.clone(),
+                    });
+                }
+            }
+            IdempotencyEntry::Pending { records, .. } => {
+                if let Ok(mut jobs) = state.jobs.lock() {
+                    jobs.entry(job_id.clone()).or_insert_with(|| JobStatus {
+                        job_id: job_id.clone(),
+                        status: "queued".to_owned(),
+                        report: None,
+                        events: vec!["queued".to_owned()],
+                        payload_hash: payload_hash.clone(),
+                    });
+                }
+                // Recover the uncommitted write in the background.
+                let state_clone = state.clone();
+                let records_clone = records.clone();
+                let job_id_thread = job_id.clone();
+                let scoped_key_thread = scoped_key;
+                let request_id_thread = request_id.clone();
+                thread::spawn(move || {
+                    update_job(&state_clone, &job_id_thread, "running", "started", None);
+                    let response = enqueue_write(
+                        &state_clone,
+                        scoped_key_thread,
+                        records_clone,
+                        &request_id_thread,
+                    );
+                    match response {
+                        Ok(report) => update_job(
+                            &state_clone,
+                            &job_id_thread,
+                            "completed",
+                            "completed",
+                            Some(report),
+                        ),
+                        Err(error) => {
+                            let report = DaemonIngestResponse {
+                                attempted: 0,
+                                succeeded: 0,
+                                failed: 1,
+                                failures: vec![DaemonIngestFailure {
+                                    record_id: job_id_thread.clone(),
+                                    message: error.message,
+                                }],
+                                record_ids: Vec::new(),
+                                idempotent: false,
+                            };
+                            update_job(
+                                &state_clone,
+                                &job_id_thread,
+                                "failed",
+                                "failed",
+                                Some(report),
+                            );
+                        }
+                    }
+                });
+            }
+        }
         return HttpResponse::success(
-            &request_id,
+            Some(&request_id),
             200,
             json!({ "job_id": job_id, "status": "queued" }),
         );
@@ -1719,7 +1803,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
                 }
                 // Return the original accepted status, not the current mutable status.
                 return HttpResponse::success(
-                    &request_id,
+                    Some(&request_id),
                     200,
                     json!({ "job_id": existing.job_id, "status": "queued" }),
                 );
@@ -1766,7 +1850,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
     });
 
     HttpResponse::success(
-        &request_id,
+        Some(&request_id),
         202,
         json!({ "job_id": job_id, "status": "queued" }),
     )
@@ -1789,7 +1873,7 @@ fn handle_get_job(path: &str, state: &ServerState) -> HttpResponse {
         json!(job)
     };
     drop(jobs);
-    HttpResponse::success("", 200, result)
+    HttpResponse::success(None, 200, result)
 }
 
 fn handle_checkpoint(state: &ServerState) -> HttpResponse {
@@ -1797,7 +1881,7 @@ fn handle_checkpoint(state: &ServerState) -> HttpResponse {
         return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
     };
     match sink.persist_indexes() {
-        Ok(()) => HttpResponse::success("", 200, json!({ "status": "checkpointed" })),
+        Ok(()) => HttpResponse::success(None, 200, json!({ "status": "checkpointed" })),
         Err(error) => HttpResponse::error(ApiError::internal(error.to_string())),
     }
 }
@@ -2178,8 +2262,6 @@ fn stable_pair_key(prefix: &str, left: &str, right: &str) -> String {
     key.push_str(right);
     key
 }
-
-
 
 fn unix_ms() -> u128 {
     SystemTime::now()
