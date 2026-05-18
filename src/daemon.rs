@@ -1,11 +1,11 @@
 //! Local daemon for shared Egregore store access.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     fmt::Write as _,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    net::{Shutdown, TcpListener, TcpStream},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -211,10 +211,16 @@ impl StoreLease {
     /// Returns an error if the runtime directory or lock file cannot be opened,
     /// or another process already holds the lease.
     pub fn acquire(data_dir: &Path) -> Result<Self> {
-        let runtime_dir = runtime_dir(data_dir);
-        fs::create_dir_all(&runtime_dir)
-            .with_context(|| format!("failed to create {}", runtime_dir.display()))?;
-        let path = runtime_dir.join(LOCK_FILE);
+        Self::try_acquire(data_dir)?.ok_or_else(|| {
+            anyhow!(
+                "embedded store is already leased for {}",
+                data_dir.display()
+            )
+        })
+    }
+
+    fn try_acquire(data_dir: &Path) -> Result<Option<Self>> {
+        let path = lock_path(data_dir)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -222,13 +228,10 @@ impl StoreLease {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
-        file.try_lock().with_context(|| {
-            format!(
-                "embedded store is already leased for {}",
-                data_dir.display()
-            )
-        })?;
-        Ok(Self { file, path })
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file, path })),
+            Err(_) => Ok(None),
+        }
     }
 
     fn write_metadata(&mut self, metadata: &DaemonMetadata) -> Result<()> {
@@ -254,25 +257,23 @@ impl Drop for StoreLease {
     }
 }
 
-fn store_lease_available(data_dir: &Path) -> Result<bool> {
+fn lock_path(data_dir: &Path) -> Result<PathBuf> {
     let runtime_dir = runtime_dir(data_dir);
     fs::create_dir_all(&runtime_dir)
         .with_context(|| format!("failed to create {}", runtime_dir.display()))?;
-    let path = runtime_dir.join(LOCK_FILE);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    match file.try_lock() {
-        Ok(()) => {
-            let _ = file.unlock();
-            Ok(true)
-        }
-        Err(_) => Ok(false),
+    Ok(runtime_dir.join(LOCK_FILE))
+}
+
+fn remove_metadata_if_store_unleased(data_dir: &Path) -> Result<bool> {
+    let Some(_lease) = StoreLease::try_acquire(data_dir)? else {
+        return Ok(false);
+    };
+    let path = metadata_path(data_dir);
+    if path.exists() {
+        fs::remove_file(&path)
+            .with_context(|| format!("failed to remove stale {}", path.display()))?;
     }
+    Ok(true)
 }
 
 #[derive(Clone)]
@@ -449,16 +450,13 @@ pub fn start_background(config: &DaemonConfig) -> Result<DaemonMetadata> {
     }
     let metadata_path = metadata_path(&config.data_dir);
     if metadata_path.exists() {
-        if store_lease_available(&config.data_dir)? {
-            fs::remove_file(&metadata_path)
-                .with_context(|| format!("failed to remove stale {}", metadata_path.display()))?;
-        } else {
+        if !remove_metadata_if_store_unleased(&config.data_dir)? {
             return Err(anyhow!(
                 "daemon metadata is unresponsive but store lease is still held for {}",
                 config.data_dir.display()
             ));
         }
-    } else if !store_lease_available(&config.data_dir)? {
+    } else if StoreLease::try_acquire(&config.data_dir)?.is_none() {
         return Err(anyhow!(
             "embedded store lease is still held for {}",
             config.data_dir.display()
@@ -583,8 +581,7 @@ pub fn stop(data_dir: &Path) -> Result<()> {
     let client = DaemonClient::new(metadata);
     if let Err(error) = client.shutdown() {
         if active_metadata(data_dir).is_none() {
-            if store_lease_available(data_dir)? {
-                let _ = fs::remove_file(metadata_path(data_dir));
+            if remove_metadata_if_store_unleased(data_dir)? {
                 return Ok(());
             }
             return Err(anyhow!(
@@ -705,7 +702,12 @@ impl DaemonClient {
             self.metadata.token,
             body_text.len()
         );
-        let mut stream = TcpStream::connect(&self.metadata.address)
+        let address = self
+            .metadata
+            .address
+            .parse::<SocketAddr>()
+            .with_context(|| format!("invalid daemon address {}", self.metadata.address))?;
+        let mut stream = TcpStream::connect_timeout(&address, timeout)
             .with_context(|| format!("failed to connect to {}", self.metadata.address))?;
         stream
             .set_read_timeout(Some(timeout))
@@ -745,6 +747,7 @@ fn apply_write(
     sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
     idempotency: &Arc<Mutex<IdempotencyStore>>,
 ) -> WriteResult {
+    validate_unique_recovery_keys(&command.records)?;
     let record_ids = command
         .records
         .iter()
@@ -822,8 +825,7 @@ fn recover_pending_write(
     sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
     idempotency: &Arc<Mutex<IdempotencyStore>>,
 ) -> WriteResult<Option<DaemonIngestResponse>> {
-    let expected_keys = expected_recovery_keys(records);
-    if expected_keys.len() != records.len() {
+    if has_ambiguous_recovery_keys(records) {
         return Err(ApiError::conflict(
             "idempotency key has duplicate record IDs in pending recovery; manual repair is required",
         ));
@@ -876,8 +878,26 @@ fn recover_pending_write(
     Ok(Some(response))
 }
 
-fn expected_recovery_keys(records: &[GraphRecord]) -> BTreeSet<String> {
-    records.iter().map(recovery_key).collect()
+fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {
+    if has_ambiguous_recovery_keys(records) {
+        return Err(ApiError::conflict(
+            "ingest payload has duplicate record IDs that are not idempotently recoverable",
+        ));
+    }
+    Ok(())
+}
+
+fn has_ambiguous_recovery_keys(records: &[GraphRecord]) -> bool {
+    let mut seen = BTreeMap::<String, &GraphRecord>::new();
+    for record in records {
+        let key = recovery_key(record);
+        if let Some(previous) = seen.insert(key, record)
+            && previous != record
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn recovery_key(record: &GraphRecord) -> String {
@@ -886,15 +906,20 @@ fn recovery_key(record: &GraphRecord) -> String {
             id,
             temporal: Some(temporal),
             ..
+        } => format!("node\0{}\0{}", id, temporal.git_commit),
+        GraphRecord::Node { id, .. } | GraphRecord::Tombstone { id, .. } => id.clone(),
+        GraphRecord::Edge { id, temporal, .. } => {
+            let commit = temporal
+                .as_ref()
+                .map_or("", |temporal| temporal.git_commit.as_str());
+            let payload = serde_json::to_vec(record).unwrap_or_default();
+            format!(
+                "edge\0{}\0{}\0{}",
+                id,
+                commit,
+                blake3::hash(&payload).to_hex()
+            )
         }
-        | GraphRecord::Edge {
-            id,
-            temporal: Some(temporal),
-            ..
-        } => format!("{}\0{}", id, temporal.git_commit),
-        GraphRecord::Node { id, .. }
-        | GraphRecord::Edge { id, .. }
-        | GraphRecord::Tombstone { id, .. } => id.clone(),
     }
 }
 
@@ -1030,11 +1055,13 @@ fn handle_get_record(record_id: &str, state: &ServerState) -> HttpResponse {
 }
 
 fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
+    let started = Instant::now();
     let query = match parse_json::<QueryRequest>(&request.body) {
         Ok(query) => query,
         Err(error) => return HttpResponse::error(error),
     };
-    if query.timeout_ms == Some(0) {
+    let budget = query.timeout_ms.map(Duration::from_millis);
+    if budget == Some(Duration::ZERO) {
         return HttpResponse::error(ApiError::new(408, "timeout", "query budget expired"));
     }
     let limit = query.limit.unwrap_or(100).min(1000);
@@ -1043,10 +1070,16 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     };
     let mut records = Vec::new();
     for record_id in query.record_ids.iter().take(limit) {
+        if budget.is_some_and(|budget| started.elapsed() >= budget) {
+            return HttpResponse::error(ApiError::new(408, "timeout", "query budget expired"));
+        }
         match sink.read_back(record_id) {
             Ok(Some(record)) => records.push(record),
             Ok(None) => {}
             Err(error) => return HttpResponse::error(ApiError::internal(error.to_string())),
+        }
+        if budget.is_some_and(|budget| started.elapsed() >= budget) {
+            return HttpResponse::error(ApiError::new(408, "timeout", "query budget expired"));
         }
     }
     HttpResponse::json(
@@ -1453,8 +1486,7 @@ fn wait_until_running(data_dir: &Path) -> Result<DaemonMetadata> {
 fn wait_until_stopped(data_dir: &Path) -> Result<()> {
     let start = Instant::now();
     loop {
-        if active_metadata(data_dir).is_none() && store_lease_available(data_dir)? {
-            let _ = fs::remove_file(metadata_path(data_dir));
+        if active_metadata(data_dir).is_none() && remove_metadata_if_store_unleased(data_dir)? {
             return Ok(());
         }
         if start.elapsed() > START_TIMEOUT {
@@ -1482,6 +1514,7 @@ fn metadata_path(data_dir: &Path) -> PathBuf {
 }
 
 fn runtime_dir(data_dir: &Path) -> PathBuf {
+    let data_dir = store_identity_dir(data_dir);
     data_dir.file_name().map_or_else(
         || data_dir.join(RUNTIME_DIR_SUFFIX),
         |file_name| {
@@ -1490,6 +1523,18 @@ fn runtime_dir(data_dir: &Path) -> PathBuf {
             data_dir.with_file_name(runtime_name)
         },
     )
+}
+
+fn store_identity_dir(data_dir: &Path) -> PathBuf {
+    if let Ok(canonical) = data_dir.canonicalize() {
+        return canonical;
+    }
+    if let (Some(parent), Some(file_name)) = (data_dir.parent(), data_dir.file_name())
+        && let Ok(canonical_parent) = parent.canonicalize()
+    {
+        return canonical_parent.join(file_name);
+    }
+    data_dir.to_path_buf()
 }
 
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {

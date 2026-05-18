@@ -3,7 +3,7 @@
 
 use std::{
     fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
@@ -12,7 +12,7 @@ use std::{
 };
 
 use aletheia_egregore::{
-    daemon::StoreLease,
+    daemon::{DaemonClient, DaemonMetadata as ClientDaemonMetadata, StoreLease},
     ir::{GraphRecord, NodeKind, TemporalMetadata},
 };
 use assert_cmd::Command;
@@ -80,6 +80,27 @@ fn second_daemon_for_same_data_dir_fails() {
         .stderr(predicate::str::contains("daemon already running"));
 
     daemon.stop();
+}
+
+#[test]
+fn store_lease_uses_canonical_data_dir_identity() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let alias_dir = temp.path().join("store-alias");
+    fs::create_dir_all(&data_dir).expect("store dir should be created");
+    if let Err(error) = create_dir_symlink(&data_dir, &alias_dir) {
+        eprintln!(
+            "skipping canonical lease alias assertion because directory symlinks are unavailable: {error}"
+        );
+        return;
+    }
+
+    let _lease = StoreLease::acquire(&data_dir).expect("primary lease should acquire");
+    let alias_attempt = StoreLease::acquire(&alias_dir);
+    assert!(
+        alias_attempt.is_err(),
+        "alias path should contend for the same physical store lease"
+    );
 }
 
 #[test]
@@ -222,6 +243,27 @@ fn daemon_status_rejects_wrong_service_health_response() {
     listener_thread
         .join()
         .expect("listener thread should finish");
+}
+
+#[test]
+fn daemon_health_probe_bounds_unroutable_connect() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let client = DaemonClient::new(ClientDaemonMetadata {
+        pid: 999_995,
+        address: "10.255.255.1:9".to_owned(),
+        token: "blackhole-token".to_owned(),
+        data_dir: temp.path().join("store"),
+        version: "test".to_owned(),
+        started_at_unix_ms: 0,
+    });
+
+    let started = Instant::now();
+    let result = client.health();
+    assert!(result.is_err(), "blackhole probe should fail");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "blackhole probe should be bounded by the daemon client timeout"
+    );
 }
 
 #[test]
@@ -786,6 +828,60 @@ fn daemon_pending_recovery_rejects_duplicate_id_batches() {
 }
 
 #[test]
+fn daemon_rejects_fresh_duplicate_current_record_ids_before_commit() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("duplicate-fresh.jsonl");
+    let first = GraphRecord::node(
+        "codegraph:v1:fresh-duplicate-node".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "first".to_owned(),
+    );
+    let second = GraphRecord::node(
+        "codegraph:v1:fresh-duplicate-node".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "second".to_owned(),
+    );
+    write_graph(&graph_path, &[first, second]);
+    let mut daemon = start_daemon(&data_dir);
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--idempotency-key")
+        .arg("duplicate-fresh")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("duplicate record IDs"));
+
+    let metadata = read_metadata(&data_dir);
+    let read_response = http_request(
+        &metadata.address,
+        &format!(
+            "GET /v1/records/codegraph:v1:fresh-duplicate-node HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    );
+    assert!(
+        read_response.contains("\"record\":null"),
+        "fresh duplicate rejection should happen before committing either record"
+    );
+
+    daemon.stop();
+}
+
+#[test]
 fn daemon_pending_recovery_accepts_temporal_duplicate_ids() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -966,6 +1062,36 @@ fn daemon_rejects_oversized_unauthorized_body_before_reading_it() {
     daemon.stop();
 }
 
+#[test]
+fn daemon_query_honors_positive_timeout_budget() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let record_ids = (0..1000)
+        .map(|index| format!("codegraph:v1:missing-query-record-{index}"))
+        .collect::<Vec<_>>();
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "tiny-budget-query",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "limit": 1000,
+            "timeout_ms": 1,
+            "record_ids": record_ids
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 408"),
+        "positive timeout budget should be enforced, got {response}"
+    );
+
+    daemon.stop();
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn daemon_registers_agents_runs_ingest_jobs_and_queries_records() {
@@ -1141,6 +1267,32 @@ fn runtime_dir(data_dir: &Path) -> PathBuf {
             data_dir.with_file_name(runtime_name)
         },
     )
+}
+
+fn create_dir_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(target, link).or_else(|symlink_error| {
+            let status = ProcessCommand::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(symlink_error)
+            }
+        })
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
 }
 
 fn http_json(
