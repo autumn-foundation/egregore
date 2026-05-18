@@ -751,6 +751,11 @@ fn recover_pending_write(
     idempotency: &Arc<Mutex<IdempotencyStore>>,
 ) -> WriteResult<Option<DaemonIngestResponse>> {
     let expected_by_id = expected_records_by_id(records);
+    if expected_by_id.len() != records.len() {
+        return Err(ApiError::conflict(
+            "idempotency key has duplicate record IDs in pending recovery; manual repair is required",
+        ));
+    }
     let matched = {
         let sink = sink
             .read()
@@ -1270,6 +1275,12 @@ fn read_http_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_default();
+    if content_length > REQUEST_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request body too large",
+        ));
+    }
     let body_start = header_end + 4;
     let mut body = buffer[body_start..].to_vec();
     while body.len() < content_length {

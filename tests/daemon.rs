@@ -130,14 +130,19 @@ fn embedded_cli_ingest_refuses_while_daemon_owns_data_dir() {
     let graph_path = temp.path().join("graph.jsonl");
     let mut daemon = start_daemon(&data_dir);
 
-    Command::cargo_bin("egregore")
-        .expect("binary should run")
-        .arg("scan")
-        .arg(fixture_repo())
-        .arg("--out")
-        .arg(&graph_path)
-        .assert()
-        .success();
+    let record = GraphRecord::node(
+        "codegraph:v1:restart-recovery-node".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "restart recovery".to_owned(),
+    );
+    fs::write(
+        &graph_path,
+        serde_json::to_string(&record).expect("record should serialize") + "\n",
+    )
+    .expect("restart recovery graph should write");
 
     Command::cargo_bin("egregore")
         .expect("binary should run")
@@ -164,14 +169,19 @@ fn embedded_cli_ingest_refuses_when_daemon_lock_exists_without_metadata() {
     let metadata_path = runtime_dir(&data_dir).join("egregored.json");
     let metadata = fs::read_to_string(&metadata_path).expect("metadata should be readable");
     fs::remove_file(&metadata_path).expect("metadata should be removable");
-    Command::cargo_bin("egregore")
-        .expect("binary should run")
-        .arg("scan")
-        .arg(fixture_repo())
-        .arg("--out")
-        .arg(&graph_path)
-        .assert()
-        .success();
+    let record = GraphRecord::node(
+        "codegraph:v1:restart-recovery-node".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "restart recovery".to_owned(),
+    );
+    fs::write(
+        &graph_path,
+        serde_json::to_string(&record).expect("record should serialize") + "\n",
+    )
+    .expect("restart recovery graph should write");
 
     Command::cargo_bin("egregore")
         .expect("binary should run")
@@ -279,14 +289,19 @@ fn daemon_recovers_pending_idempotency_receipt_after_restart() {
     let graph_path = temp.path().join("graph.jsonl");
     let mut daemon = start_daemon(&data_dir);
 
-    Command::cargo_bin("egregore")
-        .expect("binary should run")
-        .arg("scan")
-        .arg(fixture_repo())
-        .arg("--out")
-        .arg(&graph_path)
-        .assert()
-        .success();
+    let record = GraphRecord::node(
+        "codegraph:v1:restart-recovery-node".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "restart recovery".to_owned(),
+    );
+    fs::write(
+        &graph_path,
+        serde_json::to_string(&record).expect("record should serialize") + "\n",
+    )
+    .expect("restart recovery graph should write");
 
     Command::cargo_bin("egregore")
         .expect("binary should run")
@@ -455,6 +470,81 @@ fn daemon_pending_recovery_does_not_skip_same_id_update() {
 }
 
 #[test]
+fn daemon_pending_recovery_rejects_duplicate_id_batches() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("duplicate-id.jsonl");
+    let first = GraphRecord::node(
+        "codegraph:v1:duplicate-pending-node".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "first".to_owned(),
+    );
+    let second = GraphRecord::node(
+        "codegraph:v1:duplicate-pending-node".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "second".to_owned(),
+    );
+    fs::write(
+        &graph_path,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first).expect("first record should serialize"),
+            serde_json::to_string(&second).expect("second record should serialize")
+        ),
+    )
+    .expect("duplicate-id graph should write");
+
+    let records = vec![first, second];
+    let payload_hash =
+        blake3::hash(&serde_json::to_vec(&records).expect("duplicate records should serialize"))
+            .to_hex()
+            .to_string();
+    let runtime_dir = runtime_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    fs::write(
+        runtime_dir.join("idempotency.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "entries": {
+                "duplicate-pending": {
+                    "state": "pending",
+                    "payload_hash": payload_hash,
+                    "record_ids": [
+                        "codegraph:v1:duplicate-pending-node",
+                        "codegraph:v1:duplicate-pending-node"
+                    ],
+                    "records": records,
+                }
+            }
+        }))
+        .expect("idempotency JSON should serialize"),
+    )
+    .expect("pending idempotency file should write");
+
+    let mut daemon = start_daemon(&data_dir);
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--idempotency-key")
+        .arg("duplicate-pending")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("duplicate record IDs"));
+
+    daemon.stop();
+}
+
+#[test]
 fn daemon_does_not_commit_when_idempotency_receipt_reservation_fails() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -506,6 +596,24 @@ fn daemon_does_not_commit_when_idempotency_receipt_reservation_fails() {
     assert!(
         read_response.contains("\"record\":null"),
         "record should not commit when receipt reservation fails, got {read_response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn daemon_rejects_oversized_unauthorized_body_before_reading_it() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let response = http_request(
+        &metadata.address,
+        "POST /v1/status HTTP/1.1\r\nHost: egregore\r\nContent-Length: 33554433\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "oversized unauthorized body should be rejected before auth, got {response}"
     );
 
     daemon.stop();
