@@ -1360,8 +1360,8 @@ fn daemon_rejects_oversized_unauthorized_body_before_reading_it() {
         "POST /v1/status HTTP/1.1\r\nHost: egregore\r\nContent-Length: 33554433\r\nConnection: close\r\n\r\n",
     );
     assert!(
-        response.starts_with("HTTP/1.1 400"),
-        "oversized unauthorized body should be rejected before auth, got {response}"
+        response.starts_with("HTTP/1.1 413"),
+        "oversized unauthorized body should be rejected with 413, got {response}"
     );
 
     daemon.stop();
@@ -1909,20 +1909,28 @@ fn write_pending_idempotency(data_dir: &Path, idempotency_key: &str, records: &[
 }
 
 fn cli_scoped_idempotency_key(idempotency_key: &str) -> String {
-    scoped_test_idempotency_key("egregore-cli", "egregore-cli", idempotency_key)
+    scoped_test_idempotency_key("egregore-cli", "egregore-cli", "records/ingest", idempotency_key)
 }
 
-fn scoped_test_idempotency_key(agent_id: &str, session_id: &str, idempotency_key: &str) -> String {
+fn scoped_test_idempotency_key(
+    agent_id: &str,
+    session_id: &str,
+    route: &str,
+    idempotency_key: &str,
+) -> String {
     let mut key = String::new();
     key.push_str("idempotency:");
     key.push_str(&agent_id.len().to_string());
     key.push(':');
     key.push_str(&session_id.len().to_string());
     key.push(':');
+    key.push_str(&route.len().to_string());
+    key.push(':');
     key.push_str(&idempotency_key.len().to_string());
     key.push(':');
     key.push_str(agent_id);
     key.push_str(session_id);
+    key.push_str(route);
     key.push_str(idempotency_key);
     key
 }

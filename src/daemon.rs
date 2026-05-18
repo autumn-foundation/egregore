@@ -446,6 +446,13 @@ impl ApiError {
         Self::new(ErrorCode::IdempotencyConflict, message)
     }
 
+    fn payload_too_large() -> Self {
+        Self::new(
+            ErrorCode::PayloadTooLarge,
+            "request body exceeds maximum size",
+        )
+    }
+
     fn overloaded() -> Self {
         Self {
             status: 429,
@@ -1191,6 +1198,9 @@ fn complete_idempotency_entry(
 fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
     let response = match read_http_request(&mut stream, &state.token) {
         Ok(request) => handle_request(&request, &state),
+        Err(error) if error.to_string() == "request body too large" => {
+            HttpResponse::error(ApiError::payload_too_large())
+        }
         Err(error) => HttpResponse::error(ApiError::bad_request(error.to_string())),
     };
     let _ = write_http_response(&mut stream, &response);
@@ -1212,6 +1222,12 @@ fn handle_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     if !is_authorized(request, &state.token) {
         return HttpResponse::error(ApiError::unauthorized());
     }
+    // Shutdown is handled before the gate so concurrent/retried stop calls
+    // succeed even after the flag is set (idempotent drain behavior).
+    if request.method == "POST" && request.path == "/v1/admin/shutdown" {
+        state.shutdown.store(true, Ordering::SeqCst);
+        return HttpResponse::success("", 200, json!({ "status": "stopping" }));
+    }
     if state.shutdown.load(Ordering::SeqCst) {
         return HttpResponse::error(ApiError::shutdown_in_progress());
     }
@@ -1224,10 +1240,6 @@ fn handle_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         ("POST", "/v1/agents/heartbeat") => handle_agent_heartbeat(request, state),
         ("POST", "/v1/jobs/ingest") => handle_job_ingest(request, state),
         ("POST", "/v1/admin/checkpoint") => handle_checkpoint(state),
-        ("POST", "/v1/admin/shutdown") => {
-            state.shutdown.store(true, Ordering::SeqCst);
-            HttpResponse::success("", 200, json!({ "status": "stopping" }))
-        }
         _ if request.method == "GET" && request.path.starts_with("/v1/records/") => {
             let record_id = request.path.trim_start_matches("/v1/records/");
             handle_get_record(record_id, state)
@@ -1318,7 +1330,7 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             );
         }
     };
-    let scoped_key = scoped_idempotency_key(&agent_id, &session_id, &idempotency_key);
+    let scoped_key = scoped_idempotency_key(&agent_id, &session_id, "records/ingest", &idempotency_key);
     match enqueue_write(state, scoped_key, payload.records, &request_id) {
         Ok(response) => HttpResponse::success(&request_id, 200, json!(response)),
         Err(error) => HttpResponse::error_with_id(&request_id, error),
@@ -1620,7 +1632,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
             );
         }
     };
-    let scoped_key = scoped_idempotency_key(&agent_id, &session_id, &idempotency_key);
+    let scoped_key = scoped_idempotency_key(&agent_id, &session_id, "jobs/ingest", &idempotency_key);
     let payload_hash = match records_hash(&payload.records) {
         Ok(hash) => hash,
         Err(error) => {
@@ -2078,8 +2090,27 @@ fn stable_job_id(scoped_idempotency_key: &str) -> String {
     )
 }
 
-fn scoped_idempotency_key(agent_id: &str, session_id: &str, idempotency_key: &str) -> String {
-    stable_triple_key("idempotency", agent_id, session_id, idempotency_key)
+fn scoped_idempotency_key(agent_id: &str, session_id: &str, route: &str, idempotency_key: &str) -> String {
+    stable_quad_key("idempotency", agent_id, session_id, route, idempotency_key)
+}
+
+fn stable_quad_key(prefix: &str, first: &str, second: &str, third: &str, fourth: &str) -> String {
+    let mut key = String::with_capacity(
+        prefix.len() + first.len() + second.len() + third.len() + fourth.len() + 64,
+    );
+    let _ = write!(
+        &mut key,
+        "{prefix}:{}:{}:{}:{}:",
+        first.len(),
+        second.len(),
+        third.len(),
+        fourth.len()
+    );
+    key.push_str(first);
+    key.push_str(second);
+    key.push_str(third);
+    key.push_str(fourth);
+    key
 }
 
 fn stable_pair_key(prefix: &str, left: &str, right: &str) -> String {
@@ -2090,21 +2121,7 @@ fn stable_pair_key(prefix: &str, left: &str, right: &str) -> String {
     key
 }
 
-fn stable_triple_key(prefix: &str, first: &str, second: &str, third: &str) -> String {
-    let mut key =
-        String::with_capacity(prefix.len() + first.len() + second.len() + third.len() + 48);
-    let _ = write!(
-        &mut key,
-        "{prefix}:{}:{}:{}:",
-        first.len(),
-        second.len(),
-        third.len()
-    );
-    key.push_str(first);
-    key.push_str(second);
-    key.push_str(third);
-    key
-}
+
 
 fn unix_ms() -> u128 {
     SystemTime::now()
