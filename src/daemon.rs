@@ -650,6 +650,8 @@ struct QueryRequest {
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
     payload: Option<QueryPayload>,
 }
 
@@ -1389,6 +1391,9 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     if non_empty(query.session_id.as_deref()).is_none() {
         return HttpResponse::error_with_id(&request_id, ApiError::missing_field("session_id"));
     }
+    if non_empty(query.domain.as_deref()).is_some_and(|d| d != "codegraph") {
+        return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
+    }
     let agent_id = query.agent_id;
     let session_id = query.session_id;
     let Some(payload) = query.payload else {
@@ -1677,6 +1682,40 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         events: vec!["queued".to_owned()],
         payload_hash: payload_hash.clone(),
     };
+
+    // Check persisted idempotency first to handle post-restart replays.
+    let persisted = match state.idempotency.lock() {
+        Ok(store) => store.entries.get(&scoped_key).map(|e| {
+            (
+                e.payload_hash().to_owned(),
+                matches!(e, IdempotencyEntry::Committed { .. }),
+            )
+        }),
+        Err(_) => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::internal("idempotency lock poisoned"),
+            );
+        }
+    };
+    if let Some((stored_hash, is_committed)) = persisted {
+        if stored_hash != payload_hash {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::conflict("idempotency key reused with different payload"),
+            );
+        }
+        if is_committed {
+            // Original accepted result was {"job_id": ..., "status": "queued"}.
+            return HttpResponse::success(
+                &request_id,
+                200,
+                json!({ "job_id": job_id, "status": "queued" }),
+            );
+        }
+        // Pending: background worker didn't survive the restart — fall through to re-queue.
+    }
+
     match state.jobs.lock() {
         Ok(mut jobs) => {
             if let Some(existing) = jobs.get(&job_id) {
@@ -1686,10 +1725,11 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
                         ApiError::conflict("idempotency key reused with different payload"),
                     );
                 }
+                // Return the original accepted status, not the current mutable status.
                 return HttpResponse::success(
                     &request_id,
                     200,
-                    json!({ "job_id": existing.job_id, "status": existing.status }),
+                    json!({ "job_id": existing.job_id, "status": "queued" }),
                 );
             }
             jobs.insert(job_id.clone(), job);
