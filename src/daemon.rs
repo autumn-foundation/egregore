@@ -1685,12 +1685,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
 
     // Check persisted idempotency first to handle post-restart replays.
     let persisted = match state.idempotency.lock() {
-        Ok(store) => store.entries.get(&scoped_key).map(|e| {
-            (
-                e.payload_hash().to_owned(),
-                matches!(e, IdempotencyEntry::Committed { .. }),
-            )
-        }),
+        Ok(store) => store.entries.get(&scoped_key).map(|e| e.payload_hash().to_owned()),
         Err(_) => {
             return HttpResponse::error_with_id(
                 &request_id,
@@ -1698,22 +1693,19 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
             );
         }
     };
-    if let Some((stored_hash, is_committed)) = persisted {
+    if let Some(stored_hash) = persisted {
         if stored_hash != payload_hash {
             return HttpResponse::error_with_id(
                 &request_id,
                 ApiError::conflict("idempotency key reused with different payload"),
             );
         }
-        if is_committed {
-            // Original accepted result was {"job_id": ..., "status": "queued"}.
-            return HttpResponse::success(
-                &request_id,
-                200,
-                json!({ "job_id": job_id, "status": "queued" }),
-            );
-        }
-        // Pending: background worker didn't survive the restart — fall through to re-queue.
+        // Same payload — return the original accepted result regardless of Pending/Committed.
+        return HttpResponse::success(
+            &request_id,
+            200,
+            json!({ "job_id": job_id, "status": "queued" }),
+        );
     }
 
     match state.jobs.lock() {
