@@ -35,6 +35,7 @@ const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 37_383;
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
+const CLIENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_LIMIT: usize = 1024 * 1024 * 32;
 
 /// Configuration for launching the daemon.
@@ -592,7 +593,12 @@ impl DaemonClient {
             "created_at": unix_ms().to_string(),
             "payload": { "records": records },
         });
-        let (status, body) = self.request("POST", "/v1/records/ingest", Some(body))?;
+        let (status, body) = self.request(
+            "POST",
+            "/v1/records/ingest",
+            Some(body),
+            CLIENT_OPERATION_TIMEOUT,
+        )?;
         if status != 200 {
             return Err(anyhow!("daemon ingest failed with HTTP {status}: {body}"));
         }
@@ -605,9 +611,18 @@ impl DaemonClient {
     ///
     /// Returns an error if the daemon does not respond successfully.
     pub fn health(&self) -> Result<()> {
-        let (status, body) = self.request("GET", "/v1/health", None)?;
+        let (status, body) = self.request("GET", "/v1/health", None, CLIENT_TIMEOUT)?;
         if status == 200 {
-            Ok(())
+            let body = serde_json::from_str::<serde_json::Value>(&body)
+                .context("failed to parse daemon health response")?;
+            if body.get("status").and_then(serde_json::Value::as_str) == Some("ok")
+                && body.get("version").and_then(serde_json::Value::as_str)
+                    == Some(env!("CARGO_PKG_VERSION"))
+            {
+                Ok(())
+            } else {
+                Err(anyhow!("daemon health response did not match egregore"))
+            }
         } else {
             Err(anyhow!("daemon health failed with HTTP {status}: {body}"))
         }
@@ -619,7 +634,7 @@ impl DaemonClient {
     ///
     /// Returns an error if the daemon does not accept shutdown.
     pub fn shutdown(&self) -> Result<()> {
-        let (status, body) = self.request("POST", "/v1/admin/shutdown", None)?;
+        let (status, body) = self.request("POST", "/v1/admin/shutdown", None, CLIENT_TIMEOUT)?;
         if status == 200 {
             Ok(())
         } else {
@@ -632,6 +647,7 @@ impl DaemonClient {
         method: &str,
         path: &str,
         body: Option<serde_json::Value>,
+        timeout: Duration,
     ) -> Result<(u16, String)> {
         let body = body
             .map(|value| serde_json::to_string(&value))
@@ -645,10 +661,10 @@ impl DaemonClient {
         let mut stream = TcpStream::connect(&self.metadata.address)
             .with_context(|| format!("failed to connect to {}", self.metadata.address))?;
         stream
-            .set_read_timeout(Some(CLIENT_TIMEOUT))
+            .set_read_timeout(Some(timeout))
             .context("failed to set daemon read timeout")?;
         stream
-            .set_write_timeout(Some(CLIENT_TIMEOUT))
+            .set_write_timeout(Some(timeout))
             .context("failed to set daemon write timeout")?;
         stream
             .write_all(request.as_bytes())

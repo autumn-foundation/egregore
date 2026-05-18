@@ -172,6 +172,55 @@ fn daemon_status_times_out_stalled_stale_metadata() {
         .expect("listener thread should finish");
 }
 
+#[test]
+fn daemon_status_rejects_wrong_service_health_response() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let runtime_dir = runtime_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral port should bind");
+    let address = listener
+        .local_addr()
+        .expect("ephemeral address should exist")
+        .to_string();
+    let listener_thread = thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request);
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        );
+    });
+    fs::write(
+        runtime_dir.join("egregored.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "pid": 999_997,
+            "address": address,
+            "token": "wrong-service-token",
+            "data_dir": data_dir,
+            "version": "test",
+            "started_at_unix_ms": 0_u64
+        }))
+        .expect("metadata should serialize"),
+    )
+    .expect("wrong-service metadata should write");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("daemon")
+        .arg("status")
+        .arg("--data-dir")
+        .arg(temp.path().join("store"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("daemon not running"));
+    listener_thread
+        .join()
+        .expect("listener thread should finish");
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn embedded_cli_ingest_refuses_while_daemon_owns_data_dir() {
