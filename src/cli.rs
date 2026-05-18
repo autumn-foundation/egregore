@@ -16,6 +16,8 @@ use crate::{
 
 #[cfg(feature = "embedded-aletheiadb")]
 use crate::adapters::EmbeddedAletheiaSink;
+#[cfg(feature = "embedded-aletheiadb")]
+use crate::daemon::{DaemonClient, DaemonConfig};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -60,6 +62,22 @@ enum Commands {
         /// Embedded `AletheiaDB` data directory.
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Agent ID for daemon-backed writes.
+        #[arg(long, default_value = "egregore-cli")]
+        agent_id: String,
+        /// Session ID for daemon-backed writes.
+        #[arg(long, default_value = "egregore-cli")]
+        session_id: String,
+        /// Idempotency key for daemon-backed writes.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Manage the local Egregore daemon.
+    #[cfg(feature = "embedded-aletheiadb")]
+    Daemon {
+        /// Daemon action.
+        #[command(subcommand)]
+        action: DaemonAction,
     },
 }
 
@@ -70,6 +88,57 @@ enum IngestAdapter {
     /// Write into an embedded `AletheiaDB` store.
     #[cfg(feature = "embedded-aletheiadb")]
     Embedded,
+    /// Write through a running local Egregore daemon.
+    #[cfg(feature = "embedded-aletheiadb")]
+    Daemon,
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[derive(Debug, Subcommand)]
+enum DaemonAction {
+    /// Start the daemon in the background.
+    Start {
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long, default_value = ".egregore")]
+        data_dir: PathBuf,
+        /// Loopback host to bind.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// TCP port. Use 0 to ask the OS to choose one.
+        #[arg(long, default_value_t = 37_383)]
+        port: u16,
+        /// Bounded write queue capacity.
+        #[arg(long, default_value_t = 64)]
+        write_queue_capacity: usize,
+    },
+    /// Run the daemon in the current process.
+    #[command(hide = true)]
+    Run {
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long, default_value = ".egregore")]
+        data_dir: PathBuf,
+        /// Loopback host to bind.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// TCP port. Use 0 to ask the OS to choose one.
+        #[arg(long, default_value_t = 37_383)]
+        port: u16,
+        /// Bounded write queue capacity.
+        #[arg(long, default_value_t = 64)]
+        write_queue_capacity: usize,
+    },
+    /// Report daemon status.
+    Status {
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long, default_value = ".egregore")]
+        data_dir: PathBuf,
+    },
+    /// Stop the daemon.
+    Stop {
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long, default_value = ".egregore")]
+        data_dir: PathBuf,
+    },
 }
 
 /// Parses process arguments and runs the CLI.
@@ -90,7 +159,19 @@ fn run_cli(cli: Cli) -> Result<()> {
             graph,
             adapter,
             data_dir,
-        } => ingest(&graph, adapter, data_dir.as_deref()),
+            agent_id,
+            session_id,
+            idempotency_key,
+        } => ingest(
+            &graph,
+            adapter,
+            data_dir.as_deref(),
+            &agent_id,
+            &session_id,
+            idempotency_key.as_deref(),
+        ),
+        #[cfg(feature = "embedded-aletheiadb")]
+        Commands::Daemon { action } => daemon(action),
     }
 }
 
@@ -128,9 +209,16 @@ fn inspect(graph: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ingest(graph: &Path, adapter: IngestAdapter, data_dir: Option<&Path>) -> Result<()> {
+fn ingest(
+    graph: &Path,
+    adapter: IngestAdapter,
+    data_dir: Option<&Path>,
+    agent_id: &str,
+    session_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<()> {
     #[cfg(not(feature = "embedded-aletheiadb"))]
-    let _ = data_dir;
+    let _ = (data_dir, agent_id, session_id, idempotency_key);
 
     let jsonl = fs::read_to_string(graph)
         .with_context(|| format!("failed to read graph JSONL from {}", graph.display()))?;
@@ -154,6 +242,27 @@ fn ingest(graph: &Path, adapter: IngestAdapter, data_dir: Option<&Path>) -> Resu
             }
             report
         }
+        #[cfg(feature = "embedded-aletheiadb")]
+        IngestAdapter::Daemon => {
+            let data_dir = data_dir.map_or_else(|| PathBuf::from(".egregore"), Path::to_path_buf);
+            let idempotency_key =
+                idempotency_key.context("--idempotency-key is required for --adapter daemon")?;
+            let client = DaemonClient::from_data_dir(&data_dir)
+                .with_context(|| format!("failed to load daemon for {}", data_dir.display()))?;
+            let response =
+                client.ingest_records(&records, agent_id, session_id, idempotency_key)?;
+            println!("attempted: {}", response.attempted);
+            println!("succeeded: {}", response.succeeded);
+            println!("failed: {}", response.failed);
+            println!("idempotent: {}", response.idempotent);
+            if response.failed == 0 {
+                return Ok(());
+            }
+            for failure in &response.failures {
+                eprintln!("{}: {}", failure.record_id, failure.message);
+            }
+            anyhow::bail!("ingest failed for {} records", response.failed);
+        }
     };
 
     println!("attempted: {}", report.attempted);
@@ -167,6 +276,51 @@ fn ingest(graph: &Path, adapter: IngestAdapter, data_dir: Option<&Path>) -> Resu
             eprintln!("{}: {}", failure.record_id, failure.message);
         }
         anyhow::bail!("ingest failed for {} records", report.failed);
+    }
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn daemon(action: DaemonAction) -> Result<()> {
+    match action {
+        DaemonAction::Start {
+            data_dir,
+            host,
+            port,
+            write_queue_capacity,
+        } => {
+            let mut config = DaemonConfig::new(data_dir);
+            config.host = host;
+            config.port = port;
+            config.write_queue_capacity = write_queue_capacity;
+            let metadata = crate::daemon::start_background(&config)?;
+            println!("daemon started at {}", metadata.address);
+            Ok(())
+        }
+        DaemonAction::Run {
+            data_dir,
+            host,
+            port,
+            write_queue_capacity,
+        } => {
+            let mut config = DaemonConfig::new(data_dir);
+            config.host = host;
+            config.port = port;
+            config.write_queue_capacity = write_queue_capacity;
+            crate::daemon::run_foreground(&config)
+        }
+        DaemonAction::Status { data_dir } => {
+            if let Some(metadata) = crate::daemon::active_metadata(&data_dir) {
+                println!("daemon running at {}", metadata.address);
+                Ok(())
+            } else {
+                anyhow::bail!("daemon not running for {}", data_dir.display());
+            }
+        }
+        DaemonAction::Stop { data_dir } => {
+            crate::daemon::stop(&data_dir)?;
+            println!("daemon stopped");
+            Ok(())
+        }
     }
 }
 

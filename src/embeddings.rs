@@ -75,7 +75,14 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::Diagnostic
         | NodeKind::Commit
         | NodeKind::Change
-        | NodeKind::SemanticDrift => return None,
+        | NodeKind::SemanticDrift
+        | NodeKind::Agent
+        | NodeKind::AgentSession
+        | NodeKind::Observation
+        | NodeKind::Task
+        | NodeKind::Artifact
+        | NodeKind::Verification
+        | NodeKind::CommandEvidence => return None,
     };
 
     Some(EmbeddingCandidate {

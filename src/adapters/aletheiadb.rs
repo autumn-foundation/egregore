@@ -1,11 +1,12 @@
 //! Embedded `AletheiaDB` adapter.
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path, time::Instant};
 
 use chrono::{DateTime, Utc};
 
 use crate::{
-    adapters::{AdapterError, AdapterResult, GraphSink},
+    adapters::{AdapterError, AdapterResult, ExpectedRecordState, GraphSink},
+    daemon::StoreLease,
     ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan, TemporalMetadata},
 };
 
@@ -15,6 +16,7 @@ pub struct EmbeddedAletheiaSink {
     node_lookup: NodeLookupIndex,
     tombstone_ids: BTreeMap<String, ::aletheiadb::NodeId>,
     record_handles: BTreeMap<String, StoredRecord>,
+    _lease: Option<StoreLease>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -133,13 +135,28 @@ impl NodeLookupIndex {
 }
 
 impl EmbeddedAletheiaSink {
-    /// Opens an embedded `AletheiaDB` store rooted at `data_dir`.
+    /// Opens an embedded `AletheiaDB` store rooted at `data_dir` and acquires
+    /// the Egregore store lease.
     ///
     /// # Errors
     ///
-    /// Returns an error when `AletheiaDB` cannot open the requested data dir.
+    /// Returns an error when the store is already leased or `AletheiaDB` cannot
+    /// open the requested data dir.
     pub fn open(data_dir: impl AsRef<Path>) -> AdapterResult<Self> {
         let data_dir = data_dir.as_ref();
+        let lease = StoreLease::acquire(data_dir).map_err(|error| AdapterError::Rejected {
+            record_id: "embedded-store".to_owned(),
+            message: error.to_string(),
+        })?;
+        Self::open_inner(data_dir, Some(lease))
+    }
+
+    pub(crate) fn open_unleased(data_dir: impl AsRef<Path>) -> AdapterResult<Self> {
+        let data_dir = data_dir.as_ref();
+        Self::open_inner(data_dir, None)
+    }
+
+    fn open_inner(data_dir: &Path, lease: Option<StoreLease>) -> AdapterResult<Self> {
         let mut config = ::aletheiadb::config::durable_config_for_data_dir(data_dir);
         if is_fresh_data_dir(data_dir) {
             config.persistence.load_on_startup = false;
@@ -155,6 +172,7 @@ impl EmbeddedAletheiaSink {
             node_lookup: NodeLookupIndex::default(),
             tombstone_ids: BTreeMap::new(),
             record_handles: BTreeMap::new(),
+            _lease: lease,
         };
         sink.rebuild_lookup_indexes()?;
         Ok(sink)
@@ -182,6 +200,72 @@ impl EmbeddedAletheiaSink {
     /// Returns an error when the embedded store cannot perform read-back.
     pub fn read_back(&self, record_id: &str) -> AdapterResult<Option<GraphRecord>> {
         <Self as GraphSink>::read_back(self, record_id)
+    }
+
+    pub(crate) fn read_back_until(
+        &self,
+        record_id: &str,
+        deadline: Option<Instant>,
+    ) -> AdapterResult<Option<GraphRecord>> {
+        check_read_deadline(record_id, deadline)?;
+        if let Some(node_id) = self.node_lookup.latest_node(record_id) {
+            return self.read_node_record(record_id, node_id).map(Some);
+        }
+        if let Some(node_id) = self.tombstone_ids.get(record_id).copied() {
+            return self.read_tombstone_record(record_id, node_id).map(Some);
+        }
+        if let Some(edge_id) = self.find_edge_id_by_codegraph_id_until(record_id, deadline)? {
+            return self.read_edge_record(record_id, edge_id).map(Some);
+        }
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn node_observation_count_for_test(&self, record_id: &str) -> usize {
+        self.node_lookup.candidate_count(record_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edge_observation_count_for_test(&self, record_id: &str) -> usize {
+        let mut count = 0;
+        for node_id in self.db.get_all_node_ids() {
+            for edge_id in self.db.get_outgoing_edges(node_id) {
+                if self
+                    .db
+                    .get_edge(edge_id)
+                    .ok()
+                    .and_then(|edge| {
+                        edge.get_property("codegraph_id")
+                            .and_then(::aletheiadb::PropertyValue::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some(record_id)
+                {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    pub(crate) fn expected_record_state(
+        &self,
+        record: &GraphRecord,
+    ) -> AdapterResult<ExpectedRecordState> {
+        match record {
+            GraphRecord::Node { id, temporal, .. } => {
+                if let Some(temporal) = temporal
+                    && let Some(node_id) =
+                        self.node_lookup.node_for_commit(id, &temporal.git_commit)
+                {
+                    return self.compare_node_record(id, node_id, record);
+                }
+                self.compare_latest_record(record)
+            }
+            GraphRecord::Edge { id, .. } => self.compare_edge_record(id, record),
+            GraphRecord::Tombstone { .. } => self.compare_latest_record(record),
+        }
     }
 
     /// Returns true if the embedded graph contains a Repository -> File -> Symbol path.
@@ -297,16 +381,7 @@ impl GraphSink for EmbeddedAletheiaSink {
     }
 
     fn read_back(&self, record_id: &str) -> AdapterResult<Option<GraphRecord>> {
-        if let Some(node_id) = self.node_lookup.latest_node(record_id) {
-            return self.read_node_record(record_id, node_id).map(Some);
-        }
-        if let Some(node_id) = self.tombstone_ids.get(record_id).copied() {
-            return self.read_tombstone_record(record_id, node_id).map(Some);
-        }
-        if let Some(edge_id) = self.find_edge_id_by_codegraph_id(record_id)? {
-            return self.read_edge_record(record_id, edge_id).map(Some);
-        }
-        Ok(None)
+        self.read_back_until(record_id, None)
     }
 
     fn verify_record(&self, record: &GraphRecord) -> AdapterResult<()> {
@@ -379,6 +454,9 @@ impl EmbeddedAletheiaSink {
     }
 
     fn write_node(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+        if self.expected_record_state(record)? == ExpectedRecordState::Matched {
+            return Ok(());
+        }
         let GraphRecord::Node {
             id,
             kind,
@@ -441,6 +519,9 @@ impl EmbeddedAletheiaSink {
     }
 
     fn write_tombstone(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+        if self.expected_record_state(record)? == ExpectedRecordState::Matched {
+            return Ok(());
+        }
         let GraphRecord::Tombstone {
             id,
             schema_version,
@@ -485,6 +566,10 @@ impl EmbeddedAletheiaSink {
     }
 
     fn write_edge(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+        if self.expected_record_state(record)? == ExpectedRecordState::Matched {
+            return Ok(());
+        }
+
         let GraphRecord::Edge {
             id,
             schema_version,
@@ -577,13 +662,16 @@ impl EmbeddedAletheiaSink {
         self.node_lookup.latest_node(record_id)
     }
 
-    fn find_edge_id_by_codegraph_id(
+    fn find_edge_id_by_codegraph_id_until(
         &self,
         record_id: &str,
+        deadline: Option<Instant>,
     ) -> AdapterResult<Option<::aletheiadb::EdgeId>> {
         let mut found = None;
         for node_id in self.db.get_all_node_ids() {
+            check_read_deadline(record_id, deadline)?;
             for edge_id in self.db.get_outgoing_edges(node_id) {
+                check_read_deadline(record_id, deadline)?;
                 let edge = self
                     .db
                     .get_edge(edge_id)
@@ -609,6 +697,60 @@ impl EmbeddedAletheiaSink {
             }
         }
         Ok(found.map(|candidate| candidate.storage_id))
+    }
+
+    fn compare_latest_record(&self, record: &GraphRecord) -> AdapterResult<ExpectedRecordState> {
+        match self.read_back(record.id())? {
+            Some(read_back) if read_back == *record => Ok(ExpectedRecordState::Matched),
+            Some(_) => Ok(ExpectedRecordState::Mismatched),
+            None => Ok(ExpectedRecordState::Missing),
+        }
+    }
+
+    fn compare_node_record(
+        &self,
+        record_id: &str,
+        node_id: ::aletheiadb::NodeId,
+        expected: &GraphRecord,
+    ) -> AdapterResult<ExpectedRecordState> {
+        match self.read_node_record(record_id, node_id)? {
+            read_back if read_back == *expected => Ok(ExpectedRecordState::Matched),
+            _ => Ok(ExpectedRecordState::Mismatched),
+        }
+    }
+
+    fn compare_edge_record(
+        &self,
+        record_id: &str,
+        expected: &GraphRecord,
+    ) -> AdapterResult<ExpectedRecordState> {
+        let mut saw_same_id = false;
+        for node_id in self.db.get_all_node_ids() {
+            for edge_id in self.db.get_outgoing_edges(node_id) {
+                let edge = self
+                    .db
+                    .get_edge(edge_id)
+                    .map_err(|error| read_back_error(record_id, error.to_string()))?;
+                if optional_str_property(
+                    record_id,
+                    "codegraph_id",
+                    edge.get_property("codegraph_id"),
+                )?
+                .as_deref()
+                    == Some(record_id)
+                {
+                    saw_same_id = true;
+                    if self.read_edge_record(record_id, edge_id)? == *expected {
+                        return Ok(ExpectedRecordState::Matched);
+                    }
+                }
+            }
+        }
+        if saw_same_id {
+            Ok(ExpectedRecordState::Mismatched)
+        } else {
+            Ok(ExpectedRecordState::Missing)
+        }
     }
 
     fn read_node_record(
@@ -758,6 +900,15 @@ fn read_back_error(record_id: &str, message: impl Into<String>) -> AdapterError 
         record_id: record_id.to_owned(),
         message: message.into(),
     }
+}
+
+fn check_read_deadline(record_id: &str, deadline: Option<Instant>) -> AdapterResult<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(AdapterError::TimedOut {
+            record_id: record_id.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn required_str_property(
@@ -982,6 +1133,13 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "Commit" => Ok(NodeKind::Commit),
         "Change" => Ok(NodeKind::Change),
         "SemanticDrift" => Ok(NodeKind::SemanticDrift),
+        "Agent" => Ok(NodeKind::Agent),
+        "AgentSession" => Ok(NodeKind::AgentSession),
+        "Observation" => Ok(NodeKind::Observation),
+        "Task" => Ok(NodeKind::Task),
+        "Artifact" => Ok(NodeKind::Artifact),
+        "Verification" => Ok(NodeKind::Verification),
+        "CommandEvidence" => Ok(NodeKind::CommandEvidence),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded node kind {kind}"),
@@ -1001,6 +1159,9 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "CHANGED_IN" => Ok(EdgeLabel::ChangedIn),
         "PARENT_OF" => Ok(EdgeLabel::ParentOf),
         "DRIFTS_FROM" => Ok(EdgeLabel::DriftsFrom),
+        "SESSION_OF" => Ok(EdgeLabel::SessionOf),
+        "AUTHORED_BY" => Ok(EdgeLabel::AuthoredBy),
+        "HAS_EVIDENCE" => Ok(EdgeLabel::HasEvidence),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded edge label {label}"),
@@ -1096,7 +1257,14 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::Diagnostic
         | NodeKind::Commit
         | NodeKind::Change
-        | NodeKind::SemanticDrift => kind.as_str(),
+        | NodeKind::SemanticDrift
+        | NodeKind::Agent
+        | NodeKind::AgentSession
+        | NodeKind::Observation
+        | NodeKind::Task
+        | NodeKind::Artifact
+        | NodeKind::Verification
+        | NodeKind::CommandEvidence => kind.as_str(),
     }
 }
 
@@ -1209,6 +1377,48 @@ mod tests {
             .expect("edge target should be readable");
 
         assert_eq!(edge_target, updated_symbol_node_id);
+    }
+
+    #[test]
+    fn identical_non_temporal_node_write_is_noop() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("duplicate-exact-node-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let record = file_record(&file_id, "current file");
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+        sink.write_record(&record)
+            .expect("first write should succeed");
+        sink.write_record(&record)
+            .expect("identical current write should be a no-op");
+
+        assert_eq!(sink.node_lookup.candidate_count(&file_id), 1);
+    }
+
+    #[test]
+    fn read_back_until_honors_expired_deadline_before_edge_scan() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("deadline-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+        let edge = GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id.clone(),
+            symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "current edge".to_owned(),
+        );
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&file_record(&file_id, "file"))
+            .expect("file should write");
+        sink.write_record(&current_symbol_record(&symbol_id, "symbol", 10))
+            .expect("symbol should write");
+        sink.write_record(&edge).expect("edge should write");
+
+        let error = sink
+            .read_back_until("codegraph:v1:missing-edge", Some(Instant::now()))
+            .expect_err("expired deadline should stop the edge scan");
+        assert!(matches!(error, AdapterError::TimedOut { .. }));
     }
 
     fn file_record(id: &str, summary: &str) -> GraphRecord {
