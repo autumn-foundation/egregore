@@ -222,17 +222,15 @@ impl EmbeddedAletheiaSink {
 
         let mut records = Vec::new();
 
-        // Fix #2: iterate all temporal observations (by_commit) instead of just latest
+        // Temporal observations: include ALL commit snapshots even for tombstoned records so
+        // that `--at <commit>` queries can resolve past state after a deletion.
         for (record_id, commits) in &self.node_lookup.by_commit {
-            if deleted_ids.contains(record_id.as_str()) {
-                continue;
-            }
             for candidate in commits.values() {
                 records.push(self.read_node_record(record_id, candidate.storage_id)?);
             }
         }
 
-        // Non-temporal nodes (not present in by_commit)
+        // Non-temporal (current-state) nodes: skip records that have been tombstoned.
         for (record_id, &node_id) in &self.node_lookup.non_temporal {
             if deleted_ids.contains(record_id.as_str()) {
                 continue;
@@ -1538,6 +1536,58 @@ mod tests {
             summary.to_owned(),
         )
         .with_temporal(temporal)
+    }
+
+    #[test]
+    fn read_all_records_includes_historical_observations_of_tombstoned_records() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("tombstone-history-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "gone"]);
+        let tombstone_id = stable_id(&["tombstone", &symbol_id]);
+
+        let historical_symbol = symbol_record(
+            &symbol_id,
+            "symbol that will be deleted",
+            temporal_observed("deadbeef", "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z"),
+        );
+        let tombstone = GraphRecord::Tombstone {
+            id: tombstone_id.clone(),
+            schema_version: crate::ir::SCHEMA_VERSION,
+            deleted_id: symbol_id.clone(),
+            summary: "deleted".to_owned(),
+        };
+
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&historical_symbol)
+            .expect("temporal symbol should write");
+        sink.write_record(&tombstone)
+            .expect("tombstone should write");
+
+        let records = sink
+            .read_all_records()
+            .expect("read_all_records should succeed");
+
+        // The historical temporal observation must be present so --at <commit> can resolve it
+        let has_historical = records.iter().any(|r| {
+            matches!(
+                r,
+                GraphRecord::Node { id, temporal: Some(t), .. }
+                    if id == &symbol_id && t.git_commit == "deadbeef"
+            )
+        });
+        assert!(
+            has_historical,
+            "historical observation of tombstoned record must appear in read_all_records"
+        );
+
+        // The tombstone itself must still appear
+        let has_tombstone = records
+            .iter()
+            .any(|r| matches!(r, GraphRecord::Tombstone { id, .. } if id == &tombstone_id));
+        assert!(
+            has_tombstone,
+            "tombstone record must appear in read_all_records"
+        );
     }
 
     fn temporal_observed(
