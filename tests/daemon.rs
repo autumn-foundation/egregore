@@ -122,6 +122,56 @@ fn daemon_stop_cleans_stale_metadata() {
     );
 }
 
+#[test]
+fn daemon_status_times_out_stalled_stale_metadata() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let runtime_dir = runtime_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral port should bind");
+    let address = listener
+        .local_addr()
+        .expect("ephemeral address should exist")
+        .to_string();
+    let listener_thread = thread::spawn(move || {
+        let Ok((_stream, _)) = listener.accept() else {
+            return;
+        };
+        thread::sleep(Duration::from_secs(5));
+    });
+    fs::write(
+        runtime_dir.join("egregored.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "pid": 999_998,
+            "address": address,
+            "token": "stalled-token",
+            "data_dir": data_dir,
+            "version": "test",
+            "started_at_unix_ms": 0_u64
+        }))
+        .expect("metadata should serialize"),
+    )
+    .expect("stalled metadata should write");
+
+    let start = Instant::now();
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("daemon")
+        .arg("status")
+        .arg("--data-dir")
+        .arg(temp.path().join("store"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("daemon not running"));
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "stalled metadata probe should time out promptly"
+    );
+    listener_thread
+        .join()
+        .expect("listener thread should finish");
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn embedded_cli_ingest_refuses_while_daemon_owns_data_dir() {

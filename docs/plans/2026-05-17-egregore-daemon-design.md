@@ -11,8 +11,10 @@ its own process-local database owner.
 
 - One process owns the embedded AletheiaDB handle for a data directory.
 - Egregore, not AletheiaDB, owns agent workflow semantics.
-- Every persisted agent-authored record passes through redaction, provenance,
-  schema validation, and idempotency checks.
+- V1 `codegraph` writes pass through daemon envelope validation, idempotency,
+  and graph-record parsing before persistence.
+- Redaction, richer provenance edges, and non-codegraph workflow schemas are
+  daemon responsibilities, but remain planned follow-up work.
 - Reads may run concurrently through snapshot/read transactions.
 - Writes are admitted through a bounded queue with durable success semantics.
 - Embedded CLI access remains available for exclusive jobs and tests, but it

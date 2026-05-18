@@ -59,8 +59,9 @@ Positive:
 - The CLI stays ergonomic while becoming a thin client for shared use.
 - Read traffic can use snapshot/read transactions without each agent reopening
   the store.
-- Redaction, provenance, idempotency, and schema validation have one mandatory
-  persistence gate.
+- Idempotency and the v1 `codegraph` schema have one mandatory persistence
+  gate. Redaction, richer provenance, and non-codegraph workflow schemas remain
+  explicit daemon-layer responsibilities for follow-up slices.
 
 Negative:
 

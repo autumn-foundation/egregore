@@ -5,7 +5,7 @@ use std::{
     fmt::Write as _,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    net::{TcpListener, TcpStream},
+    net::{Shutdown, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -34,6 +34,7 @@ const IDEMPOTENCY_FILE: &str = "idempotency.json";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 37_383;
 const START_TIMEOUT: Duration = Duration::from_secs(10);
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_LIMIT: usize = 1024 * 1024 * 32;
 
 /// Configuration for launching the daemon.
@@ -644,8 +645,17 @@ impl DaemonClient {
         let mut stream = TcpStream::connect(&self.metadata.address)
             .with_context(|| format!("failed to connect to {}", self.metadata.address))?;
         stream
+            .set_read_timeout(Some(CLIENT_TIMEOUT))
+            .context("failed to set daemon read timeout")?;
+        stream
+            .set_write_timeout(Some(CLIENT_TIMEOUT))
+            .context("failed to set daemon write timeout")?;
+        stream
             .write_all(request.as_bytes())
             .context("failed to write daemon request")?;
+        stream
+            .shutdown(Shutdown::Write)
+            .context("failed to finish daemon request")?;
         let mut response = String::new();
         stream
             .read_to_string(&mut response)
