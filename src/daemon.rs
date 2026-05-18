@@ -18,6 +18,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use chrono::DateTime;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -287,6 +288,7 @@ struct ServerState {
     write_tx: mpsc::SyncSender<WriteCommand>,
     jobs: Arc<Mutex<BTreeMap<String, JobStatus>>>,
     agents: Arc<Mutex<BTreeMap<AgentSessionKey, AgentStatus>>>,
+    idempotency: Arc<Mutex<IdempotencyStore>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -333,44 +335,163 @@ struct JobStatus {
     payload_hash: String,
 }
 
-#[derive(Debug)]
-struct ApiError {
-    status: u16,
-    code: &'static str,
-    message: String,
+/// Stable, versioned error-code taxonomy for the v1 daemon wire contract.
+///
+/// Adding a new code is additive. Renaming, removing, or changing semantics
+/// requires a `/v2/` API prefix change per `docs/schema/daemon-api.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum ErrorCode {
+    Unauthorized,
+    BadRequest,
+    MissingField,
+    InvalidDomain,
+    IdempotencyConflict,
+    NotFound,
+    PayloadTooLarge,
+    QueueFull,
+    QueryTimeout,
+    InternalError,
+    NotImplemented,
+    ShutdownInProgress,
+    RedactionRequired,
 }
 
-impl ApiError {
-    fn new(status: u16, code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            code,
-            message: message.into(),
+impl ErrorCode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::BadRequest => "bad_request",
+            Self::MissingField => "missing_field",
+            Self::InvalidDomain => "invalid_domain",
+            Self::IdempotencyConflict => "idempotency_conflict",
+            Self::NotFound => "not_found",
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::QueueFull => "queue_full",
+            Self::QueryTimeout => "query_timeout",
+            Self::InternalError => "internal_error",
+            Self::NotImplemented => "not_implemented",
+            Self::ShutdownInProgress => "shutdown_in_progress",
+            Self::RedactionRequired => "redaction_required",
         }
     }
 
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self::new(400, "bad_request", message)
+    const fn http_status(self) -> u16 {
+        match self {
+            Self::Unauthorized => 401,
+            Self::BadRequest | Self::MissingField | Self::InvalidDomain => 400,
+            Self::IdempotencyConflict => 409,
+            Self::NotFound => 404,
+            Self::PayloadTooLarge => 413,
+            Self::QueueFull => 429,
+            Self::QueryTimeout => 408,
+            Self::InternalError => 500,
+            Self::NotImplemented => 501,
+            Self::ShutdownInProgress => 503,
+            Self::RedactionRequired => 422,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ApiError {
+    status: u16,
+    code: ErrorCode,
+    message: String,
+    field: Option<String>,
+    retry_after_ms: Option<u64>,
+    partial_result: Option<bool>,
+}
+
+impl ApiError {
+    fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            status: code.http_status(),
+            code,
+            message: message.into(),
+            field: None,
+            retry_after_ms: None,
+            partial_result: None,
+        }
+    }
+
+    fn missing_field(field_path: impl Into<String>) -> Self {
+        let field = field_path.into();
+        Self {
+            status: 400,
+            code: ErrorCode::MissingField,
+            message: format!("required field is missing: {field}"),
+            field: Some(field),
+            retry_after_ms: None,
+            partial_result: None,
+        }
     }
 
     fn unauthorized() -> Self {
-        Self::new(401, "unauthorized", "missing or invalid bearer token")
+        Self::new(ErrorCode::Unauthorized, "missing or invalid bearer token")
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::BadRequest, message)
+    }
+
+    fn invalid_domain() -> Self {
+        Self::new(
+            ErrorCode::InvalidDomain,
+            r#"domain must be "codegraph" for v1 writes"#,
+        )
     }
 
     fn not_found(message: impl Into<String>) -> Self {
-        Self::new(404, "not_found", message)
+        Self::new(ErrorCode::NotFound, message)
     }
 
     fn conflict(message: impl Into<String>) -> Self {
-        Self::new(409, "idempotency_conflict", message)
+        Self::new(ErrorCode::IdempotencyConflict, message)
+    }
+
+    fn payload_too_large() -> Self {
+        Self::new(
+            ErrorCode::PayloadTooLarge,
+            "request body exceeds maximum size",
+        )
     }
 
     fn overloaded() -> Self {
-        Self::new(429, "queue_full", "write queue is full")
+        Self {
+            status: 429,
+            code: ErrorCode::QueueFull,
+            message: "write queue is full".into(),
+            field: None,
+            retry_after_ms: Some(500),
+            partial_result: None,
+        }
+    }
+
+    fn shutdown_in_progress() -> Self {
+        Self {
+            status: 503,
+            code: ErrorCode::ShutdownInProgress,
+            message: "daemon is shutting down".into(),
+            field: None,
+            retry_after_ms: Some(2_000),
+            partial_result: None,
+        }
+    }
+
+    fn query_timeout() -> Self {
+        Self {
+            status: 408,
+            code: ErrorCode::QueryTimeout,
+            message: "query budget expired".into(),
+            field: None,
+            retry_after_ms: None,
+            partial_result: Some(false),
+        }
     }
 
     fn internal(message: impl Into<String>) -> Self {
-        Self::new(500, "internal", message)
+        Self::new(ErrorCode::InternalError, message)
     }
 }
 
@@ -389,31 +510,82 @@ struct HttpResponse {
 }
 
 impl HttpResponse {
+    /// Raw response: body is emitted as-is. Use for observability endpoints
+    /// (health, status) that return flat JSON rather than the standard envelope.
     const fn json(status: u16, body: serde_json::Value) -> Self {
         Self { status, body }
     }
 
-    fn error(error: ApiError) -> Self {
-        let ApiError {
+    /// Standard success envelope: `{ ok: true, request_id, result }`.
+    /// Pass `None` for endpoints that do not echo a parsed request ID.
+    #[allow(clippy::needless_pass_by_value)]
+    fn success(request_id: Option<&str>, status: u16, result: serde_json::Value) -> Self {
+        Self {
             status,
-            code,
-            message,
-        } = error;
-        Self::json(
-            status,
-            json!({
-                "error": code,
-                "message": message,
+            body: json!({
+                "ok": true,
+                "request_id": request_id,
+                "result": result,
             }),
-        )
+        }
     }
+
+    /// Standard error envelope with no `request_id` (connection-level errors).
+    fn error(error: ApiError) -> Self {
+        let status = error.status;
+        Self {
+            status,
+            body: build_error_envelope(None, error),
+        }
+    }
+
+    /// Standard error envelope with the echoed `request_id` from the parsed envelope.
+    fn error_with_id(request_id: &str, error: ApiError) -> Self {
+        let status = error.status;
+        Self {
+            status,
+            body: build_error_envelope(Some(request_id), error),
+        }
+    }
+}
+
+fn build_error_envelope(request_id: Option<&str>, error: ApiError) -> serde_json::Value {
+    let ApiError {
+        code,
+        message,
+        field,
+        retry_after_ms,
+        partial_result,
+        ..
+    } = error;
+    let mut error_obj = json!({
+        "code": code.as_str(),
+        "message": message,
+    });
+    if let Some(f) = field {
+        error_obj["field"] = serde_json::Value::String(f);
+    }
+    if let Some(ms) = retry_after_ms {
+        error_obj["retry_after_ms"] = serde_json::Value::Number(ms.into());
+    }
+    if let Some(pr) = partial_result {
+        error_obj["partial_result"] = serde_json::Value::Bool(pr);
+    }
+    json!({
+        "ok": false,
+        "request_id": request_id,
+        "error": error_obj,
+    })
 }
 
 #[derive(Debug, Deserialize)]
 struct RequestEnvelope {
-    request_id: String,
-    agent_id: String,
-    session_id: String,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
     #[serde(default)]
     idempotency_key: Option<String>,
     #[serde(default)]
@@ -431,32 +603,68 @@ struct IngestPayload {
 
 #[derive(Debug, Deserialize)]
 struct AgentRegisterRequest {
-    request_id: String,
-    agent_id: String,
-    session_id: String,
-    agent_kind: String,
-    project_scope: String,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    agent_kind: Option<String>,
+    #[serde(default)]
+    project_scope: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(clippy::struct_field_names)]
 struct AgentHeartbeatRequest {
-    agent_id: String,
-    session_id: String,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryBudget {
+    #[serde(default)]
+    max_results: Option<usize>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryPayload {
+    #[serde(default)]
+    budget: Option<QueryBudget>,
+    #[serde(default)]
+    record_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct QueryRequest {
-    request_id: String,
-    agent_id: String,
-    session_id: String,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
     #[serde(default)]
     domain: Option<String>,
     #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default)]
-    timeout_ms: Option<u64>,
-    #[serde(default)]
-    record_ids: Vec<String>,
+    payload: Option<QueryPayload>,
+}
+
+fn non_empty(s: Option<&str>) -> Option<&str> {
+    s.filter(|s| !s.trim().is_empty())
+}
+
+struct AgentRegisterFull {
+    agent_id: String,
+    session_id: String,
+    agent_kind: String,
+    project_scope: String,
 }
 
 /// Starts a daemon in the background and waits until it responds.
@@ -560,6 +768,7 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
         write_tx,
         jobs: Arc::new(Mutex::new(BTreeMap::new())),
         agents: Arc::new(Mutex::new(BTreeMap::new())),
+        idempotency: Arc::clone(&idempotency),
         shutdown: Arc::clone(&shutdown),
     });
     let worker = spawn_write_worker(write_rx, sink, idempotency);
@@ -670,7 +879,7 @@ impl DaemonClient {
             "session_id": session_id,
             "idempotency_key": idempotency_key,
             "domain": "codegraph",
-            "created_at": unix_ms().to_string(),
+            "created_at": chrono::Utc::now().to_rfc3339(),
             "payload": { "records": records },
         });
         let (status, body) = self.request(
@@ -683,7 +892,10 @@ impl DaemonClient {
         if status != 200 {
             return Err(anyhow!("daemon ingest failed with HTTP {status}: {body}"));
         }
-        serde_json::from_str(&body).context("failed to parse daemon ingest response")
+        let envelope: serde_json::Value =
+            serde_json::from_str(&body).context("failed to parse daemon ingest response")?;
+        serde_json::from_value(envelope["result"].clone())
+            .context("failed to parse daemon ingest result from envelope")
     }
 
     /// Checks daemon health.
@@ -1006,6 +1218,9 @@ fn complete_idempotency_entry(
 fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
     let response = match read_http_request(&mut stream, &state.token) {
         Ok(request) => handle_request(&request, &state),
+        Err(error) if error.to_string() == "request body too large" => {
+            HttpResponse::error(ApiError::payload_too_large())
+        }
         Err(error) => HttpResponse::error(ApiError::bad_request(error.to_string())),
     };
     let _ = write_http_response(&mut stream, &response);
@@ -1017,6 +1232,7 @@ fn handle_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         return HttpResponse::json(
             200,
             json!({
+                "api_version": "v1",
                 "status": "ok",
                 "version": env!("CARGO_PKG_VERSION"),
                 "data_dir": state.store_identity.as_str(),
@@ -1025,6 +1241,15 @@ fn handle_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     }
     if !is_authorized(request, &state.token) {
         return HttpResponse::error(ApiError::unauthorized());
+    }
+    // Shutdown is handled before the gate so concurrent/retried stop calls
+    // succeed even after the flag is set (idempotent drain behavior).
+    if request.method == "POST" && request.path == "/v1/admin/shutdown" {
+        state.shutdown.store(true, Ordering::SeqCst);
+        return HttpResponse::success(None, 200, json!({ "status": "stopping" }));
+    }
+    if state.shutdown.load(Ordering::SeqCst) {
+        return HttpResponse::error(ApiError::shutdown_in_progress());
     }
 
     match (request.method.as_str(), request.path.as_str()) {
@@ -1035,10 +1260,6 @@ fn handle_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         ("POST", "/v1/agents/heartbeat") => handle_agent_heartbeat(request, state),
         ("POST", "/v1/jobs/ingest") => handle_job_ingest(request, state),
         ("POST", "/v1/admin/checkpoint") => handle_checkpoint(state),
-        ("POST", "/v1/admin/shutdown") => {
-            state.shutdown.store(true, Ordering::SeqCst);
-            HttpResponse::json(200, json!({ "status": "stopping" }))
-        }
         _ if request.method == "GET" && request.path.starts_with("/v1/records/") => {
             let record_id = request.path.trim_start_matches("/v1/records/");
             handle_get_record(record_id, state)
@@ -1059,12 +1280,18 @@ fn handle_status(state: &ServerState) -> HttpResponse {
         Ok(agents) => agents.len(),
         Err(_) => return HttpResponse::error(ApiError::internal("agents lock poisoned")),
     };
+    let idempotency_store_size = match state.idempotency.lock() {
+        Ok(store) => store.entries.len(),
+        Err(_) => return HttpResponse::error(ApiError::internal("idempotency lock poisoned")),
+    };
     HttpResponse::json(
         200,
         json!({
+            "api_version": "v1",
             "status": "running",
             "jobs": jobs,
             "agents": agents,
+            "idempotency_store_size": idempotency_store_size,
         }),
     )
 }
@@ -1074,35 +1301,69 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         Ok(envelope) => envelope,
         Err(error) => return HttpResponse::error(error),
     };
-    let Some(idempotency_key) = envelope.idempotency_key.clone() else {
-        return HttpResponse::error(ApiError::bad_request("idempotency_key is required"));
+    let request_id = match non_empty(envelope.request_id.as_deref()) {
+        Some(id) => id.to_owned(),
+        None => return HttpResponse::error(ApiError::missing_field("request_id")),
     };
-    if envelope.agent_id.trim().is_empty() || envelope.session_id.trim().is_empty() {
-        return HttpResponse::error(ApiError::bad_request(
-            "agent_id and session_id are required",
-        ));
+    let agent_id = match non_empty(envelope.agent_id.as_deref()) {
+        Some(id) => id.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("agent_id"));
+        }
+    };
+    if non_empty(envelope.session_id.as_deref()).is_none() {
+        return HttpResponse::error_with_id(&request_id, ApiError::missing_field("session_id"));
     }
-    if envelope.domain.as_deref() != Some("codegraph") {
-        return HttpResponse::error(ApiError::bad_request("domain must be codegraph"));
+    let idempotency_key = match non_empty(envelope.idempotency_key.as_deref()) {
+        Some(key) => key.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::missing_field("idempotency_key"),
+            );
+        }
+    };
+    match non_empty(envelope.domain.as_deref()) {
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("domain"));
+        }
+        Some(d) if d != "codegraph" => {
+            return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
+        }
+        _ => {}
     }
-    if envelope.created_at.as_deref().is_none_or(str::is_empty) {
-        return HttpResponse::error(ApiError::bad_request("created_at is required"));
+    match envelope
+        .created_at
+        .as_deref()
+        .and_then(|s| non_empty(Some(s)))
+    {
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("created_at"));
+        }
+        Some(ts) if DateTime::parse_from_rfc3339(ts).is_err() => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::bad_request("created_at must be RFC 3339"),
+            );
+        }
+        _ => {}
+    }
+    if envelope.payload.is_null() {
+        return HttpResponse::error_with_id(&request_id, ApiError::missing_field("payload"));
     }
     let payload = match serde_json::from_value::<IngestPayload>(envelope.payload) {
         Ok(payload) => payload,
-        Err(error) => return HttpResponse::error(ApiError::bad_request(error.to_string())),
+        Err(error) => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::bad_request(error.to_string()),
+            );
+        }
     };
-    let idempotency_key =
-        scoped_idempotency_key(&envelope.agent_id, &envelope.session_id, &idempotency_key);
-    let response = enqueue_write(
-        state,
-        idempotency_key,
-        payload.records,
-        &envelope.request_id,
-    );
-    match response {
-        Ok(response) => HttpResponse::json(200, json!(response)),
-        Err(error) => HttpResponse::error(error),
+    let scoped_key = scoped_idempotency_key(&agent_id, "records/ingest", &idempotency_key);
+    match enqueue_write(state, scoped_key, payload.records, &request_id) {
+        Ok(response) => HttpResponse::success(Some(&request_id), 200, json!(response)),
+        Err(error) => HttpResponse::error_with_id(&request_id, error),
     }
 }
 
@@ -1111,10 +1372,13 @@ fn handle_get_record(record_id: &str, state: &ServerState) -> HttpResponse {
         return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
     };
     match sink.read_back(record_id) {
-        Ok(record) => HttpResponse::json(200, json!({ "record": record })),
+        Ok(record) => HttpResponse::success(None, 200, json!({ "record": record })),
         Err(error) => HttpResponse::error(ApiError::internal(error.to_string())),
     }
 }
+
+const DEFAULT_QUERY_MAX_RESULTS: usize = 5_000;
+const DEFAULT_QUERY_TIMEOUT_MS: u64 = 5_000;
 
 fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     let started = Instant::now();
@@ -1122,21 +1386,53 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         Ok(query) => query,
         Err(error) => return HttpResponse::error(error),
     };
-    let budget = query.timeout_ms.map(Duration::from_millis);
-    if budget == Some(Duration::ZERO) {
-        return HttpResponse::error(ApiError::new(408, "timeout", "query budget expired"));
+    let request_id = match non_empty(query.request_id.as_deref()) {
+        Some(id) => id.to_owned(),
+        None => return HttpResponse::error(ApiError::missing_field("request_id")),
+    };
+    if non_empty(query.agent_id.as_deref()).is_none() {
+        return HttpResponse::error_with_id(&request_id, ApiError::missing_field("agent_id"));
     }
-    let deadline = budget.and_then(|budget| started.checked_add(budget));
-    let limit = query.limit.unwrap_or(100).min(1000);
+    if non_empty(query.session_id.as_deref()).is_none() {
+        return HttpResponse::error_with_id(&request_id, ApiError::missing_field("session_id"));
+    }
+    if non_empty(query.domain.as_deref()).is_some_and(|d| d != "codegraph") {
+        return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
+    }
+    let agent_id = query.agent_id;
+    let session_id = query.session_id;
+    let Some(payload) = query.payload else {
+        return HttpResponse::error_with_id(&request_id, ApiError::missing_field("payload"));
+    };
+
+    let (limit, timeout_ms) =
+        payload
+            .budget
+            .as_ref()
+            .map_or((DEFAULT_QUERY_MAX_RESULTS, None), |b| {
+                (
+                    b.max_results.unwrap_or(DEFAULT_QUERY_MAX_RESULTS),
+                    b.timeout_ms,
+                )
+            });
+    let limit = limit.min(DEFAULT_QUERY_MAX_RESULTS);
+    let budget = timeout_ms
+        .or(Some(DEFAULT_QUERY_TIMEOUT_MS))
+        .map(Duration::from_millis);
+
+    if budget == Some(Duration::ZERO) {
+        return HttpResponse::error_with_id(&request_id, ApiError::query_timeout());
+    }
+    let deadline = budget.and_then(|b| started.checked_add(b));
     let mut records = Vec::new();
-    for record_id in query.record_ids.iter().take(limit) {
+    for record_id in payload.record_ids.iter().take(limit) {
         if let Err(error) = check_query_budget(started, budget) {
-            return HttpResponse::error(error);
+            return HttpResponse::error_with_id(&request_id, error);
         }
         let result = {
             let sink = match query_sink_read(state, started, budget) {
                 Ok(sink) => sink,
-                Err(error) => return HttpResponse::error(error),
+                Err(error) => return HttpResponse::error_with_id(&request_id, error),
             };
             sink.read_back_until(record_id, deadline)
         };
@@ -1144,21 +1440,26 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             Ok(Some(record)) => records.push(record),
             Ok(None) => {}
             Err(AdapterError::TimedOut { .. }) => {
-                return HttpResponse::error(ApiError::new(408, "timeout", "query budget expired"));
+                return HttpResponse::error_with_id(&request_id, ApiError::query_timeout());
             }
-            Err(error) => return HttpResponse::error(ApiError::internal(error.to_string())),
+            Err(error) => {
+                return HttpResponse::error_with_id(
+                    &request_id,
+                    ApiError::internal(error.to_string()),
+                );
+            }
         }
         if let Err(error) = check_query_budget(started, budget) {
-            return HttpResponse::error(error);
+            return HttpResponse::error_with_id(&request_id, error);
         }
     }
-    HttpResponse::json(
+    HttpResponse::success(
+        Some(&request_id),
         200,
         json!({
-            "request_id": query.request_id,
-            "agent_id": query.agent_id,
-            "session_id": query.session_id,
-            "domain": query.domain,
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "domain": "codegraph",
             "records": records,
             "snapshot": unix_ms().to_string(),
         }),
@@ -1170,7 +1471,7 @@ fn check_query_budget(
     budget: Option<Duration>,
 ) -> std::result::Result<(), ApiError> {
     if budget.is_some_and(|budget| started.elapsed() >= budget) {
-        return Err(ApiError::new(408, "timeout", "query budget expired"));
+        return Err(ApiError::query_timeout());
     }
     Ok(())
 }
@@ -1204,33 +1505,68 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
         Ok(registration) => registration,
         Err(error) => return HttpResponse::error(error),
     };
+    let request_id = match non_empty(registration.request_id.as_deref()) {
+        Some(id) => id.to_owned(),
+        None => return HttpResponse::error(ApiError::missing_field("request_id")),
+    };
+    let agent_id = match non_empty(registration.agent_id.as_deref()) {
+        Some(id) => id.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("agent_id"));
+        }
+    };
+    let session_id = match non_empty(registration.session_id.as_deref()) {
+        Some(id) => id.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("session_id"));
+        }
+    };
+    let agent_kind = match non_empty(registration.agent_kind.as_deref()) {
+        Some(kind) => kind.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("agent_kind"));
+        }
+    };
+    let project_scope = match non_empty(registration.project_scope.as_deref()) {
+        Some(scope) => scope.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::missing_field("project_scope"),
+            );
+        }
+    };
+
     let agent_status = AgentStatus {
-        agent_id: registration.agent_id.clone(),
-        session_id: registration.session_id.clone(),
-        agent_kind: registration.agent_kind.clone(),
-        project_scope: registration.project_scope.clone(),
+        agent_id: agent_id.clone(),
+        session_id: session_id.clone(),
+        agent_kind: agent_kind.clone(),
+        project_scope: project_scope.clone(),
         last_seen_unix_ms: unix_ms(),
     };
     if let Ok(mut agents) = state.agents.lock() {
         agents.insert(
-            AgentSessionKey::new(
-                registration.agent_id.clone(),
-                registration.session_id.clone(),
-            ),
+            AgentSessionKey::new(agent_id.clone(), session_id.clone()),
             agent_status,
         );
     } else {
-        return HttpResponse::error(ApiError::internal("agents lock poisoned"));
+        return HttpResponse::error_with_id(
+            &request_id,
+            ApiError::internal("agents lock poisoned"),
+        );
     }
 
-    let records = agent_registration_records(&registration);
-    let idempotency_key = stable_pair_key(
-        "agent-register",
-        &registration.agent_id,
-        &registration.session_id,
-    );
-    match enqueue_write(state, idempotency_key, records, &registration.request_id) {
-        Ok(response) => HttpResponse::json(
+    let reg = AgentRegisterFull {
+        agent_id,
+        session_id,
+        agent_kind,
+        project_scope,
+    };
+    let records = agent_registration_records(&reg);
+    let idempotency_key = stable_pair_key("agent-register", &reg.agent_id, &reg.session_id);
+    match enqueue_write(state, idempotency_key, records, &request_id) {
+        Ok(response) => HttpResponse::success(
+            Some(&request_id),
             200,
             json!({
                 "status": "registered",
@@ -1238,7 +1574,7 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
                 "node_kinds": ["Agent", "AgentSession"],
             }),
         ),
-        Err(error) => HttpResponse::error(error),
+        Err(error) => HttpResponse::error_with_id(&request_id, error),
     }
 }
 
@@ -1247,48 +1583,110 @@ fn handle_agent_heartbeat(request: &HttpRequest, state: &ServerState) -> HttpRes
         Ok(heartbeat) => heartbeat,
         Err(error) => return HttpResponse::error(error),
     };
-    let key = AgentSessionKey::new(heartbeat.agent_id, heartbeat.session_id);
+    let request_id = match non_empty(heartbeat.request_id.as_deref()) {
+        Some(id) => id.to_owned(),
+        None => return HttpResponse::error(ApiError::missing_field("request_id")),
+    };
+    let agent_id = match non_empty(heartbeat.agent_id.as_deref()) {
+        Some(id) => id.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("agent_id"));
+        }
+    };
+    let session_id = match non_empty(heartbeat.session_id.as_deref()) {
+        Some(id) => id.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("session_id"));
+        }
+    };
+    let key = AgentSessionKey::new(agent_id, session_id);
     let Ok(mut agents) = state.agents.lock() else {
-        return HttpResponse::error(ApiError::internal("agents lock poisoned"));
+        return HttpResponse::error_with_id(
+            &request_id,
+            ApiError::internal("agents lock poisoned"),
+        );
     };
     if let Some(agent) = agents.get_mut(&key) {
         agent.last_seen_unix_ms = unix_ms();
     }
     drop(agents);
-    HttpResponse::json(200, json!({ "status": "ok" }))
+    HttpResponse::success(Some(&request_id), 200, json!({ "status": "ok" }))
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     let envelope = match parse_json::<RequestEnvelope>(&request.body) {
         Ok(envelope) => envelope,
         Err(error) => return HttpResponse::error(error),
     };
-    let Some(idempotency_key) = envelope.idempotency_key.clone() else {
-        return HttpResponse::error(ApiError::bad_request("idempotency_key is required"));
+    let request_id = match non_empty(envelope.request_id.as_deref()) {
+        Some(id) => id.to_owned(),
+        None => return HttpResponse::error(ApiError::missing_field("request_id")),
     };
-    if envelope.agent_id.trim().is_empty() || envelope.session_id.trim().is_empty() {
-        return HttpResponse::error(ApiError::bad_request(
-            "agent_id and session_id are required",
-        ));
+    let agent_id = match non_empty(envelope.agent_id.as_deref()) {
+        Some(id) => id.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("agent_id"));
+        }
+    };
+    if non_empty(envelope.session_id.as_deref()).is_none() {
+        return HttpResponse::error_with_id(&request_id, ApiError::missing_field("session_id"));
     }
-    if envelope.domain.as_deref() != Some("codegraph") {
-        return HttpResponse::error(ApiError::bad_request("domain must be codegraph"));
+    let idempotency_key = match non_empty(envelope.idempotency_key.as_deref()) {
+        Some(key) => key.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::missing_field("idempotency_key"),
+            );
+        }
+    };
+    match non_empty(envelope.domain.as_deref()) {
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("domain"));
+        }
+        Some(d) if d != "codegraph" => {
+            return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
+        }
+        _ => {}
     }
-    if envelope.created_at.as_deref().is_none_or(str::is_empty) {
-        return HttpResponse::error(ApiError::bad_request("created_at is required"));
+    match envelope
+        .created_at
+        .as_deref()
+        .and_then(|s| non_empty(Some(s)))
+    {
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("created_at"));
+        }
+        Some(ts) if DateTime::parse_from_rfc3339(ts).is_err() => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::bad_request("created_at must be RFC 3339"),
+            );
+        }
+        _ => {}
+    }
+    if envelope.payload.is_null() {
+        return HttpResponse::error_with_id(&request_id, ApiError::missing_field("payload"));
     }
     let payload = match serde_json::from_value::<IngestPayload>(envelope.payload) {
         Ok(payload) => payload,
-        Err(error) => return HttpResponse::error(ApiError::bad_request(error.to_string())),
+        Err(error) => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::bad_request(error.to_string()),
+            );
+        }
     };
-    let scoped_idempotency_key =
-        scoped_idempotency_key(&envelope.agent_id, &envelope.session_id, &idempotency_key);
+    let scoped_key = scoped_idempotency_key(&agent_id, "jobs/ingest", &idempotency_key);
     let payload_hash = match records_hash(&payload.records) {
         Ok(hash) => hash,
-        Err(error) => return HttpResponse::error(ApiError::internal(error.to_string())),
+        Err(error) => {
+            return HttpResponse::error_with_id(&request_id, ApiError::internal(error.to_string()));
+        }
     };
 
-    let job_id = stable_job_id(&scoped_idempotency_key);
+    let job_id = stable_job_id(&scoped_key);
     let job = JobStatus {
         job_id: job_id.clone(),
         status: "queued".to_owned(),
@@ -1296,34 +1694,136 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         events: vec!["queued".to_owned()],
         payload_hash: payload_hash.clone(),
     };
+
+    // Check persisted idempotency first to handle post-restart replays.
+    let persisted = match state.idempotency.lock() {
+        Ok(store) => store.entries.get(&scoped_key).cloned(),
+        Err(_) => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::internal("idempotency lock poisoned"),
+            );
+        }
+    };
+    if let Some(entry) = persisted {
+        if entry.payload_hash() != payload_hash {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::conflict("idempotency key reused with different payload"),
+            );
+        }
+        // Rehydrate job into state.jobs so GET /v1/jobs/{id} works after restart.
+        match &entry {
+            IdempotencyEntry::Committed { response, .. } => {
+                if let Ok(mut jobs) = state.jobs.lock() {
+                    jobs.entry(job_id.clone()).or_insert_with(|| JobStatus {
+                        job_id: job_id.clone(),
+                        status: "completed".to_owned(),
+                        report: Some(response.clone()),
+                        events: vec![
+                            "queued".to_owned(),
+                            "started".to_owned(),
+                            "completed".to_owned(),
+                        ],
+                        payload_hash: payload_hash.clone(),
+                    });
+                }
+            }
+            IdempotencyEntry::Pending { records, .. } => {
+                if let Ok(mut jobs) = state.jobs.lock() {
+                    jobs.entry(job_id.clone()).or_insert_with(|| JobStatus {
+                        job_id: job_id.clone(),
+                        status: "queued".to_owned(),
+                        report: None,
+                        events: vec!["queued".to_owned()],
+                        payload_hash: payload_hash.clone(),
+                    });
+                }
+                // Recover the uncommitted write in the background.
+                let state_clone = state.clone();
+                let records_clone = records.clone();
+                let job_id_thread = job_id.clone();
+                let scoped_key_thread = scoped_key;
+                let request_id_thread = request_id.clone();
+                thread::spawn(move || {
+                    update_job(&state_clone, &job_id_thread, "running", "started", None);
+                    let response = enqueue_write(
+                        &state_clone,
+                        scoped_key_thread,
+                        records_clone,
+                        &request_id_thread,
+                    );
+                    match response {
+                        Ok(report) => update_job(
+                            &state_clone,
+                            &job_id_thread,
+                            "completed",
+                            "completed",
+                            Some(report),
+                        ),
+                        Err(error) => {
+                            let report = DaemonIngestResponse {
+                                attempted: 0,
+                                succeeded: 0,
+                                failed: 1,
+                                failures: vec![DaemonIngestFailure {
+                                    record_id: job_id_thread.clone(),
+                                    message: error.message,
+                                }],
+                                record_ids: Vec::new(),
+                                idempotent: false,
+                            };
+                            update_job(
+                                &state_clone,
+                                &job_id_thread,
+                                "failed",
+                                "failed",
+                                Some(report),
+                            );
+                        }
+                    }
+                });
+            }
+        }
+        return HttpResponse::success(
+            Some(&request_id),
+            200,
+            json!({ "job_id": job_id, "status": "queued" }),
+        );
+    }
+
     match state.jobs.lock() {
         Ok(mut jobs) => {
-            if let Some(job) = jobs.get(&job_id) {
-                if job.payload_hash != payload_hash {
-                    return HttpResponse::error(ApiError::conflict(
-                        "idempotency key reused with different payload",
-                    ));
+            if let Some(existing) = jobs.get(&job_id) {
+                if existing.payload_hash != payload_hash {
+                    return HttpResponse::error_with_id(
+                        &request_id,
+                        ApiError::conflict("idempotency key reused with different payload"),
+                    );
                 }
-                return HttpResponse::json(
-                    202,
-                    json!({ "job_id": job.job_id, "status": job.status }),
+                // Return the original accepted status, not the current mutable status.
+                return HttpResponse::success(
+                    Some(&request_id),
+                    200,
+                    json!({ "job_id": existing.job_id, "status": "queued" }),
                 );
             }
             jobs.insert(job_id.clone(), job);
         }
-        Err(_) => return HttpResponse::error(ApiError::internal("jobs lock poisoned")),
+        Err(_) => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::internal("jobs lock poisoned"),
+            );
+        }
     }
 
     let state = state.clone();
     let job_id_for_thread = job_id.clone();
+    let request_id_for_thread = request_id.clone();
     thread::spawn(move || {
         update_job(&state, &job_id_for_thread, "running", "started", None);
-        let response = enqueue_write(
-            &state,
-            scoped_idempotency_key,
-            payload.records,
-            &envelope.request_id,
-        );
+        let response = enqueue_write(&state, scoped_key, payload.records, &request_id_for_thread);
         match response {
             Ok(report) => update_job(
                 &state,
@@ -1349,7 +1849,11 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         }
     });
 
-    HttpResponse::json(202, json!({ "job_id": job_id, "status": "queued" }))
+    HttpResponse::success(
+        Some(&request_id),
+        202,
+        json!({ "job_id": job_id, "status": "queued" }),
+    )
 }
 
 fn handle_get_job(path: &str, state: &ServerState) -> HttpResponse {
@@ -1363,13 +1867,13 @@ fn handle_get_job(path: &str, state: &ServerState) -> HttpResponse {
     let Some(job) = jobs.get(job_id) else {
         return HttpResponse::error(ApiError::not_found("job not found"));
     };
-    let response = if events_only {
-        HttpResponse::json(200, json!({ "job_id": job.job_id, "events": job.events }))
+    let result = if events_only {
+        json!({ "job_id": job.job_id, "events": job.events })
     } else {
-        HttpResponse::json(200, json!(job))
+        json!(job)
     };
     drop(jobs);
-    response
+    HttpResponse::success(None, 200, result)
 }
 
 fn handle_checkpoint(state: &ServerState) -> HttpResponse {
@@ -1377,7 +1881,7 @@ fn handle_checkpoint(state: &ServerState) -> HttpResponse {
         return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
     };
     match sink.persist_indexes() {
-        Ok(()) => HttpResponse::json(200, json!({ "status": "checkpointed" })),
+        Ok(()) => HttpResponse::success(None, 200, json!({ "status": "checkpointed" })),
         Err(error) => HttpResponse::error(ApiError::internal(error.to_string())),
     }
 }
@@ -1426,7 +1930,7 @@ fn update_job(
     }
 }
 
-fn agent_registration_records(registration: &AgentRegisterRequest) -> Vec<GraphRecord> {
+fn agent_registration_records(registration: &AgentRegisterFull) -> Vec<GraphRecord> {
     let agent_node_id = stable_id(&["node", "agent", &registration.agent_id]);
     let session_node_id = stable_id(&[
         "node",
@@ -1529,12 +2033,6 @@ fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequ
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_default();
-    if content_length > REQUEST_LIMIT {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "request body too large",
-        ));
-    }
     if !headers_authorized(&headers, token) {
         return Ok(HttpRequest {
             method,
@@ -1542,6 +2040,12 @@ fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequ
             headers,
             body: Vec::new(),
         });
+    }
+    if content_length > REQUEST_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request body too large",
+        ));
     }
     let body_start = header_end + 4;
     let mut body = buffer[body_start..].to_vec();
@@ -1731,16 +2235,8 @@ fn stable_job_id(scoped_idempotency_key: &str) -> String {
     )
 }
 
-fn scoped_idempotency_key(agent_id: &str, session_id: &str, idempotency_key: &str) -> String {
-    stable_triple_key("idempotency", agent_id, session_id, idempotency_key)
-}
-
-fn stable_pair_key(prefix: &str, left: &str, right: &str) -> String {
-    let mut key = String::with_capacity(prefix.len() + left.len() + right.len() + 32);
-    let _ = write!(&mut key, "{prefix}:{}:{}:", left.len(), right.len());
-    key.push_str(left);
-    key.push_str(right);
-    key
+fn scoped_idempotency_key(agent_id: &str, route: &str, idempotency_key: &str) -> String {
+    stable_triple_key("idempotency", agent_id, route, idempotency_key)
 }
 
 fn stable_triple_key(prefix: &str, first: &str, second: &str, third: &str) -> String {
@@ -1756,6 +2252,14 @@ fn stable_triple_key(prefix: &str, first: &str, second: &str, third: &str) -> St
     key.push_str(first);
     key.push_str(second);
     key.push_str(third);
+    key
+}
+
+fn stable_pair_key(prefix: &str, left: &str, right: &str) -> String {
+    let mut key = String::with_capacity(prefix.len() + left.len() + right.len() + 32);
+    let _ = write!(&mut key, "{prefix}:{}:{}:", left.len(), right.len());
+    key.push_str(left);
+    key.push_str(right);
     key
 }
 
@@ -1819,6 +2323,10 @@ mod tests {
             .write()
             .map_err(|_| anyhow!("embedded sink lock poisoned"))?;
         let (write_tx, _write_rx) = mpsc::sync_channel(1);
+        let idempotency_path = temp.path().join("idempotency.json");
+        let idempotency = Arc::new(Mutex::new(
+            IdempotencyStore::load(idempotency_path).context("idempotency store")?,
+        ));
         let state = ServerState {
             token: "test-token".to_owned(),
             store_identity: store_identity_text(temp.path()),
@@ -1826,6 +2334,7 @@ mod tests {
             write_tx,
             jobs: Arc::new(Mutex::new(BTreeMap::new())),
             agents: Arc::new(Mutex::new(BTreeMap::new())),
+            idempotency,
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         let request = HttpRequest {
@@ -1836,8 +2345,10 @@ mod tests {
                 "request_id": "locked-query",
                 "agent_id": "test-agent",
                 "session_id": "test-session",
-                "timeout_ms": 1_u64,
-                "record_ids": ["codegraph:v1:missing"]
+                "payload": {
+                    "budget": { "timeout_ms": 1_u64 },
+                    "record_ids": ["codegraph:v1:missing"]
+                }
             }))?,
         };
 
