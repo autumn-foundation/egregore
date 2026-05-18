@@ -63,6 +63,59 @@ fn foreground_daemon_status_stop_and_requires_auth() {
 }
 
 #[test]
+fn daemon_status_rejects_copied_metadata_for_another_data_dir() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let first_data_dir = temp.path().join("first-store");
+    let second_data_dir = temp.path().join("second-store");
+    let mut daemon = start_daemon(&second_data_dir);
+    let second_metadata_path = runtime_dir(&second_data_dir).join("egregored.json");
+    let first_metadata_path = runtime_dir(&first_data_dir).join("egregored.json");
+    let second_metadata = fs::read_to_string(&second_metadata_path)
+        .expect("second daemon metadata should be readable");
+    fs::create_dir_all(
+        first_metadata_path
+            .parent()
+            .expect("first metadata should have a parent"),
+    )
+    .expect("first runtime dir should be created");
+    fs::write(&first_metadata_path, second_metadata)
+        .expect("copied daemon metadata should be written");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("daemon")
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&first_data_dir)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("daemon not running"));
+
+    daemon.stop();
+}
+
+#[test]
+fn daemon_stop_does_not_wait_for_slow_request_headers() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let mut stream =
+        TcpStream::connect(&metadata.address).expect("slow request connection should open");
+    stream
+        .write_all(b"POST /v1/status HTTP/1.1\r\nHost: egregore\r\n")
+        .expect("partial request should write");
+    thread::sleep(Duration::from_millis(100));
+
+    let started = Instant::now();
+    daemon.stop();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "daemon shutdown should not wait for a trickling request"
+    );
+}
+
+#[test]
 fn second_daemon_for_same_data_dir_fails() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");

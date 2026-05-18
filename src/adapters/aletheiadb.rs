@@ -225,6 +225,30 @@ impl EmbeddedAletheiaSink {
         self.node_lookup.candidate_count(record_id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn edge_observation_count_for_test(&self, record_id: &str) -> usize {
+        let mut count = 0;
+        for node_id in self.db.get_all_node_ids() {
+            for edge_id in self.db.get_outgoing_edges(node_id) {
+                if self
+                    .db
+                    .get_edge(edge_id)
+                    .ok()
+                    .and_then(|edge| {
+                        edge.get_property("codegraph_id")
+                            .and_then(::aletheiadb::PropertyValue::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some(record_id)
+                {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     pub(crate) fn expected_record_state(
         &self,
         record: &GraphRecord,
@@ -542,6 +566,10 @@ impl EmbeddedAletheiaSink {
     }
 
     fn write_edge(&mut self, record: &GraphRecord) -> AdapterResult<()> {
+        if self.expected_record_state(record)? == ExpectedRecordState::Matched {
+            return Ok(());
+        }
+
         let GraphRecord::Edge {
             id,
             schema_version,

@@ -38,6 +38,7 @@ const DEFAULT_PORT: u16 = 37_383;
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_LIMIT: usize = 1024 * 1024 * 32;
 
 /// Configuration for launching the daemon.
@@ -569,7 +570,7 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
 #[must_use]
 pub fn active_metadata(data_dir: &Path) -> Option<DaemonMetadata> {
     let metadata = read_metadata(data_dir).ok()?;
-    let client = DaemonClient::new(metadata.clone());
+    let client = DaemonClient::for_data_dir(metadata.clone(), data_dir);
     client.health().ok()?;
     Some(metadata)
 }
@@ -582,7 +583,7 @@ pub fn active_metadata(data_dir: &Path) -> Option<DaemonMetadata> {
 pub fn stop(data_dir: &Path) -> Result<()> {
     let metadata = read_metadata(data_dir)
         .with_context(|| format!("no daemon metadata found for {}", data_dir.display()))?;
-    let client = DaemonClient::new(metadata);
+    let client = DaemonClient::for_data_dir(metadata, data_dir);
     if let Err(error) = client.shutdown() {
         if active_metadata(data_dir).is_none() {
             if remove_metadata_if_store_unleased(data_dir)? {
@@ -602,13 +603,25 @@ pub fn stop(data_dir: &Path) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
     metadata: DaemonMetadata,
+    expected_store_identity: String,
 }
 
 impl DaemonClient {
     /// Creates a client from daemon metadata.
     #[must_use]
-    pub const fn new(metadata: DaemonMetadata) -> Self {
-        Self { metadata }
+    pub fn new(metadata: DaemonMetadata) -> Self {
+        let expected_store_identity = store_identity_text(&metadata.data_dir);
+        Self {
+            metadata,
+            expected_store_identity,
+        }
+    }
+
+    fn for_data_dir(metadata: DaemonMetadata, data_dir: &Path) -> Self {
+        Self {
+            metadata,
+            expected_store_identity: store_identity_text(data_dir),
+        }
     }
 
     /// Loads metadata from a data directory.
@@ -617,7 +630,7 @@ impl DaemonClient {
     ///
     /// Returns an error if the daemon metadata cannot be read.
     pub fn from_data_dir(data_dir: &Path) -> Result<Self> {
-        Ok(Self::new(read_metadata(data_dir)?))
+        Ok(Self::for_data_dir(read_metadata(data_dir)?, data_dir))
     }
 
     /// Sends graph records to the daemon.
@@ -666,12 +679,11 @@ impl DaemonClient {
         if status == 200 {
             let body = serde_json::from_str::<serde_json::Value>(&body)
                 .context("failed to parse daemon health response")?;
-            let expected_data_dir = store_identity_text(&self.metadata.data_dir);
             if body.get("status").and_then(serde_json::Value::as_str) == Some("ok")
                 && body.get("version").and_then(serde_json::Value::as_str)
                     == Some(env!("CARGO_PKG_VERSION"))
                 && body.get("data_dir").and_then(serde_json::Value::as_str)
-                    == Some(expected_data_dir.as_str())
+                    == Some(self.expected_store_identity.as_str())
             {
                 Ok(())
             } else {
@@ -1428,10 +1440,11 @@ fn headers_authorized(headers: &HashMap<String, String>, token: &str) -> bool {
 }
 
 fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequest> {
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let started = Instant::now();
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 1024];
     let header_end = loop {
+        set_request_read_timeout(stream, started)?;
         let read = stream.read(&mut chunk)?;
         if read == 0 {
             return Err(io::Error::new(
@@ -1491,6 +1504,7 @@ fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequ
     let body_start = header_end + 4;
     let mut body = buffer[body_start..].to_vec();
     while body.len() < content_length {
+        set_request_read_timeout(stream, started)?;
         let read = stream.read(&mut chunk)?;
         if read == 0 {
             return Err(io::Error::new(
@@ -1507,6 +1521,18 @@ fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequ
         headers,
         body,
     })
+}
+
+fn set_request_read_timeout(stream: &TcpStream, started: Instant) -> io::Result<()> {
+    let remaining = REQUEST_READ_TIMEOUT
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(request_read_timed_out)?;
+    stream.set_read_timeout(Some(remaining))
+}
+
+fn request_read_timed_out() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "request read timed out")
 }
 
 fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> io::Result<()> {
@@ -1667,6 +1693,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_read_uses_total_deadline_for_slow_headers() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").context("test listener should bind")?;
+        let address = listener
+            .local_addr()
+            .context("test listener should have a local address")?;
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client should connect");
+            let started = Instant::now();
+            let result = read_http_request(&mut stream, "test-token");
+            (started.elapsed(), result.map_err(|error| error.kind()))
+        });
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("client should connect");
+            for byte in b"POST /v1/" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(400));
+            }
+        });
+
+        let (elapsed, result) = server
+            .join()
+            .expect("server request reader should finish cleanly");
+        client
+            .join()
+            .expect("slow client writer should finish cleanly");
+
+        assert!(
+            matches!(result, Err(io::ErrorKind::TimedOut)),
+            "slow request should time out, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "slow request headers should be bounded by a total read deadline"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn query_timeout_includes_waiting_for_sink_read_lock() -> Result<()> {
         let temp = tempfile::tempdir().context("temp dir should be created")?;
         let sink = Arc::new(RwLock::new(
@@ -1750,6 +1816,69 @@ mod tests {
                 sink.node_observation_count_for_test("codegraph:v1:cross-key-current-node"),
                 1
             );
+            drop(sink);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cross_key_exact_edge_replay_does_not_duplicate_observation() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let sink = Arc::new(RwLock::new(
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?,
+        ));
+        let idempotency = Arc::new(Mutex::new(IdempotencyStore {
+            path: temp.path().join("idempotency.json"),
+            entries: BTreeMap::new(),
+        }));
+        let file_id = "codegraph:v1:cross-key-edge-file".to_owned();
+        let symbol_id = "codegraph:v1:cross-key-edge-symbol".to_owned();
+        let edge = GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id.clone(),
+            symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "same current edge".to_owned(),
+        );
+        let records = vec![
+            GraphRecord::node(
+                file_id,
+                NodeKind::File,
+                Some("src/lib.rs".to_owned()),
+                None,
+                Some("src/lib.rs".to_owned()),
+                "file endpoint".to_owned(),
+            ),
+            GraphRecord::node(
+                symbol_id,
+                NodeKind::Symbol,
+                Some("src/lib.rs".to_owned()),
+                None,
+                Some("stable".to_owned()),
+                "symbol endpoint".to_owned(),
+            ),
+            edge.clone(),
+        ];
+
+        for idempotency_key in ["first-key", "second-key"] {
+            let (response_tx, response_rx) = mpsc::channel();
+            let command = WriteCommand {
+                idempotency_key: idempotency_key.to_owned(),
+                payload_hash: records_hash(&records)?,
+                records: records.clone(),
+                response_tx,
+            };
+            let response = apply_write(&command, &sink, &idempotency)
+                .map_err(|error| anyhow!(error.message))?;
+            assert_eq!(response.succeeded, 3);
+            drop(response_rx);
+        }
+
+        {
+            let sink = sink
+                .read()
+                .map_err(|_| anyhow!("embedded sink lock poisoned"))?;
+            assert_eq!(sink.edge_observation_count_for_test(edge.id()), 1);
             drop(sink);
         }
         Ok(())
