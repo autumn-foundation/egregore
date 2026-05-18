@@ -104,6 +104,117 @@ fn fixture_graph_with_temporal_symbols() -> (tempfile::TempDir, PathBuf) {
     (temp, path)
 }
 
+/// Fixture for Fix #1: two different symbols at commits sharing a prefix.
+/// `scan_repository` at `aaaa0000...`, `other_fn` at `aaaa1111...`
+fn fixture_graph_with_cross_symbol_commits() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("cross.jsonl");
+
+    let sym_a = GraphRecord::symbol(
+        stable_id(&["node", "Symbol", "src/lib.rs", "scan_repository", "aaaa0"]),
+        "fn",
+        "src/lib.rs".to_owned(),
+        span(10, 20),
+        "scan_repository".to_owned(),
+        "scan_repository at aaaa0000".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "aaaa000000000000".to_owned(),
+        git_parent_commits: vec![],
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: None,
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+    });
+
+    let sym_b = GraphRecord::symbol(
+        stable_id(&["node", "Symbol", "src/lib.rs", "other_fn", "aaaa1"]),
+        "fn",
+        "src/lib.rs".to_owned(),
+        span(30, 40),
+        "other_fn".to_owned(),
+        "other_fn at aaaa1111".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "aaaa111111111111".to_owned(),
+        git_parent_commits: vec![],
+        valid_time: "2026-01-02T00:00:00Z".to_owned(),
+        author_time: None,
+        observed_at: "2026-01-02T00:00:00Z".to_owned(),
+    });
+
+    let mut graph = Graph::new();
+    graph.push(sym_a);
+    graph.push(sym_b);
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+
+    (temp, path)
+}
+
+/// Fixture for Fix #3: nested symbol (file→module→symbol) with no direct file→symbol edge.
+fn fixture_graph_with_nested_symbol() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("nested.jsonl");
+
+    let file_id = stable_id(&["node", "File", "src/lib.rs"]);
+    let mod_id = stable_id(&["node", "Module", "src/lib.rs", "MyModule"]);
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "nested_fn"]);
+
+    let file_node = GraphRecord::syntax_node(
+        file_id.clone(),
+        NodeKind::File,
+        "src/lib.rs".to_owned(),
+        span(1, 100),
+        "lib.rs".to_owned(),
+        "rust",
+        "Source file".to_owned(),
+    );
+    let mod_node = GraphRecord::syntax_node(
+        mod_id.clone(),
+        NodeKind::Module,
+        "src/lib.rs".to_owned(),
+        span(5, 80),
+        "MyModule".to_owned(),
+        "rust",
+        "Module MyModule".to_owned(),
+    );
+    let sym_node = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        span(10, 20),
+        "nested_fn".to_owned(),
+        "nested function".to_owned(),
+    );
+    // file→module DEFINES edge (but NOT file→symbol)
+    let edge_file_mod = GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id,
+        mod_id.clone(),
+        Some("1.0".to_owned()),
+        "file defines module".to_owned(),
+    );
+    // module→symbol DEFINES edge
+    let edge_mod_sym = GraphRecord::edge(
+        EdgeLabel::Defines,
+        mod_id,
+        sym_id,
+        Some("1.0".to_owned()),
+        "module defines symbol".to_owned(),
+    );
+
+    let mut graph = Graph::new();
+    graph.push(file_node);
+    graph.push(mod_node);
+    graph.push(sym_node);
+    graph.push(edge_file_mod);
+    graph.push(edge_mod_sym);
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+
+    (temp, path)
+}
+
 fn fixture_graph_with_drift() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("temp dir");
     let path = temp.path().join("drift.jsonl");
@@ -689,4 +800,50 @@ fn eg_alias_query_symbol_works() {
         .arg(&graph)
         .assert()
         .success();
+}
+
+// ---------------------------------------------------------------------------
+// Fix #1: ambiguous prefix must be checked across ALL temporal records
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_symbol_at_ambiguous_when_prefix_matches_commits_from_other_symbols() {
+    let (_temp, graph) = fixture_graph_with_cross_symbol_commits();
+
+    // prefix "aaaa" matches both "aaaa000000000000" (scan_repository)
+    // and "aaaa111111111111" (other_fn) → must be flagged as ambiguous
+    egregore()
+        .args(["query", "symbol", "scan_repository", "--graph"])
+        .arg(&graph)
+        .args(["--at", "aaaa"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ambiguous commit prefix"));
+}
+
+// ---------------------------------------------------------------------------
+// Fix #3: query file must return nested symbols (not only direct DEFINES targets)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_file_returns_nested_symbols_not_directly_defined_by_file() {
+    let (_temp, graph) = fixture_graph_with_nested_symbol();
+
+    let output = egregore()
+        .args(["query", "file", "src/lib.rs", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    assert!(!stdout.trim().is_empty(), "should have output lines");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("first line")).expect("valid JSON");
+    assert_eq!(parsed["name"], "nested_fn");
+    assert_eq!(parsed["kind"], "Symbol");
+    assert_eq!(parsed["repo_relative_path"], "src/lib.rs");
 }

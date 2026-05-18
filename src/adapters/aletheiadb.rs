@@ -204,11 +204,40 @@ impl EmbeddedAletheiaSink {
     ///
     /// Returns an error when the embedded store cannot read a node or edge.
     pub fn read_all_records(&self) -> AdapterResult<Vec<GraphRecord>> {
-        let mut records =
-            Vec::with_capacity(self.node_lookup.latest.len() + self.tombstone_ids.len());
+        // Fix #4: collect deleted_ids from tombstones so we can skip tombstoned nodes
+        let mut deleted_ids = std::collections::BTreeSet::new();
+        for &node_id in self.tombstone_ids.values() {
+            let node = self
+                .db
+                .get_node(node_id)
+                .map_err(|error| read_back_error("read_all_records", error.to_string()))?;
+            if let Some(deleted_id) = optional_str_property(
+                "read_all_records",
+                "deleted_id",
+                node.get_property("deleted_id"),
+            )? {
+                deleted_ids.insert(deleted_id);
+            }
+        }
 
-        for (record_id, candidate) in &self.node_lookup.latest {
-            records.push(self.read_node_record(record_id, candidate.storage_id)?);
+        let mut records = Vec::new();
+
+        // Fix #2: iterate all temporal observations (by_commit) instead of just latest
+        for (record_id, commits) in &self.node_lookup.by_commit {
+            if deleted_ids.contains(record_id.as_str()) {
+                continue;
+            }
+            for candidate in commits.values() {
+                records.push(self.read_node_record(record_id, candidate.storage_id)?);
+            }
+        }
+
+        // Non-temporal nodes (not present in by_commit)
+        for (record_id, &node_id) in &self.node_lookup.non_temporal {
+            if deleted_ids.contains(record_id.as_str()) {
+                continue;
+            }
+            records.push(self.read_node_record(record_id, node_id)?);
         }
 
         for (record_id, &node_id) in &self.tombstone_ids {

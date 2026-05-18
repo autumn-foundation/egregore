@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::{
     adapters::{DryRunSink, ingest_records, records_from_jsonl},
-    ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan},
+    ir::{GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan},
     query, scan_repository, scan_repository_history,
 };
 
@@ -554,7 +554,7 @@ fn query_symbol_at(
 ) -> Result<()> {
     let matching_commits: std::collections::BTreeSet<&str> = records
         .iter()
-        .filter_map(|r| symbol_commit_if_named(r, name, prefix))
+        .filter_map(|r| temporal_commit_if_prefix(r, prefix))
         .collect();
 
     if matching_commits.len() > 1 {
@@ -579,24 +579,16 @@ fn query_symbol_at(
     Ok(())
 }
 
-fn symbol_commit_if_named<'a>(
-    record: &'a GraphRecord,
-    name: &str,
-    prefix: &str,
-) -> Option<&'a str> {
-    let GraphRecord::Node {
-        kind: NodeKind::Symbol,
-        name: node_name,
-        temporal,
-        ..
-    } = record
-    else {
-        return None;
+fn temporal_commit_if_prefix<'a>(record: &'a GraphRecord, prefix: &str) -> Option<&'a str> {
+    let commit = match record {
+        GraphRecord::Node {
+            temporal: Some(t), ..
+        }
+        | GraphRecord::Edge {
+            temporal: Some(t), ..
+        } => t.git_commit.as_str(),
+        _ => return None,
     };
-    if node_name.as_deref() != Some(name) {
-        return None;
-    }
-    let commit = temporal.as_ref()?.git_commit.as_str();
     if commit.starts_with(prefix) {
         Some(commit)
     } else {
@@ -609,47 +601,22 @@ fn symbol_commit_if_named<'a>(
 // ---------------------------------------------------------------------------
 
 fn query_file(records: &[GraphRecord], path: &str, format: OutputFormat) -> Result<()> {
-    let file_id = records.iter().find_map(|r| {
+    let file_exists = records.iter().any(|r| {
         let GraphRecord::Node {
-            id,
             kind: NodeKind::File,
             repo_relative_path,
             ..
         } = r
         else {
-            return None;
+            return false;
         };
-        if repo_relative_path.as_deref() == Some(path) {
-            Some(id.as_str())
-        } else {
-            None
-        }
+        repo_relative_path.as_deref() == Some(path)
     });
 
-    let Some(file_id) = file_id else {
+    if !file_exists {
         eprintln!("error: no match found for file `{path}`");
         std::process::exit(2);
-    };
-
-    let defined_ids: Vec<&str> = records
-        .iter()
-        .filter_map(|r| {
-            let GraphRecord::Edge {
-                label: EdgeLabel::Defines,
-                source,
-                target,
-                ..
-            } = r
-            else {
-                return None;
-            };
-            if source.as_str() == file_id {
-                Some(target.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
+    }
 
     let mut results: Vec<SymbolResult<'_>> = records
         .iter()
@@ -666,7 +633,7 @@ fn query_file(records: &[GraphRecord], path: &str, format: OutputFormat) -> Resu
             else {
                 return None;
             };
-            if !defined_ids.contains(&id.as_str()) {
+            if repo_relative_path.as_deref() != Some(path) {
                 return None;
             }
             Some(SymbolResult {
