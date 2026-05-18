@@ -18,6 +18,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use chrono::DateTime;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -399,6 +400,7 @@ struct ApiError {
     message: String,
     field: Option<String>,
     retry_after_ms: Option<u64>,
+    partial_result: Option<bool>,
 }
 
 impl ApiError {
@@ -409,6 +411,7 @@ impl ApiError {
             message: message.into(),
             field: None,
             retry_after_ms: None,
+            partial_result: None,
         }
     }
 
@@ -420,6 +423,7 @@ impl ApiError {
             message: format!("required field is missing: {field}"),
             field: Some(field),
             retry_after_ms: None,
+            partial_result: None,
         }
     }
 
@@ -460,6 +464,7 @@ impl ApiError {
             message: "write queue is full".into(),
             field: None,
             retry_after_ms: Some(500),
+            partial_result: None,
         }
     }
 
@@ -470,11 +475,19 @@ impl ApiError {
             message: "daemon is shutting down".into(),
             field: None,
             retry_after_ms: Some(2_000),
+            partial_result: None,
         }
     }
 
     fn query_timeout() -> Self {
-        Self::new(ErrorCode::QueryTimeout, "query budget expired")
+        Self {
+            status: 408,
+            code: ErrorCode::QueryTimeout,
+            message: "query budget expired".into(),
+            field: None,
+            retry_after_ms: None,
+            partial_result: Some(false),
+        }
     }
 
     fn internal(message: impl Into<String>) -> Self {
@@ -541,6 +554,7 @@ fn build_error_envelope(request_id: Option<&str>, error: ApiError) -> serde_json
         message,
         field,
         retry_after_ms,
+        partial_result,
         ..
     } = error;
     let mut error_obj = json!({
@@ -552,6 +566,9 @@ fn build_error_envelope(request_id: Option<&str>, error: ApiError) -> serde_json
     }
     if let Some(ms) = retry_after_ms {
         error_obj["retry_after_ms"] = serde_json::Value::Number(ms.into());
+    }
+    if let Some(pr) = partial_result {
+        error_obj["partial_result"] = serde_json::Value::Bool(pr);
     }
     json!({
         "ok": false,
@@ -859,7 +876,7 @@ impl DaemonClient {
             "session_id": session_id,
             "idempotency_key": idempotency_key,
             "domain": "codegraph",
-            "created_at": unix_ms().to_string(),
+            "created_at": chrono::Utc::now().to_rfc3339(),
             "payload": { "records": records },
         });
         let (status, body) = self.request(
@@ -1291,12 +1308,9 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("agent_id"));
         }
     };
-    let session_id = match non_empty(envelope.session_id.as_deref()) {
-        Some(id) => id.to_owned(),
-        None => {
-            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("session_id"));
-        }
-    };
+    if non_empty(envelope.session_id.as_deref()).is_none() {
+        return HttpResponse::error_with_id(&request_id, ApiError::missing_field("session_id"));
+    }
     let idempotency_key = match non_empty(envelope.idempotency_key.as_deref()) {
         Some(key) => key.to_owned(),
         None => {
@@ -1315,8 +1329,17 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         }
         _ => {}
     }
-    if non_empty(envelope.created_at.as_deref()).is_none() {
-        return HttpResponse::error_with_id(&request_id, ApiError::missing_field("created_at"));
+    match envelope.created_at.as_deref().and_then(|s| non_empty(Some(s))) {
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("created_at"));
+        }
+        Some(ts) if DateTime::parse_from_rfc3339(ts).is_err() => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::bad_request("created_at must be RFC 3339"),
+            );
+        }
+        _ => {}
     }
     if envelope.payload.is_null() {
         return HttpResponse::error_with_id(&request_id, ApiError::missing_field("payload"));
@@ -1330,7 +1353,7 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             );
         }
     };
-    let scoped_key = scoped_idempotency_key(&agent_id, &session_id, "records/ingest", &idempotency_key);
+    let scoped_key = scoped_idempotency_key(&agent_id, "records/ingest", &idempotency_key);
     match enqueue_write(state, scoped_key, payload.records, &request_id) {
         Ok(response) => HttpResponse::success(&request_id, 200, json!(response)),
         Err(error) => HttpResponse::error_with_id(&request_id, error),
@@ -1593,12 +1616,9 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("agent_id"));
         }
     };
-    let session_id = match non_empty(envelope.session_id.as_deref()) {
-        Some(id) => id.to_owned(),
-        None => {
-            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("session_id"));
-        }
-    };
+    if non_empty(envelope.session_id.as_deref()).is_none() {
+        return HttpResponse::error_with_id(&request_id, ApiError::missing_field("session_id"));
+    }
     let idempotency_key = match non_empty(envelope.idempotency_key.as_deref()) {
         Some(key) => key.to_owned(),
         None => {
@@ -1617,8 +1637,17 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         }
         _ => {}
     }
-    if non_empty(envelope.created_at.as_deref()).is_none() {
-        return HttpResponse::error_with_id(&request_id, ApiError::missing_field("created_at"));
+    match envelope.created_at.as_deref().and_then(|s| non_empty(Some(s))) {
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("created_at"));
+        }
+        Some(ts) if DateTime::parse_from_rfc3339(ts).is_err() => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::bad_request("created_at must be RFC 3339"),
+            );
+        }
+        _ => {}
     }
     if envelope.payload.is_null() {
         return HttpResponse::error_with_id(&request_id, ApiError::missing_field("payload"));
@@ -1632,7 +1661,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
             );
         }
     };
-    let scoped_key = scoped_idempotency_key(&agent_id, &session_id, "jobs/ingest", &idempotency_key);
+    let scoped_key = scoped_idempotency_key(&agent_id, "jobs/ingest", &idempotency_key);
     let payload_hash = match records_hash(&payload.records) {
         Ok(hash) => hash,
         Err(error) => {
@@ -2090,26 +2119,23 @@ fn stable_job_id(scoped_idempotency_key: &str) -> String {
     )
 }
 
-fn scoped_idempotency_key(agent_id: &str, session_id: &str, route: &str, idempotency_key: &str) -> String {
-    stable_quad_key("idempotency", agent_id, session_id, route, idempotency_key)
+fn scoped_idempotency_key(agent_id: &str, route: &str, idempotency_key: &str) -> String {
+    stable_triple_key("idempotency", agent_id, route, idempotency_key)
 }
 
-fn stable_quad_key(prefix: &str, first: &str, second: &str, third: &str, fourth: &str) -> String {
-    let mut key = String::with_capacity(
-        prefix.len() + first.len() + second.len() + third.len() + fourth.len() + 64,
-    );
+fn stable_triple_key(prefix: &str, first: &str, second: &str, third: &str) -> String {
+    let mut key =
+        String::with_capacity(prefix.len() + first.len() + second.len() + third.len() + 48);
     let _ = write!(
         &mut key,
-        "{prefix}:{}:{}:{}:{}:",
+        "{prefix}:{}:{}:{}:",
         first.len(),
         second.len(),
-        third.len(),
-        fourth.len()
+        third.len()
     );
     key.push_str(first);
     key.push_str(second);
     key.push_str(third);
-    key.push_str(fourth);
     key
 }
 
