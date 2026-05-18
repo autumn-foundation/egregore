@@ -232,12 +232,6 @@ fn ingest(
         #[cfg(feature = "embedded-aletheiadb")]
         IngestAdapter::Embedded => {
             let data_dir = data_dir.map_or_else(|| PathBuf::from(".egregore"), Path::to_path_buf);
-            let _lease = crate::daemon::StoreLease::acquire(&data_dir).with_context(|| {
-                format!(
-                    "embedded store is already leased {}; use --adapter daemon",
-                    data_dir.display()
-                )
-            })?;
             let mut sink = EmbeddedAletheiaSink::open(&data_dir)
                 .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
             let report = ingest_records(&records, &mut sink);

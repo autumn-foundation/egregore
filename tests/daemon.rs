@@ -12,8 +12,9 @@ use std::{
 };
 
 use aletheia_egregore::{
+    adapters::EmbeddedAletheiaSink,
     daemon::{DaemonClient, DaemonMetadata as ClientDaemonMetadata, StoreLease},
-    ir::{GraphRecord, NodeKind, TemporalMetadata},
+    ir::{EdgeLabel, GraphRecord, NodeKind, TemporalMetadata},
 };
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -100,6 +101,20 @@ fn store_lease_uses_canonical_data_dir_identity() {
     assert!(
         alias_attempt.is_err(),
         "alias path should contend for the same physical store lease"
+    );
+}
+
+#[test]
+fn public_embedded_sink_respects_store_lease() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let _lease = StoreLease::acquire(&data_dir).expect("test should hold store lease");
+
+    let result = EmbeddedAletheiaSink::open(&data_dir);
+
+    assert!(
+        result.is_err(),
+        "public embedded sink open should not bypass an active store lease"
     );
 }
 
@@ -230,6 +245,65 @@ fn daemon_status_rejects_wrong_service_health_response() {
         .expect("metadata should serialize"),
     )
     .expect("wrong-service metadata should write");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("daemon")
+        .arg("status")
+        .arg("--data-dir")
+        .arg(temp.path().join("store"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("daemon not running"));
+    listener_thread
+        .join()
+        .expect("listener thread should finish");
+}
+
+#[test]
+fn daemon_status_rejects_same_version_wrong_store_health_response() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let runtime_dir = runtime_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral port should bind");
+    let address = listener
+        .local_addr()
+        .expect("ephemeral address should exist")
+        .to_string();
+    let wrong_data_dir = temp.path().join("other-store");
+    let response_body = serde_json::to_vec(&serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "data_dir": wrong_data_dir
+    }))
+    .expect("health body should serialize");
+    let listener_thread = thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            String::from_utf8(response_body).expect("health body should be utf8")
+        );
+        let _ = stream.write_all(response.as_bytes());
+    });
+    fs::write(
+        runtime_dir.join("egregored.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "pid": 999_993,
+            "address": address,
+            "token": "wrong-store-token",
+            "data_dir": data_dir,
+            "version": "test",
+            "started_at_unix_ms": 0_u64
+        }))
+        .expect("metadata should serialize"),
+    )
+    .expect("wrong-store metadata should write");
 
     Command::cargo_bin("egregore")
         .expect("binary should run")
@@ -1001,6 +1075,56 @@ fn daemon_rejects_identical_fresh_duplicate_current_record_ids_before_commit() {
         read_response.contains("\"record\":null"),
         "identical duplicate rejection should happen before committing either record"
     );
+
+    daemon.stop();
+}
+
+#[test]
+fn daemon_rejects_identical_duplicate_edge_observations_before_commit() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("duplicate-edge-fresh.jsonl");
+    let file_id = "codegraph:v1:duplicate-edge-file".to_owned();
+    let symbol_id = "codegraph:v1:duplicate-edge-symbol".to_owned();
+    let file = GraphRecord::node(
+        file_id.clone(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("src/lib.rs".to_owned()),
+        "file".to_owned(),
+    );
+    let symbol = GraphRecord::node(
+        symbol_id.clone(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("thing".to_owned()),
+        "symbol".to_owned(),
+    );
+    let edge = GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id,
+        symbol_id,
+        Some("1.0".to_owned()),
+        "file defines symbol".to_owned(),
+    );
+    write_graph(&graph_path, &[file, symbol, edge.clone(), edge]);
+    let mut daemon = start_daemon(&data_dir);
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--idempotency-key")
+        .arg("duplicate-edge-fresh")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("duplicate record IDs"));
 
     daemon.stop();
 }

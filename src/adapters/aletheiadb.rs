@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 
 use crate::{
     adapters::{AdapterError, AdapterResult, ExpectedRecordState, GraphSink},
+    daemon::StoreLease,
     ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan, TemporalMetadata},
 };
 
@@ -15,6 +16,7 @@ pub struct EmbeddedAletheiaSink {
     node_lookup: NodeLookupIndex,
     tombstone_ids: BTreeMap<String, ::aletheiadb::NodeId>,
     record_handles: BTreeMap<String, StoredRecord>,
+    _lease: Option<StoreLease>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -133,13 +135,28 @@ impl NodeLookupIndex {
 }
 
 impl EmbeddedAletheiaSink {
-    /// Opens an embedded `AletheiaDB` store rooted at `data_dir`.
+    /// Opens an embedded `AletheiaDB` store rooted at `data_dir` and acquires
+    /// the Egregore store lease.
     ///
     /// # Errors
     ///
-    /// Returns an error when `AletheiaDB` cannot open the requested data dir.
+    /// Returns an error when the store is already leased or `AletheiaDB` cannot
+    /// open the requested data dir.
     pub fn open(data_dir: impl AsRef<Path>) -> AdapterResult<Self> {
         let data_dir = data_dir.as_ref();
+        let lease = StoreLease::acquire(data_dir).map_err(|error| AdapterError::Rejected {
+            record_id: "embedded-store".to_owned(),
+            message: error.to_string(),
+        })?;
+        Self::open_inner(data_dir, Some(lease))
+    }
+
+    pub(crate) fn open_unleased(data_dir: impl AsRef<Path>) -> AdapterResult<Self> {
+        let data_dir = data_dir.as_ref();
+        Self::open_inner(data_dir, None)
+    }
+
+    fn open_inner(data_dir: &Path, lease: Option<StoreLease>) -> AdapterResult<Self> {
         let mut config = ::aletheiadb::config::durable_config_for_data_dir(data_dir);
         if is_fresh_data_dir(data_dir) {
             config.persistence.load_on_startup = false;
@@ -155,6 +172,7 @@ impl EmbeddedAletheiaSink {
             node_lookup: NodeLookupIndex::default(),
             tombstone_ids: BTreeMap::new(),
             record_handles: BTreeMap::new(),
+            _lease: lease,
         };
         sink.rebuild_lookup_indexes()?;
         Ok(sink)

@@ -281,6 +281,7 @@ fn remove_metadata_if_store_unleased(data_dir: &Path) -> Result<bool> {
 #[derive(Clone)]
 struct ServerState {
     token: String,
+    store_identity: String,
     sink: Arc<RwLock<EmbeddedAletheiaSink>>,
     write_tx: mpsc::SyncSender<WriteCommand>,
     jobs: Arc<Mutex<BTreeMap<String, JobStatus>>>,
@@ -502,7 +503,7 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
         .with_context(|| format!("failed to create {}", config.data_dir.display()))?;
     let mut lease = StoreLease::acquire(&config.data_dir)
         .with_context(|| format!("daemon already running for {}", config.data_dir.display()))?;
-    let sink = EmbeddedAletheiaSink::open(&config.data_dir).with_context(|| {
+    let sink = EmbeddedAletheiaSink::open_unleased(&config.data_dir).with_context(|| {
         format!(
             "failed to open embedded store {}",
             config.data_dir.display()
@@ -536,6 +537,7 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let state = Arc::new(ServerState {
         token,
+        store_identity: store_identity_text(&config.data_dir),
         sink: Arc::clone(&sink),
         write_tx,
         jobs: Arc::new(Mutex::new(BTreeMap::new())),
@@ -664,9 +666,12 @@ impl DaemonClient {
         if status == 200 {
             let body = serde_json::from_str::<serde_json::Value>(&body)
                 .context("failed to parse daemon health response")?;
+            let expected_data_dir = store_identity_text(&self.metadata.data_dir);
             if body.get("status").and_then(serde_json::Value::as_str) == Some("ok")
                 && body.get("version").and_then(serde_json::Value::as_str)
                     == Some(env!("CARGO_PKG_VERSION"))
+                && body.get("data_dir").and_then(serde_json::Value::as_str)
+                    == Some(expected_data_dir.as_str())
             {
                 Ok(())
             } else {
@@ -683,6 +688,8 @@ impl DaemonClient {
     ///
     /// Returns an error if the daemon does not accept shutdown.
     pub fn shutdown(&self) -> Result<()> {
+        self.health()
+            .context("daemon health validation failed before shutdown")?;
         let (status, body) =
             self.request("POST", "/v1/admin/shutdown", None, CLIENT_TIMEOUT, true)?;
         if status == 200 {
@@ -836,7 +843,7 @@ fn recover_pending_write(
     sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
     idempotency: &Arc<Mutex<IdempotencyStore>>,
 ) -> WriteResult<Option<DaemonIngestResponse>> {
-    if has_ambiguous_recovery_keys(records) {
+    if has_duplicate_recovery_keys(records) || has_ambiguous_recovery_keys(records) {
         return Err(ApiError::conflict(
             "idempotency key has duplicate record IDs in pending recovery; manual repair is required",
         ));
@@ -890,9 +897,7 @@ fn recover_pending_write(
 }
 
 fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {
-    if has_duplicate_node_or_tombstone_recovery_keys(records)
-        || has_ambiguous_recovery_keys(records)
-    {
+    if has_duplicate_recovery_keys(records) || has_ambiguous_recovery_keys(records) {
         return Err(ApiError::conflict(
             "ingest payload has duplicate record IDs that are not idempotently recoverable",
         ));
@@ -900,20 +905,10 @@ fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {
     Ok(())
 }
 
-fn has_duplicate_node_or_tombstone_recovery_keys(records: &[GraphRecord]) -> bool {
+fn has_duplicate_recovery_keys(records: &[GraphRecord]) -> bool {
     let mut seen = BTreeSet::new();
     for record in records {
-        let key = match record {
-            GraphRecord::Node {
-                id,
-                temporal: Some(temporal),
-                ..
-            } => format!("node\0{}\0{}", id, temporal.git_commit),
-            GraphRecord::Node { id, .. } => format!("node\0{id}"),
-            GraphRecord::Tombstone { id, .. } => format!("tombstone\0{id}"),
-            GraphRecord::Edge { .. } => continue,
-        };
-        if !seen.insert(key) {
+        if !seen.insert(recovery_key(record)) {
             return true;
         }
     }
@@ -995,6 +990,7 @@ fn handle_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             json!({
                 "status": "ok",
                 "version": env!("CARGO_PKG_VERSION"),
+                "data_dir": state.store_identity.as_str(),
             }),
         );
     }
@@ -1625,6 +1621,10 @@ fn store_identity_dir(data_dir: &Path) -> PathBuf {
     data_dir.to_path_buf()
 }
 
+fn store_identity_text(data_dir: &Path) -> String {
+    store_identity_dir(data_dir).to_string_lossy().into_owned()
+}
+
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -1678,6 +1678,7 @@ mod tests {
         let (write_tx, _write_rx) = mpsc::sync_channel(1);
         let state = ServerState {
             token: "test-token".to_owned(),
+            store_identity: store_identity_text(temp.path()),
             sink: Arc::clone(&sink),
             write_tx,
             jobs: Arc::new(Mutex::new(BTreeMap::new())),
