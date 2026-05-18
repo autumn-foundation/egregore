@@ -1108,3 +1108,71 @@ fn query_symbol_at_commit_still_works_for_tombstoned_temporal_symbol() {
     assert_eq!(parsed["name"], "removed_fn");
     assert_eq!(parsed["git_commit"], "aaaaaaaaaaaaaaaa");
 }
+
+fn fixture_graph_with_temporal_file_and_symbol() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("temporal_file.jsonl");
+
+    let file_id = stable_id(&["node", "File", "src/lib.rs", "aaaa"]);
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "temporal_fn", "aaaa"]);
+
+    let file_node = GraphRecord::syntax_node(
+        file_id,
+        NodeKind::File,
+        "src/lib.rs".to_owned(),
+        span(1, 50),
+        "lib.rs".to_owned(),
+        "rust",
+        "Source file at commit aaaa".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "aaaaaaaaaaaaaaaa".to_owned(),
+        git_parent_commits: vec![],
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: None,
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+    });
+    let sym_node = GraphRecord::symbol(
+        sym_id,
+        "fn",
+        "src/lib.rs".to_owned(),
+        span(10, 20),
+        "temporal_fn".to_owned(),
+        "Function at commit aaaa".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "aaaaaaaaaaaaaaaa".to_owned(),
+        git_parent_commits: vec![],
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: None,
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+    });
+
+    let mut graph = Graph::new();
+    graph.push(file_node);
+    graph.push(sym_node);
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+
+    (temp, path)
+}
+
+#[test]
+fn query_file_finds_temporal_file_node_from_scan_history_graph() {
+    let (_temp, graph) = fixture_graph_with_temporal_file_and_symbol();
+
+    let output = egregore()
+        .args(["query", "file", "src/lib.rs", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("line")).expect("json");
+    assert_eq!(parsed["name"], "temporal_fn");
+    assert_eq!(parsed["git_commit"], "aaaaaaaaaaaaaaaa");
+}

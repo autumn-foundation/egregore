@@ -656,7 +656,6 @@ fn query_file(records: &[GraphRecord], path: &str, format: OutputFormat) -> Resu
             id,
             kind: NodeKind::File,
             repo_relative_path,
-            temporal: None,
             ..
         } = r
         else {
