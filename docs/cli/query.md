@@ -5,12 +5,18 @@ Query an existing graph JSONL for symbols, files, or semantic drift records.
 ## Synopsis
 
 ```text
-eg query symbol <NAME> --graph <PATH> [--at <COMMIT>] [--format json|text]
-eg query file <PATH>   --graph <PATH> [--format json|text]
-eg query drift         --graph <PATH> [--limit N] [--format json|text]
+eg query symbol <NAME> --graph <PATH>    [--at <COMMIT>] [--format json|text]
+eg query symbol <NAME> --data-dir <DIR>  [--at <COMMIT>] [--format json|text]
+eg query file <PATH>   --graph <PATH>    [--format json|text]
+eg query file <PATH>   --data-dir <DIR>  [--format json|text]
+eg query drift         --graph <PATH>    [--limit N] [--format json|text]
+eg query drift         --data-dir <DIR>  [--limit N] [--format json|text]
 ```
 
-All subcommands read from a `--graph <PATH>` JSONL file produced by `eg scan` or `eg scan-history`. Querying directly from an ingested AletheiaDB `--data-dir` store is deferred to a follow-up issue.
+Each subcommand accepts exactly one input source:
+
+- `--graph <PATH>` — read from a JSONL file produced by `eg scan` or `eg scan-history`.
+- `--data-dir <DIR>` — read from an embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. Requires the `embedded-aletheiadb` feature (enabled by default). Providing both `--graph` and `--data-dir` is an error.
 
 ## Exit codes
 

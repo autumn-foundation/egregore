@@ -213,6 +213,143 @@ fn egregore() -> Command {
 }
 
 // ---------------------------------------------------------------------------
+// --data-dir integration tests (require embedded-aletheiadb feature)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn ingest_to_data_dir(graph: &std::path::Path, data_dir: &std::path::Path) {
+    egregore()
+        .arg("ingest")
+        .arg(graph)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(data_dir)
+        .assert()
+        .success();
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_symbol_data_dir_returns_jsonl_for_matching_symbol() {
+    let (_temp_graph, graph) = fixture_graph_with_symbols();
+    let temp_db = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp_db.path().join("store");
+
+    ingest_to_data_dir(&graph, &data_dir);
+
+    let output = egregore()
+        .args(["query", "symbol", "scan_repository", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("first line")).expect("valid JSON");
+    assert_eq!(parsed["name"], "scan_repository");
+    assert_eq!(parsed["kind"], "Symbol");
+    assert!(parsed["record_id"].is_string());
+    assert!(parsed["repo_relative_path"].is_string());
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_symbol_data_dir_exits_2_when_no_match() {
+    let (_temp_graph, graph) = fixture_graph_with_symbols();
+    let temp_db = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp_db.path().join("store");
+
+    ingest_to_data_dir(&graph, &data_dir);
+
+    egregore()
+        .args(["query", "symbol", "nonexistent_xyz", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("no match"));
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_file_data_dir_returns_symbols_defined_in_file() {
+    let (_temp_graph, graph) = fixture_graph_with_symbols();
+    let temp_db = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp_db.path().join("store");
+
+    ingest_to_data_dir(&graph, &data_dir);
+
+    let output = egregore()
+        .args(["query", "file", "src/lib.rs", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("first line")).expect("valid JSON");
+    assert_eq!(parsed["name"], "scan_repository");
+    assert_eq!(parsed["kind"], "Symbol");
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_drift_data_dir_returns_drift_ranked_by_score() {
+    let (_temp_graph, graph) = fixture_graph_with_drift();
+    let temp_db = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp_db.path().join("store");
+
+    ingest_to_data_dir(&graph, &data_dir);
+
+    let output = egregore()
+        .args(["query", "drift", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let first: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("first line")).expect("valid JSON");
+    assert_eq!(first["score"], "0.900000", "largest drift should be first");
+    assert_eq!(first["model_id"], "test-model-v1");
+    assert!(first["record_id"].is_string());
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_symbol_graph_and_data_dir_together_is_an_error() {
+    let (_temp_graph, graph) = fixture_graph_with_symbols();
+    let temp_db = tempfile::tempdir().expect("temp dir");
+
+    egregore()
+        .args(["query", "symbol", "scan_repository", "--graph"])
+        .arg(&graph)
+        .args(["--data-dir"])
+        .arg(temp_db.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty());
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_symbol_neither_graph_nor_data_dir_is_an_error() {
+    egregore()
+        .args(["query", "symbol", "scan_repository"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // query symbol — happy path
 // ---------------------------------------------------------------------------
 

@@ -193,6 +193,52 @@ impl EmbeddedAletheiaSink {
             })
     }
 
+    /// Reads all records from the embedded store for query purposes.
+    ///
+    /// Returns the latest observation of each node (by `codegraph_id`), all
+    /// tombstones, and all edges (deduplicated by `codegraph_id`). The result
+    /// mirrors a JSONL graph slice and can be passed directly to the CLI query
+    /// helpers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the embedded store cannot read a node or edge.
+    pub fn read_all_records(&self) -> AdapterResult<Vec<GraphRecord>> {
+        let mut records =
+            Vec::with_capacity(self.node_lookup.latest.len() + self.tombstone_ids.len());
+
+        for (record_id, candidate) in &self.node_lookup.latest {
+            records.push(self.read_node_record(record_id, candidate.storage_id)?);
+        }
+
+        for (record_id, &node_id) in &self.tombstone_ids {
+            records.push(self.read_tombstone_record(record_id, node_id)?);
+        }
+
+        let mut seen_edge_ids = std::collections::BTreeSet::new();
+        for node_id in self.db.get_all_node_ids() {
+            for edge_id in self.db.get_outgoing_edges(node_id) {
+                let edge = self
+                    .db
+                    .get_edge(edge_id)
+                    .map_err(|error| read_back_error("read_all_records", error.to_string()))?;
+                let Some(codegraph_id) = optional_str_property(
+                    "read_all_records",
+                    "codegraph_id",
+                    edge.get_property("codegraph_id"),
+                )?
+                else {
+                    continue;
+                };
+                if seen_edge_ids.insert(codegraph_id.clone()) {
+                    records.push(self.read_edge_record(&codegraph_id, edge_id)?);
+                }
+            }
+        }
+
+        Ok(records)
+    }
+
     /// Reads a graph record back by stable ID.
     ///
     /// # Errors

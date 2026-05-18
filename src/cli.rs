@@ -105,9 +105,12 @@ enum QuerySubcommand {
     Symbol {
         /// Symbol name to look up.
         name: String,
-        /// Graph JSONL path.
+        /// Graph JSONL path (mutually exclusive with --data-dir).
         #[arg(long)]
-        graph: PathBuf,
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
         /// Restrict to the record at this commit SHA or unique prefix.
         #[arg(long)]
         at: Option<String>,
@@ -119,18 +122,24 @@ enum QuerySubcommand {
     File {
         /// Repository-relative file path.
         path: String,
-        /// Graph JSONL path.
+        /// Graph JSONL path (mutually exclusive with --data-dir).
         #[arg(long)]
-        graph: PathBuf,
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
     /// Find semantic drift nodes ranked by score descending.
     Drift {
-        /// Graph JSONL path.
+        /// Graph JSONL path (mutually exclusive with --data-dir).
         #[arg(long)]
-        graph: PathBuf,
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
         /// Maximum number of results (default 10).
         #[arg(long, default_value_t = 10)]
         limit: usize,
@@ -421,10 +430,11 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         QuerySubcommand::Symbol {
             name,
             graph,
+            data_dir,
             at,
             format,
         } => {
-            let records = load_records(&graph)?;
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             at.map_or_else(
                 || query_symbol_all(&records, &name, format),
                 |prefix| query_symbol_at(&records, &name, &prefix, format),
@@ -433,27 +443,55 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         QuerySubcommand::File {
             path,
             graph,
+            data_dir,
             format,
         } => {
-            let records = load_records(&graph)?;
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_file(&records, &path, format)
         }
         QuerySubcommand::Drift {
             graph,
+            data_dir,
             limit,
             format,
         } => {
-            let records = load_records(&graph)?;
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_drift(&records, limit, format)
         }
     }
 }
 
-fn load_records(graph: &Path) -> Result<Vec<GraphRecord>> {
+fn load_query_records(graph: Option<&Path>, data_dir: Option<&Path>) -> Result<Vec<GraphRecord>> {
+    match (graph, data_dir) {
+        (Some(path), None) => load_records_from_jsonl(path),
+        (None, Some(dir)) => load_records_from_db(dir),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("provide only one of --graph or --data-dir, not both")
+        }
+        (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+    }
+}
+
+fn load_records_from_jsonl(graph: &Path) -> Result<Vec<GraphRecord>> {
     let jsonl = fs::read_to_string(graph)
         .with_context(|| format!("failed to read graph JSONL from {}", graph.display()))?;
     crate::adapters::records_from_jsonl(&jsonl)
         .map_err(|e| anyhow::anyhow!("failed to parse graph JSONL: {e}"))
+}
+
+fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+            .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+        sink.read_all_records()
+            .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
 }
 
 // ---------------------------------------------------------------------------

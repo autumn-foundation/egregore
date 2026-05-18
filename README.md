@@ -32,11 +32,16 @@ cargo run -- inspect graph.jsonl
 cargo run -- ingest graph.jsonl --adapter dry-run
 cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .egregore
 
-# Query a graph (where-is-this-symbol, what-does-this-file-define, when-did-this-drift)
+# Query from a JSONL graph (where-is-this-symbol, what-does-this-file-define, when-did-this-drift)
 eg query symbol scan_repository --graph graph.jsonl
 eg query file src/lib.rs --graph graph.jsonl
 eg query drift --graph history.graph.jsonl --limit 5
 eg query symbol scan_repository --graph history.graph.jsonl --at <commit-sha>
+
+# Query directly from an ingested AletheiaDB store
+eg query symbol scan_repository --data-dir .egregore
+eg query file src/lib.rs --data-dir .egregore
+eg query drift --data-dir .egregore --limit 5
 ```
 
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
