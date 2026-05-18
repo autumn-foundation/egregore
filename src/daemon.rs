@@ -771,15 +771,23 @@ fn recover_pending_write(
             .read()
             .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
         let mut matched = 0;
+        let mut mismatched = 0;
         for (record_id, expected_records) in &expected_by_id {
             match sink.read_back(record_id) {
                 Ok(Some(persisted)) if expected_records.contains(&persisted) => matched += 1,
-                Ok(Some(_) | None) => {}
+                Ok(Some(_)) => mismatched += 1,
+                Ok(None) => {}
                 Err(error) => return Err(ApiError::internal(error.to_string())),
             }
         }
-        matched
+        (matched, mismatched)
     };
+    let (matched, mismatched) = matched;
+    if mismatched > 0 {
+        return Err(ApiError::conflict(
+            "idempotency key has conflicting committed records; manual repair is required",
+        ));
+    }
     if matched == 0 {
         return Ok(None);
     }

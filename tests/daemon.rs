@@ -420,7 +420,7 @@ fn daemon_recovers_pending_idempotency_receipt_after_restart() {
 }
 
 #[test]
-fn daemon_pending_recovery_does_not_skip_same_id_update() {
+fn daemon_pending_recovery_rejects_same_id_mismatch() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
     let mut daemon = start_daemon(&data_dir);
@@ -500,8 +500,8 @@ fn daemon_pending_recovery_does_not_skip_same_id_update() {
         .arg("--idempotency-key")
         .arg("same-id-second")
         .assert()
-        .success()
-        .stdout(predicate::str::contains("idempotent: false"));
+        .failure()
+        .stderr(predicate::str::contains("conflicting committed records"));
 
     let metadata = read_metadata(&data_dir);
     let read_response = http_request(
@@ -512,8 +512,109 @@ fn daemon_pending_recovery_does_not_skip_same_id_update() {
         ),
     );
     assert!(
+        read_response.contains("\"summary\":\"old\""),
+        "ambiguous same-id pending retry should leave existing record current, got {read_response}"
+    );
+
+    restarted.stop();
+}
+
+#[test]
+fn daemon_pending_recovery_rejects_stale_same_id_replay() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let old = GraphRecord::node(
+        "codegraph:v1:stale-pending-node".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "old".to_owned(),
+    );
+    let new = GraphRecord::node(
+        "codegraph:v1:stale-pending-node".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "new".to_owned(),
+    );
+    let new_graph_path = temp.path().join("new.jsonl");
+    fs::write(
+        &new_graph_path,
+        serde_json::to_string(&new).expect("new record should serialize") + "\n",
+    )
+    .expect("new graph should write");
+
+    let old_hash =
+        blake3::hash(&serde_json::to_vec(&vec![old.clone()]).expect("old record should serialize"))
+            .to_hex()
+            .to_string();
+    let runtime_dir = runtime_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    fs::write(
+        runtime_dir.join("idempotency.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "entries": {
+                "stale-old": {
+                    "state": "pending",
+                    "payload_hash": old_hash,
+                    "record_ids": ["codegraph:v1:stale-pending-node"],
+                    "records": [old],
+                }
+            }
+        }))
+        .expect("idempotency JSON should serialize"),
+    )
+    .expect("stale pending idempotency file should write");
+
+    let mut daemon = start_daemon(&data_dir);
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&new_graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--idempotency-key")
+        .arg("new-write")
+        .assert()
+        .success();
+    daemon.stop();
+
+    let old_graph_path = temp.path().join("old.jsonl");
+    fs::write(
+        &old_graph_path,
+        serde_json::to_string(&old).expect("old record should serialize") + "\n",
+    )
+    .expect("old graph should write");
+    let mut restarted = start_daemon(&data_dir);
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&old_graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--idempotency-key")
+        .arg("stale-old")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("conflicting committed records"));
+
+    let metadata = read_metadata(&data_dir);
+    let read_response = http_request(
+        &metadata.address,
+        &format!(
+            "GET /v1/records/codegraph:v1:stale-pending-node HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    );
+    assert!(
         read_response.contains("\"summary\":\"new\""),
-        "same-id update should be written, got {read_response}"
+        "newer same-id write should remain current, got {read_response}"
     );
 
     restarted.stop();
