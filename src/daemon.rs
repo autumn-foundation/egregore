@@ -286,7 +286,7 @@ struct ServerState {
     sink: Arc<RwLock<EmbeddedAletheiaSink>>,
     write_tx: mpsc::SyncSender<WriteCommand>,
     jobs: Arc<Mutex<BTreeMap<String, JobStatus>>>,
-    agents: Arc<Mutex<BTreeMap<String, AgentStatus>>>,
+    agents: Arc<Mutex<BTreeMap<AgentSessionKey, AgentStatus>>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -298,6 +298,21 @@ struct WriteCommand {
 }
 
 type WriteResult<T = DaemonIngestResponse> = std::result::Result<T, ApiError>;
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct AgentSessionKey {
+    agent_id: String,
+    session_id: String,
+}
+
+impl AgentSessionKey {
+    fn new(agent_id: impl Into<String>, session_id: impl Into<String>) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            session_id: session_id.into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentStatus {
@@ -1194,7 +1209,10 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
     };
     if let Ok(mut agents) = state.agents.lock() {
         agents.insert(
-            format!("{}:{}", registration.agent_id, registration.session_id),
+            AgentSessionKey::new(
+                registration.agent_id.clone(),
+                registration.session_id.clone(),
+            ),
             agent_status,
         );
     } else {
@@ -1202,9 +1220,10 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
     }
 
     let records = agent_registration_records(&registration);
-    let idempotency_key = format!(
-        "agent-register:{}:{}",
-        registration.agent_id, registration.session_id
+    let idempotency_key = stable_pair_key(
+        "agent-register",
+        &registration.agent_id,
+        &registration.session_id,
     );
     match enqueue_write(state, idempotency_key, records, &registration.request_id) {
         Ok(response) => HttpResponse::json(
@@ -1224,7 +1243,7 @@ fn handle_agent_heartbeat(request: &HttpRequest, state: &ServerState) -> HttpRes
         Ok(heartbeat) => heartbeat,
         Err(error) => return HttpResponse::error(error),
     };
-    let key = format!("{}:{}", heartbeat.agent_id, heartbeat.session_id);
+    let key = AgentSessionKey::new(heartbeat.agent_id, heartbeat.session_id);
     let Ok(mut agents) = state.agents.lock() else {
         return HttpResponse::error(ApiError::internal("agents lock poisoned"));
     };
@@ -1258,7 +1277,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         Ok(payload) => payload,
         Err(error) => return HttpResponse::error(ApiError::bad_request(error.to_string())),
     };
-    let job_id = request_id("job", &format!("{}:{idempotency_key}", envelope.request_id));
+    let job_id = stable_job_id(&envelope.request_id, &idempotency_key);
     let job = JobStatus {
         job_id: job_id.clone(),
         status: "queued".to_owned(),
@@ -1267,6 +1286,12 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
     };
     match state.jobs.lock() {
         Ok(mut jobs) => {
+            if let Some(job) = jobs.get(&job_id) {
+                return HttpResponse::json(
+                    202,
+                    json!({ "job_id": job.job_id, "status": job.status }),
+                );
+            }
             jobs.insert(job_id.clone(), job);
         }
         Err(_) => return HttpResponse::error(ApiError::internal("jobs lock poisoned")),
@@ -1680,6 +1705,19 @@ fn records_hash(records: &[GraphRecord]) -> Result<String> {
 fn request_id(prefix: &str, value: &str) -> String {
     let input = format!("{prefix}:{value}:{}", unix_ms());
     format!("{prefix}-{}", blake3::hash(input.as_bytes()).to_hex())
+}
+
+fn stable_job_id(request_id: &str, idempotency_key: &str) -> String {
+    let key = stable_pair_key("job", request_id, idempotency_key);
+    format!("job-{}", blake3::hash(key.as_bytes()).to_hex())
+}
+
+fn stable_pair_key(prefix: &str, left: &str, right: &str) -> String {
+    let mut key = String::with_capacity(prefix.len() + left.len() + right.len() + 32);
+    let _ = write!(&mut key, "{prefix}:{}:{}:", left.len(), right.len());
+    key.push_str(left);
+    key.push_str(right);
+    key
 }
 
 fn unix_ms() -> u128 {

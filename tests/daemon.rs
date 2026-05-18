@@ -1421,6 +1421,103 @@ fn daemon_query_honors_positive_timeout_budget() {
     daemon.stop();
 }
 
+#[test]
+fn daemon_agent_registration_distinguishes_colon_bearing_ids() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    for (request_id, agent_id, session_id) in [
+        ("register-colon-1", "codex:alpha", "session"),
+        ("register-colon-2", "codex", "alpha:session"),
+    ] {
+        let register_response = http_json(
+            &metadata,
+            "POST",
+            "/v1/agents/register",
+            &serde_json::json!({
+                "request_id": request_id,
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "agent_kind": "codex",
+                "project_scope": "egregore"
+            }),
+        );
+        assert!(
+            register_response.starts_with("HTTP/1.1 200"),
+            "colon-bearing agent/session identity should register distinctly, got {register_response}"
+        );
+    }
+
+    let status = http_request(
+        &metadata.address,
+        &format!(
+            "GET /v1/status HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    );
+    assert!(
+        status.starts_with("HTTP/1.1 200"),
+        "status should succeed, got {status}"
+    );
+    assert_eq!(response_json(&status)["agents"], 2);
+
+    daemon.stop();
+}
+
+#[test]
+fn daemon_job_ingest_retry_returns_original_job_handle() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let record = GraphRecord::node(
+        "codegraph:v1:job-retry-node".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "job retry".to_owned(),
+    );
+    let request_body = serde_json::json!({
+        "request_id": "retryable-job",
+        "agent_id": "test-agent",
+        "session_id": "test-session",
+        "idempotency_key": "retryable-job-ingest",
+        "domain": "codegraph",
+        "created_at": "2026-05-17T00:00:00Z",
+        "payload": { "records": [record] }
+    });
+
+    let first_response = http_json(&metadata, "POST", "/v1/jobs/ingest", &request_body);
+    assert!(
+        first_response.starts_with("HTTP/1.1 202"),
+        "first job ingest should be accepted, got {first_response}"
+    );
+    let first_job_id = response_json(&first_response)["job_id"]
+        .as_str()
+        .expect("first job response should include id")
+        .to_owned();
+    thread::sleep(Duration::from_millis(5));
+    let retry_response = http_json(&metadata, "POST", "/v1/jobs/ingest", &request_body);
+    assert!(
+        retry_response.starts_with("HTTP/1.1 202"),
+        "job ingest retry should be accepted, got {retry_response}"
+    );
+    let retry_body = response_json(&retry_response);
+    let retry_job_id = retry_body["job_id"]
+        .as_str()
+        .expect("retry job response should include id");
+
+    assert_eq!(retry_job_id, first_job_id);
+    let job_status = wait_for_job(&metadata, &first_job_id);
+    assert_eq!(job_status["status"], "completed");
+    assert_eq!(job_status["report"]["failed"], 0);
+
+    daemon.stop();
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn daemon_registers_agents_runs_ingest_jobs_and_queries_records() {
