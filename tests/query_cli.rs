@@ -977,3 +977,134 @@ fn query_symbol_empty_data_dir_exits_1_with_error() {
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::is_match("error|not found|empty|ingest").unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// Fix E: tombstoned records must not appear in current-state queries
+// ---------------------------------------------------------------------------
+
+fn fixture_graph_with_tombstoned_symbol() -> (tempfile::TempDir, PathBuf) {
+    use aletheia_egregore::ir::SCHEMA_VERSION;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("tombstoned.jsonl");
+
+    let file_id = stable_id(&["node", "File", "src/lib.rs"]);
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "deleted_fn"]);
+    let tombstone_id = stable_id(&["tombstone", &sym_id]);
+
+    let file_node = GraphRecord::syntax_node(
+        file_id,
+        NodeKind::File,
+        "src/lib.rs".to_owned(),
+        span(1, 50),
+        "lib.rs".to_owned(),
+        "rust",
+        "Source file src/lib.rs".to_owned(),
+    );
+    let sym_node = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        span(5, 15),
+        "deleted_fn".to_owned(),
+        "A function that will be deleted".to_owned(),
+    );
+    let tombstone = GraphRecord::Tombstone {
+        id: tombstone_id,
+        schema_version: SCHEMA_VERSION,
+        deleted_id: sym_id,
+        summary: "deleted_fn removed".to_owned(),
+    };
+
+    let mut graph = Graph::new();
+    graph.push(file_node);
+    graph.push(sym_node);
+    graph.push(tombstone);
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+
+    (temp, path)
+}
+
+#[test]
+fn query_symbol_exits_2_for_tombstoned_symbol() {
+    let (_temp, graph) = fixture_graph_with_tombstoned_symbol();
+
+    egregore()
+        .args(["query", "symbol", "deleted_fn", "--graph"])
+        .arg(&graph)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn query_file_exits_2_for_file_with_only_tombstoned_symbols() {
+    let (_temp, graph) = fixture_graph_with_tombstoned_symbol();
+
+    egregore()
+        .args(["query", "file", "src/lib.rs", "--graph"])
+        .arg(&graph)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty());
+}
+
+fn fixture_graph_with_tombstoned_temporal_symbol() -> (tempfile::TempDir, PathBuf) {
+    use aletheia_egregore::ir::SCHEMA_VERSION;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("tombstoned_temporal.jsonl");
+
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "removed_fn", "aaaa"]);
+    let tombstone_id = stable_id(&["tombstone", &sym_id]);
+
+    let sym_node = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        span(5, 15),
+        "removed_fn".to_owned(),
+        "Function observed at commit aaaa".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "aaaaaaaaaaaaaaaa".to_owned(),
+        git_parent_commits: vec![],
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: None,
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+    });
+    let tombstone = GraphRecord::Tombstone {
+        id: tombstone_id,
+        schema_version: SCHEMA_VERSION,
+        deleted_id: sym_id,
+        summary: "removed_fn deleted after aaaa".to_owned(),
+    };
+
+    let mut graph = Graph::new();
+    graph.push(sym_node);
+    graph.push(tombstone);
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+
+    (temp, path)
+}
+
+#[test]
+fn query_symbol_at_commit_still_works_for_tombstoned_temporal_symbol() {
+    let (_temp, graph) = fixture_graph_with_tombstoned_temporal_symbol();
+
+    // --at query must still find the historical observation even after tombstone
+    let output = egregore()
+        .args(["query", "symbol", "removed_fn", "--at", "aaaa", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("line")).expect("json");
+    assert_eq!(parsed["name"], "removed_fn");
+    assert_eq!(parsed["git_commit"], "aaaaaaaaaaaaaaaa");
+}

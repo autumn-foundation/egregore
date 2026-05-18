@@ -516,12 +516,39 @@ fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
 }
 
 // ---------------------------------------------------------------------------
+// Tombstone helpers
+// ---------------------------------------------------------------------------
+
+/// Returns the set of record IDs that have been tombstoned and not superseded.
+/// Used to exclude deleted records from current-state queries (but not --at queries).
+fn current_deleted_ids(records: &[GraphRecord]) -> std::collections::BTreeSet<&str> {
+    let mut deleted: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for record in records {
+        if let GraphRecord::Tombstone { deleted_id, .. } = record {
+            deleted.insert(deleted_id.as_str());
+        }
+    }
+    deleted
+}
+
+// ---------------------------------------------------------------------------
 // query symbol (all matching)
 // ---------------------------------------------------------------------------
 
 fn query_symbol_all(records: &[GraphRecord], name: &str, format: OutputFormat) -> Result<()> {
+    let deleted = current_deleted_ids(records);
     let mut results: Vec<SymbolResult<'_>> = records
         .iter()
+        .filter(|r| {
+            if let GraphRecord::Node {
+                id, temporal: None, ..
+            } = r
+            {
+                !deleted.contains(id.as_str())
+            } else {
+                true
+            }
+        })
         .filter_map(|r| symbol_result(r, name))
         .collect();
 
@@ -622,16 +649,20 @@ fn temporal_commit_if_prefix<'a>(record: &'a GraphRecord, prefix: &str) -> Optio
 // ---------------------------------------------------------------------------
 
 fn query_file(records: &[GraphRecord], path: &str, format: OutputFormat) -> Result<()> {
+    let deleted = current_deleted_ids(records);
+
     let file_exists = records.iter().any(|r| {
         let GraphRecord::Node {
+            id,
             kind: NodeKind::File,
             repo_relative_path,
+            temporal: None,
             ..
         } = r
         else {
             return false;
         };
-        repo_relative_path.as_deref() == Some(path)
+        repo_relative_path.as_deref() == Some(path) && !deleted.contains(id.as_str())
     });
 
     if !file_exists {
@@ -655,6 +686,9 @@ fn query_file(records: &[GraphRecord], path: &str, format: OutputFormat) -> Resu
                 return None;
             };
             if repo_relative_path.as_deref() != Some(path) {
+                return None;
+            }
+            if temporal.is_none() && deleted.contains(id.as_str()) {
                 return None;
             }
             Some(SymbolResult {
