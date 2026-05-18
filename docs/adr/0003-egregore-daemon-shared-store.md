@@ -4,6 +4,13 @@
 
 Accepted
 
+## Wire Contract
+
+The HTTP/JSON wire contract for `egregored` is frozen in
+[docs/schema/daemon-api.md](../schema/daemon-api.md). That document is the
+single source of truth for request envelopes, response envelopes, error-code
+identifiers, idempotency semantics, and versioning policy.
+
 ## Context
 
 Egregore stores code facts, agent memory, project/task state, artifacts, and

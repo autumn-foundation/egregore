@@ -1499,7 +1499,7 @@ fn daemon_job_ingest_retry_returns_original_job_handle() {
         first_response.starts_with("HTTP/1.1 202"),
         "first job ingest should be accepted, got {first_response}"
     );
-    let first_job_id = response_json(&first_response)["job_id"]
+    let first_job_id = response_json(&first_response)["result"]["job_id"]
         .as_str()
         .expect("first job response should include id")
         .to_owned();
@@ -1512,7 +1512,7 @@ fn daemon_job_ingest_retry_returns_original_job_handle() {
         "job ingest retry should be accepted, got {retry_response}"
     );
     let retry_body = response_json(&retry_response);
-    let retry_job_id = retry_body["job_id"]
+    let retry_job_id = retry_body["result"]["job_id"]
         .as_str()
         .expect("retry job response should include id");
 
@@ -1624,7 +1624,7 @@ fn daemon_ingest_idempotency_keys_are_scoped_by_agent_session() {
             response.starts_with("HTTP/1.1 200"),
             "same local idempotency key should be independent per agent session, got {response}"
         );
-        assert_eq!(response_json(&response)["failed"], 0);
+        assert_eq!(response_json(&response)["result"]["failed"], 0);
     }
 
     daemon.stop();
@@ -1685,7 +1685,7 @@ fn daemon_registers_agents_runs_ingest_jobs_and_queries_records() {
         job_response.starts_with("HTTP/1.1 202"),
         "job ingest should be accepted, got {job_response}"
     );
-    let job_id = response_json(&job_response)["job_id"]
+    let job_id = response_json(&job_response)["result"]["job_id"]
         .as_str()
         .expect("job response should include id")
         .to_owned();
@@ -1955,8 +1955,9 @@ fn wait_for_job(metadata: &DaemonMetadata, job_id: &str) -> serde_json::Value {
         );
         if response.starts_with("HTTP/1.1 200") {
             let body = response_json(&response);
-            if body["status"] == "completed" || body["status"] == "failed" {
-                return body;
+            let result = &body["result"];
+            if result["status"] == "completed" || result["status"] == "failed" {
+                return result.clone();
             }
         }
         assert!(
@@ -1973,6 +1974,611 @@ fn response_json(response: &str) -> serde_json::Value {
         .nth(1)
         .expect("response should contain body");
     serde_json::from_str(body).expect("response body should be JSON")
+}
+
+fn http_get_authed(metadata: &DaemonMetadata, path: &str) -> String {
+    http_request(
+        &metadata.address,
+        &format!(
+            "GET {path} HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    )
+}
+
+fn http_post_empty(metadata: &DaemonMetadata, path: &str) -> String {
+    http_request(
+        &metadata.address,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    )
+}
+
+/// Contract conformance: table-driven assertions over every daemon route.
+///
+/// Each assertion group maps to one of the five checks in issue #5 ACC item 8:
+///   (a) missing required envelope field → `missing_field` + field path
+///   (b) unknown domain → `invalid_domain`
+///   (c) idempotency replay same payload → HTTP 200 + original result
+///   (d) idempotency conflict different payload → `idempotency_conflict` + HTTP 409
+///   (e) success envelope is `{ ok: true, request_id, result }` with no error key
+///
+/// Adding a new route to the daemon requires a new block here.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn contract_conformance_all_routes() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // ── GET /v1/health ──────────────────────────────────────────────────────────
+    // (e) success + api_version surfaced
+    {
+        let res = http_request(
+            &metadata.address,
+            "GET /v1/health HTTP/1.1\r\nHost: egregore\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "GET /v1/health should return 200, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["api_version"], "v1",
+            "GET /v1/health must include api_version: \"v1\", got {body}"
+        );
+    }
+
+    // ── GET /v1/status ──────────────────────────────────────────────────────────
+    // (e) success + api_version surfaced
+    {
+        let res = http_get_authed(&metadata, "/v1/status");
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "GET /v1/status should return 200, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["api_version"], "v1",
+            "GET /v1/status must include api_version: \"v1\", got {body}"
+        );
+        assert!(
+            body.get("idempotency_store_size").is_some(),
+            "GET /v1/status must include idempotency_store_size, got {body}"
+        );
+    }
+
+    // ── POST /v1/records/ingest ─────────────────────────────────────────────────
+    let ingest_record = serde_json::json!({
+        "record_type": "node",
+        "id": "codegraph:v1:conformance-ingest-node",
+        "schema_version": 1,
+        "kind": "Repository",
+        "name": "conformance",
+        "summary": "conformance test node"
+    });
+
+    // (a) missing request_id
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/records/ingest",
+            &serde_json::json!({
+                "agent_id": "test-agent",
+                "session_id": "test-session",
+                "idempotency_key": "conf-ingest-key",
+                "domain": "codegraph",
+                "created_at": "2026-05-18T00:00:00Z",
+                "payload": {"records": [ingest_record]}
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 400"),
+            "POST /v1/records/ingest missing request_id should be 400, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], false,
+            "error envelope must have ok:false, got {body}"
+        );
+        assert_eq!(
+            body["error"]["code"], "missing_field",
+            "missing request_id should return code missing_field, got {body}"
+        );
+        assert_eq!(
+            body["error"]["field"], "request_id",
+            "missing_field error must name the field, got {body}"
+        );
+        assert!(
+            body.get("result").is_none(),
+            "error envelope must not have a result key, got {body}"
+        );
+    }
+
+    // (a) missing idempotency_key
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/records/ingest",
+            &serde_json::json!({
+                "request_id": "conf-ingest-missing-ikey",
+                "agent_id": "test-agent",
+                "session_id": "test-session",
+                "domain": "codegraph",
+                "created_at": "2026-05-18T00:00:00Z",
+                "payload": {"records": [ingest_record]}
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 400"),
+            "POST /v1/records/ingest missing idempotency_key should be 400, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], false,
+            "error envelope must have ok:false, got {body}"
+        );
+        assert_eq!(
+            body["error"]["code"], "missing_field",
+            "missing idempotency_key should return code missing_field, got {body}"
+        );
+        assert_eq!(
+            body["error"]["field"], "idempotency_key",
+            "missing_field error must name the field, got {body}"
+        );
+    }
+
+    // (b) unknown domain
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/records/ingest",
+            &serde_json::json!({
+                "request_id": "conf-ingest-baddomain",
+                "agent_id": "test-agent",
+                "session_id": "test-session",
+                "idempotency_key": "conf-ingest-baddomain-key",
+                "domain": "unknown_domain_xyz",
+                "created_at": "2026-05-18T00:00:00Z",
+                "payload": {"records": [ingest_record]}
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 400"),
+            "POST /v1/records/ingest unknown domain should be 400, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], false,
+            "error envelope must have ok:false, got {body}"
+        );
+        assert_eq!(
+            body["error"]["code"], "invalid_domain",
+            "unknown domain should return code invalid_domain, got {body}"
+        );
+    }
+
+    // (e) success envelope shape
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/records/ingest",
+            &serde_json::json!({
+                "request_id": "conf-ingest-success",
+                "agent_id": "test-agent",
+                "session_id": "test-session",
+                "idempotency_key": "conf-ingest-success-key",
+                "domain": "codegraph",
+                "created_at": "2026-05-18T00:00:00Z",
+                "payload": {"records": [ingest_record]}
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "POST /v1/records/ingest valid request should be 200, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], true,
+            "success envelope must have ok:true, got {body}"
+        );
+        assert_eq!(
+            body["request_id"], "conf-ingest-success",
+            "success envelope must echo request_id, got {body}"
+        );
+        assert!(
+            body.get("result").is_some(),
+            "success envelope must have result key, got {body}"
+        );
+        assert!(
+            body.get("error").is_none(),
+            "success envelope must not have error key, got {body}"
+        );
+    }
+
+    // (c) idempotency replay same payload → HTTP 200 + result.idempotent=true
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/records/ingest",
+            &serde_json::json!({
+                "request_id": "conf-ingest-replay-2",
+                "agent_id": "test-agent",
+                "session_id": "test-session",
+                "idempotency_key": "conf-ingest-success-key",
+                "domain": "codegraph",
+                "created_at": "2026-05-18T00:00:00Z",
+                "payload": {"records": [ingest_record]}
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "POST /v1/records/ingest idempotent replay should return 200, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], true,
+            "idempotent replay envelope must have ok:true, got {body}"
+        );
+        assert_eq!(
+            body["result"]["idempotent"], true,
+            "idempotent replay result must have idempotent:true, got {body}"
+        );
+    }
+
+    // (d) idempotency conflict different payload → HTTP 409 + idempotency_conflict
+    {
+        let other_record = serde_json::json!({
+            "record_type": "node",
+            "id": "codegraph:v1:conformance-conflict-node",
+            "schema_version": 1,
+            "kind": "Repository",
+            "name": "conflict",
+            "summary": "a different node"
+        });
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/records/ingest",
+            &serde_json::json!({
+                "request_id": "conf-ingest-conflict",
+                "agent_id": "test-agent",
+                "session_id": "test-session",
+                "idempotency_key": "conf-ingest-success-key",
+                "domain": "codegraph",
+                "created_at": "2026-05-18T00:00:00Z",
+                "payload": {"records": [other_record]}
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 409"),
+            "POST /v1/records/ingest conflict should return 409, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], false,
+            "conflict envelope must have ok:false, got {body}"
+        );
+        assert_eq!(
+            body["error"]["code"], "idempotency_conflict",
+            "conflict should return code idempotency_conflict, got {body}"
+        );
+    }
+
+    // ── POST /v1/query ──────────────────────────────────────────────────────────
+    // (a) missing request_id
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "agent_id": "test-agent",
+                "session_id": "test-session",
+                "record_ids": []
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 400"),
+            "POST /v1/query missing request_id should be 400, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], false,
+            "error envelope must have ok:false, got {body}"
+        );
+        assert_eq!(
+            body["error"]["code"], "missing_field",
+            "missing request_id on query should return missing_field, got {body}"
+        );
+        assert_eq!(body["error"]["field"], "request_id");
+    }
+
+    // (e) success envelope
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "conf-query-success",
+                "agent_id": "test-agent",
+                "session_id": "test-session",
+                "record_ids": []
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "POST /v1/query valid request should be 200, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], true,
+            "query success envelope must have ok:true, got {body}"
+        );
+        assert_eq!(body["request_id"], "conf-query-success");
+        assert!(
+            body.get("result").is_some(),
+            "query success must have result, got {body}"
+        );
+        assert!(
+            body.get("error").is_none(),
+            "query success must not have error, got {body}"
+        );
+    }
+
+    // ── POST /v1/agents/register ────────────────────────────────────────────────
+    // (a) missing request_id
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/agents/register",
+            &serde_json::json!({
+                "agent_id": "conf-agent",
+                "session_id": "conf-session",
+                "agent_kind": "test",
+                "project_scope": "egregore"
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 400"),
+            "POST /v1/agents/register missing request_id should be 400, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "missing_field");
+        assert_eq!(body["error"]["field"], "request_id");
+    }
+
+    // (e) success envelope
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/agents/register",
+            &serde_json::json!({
+                "request_id": "conf-register-success",
+                "agent_id": "conf-agent",
+                "session_id": "conf-session",
+                "agent_kind": "test",
+                "project_scope": "egregore"
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "POST /v1/agents/register valid request should be 200, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], true,
+            "register success envelope must have ok:true, got {body}"
+        );
+        assert_eq!(body["request_id"], "conf-register-success");
+        assert!(
+            body.get("result").is_some(),
+            "register success must have result, got {body}"
+        );
+        assert!(
+            body.get("error").is_none(),
+            "register success must not have error, got {body}"
+        );
+    }
+
+    // ── POST /v1/agents/heartbeat ───────────────────────────────────────────────
+    // (a) missing request_id
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/agents/heartbeat",
+            &serde_json::json!({
+                "agent_id": "conf-agent",
+                "session_id": "conf-session"
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 400"),
+            "POST /v1/agents/heartbeat missing request_id should be 400, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "missing_field");
+        assert_eq!(body["error"]["field"], "request_id");
+    }
+
+    // (e) success envelope
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/agents/heartbeat",
+            &serde_json::json!({
+                "request_id": "conf-heartbeat-success",
+                "agent_id": "conf-agent",
+                "session_id": "conf-session"
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "POST /v1/agents/heartbeat valid request should be 200, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], true,
+            "heartbeat success envelope must have ok:true, got {body}"
+        );
+        assert_eq!(body["request_id"], "conf-heartbeat-success");
+        assert!(body.get("result").is_some());
+        assert!(body.get("error").is_none());
+    }
+
+    // ── POST /v1/jobs/ingest ────────────────────────────────────────────────────
+    // (a) missing idempotency_key
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/jobs/ingest",
+            &serde_json::json!({
+                "request_id": "conf-job-missing-ikey",
+                "agent_id": "test-agent",
+                "session_id": "test-session",
+                "domain": "codegraph",
+                "created_at": "2026-05-18T00:00:00Z",
+                "payload": {"records": []}
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 400"),
+            "POST /v1/jobs/ingest missing idempotency_key should be 400, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "missing_field");
+        assert_eq!(body["error"]["field"], "idempotency_key");
+    }
+
+    // (b) unknown domain
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/jobs/ingest",
+            &serde_json::json!({
+                "request_id": "conf-job-baddomain",
+                "agent_id": "test-agent",
+                "session_id": "test-session",
+                "idempotency_key": "conf-job-baddomain-key",
+                "domain": "unknown_domain",
+                "created_at": "2026-05-18T00:00:00Z",
+                "payload": {"records": []}
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 400"),
+            "POST /v1/jobs/ingest unknown domain should be 400, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "invalid_domain");
+    }
+
+    // (e) success envelope (202 Accepted)
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/jobs/ingest",
+            &serde_json::json!({
+                "request_id": "conf-job-success",
+                "agent_id": "test-agent",
+                "session_id": "test-session",
+                "idempotency_key": "conf-job-success-key",
+                "domain": "codegraph",
+                "created_at": "2026-05-18T00:00:00Z",
+                "payload": {"records": []}
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 202"),
+            "POST /v1/jobs/ingest valid request should be 202, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], true,
+            "job ingest success envelope must have ok:true, got {body}"
+        );
+        assert_eq!(body["request_id"], "conf-job-success");
+        assert!(
+            body.get("result").is_some(),
+            "job ingest must have result, got {body}"
+        );
+        assert!(
+            body.get("error").is_none(),
+            "job ingest must not have error, got {body}"
+        );
+    }
+
+    // ── POST /v1/admin/checkpoint ───────────────────────────────────────────────
+    // (e) success envelope (no request body, request_id is null)
+    {
+        let res = http_post_empty(&metadata, "/v1/admin/checkpoint");
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "POST /v1/admin/checkpoint should return 200, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], true,
+            "checkpoint success envelope must have ok:true, got {body}"
+        );
+        assert!(
+            body.get("result").is_some(),
+            "checkpoint must have result, got {body}"
+        );
+        assert!(
+            body.get("error").is_none(),
+            "checkpoint must not have error, got {body}"
+        );
+    }
+
+    // ── GET /v1/records/{id} ────────────────────────────────────────────────────
+    // (e) success envelope (record may be null if not present)
+    {
+        let res = http_get_authed(
+            &metadata,
+            "/v1/records/codegraph:v1:conformance-ingest-node",
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "GET /v1/records/{{id}} should return 200, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], true,
+            "record read success envelope must have ok:true, got {body}"
+        );
+        assert!(
+            body.get("result").is_some(),
+            "record read must have result, got {body}"
+        );
+        assert!(
+            body.get("error").is_none(),
+            "record read must not have error, got {body}"
+        );
+    }
+
+    daemon.stop();
 }
 
 fn first_record_id(graph_path: &Path) -> String {

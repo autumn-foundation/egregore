@@ -1,11 +1,17 @@
 # Egregore Daemon Design
 
-**Status:** Implemented v1 daemon slice on 2026-05-17; security and workflow
+**Status:** Implemented v1 daemon slice on 2026-05-17; wire contract frozen in
+[docs/schema/daemon-api.md](../schema/daemon-api.md); security and workflow
 hardening remains planned.
 
 **Goal:** Provide a safe local multi-agent access path to one AletheiaDB-backed
 Egregore store without letting every agent open the embedded data directory as
 its own process-local database owner.
+
+**Wire contract:** The HTTP/JSON surface (`/v1/` routes, request envelope,
+response envelope, error-code taxonomy, idempotency semantics) is specified in
+[docs/schema/daemon-api.md](../schema/daemon-api.md). This design plan
+describes *how* the daemon is built; the schema doc owns *what* it exposes.
 
 ## Design Principles
 
