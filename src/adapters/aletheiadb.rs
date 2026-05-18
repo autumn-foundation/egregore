@@ -204,18 +204,33 @@ impl EmbeddedAletheiaSink {
     ///
     /// Returns an error when the embedded store cannot read a node or edge.
     pub fn read_all_records(&self) -> AdapterResult<Vec<GraphRecord>> {
-        // Fix #4: collect deleted_ids from tombstones so we can skip tombstoned nodes
+        // Collect deleted_ids from tombstones.  A tombstone is stale when a
+        // non-temporal node with the same record_id was re-ingested after it
+        // (indicated by a higher AletheiaDB NodeId).  Stale tombstones must not
+        // suppress the restored record.
         let mut deleted_ids = std::collections::BTreeSet::new();
-        for &node_id in self.tombstone_ids.values() {
+        for &tombstone_node_id in self.tombstone_ids.values() {
             let node = self
                 .db
-                .get_node(node_id)
+                .get_node(tombstone_node_id)
                 .map_err(|error| read_back_error("read_all_records", error.to_string()))?;
-            if let Some(deleted_id) = optional_str_property(
+            let Some(deleted_id) = optional_str_property(
                 "read_all_records",
                 "deleted_id",
                 node.get_property("deleted_id"),
-            )? {
+            )?
+            else {
+                continue;
+            };
+            // Fix C: if a non-temporal node with this id was re-ingested after
+            // the tombstone (higher NodeId = created later), the tombstone is
+            // stale — don't suppress the restored record.
+            let superseded = self
+                .node_lookup
+                .non_temporal
+                .get(deleted_id.as_str())
+                .is_some_and(|&live_node_id| live_node_id > tombstone_node_id);
+            if !superseded {
                 deleted_ids.insert(deleted_id);
             }
         }
@@ -257,7 +272,10 @@ impl EmbeddedAletheiaSink {
                 else {
                     continue;
                 };
-                if seen_edge_ids.insert(codegraph_id.clone()) {
+                // Fix D: deduplicate and skip tombstoned edges.
+                if seen_edge_ids.insert(codegraph_id.clone())
+                    && !deleted_ids.contains(codegraph_id.as_str())
+                {
                     records.push(self.read_edge_record(&codegraph_id, edge_id)?);
                 }
             }
@@ -1587,6 +1605,85 @@ mod tests {
         assert!(
             has_tombstone,
             "tombstone record must appear in read_all_records"
+        );
+    }
+
+    #[test]
+    fn read_all_records_includes_restored_node_when_tombstone_is_stale() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("restoration-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "restored"]);
+        let tombstone_id = stable_id(&["tombstone", &symbol_id, "v1"]);
+
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        // 1. Write original node
+        sink.write_record(&current_symbol_record(&symbol_id, "original", 10))
+            .expect("original symbol should write");
+        // 2. Write tombstone marking it deleted
+        sink.write_record(&GraphRecord::Tombstone {
+            id: tombstone_id,
+            schema_version: crate::ir::SCHEMA_VERSION,
+            deleted_id: symbol_id.clone(),
+            summary: "deleted".to_owned(),
+        })
+        .expect("tombstone should write");
+        // 3. Re-ingest the same record (restoration) — new AletheiaDB node, higher NodeId
+        sink.write_record(&current_symbol_record(&symbol_id, "restored", 20))
+            .expect("restored symbol should write");
+
+        let records = sink
+            .read_all_records()
+            .expect("read_all_records should succeed");
+
+        let has_live_node = records
+            .iter()
+            .any(|r| matches!(r, GraphRecord::Node { id, .. } if id == &symbol_id));
+        assert!(
+            has_live_node,
+            "restored node must appear in read_all_records after stale tombstone"
+        );
+    }
+
+    #[test]
+    fn read_all_records_excludes_tombstoned_edges() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("tombstoned-edge-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "edge_target"]);
+        let edge = GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id.clone(),
+            symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "file defines symbol".to_owned(),
+        );
+        let edge_id = edge.id().to_owned();
+        let tombstone_id = stable_id(&["tombstone", &edge_id]);
+
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&file_record(&file_id, "file"))
+            .expect("file should write");
+        sink.write_record(&current_symbol_record(&symbol_id, "symbol", 10))
+            .expect("symbol should write");
+        sink.write_record(&edge).expect("edge should write");
+        sink.write_record(&GraphRecord::Tombstone {
+            id: tombstone_id,
+            schema_version: crate::ir::SCHEMA_VERSION,
+            deleted_id: edge_id.clone(),
+            summary: "edge deleted".to_owned(),
+        })
+        .expect("tombstone should write");
+
+        let records = sink
+            .read_all_records()
+            .expect("read_all_records should succeed");
+
+        let has_edge = records
+            .iter()
+            .any(|r| matches!(r, GraphRecord::Edge { id, .. } if id == &edge_id));
+        assert!(
+            !has_edge,
+            "tombstoned edge must not appear in read_all_records"
         );
     }
 
