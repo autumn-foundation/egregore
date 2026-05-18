@@ -1412,9 +1412,10 @@ fn daemon_query_honors_positive_timeout_budget() {
             "request_id": "tiny-budget-query",
             "agent_id": "test-agent",
             "session_id": "test-session",
-            "limit": 1000,
-            "timeout_ms": 1,
-            "record_ids": record_ids
+            "payload": {
+                "budget": { "max_results": 1000, "timeout_ms": 1 },
+                "record_ids": record_ids
+            }
         }),
     );
     assert!(
@@ -1703,9 +1704,10 @@ fn daemon_registers_agents_runs_ingest_jobs_and_queries_records() {
             "request_id": "query-1",
             "agent_id": "test-agent",
             "session_id": "test-session",
-            "domain": "codegraph",
-            "limit": 1,
-            "record_ids": [first_record_id]
+            "payload": {
+                "budget": { "max_results": 1 },
+                "record_ids": [first_record_id]
+            }
         }),
     );
     assert!(
@@ -2284,7 +2286,7 @@ fn contract_conformance_all_routes() {
             &serde_json::json!({
                 "agent_id": "test-agent",
                 "session_id": "test-session",
-                "record_ids": []
+                "payload": { "record_ids": [] }
             }),
         );
         assert!(
@@ -2313,7 +2315,7 @@ fn contract_conformance_all_routes() {
                 "request_id": "conf-query-success",
                 "agent_id": "test-agent",
                 "session_id": "test-session",
-                "record_ids": []
+                "payload": { "record_ids": [] }
             }),
         );
         assert!(

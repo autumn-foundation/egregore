@@ -447,7 +447,23 @@ impl ApiError {
     }
 
     fn overloaded() -> Self {
-        Self::new(ErrorCode::QueueFull, "write queue is full")
+        Self {
+            status: 429,
+            code: ErrorCode::QueueFull,
+            message: "write queue is full".into(),
+            field: None,
+            retry_after_ms: Some(500),
+        }
+    }
+
+    fn shutdown_in_progress() -> Self {
+        Self {
+            status: 503,
+            code: ErrorCode::ShutdownInProgress,
+            message: "daemon is shutting down".into(),
+            field: None,
+            retry_after_ms: Some(2_000),
+        }
     }
 
     fn query_timeout() -> Self {
@@ -594,6 +610,14 @@ struct QueryBudget {
 }
 
 #[derive(Debug, Deserialize)]
+struct QueryPayload {
+    #[serde(default)]
+    budget: Option<QueryBudget>,
+    #[serde(default)]
+    record_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct QueryRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -602,15 +626,7 @@ struct QueryRequest {
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
-    domain: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default)]
-    timeout_ms: Option<u64>,
-    #[serde(default)]
-    record_ids: Vec<String>,
-    #[serde(default)]
-    budget: Option<QueryBudget>,
+    payload: Option<QueryPayload>,
 }
 
 fn non_empty(s: Option<&str>) -> Option<&str> {
@@ -1196,6 +1212,9 @@ fn handle_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     if !is_authorized(request, &state.token) {
         return HttpResponse::error(ApiError::unauthorized());
     }
+    if state.shutdown.load(Ordering::SeqCst) {
+        return HttpResponse::error(ApiError::shutdown_in_progress());
+    }
 
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/v1/status") => handle_status(state),
@@ -1275,11 +1294,20 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             );
         }
     };
-    if envelope.domain.as_deref() != Some("codegraph") {
-        return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
+    match non_empty(envelope.domain.as_deref()) {
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("domain"));
+        }
+        Some(d) if d != "codegraph" => {
+            return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
+        }
+        _ => {}
     }
     if non_empty(envelope.created_at.as_deref()).is_none() {
         return HttpResponse::error_with_id(&request_id, ApiError::missing_field("created_at"));
+    }
+    if envelope.payload.is_null() {
+        return HttpResponse::error_with_id(&request_id, ApiError::missing_field("payload"));
     }
     let payload = match serde_json::from_value::<IngestPayload>(envelope.payload) {
         Ok(payload) => payload,
@@ -1326,18 +1354,16 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     if non_empty(query.session_id.as_deref()).is_none() {
         return HttpResponse::error_with_id(&request_id, ApiError::missing_field("session_id"));
     }
-
-    let (limit, timeout_ms) = if let Some(budget) = &query.budget {
-        (
-            budget.max_results.unwrap_or(DEFAULT_QUERY_MAX_RESULTS),
-            budget.timeout_ms,
-        )
-    } else {
-        (
-            query.limit.unwrap_or(DEFAULT_QUERY_MAX_RESULTS),
-            query.timeout_ms,
-        )
+    let agent_id = query.agent_id;
+    let session_id = query.session_id;
+    let Some(payload) = query.payload else {
+        return HttpResponse::error_with_id(&request_id, ApiError::missing_field("payload"));
     };
+
+    let (limit, timeout_ms) = payload.budget.as_ref().map_or(
+        (DEFAULT_QUERY_MAX_RESULTS, None),
+        |b| (b.max_results.unwrap_or(DEFAULT_QUERY_MAX_RESULTS), b.timeout_ms),
+    );
     let limit = limit.min(DEFAULT_QUERY_MAX_RESULTS);
     let budget = timeout_ms
         .or(Some(DEFAULT_QUERY_TIMEOUT_MS))
@@ -1348,7 +1374,7 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     }
     let deadline = budget.and_then(|b| started.checked_add(b));
     let mut records = Vec::new();
-    for record_id in query.record_ids.iter().take(limit) {
+    for record_id in payload.record_ids.iter().take(limit) {
         if let Err(error) = check_query_budget(started, budget) {
             return HttpResponse::error_with_id(&request_id, error);
         }
@@ -1380,9 +1406,9 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         &request_id,
         200,
         json!({
-            "agent_id": query.agent_id,
-            "session_id": query.session_id,
-            "domain": query.domain,
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "domain": "codegraph",
             "records": records,
             "snapshot": unix_ms().to_string(),
         }),
@@ -1444,16 +1470,24 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("session_id"));
         }
     };
-    let agent_kind = registration
-        .agent_kind
-        .as_deref()
-        .unwrap_or("unknown")
-        .to_owned();
-    let project_scope = registration
-        .project_scope
-        .as_deref()
-        .unwrap_or("unknown")
-        .to_owned();
+    let agent_kind = match non_empty(registration.agent_kind.as_deref()) {
+        Some(kind) => kind.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::missing_field("agent_kind"),
+            );
+        }
+    };
+    let project_scope = match non_empty(registration.project_scope.as_deref()) {
+        Some(scope) => scope.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::missing_field("project_scope"),
+            );
+        }
+    };
 
     let agent_status = AgentStatus {
         agent_id: agent_id.clone(),
@@ -1562,11 +1596,20 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
             );
         }
     };
-    if envelope.domain.as_deref() != Some("codegraph") {
-        return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
+    match non_empty(envelope.domain.as_deref()) {
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("domain"));
+        }
+        Some(d) if d != "codegraph" => {
+            return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
+        }
+        _ => {}
     }
     if non_empty(envelope.created_at.as_deref()).is_none() {
         return HttpResponse::error_with_id(&request_id, ApiError::missing_field("created_at"));
+    }
+    if envelope.payload.is_null() {
+        return HttpResponse::error_with_id(&request_id, ApiError::missing_field("payload"));
     }
     let payload = match serde_json::from_value::<IngestPayload>(envelope.payload) {
         Ok(payload) => payload,
@@ -2145,8 +2188,10 @@ mod tests {
                 "request_id": "locked-query",
                 "agent_id": "test-agent",
                 "session_id": "test-session",
-                "timeout_ms": 1_u64,
-                "record_ids": ["codegraph:v1:missing"]
+                "payload": {
+                    "budget": { "timeout_ms": 1_u64 },
+                    "record_ids": ["codegraph:v1:missing"]
+                }
             }))?,
         };
 
