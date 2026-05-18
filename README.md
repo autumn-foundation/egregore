@@ -13,6 +13,7 @@ Implemented MVP surfaces:
 - `inspect` for graph summaries
 - `ingest --adapter dry-run`
 - `ingest --adapter embedded --data-dir <path>`
+- `query symbol`, `query file`, `query drift` for agent-callable graph queries
 - Rust symbol extraction for common modules, imports, definitions, calls, mentions, impls, and diagnostics
 - Incremental file-cache planning with tombstones
 - AletheiaDB embedding re-export through the optional `embeddings` feature
@@ -30,9 +31,17 @@ cargo run -- scan-history . --out history.graph.jsonl
 cargo run -- inspect graph.jsonl
 cargo run -- ingest graph.jsonl --adapter dry-run
 cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .egregore
+
+# Query a graph (where-is-this-symbol, what-does-this-file-define, when-did-this-drift)
+eg query symbol scan_repository --graph graph.jsonl
+eg query file src/lib.rs --graph graph.jsonl
+eg query drift --graph history.graph.jsonl --limit 5
+eg query symbol scan_repository --graph history.graph.jsonl --at <commit-sha>
 ```
 
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
+
+Query output is newline-delimited JSON by default (`--format json`). Pass `--format text` for human-readable terminal output. See [docs/cli/query.md](docs/cli/query.md) for the stable output schema.
 
 ## Primary Documents
 

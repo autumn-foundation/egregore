@@ -60,6 +60,10 @@ egregore scan <repo-path> --out graph.jsonl
 egregore scan-history <repo-path> --out history.graph.jsonl
 egregore inspect graph.jsonl
 egregore ingest graph.jsonl --adapter embedded --data-dir .egregore
+eg query symbol <name>  --graph graph.jsonl
+eg query symbol <name>  --graph history.graph.jsonl --at <commit>
+eg query file <path>    --graph graph.jsonl
+eg query drift          --graph history.graph.jsonl --limit 10
 ```
 
 The CLI should be deterministic: the same repository state and config produce the same graph IDs and JSONL output.
@@ -67,6 +71,8 @@ The CLI should be deterministic: the same repository state and config produce th
 The primary binary is `egregore`; `eg` is a short alias for repeated local use.
 
 `scan` indexes the current working tree. `scan-history` walks Git commits in deterministic topological order, checks out each tree through Git object reads rather than mutating the user's workspace, extracts code graph records for each commit, and emits temporal metadata for AletheiaDB ingestion.
+
+`query` reads a JSONL graph and answers agent-callable questions with stable record IDs and file/span/commit handles. Output is newline-delimited JSON by default; `--format text` produces human-readable terminal output. The stable output schema is documented in [docs/cli/query.md](../cli/query.md).
 
 ### Language Support
 
@@ -214,13 +220,17 @@ Acceptance criteria:
 
 ### PR-6: Agent-Useful Query Handles
 
-The output must preserve handles agents can cite in answers.
+The output must preserve handles agents can cite in answers, and the `eg query` CLI must expose them without requiring Rust.
 
 Acceptance criteria:
 
 - File paths are repo-relative.
 - Symbols include name, kind, span, and containing file.
 - Edges include source, target, label, and optional confidence.
+- `eg query symbol <name> --graph` prints JSONL with `record_id`, `name`, `kind`, `repo_relative_path`, `span`, and `git_commit` when present. Exit `0` on match, `2` on no match.
+- `eg query symbol <name> --graph --at <commit>` returns the single best match at that commit SHA or prefix; exits `1` with `error: ambiguous commit prefix` for non-unique prefixes.
+- `eg query file <path> --graph` lists all symbols defined in the file via `DEFINES` edges, sorted by span then record ID.
+- `eg query drift --graph [--limit N]` lists the top-N `SemanticDrift` nodes by score with target `repo_relative_path` and `name` resolved from `DRIFTS_FROM` edges.
 
 ### PR-7: Temporal Semantic Drift
 

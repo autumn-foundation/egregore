@@ -7,11 +7,12 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 
 use crate::{
     adapters::{DryRunSink, ingest_records, records_from_jsonl},
-    ir::{GraphRecord, NodeKind},
-    scan_repository, scan_repository_history,
+    ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan},
+    query, scan_repository, scan_repository_history,
 };
 
 #[cfg(feature = "embedded-aletheiadb")]
@@ -72,12 +73,70 @@ enum Commands {
         #[arg(long)]
         idempotency_key: Option<String>,
     },
+    /// Query an existing graph JSONL for symbols, files, or drift records.
+    Query {
+        /// Query subcommand.
+        #[command(subcommand)]
+        subcommand: QuerySubcommand,
+    },
     /// Manage the local Egregore daemon.
     #[cfg(feature = "embedded-aletheiadb")]
     Daemon {
         /// Daemon action.
         #[command(subcommand)]
         action: DaemonAction,
+    },
+}
+
+/// Output format for query results.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, clap::ValueEnum)]
+enum OutputFormat {
+    /// Newline-delimited JSON objects (default, machine-readable).
+    #[default]
+    Json,
+    /// Human-readable one-line-per-result form.
+    Text,
+}
+
+/// Subcommands for `query`.
+#[derive(Debug, Subcommand)]
+enum QuerySubcommand {
+    /// Find symbol nodes by name.
+    Symbol {
+        /// Symbol name to look up.
+        name: String,
+        /// Graph JSONL path.
+        #[arg(long)]
+        graph: PathBuf,
+        /// Restrict to the record at this commit SHA or unique prefix.
+        #[arg(long)]
+        at: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// List symbols defined in a file via DEFINES edges.
+    File {
+        /// Repository-relative file path.
+        path: String,
+        /// Graph JSONL path.
+        #[arg(long)]
+        graph: PathBuf,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Find semantic drift nodes ranked by score descending.
+    Drift {
+        /// Graph JSONL path.
+        #[arg(long)]
+        graph: PathBuf,
+        /// Maximum number of results (default 10).
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
 }
 
@@ -170,6 +229,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             &session_id,
             idempotency_key.as_deref(),
         ),
+        Commands::Query { subcommand } => query_cmd(subcommand),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Daemon { action } => daemon(action),
     }
@@ -323,6 +383,377 @@ fn daemon(action: DaemonAction) -> Result<()> {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Query output types
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct SymbolResult<'a> {
+    record_id: &'a str,
+    name: &'a str,
+    kind: &'static str,
+    repo_relative_path: Option<&'a str>,
+    span: Option<SourceSpan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_commit: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct DriftResult<'a> {
+    record_id: &'a str,
+    before_commit: &'a str,
+    after_commit: &'a str,
+    score: &'a str,
+    model_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+}
+
+// ---------------------------------------------------------------------------
+// query_cmd — dispatch
+// ---------------------------------------------------------------------------
+
+fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
+    match subcommand {
+        QuerySubcommand::Symbol {
+            name,
+            graph,
+            at,
+            format,
+        } => {
+            let records = load_records(&graph)?;
+            at.map_or_else(
+                || query_symbol_all(&records, &name, format),
+                |prefix| query_symbol_at(&records, &name, &prefix, format),
+            )
+        }
+        QuerySubcommand::File {
+            path,
+            graph,
+            format,
+        } => {
+            let records = load_records(&graph)?;
+            query_file(&records, &path, format)
+        }
+        QuerySubcommand::Drift {
+            graph,
+            limit,
+            format,
+        } => {
+            let records = load_records(&graph)?;
+            query_drift(&records, limit, format)
+        }
+    }
+}
+
+fn load_records(graph: &Path) -> Result<Vec<GraphRecord>> {
+    let jsonl = fs::read_to_string(graph)
+        .with_context(|| format!("failed to read graph JSONL from {}", graph.display()))?;
+    crate::adapters::records_from_jsonl(&jsonl)
+        .map_err(|e| anyhow::anyhow!("failed to parse graph JSONL: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// query symbol (all matching)
+// ---------------------------------------------------------------------------
+
+fn query_symbol_all(records: &[GraphRecord], name: &str, format: OutputFormat) -> Result<()> {
+    let mut results: Vec<SymbolResult<'_>> = records
+        .iter()
+        .filter_map(|r| symbol_result(r, name))
+        .collect();
+
+    if results.is_empty() {
+        eprintln!("error: no match found for symbol `{name}`");
+        std::process::exit(2);
+    }
+
+    results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
+    for result in &results {
+        print_result(result, format)?;
+    }
+    Ok(())
+}
+
+fn symbol_result<'a>(record: &'a GraphRecord, name: &str) -> Option<SymbolResult<'a>> {
+    let GraphRecord::Node {
+        id,
+        kind: NodeKind::Symbol,
+        name: node_name,
+        repo_relative_path,
+        span,
+        temporal,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    if node_name.as_deref() != Some(name) {
+        return None;
+    }
+    Some(SymbolResult {
+        record_id: id,
+        name: node_name.as_deref().unwrap_or(""),
+        kind: "Symbol",
+        repo_relative_path: repo_relative_path.as_deref(),
+        span: *span,
+        git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// query symbol --at <commit>
+// ---------------------------------------------------------------------------
+
+fn query_symbol_at(
+    records: &[GraphRecord],
+    name: &str,
+    prefix: &str,
+    format: OutputFormat,
+) -> Result<()> {
+    let matching_commits: std::collections::BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| symbol_commit_if_named(r, name, prefix))
+        .collect();
+
+    if matching_commits.len() > 1 {
+        eprintln!(
+            "error: ambiguous commit prefix `{prefix}` matches {} commits",
+            matching_commits.len()
+        );
+        std::process::exit(1);
+    }
+
+    match query::symbol_at_commit(records, name, prefix) {
+        None => {
+            eprintln!("error: no match found for symbol `{name}` at commit `{prefix}`");
+            std::process::exit(2);
+        }
+        Some(record) => {
+            if let Some(result) = symbol_result(record, name) {
+                print_result(&result, format)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn symbol_commit_if_named<'a>(
+    record: &'a GraphRecord,
+    name: &str,
+    prefix: &str,
+) -> Option<&'a str> {
+    let GraphRecord::Node {
+        kind: NodeKind::Symbol,
+        name: node_name,
+        temporal,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    if node_name.as_deref() != Some(name) {
+        return None;
+    }
+    let commit = temporal.as_ref()?.git_commit.as_str();
+    if commit.starts_with(prefix) {
+        Some(commit)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// query file
+// ---------------------------------------------------------------------------
+
+fn query_file(records: &[GraphRecord], path: &str, format: OutputFormat) -> Result<()> {
+    let file_id = records.iter().find_map(|r| {
+        let GraphRecord::Node {
+            id,
+            kind: NodeKind::File,
+            repo_relative_path,
+            ..
+        } = r
+        else {
+            return None;
+        };
+        if repo_relative_path.as_deref() == Some(path) {
+            Some(id.as_str())
+        } else {
+            None
+        }
+    });
+
+    let Some(file_id) = file_id else {
+        eprintln!("error: no match found for file `{path}`");
+        std::process::exit(2);
+    };
+
+    let defined_ids: Vec<&str> = records
+        .iter()
+        .filter_map(|r| {
+            let GraphRecord::Edge {
+                label: EdgeLabel::Defines,
+                source,
+                target,
+                ..
+            } = r
+            else {
+                return None;
+            };
+            if source.as_str() == file_id {
+                Some(target.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut results: Vec<SymbolResult<'_>> = records
+        .iter()
+        .filter_map(|r| {
+            let GraphRecord::Node {
+                id,
+                kind: NodeKind::Symbol,
+                name,
+                repo_relative_path,
+                span,
+                temporal,
+                ..
+            } = r
+            else {
+                return None;
+            };
+            if !defined_ids.contains(&id.as_str()) {
+                return None;
+            }
+            Some(SymbolResult {
+                record_id: id,
+                name: name.as_deref().unwrap_or(""),
+                kind: "Symbol",
+                repo_relative_path: repo_relative_path.as_deref(),
+                span: *span,
+                git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+            })
+        })
+        .collect();
+
+    if results.is_empty() {
+        eprintln!("error: no match found for file `{path}`");
+        std::process::exit(2);
+    }
+
+    results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
+    for result in &results {
+        print_result(result, format)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// query drift
+// ---------------------------------------------------------------------------
+
+fn query_drift(records: &[GraphRecord], limit: usize, format: OutputFormat) -> Result<()> {
+    let drifts = query::largest_semantic_drifts(records, limit);
+
+    if drifts.is_empty() {
+        eprintln!("error: no match found — no SemanticDrift nodes in graph");
+        std::process::exit(2);
+    }
+
+    for record in drifts {
+        let GraphRecord::Node {
+            id,
+            semantic_drift: Some(drift),
+            repo_relative_path: drift_path,
+            name: drift_name,
+            ..
+        } = record
+        else {
+            continue;
+        };
+
+        let (resolved_path, resolved_name) =
+            resolve_drift_target(records, drift, drift_path.as_deref(), drift_name.as_deref());
+
+        let result = DriftResult {
+            record_id: id,
+            before_commit: &drift.before_git_commit,
+            after_commit: &drift.after_git_commit,
+            score: &drift.score,
+            model_id: &drift.model_id,
+            repo_relative_path: resolved_path,
+            name: resolved_name,
+        };
+        print_result(&result, format)?;
+    }
+    Ok(())
+}
+
+fn resolve_drift_target<'a>(
+    records: &'a [GraphRecord],
+    drift: &'a SemanticDriftMetadata,
+    drift_path: Option<&'a str>,
+    drift_name: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if let Some(GraphRecord::Node {
+        repo_relative_path,
+        name,
+        ..
+    }) = records.iter().find(|r| r.id() == drift.target_record_id)
+    {
+        return (repo_relative_path.as_deref(), name.as_deref());
+    }
+    (drift_path, drift_name)
+}
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
+fn print_result<T: Serialize + PrintText>(result: &T, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            let line = serde_json::to_string(result).context("failed to serialize query result")?;
+            println!("{line}");
+        }
+        OutputFormat::Text => {
+            println!("{}", result.as_text());
+        }
+    }
+    Ok(())
+}
+
+trait PrintText {
+    fn as_text(&self) -> String;
+}
+
+impl PrintText for SymbolResult<'_> {
+    fn as_text(&self) -> String {
+        let path = self.repo_relative_path.unwrap_or("(unknown)");
+        let line = self.span.map_or(0, |s| s.start_line);
+        let commit = self.git_commit.map_or(String::new(), |c| format!(" [{c}]"));
+        format!("{} ({}) @ {path}:{line}{commit}", self.name, self.kind)
+    }
+}
+
+impl PrintText for DriftResult<'_> {
+    fn as_text(&self) -> String {
+        let name = self.name.unwrap_or("(unknown)");
+        let path = self.repo_relative_path.unwrap_or("(unknown)");
+        format!(
+            "{name} score={} {}..{} @ {path}",
+            self.score, self.before_commit, self.after_commit
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
 struct InspectCounts {
