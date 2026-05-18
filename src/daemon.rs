@@ -1,7 +1,7 @@
 //! Local daemon for shared Egregore store access.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex, RwLock, RwLockReadGuard, TryLockError,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -879,12 +879,34 @@ fn recover_pending_write(
 }
 
 fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {
-    if has_ambiguous_recovery_keys(records) {
+    if has_duplicate_node_or_tombstone_recovery_keys(records)
+        || has_ambiguous_recovery_keys(records)
+    {
         return Err(ApiError::conflict(
             "ingest payload has duplicate record IDs that are not idempotently recoverable",
         ));
     }
     Ok(())
+}
+
+fn has_duplicate_node_or_tombstone_recovery_keys(records: &[GraphRecord]) -> bool {
+    let mut seen = BTreeSet::new();
+    for record in records {
+        let key = match record {
+            GraphRecord::Node {
+                id,
+                temporal: Some(temporal),
+                ..
+            } => format!("node\0{}\0{}", id, temporal.git_commit),
+            GraphRecord::Node { id, .. } => format!("node\0{id}"),
+            GraphRecord::Tombstone { id, .. } => format!("tombstone\0{id}"),
+            GraphRecord::Edge { .. } => continue,
+        };
+        if !seen.insert(key) {
+            return true;
+        }
+    }
+    false
 }
 
 fn has_ambiguous_recovery_keys(records: &[GraphRecord]) -> bool {
@@ -947,7 +969,7 @@ fn complete_idempotency_entry(
 }
 
 fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
-    let response = match read_http_request(&mut stream) {
+    let response = match read_http_request(&mut stream, &state.token) {
         Ok(request) => handle_request(&request, &state),
         Err(error) => HttpResponse::error(ApiError::bad_request(error.to_string())),
     };
@@ -1065,21 +1087,25 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         return HttpResponse::error(ApiError::new(408, "timeout", "query budget expired"));
     }
     let limit = query.limit.unwrap_or(100).min(1000);
-    let Ok(sink) = state.sink.read() else {
-        return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
-    };
     let mut records = Vec::new();
     for record_id in query.record_ids.iter().take(limit) {
-        if budget.is_some_and(|budget| started.elapsed() >= budget) {
-            return HttpResponse::error(ApiError::new(408, "timeout", "query budget expired"));
+        if let Err(error) = check_query_budget(started, budget) {
+            return HttpResponse::error(error);
         }
-        match sink.read_back(record_id) {
+        let result = {
+            let sink = match query_sink_read(state, started, budget) {
+                Ok(sink) => sink,
+                Err(error) => return HttpResponse::error(error),
+            };
+            sink.read_back(record_id)
+        };
+        match result {
             Ok(Some(record)) => records.push(record),
             Ok(None) => {}
             Err(error) => return HttpResponse::error(ApiError::internal(error.to_string())),
         }
-        if budget.is_some_and(|budget| started.elapsed() >= budget) {
-            return HttpResponse::error(ApiError::new(408, "timeout", "query budget expired"));
+        if let Err(error) = check_query_budget(started, budget) {
+            return HttpResponse::error(error);
         }
     }
     HttpResponse::json(
@@ -1093,6 +1119,40 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             "snapshot": unix_ms().to_string(),
         }),
     )
+}
+
+fn check_query_budget(
+    started: Instant,
+    budget: Option<Duration>,
+) -> std::result::Result<(), ApiError> {
+    if budget.is_some_and(|budget| started.elapsed() >= budget) {
+        return Err(ApiError::new(408, "timeout", "query budget expired"));
+    }
+    Ok(())
+}
+
+fn query_sink_read(
+    state: &ServerState,
+    started: Instant,
+    budget: Option<Duration>,
+) -> std::result::Result<RwLockReadGuard<'_, EmbeddedAletheiaSink>, ApiError> {
+    if budget.is_none() {
+        return state
+            .sink
+            .read()
+            .map_err(|_| ApiError::internal("embedded sink lock poisoned"));
+    }
+
+    loop {
+        check_query_budget(started, budget)?;
+        match state.sink.try_read() {
+            Ok(sink) => return Ok(sink),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(ApiError::internal("embedded sink lock poisoned"));
+            }
+            Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
 }
 
 fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResponse {
@@ -1345,13 +1405,16 @@ fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> std::result::Result<
 }
 
 fn is_authorized(request: &HttpRequest, token: &str) -> bool {
-    request
-        .headers
+    headers_authorized(&request.headers, token)
+}
+
+fn headers_authorized(headers: &HashMap<String, String>, token: &str) -> bool {
+    headers
         .get("authorization")
         .is_some_and(|header| header == &format!("Bearer {token}"))
 }
 
-fn read_http_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
+fn read_http_request(stream: &mut TcpStream, token: &str) -> io::Result<HttpRequest> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 1024];
@@ -1403,6 +1466,14 @@ fn read_http_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
             io::ErrorKind::InvalidData,
             "request body too large",
         ));
+    }
+    if !headers_authorized(&headers, token) {
+        return Ok(HttpRequest {
+            method,
+            path,
+            headers,
+            body: Vec::new(),
+        });
     }
     let body_start = header_end + 4;
     let mut body = buffer[body_start..].to_vec();
@@ -1572,4 +1643,51 @@ fn unix_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_timeout_includes_waiting_for_sink_read_lock() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let sink = Arc::new(RwLock::new(
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?,
+        ));
+        let write_guard = sink
+            .write()
+            .map_err(|_| anyhow!("embedded sink lock poisoned"))?;
+        let (write_tx, _write_rx) = mpsc::sync_channel(1);
+        let state = ServerState {
+            token: "test-token".to_owned(),
+            sink: Arc::clone(&sink),
+            write_tx,
+            jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            agents: Arc::new(Mutex::new(BTreeMap::new())),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        let request = HttpRequest {
+            method: "POST".to_owned(),
+            path: "/v1/query".to_owned(),
+            headers: HashMap::new(),
+            body: serde_json::to_vec(&json!({
+                "request_id": "locked-query",
+                "agent_id": "test-agent",
+                "session_id": "test-session",
+                "timeout_ms": 1_u64,
+                "record_ids": ["codegraph:v1:missing"]
+            }))?,
+        };
+
+        let started = Instant::now();
+        let response = handle_query(&request, &state);
+        assert_eq!(response.status, 408);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "query timeout should include waiting for the read lock"
+        );
+        drop(write_guard);
+        Ok(())
+    }
 }

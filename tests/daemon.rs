@@ -882,6 +882,52 @@ fn daemon_rejects_fresh_duplicate_current_record_ids_before_commit() {
 }
 
 #[test]
+fn daemon_rejects_identical_fresh_duplicate_current_record_ids_before_commit() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("identical-duplicate-fresh.jsonl");
+    let record = GraphRecord::node(
+        "codegraph:v1:identical-fresh-duplicate-node".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "same".to_owned(),
+    );
+    write_graph(&graph_path, &[record.clone(), record]);
+    let mut daemon = start_daemon(&data_dir);
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--idempotency-key")
+        .arg("identical-duplicate-fresh")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("duplicate record IDs"));
+
+    let metadata = read_metadata(&data_dir);
+    let read_response = http_request(
+        &metadata.address,
+        &format!(
+            "GET /v1/records/codegraph:v1:identical-fresh-duplicate-node HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    );
+    assert!(
+        read_response.contains("\"record\":null"),
+        "identical duplicate rejection should happen before committing either record"
+    );
+
+    daemon.stop();
+}
+
+#[test]
 fn daemon_pending_recovery_accepts_temporal_duplicate_ids() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -1057,6 +1103,34 @@ fn daemon_rejects_oversized_unauthorized_body_before_reading_it() {
     assert!(
         response.starts_with("HTTP/1.1 400"),
         "oversized unauthorized body should be rejected before auth, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn daemon_rejects_unauthorized_body_under_limit_before_reading_it() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let mut stream =
+        TcpStream::connect(&metadata.address).expect("daemon should accept connections");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout should configure");
+    stream
+        .write_all(
+            b"POST /v1/status HTTP/1.1\r\nHost: egregore\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n",
+        )
+        .expect("headers should write");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("unauthorized response should arrive before body is sent");
+    assert!(
+        response.starts_with("HTTP/1.1 401"),
+        "under-limit unauthorized body should be rejected before body read, got {response}"
     );
 
     daemon.stop();
