@@ -36,8 +36,8 @@ pub use error::{CodegraphError, Result};
 pub use history::scan_repository_history;
 pub use ir::{
     AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind,
-    SCHEMA_VERSION, SemanticDriftMetadata, SourceSpan, TemporalMetadata, agent_memory_stable_id,
-    stable_id,
+    NodeProvenance, SCHEMA_VERSION, SemanticDriftMetadata, SourceSpan, TemporalMetadata,
+    agent_memory_stable_id, stable_id,
 };
 
 /// Scans a repository into deterministic graph records.

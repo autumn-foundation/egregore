@@ -595,6 +595,16 @@ impl EmbeddedAletheiaSink {
             temporal,
             semantic_drift,
             evidence_links,
+            text,
+            superseded_by,
+            agent_id,
+            agent_kind,
+            session_id,
+            observed_at,
+            ingested_at,
+            confidence,
+            source_handle,
+            redaction_policy_version,
             summary,
         } = record
         else {
@@ -617,6 +627,21 @@ impl EmbeddedAletheiaSink {
         {
             builder = builder.insert("evidence_links_json", json.as_str());
         }
+        builder = insert_optional(builder, "text", text.as_deref());
+        builder = insert_optional(builder, "superseded_by", superseded_by.as_deref());
+        builder = insert_optional(builder, "agent_id", agent_id.as_deref());
+        builder = insert_optional(builder, "agent_kind", agent_kind.as_deref());
+        builder = insert_optional(builder, "session_id", session_id.as_deref());
+        // Use "prov_observed_at" to avoid collision with temporal "observed_at".
+        builder = insert_optional(builder, "prov_observed_at", observed_at.as_deref());
+        builder = insert_optional(builder, "ingested_at", ingested_at.as_deref());
+        builder = insert_optional(builder, "confidence", confidence.as_deref());
+        builder = insert_optional(builder, "source_handle", source_handle.as_deref());
+        builder = insert_optional(
+            builder,
+            "redaction_policy_version",
+            redaction_policy_version.as_deref(),
+        );
 
         let node_id = self
             .db
@@ -940,6 +965,49 @@ impl EmbeddedAletheiaSink {
             .map(serde_json::from_str::<Vec<EvidenceLink>>)
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("evidence_links_json invalid: {e}")))?,
+            text: optional_str_property(record_id, "text", node.get_property("text"))?,
+            superseded_by: optional_str_property(
+                record_id,
+                "superseded_by",
+                node.get_property("superseded_by"),
+            )?,
+            agent_id: optional_str_property(record_id, "agent_id", node.get_property("agent_id"))?,
+            agent_kind: optional_str_property(
+                record_id,
+                "agent_kind",
+                node.get_property("agent_kind"),
+            )?,
+            session_id: optional_str_property(
+                record_id,
+                "session_id",
+                node.get_property("session_id"),
+            )?,
+            // Stored under "prov_observed_at" to avoid collision with temporal "observed_at".
+            observed_at: optional_str_property(
+                record_id,
+                "prov_observed_at",
+                node.get_property("prov_observed_at"),
+            )?,
+            ingested_at: optional_str_property(
+                record_id,
+                "ingested_at",
+                node.get_property("ingested_at"),
+            )?,
+            confidence: optional_str_property(
+                record_id,
+                "confidence",
+                node.get_property("confidence"),
+            )?,
+            source_handle: optional_str_property(
+                record_id,
+                "source_handle",
+                node.get_property("source_handle"),
+            )?,
+            redaction_policy_version: optional_str_property(
+                record_id,
+                "redaction_policy_version",
+                node.get_property("redaction_policy_version"),
+            )?,
             summary: required_str_property(record_id, "summary", node.get_property("summary"))?,
         })
     }

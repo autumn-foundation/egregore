@@ -27,7 +27,10 @@ use crate::{
     adapters::{
         AdapterError, EmbeddedAletheiaSink, ExpectedRecordState, IngestReport, ingest_records,
     },
-    ir::{AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, GraphRecord, NodeKind, agent_memory_stable_id},
+    ir::{
+        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord, NodeKind,
+        agent_memory_stable_id,
+    },
 };
 
 const RUNTIME_DIR_SUFFIX: &str = ".egregore-runtime";
@@ -440,7 +443,7 @@ impl ApiError {
     fn invalid_domain() -> Self {
         Self::new(
             ErrorCode::InvalidDomain,
-            r#"domain must be "codegraph" for v1 writes"#,
+            r#"domain must be "codegraph" or "agent_memory""#,
         )
     }
 
@@ -1009,9 +1012,14 @@ fn apply_write(
     idempotency: &Arc<Mutex<IdempotencyStore>>,
 ) -> WriteResult {
     validate_unique_recovery_keys(&command.records)?;
-    validate_evidence_links(&command.records, sink)?;
-    let record_ids = command
+    let synthesized_edges = validate_and_synthesize_evidence_edges(&command.records, sink)?;
+    let all_records: Vec<GraphRecord> = command
         .records
+        .iter()
+        .cloned()
+        .chain(synthesized_edges)
+        .collect();
+    let record_ids = all_records
         .iter()
         .map(|record| record.id().to_owned())
         .collect::<Vec<_>>();
@@ -1040,7 +1048,7 @@ fn apply_write(
                     IdempotencyEntry::Pending {
                         payload_hash: command.payload_hash.clone(),
                         record_ids: record_ids.clone(),
-                        records: command.records.clone(),
+                        records: all_records.clone(),
                     },
                 )
                 .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -1063,7 +1071,7 @@ fn apply_write(
         let mut sink = sink
             .write()
             .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
-        let report = ingest_records(&command.records, &mut *sink);
+        let report = ingest_records(&all_records, &mut *sink);
         if report.succeeded > 0 {
             sink.persist_indexes()
                 .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -1149,37 +1157,129 @@ fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {
     Ok(())
 }
 
-fn validate_evidence_links(
-    records: &[GraphRecord],
-    sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
-) -> WriteResult<()> {
-    let sink_guard = sink
-        .read()
-        .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
-    for record in records {
+// Resolves an evidence link's target ID.  Returns the canonical record ID or an error.
+// Accepts either a direct `target_record_id` or a (path, span, commit) triple.
+fn resolve_evidence_target(
+    link: &EvidenceLink,
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<String> {
+    if let Some(id) = &link.target_record_id {
+        return match sink.read_back(id) {
+            Ok(Some(_)) => Ok(id.clone()),
+            Ok(None) => Err(ApiError::new(
+                ErrorCode::UnresolvedEvidenceTarget,
+                format!("evidence link target '{id}' not found in store"),
+            )),
+            Err(e) => Err(ApiError::internal(e.to_string())),
+        };
+    }
+    // Triple-based resolution: scan all records for matching path + commit [+ span].
+    let path = link.target_repo_relative_path.as_deref().ok_or_else(|| {
+        ApiError::missing_field(
+            "evidence_links[].target_record_id or (target_repo_relative_path, target_git_commit)",
+        )
+    })?;
+    let commit = link
+        .target_git_commit
+        .as_deref()
+        .ok_or_else(|| ApiError::missing_field("evidence_links[].target_git_commit"))?;
+    let all = sink
+        .read_all_records()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    for record in &all {
         if let GraphRecord::Node {
-            evidence_links: Some(links),
+            id,
+            repo_relative_path: Some(rp),
+            temporal: Some(t),
+            span,
             ..
         } = record
+            && rp == path
+            && t.git_commit == commit
+            && link
+                .target_span
+                .as_ref()
+                .is_none_or(|ts| span.as_ref() == Some(ts))
         {
-            for link in links {
-                match sink_guard.read_back(&link.target_record_id) {
-                    Ok(None) => {
-                        return Err(ApiError::new(
-                            ErrorCode::UnresolvedEvidenceTarget,
-                            format!(
-                                "evidence link target '{}' not found in store",
-                                link.target_record_id
-                            ),
-                        ));
-                    }
-                    Ok(Some(_)) => {}
-                    Err(error) => return Err(ApiError::internal(error.to_string())),
+            return Ok(id.clone());
+        }
+    }
+    Err(ApiError::new(
+        ErrorCode::UnresolvedEvidenceTarget,
+        format!("evidence link target not found by triple (path={path}, commit={commit})"),
+    ))
+}
+
+// Validates evidence link invariants and synthesizes the required graph Edge records.
+struct ResolvedLink {
+    node_id: String,
+    target_id: String,
+    relation: String,
+    confidence: Option<String>,
+}
+
+// Returns the synthesized edges, which the caller must include in the write set.
+fn validate_and_synthesize_evidence_edges(
+    records: &[GraphRecord],
+    sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
+) -> WriteResult<Vec<GraphRecord>> {
+    // Phase 1: validate and resolve all targets while holding the read lock.
+    let resolved: Vec<ResolvedLink> = {
+        let sink_guard = sink
+            .read()
+            .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
+        let mut resolved = Vec::new();
+        for record in records {
+            if let GraphRecord::Node {
+                id,
+                kind,
+                evidence_links,
+                confidence,
+                ..
+            } = record
+            {
+                let links = evidence_links.as_deref().unwrap_or(&[]);
+                if *kind == NodeKind::Observation && links.is_empty() {
+                    return Err(ApiError::missing_field(
+                        "evidence_links (Observation requires at least one evidence link)",
+                    ));
+                }
+                for link in links {
+                    let target_id = resolve_evidence_target(link, &sink_guard)?;
+                    let link_confidence = if link.confidence.is_empty() {
+                        confidence.clone()
+                    } else {
+                        Some(link.confidence.clone())
+                    };
+                    resolved.push(ResolvedLink {
+                        node_id: id.clone(),
+                        target_id,
+                        relation: link.relation.clone(),
+                        confidence: link_confidence,
+                    });
                 }
             }
         }
+        drop(sink_guard); // release read lock before Phase 2
+        resolved
+    };
+
+    // Phase 2: synthesize edge records (no lock needed).
+    let mut edges = Vec::with_capacity(resolved.len());
+    for rl in resolved {
+        let edge_label = EdgeLabel::from_relation(&rl.relation).ok_or_else(|| {
+            ApiError::bad_request(format!("unknown evidence link relation '{}'", rl.relation))
+        })?;
+        let summary = format!("{} {} (from evidence link)", rl.node_id, rl.relation);
+        edges.push(GraphRecord::agent_memory_edge(
+            edge_label,
+            rl.node_id,
+            rl.target_id,
+            rl.confidence,
+            summary,
+        ));
     }
-    Ok(())
+    Ok(edges)
 }
 
 fn has_duplicate_recovery_keys(records: &[GraphRecord]) -> bool {
@@ -1432,11 +1532,16 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     if non_empty(query.session_id.as_deref()).is_none() {
         return HttpResponse::error_with_id(&request_id, ApiError::missing_field("session_id"));
     }
-    if non_empty(query.domain.as_deref()).is_some_and(|d| !matches!(d, "codegraph" | "agent_memory")) {
+    if non_empty(query.domain.as_deref())
+        .is_some_and(|d| !matches!(d, "codegraph" | "agent_memory"))
+    {
         return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
     }
     let agent_id = query.agent_id;
     let session_id = query.session_id;
+    let domain = non_empty(query.domain.as_deref())
+        .unwrap_or("codegraph")
+        .to_owned();
     let Some(payload) = query.payload else {
         return HttpResponse::error_with_id(&request_id, ApiError::missing_field("payload"));
     };
@@ -1495,7 +1600,7 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         json!({
             "agent_id": agent_id,
             "session_id": session_id,
-            "domain": "codegraph",
+            "domain": domain,
             "records": records,
             "snapshot": unix_ms().to_string(),
         }),
