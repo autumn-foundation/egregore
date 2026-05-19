@@ -535,15 +535,41 @@ impl EmbeddedAletheiaSink {
 
     /// Returns true if the store contains any records whose ID does not start with `codegraph:`.
     ///
+    /// Scans both node and edge records; edge records are not indexed in `node_lookup`
+    /// but may carry `agent_memory:v1:` IDs.
+    ///
     /// # Errors
     ///
-    /// Returns an error if an embedded read operation fails.
-    #[must_use]
-    pub fn has_non_codegraph_records(&self) -> bool {
-        self.node_lookup
+    /// Returns an error if an embedded read or edge operation fails.
+    pub fn has_non_codegraph_records(&self) -> AdapterResult<bool> {
+        // Check node records.
+        if self
+            .node_lookup
             .latest
             .keys()
             .any(|id| !id.starts_with("codegraph:"))
+        {
+            return Ok(true);
+        }
+        // Also check edge records (evidence links can carry agent_memory:v1: IDs).
+        for node_id in self.db.get_all_node_ids() {
+            for edge_id in self.db.get_outgoing_edges(node_id) {
+                let edge = self
+                    .db
+                    .get_edge(edge_id)
+                    .map_err(|e| read_back_error("has_non_codegraph_records", e.to_string()))?;
+                if optional_str_property(
+                    "has_non_codegraph_records",
+                    "codegraph_id",
+                    edge.get_property("codegraph_id"),
+                )?
+                .is_some_and(|id| !id.starts_with("codegraph:"))
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Returns true if the embedded graph contains a Commit -> Change -> Symbol path.

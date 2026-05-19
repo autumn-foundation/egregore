@@ -203,10 +203,25 @@ fn git_canonical_remote_url(repo_root: &Path) -> Option<String> {
 
 /// Returns `true` for URLs that are machine-specific local paths rather than
 /// portable remote addresses: absolute paths, `file://` URLs, and relative paths.
+///
+/// Scp-form remotes (`[user@]host:path`) are portable and return `false`.
+/// Userless scp form (`host:path`, no `@`) is distinguished from relative paths
+/// by the presence of `:` with no `/` before it.
 fn is_local_remote_url(url: &str) -> bool {
-    url.starts_with('/')
-        || url.starts_with("file://")
-        || (!url.contains("://") && !url.contains('@'))
+    if url.starts_with('/') || url.starts_with("file://") {
+        return true;
+    }
+    if url.contains("://") {
+        return false;
+    }
+    // No scheme: scp form ([user@]host:path) if ':' appears before any '/'.
+    if url
+        .find(':')
+        .is_some_and(|colon_pos| !url[..colon_pos].contains('/'))
+    {
+        return false; // scp form — portable
+    }
+    true // relative path or other local form
 }
 
 /// Returns the root commit SHA (oldest first-parent ancestor of HEAD),
@@ -242,6 +257,7 @@ fn git_root_commit_sha(repo_root: &Path) -> Option<String> {
 /// - Scheme coerced from `http` to `https`
 /// - Host portion lowercased
 /// - Trailing `.git` stripped
+#[must_use]
 pub fn normalize_remote_url(url: &str) -> String {
     // SSH scp form: [user@]host:path  (e.g. git@github.com:owner/repo.git or alice@host:path)
     if !url.contains("://") {
@@ -249,8 +265,7 @@ pub fn normalize_remote_url(url: &str) -> String {
         if let Some(colon) = without_user.find(':') {
             let host = without_user[..colon].to_lowercase();
             let path = &without_user[colon + 1..];
-            let path = path.strip_suffix(".git").unwrap_or(path);
-            return format!("https://{host}/{path}");
+            return format!("https://{host}/{}", strip_git_suffix(path));
         }
     }
 
@@ -260,8 +275,7 @@ pub fn normalize_remote_url(url: &str) -> String {
         if let Some(slash) = rest.find('/') {
             let host = rest[..slash].to_lowercase();
             let path = &rest[slash..];
-            let path = path.strip_suffix(".git").unwrap_or(path);
-            return format!("https://{host}{path}");
+            return format!("https://{host}{}", strip_git_suffix(path));
         }
         let host = rest.to_lowercase();
         return format!("https://{host}");
@@ -276,18 +290,28 @@ pub fn normalize_remote_url(url: &str) -> String {
         return url.to_owned();
     };
 
-    let normalized = scheme_rest.find('/').map_or_else(
-        || format!("https://{}", scheme_rest.to_lowercase()),
-        |slash| {
-            let host = scheme_rest[..slash].to_lowercase();
-            let path = &scheme_rest[slash..];
-            format!("https://{host}{path}")
+    scheme_rest.find('/').map_or_else(
+        || {
+            let host = strip_userinfo(scheme_rest).to_lowercase();
+            format!("https://{host}")
         },
-    );
+        |slash| {
+            let host = strip_userinfo(&scheme_rest[..slash]).to_lowercase();
+            let path = &scheme_rest[slash..];
+            format!("https://{host}{}", strip_git_suffix(path))
+        },
+    )
+}
 
-    normalized
-        .strip_suffix(".git")
-        .map_or_else(|| normalized.clone(), ToOwned::to_owned)
+/// Strips a leading `user@` from a host string, if present.
+fn strip_userinfo(host: &str) -> &str {
+    host.split_once('@').map_or(host, |(_, h)| h)
+}
+
+/// Trims trailing slashes then strips a trailing `.git` extension, then trims again.
+fn strip_git_suffix(s: &str) -> &str {
+    let s = s.trim_end_matches('/');
+    s.strip_suffix(".git").unwrap_or(s).trim_end_matches('/')
 }
 
 #[cfg(test)]
@@ -355,6 +379,38 @@ mod tests {
         assert_eq!(
             normalize_remote_url("alice@example.com:owner/repo.git"),
             "https://example.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn scp_without_user_normalized() {
+        assert_eq!(
+            normalize_remote_url("github.com:owner/repo.git"),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn https_trailing_slash_stripped() {
+        assert_eq!(
+            normalize_remote_url("https://github.com/owner/repo/"),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn https_git_suffix_and_trailing_slash_stripped() {
+        assert_eq!(
+            normalize_remote_url("https://github.com/owner/repo.git/"),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn https_userinfo_stripped() {
+        assert_eq!(
+            normalize_remote_url("https://alice@github.com/owner/repo.git"),
+            "https://github.com/owner/repo"
         );
     }
 }

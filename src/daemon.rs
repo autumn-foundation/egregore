@@ -1323,7 +1323,8 @@ fn validate_no_local_path_identity_in_shared_store(
                 .map_err(|error| ApiError::internal(error.to_string()))?,
             sink.stored_local_path_repository_ids()
                 .map_err(|error| ApiError::internal(error.to_string()))?,
-            sink.has_non_codegraph_records(),
+            sink.has_non_codegraph_records()
+                .map_err(|error| ApiError::internal(error.to_string()))?,
         )
     };
 
