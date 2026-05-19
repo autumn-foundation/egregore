@@ -143,7 +143,7 @@ Small writes can remain synchronous:
 POST /v1/records/ingest
 POST /v1/observations
 POST /v1/artifacts
-POST /v1/verifications
+POST /v1/verifications    # schema: docs/schema/verification.md
 ```
 
 ## Concurrency Model

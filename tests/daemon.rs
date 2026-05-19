@@ -2603,7 +2603,7 @@ fn first_record_id(graph_path: &Path) -> String {
 // ── Schema conformance: issue #6 ─────────────────────────────────────────────
 
 // (a) Every NodeKind variant is either code-graph-documented,
-// agent-memory-documented, or agent-memory-reserved.
+// agent-memory-documented, agent-memory-reserved, or verification-domain-documented.
 // The exhaustive match enforces this at compile time: adding a new
 // NodeKind variant without updating this list is a compile error.
 #[test]
@@ -2624,10 +2624,7 @@ fn all_node_kinds_have_documented_schema() {
             "agent-memory-documented"
         }
         // Reserved with one-line definitions in docs/schema/agent-memory.md §4b
-        NodeKind::Task
-        | NodeKind::Artifact
-        | NodeKind::Verification
-        | NodeKind::CommandEvidence => "agent-memory-reserved",
+        NodeKind::Task | NodeKind::Artifact | NodeKind::CommandEvidence => "agent-memory-reserved",
         // M2 trajectory-importer node kinds (docs/schema/agent-memory.md §4b + PRD M2)
         NodeKind::AgentRun
         | NodeKind::AgentTurn
@@ -2637,6 +2634,14 @@ fn all_node_kinds_have_documented_schema() {
         | NodeKind::PatchArtifact
         | NodeKind::Failure
         | NodeKind::Decision => "agent-memory-m2-traj-importer",
+        // Documented in docs/schema/verification.md (full schema, day-one shapes)
+        NodeKind::Verification => "verification-documented",
+        // Reserved in docs/schema/verification.md §5 with one-line definitions
+        NodeKind::TestRun
+        | NodeKind::CIStatus
+        | NodeKind::BenchmarkRun
+        | NodeKind::CoverageReport
+        | NodeKind::ProofResult => "verification-domain-documented",
     };
 }
 
@@ -3483,6 +3488,155 @@ fn eg_query_daemon_smoke() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("no match found"));
+
+    daemon.stop();
+}
+
+// ── Schema conformance: issue #11 (verification domain) ──────────────────────
+
+// RED: (d) A Verification record without an evidence handle is rejected
+// with the documented `missing_evidence_handle` error code.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn verification_missing_evidence_handle_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-missing-evidence-handle",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-missing-evidence-handle-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:no-evidence-handle-fixture",
+                    "kind": "Verification",
+                    "schema_version": 1,
+                    "summary": "Verification record with no evidence handle",
+                    "executed_at": "2026-05-19T00:00:00Z",
+                    "ingested_at": "2026-05-19T00:00:00Z",
+                    "verification_kind": "command_run",
+                    "status": "passed",
+                    "evidence_quality": "verbatim"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "Verification record without evidence handle should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_evidence_handle",
+        "rejection must carry missing_evidence_handle code per schema doc, got {body}"
+    );
+
+    daemon.stop();
+}
+
+// RED: (c) A CommandRun with stdout_handle.inline set and bytes > 16 KiB
+// is rejected; accepted when correctly demoted to handle-only (inline=null).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn verification_command_run_oversized_inline_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // 17 KiB of inline content — exceeds the 16 KiB ceiling
+    let oversized_inline: String = "x".repeat(17 * 1024);
+
+    let reject_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-oversized-inline-reject",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-oversized-inline-reject-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:oversized-inline-fixture",
+                    "kind": "CommandRun",
+                    "schema_version": 1,
+                    "summary": "CommandRun with oversized inline stdout",
+                    "source_artifact_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "executed_at": "2026-05-19T00:00:00Z",
+                    "ingested_at": "2026-05-19T00:00:00Z",
+                    "evidence_quality": "verbatim",
+                    "stdout_handle": {
+                        "inline": oversized_inline,
+                        "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                        "bytes": 17408_u64
+                    }
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !reject_response.starts_with("HTTP/1.1 200"),
+        "CommandRun with oversized stdout_handle.inline should be rejected, got {reject_response}"
+    );
+    let reject_body = response_json(&reject_response);
+    assert!(
+        reject_body["error"]["code"] == "bad_request"
+            || reject_body["error"]["code"] == "payload_too_large",
+        "oversized inline stdout rejection must carry bad_request or payload_too_large, got {reject_body}"
+    );
+
+    // Accept when inline demoted to null (handle-only)
+    let accept_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-oversized-inline-accept",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-oversized-inline-accept-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:handle-only-fixture",
+                    "kind": "CommandRun",
+                    "schema_version": 1,
+                    "summary": "CommandRun with handle-only stdout (demoted)",
+                    "source_artifact_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "executed_at": "2026-05-19T00:00:00Z",
+                    "ingested_at": "2026-05-19T00:00:00Z",
+                    "evidence_quality": "referenced_only",
+                    "stdout_handle": {
+                        "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                        "bytes": 17408_u64
+                    }
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        accept_response.starts_with("HTTP/1.1 200"),
+        "CommandRun with handle-only stdout (inline=null) should be accepted, got {accept_response}"
+    );
 
     daemon.stop();
 }

@@ -887,6 +887,12 @@ fn make_node(
         repository_identity: None,
         valid_time: None,
         valid_time_source: None,
+        stdout_handle: None,
+        stderr_handle: None,
+        evidence_quality: None,
+        executed_at: None,
+        verification_kind: None,
+        status: None,
     }
 }
 

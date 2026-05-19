@@ -369,6 +369,10 @@ enum ErrorCode {
     /// Reserved on #5's error-code enum; returned when a commit prefix matches
     /// more than one distinct commit SHA in the store.
     AmbiguousCommitPrefix,
+    /// Added by #11 (verification schema): a verification-domain record is
+    /// missing a required evidence handle (`source_artifact_hash`,
+    /// `source_artifact_path`, or `stdout_handle.hash`).
+    MissingEvidenceHandle,
 }
 
 impl ErrorCode {
@@ -390,6 +394,7 @@ impl ErrorCode {
             Self::UnresolvedEvidenceTarget => "unresolved_evidence_target",
             Self::LocalPathIdentityUnsupported => "local_path_identity_unsupported",
             Self::AmbiguousCommitPrefix => "ambiguous_commit_prefix",
+            Self::MissingEvidenceHandle => "missing_evidence_handle",
         }
     }
 
@@ -410,7 +415,8 @@ impl ErrorCode {
             Self::ShutdownInProgress => 503,
             Self::RedactionRequired
             | Self::UnresolvedEvidenceTarget
-            | Self::LocalPathIdentityUnsupported => 422,
+            | Self::LocalPathIdentityUnsupported
+            | Self::MissingEvidenceHandle => 422,
         }
     }
 }
@@ -471,7 +477,7 @@ impl ApiError {
     fn invalid_domain() -> Self {
         Self::new(
             ErrorCode::InvalidDomain,
-            r#"domain must be "codegraph" or "agent_memory""#,
+            r#"domain must be "codegraph", "agent_memory", or "verification""#,
         )
     }
 
@@ -1219,6 +1225,7 @@ fn apply_write(
     }
 
     validate_no_local_path_identity_in_shared_store(&command.records, sink)?;
+    validate_verification_domain_records(&command.records)?;
 
     let (synthesized_edges, canonical_nodes) =
         validate_and_synthesize_evidence_edges(&command.records, sink)?;
@@ -1515,6 +1522,72 @@ fn incoming_identity_is_local(payload: &crate::ir::RepositoryIdentityPayload) ->
     }
 }
 
+/// Validates verification-domain records against the rules in
+/// `docs/schema/verification.md`:
+/// - Every record MUST carry an evidence handle (`source_artifact_hash`,
+///   `source_artifact_path`, or `stdout_handle.hash`).
+/// - `stdout_handle.inline` MUST be `None` when `stdout_handle.bytes` exceeds
+///   the 16 KiB inline ceiling.
+///
+/// A record is treated as verification-domain when its ID starts with
+/// `verification:v` (per `record_id_matches_domain`) or when it carries
+/// `domain = "verification"` explicitly.
+fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<()> {
+    const INLINE_CEILING: u64 = 16 * 1024;
+    for record in records {
+        let GraphRecord::Node {
+            id,
+            domain,
+            source_artifact_hash,
+            source_artifact_path,
+            stdout_handle,
+            stderr_handle,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        let is_verification =
+            id.starts_with("verification:v") || domain.as_deref() == Some("verification");
+        if !is_verification {
+            continue;
+        }
+
+        let has_artifact_handle = source_artifact_hash.is_some() || source_artifact_path.is_some();
+        let stdout_hash = stdout_handle.as_deref().is_some_and(|h| !h.hash.is_empty());
+        let stderr_hash = stderr_handle.as_deref().is_some_and(|h| !h.hash.is_empty());
+
+        if !has_artifact_handle && !stdout_hash && !stderr_hash {
+            return Err(ApiError::new(
+                ErrorCode::MissingEvidenceHandle,
+                "verification-domain records must carry an evidence handle \
+                 (source_artifact_hash, source_artifact_path, stdout_handle.hash, \
+                 or stderr_handle.hash)",
+            ));
+        }
+
+        if let Some(h) = stdout_handle.as_deref()
+            && h.inline.is_some()
+            && h.bytes > INLINE_CEILING
+        {
+            return Err(ApiError::bad_request(
+                "verification-domain CommandRun: stdout_handle.inline must be None when \
+                 bytes exceeds the 16 KiB ceiling; demote to handle-only before writing",
+            ));
+        }
+        if let Some(h) = stderr_handle.as_deref()
+            && h.inline.is_some()
+            && h.bytes > INLINE_CEILING
+        {
+            return Err(ApiError::bad_request(
+                "verification-domain CommandRun: stderr_handle.inline must be None when \
+                 bytes exceeds the 16 KiB ceiling; demote to handle-only before writing",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {
     if has_duplicate_recovery_keys(records) || has_ambiguous_recovery_keys(records) {
         return Err(ApiError::conflict(
@@ -1529,6 +1602,7 @@ fn record_id_matches_domain(id: &str, domain: &str) -> bool {
     match domain {
         "codegraph" => id.starts_with("codegraph:"),
         "agent_memory" => id.starts_with("agent_memory:v1:"),
+        "verification" => id.starts_with("verification:v"),
         _ => true,
     }
 }
@@ -2626,7 +2700,7 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         None => {
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("domain"));
         }
-        Some(d) if !matches!(d, "codegraph" | "agent_memory") => {
+        Some(d) if !matches!(d, "codegraph" | "agent_memory" | "verification") => {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
         }
         Some(d) => d.to_owned(),
@@ -3506,7 +3580,7 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     }
 
     if non_empty(query.domain.as_deref())
-        .is_some_and(|d| !matches!(d, "codegraph" | "agent_memory"))
+        .is_some_and(|d| !matches!(d, "codegraph" | "agent_memory" | "verification"))
     {
         return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
     }
@@ -3818,7 +3892,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         None => {
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("domain"));
         }
-        Some(d) if !matches!(d, "codegraph" | "agent_memory") => {
+        Some(d) if !matches!(d, "codegraph" | "agent_memory" | "verification") => {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
         }
         Some(d) => d.to_owned(),
