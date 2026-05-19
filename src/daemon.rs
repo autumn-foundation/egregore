@@ -1363,7 +1363,7 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         None => {
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("domain"));
         }
-        Some(d) if d != "codegraph" => {
+        Some(d) if !matches!(d, "codegraph" | "agent_memory") => {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
         }
         _ => {}
@@ -1432,7 +1432,7 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     if non_empty(query.session_id.as_deref()).is_none() {
         return HttpResponse::error_with_id(&request_id, ApiError::missing_field("session_id"));
     }
-    if non_empty(query.domain.as_deref()).is_some_and(|d| d != "codegraph") {
+    if non_empty(query.domain.as_deref()).is_some_and(|d| !matches!(d, "codegraph" | "agent_memory")) {
         return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
     }
     let agent_id = query.agent_id;
@@ -1681,7 +1681,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         None => {
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("domain"));
         }
-        Some(d) if d != "codegraph" => {
+        Some(d) if !matches!(d, "codegraph" | "agent_memory") => {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
         }
         _ => {}

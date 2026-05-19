@@ -7,7 +7,10 @@ use chrono::{DateTime, Utc};
 use crate::{
     adapters::{AdapterError, AdapterResult, ExpectedRecordState, GraphSink},
     daemon::StoreLease,
-    ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan, TemporalMetadata},
+    ir::{
+        EdgeLabel, EvidenceLink, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan,
+        TemporalMetadata,
+    },
 };
 
 /// Graph sink backed by an embedded `AletheiaDB` store.
@@ -591,8 +594,8 @@ impl EmbeddedAletheiaSink {
             symbol_kind,
             temporal,
             semantic_drift,
+            evidence_links,
             summary,
-            ..
         } = record
         else {
             unreachable!("write_node called with non-node record");
@@ -608,6 +611,11 @@ impl EmbeddedAletheiaSink {
         builder = insert_semantic_drift(builder, semantic_drift.as_deref());
         if let Some(span) = span {
             builder = insert_span(builder, *span);
+        }
+        if let Some(links) = evidence_links
+            && let Ok(json) = serde_json::to_string(links)
+        {
+            builder = builder.insert("evidence_links_json", json.as_str());
         }
 
         let node_id = self
@@ -923,7 +931,15 @@ impl EmbeddedAletheiaSink {
             semantic_drift: semantic_drift_from_properties(record_id, |key| {
                 node.get_property(key)
             })?,
-            evidence_links: None,
+            evidence_links: optional_str_property(
+                record_id,
+                "evidence_links_json",
+                node.get_property("evidence_links_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<Vec<EvidenceLink>>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("evidence_links_json invalid: {e}")))?,
             summary: required_str_property(record_id, "summary", node.get_property("summary"))?,
         })
     }
@@ -1287,6 +1303,17 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "SESSION_OF" => Ok(EdgeLabel::SessionOf),
         "AUTHORED_BY" => Ok(EdgeLabel::AuthoredBy),
         "HAS_EVIDENCE" => Ok(EdgeLabel::HasEvidence),
+        "OBSERVES" => Ok(EdgeLabel::Observes),
+        "MENTIONS_SYMBOL" => Ok(EdgeLabel::MentionsSymbol),
+        "TOUCHED_FILE" => Ok(EdgeLabel::TouchedFile),
+        "PRODUCED_PATCH" => Ok(EdgeLabel::ProducedPatch),
+        "VALIDATED_BY" => Ok(EdgeLabel::ValidatedBy),
+        "FAILED_ON" => Ok(EdgeLabel::FailedOn),
+        "EXPLAINS_CHANGE" => Ok(EdgeLabel::ExplainsChange),
+        "REFERENCES_TASK" => Ok(EdgeLabel::ReferencesTask),
+        "CONTRADICTS" => Ok(EdgeLabel::Contradicts),
+        "SUPERSEDES" => Ok(EdgeLabel::Supersedes),
+        "RELATES_TO" => Ok(EdgeLabel::RelatesTo),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded edge label {label}"),
