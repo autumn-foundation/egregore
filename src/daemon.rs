@@ -1173,11 +1173,28 @@ fn record_id_matches_domain(id: &str, domain: &str) -> bool {
 }
 
 // Validates that a resolved target ID is consistent with the declared target_domain.
+// Rejects unknown domains — only "codegraph" and "agent_memory" are recognized.
 fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult<()> {
-    if !record_id_matches_domain(id, target_domain) {
-        return Err(ApiError::bad_request(format!(
-            "evidence link declares target_domain '{target_domain}' but target '{id}' has a different ID prefix",
-        )));
+    match target_domain {
+        "codegraph" => {
+            if !id.starts_with("codegraph:v1:") {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link declares target_domain 'codegraph' but target '{id}' does not have the expected 'codegraph:v1:' prefix",
+                )));
+            }
+        }
+        "agent_memory" => {
+            if !id.starts_with("agent_memory:v1:") {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link declares target_domain 'agent_memory' but target '{id}' does not have the expected 'agent_memory:v1:' prefix",
+                )));
+            }
+        }
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "unknown evidence link target_domain '{other}'; expected 'codegraph' or 'agent_memory'"
+            )));
+        }
     }
     Ok(())
 }
@@ -1189,17 +1206,39 @@ fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult
 // node and an observation that cites it.
 // For triple resolution, routing_commit is link.target_git_commit.
 // For direct ID with as_of_commit, validates the commit exists as a temporal observation.
+#[allow(clippy::too_many_lines)]
 fn resolve_evidence_target(
     link: &EvidenceLink,
     sink: &EmbeddedAletheiaSink,
     batch: &[GraphRecord],
 ) -> WriteResult<(String, Option<String>)> {
     if let Some(id) = &link.target_record_id {
-        let in_sink = match sink.read_back(id) {
-            Ok(found) => found.is_some(),
+        let sink_record = match sink.read_back(id) {
+            Ok(found) => found,
             Err(e) => return Err(ApiError::internal(e.to_string())),
         };
-        let in_batch = batch.iter().any(|r| r.id() == id.as_str());
+        // Only node records are valid evidence targets — reject edges and tombstones.
+        if let Some(ref rec) = sink_record
+            && !matches!(rec, GraphRecord::Node { .. })
+        {
+            return Err(ApiError::bad_request(format!(
+                "evidence link target '{id}' is not a node record; only node records may be evidence targets"
+            )));
+        }
+        let in_sink = sink_record.is_some();
+        // Also reject batch edges or tombstones that share the ID.
+        let in_batch_as_node = batch
+            .iter()
+            .any(|r| r.id() == id.as_str() && matches!(r, GraphRecord::Node { .. }));
+        let in_batch_as_non_node = batch
+            .iter()
+            .any(|r| r.id() == id.as_str() && !matches!(r, GraphRecord::Node { .. }));
+        if in_batch_as_non_node && !in_batch_as_node {
+            return Err(ApiError::bad_request(format!(
+                "evidence link target '{id}' in the current batch is not a node record"
+            )));
+        }
+        let in_batch = in_batch_as_node;
         if !in_sink && !in_batch {
             return Err(ApiError::new(
                 ErrorCode::UnresolvedEvidenceTarget,
@@ -1207,10 +1246,10 @@ fn resolve_evidence_target(
             ));
         }
         validate_evidence_target_domain(id, &link.target_domain)?;
+        let store_records = sink
+            .read_all_records()
+            .map_err(|e| ApiError::internal(e.to_string()))?;
         if let Some(commit) = &link.as_of_commit {
-            let store_records = sink
-                .read_all_records()
-                .map_err(|e| ApiError::internal(e.to_string()))?;
             let commit_found = store_records.iter().chain(batch.iter()).any(|record| {
                 if let GraphRecord::Node {
                     id: record_id,
@@ -1233,18 +1272,47 @@ fn resolve_evidence_target(
             }
             return Ok((id.clone(), Some(commit.clone())));
         }
+        // No as_of_commit — reject if the target has multiple temporal observations
+        // (ambiguous: the edge writer cannot determine which observation to link to).
+        let temporal_count = store_records
+            .iter()
+            .chain(batch.iter())
+            .filter(|r| {
+                if let GraphRecord::Node {
+                    id: nid,
+                    temporal: Some(_),
+                    ..
+                } = r
+                {
+                    nid == id
+                } else {
+                    false
+                }
+            })
+            .count();
+        if temporal_count > 1 {
+            return Err(ApiError::bad_request(format!(
+                "evidence link to '{id}' is ambiguous: the target has {temporal_count} temporal observations; supply as_of_commit to select a specific observation"
+            )));
+        }
         return Ok((id.clone(), None));
     }
-    // Triple-based resolution: scan store + batch for matching path + commit [+ span].
+    // Triple-based resolution: scan store + batch for matching (path, span, commit).
+    // target_span is required to avoid ambiguity for files with multiple path-backed nodes.
     let path = link.target_repo_relative_path.as_deref().ok_or_else(|| {
         ApiError::missing_field(
-            "evidence_links[].target_record_id or (target_repo_relative_path, target_git_commit)",
+            "evidence_links[].target_record_id or (target_repo_relative_path, target_git_commit, target_span)",
         )
     })?;
     let commit = link
         .target_git_commit
         .as_deref()
         .ok_or_else(|| ApiError::missing_field("evidence_links[].target_git_commit"))?;
+    if link.target_span.is_none() {
+        return Err(ApiError::missing_field(
+            "evidence_links[].target_span (required for triple evidence target lookup to avoid ambiguity)",
+        ));
+    }
     let store_records = sink
         .read_all_records()
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -1271,6 +1339,16 @@ fn resolve_evidence_target(
     match found_id {
         Some(id) => {
             validate_evidence_target_domain(&id, &link.target_domain)?;
+            // Reject if an explicit as_of_commit was supplied but differs from the triple commit —
+            // the two would route the edge to different temporal observations.
+            if let Some(aoc) = &link.as_of_commit
+                && Some(aoc.as_str()) != link.target_git_commit.as_deref()
+            {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link triple resolved to commit '{}' but as_of_commit '{aoc}' conflicts; omit as_of_commit or set it to the same value as target_git_commit",
+                    link.target_git_commit.as_deref().unwrap_or("")
+                )));
+            }
             // For triple resolution, route by the target commit so multi-observation
             // temporal targets resolve to the correct historical endpoint.
             Ok((id, link.target_git_commit.clone()))
@@ -1327,15 +1405,22 @@ fn validate_and_synthesize_evidence_edges(
             } = record
             {
                 let links = evidence_links.as_deref().unwrap_or(&[]);
-                if *kind == NodeKind::Observation {
-                    if links.is_empty() {
+                // Reject evidence links on codegraph nodes — they would produce
+                // agent_memory:v1: edges from a non-agent-memory source, bypassing
+                // the envelope domain check.
+                if !links.is_empty() && !id.starts_with("agent_memory:v1:") {
+                    return Err(ApiError::bad_request(format!(
+                        "node '{id}' has evidence_links but is not an agent-memory record; evidence links are only supported for agent_memory:v1: nodes"
+                    )));
+                }
+                // Enforce required provenance fields for all agent-memory node kinds.
+                if id.starts_with("agent_memory:v1:") {
+                    if *kind == NodeKind::Observation && links.is_empty() {
                         return Err(ApiError::missing_field(
                             "evidence_links (Observation requires at least one evidence link)",
                         ));
                     }
-                    // Enforce required Observation provenance fields.
                     let required: &[(&str, bool)] = &[
-                        ("text", text.as_ref().is_some_and(|s| !s.is_empty())),
                         ("agent_id", agent_id.as_ref().is_some_and(|s| !s.is_empty())),
                         (
                             "agent_kind",
@@ -1361,9 +1446,17 @@ fn validate_and_synthesize_evidence_edges(
                     for (field, present) in required {
                         if !present {
                             return Err(ApiError::missing_field(format!(
-                                "{field} (required for Observation nodes)"
+                                "{field} (required for agent-memory {} nodes)",
+                                kind.as_str()
                             )));
                         }
+                    }
+                    // text is additionally required for Observation nodes.
+                    if *kind == NodeKind::Observation && text.as_ref().is_none_or(String::is_empty)
+                    {
+                        return Err(ApiError::missing_field(
+                            "text (required for Observation nodes)",
+                        ));
                     }
                 }
                 for link in links {
@@ -1371,6 +1464,18 @@ fn validate_and_synthesize_evidence_edges(
                         resolve_evidence_target(link, &sink_guard, records)?;
                     if link.confidence.is_empty() {
                         return Err(ApiError::missing_field("evidence_links[].confidence"));
+                    }
+                    let conf_val: f64 = link.confidence.parse().map_err(|_| {
+                        ApiError::bad_request(format!(
+                            "evidence_links[].confidence '{}' must be a numeric float string",
+                            link.confidence
+                        ))
+                    })?;
+                    if !(0.0..=1.0).contains(&conf_val) {
+                        return Err(ApiError::bad_request(format!(
+                            "evidence_links[].confidence '{}' must be in the range [0.0, 1.0]",
+                            link.confidence
+                        )));
                     }
                     resolved.push(ResolvedLink {
                         node_id: id.clone(),
@@ -1856,9 +1961,6 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
         }
     };
     let registered_at = match non_empty(registration.created_at.as_deref()) {
-        None => {
-            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("created_at"));
-        }
         Some(ts) if DateTime::parse_from_rfc3339(ts).is_err() => {
             return HttpResponse::error_with_id(
                 &request_id,
@@ -1866,6 +1968,10 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
             );
         }
         Some(ts) => ts.to_owned(),
+        // Fall back to the current time when the caller omits created_at.
+        // Supplying created_at is strongly recommended so that registration
+        // retries hash-stabilise the generated node records.
+        None => chrono::Utc::now().to_rfc3339(),
     };
 
     let agent_status = AgentStatus {
@@ -2299,6 +2405,8 @@ fn agent_registration_records(registration: &AgentRegisterFull) -> Vec<GraphReco
         schema_version,
         agent_id,
         agent_kind,
+        session_id,
+        confidence,
         observed_at,
         ingested_at,
         ..
@@ -2307,6 +2415,9 @@ fn agent_registration_records(registration: &AgentRegisterFull) -> Vec<GraphReco
         *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
         *agent_id = Some(registration.agent_id.clone());
         *agent_kind = Some(registration.agent_kind.clone());
+        // The session that performed this registration is the provenance session.
+        *session_id = Some(registration.session_id.clone());
+        *confidence = Some("1.0".to_owned());
         *observed_at = Some(now.clone());
         *ingested_at = Some(now.clone());
     }
@@ -2326,6 +2437,7 @@ fn agent_registration_records(registration: &AgentRegisterFull) -> Vec<GraphReco
         agent_id,
         agent_kind,
         session_id,
+        confidence,
         observed_at,
         ingested_at,
         ..
@@ -2335,6 +2447,7 @@ fn agent_registration_records(registration: &AgentRegisterFull) -> Vec<GraphReco
         *agent_id = Some(registration.agent_id.clone());
         *agent_kind = Some(registration.agent_kind.clone());
         *session_id = Some(registration.session_id.clone());
+        *confidence = Some("1.0".to_owned());
         *observed_at = Some(now.clone());
         *ingested_at = Some(now);
     }
