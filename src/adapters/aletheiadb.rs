@@ -554,6 +554,30 @@ impl EmbeddedAletheiaSink {
         {
             return Ok(true);
         }
+        // Check non-stale tombstone records whose own codegraph_id is outside the codegraph:
+        // namespace (e.g. agent_memory:v1: tombstones).  A non-stale tombstone is emitted by
+        // read_all_records(), so it counts as a live non-codegraph record in the store.
+        for (tombstone_record_id, &tombstone_node_id) in &self.tombstone_ids {
+            if tombstone_record_id.starts_with("codegraph:") {
+                continue;
+            }
+            let node = self
+                .db
+                .get_node(tombstone_node_id)
+                .map_err(|e| read_back_error("has_non_codegraph_records", e.to_string()))?;
+            let Some(deleted_id) = optional_str_property(
+                "has_non_codegraph_records",
+                "deleted_id",
+                node.get_property("deleted_id"),
+            )?
+            else {
+                continue;
+            };
+            // The tombstone is non-stale when its deleted_id appears in the active tombstoned set.
+            if tombstoned.contains(deleted_id.as_str()) {
+                return Ok(true);
+            }
+        }
         // Also check edge records (evidence links can carry agent_memory:v1: IDs).
         for node_id in self.db.get_all_node_ids() {
             for edge_id in self.db.get_outgoing_edges(node_id) {

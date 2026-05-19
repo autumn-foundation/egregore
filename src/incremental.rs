@@ -57,6 +57,21 @@ pub fn scan_repository_incremental(
 
     graph.push(repository);
 
+    // If the repository identity changed from a previous scan, tombstone the old Repository node
+    // so it does not remain live in persisted stores alongside the new identity.  Without this,
+    // a store first scanned with local_path identity keeps the stale Repository node even after
+    // the identity changes to Remote, which causes the daemon's shared-store guard to keep
+    // rejecting otherwise valid writes.
+    if !previous_cache.repository_id.is_empty() && previous_cache.repository_id != repository_id {
+        let old_repo_id = &previous_cache.repository_id;
+        graph.push(GraphRecord::Tombstone {
+            id: stable_id(&["tombstone", "repository-identity-changed", old_repo_id]),
+            schema_version: SCHEMA_VERSION,
+            deleted_id: old_repo_id.clone(),
+            summary: format!("Repository identity changed; stale Repository {old_repo_id} removed"),
+        });
+    }
+
     for source_file in crate::fs::discover_rust_source_files(repo_root)? {
         let hash = file_hash(&source_file.path)?;
         seen_files.insert(source_file.repo_relative_path.clone());
