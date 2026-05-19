@@ -1387,7 +1387,7 @@ fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {
 // Returns true when `id` has the expected record-ID prefix for `domain`.
 fn record_id_matches_domain(id: &str, domain: &str) -> bool {
     match domain {
-        "codegraph" => id.starts_with("codegraph:v3:"),
+        "codegraph" => id.starts_with("codegraph:"),
         "agent_memory" => id.starts_with("agent_memory:v1:"),
         _ => true,
     }
@@ -1400,9 +1400,9 @@ fn record_id_matches_domain(id: &str, domain: &str) -> bool {
 fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult<()> {
     match target_domain {
         "codegraph" => {
-            if !id.starts_with("codegraph:v3:") {
+            if !id.starts_with("codegraph:") {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link declares target_domain 'codegraph' but target '{id}' does not have the expected 'codegraph:v3:' prefix",
+                    "evidence link declares target_domain 'codegraph' but target '{id}' does not have the expected 'codegraph:' prefix",
                 )));
             }
         }
@@ -1825,9 +1825,9 @@ fn validate_agent_memory_edge_endpoints(
         | EdgeLabel::TouchedFile
         | EdgeLabel::FailedOn
         | EdgeLabel::ExplainsChange => {
-            if !target.starts_with("codegraph:v3:") {
+            if !target.starts_with("codegraph:") {
                 return Err(ApiError::bad_request(format!(
-                    "agent-memory edge '{edge_id}' label '{}' requires a codegraph:v3: target; got target '{target}'",
+                    "agent-memory edge '{edge_id}' label '{}' requires a codegraph: target; got target '{target}'",
                     label.as_str()
                 )));
             }
@@ -1990,7 +1990,7 @@ fn validate_and_synthesize_evidence_edges(
                     // Reject codegraph node kinds stored under an agent-memory ID.
                     if !AGENT_MEMORY_NODE_KINDS.contains(kind) {
                         return Err(ApiError::bad_request(format!(
-                            "node kind '{}' is not permitted under the agent_memory:v1: namespace; use codegraph:v3: IDs for code-graph nodes",
+                            "node kind '{}' is not permitted under the agent_memory:v1: namespace; use codegraph: IDs for code-graph nodes",
                             kind.as_str()
                         )));
                     }

@@ -54,7 +54,7 @@ pub fn compute_repository_identity(
                 remote_url: None,
                 root_commit_sha: None,
                 canonical_path: None,
-                basename,
+                basename: override_str.to_owned(),
             },
         };
     }
@@ -231,14 +231,15 @@ fn git_root_commit_sha(repo_root: &Path) -> Option<String> {
 /// - Host portion lowercased
 /// - Trailing `.git` stripped
 pub fn normalize_remote_url(url: &str) -> String {
-    // SSH scp form: git@github.com:owner/repo.git
-    if let Some(stripped) = url.strip_prefix("git@")
-        && let Some(colon) = stripped.find(':')
-    {
-        let host = stripped[..colon].to_lowercase();
-        let path = &stripped[colon + 1..];
-        let path = path.strip_suffix(".git").unwrap_or(path);
-        return format!("https://{host}/{path}");
+    // SSH scp form: [user@]host:path  (e.g. git@github.com:owner/repo.git or alice@host:path)
+    if !url.contains("://") {
+        let without_user = url.split_once('@').map_or(url, |(_, rest)| rest);
+        if let Some(colon) = without_user.find(':') {
+            let host = without_user[..colon].to_lowercase();
+            let path = &without_user[colon + 1..];
+            let path = path.strip_suffix(".git").unwrap_or(path);
+            return format!("https://{host}/{path}");
+        }
     }
 
     // SSH URL form: ssh://[user@]host/path
@@ -334,6 +335,14 @@ mod tests {
         assert_eq!(
             normalize_remote_url("ssh://alice@github.com/owner/repo.git"),
             "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn scp_arbitrary_user_normalized() {
+        assert_eq!(
+            normalize_remote_url("alice@example.com:owner/repo.git"),
+            "https://example.com/owner/repo"
         );
     }
 }
