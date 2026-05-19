@@ -126,12 +126,16 @@ enum QuerySubcommand {
     Symbol {
         /// Symbol name to look up.
         name: String,
-        /// Graph JSONL path (mutually exclusive with --data-dir).
+        /// Graph JSONL path (mutually exclusive with --data-dir / --daemon).
         #[arg(long)]
         graph: Option<PathBuf>,
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Route the query through the running daemon (requires --data-dir).
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, requires = "data_dir")]
+        daemon: bool,
         /// Restrict to the record at this commit SHA or unique prefix.
         /// Shorthand for --as-of keyed by a Git SHA. Mutually exclusive with --as-of.
         #[arg(long, conflicts_with = "as_of")]
@@ -152,24 +156,32 @@ enum QuerySubcommand {
     File {
         /// Repository-relative file path.
         path: String,
-        /// Graph JSONL path (mutually exclusive with --data-dir).
+        /// Graph JSONL path (mutually exclusive with --data-dir / --daemon).
         #[arg(long)]
         graph: Option<PathBuf>,
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Route the query through the running daemon (requires --data-dir).
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, requires = "data_dir")]
+        daemon: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
     /// Find semantic drift nodes ranked by score descending.
     Drift {
-        /// Graph JSONL path (mutually exclusive with --data-dir).
+        /// Graph JSONL path (mutually exclusive with --data-dir / --daemon).
         #[arg(long)]
         graph: Option<PathBuf>,
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Route the query through the running daemon (requires --data-dir).
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, requires = "data_dir")]
+        daemon: bool,
         /// Maximum number of results (default 10).
         #[arg(long, default_value_t = 10)]
         limit: usize,
@@ -489,12 +501,13 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             name,
             graph,
             data_dir,
+            #[cfg(feature = "embedded-aletheiadb")]
+            daemon,
             at,
             as_of,
             tx_as_of,
             format,
         } => {
-            // --tx-as-of is reserved: always return a not_implemented envelope.
             if tx_as_of.is_some() {
                 let envelope = serde_json::json!({
                     "ok": false,
@@ -507,7 +520,13 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 println!("{}", serde_json::to_string(&envelope)?);
                 std::process::exit(1);
             }
-
+            #[cfg(feature = "embedded-aletheiadb")]
+            if daemon {
+                let dir = data_dir
+                    .as_deref()
+                    .expect("clap requires --data-dir with --daemon");
+                return query_symbol_via_daemon(&name, dir, at.as_deref(), as_of.as_deref());
+            }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             as_of.map_or_else(
                 || {
@@ -523,21 +542,100 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             path,
             graph,
             data_dir,
+            #[cfg(feature = "embedded-aletheiadb")]
+            daemon,
             format,
         } => {
+            #[cfg(feature = "embedded-aletheiadb")]
+            if daemon {
+                let dir = data_dir
+                    .as_deref()
+                    .expect("clap requires --data-dir with --daemon");
+                return query_file_via_daemon(&path, dir);
+            }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_file(&records, &path, format)
         }
         QuerySubcommand::Drift {
             graph,
             data_dir,
+            #[cfg(feature = "embedded-aletheiadb")]
+            daemon,
             limit,
             format,
         } => {
+            #[cfg(feature = "embedded-aletheiadb")]
+            if daemon {
+                let dir = data_dir
+                    .as_deref()
+                    .expect("clap requires --data-dir with --daemon");
+                return query_drift_via_daemon(dir, limit);
+            }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_drift(&records, limit, format)
         }
     }
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn query_symbol_via_daemon(
+    name: &str,
+    data_dir: &Path,
+    at: Option<&str>,
+    as_of: Option<&str>,
+) -> Result<()> {
+    let client = DaemonClient::from_data_dir(data_dir)
+        .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
+    let (verb, params) = at.map_or_else(
+        || ("symbol_by_name", serde_json::json!({ "name": name })),
+        |commit| {
+            (
+                "symbol_at_commit",
+                serde_json::json!({ "name": name, "commit": commit }),
+            )
+        },
+    );
+    let records = client.query_verb(verb, &params, as_of)?;
+    if records.is_empty() {
+        eprintln!("error: no match found for symbol `{name}`");
+        std::process::exit(2);
+    }
+    for rec in &records {
+        println!("{}", serde_json::to_string(rec)?);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn query_file_via_daemon(path: &str, data_dir: &Path) -> Result<()> {
+    let client = DaemonClient::from_data_dir(data_dir)
+        .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
+    let params = serde_json::json!({ "repo_relative_path": path });
+    let records = client.query_verb("file_defines", &params, None)?;
+    if records.is_empty() {
+        eprintln!("error: no match found for file `{path}`");
+        std::process::exit(2);
+    }
+    for rec in &records {
+        println!("{}", serde_json::to_string(rec)?);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn query_drift_via_daemon(data_dir: &Path, limit: usize) -> Result<()> {
+    let client = DaemonClient::from_data_dir(data_dir)
+        .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
+    let params = serde_json::json!({ "limit": limit as u64 });
+    let records = client.query_verb("drift_top_n", &params, None)?;
+    if records.is_empty() {
+        eprintln!("error: no match found — no SemanticDrift nodes in graph");
+        std::process::exit(2);
+    }
+    for rec in &records {
+        println!("{}", serde_json::to_string(rec)?);
+    }
+    Ok(())
 }
 
 fn load_query_records(graph: Option<&Path>, data_dir: Option<&Path>) -> Result<Vec<GraphRecord>> {

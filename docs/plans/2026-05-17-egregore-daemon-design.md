@@ -206,10 +206,19 @@ eg daemon stop
 eg ingest graph.jsonl --adapter daemon --idempotency-key <key>
 ```
 
+Implemented CLI mapping (daemon query surface):
+
+```text
+eg query symbol <name>  --daemon --data-dir .egregore
+eg query file   <path>  --daemon --data-dir .egregore
+eg query drift          --daemon --data-dir .egregore
+```
+
+The query verb spec is in [`docs/schema/daemon-query.md`](../schema/daemon-query.md).
+
 Future CLI mapping:
 
 ```text
-eg query --daemon ...
 eg inspect --daemon ...
 ```
 
