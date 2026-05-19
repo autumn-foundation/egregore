@@ -1211,7 +1211,9 @@ fn record_id_matches_domain(id: &str, domain: &str) -> bool {
 }
 
 // Validates that a resolved target ID is consistent with the declared target_domain.
-// Rejects unknown domains — only "codegraph" and "agent_memory" are recognized.
+// For "codegraph" and "agent_memory", enforces the expected ID prefix.
+// "project" and any other domain have no universal prefix requirement; the
+// relation-specific checks in validate_evidence_endpoint_constraints enforce per-label rules.
 fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult<()> {
     match target_domain {
         "codegraph" => {
@@ -1228,11 +1230,8 @@ fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult
                 )));
             }
         }
-        other => {
-            return Err(ApiError::bad_request(format!(
-                "unknown evidence link target_domain '{other}'; expected 'codegraph' or 'agent_memory'"
-            )));
-        }
+        // "project" and any other declared domain: no universal prefix requirement.
+        _ => {}
     }
     Ok(())
 }
@@ -1448,10 +1447,19 @@ fn validate_evidence_endpoint_constraints(
 ) -> WriteResult<()> {
     // Source-side constraints.
     match label {
-        EdgeLabel::Observes | EdgeLabel::ExplainsChange => {
+        EdgeLabel::Observes | EdgeLabel::ExplainsChange | EdgeLabel::ValidatedBy => {
             if source_kind != NodeKind::Observation {
                 return Err(ApiError::bad_request(format!(
                     "evidence link relation '{}' requires an Observation source node, not {}",
+                    label.as_str(),
+                    source_kind.as_str()
+                )));
+            }
+        }
+        EdgeLabel::ProducedPatch => {
+            if source_kind != NodeKind::CommandEvidence {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires a CommandEvidence source node, not {}",
                     label.as_str(),
                     source_kind.as_str()
                 )));
@@ -1494,6 +1502,19 @@ fn validate_evidence_endpoint_constraints(
             if !matches!(target_kind, Some(NodeKind::Task)) {
                 return Err(ApiError::bad_request(format!(
                     "evidence link relation '{}' requires a Task target; target '{}' has kind {}",
+                    label.as_str(),
+                    target_id,
+                    target_kind_str()
+                )));
+            }
+        }
+        EdgeLabel::HasEvidence | EdgeLabel::ValidatedBy => {
+            if !matches!(
+                target_kind,
+                Some(NodeKind::Verification | NodeKind::CommandEvidence)
+            ) {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires a Verification or CommandEvidence target; target '{}' has kind {}",
                     label.as_str(),
                     target_id,
                     target_kind_str()
@@ -1654,6 +1675,45 @@ fn validate_and_synthesize_evidence_edges(
                     }
                 }
                 validate_agent_memory_edge_endpoints(id, *label, source, target)?;
+                // Validate node-kind constraints for structural labels where the registry
+                // requires specific endpoint kinds beyond domain-prefix checks.
+                match label {
+                    EdgeLabel::SessionOf => {
+                        let source_kind = lookup_node_kind(source, records, &sink_guard)?;
+                        let target_kind = lookup_node_kind(target, records, &sink_guard)?;
+                        if !matches!(source_kind, Some(NodeKind::AgentSession)) {
+                            return Err(ApiError::bad_request(format!(
+                                "agent-memory edge '{id}' SESSION_OF requires an AgentSession source; got {}",
+                                source_kind.map_or_else(
+                                    || "unknown".to_owned(),
+                                    |k| k.as_str().to_owned()
+                                )
+                            )));
+                        }
+                        if !matches!(target_kind, Some(NodeKind::Agent)) {
+                            return Err(ApiError::bad_request(format!(
+                                "agent-memory edge '{id}' SESSION_OF requires an Agent target; got {}",
+                                target_kind.map_or_else(
+                                    || "unknown".to_owned(),
+                                    |k| k.as_str().to_owned()
+                                )
+                            )));
+                        }
+                    }
+                    EdgeLabel::AuthoredBy => {
+                        let target_kind = lookup_node_kind(target, records, &sink_guard)?;
+                        if !matches!(target_kind, Some(NodeKind::AgentSession)) {
+                            return Err(ApiError::bad_request(format!(
+                                "agent-memory edge '{id}' AUTHORED_BY requires an AgentSession target; got {}",
+                                target_kind.map_or_else(
+                                    || "unknown".to_owned(),
+                                    |k| k.as_str().to_owned()
+                                )
+                            )));
+                        }
+                    }
+                    _ => {}
+                }
             }
             if let GraphRecord::Node {
                 id,
@@ -2413,10 +2473,10 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
             );
         }
         Some(ts) => ts.to_owned(),
-        // Fall back to the current time when the caller omits created_at.
-        // Supplying created_at is strongly recommended so that registration
-        // retries hash-stabilise the generated node records.
-        None => chrono::Utc::now().to_rfc3339(),
+        // Use the Unix epoch as a stable sentinel when created_at is omitted so that
+        // registration retries for the same (agent_id, session_id) pair hash-stabilise
+        // and hit the idempotency cache rather than producing a hash conflict.
+        None => "1970-01-01T00:00:00Z".to_owned(),
     };
 
     let agent_status = AgentStatus {
