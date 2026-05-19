@@ -32,6 +32,10 @@ cargo run -- inspect graph.jsonl
 cargo run -- ingest graph.jsonl --adapter dry-run
 cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .egregore
 
+# Import a rust-swe-agent / Maxwell's Daemon .traj file as agent-memory records
+cargo run -- import-traj run.traj --out agent-memory.jsonl
+cargo run -- ingest agent-memory.jsonl --adapter embedded --data-dir .egregore
+
 # Query from a JSONL graph (where-is-this-symbol, what-does-this-file-define, when-did-this-drift)
 eg query symbol scan_repository --graph graph.jsonl
 eg query file src/lib.rs --graph graph.jsonl

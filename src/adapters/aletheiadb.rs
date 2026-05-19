@@ -579,6 +579,7 @@ impl EmbeddedAletheiaSink {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn write_node(&mut self, record: &GraphRecord) -> AdapterResult<()> {
         if self.expected_record_state(record)? == ExpectedRecordState::Matched {
             return Ok(());
@@ -606,6 +607,15 @@ impl EmbeddedAletheiaSink {
             source_handle,
             redaction_policy_version,
             summary,
+            domain,
+            importer_id,
+            importer_version,
+            source_artifact_path,
+            source_artifact_hash,
+            patch_status,
+            failure_kind,
+            exit_code,
+            turn_index,
         } = record
         else {
             unreachable!("write_node called with non-node record");
@@ -642,6 +652,27 @@ impl EmbeddedAletheiaSink {
             "redaction_policy_version",
             redaction_policy_version.as_deref(),
         );
+        builder = insert_optional(builder, "domain", domain.as_deref());
+        builder = insert_optional(builder, "importer_id", importer_id.as_deref());
+        builder = insert_optional(builder, "importer_version", importer_version.as_deref());
+        builder = insert_optional(
+            builder,
+            "source_artifact_path",
+            source_artifact_path.as_deref(),
+        );
+        builder = insert_optional(
+            builder,
+            "source_artifact_hash",
+            source_artifact_hash.as_deref(),
+        );
+        builder = insert_optional(builder, "patch_status", patch_status.as_deref());
+        builder = insert_optional(builder, "failure_kind", failure_kind.as_deref());
+        if let Some(code) = exit_code {
+            builder = builder.insert("exit_code", code.to_string().as_str());
+        }
+        if let Some(idx) = turn_index {
+            builder = builder.insert("turn_index", idx.to_string().as_str());
+        }
 
         let node_id = self
             .db
@@ -910,6 +941,7 @@ impl EmbeddedAletheiaSink {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn read_node_record(
         &self,
         record_id: &str,
@@ -1009,6 +1041,55 @@ impl EmbeddedAletheiaSink {
                 node.get_property("redaction_policy_version"),
             )?,
             summary: required_str_property(record_id, "summary", node.get_property("summary"))?,
+            domain: optional_str_property(record_id, "domain", node.get_property("domain"))?,
+            importer_id: optional_str_property(
+                record_id,
+                "importer_id",
+                node.get_property("importer_id"),
+            )?,
+            importer_version: optional_str_property(
+                record_id,
+                "importer_version",
+                node.get_property("importer_version"),
+            )?,
+            source_artifact_path: optional_str_property(
+                record_id,
+                "source_artifact_path",
+                node.get_property("source_artifact_path"),
+            )?,
+            source_artifact_hash: optional_str_property(
+                record_id,
+                "source_artifact_hash",
+                node.get_property("source_artifact_hash"),
+            )?,
+            patch_status: optional_str_property(
+                record_id,
+                "patch_status",
+                node.get_property("patch_status"),
+            )?,
+            failure_kind: optional_str_property(
+                record_id,
+                "failure_kind",
+                node.get_property("failure_kind"),
+            )?,
+            exit_code: optional_str_property(
+                record_id,
+                "exit_code",
+                node.get_property("exit_code"),
+            )?
+            .as_deref()
+            .map(str::parse::<i64>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("exit_code parse error: {e}")))?,
+            turn_index: optional_str_property(
+                record_id,
+                "turn_index",
+                node.get_property("turn_index"),
+            )?
+            .as_deref()
+            .map(str::parse::<u64>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("turn_index parse error: {e}")))?,
         })
     }
 
@@ -1349,6 +1430,14 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "Artifact" => Ok(NodeKind::Artifact),
         "Verification" => Ok(NodeKind::Verification),
         "CommandEvidence" => Ok(NodeKind::CommandEvidence),
+        "AgentRun" => Ok(NodeKind::AgentRun),
+        "AgentTurn" => Ok(NodeKind::AgentTurn),
+        "ToolCall" => Ok(NodeKind::ToolCall),
+        "CommandRun" => Ok(NodeKind::CommandRun),
+        "FileEdit" => Ok(NodeKind::FileEdit),
+        "PatchArtifact" => Ok(NodeKind::PatchArtifact),
+        "Failure" => Ok(NodeKind::Failure),
+        "Decision" => Ok(NodeKind::Decision),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded node kind {kind}"),
@@ -1484,7 +1573,15 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::Task
         | NodeKind::Artifact
         | NodeKind::Verification
-        | NodeKind::CommandEvidence => kind.as_str(),
+        | NodeKind::CommandEvidence
+        | NodeKind::AgentRun
+        | NodeKind::AgentTurn
+        | NodeKind::ToolCall
+        | NodeKind::CommandRun
+        | NodeKind::FileEdit
+        | NodeKind::PatchArtifact
+        | NodeKind::Failure
+        | NodeKind::Decision => kind.as_str(),
     }
 }
 

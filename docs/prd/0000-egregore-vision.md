@@ -350,15 +350,18 @@ flowchart TB
 
 Implemented and maintained as `docs/prd/0001-codebase-knowledge-graph.md`.
 
-### M2: `rust-swe-agent` Trajectory Import
+### M2: `rust-swe-agent` Trajectory Import ✅
 
 Import `.traj` files as the first agent-memory source. Preserve raw trajectory artifacts, normalize SWE-run events, and connect patch, failure, command, and verification evidence to code graph records where stable handles exist.
 
 Exit criteria:
 
-- A fixture `.traj` imports into `AgentSession`, `AgentRun`, `AgentTurn`, `ToolCall`, `CommandRun`, `PatchArtifact`, `Failure`, and `Verification` records.
-- The importer preserves source path/hash and importer version.
-- An invalid or unverified patch remains labeled invalid/unverified instead of becoming a false success memory.
+- ✅ A fixture `.traj` imports into `AgentSession`, `AgentRun`, `AgentTurn`, `ToolCall`, `CommandRun`, `PatchArtifact`, `Failure`, and `Verification` records.
+- ✅ The importer preserves source path/hash and importer version (BLAKE3 hash on every record).
+- ✅ An invalid or unverified patch remains labeled invalid/unverified instead of becoming a false success memory (`patch_status` field; test enforced).
+- ✅ `import-traj` CLI subcommand emits JSONL following `scan`/`scan-history` conventions.
+- ✅ Re-importing the same `.traj` 5× produces byte-identical JSONL (canonical sort + BLAKE3 idempotency).
+- ✅ Redaction hook wired with pass-through default; single call site marked `TODO: replace with #4 policy`.
 
 ### M3: Codex Session Import
 

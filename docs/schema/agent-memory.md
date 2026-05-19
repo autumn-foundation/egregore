@@ -67,6 +67,11 @@ these fields.
 | `confidence` | float string `[0.0, 1.0]` | `Observation`, `Decision`, `Lesson` | Omitted for purely-derived shapes (`ToolCall`, etc.). |
 | `source_handle` | string (path or hash) | when upstream artifact exists | The artifact path or hash the record was extracted from. |
 | `redaction_policy_version` | string | when any field passed through redaction | Reserved by this schema; populated once issue #4 ships. |
+| `domain` | `"agent_memory"` | traj-importer records | Explicit domain tag carried on every traj-importer node. |
+| `importer_id` | string | traj-importer records | `"traj-importer"` — identifies the import pipeline. |
+| `importer_version` | string | traj-importer records | Semver of the importer that emitted the record. |
+| `source_artifact_path` | string | traj-importer records | Filesystem path to the `.traj` file. |
+| `source_artifact_hash` | string | traj-importer records | BLAKE3 hex of the raw `.traj` bytes — idempotency anchor. |
 
 **`agent_kind` additive enum** (new values are additive; renaming requires a
 schema version bump):
@@ -95,6 +100,13 @@ compile time.
 |------|--------|-----------|-----------------|-------|
 | `Agent` | `agent_memory` | `["node", "agent", agent_id]` | `Agent {agent_id} ({agent_kind}) scoped to {project_scope}` | Stable identity for one agent process or human actor. |
 | `AgentSession` | `agent_memory` | `["node", "agent_session", agent_id, session_id]` | `Session {session_id} for agent {agent_id}` | One bounded run or conversation session. |
+| `AgentRun` | `agent_memory` | `["node", "agent_run", session_id, "run-0"]` | `AgentRun outcome={outcome} exit_reason={exit_reason}` | One trajectory / invocation of an agent within a session. |
+| `AgentTurn` | `agent_memory` | `["node", "agent_turn", run_id, turn_index]` | `AgentTurn {turn_index}` | One assistant→user message pair in an AgentRun. |
+| `ToolCall` | `agent_memory` | `["node", "tool_call", turn_id, action_idx]` | `ToolCall bash turn={t} action={a}` | Structured tool invocation (bash, patch, etc.) within a turn. |
+| `CommandRun` | `agent_memory` | `["node", "command_run", turn_id, action_idx]` | `CommandRun exit={code} turn={t}` | Shell command execution with exit code and output. |
+| `FileEdit` | `agent_memory` | `["node", "file_edit", turn_id, action_idx]` | `FileEdit {target} turn={t}` | Agent write to a file path. |
+| `PatchArtifact` | `agent_memory` | `["node", "patch_artifact", turn_id, action_idx]` | `PatchArtifact status={status} turn={t}` | Patch command execution; `patch_status` = `invalid` or `unverified`. |
+| `Failure` | `agent_memory` | `["node", "failure", kind, turn_id, action_idx]` | `Failure {kind} turn={t}` | Failed command or invalid patch; `failure_kind` = `command_failure` or `patch_invalid`. |
 | `Observation` | `agent_memory` | writer-chosen | free | Agent-authored claim with confidence and provenance. Carries `evidence_links`. |
 
 #### `Agent` record shape
@@ -144,21 +156,71 @@ or discovery.
 | `superseded_by` | record ID | optional | ID of the record that supersedes this one. |
 | `evidence_links` | `EvidenceLink[]` | required | Must contain at least one link. See §5. |
 
-#### `Decision` record shape
-
-A durable project or implementation decision inferred from explicit context.
+#### `AgentRun` record shape
 
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
 | `id` | `agent_memory:v1:{hash}` | yes | |
-| `kind` | `"Decision"` | yes | Awaiting `NodeKind::Decision` addition. Currently reserved. |
+| `kind` | `"AgentRun"` | yes | |
 | `schema_version` | `1` | yes | |
-| `decision_text` | string | yes | The decision, stated directly. |
-| `scope` | string | yes | Repository, module, or task scope. |
-| `rationale_summary` | string | yes | Why this decision was made. |
-| `confidence` | float string | yes | `[0.0, 1.0]`. |
-| provenance fields | see §3 | yes | |
-| `evidence_links` | `EvidenceLink[]` | required | |
+| `summary` | string | yes | `AgentRun outcome={outcome} exit_reason={exit_reason}` |
+| `domain` | `"agent_memory"` | yes | |
+| `importer_id` | string | yes | `"traj-importer"` |
+| `importer_version` | string | yes | semver string |
+| `source_artifact_path` | string | yes | Path to the `.traj` file. |
+| `source_artifact_hash` | string | yes | BLAKE3 hex of the raw `.traj` bytes. |
+| `observed_at` | RFC 3339 | optional | `info.started_at` from the trajectory. |
+| `agent_kind` | `"rust-swe-agent"` | yes | |
+
+#### `AgentTurn` record shape
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | `agent_memory:v1:{hash}` | yes | |
+| `kind` | `"AgentTurn"` | yes | |
+| `schema_version` | `1` | yes | |
+| `summary` | string | yes | `AgentTurn {turn_index}` |
+| `turn_index` | u64 | yes | 0-based position in the AgentRun. |
+| traj-importer provenance | see above | yes | `domain`, `importer_id`, etc. |
+| `observed_at` | RFC 3339 | optional | Timestamp from `extra.timestamp`. |
+
+#### `ToolCall` record shape
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | `agent_memory:v1:{hash}` | yes | |
+| `kind` | `"ToolCall"` | yes | |
+| `text` | string | yes | Redacted command text. |
+| traj-importer provenance | see above | yes | |
+
+#### `CommandRun` record shape
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | `agent_memory:v1:{hash}` | yes | |
+| `kind` | `"CommandRun"` | yes | |
+| `text` | string | yes | Redacted command text. |
+| `exit_code` | i64 | yes | Shell exit code. |
+| traj-importer provenance | see above | yes | |
+
+#### `FileEdit` record shape
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | `agent_memory:v1:{hash}` | yes | |
+| `kind` | `"FileEdit"` | yes | |
+| `text` | string | yes | Redacted command text. |
+| traj-importer provenance | see above | yes | |
+
+#### `PatchArtifact` record shape
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | `agent_memory:v1:{hash}` | yes | |
+| `kind` | `"PatchArtifact"` | yes | |
+| `text` | string | yes | Redacted patch command text. |
+| `patch_status` | string | yes | `"invalid"` (failed apply) or `"unverified"` (succeeded apply but not tested). |
+| traj-importer provenance | see above | yes | |
 
 #### `Failure` record shape
 
@@ -167,12 +229,28 @@ A failed command, invalid patch, rejected assumption, or blocked workflow.
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
 | `id` | `agent_memory:v1:{hash}` | yes | |
-| `kind` | `"Failure"` | yes | Awaiting `NodeKind::Failure` addition. Currently reserved. |
+| `kind` | `"Failure"` | yes | |
 | `schema_version` | `1` | yes | |
 | `failure_kind` | string | yes | `command_failure`, `patch_invalid`, `assumption_rejected`, `workflow_blocked`. |
-| `error_summary` | string | yes | One-line error description. |
-| `command_evidence_link` | EvidenceLink | optional | Link to the `CommandEvidence` record. |
+| `exit_code` | i64 | optional | Exit code when `failure_kind` is `command_failure` or `patch_invalid`. |
+| `text` | string | yes | Redacted output excerpt. |
+| traj-importer provenance | see above | yes | |
+
+#### `Decision` record shape
+
+A durable project or implementation decision inferred from explicit context.
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | `agent_memory:v1:{hash}` | yes | |
+| `kind` | `"Decision"` | yes | |
+| `schema_version` | `1` | yes | |
+| `decision_text` | string | yes | The decision, stated directly. |
+| `scope` | string | yes | Repository, module, or task scope. |
+| `rationale_summary` | string | yes | Why this decision was made. |
+| `confidence` | float string | yes | `[0.0, 1.0]`. |
 | provenance fields | see §3 | yes | |
+| `evidence_links` | `EvidenceLink[]` | required | |
 
 ### 4b — Agent-memory nodes (reserved, one-line definitions)
 
@@ -184,14 +262,8 @@ producer.
 |------|-------------|
 | `Task` | Work item tracked by an agent (project domain may reuse). |
 | `Artifact` | File, patch, report, or generated output linked to work. |
-| `Verification` | Evidence for a claim, test, or check. |
+| `Verification` | Evidence for a claim, test, or check (emitted by traj importer for test commands). |
 | `CommandEvidence` | Command output or terminal evidence. |
-| `Hypothesis` | Speculative claim with low confidence. |
-| `Lesson` | Durable learning extracted from repeated patterns. |
-| `ToolCall` | Structured tool invocation and result handle. |
-| `CommandRun` | Shell command, exit status, output handle. |
-| `FileEdit` | File path, diff/patch handle, and edit provenance. |
-| `PatchArtifact` | Patch content, validation status, and source trajectory. |
 | `CostUsage` | Token, wall-clock, budget, or provider-cost metadata. |
 
 Adding a new reserved kind requires updating this table and the compile-time
@@ -288,13 +360,22 @@ documented in `docs/prd/0001-codebase-knowledge-graph.md`:
 Both functions null-terminate each input part before hashing, so
 `stable_id(&["a", "bc"])` ≠ `stable_id(&["ab", "c"])`.
 
-### Agent and AgentSession ID inputs
+### Agent, AgentSession, and traj-importer ID inputs
 
 | Record | ID inputs |
 |--------|-----------|
 | `Agent` | `["node", "agent", agent_id]` |
 | `AgentSession` | `["node", "agent_session", agent_id, session_id]` |
 | `SESSION_OF` edge | `["edge", "SESSION_OF", session_node_id, agent_node_id]` |
+| `AgentSession` (traj) | `["node", "agent_session", "traj-importer", importer_version, blake3_hex]` |
+| `AgentRun` (traj) | `["node", "agent_run", session_id, "run-0"]` |
+| `AgentTurn` (traj) | `["node", "agent_turn", run_id, turn_index]` |
+| `ToolCall` (traj) | `["node", "tool_call", turn_id, action_idx]` |
+| `CommandRun` (traj) | `["node", "command_run", turn_id, action_idx]` |
+| `FileEdit` (traj) | `["node", "file_edit", turn_id, action_idx]` |
+| `PatchArtifact` (traj) | `["node", "patch_artifact", turn_id, action_idx]` |
+| `Failure` (command) | `["node", "failure", "command_failure", turn_id, action_idx]` |
+| `Failure` (patch) | `["node", "failure", "patch_invalid", turn_id, action_idx]` |
 
 ---
 

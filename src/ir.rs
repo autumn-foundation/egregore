@@ -210,6 +210,35 @@ pub enum GraphRecord {
         redaction_policy_version: Option<String>,
         /// Agent-facing summary.
         summary: String,
+        // ── Importer provenance fields (absent for non-imported records) ─────
+        /// Domain identifier (`"agent_memory"`, `"codegraph"`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        domain: Option<String>,
+        /// Importer identity for trajectory-imported records (e.g. `"traj-importer"`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        importer_id: Option<String>,
+        /// Importer version string (e.g. `"0.1.0"`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        importer_version: Option<String>,
+        /// Repo-relative or fixture-relative path to the raw source artifact.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_artifact_path: Option<String>,
+        /// BLAKE3 hex hash of the raw source artifact bytes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_artifact_hash: Option<String>,
+        // ── Record-type-specific fields (M2 trajectory import) ───────────────
+        /// Patch validation status for `PatchArtifact` records: `"success"`, `"invalid"`, `"unverified"`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        patch_status: Option<String>,
+        /// Failure classification for `Failure` records: `"command_failure"`, `"patch_invalid"`, etc.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure_kind: Option<String>,
+        /// Shell exit code for `CommandRun` records.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i64>,
+        /// Zero-based turn index within an `AgentRun` for `AgentTurn` records.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_index: Option<u64>,
     },
     /// A graph edge.
     Edge {
@@ -296,6 +325,15 @@ impl GraphRecord {
             source_handle: None,
             redaction_policy_version: None,
             summary,
+            domain: None,
+            importer_id: None,
+            importer_version: None,
+            source_artifact_path: None,
+            source_artifact_hash: None,
+            patch_status: None,
+            failure_kind: None,
+            exit_code: None,
+            turn_index: None,
         }
     }
 
@@ -333,6 +371,15 @@ impl GraphRecord {
             source_handle: None,
             redaction_policy_version: None,
             summary,
+            domain: None,
+            importer_id: None,
+            importer_version: None,
+            source_artifact_path: None,
+            source_artifact_hash: None,
+            patch_status: None,
+            failure_kind: None,
+            exit_code: None,
+            turn_index: None,
         }
     }
 
@@ -369,6 +416,15 @@ impl GraphRecord {
             source_handle: None,
             redaction_policy_version: None,
             summary,
+            domain: None,
+            importer_id: None,
+            importer_version: None,
+            source_artifact_path: None,
+            source_artifact_hash: None,
+            patch_status: None,
+            failure_kind: None,
+            exit_code: None,
+            turn_index: None,
         }
     }
 
@@ -510,6 +566,23 @@ pub enum NodeKind {
     Verification,
     /// Command output or terminal evidence.
     CommandEvidence,
+    // ── M2 trajectory-importer node kinds (docs/schema/agent-memory.md §4) ───
+    /// A bounded attempt to complete a task (M2 trajectory import).
+    AgentRun,
+    /// One turn within an agent run: assistant action + observation (M2).
+    AgentTurn,
+    /// Structured tool invocation and result handle (M2).
+    ToolCall,
+    /// Shell command with exit status and output handle (M2).
+    CommandRun,
+    /// File path, diff handle, and edit provenance (M2).
+    FileEdit,
+    /// Patch content, validation status, and source trajectory (M2).
+    PatchArtifact,
+    /// Failed command, invalid patch, or blocked workflow (M2).
+    Failure,
+    /// Durable decision inferred from explicit context (reserved, agent-memory §4a).
+    Decision,
 }
 
 impl NodeKind {
@@ -533,6 +606,14 @@ impl NodeKind {
             Self::Artifact => "Artifact",
             Self::Verification => "Verification",
             Self::CommandEvidence => "CommandEvidence",
+            Self::AgentRun => "AgentRun",
+            Self::AgentTurn => "AgentTurn",
+            Self::ToolCall => "ToolCall",
+            Self::CommandRun => "CommandRun",
+            Self::FileEdit => "FileEdit",
+            Self::PatchArtifact => "PatchArtifact",
+            Self::Failure => "Failure",
+            Self::Decision => "Decision",
         }
     }
 }

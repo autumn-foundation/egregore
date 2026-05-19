@@ -2621,11 +2621,20 @@ fn all_node_kinds_have_documented_schema() {
         NodeKind::Agent | NodeKind::AgentSession | NodeKind::Observation => {
             "agent-memory-documented"
         }
-        // Reserved with one-line definitions in docs/schema/agent-memory.md
+        // Reserved with one-line definitions in docs/schema/agent-memory.md §4b
         NodeKind::Task
         | NodeKind::Artifact
         | NodeKind::Verification
         | NodeKind::CommandEvidence => "agent-memory-reserved",
+        // M2 trajectory-importer node kinds (docs/schema/agent-memory.md §4b + PRD M2)
+        NodeKind::AgentRun
+        | NodeKind::AgentTurn
+        | NodeKind::ToolCall
+        | NodeKind::CommandRun
+        | NodeKind::FileEdit
+        | NodeKind::PatchArtifact
+        | NodeKind::Failure
+        | NodeKind::Decision => "agent-memory-m2-traj-importer",
     };
 }
 

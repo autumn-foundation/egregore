@@ -13,6 +13,7 @@ use crate::{
     adapters::{DryRunSink, ingest_records, records_from_jsonl},
     ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan},
     query, scan_repository, scan_repository_history,
+    traj::{self, ImportOptions},
 };
 
 #[cfg(feature = "embedded-aletheiadb")]
@@ -72,6 +73,14 @@ enum Commands {
         /// Idempotency key for daemon-backed writes.
         #[arg(long)]
         idempotency_key: Option<String>,
+    },
+    /// Import a rust-swe-agent .traj trajectory file into agent-memory JSONL.
+    ImportTraj {
+        /// Path to the `.traj` trajectory file.
+        traj_path: PathBuf,
+        /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Query an existing graph JSONL for symbols, files, or drift records.
     Query {
@@ -238,10 +247,27 @@ fn run_cli(cli: Cli) -> Result<()> {
             &session_id,
             idempotency_key.as_deref(),
         ),
+        Commands::ImportTraj { traj_path, out } => import_traj_cmd(&traj_path, &out),
         Commands::Query { subcommand } => query_cmd(subcommand),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Daemon { action } => daemon(action),
     }
+}
+
+fn import_traj_cmd(traj_path: &Path, out: &Path) -> Result<()> {
+    let opts = ImportOptions::default();
+    let graph = traj::import_traj(traj_path, &opts)
+        .with_context(|| format!("failed to import .traj from {}", traj_path.display()))?;
+    let jsonl = graph
+        .to_jsonl()
+        .context("failed to serialize agent-memory JSONL")?;
+    fs::write(out, jsonl).with_context(|| format!("failed to write JSONL to {}", out.display()))?;
+    println!(
+        "imported {} records from {}",
+        graph.records().len(),
+        traj_path.display()
+    );
+    Ok(())
 }
 
 fn scan(repo_path: &Path, out: &Path) -> Result<()> {
