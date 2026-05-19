@@ -2971,7 +2971,8 @@ fn handle_verb_symbol_by_name(
         match graph_query::symbol_as_of_valid_time(&records, &name, as_of) {
             Ok(Some(record)) => {
                 // kind_filter only recognises "Symbol" in v1; anything else → empty.
-                if kind_filter.as_deref().is_some_and(|kf| kf != "Symbol") {
+                // Apply limit: a budget cap of 0 means no results.
+                if kind_filter.as_deref().is_some_and(|kf| kf != "Symbol") || limit == 0 {
                     vec![]
                 } else {
                     symbol_node_to_query_json(record).into_iter().collect()
@@ -3038,6 +3039,7 @@ fn handle_verb_symbol_by_name(
 fn handle_verb_symbol_at_commit(
     request_id: &str,
     params: &serde_json::Value,
+    limit: usize,
     started: Instant,
     budget: Option<Duration>,
     domain: &str,
@@ -3098,9 +3100,16 @@ fn handle_verb_symbol_at_commit(
         );
     }
 
+    // Enforce timeout after the full-scan ambiguity check.
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
+
+    // Apply the budget limit: limit=0 means no results are wanted.
     let result_records = graph_query::symbol_at_commit(&records, &name, &commit)
         .and_then(symbol_node_to_query_json)
         .into_iter()
+        .take(limit)
         .collect::<Vec<_>>();
 
     HttpResponse::success(
@@ -3112,20 +3121,20 @@ fn handle_verb_symbol_at_commit(
 
 // ── Verb handler: file_defines ────────────────────────────────────────────────
 
-/// Collects the symbols defined in `path` as of `as_of_dt` (one per name, most recent).
+/// Collects the symbols defined in `path` as of `as_of_dt` (most-recent per
+/// `(name, start_line)` key so that same-name symbols at different spans are preserved).
 fn file_defines_as_of(
     records: &[GraphRecord],
     path: &str,
     as_of_dt: chrono::DateTime<chrono::FixedOffset>,
     limit: usize,
 ) -> Vec<serde_json::Value> {
-    let mut best_by_name: std::collections::BTreeMap<
-        String,
-        (
-            serde_json::Value,
-            Option<usize>,
-            chrono::DateTime<chrono::FixedOffset>,
-        ),
+    // Key: (name, start_line) — preserves distinct symbols that share the same
+    // name but appear at different line positions (e.g. same method in different
+    // impl blocks). Within each key, keep the most-recent record at or before as_of_dt.
+    let mut best: std::collections::BTreeMap<
+        (String, Option<usize>),
+        (serde_json::Value, chrono::DateTime<chrono::FixedOffset>),
     > = std::collections::BTreeMap::new();
     for r in records {
         let GraphRecord::Node {
@@ -3161,15 +3170,18 @@ fn file_defines_as_of(
             continue;
         };
         let line = span.map(|s| s.start_line);
-        let is_better = best_by_name.get(name_str).is_none_or(|(pv, _, pvt)| {
+        let key = (name_str.to_owned(), line);
+        let is_better = best.get(&key).is_none_or(|(pv, pvt)| {
             vt > *pvt || (vt == *pvt && json["record_id"].as_str() < pv["record_id"].as_str())
         });
         if is_better {
-            best_by_name.insert(name_str.to_owned(), (json, line, vt));
+            best.insert(key, (json, vt));
         }
     }
-    let mut results: Vec<(serde_json::Value, Option<usize>)> =
-        best_by_name.into_values().map(|(v, l, _)| (v, l)).collect();
+    let mut results: Vec<(serde_json::Value, Option<usize>)> = best
+        .into_iter()
+        .map(|((_, line), (v, _))| (v, line))
+        .collect();
     sort_and_truncate_symbol_results(&mut results, limit);
     results.into_iter().map(|(v, _)| v).collect()
 }
@@ -3270,6 +3282,11 @@ fn handle_verb_file_defines(
         file_defines_current(&records, &path, limit)
     };
 
+    // Enforce timeout after the in-memory filter/sort phase.
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
+
     HttpResponse::success(
         Some(request_id),
         200,
@@ -3341,6 +3358,11 @@ fn handle_verb_drift_top_n(
         .into_iter()
         .filter_map(|r| drift_node_to_query_json(r, &records))
         .collect::<Vec<_>>();
+
+    // Enforce timeout after ranking/materialization CPU phase.
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
 
     HttpResponse::success(
         Some(request_id),
@@ -3452,9 +3474,15 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             &domain,
             state,
         ),
-        "symbol_at_commit" => {
-            handle_verb_symbol_at_commit(&request_id, &params, started, budget, &domain, state)
-        }
+        "symbol_at_commit" => handle_verb_symbol_at_commit(
+            &request_id,
+            &params,
+            limit,
+            started,
+            budget,
+            &domain,
+            state,
+        ),
         "file_defines" => handle_verb_file_defines(
             &request_id,
             &params,
