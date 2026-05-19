@@ -68,7 +68,8 @@ pub fn compute_repository_identity(
         RemoteStatus::Found(canonical_url) => {
             let id = stable_id(&["repository", "remote", &canonical_url]);
             let stable_basename = canonical_url
-                .strip_prefix("https://")
+                .find("://")
+                .and_then(|i| canonical_url.get(i + 3..))
                 .and_then(|rest| rest.split_once('/'))
                 .map(|(_, path)| path.to_owned())
                 .filter(|path| !path.is_empty())
@@ -247,7 +248,7 @@ fn git_canonical_remote_url(repo_root: &Path) -> RemoteStatus {
 /// Scp-form remotes (`[user@]host:path`) are portable and return `false`.
 /// Userless scp form (`host:path`, no `@`) is distinguished from relative paths
 /// by the presence of `:` with no `/` before it.
-fn is_local_remote_url(url: &str) -> bool {
+pub(crate) fn is_local_remote_url(url: &str) -> bool {
     if url.starts_with('/') {
         return true;
     }
@@ -299,7 +300,7 @@ fn git_root_commit_sha(repo_root: &Path) -> Option<String> {
 /// Normalizations applied (in order):
 /// - `git@host:owner/repo` → `https://host/owner/repo`
 /// - `ssh://[user@]host/path` → `https://host/path`
-/// - Scheme coerced from `http` to `https`
+/// - Scheme coerced from `http` to `https` (case-insensitively)
 /// - Host portion lowercased
 /// - Trailing `.git` stripped
 #[must_use]
@@ -312,11 +313,22 @@ pub fn normalize_remote_url(url: &str) -> String {
             let path = &without_user[colon + 1..];
             return format!("https://{host}/{}", strip_git_suffix(path));
         }
+        return url.to_owned();
     }
 
+    // Normalize the scheme to lowercase before dispatch so that HTTPS://, SSH://, etc. are handled.
+    // SAFETY: url.contains("://") was checked at the top of this arm, so find returns Some.
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_owned();
+    };
+    let scheme_lower = url[..scheme_end].to_lowercase();
+    let after_scheme_sep = &url[scheme_end + 3..]; // after "://"
+
     // SSH URL form: ssh://[user@]host[:22]/path
-    if let Some(rest) = url.strip_prefix("ssh://") {
-        let rest = rest.split_once('@').map_or(rest, |(_, after)| after);
+    if scheme_lower == "ssh" {
+        let rest = after_scheme_sep
+            .split_once('@')
+            .map_or(after_scheme_sep, |(_, after)| after);
         if let Some(slash) = rest.find('/') {
             let host_lower = rest[..slash].to_lowercase();
             let host = strip_default_port(&host_lower, 22);
@@ -329,14 +341,15 @@ pub fn normalize_remote_url(url: &str) -> String {
     }
 
     // https://, http://, or git:// (git:// coerced to https)
-    let (scheme_rest, default_port) = if let Some(s) = url.strip_prefix("https://") {
-        (s, 443u16)
-    } else if let Some(s) = url.strip_prefix("http://") {
-        (s, 80u16)
-    } else if let Some(s) = url.strip_prefix("git://") {
-        (s, 9418u16)
+    let (scheme_rest, default_port) = if scheme_lower == "https" {
+        (after_scheme_sep, 443u16)
+    } else if scheme_lower == "http" {
+        (after_scheme_sep, 80u16)
+    } else if scheme_lower == "git" {
+        (after_scheme_sep, 9418u16)
     } else {
-        return url.to_owned();
+        // Unknown scheme: return with lowercase scheme applied.
+        return format!("{scheme_lower}://{after_scheme_sep}");
     };
 
     scheme_rest.find('/').map_or_else(
@@ -519,6 +532,38 @@ mod tests {
         assert_eq!(
             normalize_remote_url("http://example.com:80/owner/repo"),
             "https://example.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn uppercase_https_scheme_normalized() {
+        assert_eq!(
+            normalize_remote_url("HTTPS://github.com/owner/repo.git"),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn mixed_case_ssh_scheme_normalized() {
+        assert_eq!(
+            normalize_remote_url("SSH://git@github.com/owner/repo.git"),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn mixed_case_http_scheme_normalized() {
+        assert_eq!(
+            normalize_remote_url("HTTP://example.com/owner/repo"),
+            "https://example.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn unknown_scheme_lowercased_but_otherwise_preserved() {
+        assert_eq!(
+            normalize_remote_url("FTP://example.com/repo"),
+            "ftp://example.com/repo"
         );
     }
 }

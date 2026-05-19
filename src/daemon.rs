@@ -27,6 +27,7 @@ use crate::{
     adapters::{
         AdapterError, EmbeddedAletheiaSink, ExpectedRecordState, IngestReport, ingest_records,
     },
+    identity::is_local_remote_url,
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord, IdentitySource,
         NodeKind, TemporalMetadata, agent_memory_stable_id,
@@ -1293,7 +1294,7 @@ fn validate_no_local_path_identity_in_shared_store(
             {
                 let is_unsafe = repository_identity
                     .as_deref()
-                    .is_none_or(|p| p.identity_source == IdentitySource::LocalPath);
+                    .is_none_or(incoming_identity_is_local);
                 if is_unsafe {
                     return Some(id.as_str());
                 }
@@ -1382,6 +1383,24 @@ fn validate_no_local_path_identity_in_shared_store(
     }
 
     Ok(())
+}
+
+/// Returns `true` if an incoming Repository identity payload indicates machine-local identity.
+///
+/// A `Remote` payload is safe only when `remote_url` is present and non-local.
+/// A `LocalRootCommit` payload is safe only when `root_commit_sha` is present and non-empty.
+fn incoming_identity_is_local(payload: &crate::ir::RepositoryIdentityPayload) -> bool {
+    match payload.identity_source {
+        IdentitySource::LocalPath => true,
+        IdentitySource::Remote => payload
+            .remote_url
+            .as_deref()
+            .is_none_or(is_local_remote_url),
+        IdentitySource::LocalRootCommit => {
+            payload.root_commit_sha.as_deref().is_none_or(str::is_empty)
+        }
+        IdentitySource::OperatorOverride => false,
+    }
 }
 
 fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {

@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use crate::{
     adapters::{AdapterError, AdapterResult, ExpectedRecordState, GraphSink},
     daemon::StoreLease,
+    identity::is_local_remote_url,
     ir::{
         EdgeLabel, EvidenceLink, GraphRecord, IdentitySource, NodeKind, SemanticDriftMetadata,
         SourceSpan, TemporalMetadata,
@@ -19,9 +20,13 @@ pub struct EmbeddedAletheiaSink {
     node_lookup: NodeLookupIndex,
     tombstone_ids: BTreeMap<String, ::aletheiadb::NodeId>,
     record_handles: BTreeMap<String, StoredRecord>,
-    /// Counts how many physical `AletheiaDB` edges exist for each edge `codegraph_id`.
-    /// A count > 1 means the edge was tombstoned and then re-ingested, so its tombstone is stale.
-    edge_codegraph_counts: BTreeMap<String, usize>,
+    /// Monotonically increasing sequence counter stamped on every edge and tombstone write.
+    /// Enables detecting whether an edge was re-ingested after its tombstone.
+    write_seq: u64,
+    /// Latest `egregore_seq` stored for each edge `codegraph_id`.
+    edge_seqs: BTreeMap<String, u64>,
+    /// `egregore_seq` stored on each tombstone node, keyed by `AletheiaDB` `NodeId`.
+    tombstone_node_seqs: BTreeMap<::aletheiadb::NodeId, u64>,
     _lease: Option<StoreLease>,
 }
 
@@ -178,7 +183,9 @@ impl EmbeddedAletheiaSink {
             node_lookup: NodeLookupIndex::default(),
             tombstone_ids: BTreeMap::new(),
             record_handles: BTreeMap::new(),
-            edge_codegraph_counts: BTreeMap::new(),
+            write_seq: 0,
+            edge_seqs: BTreeMap::new(),
+            tombstone_node_seqs: BTreeMap::new(),
             _lease: lease,
         };
         sink.rebuild_lookup_indexes()?;
@@ -211,39 +218,14 @@ impl EmbeddedAletheiaSink {
     ///
     /// Returns an error when the embedded store cannot read a node or edge.
     pub fn read_all_records(&self) -> AdapterResult<Vec<GraphRecord>> {
-        // Pre-scan edges: build a count of AletheiaDB edges per codegraph_id.
-        // A count > 1 means the same logical edge was re-ingested after a tombstone
-        // (Mismatched re-ingest creates a second physical edge), so that tombstone is stale.
-        let mut edge_counts: std::collections::BTreeMap<String, usize> =
-            std::collections::BTreeMap::new();
-        for node_id in self.db.get_all_node_ids() {
-            for edge_id in self.db.get_outgoing_edges(node_id) {
-                let edge = self
-                    .db
-                    .get_edge(edge_id)
-                    .map_err(|error| read_back_error("read_all_records", error.to_string()))?;
-                if let Some(codegraph_id) = optional_str_property(
-                    "read_all_records",
-                    "codegraph_id",
-                    edge.get_property("codegraph_id"),
-                )? {
-                    *edge_counts.entry(codegraph_id.clone()).or_insert(0) += 1;
-                }
-            }
-        }
-        let multi_edge_ids: std::collections::BTreeSet<&str> = edge_counts
-            .iter()
-            .filter(|(_, count)| **count > 1)
-            .map(|(id, _)| id.as_str())
-            .collect();
+        // active_deleted_ids uses egregore_seq to correctly detect whether a tombstone has
+        // been superseded by a later node or edge write (seq comparison beats a simple count).
+        let active_tombstoned = self.active_deleted_ids()?;
 
-        // Collect deleted_ids from tombstones.  A tombstone is stale when:
-        //   - a non-temporal node with the same record_id was re-ingested after it
-        //     (higher AletheiaDB NodeId = created later), OR
-        //   - the deleted record is an edge that was re-ingested (multi_edge_ids).
-        // Stale tombstones must not suppress the restored record and must not be emitted.
-        let mut deleted_ids = std::collections::BTreeSet::new();
-        let mut stale_tombstone_ids = std::collections::BTreeSet::new();
+        // Determine which tombstone *records* are stale so they are not re-emitted.
+        // A tombstone is stale when its deleted_id is NOT in active_tombstoned (the write
+        // that it was meant to suppress has been superseded by a newer write).
+        let mut stale_tombstone_record_ids = std::collections::BTreeSet::new();
         for (tombstone_record_id, &tombstone_node_id) in &self.tombstone_ids {
             let node = self
                 .db
@@ -257,16 +239,8 @@ impl EmbeddedAletheiaSink {
             else {
                 continue;
             };
-            let superseded_by_node = self
-                .node_lookup
-                .non_temporal
-                .get(deleted_id.as_str())
-                .is_some_and(|&live_node_id| live_node_id > tombstone_node_id);
-            let superseded_by_edge = multi_edge_ids.contains(deleted_id.as_str());
-            if superseded_by_node || superseded_by_edge {
-                stale_tombstone_ids.insert(tombstone_record_id.as_str());
-            } else {
-                deleted_ids.insert(deleted_id.clone());
+            if !active_tombstoned.contains(deleted_id.as_str()) {
+                stale_tombstone_record_ids.insert(tombstone_record_id.as_str());
             }
         }
 
@@ -282,7 +256,7 @@ impl EmbeddedAletheiaSink {
 
         // Non-temporal (current-state) nodes: skip records that have been tombstoned.
         for (record_id, &node_id) in &self.node_lookup.non_temporal {
-            if deleted_ids.contains(record_id.as_str()) {
+            if active_tombstoned.contains(record_id.as_str()) {
                 continue;
             }
             records.push(self.read_node_record(record_id, node_id)?);
@@ -290,7 +264,7 @@ impl EmbeddedAletheiaSink {
 
         // Tombstones: skip stale ones so the CLI deleted_id filter doesn't re-suppress restored records.
         for (record_id, &node_id) in &self.tombstone_ids {
-            if stale_tombstone_ids.contains(record_id.as_str()) {
+            if stale_tombstone_record_ids.contains(record_id.as_str()) {
                 continue;
             }
             records.push(self.read_tombstone_record(record_id, node_id)?);
@@ -313,7 +287,7 @@ impl EmbeddedAletheiaSink {
                 };
                 // Deduplicate and skip tombstoned edges.
                 if seen_edge_ids.insert(codegraph_id.clone())
-                    && !deleted_ids.contains(codegraph_id.as_str())
+                    && !active_tombstoned.contains(codegraph_id.as_str())
                 {
                     records.push(self.read_edge_record(&codegraph_id, edge_id)?);
                 }
@@ -493,11 +467,9 @@ impl EmbeddedAletheiaSink {
                 ..
             }) = self.read_back(record_id)?
             {
-                // Any Repository node without an identity payload may be machine-local
-                // (legacy v1/v2 write or an unverifiable write path). Treat as unsafe.
                 let is_unsafe = repository_identity
                     .as_deref()
-                    .is_none_or(|payload| payload.identity_source == IdentitySource::LocalPath);
+                    .is_none_or(identity_payload_is_local);
                 if is_unsafe {
                     ids.push(record_id.clone());
                 }
@@ -528,12 +500,20 @@ impl EmbeddedAletheiaSink {
                 .non_temporal
                 .get(deleted_id.as_str())
                 .is_some_and(|&live_node_id| live_node_id > tombstone_node_id);
-            // Tombstone is also stale if the edge was re-ingested: a re-ingested edge creates a
-            // second physical AletheiaDB edge with the same codegraph_id (count > 1).
+            // Tombstone is stale if an edge with the same codegraph_id was written AFTER the
+            // tombstone (higher egregore_seq). Using seq rather than a simple count correctly
+            // handles updates: an edge that was re-written before being tombstoned has a higher
+            // write count but a lower seq than the tombstone, so the tombstone is not stale.
+            // Legacy records without egregore_seq default to seq 0 (tombstone assumed valid).
+            let tombstone_seq = self
+                .tombstone_node_seqs
+                .get(&tombstone_node_id)
+                .copied()
+                .unwrap_or(0);
             let edge_stale = self
-                .edge_codegraph_counts
+                .edge_seqs
                 .get(deleted_id.as_str())
-                .is_some_and(|&count| count > 1);
+                .is_some_and(|&edge_seq| edge_seq > tombstone_seq);
             if !node_stale && !edge_stale {
                 deleted.insert(deleted_id);
             }
@@ -685,19 +665,60 @@ impl EmbeddedAletheiaSink {
     fn rebuild_lookup_indexes(&mut self) -> AdapterResult<()> {
         for node_id in self.db.get_all_node_ids() {
             self.index_stored_node(node_id, "embedded-store")?;
-            // Count physical AletheiaDB edges per codegraph_id so that `active_deleted_ids`
-            // can detect whether an edge was re-ingested after its tombstone (count > 1).
+            // Rebuild edge_seqs: track the latest egregore_seq stored on each edge.
+            // A higher seq means the edge was written later than something with a lower seq.
             for edge_id in self.db.get_outgoing_edges(node_id) {
                 let edge = self
                     .db
                     .get_edge(edge_id)
                     .map_err(|e| read_back_error("rebuild_lookup_indexes", e.to_string()))?;
-                if let Some(id) = optional_str_property(
+                let Some(id) = optional_str_property(
                     "rebuild_lookup_indexes",
                     "codegraph_id",
                     edge.get_property("codegraph_id"),
-                )? {
-                    *self.edge_codegraph_counts.entry(id).or_default() += 1;
+                )?
+                else {
+                    continue;
+                };
+                let Some(seq_str) = optional_str_property(
+                    "rebuild_lookup_indexes",
+                    "egregore_seq",
+                    edge.get_property("egregore_seq"),
+                )?
+                else {
+                    continue;
+                };
+                if let Ok(seq) = seq_str.parse::<u64>() {
+                    let entry = self.edge_seqs.entry(id).or_insert(0);
+                    if seq > *entry {
+                        *entry = seq;
+                    }
+                    if seq > self.write_seq {
+                        self.write_seq = seq;
+                    }
+                }
+            }
+        }
+        // Second pass: rebuild tombstone_node_seqs from egregore_seq stored on tombstone nodes.
+        let tombstone_node_ids: Vec<::aletheiadb::NodeId> =
+            self.tombstone_ids.values().copied().collect();
+        for tombstone_node_id in tombstone_node_ids {
+            let node = self
+                .db
+                .get_node(tombstone_node_id)
+                .map_err(|e| read_back_error("rebuild_lookup_indexes", e.to_string()))?;
+            let Some(seq_str) = optional_str_property(
+                "rebuild_lookup_indexes",
+                "egregore_seq",
+                node.get_property("egregore_seq"),
+            )?
+            else {
+                continue;
+            };
+            if let Ok(seq) = seq_str.parse::<u64>() {
+                self.tombstone_node_seqs.insert(tombstone_node_id, seq);
+                if seq > self.write_seq {
+                    self.write_seq = seq;
                 }
             }
         }
@@ -886,8 +907,12 @@ impl EmbeddedAletheiaSink {
         else {
             unreachable!("write_tombstone called with non-tombstone record");
         };
+        self.write_seq += 1;
+        let seq = self.write_seq;
+        let seq_str = seq.to_string();
         let properties = base_properties(id, "tombstone", *schema_version, summary)
             .insert("deleted_id", deleted_id.as_str())
+            .insert("egregore_seq", seq_str.as_str())
             .build();
         let node_id = self
             .db
@@ -915,6 +940,7 @@ impl EmbeddedAletheiaSink {
         }
 
         self.tombstone_ids.insert(id.clone(), node_id);
+        self.tombstone_node_seqs.insert(node_id, seq);
         self.record_handles
             .insert(id.clone(), StoredRecord::Tombstone(node_id));
         Ok(())
@@ -940,10 +966,14 @@ impl EmbeddedAletheiaSink {
         };
         let source_id = self.resolve_node_id(id, source, temporal.as_ref(), "source")?;
         let target_id = self.resolve_node_id(id, target, temporal.as_ref(), "target")?;
+        self.write_seq += 1;
+        let seq = self.write_seq;
+        let seq_str = seq.to_string();
         let mut builder = base_properties(id, "edge", *schema_version, summary)
             .insert("label", label.as_str())
             .insert("source_codegraph_id", source.as_str())
-            .insert("target_codegraph_id", target.as_str());
+            .insert("target_codegraph_id", target.as_str())
+            .insert("egregore_seq", seq_str.as_str());
         builder = insert_optional(builder, "confidence", confidence.as_deref());
         builder = insert_temporal(builder, temporal.as_ref());
 
@@ -977,7 +1007,7 @@ impl EmbeddedAletheiaSink {
 
         self.record_handles
             .insert(id.clone(), StoredRecord::Edge(edge_id));
-        *self.edge_codegraph_counts.entry(id.clone()).or_default() += 1;
+        self.edge_seqs.insert(id.clone(), seq);
         Ok(())
     }
 
@@ -1362,6 +1392,26 @@ impl EmbeddedAletheiaSink {
             temporal: temporal_from_properties(record_id, |key| edge.get_property(key))?,
             summary: required_str_property(record_id, "summary", edge.get_property("summary"))?,
         })
+    }
+}
+
+/// Returns `true` if the identity payload indicates that the Repository is machine-local
+/// and therefore unsafe for use in a shared store.
+///
+/// A `Remote` payload is only considered safe when `remote_url` is present and non-local.
+/// A `LocalRootCommit` payload is only considered safe when `root_commit_sha` is present and
+/// non-empty. A missing payload is treated as unsafe (legacy/unverifiable write path).
+fn identity_payload_is_local(payload: &crate::ir::RepositoryIdentityPayload) -> bool {
+    match payload.identity_source {
+        IdentitySource::LocalPath => true,
+        IdentitySource::Remote => payload
+            .remote_url
+            .as_deref()
+            .is_none_or(is_local_remote_url),
+        IdentitySource::LocalRootCommit => {
+            payload.root_commit_sha.as_deref().is_none_or(str::is_empty)
+        }
+        IdentitySource::OperatorOverride => false,
     }
 }
 
