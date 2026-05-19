@@ -2773,7 +2773,8 @@ fn symbol_node_to_query_json(record: &GraphRecord) -> Option<serde_json::Value> 
     else {
         return None;
     };
-    let name_str = name.as_deref()?;
+    // Use empty string for unnamed symbols to match non-daemon `eg query file` parity.
+    let name_str = name.as_deref().unwrap_or("");
     let mut obj = serde_json::Map::new();
     obj.insert("record_id".to_owned(), json!(id.as_str()));
     obj.insert("name".to_owned(), json!(name_str));
@@ -3131,6 +3132,7 @@ fn handle_verb_symbol_at_commit(
 // ── Verb handler: file_defines ────────────────────────────────────────────────
 
 /// Collects the symbols defined in `path` as of `as_of_dt`.
+/// Returns empty when no `File` node for `path` with `valid_time <= as_of_dt` exists.
 /// Deduplicates by `name` for spanned records (history records with the same name
 /// are the same logical symbol, even when it moves lines across commits) and by
 /// `record_id` for span-absent records to avoid coalescing distinct same-name symbols
@@ -3141,6 +3143,9 @@ fn file_defines_as_of(
     as_of_dt: chrono::DateTime<chrono::FixedOffset>,
     limit: usize,
 ) -> Vec<serde_json::Value> {
+    if !file_node_exists_as_of(records, path, as_of_dt) {
+        return vec![];
+    }
     // Key: (name, span_key) where span_key is "" for spanned records (dedup by
     // name so the same logical symbol is collapsed across line-moving commits)
     // or "id:<record_id>" for span-absent records.
@@ -3208,12 +3213,63 @@ fn file_defines_as_of(
     results.into_iter().map(|(v, _)| v).collect()
 }
 
+/// Returns true when a non-tombstoned `File` node for `path` exists in `records`.
+fn live_file_node_exists(records: &[GraphRecord], path: &str) -> bool {
+    let deleted = tombstoned_ids_in(records);
+    records.iter().any(|r| {
+        matches!(
+            r,
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::File,
+                repo_relative_path: Some(p),
+                temporal: None,
+                ..
+            } if p == path && !deleted.contains(id.as_str())
+        )
+    })
+}
+
+/// Returns true when a `File` node for `path` with `valid_time <= as_of_dt` exists in `records`.
+fn file_node_exists_as_of(
+    records: &[GraphRecord],
+    path: &str,
+    as_of_dt: chrono::DateTime<chrono::FixedOffset>,
+) -> bool {
+    records.iter().any(|r| {
+        let GraphRecord::Node {
+            kind: NodeKind::File,
+            repo_relative_path,
+            temporal,
+            valid_time,
+            ..
+        } = r
+        else {
+            return false;
+        };
+        if repo_relative_path.as_deref() != Some(path) {
+            return false;
+        }
+        let vt_str = temporal
+            .as_ref()
+            .map(|t| t.valid_time.as_str())
+            .or(valid_time.as_deref());
+        vt_str
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .is_some_and(|vt| vt <= as_of_dt)
+    })
+}
+
 /// Collects the current-state symbols defined in `path` (tombstones excluded).
+/// Returns empty when no live `File` node exists for `path`, matching non-daemon behaviour.
 fn file_defines_current(
     records: &[GraphRecord],
     path: &str,
     limit: usize,
 ) -> Vec<serde_json::Value> {
+    if !live_file_node_exists(records, path) {
+        return vec![];
+    }
     let deleted = tombstoned_ids_in(records);
     let mut results: Vec<(serde_json::Value, Option<usize>)> = records
         .iter()
@@ -3330,13 +3386,20 @@ fn handle_verb_drift_top_n(
     state: &ServerState,
 ) -> HttpResponse {
     // Effective limit: min(params.limit capped at DRIFT_TOP_N_MAX, budget_limit).
-    let params_limit = params
-        .get("limit")
-        .and_then(serde_json::Value::as_u64)
-        .map_or(DRIFT_TOP_N_DEFAULT, |n| {
-            usize::try_from(n).unwrap_or(DRIFT_TOP_N_MAX)
-        })
-        .min(DRIFT_TOP_N_MAX);
+    // Reject non-integer limit values rather than silently coercing to the default.
+    let params_limit = match params.get("limit") {
+        None => DRIFT_TOP_N_DEFAULT,
+        Some(v) => match v.as_u64() {
+            Some(n) => usize::try_from(n).unwrap_or(DRIFT_TOP_N_MAX),
+            None => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request("params.limit must be a non-negative integer"),
+                );
+            }
+        },
+    }
+    .min(DRIFT_TOP_N_MAX);
     let effective_limit = params_limit.min(budget_limit);
 
     let (mut records, snapshot) = match load_all_records_for_verb(state, started, budget, domain) {
@@ -3371,12 +3434,13 @@ fn handle_verb_drift_top_n(
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .is_some_and(|vt| vt <= as_of_dt)
             }
-            // Edges: temporal edges are filtered to valid_time <= as_of_dt so
-            // DriftsFrom edges newer than as_of don't decorate older drift nodes.
-            // Edges without temporal info are current-state and always kept.
+            // In an as-of query, keep only edges that have an explicit valid_time
+            // at or before as_of_dt.  Untimed current-state edges (temporal: None)
+            // are from outside the point-in-time snapshot and must be excluded so
+            // drift targets are not resolved using out-of-snapshot metadata.
             GraphRecord::Edge { temporal, .. } => {
                 let vt_str = temporal.as_ref().map(|t| t.valid_time.as_str());
-                vt_str.is_none_or(|s| {
+                vt_str.is_some_and(|s| {
                     chrono::DateTime::parse_from_rfc3339(s)
                         .ok()
                         .is_some_and(|vt| vt <= as_of_dt)
