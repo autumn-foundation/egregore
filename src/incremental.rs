@@ -121,7 +121,14 @@ pub fn scan_repository_incremental_at(
 
         let records = if let Some(cached) = cached.filter(|entry| entry.hash == hash) {
             reused_files.push(source_file.repo_relative_path.clone());
-            cached.records.clone()
+            // Restamp reused records so valid_time reflects this scan's transaction time,
+            // not the prior scan's time when they were first extracted.
+            cached
+                .records
+                .iter()
+                .cloned()
+                .map(|r| r.with_valid_time_inferred(transaction_time))
+                .collect::<Vec<_>>()
         } else {
             rebuilt_files.push(source_file.repo_relative_path.clone());
             let records = scan_source_file_records(&source_file, &repository_id)?
