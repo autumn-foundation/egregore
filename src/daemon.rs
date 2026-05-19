@@ -1010,9 +1010,9 @@ fn spawn_write_worker(
 }
 
 // Attempts recovery of a pending write using the record_ids stored in the idempotency entry,
-// BEFORE re-running evidence-link validation.  Synthesized edges are written atomically with
-// the original records, so if all original records are matched in the store the full write
-// (including synthesized edges) committed and the pending entry can be completed.
+// BEFORE re-running evidence-link validation.  Checks both original records (content match)
+// and synthesized edge IDs from the pending entry (presence check) so recovery is not
+// declared complete when only source nodes committed but the synthesized edges did not.
 // Returns Some(response) on successful recovery, None if the write is not yet committed.
 fn recover_pending_write_pre_validation(
     command: &WriteCommand,
@@ -1028,16 +1028,31 @@ fn recover_pending_write_pre_validation(
             _ => return Ok(None),
         }
     };
+    // Build the set of original record IDs for efficient lookup.
+    let original_ids: BTreeSet<&str> = command.records.iter().map(GraphRecord::id).collect();
     let all_matched = {
         let sink_guard = sink
             .read()
             .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
-        command.records.iter().all(|r| {
+        // Content-match all original records (catches payload mismatches).
+        let originals_ok = command.records.iter().all(|r| {
             sink_guard
                 .expected_record_state(r)
                 .map(|s| matches!(s, ExpectedRecordState::Matched))
                 .unwrap_or(false)
-        })
+        });
+        // Presence-check synthesized edge IDs (those in the pending entry but not in the
+        // original batch) to avoid falsely completing recovery when edges are missing.
+        let synthesized_ok = pending_record_ids
+            .iter()
+            .filter(|id| !original_ids.contains(id.as_str()))
+            .all(|id| {
+                sink_guard
+                    .read_back(id)
+                    .map(|r| r.is_some())
+                    .unwrap_or(false)
+            });
+        originals_ok && synthesized_ok
     };
     if !all_matched {
         return Ok(None);
@@ -1370,24 +1385,28 @@ fn resolve_evidence_target(
             }
             return Ok((id.clone(), Some(commit.clone())));
         }
-        // No as_of_commit — reject if the target has multiple temporal observations
-        // (ambiguous: the edge writer cannot determine which observation to link to).
-        let temporal_count = store_records
+        // No as_of_commit — reject if the target has multiple distinct temporal observations
+        // (ambiguous: the edge writer cannot determine which to link to).
+        // Deduplicate by (id, git_commit) so an idempotent re-submission that includes an
+        // already-written temporal node in both the store and the batch is not double-counted.
+        let distinct_temporal_commits: BTreeSet<&str> = store_records
             .iter()
             .chain(batch.iter())
-            .filter(|r| {
+            .filter_map(|r| {
                 if let GraphRecord::Node {
                     id: nid,
-                    temporal: Some(_),
+                    temporal: Some(t),
                     ..
                 } = r
+                    && nid == id
                 {
-                    nid == id
+                    Some(t.git_commit.as_str())
                 } else {
-                    false
+                    None
                 }
             })
-            .count();
+            .collect();
+        let temporal_count = distinct_temporal_commits.len();
         if temporal_count > 1 {
             return Err(ApiError::bad_request(format!(
                 "evidence link to '{id}' is ambiguous: the target has {temporal_count} temporal observations; supply as_of_commit to select a specific observation"
@@ -1728,6 +1747,17 @@ fn validate_and_synthesize_evidence_edges(
             .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
         let mut resolved = Vec::new();
         for record in records {
+            // Reject evidence-link labels on codegraph edges — they must go through the
+            // agent-memory envelope and its cross-domain checks, not the codegraph path.
+            if let GraphRecord::Edge { id, label, .. } = record
+                && !id.starts_with("agent_memory:v1:")
+                && label.is_evidence_link_label()
+            {
+                return Err(ApiError::bad_request(format!(
+                    "edge '{id}' uses evidence-link label '{}' but is not an agent_memory:v1: edge; evidence relations are only permitted on agent-memory edges",
+                    label.as_str()
+                )));
+            }
             // Validate directly submitted agent-memory edge records.
             if let GraphRecord::Edge {
                 id,
@@ -3013,7 +3043,16 @@ fn update_job(
 }
 
 fn agent_registration_records(registration: &AgentRegisterFull) -> Vec<GraphRecord> {
-    let agent_node_id = agent_memory_stable_id(&["node", "agent", &registration.agent_id]);
+    // Agent node ID is derived from (agent_id, agent_kind, project_scope) so the payload
+    // is identical on every registration for the same combination.  Different agent_kind or
+    // project_scope values produce different Agent node identities.
+    let agent_node_id = agent_memory_stable_id(&[
+        "node",
+        "agent",
+        &registration.agent_id,
+        &registration.agent_kind,
+        &registration.project_scope,
+    ]);
     let session_node_id = agent_memory_stable_id(&[
         "node",
         "agent_session",
@@ -3029,7 +3068,7 @@ fn agent_registration_records(registration: &AgentRegisterFull) -> Vec<GraphReco
         Some(registration.agent_id.clone()),
         format!(
             "Agent {} ({}) scoped to {}",
-            registration.agent_id, registration.agent_kind, registration.project_scope
+            registration.agent_id, registration.agent_kind, registration.project_scope,
         ),
     );
     if let GraphRecord::Node {
