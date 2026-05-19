@@ -113,6 +113,7 @@ All error codes are snake\_case identifiers. String literals at call sites in
 | `not_implemented`     | 501  | no        | no               | reserved |
 | `shutdown_in_progress`| 503  | yes       | yes              | all    |
 | `redaction_required`  | 422  | no        | no               | ingest (future) |
+| `unresolved_evidence_target` | 422 | no  | no               | ingest, jobs/ingest |
 
 Adding a new code is additive. Renaming or removing a code requires `/v2/`.
 
@@ -217,7 +218,10 @@ Success result:
 ### `POST /v1/agents/register`
 
 Top-level fields: `request_id`, `agent_id`, `session_id`, `agent_kind`,
-`project_scope`. Success result:
+`project_scope`, `created_at` (RFC 3339, required — used as the registration
+timestamp; must be identical across retries for the same `(agent_id, session_id)`
+pair so that registration records hash-stabilise and hit the idempotency cache).
+Success result:
 
 ```json
 { "status": "registered", "record_ids": ["..."], "node_kinds": ["Agent", "AgentSession"] }

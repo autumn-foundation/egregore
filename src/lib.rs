@@ -35,8 +35,9 @@ use std::{ffi::OsStr, path::Path};
 pub use error::{CodegraphError, Result};
 pub use history::scan_repository_history;
 pub use ir::{
-    EdgeLabel, Graph, GraphRecord, NodeKind, SCHEMA_VERSION, SemanticDriftMetadata, SourceSpan,
-    TemporalMetadata, stable_id,
+    AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind,
+    NodeProvenance, SCHEMA_VERSION, SemanticDriftMetadata, SourceSpan, TemporalMetadata,
+    agent_memory_stable_id, stable_id,
 };
 
 /// Scans a repository into deterministic graph records.

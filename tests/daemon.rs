@@ -1446,7 +1446,8 @@ fn daemon_agent_registration_distinguishes_colon_bearing_ids() {
                 "agent_id": agent_id,
                 "session_id": session_id,
                 "agent_kind": "codex",
-                "project_scope": "egregore"
+                "project_scope": "egregore",
+                "created_at": "2026-05-18T00:00:00Z"
             }),
         );
         assert!(
@@ -1658,7 +1659,8 @@ fn daemon_registers_agents_runs_ingest_jobs_and_queries_records() {
             "agent_id": "test-agent",
             "session_id": "test-session",
             "agent_kind": "codex",
-            "project_scope": "egregore"
+            "project_scope": "egregore",
+            "created_at": "2026-05-17T00:00:00Z"
         }),
     );
     assert!(
@@ -2372,8 +2374,9 @@ fn contract_conformance_all_routes() {
                 "request_id": "conf-register-success",
                 "agent_id": "conf-agent",
                 "session_id": "conf-session",
-                "agent_kind": "test",
-                "project_scope": "egregore"
+                "agent_kind": "other",
+                "project_scope": "egregore",
+                "created_at": "2026-05-18T00:00:00Z"
             }),
         );
         assert!(
@@ -2593,4 +2596,199 @@ fn first_record_id(graph_path: &Path) -> String {
         .and_then(serde_json::Value::as_str)
         .expect("record should have id")
         .to_owned()
+}
+
+// ── Schema conformance: issue #6 ─────────────────────────────────────────────
+
+// (a) Every NodeKind variant is either code-graph-documented,
+// agent-memory-documented, or agent-memory-reserved.
+// The exhaustive match enforces this at compile time: adding a new
+// NodeKind variant without updating this list is a compile error.
+#[test]
+fn all_node_kinds_have_documented_schema() {
+    let _ = |k: NodeKind| match k {
+        // Documented in docs/prd/0001-codebase-knowledge-graph.md
+        NodeKind::Repository
+        | NodeKind::File
+        | NodeKind::Module
+        | NodeKind::Symbol
+        | NodeKind::Import
+        | NodeKind::Diagnostic
+        | NodeKind::Commit
+        | NodeKind::Change
+        | NodeKind::SemanticDrift => "code-graph-documented",
+        // Documented in docs/schema/agent-memory.md (full schema)
+        NodeKind::Agent | NodeKind::AgentSession | NodeKind::Observation => {
+            "agent-memory-documented"
+        }
+        // Reserved with one-line definitions in docs/schema/agent-memory.md
+        NodeKind::Task
+        | NodeKind::Artifact
+        | NodeKind::Verification
+        | NodeKind::CommandEvidence => "agent-memory-reserved",
+    };
+}
+
+// (b) Every EdgeLabel variant is either code-graph-internal or has a row in
+// the cross-domain edge registry in docs/schema/agent-memory.md.
+// The exhaustive match enforces this at compile time.
+#[test]
+fn all_edge_labels_have_documented_schema() {
+    let _ = |l: EdgeLabel| match l {
+        // Code-graph-internal: documented in docs/prd/0001-codebase-knowledge-graph.md
+        EdgeLabel::Contains
+        | EdgeLabel::Defines
+        | EdgeLabel::Imports
+        | EdgeLabel::References
+        | EdgeLabel::Calls
+        | EdgeLabel::Implements
+        | EdgeLabel::Mentions
+        | EdgeLabel::ChangedIn
+        | EdgeLabel::ParentOf
+        | EdgeLabel::DriftsFrom => "code-graph-internal",
+        // Cross-domain registry: documented in docs/schema/agent-memory.md
+        EdgeLabel::SessionOf
+        | EdgeLabel::AuthoredBy
+        | EdgeLabel::HasEvidence
+        | EdgeLabel::Observes
+        | EdgeLabel::MentionsSymbol
+        | EdgeLabel::TouchedFile
+        | EdgeLabel::ProducedPatch
+        | EdgeLabel::ValidatedBy
+        | EdgeLabel::FailedOn
+        | EdgeLabel::ExplainsChange
+        | EdgeLabel::ReferencesTask
+        | EdgeLabel::Contradicts
+        | EdgeLabel::Supersedes
+        | EdgeLabel::RelatesTo => "cross-domain-registry",
+    };
+}
+
+// (c) Agent and AgentSession records produced by POST /v1/agents/register
+// use the documented agent_memory:v1: ID prefix and return the documented
+// field set.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn agent_registration_produces_agent_memory_ids() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/agents/register",
+        &serde_json::json!({
+            "request_id": "schema-shape-test",
+            "agent_id": "test-agent-schema",
+            "session_id": "test-session-schema",
+            "agent_kind": "claude-code",
+            "project_scope": "egregore",
+            "created_at": "2026-05-18T00:00:00Z"
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "agent registration should succeed, got {response}"
+    );
+
+    let body = response_json(&response);
+    let result = &body["result"];
+
+    assert_eq!(
+        result["status"], "registered",
+        "agent registration must return status=registered per schema doc"
+    );
+
+    let record_ids = result["record_ids"]
+        .as_array()
+        .expect("record_ids must be an array per schema doc");
+    assert!(
+        record_ids.len() >= 2,
+        "agent registration must produce at least Agent and AgentSession records"
+    );
+
+    let all_agent_memory = record_ids.iter().all(|id| {
+        id.as_str()
+            .is_some_and(|s| s.starts_with("agent_memory:v1:"))
+    });
+    assert!(
+        all_agent_memory,
+        "all agent-registration record IDs must use agent_memory:v1: prefix per schema doc, got {record_ids:?}"
+    );
+
+    let node_kinds = result["node_kinds"]
+        .as_array()
+        .expect("node_kinds must be an array per schema doc");
+    assert!(
+        node_kinds.contains(&serde_json::Value::String("Agent".to_owned())),
+        "node_kinds must include Agent, got {node_kinds:?}"
+    );
+    assert!(
+        node_kinds.contains(&serde_json::Value::String("AgentSession".to_owned())),
+        "node_kinds must include AgentSession, got {node_kinds:?}"
+    );
+
+    daemon.stop();
+}
+
+// (d) An evidence link whose target_record_id does not exist in the store
+// is rejected with the documented unresolved_evidence_target error code.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn evidence_link_with_missing_target_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "evidence-link-missing-target",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "evidence-link-missing-target-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-18T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "agent_memory:v1:evidence-link-test-obs",
+                    "kind": "Observation",
+                    "schema_version": 1,
+                    "text": "test observation",
+                    "agent_id": "test-agent",
+                    "agent_kind": "other",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-18T00:00:00Z",
+                    "ingested_at": "2026-05-18T00:00:00Z",
+                    "confidence": "0.9",
+                    "summary": "test observation with unresolved evidence link",
+                    "evidence_links": [{
+                        "target_record_id": "codegraph:v1:nonexistent-symbol-xyzzy",
+                        "target_domain": "codegraph",
+                        "relation": "OBSERVES",
+                        "confidence": "0.9"
+                    }]
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "ingest with unresolved evidence link target should be rejected, got {response}"
+    );
+
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "unresolved_evidence_target",
+        "rejection must carry unresolved_evidence_target code per schema doc, got {body}"
+    );
+
+    daemon.stop();
 }

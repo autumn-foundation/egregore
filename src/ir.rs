@@ -2,8 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
-/// Current schema version for emitted graph records.
+/// Current schema version for code-graph records.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Schema version for agent-memory records (`Agent`, `AgentSession`, `Observation`, etc.).
+/// Documented in `docs/schema/agent-memory.md`.
+pub const AGENT_MEMORY_SCHEMA_VERSION: u32 = 1;
 
 /// Complete in-memory graph emitted by a scan.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -56,7 +60,88 @@ impl Default for Graph {
     }
 }
 
+/// Agent-memory provenance fields for agent-authored nodes.
+///
+/// Documented in `docs/schema/agent-memory.md §3`.
+/// These fields appear flat in `GraphRecord::Node` JSON.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct NodeProvenance {
+    /// Observation body text (Observation nodes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// ID of the record that supersedes this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    /// Stable agent identity (agent-authored nodes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Agent kind enum value (agent-authored nodes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<String>,
+    /// Agent session ID (agent-authored nodes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Wall-clock time the agent observed the fact (RFC 3339).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    /// Transaction time when the daemon committed the record (RFC 3339).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingested_at: Option<String>,
+    /// Extraction confidence `[0.0, 1.0]` (Observation, Decision, Lesson).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    /// Artifact path or hash the record was extracted from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_handle: Option<String>,
+    /// Redaction policy version when any field passed through redaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redaction_policy_version: Option<String>,
+}
+
+/// A typed citation from an agent-memory node to another graph record.
+///
+/// Evidence links are stored both on the source node (for fast read) and as
+/// graph edges (for traversal). Both representations MUST agree at write time;
+/// the daemon write applier is the enforcement point.
+///
+/// The target may be specified either by its stable `target_record_id` or by
+/// the `(target_repo_relative_path, target_span, target_git_commit)` triple
+/// when the writer cannot compute the stable hash. The daemon write applier
+/// resolves the triple at write time.
+///
+/// Documented in docs/schema/agent-memory.md.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceLink {
+    /// Stable record ID of the cited graph node.
+    /// Either this or the triple fields below must be present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_record_id: Option<String>,
+    /// Domain of the target record (e.g. `"codegraph"`, `"agent_memory"`).
+    pub target_domain: String,
+    /// Cross-domain edge label (e.g. `"OBSERVES"`, `"MENTIONS_SYMBOL"`).
+    pub relation: String,
+    /// Extraction confidence formatted in `[0.0, 1.0]`.
+    pub confidence: String,
+    /// Git commit SHA anchoring a time-specific citation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub as_of_commit: Option<String>,
+    // ── Triple-based target resolution ────────────────────────────────────────
+    /// Repository-relative path of the target node (triple fallback).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_repo_relative_path: Option<String>,
+    /// Source span of the target node (triple fallback).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_span: Option<SourceSpan>,
+    /// Git commit SHA anchoring the target node lookup (triple fallback).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_git_commit: Option<String>,
+}
+
 /// One JSONL graph record.
+// Node carries 10 optional provenance strings for agent-memory nodes.
+// These are None for all code-graph nodes, so the memory cost is only
+// paid by agent-memory records that actually populate them.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "record_type", rename_all = "snake_case")]
 pub enum GraphRecord {
@@ -89,6 +174,40 @@ pub enum GraphRecord {
         /// Semantic drift details for drift marker nodes.
         #[serde(skip_serializing_if = "Option::is_none")]
         semantic_drift: Option<Box<SemanticDriftMetadata>>,
+        /// Evidence citations for agent-memory nodes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        evidence_links: Option<Vec<EvidenceLink>>,
+        // ── Agent-memory provenance fields (absent for code-graph nodes) ─────
+        /// Observation body text (Observation nodes).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        /// ID of the record that supersedes this one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        superseded_by: Option<String>,
+        /// Stable agent identity (agent-authored nodes).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        /// Agent kind enum value (agent-authored nodes).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_kind: Option<String>,
+        /// Agent session ID (agent-authored nodes).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// Wall-clock time the agent observed the fact (RFC 3339).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        observed_at: Option<String>,
+        /// Transaction time when the daemon committed the record (RFC 3339).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ingested_at: Option<String>,
+        /// Extraction confidence `[0.0, 1.0]` (Observation, Decision, Lesson).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        confidence: Option<String>,
+        /// Artifact path or hash the record was extracted from.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_handle: Option<String>,
+        /// Redaction policy version when any field passed through redaction.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        redaction_policy_version: Option<String>,
         /// Agent-facing summary.
         summary: String,
     },
@@ -165,6 +284,17 @@ impl GraphRecord {
             symbol_kind: None,
             temporal: None,
             semantic_drift: None,
+            evidence_links: None,
+            text: None,
+            superseded_by: None,
+            agent_id: None,
+            agent_kind: None,
+            session_id: None,
+            observed_at: None,
+            ingested_at: None,
+            confidence: None,
+            source_handle: None,
+            redaction_policy_version: None,
             summary,
         }
     }
@@ -191,6 +321,17 @@ impl GraphRecord {
             symbol_kind: None,
             temporal: None,
             semantic_drift: None,
+            evidence_links: None,
+            text: None,
+            superseded_by: None,
+            agent_id: None,
+            agent_kind: None,
+            session_id: None,
+            observed_at: None,
+            ingested_at: None,
+            confidence: None,
+            source_handle: None,
+            redaction_policy_version: None,
             summary,
         }
     }
@@ -216,6 +357,39 @@ impl GraphRecord {
             symbol_kind: Some(symbol_kind.to_owned()),
             temporal: None,
             semantic_drift: None,
+            evidence_links: None,
+            text: None,
+            superseded_by: None,
+            agent_id: None,
+            agent_kind: None,
+            session_id: None,
+            observed_at: None,
+            ingested_at: None,
+            confidence: None,
+            source_handle: None,
+            redaction_policy_version: None,
+            summary,
+        }
+    }
+
+    /// Creates an agent-memory graph edge with the `agent_memory:v1:` ID prefix.
+    #[must_use]
+    pub fn agent_memory_edge(
+        label: EdgeLabel,
+        source: String,
+        target: String,
+        confidence: Option<String>,
+        summary: String,
+    ) -> Self {
+        let id = agent_memory_stable_id(&["edge", label.as_str(), &source, &target]);
+        Self::Edge {
+            id,
+            schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+            label,
+            source,
+            target,
+            confidence,
+            temporal: None,
             summary,
         }
     }
@@ -393,9 +567,110 @@ pub enum EdgeLabel {
     AuthoredBy,
     /// Entity has supporting evidence.
     HasEvidence,
+    // ── Cross-domain edge registry (docs/schema/agent-memory.md) ─────────────
+    /// Agent-memory node observes a code-graph entity.
+    Observes,
+    /// Agent-memory node mentions a specific symbol.
+    MentionsSymbol,
+    /// Agent-memory node cites a file that was touched.
+    TouchedFile,
+    /// Agent-memory node produced a patch artifact.
+    ProducedPatch,
+    /// Agent-memory node is validated by an evidence record.
+    ValidatedBy,
+    /// Agent-memory node describes a failure on a code entity.
+    FailedOn,
+    /// Agent-memory node explains a code change.
+    ExplainsChange,
+    /// Agent-memory node references a task record.
+    ReferencesTask,
+    /// Agent-memory node contradicts another record.
+    Contradicts,
+    /// Agent-memory node supersedes another record.
+    Supersedes,
+    /// Generic weak relationship between any two records.
+    RelatesTo,
 }
 
 impl EdgeLabel {
+    /// Parses an edge label from its wire string.  Returns `None` for unknown labels.
+    #[must_use]
+    pub fn from_relation(s: &str) -> Option<Self> {
+        match s {
+            "CONTAINS" => Some(Self::Contains),
+            "DEFINES" => Some(Self::Defines),
+            "IMPORTS" => Some(Self::Imports),
+            "REFERENCES" => Some(Self::References),
+            "CALLS" => Some(Self::Calls),
+            "IMPLEMENTS" => Some(Self::Implements),
+            "MENTIONS" => Some(Self::Mentions),
+            "CHANGED_IN" => Some(Self::ChangedIn),
+            "PARENT_OF" => Some(Self::ParentOf),
+            "DRIFTS_FROM" => Some(Self::DriftsFrom),
+            "SESSION_OF" => Some(Self::SessionOf),
+            "AUTHORED_BY" => Some(Self::AuthoredBy),
+            "HAS_EVIDENCE" => Some(Self::HasEvidence),
+            "OBSERVES" => Some(Self::Observes),
+            "MENTIONS_SYMBOL" => Some(Self::MentionsSymbol),
+            "TOUCHED_FILE" => Some(Self::TouchedFile),
+            "PRODUCED_PATCH" => Some(Self::ProducedPatch),
+            "VALIDATED_BY" => Some(Self::ValidatedBy),
+            "FAILED_ON" => Some(Self::FailedOn),
+            "EXPLAINS_CHANGE" => Some(Self::ExplainsChange),
+            "REFERENCES_TASK" => Some(Self::ReferencesTask),
+            "CONTRADICTS" => Some(Self::Contradicts),
+            "SUPERSEDES" => Some(Self::Supersedes),
+            "RELATES_TO" => Some(Self::RelatesTo),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` when this label is permitted in an evidence link citation.
+    ///
+    /// Code-graph-internal labels (`CONTAINS`, `DEFINES`, `CALLS`, etc.) are
+    /// reserved for the extractor and must not appear in evidence links.
+    #[must_use]
+    pub const fn is_evidence_link_label(self) -> bool {
+        matches!(
+            self,
+            Self::HasEvidence
+                | Self::Observes
+                | Self::MentionsSymbol
+                | Self::TouchedFile
+                | Self::ProducedPatch
+                | Self::ValidatedBy
+                | Self::FailedOn
+                | Self::ExplainsChange
+                | Self::ReferencesTask
+                | Self::Contradicts
+                | Self::Supersedes
+                | Self::RelatesTo
+        )
+    }
+
+    /// Returns `true` when this label belongs to the codegraph topology set and
+    /// must not appear on agent-memory (`agent_memory:v1:`) edge records.
+    ///
+    /// Agent-memory structural labels (`SESSION_OF`, `AUTHORED_BY`) and the full
+    /// evidence-link registry are permitted; only extractor-specific topology labels
+    /// such as `CONTAINS`, `CALLS`, `DEFINES`, etc. are rejected.
+    #[must_use]
+    pub const fn is_codegraph_topology_label(self) -> bool {
+        matches!(
+            self,
+            Self::Contains
+                | Self::Defines
+                | Self::Imports
+                | Self::References
+                | Self::Calls
+                | Self::Implements
+                | Self::Mentions
+                | Self::ChangedIn
+                | Self::ParentOf
+                | Self::DriftsFrom
+        )
+    }
+
     /// Returns the serialized edge label.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -413,6 +688,17 @@ impl EdgeLabel {
             Self::SessionOf => "SESSION_OF",
             Self::AuthoredBy => "AUTHORED_BY",
             Self::HasEvidence => "HAS_EVIDENCE",
+            Self::Observes => "OBSERVES",
+            Self::MentionsSymbol => "MENTIONS_SYMBOL",
+            Self::TouchedFile => "TOUCHED_FILE",
+            Self::ProducedPatch => "PRODUCED_PATCH",
+            Self::ValidatedBy => "VALIDATED_BY",
+            Self::FailedOn => "FAILED_ON",
+            Self::ExplainsChange => "EXPLAINS_CHANGE",
+            Self::ReferencesTask => "REFERENCES_TASK",
+            Self::Contradicts => "CONTRADICTS",
+            Self::Supersedes => "SUPERSEDES",
+            Self::RelatesTo => "RELATES_TO",
         }
     }
 }
@@ -430,7 +716,7 @@ pub struct SourceSpan {
     pub end_line: usize,
 }
 
-/// Builds a stable ID from semantic, repo-relative inputs.
+/// Builds a stable code-graph ID from semantic, repo-relative inputs.
 #[must_use]
 pub fn stable_id(parts: &[&str]) -> String {
     let mut hasher = blake3::Hasher::new();
@@ -439,4 +725,22 @@ pub fn stable_id(parts: &[&str]) -> String {
         hasher.update(b"\0");
     }
     format!("codegraph:v{SCHEMA_VERSION}:{}", hasher.finalize().to_hex())
+}
+
+/// Builds a stable agent-memory record ID.
+///
+/// Uses the `agent_memory:v1:` prefix so agent-memory IDs cannot collide with
+/// code-graph `codegraph:v1:` IDs even when the content hashes are identical.
+/// Documented in docs/schema/agent-memory.md.
+#[must_use]
+pub fn agent_memory_stable_id(parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!(
+        "agent_memory:v{AGENT_MEMORY_SCHEMA_VERSION}:{}",
+        hasher.finalize().to_hex()
+    )
 }
