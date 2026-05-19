@@ -1792,7 +1792,7 @@ mod tests {
         sink.write_record(&edge).expect("edge should write");
 
         let error = sink
-            .read_back_until("codegraph:v2:missing-edge", Some(Instant::now()))
+            .read_back_until("codegraph:v3:missing-edge", Some(Instant::now()))
             .expect_err("expired deadline should stop the edge scan");
         assert!(matches!(error, AdapterError::TimedOut { .. }));
     }

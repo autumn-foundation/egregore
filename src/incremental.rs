@@ -16,7 +16,7 @@ use crate::{
 };
 
 /// Incremental cache schema for extractor output stored on disk.
-const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

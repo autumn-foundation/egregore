@@ -105,24 +105,39 @@ pub fn compute_repository_identity(
     }
 }
 
-/// Returns `true` if `repo_root` is the root of a git repository.
-///
-/// Works for regular clones, worktrees, and submodules (where `.git` is a file,
-/// not a directory).
-fn git_is_repo(repo_root: &Path) -> bool {
-    Command::new("git")
+
+/// Returns the canonicalized absolute path of `repo_root`'s git top-level,
+/// or `None` if git cannot discover a repository at `repo_root`.
+fn git_top_level(repo_root: &Path) -> Option<std::path::PathBuf> {
+    let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["rev-parse", "--git-dir"])
+        .args(["rev-parse", "--show-toplevel"])
         .stdin(Stdio::null())
         .output()
-        .is_ok_and(|o| o.status.success())
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path_str = String::from_utf8(output.stdout).ok()?;
+    Some(std::path::PathBuf::from(path_str.trim()))
+}
+
+/// Returns `true` if `repo_root` is exactly the root of its git repository
+/// (not a subdirectory of one).
+fn git_is_repo_root(repo_root: &Path) -> bool {
+    let Some(top_level) = git_top_level(repo_root) else {
+        return false;
+    };
+    let canonical_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let canonical_top = std::fs::canonicalize(&top_level).unwrap_or(top_level);
+    canonical_root == canonical_top
 }
 
 /// Returns the normalized canonical URL of the lowest-name-sorted remote,
 /// or `None` if `.git` does not exist or has no remotes.
 fn git_canonical_remote_url(repo_root: &Path) -> Option<String> {
-    if !git_is_repo(repo_root) {
+    if !git_is_repo_root(repo_root) {
         return None;
     }
 
@@ -175,9 +190,9 @@ fn git_canonical_remote_url(repo_root: &Path) -> Option<String> {
 }
 
 /// Returns the root commit SHA (oldest first-parent ancestor of HEAD),
-/// or `None` if `.git` does not exist or HEAD has no commits.
+/// or `None` if the path is not a git repo root or HEAD has no commits.
 fn git_root_commit_sha(repo_root: &Path) -> Option<String> {
-    if !git_is_repo(repo_root) {
+    if !git_is_repo_root(repo_root) {
         return None;
     }
 
@@ -203,11 +218,12 @@ fn git_root_commit_sha(repo_root: &Path) -> Option<String> {
 ///
 /// Normalizations applied (in order):
 /// - `git@host:owner/repo` → `https://host/owner/repo`
+/// - `ssh://[user@]host/path` → `https://host/path`
 /// - Scheme coerced from `http` to `https`
 /// - Host portion lowercased
 /// - Trailing `.git` stripped
 pub fn normalize_remote_url(url: &str) -> String {
-    // SSH form: git@github.com:owner/repo.git
+    // SSH scp form: git@github.com:owner/repo.git
     if let Some(stripped) = url.strip_prefix("git@")
         && let Some(colon) = stripped.find(':')
     {
@@ -215,6 +231,19 @@ pub fn normalize_remote_url(url: &str) -> String {
         let path = &stripped[colon + 1..];
         let path = path.strip_suffix(".git").unwrap_or(path);
         return format!("https://{host}/{path}");
+    }
+
+    // SSH URL form: ssh://[user@]host/path
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        let rest = rest.strip_prefix("git@").unwrap_or(rest);
+        if let Some(slash) = rest.find('/') {
+            let host = rest[..slash].to_lowercase();
+            let path = &rest[slash..];
+            let path = path.strip_suffix(".git").unwrap_or(path);
+            return format!("https://{host}{path}");
+        }
+        let host = rest.to_lowercase();
+        return format!("https://{host}");
     }
 
     // https:// or http://
@@ -272,6 +301,22 @@ mod tests {
     fn host_lowercased() {
         assert_eq!(
             normalize_remote_url("https://GITHUB.COM/owner/repo"),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn ssh_url_form_normalized() {
+        assert_eq!(
+            normalize_remote_url("ssh://git@github.com/owner/repo.git"),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn ssh_url_without_user_normalized() {
+        assert_eq!(
+            normalize_remote_url("ssh://github.com/owner/repo"),
             "https://github.com/owner/repo"
         );
     }

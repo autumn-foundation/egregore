@@ -93,17 +93,46 @@ pub(crate) fn repository_record_from_identity(
     identity: &identity::RepositoryIdentity,
 ) -> (String, GraphRecord) {
     let id = identity.id.clone();
-    let basename = &identity.payload.basename;
+    let display_name = stable_display_name(&identity.payload);
     let record = GraphRecord::node(
         id.clone(),
         NodeKind::Repository,
         None,
         None,
-        Some(basename.clone()),
-        format!("Repository {basename}"),
+        Some(display_name.clone()),
+        format!("Repository {display_name}"),
     )
     .with_repository_identity(identity.payload.clone());
     (id, record)
+}
+
+/// Returns a stable display name for the repository that does not depend on the
+/// local checkout directory basename when a more canonical source is available.
+fn stable_display_name(payload: &RepositoryIdentityPayload) -> String {
+    match &payload.identity_source {
+        IdentitySource::Remote => payload
+            .remote_url
+            .as_deref()
+            .and_then(|url| {
+                url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))
+            })
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(_, path)| path)
+            .filter(|path| !path.is_empty())
+            .unwrap_or(&payload.basename)
+            .to_owned(),
+        IdentitySource::LocalRootCommit => payload
+            .root_commit_sha
+            .as_deref()
+            .map_or_else(
+                || payload.basename.clone(),
+                |sha| {
+                    let short: String = sha.chars().take(12).collect();
+                    format!("commit-{short}")
+                },
+            ),
+        IdentitySource::OperatorOverride | IdentitySource::LocalPath => payload.basename.clone(),
+    }
 }
 
 pub(crate) fn scan_source_file_records(
@@ -125,7 +154,7 @@ pub(crate) fn scan_source_text_records(
 ) -> Result<Vec<GraphRecord>> {
     let mut graph = Graph::new();
     let repo_relative_path = source_file.repo_relative_path.clone();
-    let file_id = stable_id(&["node", "file", &repo_relative_path]);
+    let file_id = stable_id(&["node", "file", repository_id, &repo_relative_path]);
     graph.push(GraphRecord::node(
         file_id.clone(),
         NodeKind::File,
@@ -135,7 +164,7 @@ pub(crate) fn scan_source_text_records(
         format!("Rust source file {repo_relative_path}"),
     ));
     parser::add_repository_file_edge(&mut graph, repository_id, &file_id);
-    parser::extract_source_text(source_file, source, &file_id, &mut graph)?;
+    parser::extract_source_text(source_file, source, &file_id, repository_id, &mut graph)?;
     Ok(graph.records().to_vec())
 }
 

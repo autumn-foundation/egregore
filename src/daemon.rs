@@ -1350,7 +1350,7 @@ fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {
 // Returns true when `id` has the expected record-ID prefix for `domain`.
 fn record_id_matches_domain(id: &str, domain: &str) -> bool {
     match domain {
-        "codegraph" => id.starts_with("codegraph:v2:"),
+        "codegraph" => id.starts_with("codegraph:v3:"),
         "agent_memory" => id.starts_with("agent_memory:v1:"),
         _ => true,
     }
@@ -1363,9 +1363,9 @@ fn record_id_matches_domain(id: &str, domain: &str) -> bool {
 fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult<()> {
     match target_domain {
         "codegraph" => {
-            if !id.starts_with("codegraph:v2:") {
+            if !id.starts_with("codegraph:v3:") {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link declares target_domain 'codegraph' but target '{id}' does not have the expected 'codegraph:v2:' prefix",
+                    "evidence link declares target_domain 'codegraph' but target '{id}' does not have the expected 'codegraph:v3:' prefix",
                 )));
             }
         }
@@ -1788,9 +1788,9 @@ fn validate_agent_memory_edge_endpoints(
         | EdgeLabel::TouchedFile
         | EdgeLabel::FailedOn
         | EdgeLabel::ExplainsChange => {
-            if !target.starts_with("codegraph:v2:") {
+            if !target.starts_with("codegraph:v3:") {
                 return Err(ApiError::bad_request(format!(
-                    "agent-memory edge '{edge_id}' label '{}' requires a codegraph:v2: target; got target '{target}'",
+                    "agent-memory edge '{edge_id}' label '{}' requires a codegraph:v3: target; got target '{target}'",
                     label.as_str()
                 )));
             }
@@ -1953,7 +1953,7 @@ fn validate_and_synthesize_evidence_edges(
                     // Reject codegraph node kinds stored under an agent-memory ID.
                     if !AGENT_MEMORY_NODE_KINDS.contains(kind) {
                         return Err(ApiError::bad_request(format!(
-                            "node kind '{}' is not permitted under the agent_memory:v1: namespace; use codegraph:v2: IDs for code-graph nodes",
+                            "node kind '{}' is not permitted under the agent_memory:v1: namespace; use codegraph:v3: IDs for code-graph nodes",
                             kind.as_str()
                         )));
                     }
@@ -3576,7 +3576,7 @@ mod tests {
                 "session_id": "test-session",
                 "payload": {
                     "budget": { "timeout_ms": 1_u64 },
-                    "record_ids": ["codegraph:v2:missing"]
+                    "record_ids": ["codegraph:v3:missing"]
                 }
             }))?,
         };
@@ -3603,7 +3603,7 @@ mod tests {
             entries: BTreeMap::new(),
         }));
         let record = GraphRecord::node(
-            "codegraph:v2:cross-key-current-node".to_owned(),
+            "codegraph:v3:cross-key-current-node".to_owned(),
             NodeKind::Repository,
             None,
             None,
@@ -3630,7 +3630,7 @@ mod tests {
                 .read()
                 .map_err(|_| anyhow!("embedded sink lock poisoned"))?;
             assert_eq!(
-                sink.node_observation_count_for_test("codegraph:v2:cross-key-current-node"),
+                sink.node_observation_count_for_test("codegraph:v3:cross-key-current-node"),
                 1
             );
             drop(sink);
@@ -3648,8 +3648,8 @@ mod tests {
             path: temp.path().join("idempotency.json"),
             entries: BTreeMap::new(),
         }));
-        let file_id = "codegraph:v2:cross-key-edge-file".to_owned();
-        let symbol_id = "codegraph:v2:cross-key-edge-symbol".to_owned();
+        let file_id = "codegraph:v3:cross-key-edge-file".to_owned();
+        let symbol_id = "codegraph:v3:cross-key-edge-symbol".to_owned();
         let edge = GraphRecord::edge(
             EdgeLabel::Defines,
             file_id.clone(),

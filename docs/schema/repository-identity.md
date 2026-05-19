@@ -81,7 +81,7 @@ Every `Repository` node carries a `repository_identity` object:
 {
   "record_type": "node",
   "kind": "Repository",
-  "id": "codegraph:v2:<blake3hex>",
+  "id": "codegraph:v3:<blake3hex>",
   "repository_identity": {
     "identity_source": "remote",
     "remote_url": "https://github.com/owner/repo",
@@ -103,7 +103,7 @@ Every `Repository` node carries a `repository_identity` object:
 
 ## Schema Version
 
-`SCHEMA_VERSION = 2`. All `stable_id` outputs use the prefix `codegraph:v2:`.
+`SCHEMA_VERSION = 3`. All `stable_id` outputs use the prefix `codegraph:v3:`.
 
 ## Child Record Scope
 
@@ -117,7 +117,7 @@ Every `Repository` node carries a `repository_identity` object:
 The `inspect` CLI command prints the identity source alongside each repository ID:
 
 ```
-repository: codegraph:v2:<hex> (remote: https://github.com/owner/repo)
+repository: codegraph:v3:<hex> (remote: https://github.com/owner/repo)
 ```
 
 For shared AletheiaDB stores (daemon mode), `local_path` identity is not recommended because absolute paths are machine-specific. Use `--repo-id-override` or a remote-backed clone instead.

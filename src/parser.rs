@@ -12,8 +12,13 @@ use crate::{
 /// # Errors
 ///
 /// Returns an error when source reading or Tree-sitter parsing fails.
-pub fn extract_source_file(file: &SourceFile, file_id: &str, graph: &mut Graph) -> Result<()> {
-    languages::rust::extract_file(file, file_id, graph)
+pub fn extract_source_file(
+    file: &SourceFile,
+    file_id: &str,
+    repository_id: &str,
+    graph: &mut Graph,
+) -> Result<()> {
+    languages::rust::extract_file(file, file_id, repository_id, graph)
 }
 
 /// Extracts syntax-backed graph records from source text that may not exist in
@@ -26,9 +31,10 @@ pub fn extract_source_text(
     file: &SourceFile,
     source: &str,
     file_id: &str,
+    repository_id: &str,
     graph: &mut Graph,
 ) -> Result<()> {
-    languages::rust::extract_file_source(file, source, file_id, graph)
+    languages::rust::extract_file_source(file, source, file_id, repository_id, graph)
 }
 
 /// Adds a repository containment edge for a file node.
