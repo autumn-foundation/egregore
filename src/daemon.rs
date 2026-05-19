@@ -1457,25 +1457,13 @@ fn validate_evidence_endpoint_constraints(
                 )));
             }
         }
-        EdgeLabel::TouchedFile => {
-            if !matches!(
-                source_kind,
-                NodeKind::Observation | NodeKind::CommandEvidence | NodeKind::Verification
-            ) {
-                return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires an Observation, CommandEvidence, or Verification source node, not {}",
-                    label.as_str(),
-                    source_kind.as_str()
-                )));
-            }
-        }
         // FAILED_ON is reserved for a Failure source node kind that does not yet exist.
         EdgeLabel::FailedOn => {
             return Err(ApiError::bad_request(
                 "evidence link relation 'FAILED_ON' requires a Failure source node; the Failure node kind is not yet supported",
             ));
         }
-        // MentionsSymbol and all other labels: any agent-memory source kind is permitted.
+        // TouchedFile, MentionsSymbol, and all other labels: any agent-memory source kind is permitted.
         _ => {}
     }
     // Target-side constraints.
@@ -1630,6 +1618,8 @@ fn validate_and_synthesize_evidence_edges(
                 label,
                 source,
                 target,
+                schema_version,
+                confidence,
                 ..
             } = record
                 && id.starts_with("agent_memory:v1:")
@@ -1639,6 +1629,29 @@ fn validate_and_synthesize_evidence_edges(
                         "agent-memory edge '{id}' uses codegraph-topology label '{}'; only evidence-link and agent-memory structural labels are permitted for agent-memory edges",
                         label.as_str()
                     )));
+                }
+                if *schema_version != AGENT_MEMORY_SCHEMA_VERSION {
+                    return Err(ApiError::bad_request(format!(
+                        "agent-memory edge '{id}' has schema_version {schema_version} but only version {AGENT_MEMORY_SCHEMA_VERSION} is accepted"
+                    )));
+                }
+                if matches!(
+                    label,
+                    EdgeLabel::Observes
+                        | EdgeLabel::MentionsSymbol
+                        | EdgeLabel::ExplainsChange
+                        | EdgeLabel::Contradicts
+                ) {
+                    let valid = confidence
+                        .as_deref()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .is_some_and(|v| (0.0..=1.0).contains(&v));
+                    if !valid {
+                        return Err(ApiError::bad_request(format!(
+                            "agent-memory edge '{id}' label '{}' requires a numeric confidence in [0.0, 1.0]",
+                            label.as_str()
+                        )));
+                    }
                 }
                 validate_agent_memory_edge_endpoints(id, *label, source, target)?;
             }
@@ -1812,13 +1825,24 @@ fn validate_and_synthesize_evidence_edges(
                             }
                         }
                         EdgeLabel::ValidatedBy
-                        | EdgeLabel::ReferencesTask
                         | EdgeLabel::Contradicts
                         | EdgeLabel::Supersedes
                         | EdgeLabel::HasEvidence => {
                             if link.target_domain != "agent_memory" {
                                 return Err(ApiError::bad_request(format!(
                                     "evidence link relation '{}' requires target_domain 'agent_memory'; got '{}'",
+                                    edge_label.as_str(),
+                                    link.target_domain
+                                )));
+                            }
+                        }
+                        // REFERENCES_TASK: the schema registry documents the TO domain as
+                        // "project", but Task nodes currently live in agent_memory.
+                        // Accept both to cover clients using the documented domain name.
+                        EdgeLabel::ReferencesTask => {
+                            if !matches!(link.target_domain.as_str(), "project" | "agent_memory") {
+                                return Err(ApiError::bad_request(format!(
+                                    "evidence link relation '{}' requires target_domain 'project' or 'agent_memory'; got '{}'",
                                     edge_label.as_str(),
                                     link.target_domain
                                 )));
