@@ -1009,6 +1009,57 @@ fn spawn_write_worker(
     })
 }
 
+// Attempts recovery of a pending write using the record_ids stored in the idempotency entry,
+// BEFORE re-running evidence-link validation.  Synthesized edges are written atomically with
+// the original records, so if all original records are matched in the store the full write
+// (including synthesized edges) committed and the pending entry can be completed.
+// Returns Some(response) on successful recovery, None if the write is not yet committed.
+fn recover_pending_write_pre_validation(
+    command: &WriteCommand,
+    sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
+    idempotency: &Arc<Mutex<IdempotencyStore>>,
+) -> WriteResult<Option<DaemonIngestResponse>> {
+    let pending_record_ids: Vec<String> = {
+        let store = idempotency
+            .lock()
+            .map_err(|_| ApiError::internal("idempotency store lock poisoned"))?;
+        match store.entries.get(&command.idempotency_key) {
+            Some(IdempotencyEntry::Pending { record_ids, .. }) => record_ids.clone(),
+            _ => return Ok(None),
+        }
+    };
+    let all_matched = {
+        let sink_guard = sink
+            .read()
+            .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
+        command.records.iter().all(|r| {
+            sink_guard
+                .expected_record_state(r)
+                .map(|s| matches!(s, ExpectedRecordState::Matched))
+                .unwrap_or(false)
+        })
+    };
+    if !all_matched {
+        return Ok(None);
+    }
+    let response = DaemonIngestResponse {
+        attempted: pending_record_ids.len(),
+        succeeded: pending_record_ids.len(),
+        failed: 0,
+        failures: Vec::new(),
+        record_ids: pending_record_ids,
+        idempotent: true,
+    };
+    complete_idempotency_entry(
+        &command.idempotency_key,
+        &command.payload_hash,
+        &response,
+        idempotency,
+    )?;
+    Ok(Some(response))
+}
+
+#[allow(clippy::too_many_lines)]
 fn apply_write(
     command: &WriteCommand,
     sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
@@ -1042,6 +1093,16 @@ fn apply_write(
             false
         }
     };
+
+    // For pending retries: attempt recovery BEFORE re-running evidence-link validation.
+    // Re-running validation can fail spuriously when the original write's target nodes are
+    // now in the store (e.g. an ambiguous temporal target that appears in both the store
+    // and the retry batch).
+    if is_pending
+        && let Some(response) = recover_pending_write_pre_validation(command, sink, idempotency)?
+    {
+        return Ok(response);
+    }
 
     let (synthesized_edges, canonical_nodes) =
         validate_and_synthesize_evidence_edges(&command.records, sink)?;
@@ -1439,8 +1500,12 @@ fn lookup_node_kind(
 }
 
 // Validates source-kind and target-kind constraints per evidence-link relation.
+// `source_kind` is None when the source node cannot be resolved (e.g. a directly
+// submitted edge whose source is not in the current batch or store); source-side
+// constraints are skipped when the kind is unknown.
+#[allow(clippy::too_many_lines)]
 fn validate_evidence_endpoint_constraints(
-    source_kind: NodeKind,
+    source_kind: Option<NodeKind>,
     label: EdgeLabel,
     target_kind: Option<NodeKind>,
     target_id: &str,
@@ -1448,20 +1513,24 @@ fn validate_evidence_endpoint_constraints(
     // Source-side constraints.
     match label {
         EdgeLabel::Observes | EdgeLabel::ExplainsChange | EdgeLabel::ValidatedBy => {
-            if source_kind != NodeKind::Observation {
+            if let Some(sk) = source_kind
+                && sk != NodeKind::Observation
+            {
                 return Err(ApiError::bad_request(format!(
                     "evidence link relation '{}' requires an Observation source node, not {}",
                     label.as_str(),
-                    source_kind.as_str()
+                    sk.as_str()
                 )));
             }
         }
         EdgeLabel::ProducedPatch => {
-            if source_kind != NodeKind::CommandEvidence {
+            if let Some(sk) = source_kind
+                && sk != NodeKind::CommandEvidence
+            {
                 return Err(ApiError::bad_request(format!(
                     "evidence link relation '{}' requires a CommandEvidence source node, not {}",
                     label.as_str(),
-                    source_kind.as_str()
+                    sk.as_str()
                 )));
             }
         }
@@ -1540,6 +1609,12 @@ fn validate_evidence_endpoint_constraints(
                     target_kind_str()
                 )));
             }
+        }
+        // PRODUCED_PATCH requires a PatchArtifact target, which does not yet exist as a NodeKind.
+        EdgeLabel::ProducedPatch => {
+            return Err(ApiError::bad_request(
+                "evidence link relation 'PRODUCED_PATCH' requires a PatchArtifact target; the PatchArtifact node kind is not yet supported",
+            ));
         }
         _ => {}
     }
@@ -1731,6 +1806,19 @@ fn validate_and_synthesize_evidence_edges(
                                 )
                             )));
                         }
+                    }
+                    // Evidence-link labels: apply the same source/target kind constraints
+                    // used by the evidence_links validator so direct-edge submissions cannot
+                    // bypass schema endpoint checks.
+                    other if other.is_evidence_link_label() => {
+                        let source_kind = lookup_node_kind(source, records, &sink_guard)?;
+                        let target_kind = lookup_node_kind(target, records, &sink_guard)?;
+                        validate_evidence_endpoint_constraints(
+                            source_kind,
+                            *label,
+                            target_kind,
+                            target,
+                        )?;
                     }
                     _ => {}
                 }
@@ -1949,7 +2037,7 @@ fn validate_and_synthesize_evidence_edges(
                     }
                     let target_kind = lookup_node_kind(&target_id, records, &sink_guard)?;
                     validate_evidence_endpoint_constraints(
-                        *kind,
+                        Some(*kind),
                         edge_label,
                         target_kind,
                         &target_id,
