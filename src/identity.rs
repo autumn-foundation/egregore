@@ -256,8 +256,11 @@ pub(crate) fn is_local_remote_url(url: &str) -> bool {
     if url.len() >= 7 && url[..7].eq_ignore_ascii_case("file://") {
         return true;
     }
-    if url.contains("://") {
-        return false;
+    if let Some(scheme_end) = url.find("://") {
+        // file:// already caught above; treat loopback hosts as local.
+        let after_scheme = &url[scheme_end + 3..];
+        let host = extract_host_from_authority(after_scheme);
+        return is_loopback_host(host);
     }
     // No scheme: scp form ([user@]host:path) if ':' appears before any '/'.
     // colon_pos > 1 rejects Windows drive letters like C:/repos (single-char prefix).
@@ -268,6 +271,28 @@ pub(crate) fn is_local_remote_url(url: &str) -> bool {
         return false; // scp form — portable
     }
     true // relative path or other local form
+}
+
+/// Extracts the host from a URL authority component (`[user@]host[:port]` or `[user@][host]:port`).
+fn extract_host_from_authority(authority: &str) -> &str {
+    let after_at = authority
+        .split_once('@')
+        .map_or(authority, |(_, rest)| rest);
+    if let Some(rest) = after_at.strip_prefix('[') {
+        // IPv6 bracketed form: [::1] or [::1]:port
+        return rest.split_once(']').map_or(rest, |(host, _)| host);
+    }
+    // Plain host or host:port — strip path and port.
+    let host_port = after_at.split_once('/').map_or(after_at, |(h, _)| h);
+    host_port
+        .split_once(':')
+        .map_or(host_port, |(host, _)| host)
+}
+
+/// Returns `true` for loopback host names and addresses.
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    h == "localhost" || h == "::1" || h.starts_with("127.")
 }
 
 /// Returns the root commit SHA (oldest first-parent ancestor of HEAD),
@@ -620,6 +645,35 @@ mod tests {
             normalize_remote_url("FTP://EXAMPLE.com"),
             "ftp://example.com"
         );
+    }
+
+    #[test]
+    fn ssh_localhost_is_local() {
+        assert!(super::is_local_remote_url(
+            "ssh://localhost/path/to/repo.git"
+        ));
+        assert!(super::is_local_remote_url(
+            "ssh://user@localhost/path/to/repo.git"
+        ));
+    }
+
+    #[test]
+    fn https_loopback_ipv4_is_local() {
+        assert!(super::is_local_remote_url("https://127.0.0.1/repo.git"));
+        assert!(super::is_local_remote_url("https://127.1.2.3/repo.git"));
+    }
+
+    #[test]
+    fn https_loopback_ipv6_is_local() {
+        assert!(super::is_local_remote_url("https://[::1]/repo.git"));
+        assert!(super::is_local_remote_url("git://[::1]:9418/repo.git"));
+    }
+
+    #[test]
+    fn ssh_github_is_not_local() {
+        assert!(!super::is_local_remote_url(
+            "ssh://github.com/owner/repo.git"
+        ));
     }
 
     #[test]

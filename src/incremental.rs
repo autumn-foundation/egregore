@@ -70,6 +70,25 @@ pub fn scan_repository_incremental(
             deleted_id: old_repo_id.clone(),
             summary: format!("Repository identity changed; stale Repository {old_repo_id} removed"),
         });
+    } else if previous_cache.repository_id.is_empty() && !previous_cache.files.is_empty() {
+        // Legacy cache written before the repository_id field existed: infer the old
+        // basename-derived ID and tombstone it so persisted stores can retire stale records.
+        let basename = repo_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or("repository");
+        let legacy_repo_id = stable_id(&["node", "repository", basename]);
+        if legacy_repo_id != repository_id {
+            graph.push(GraphRecord::Tombstone {
+                id: stable_id(&["tombstone", "repository-identity-changed", &legacy_repo_id]),
+                schema_version: SCHEMA_VERSION,
+                deleted_id: legacy_repo_id.clone(),
+                summary: format!(
+                    "Repository identity changed; stale Repository {legacy_repo_id} removed"
+                ),
+            });
+        }
     }
 
     for source_file in crate::fs::discover_rust_source_files(repo_root)? {

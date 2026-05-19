@@ -1275,6 +1275,7 @@ fn recover_pending_write(
     Ok(Some(response))
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_no_local_path_identity_in_shared_store(
     records: &[GraphRecord],
     sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
@@ -1323,6 +1324,17 @@ fn validate_no_local_path_identity_in_shared_store(
         .iter()
         .any(|record| !record.id().starts_with("codegraph:"));
 
+    let incoming_tombstoned_ids: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|record| {
+            if let GraphRecord::Tombstone { deleted_id, .. } = record {
+                Some(deleted_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
     let (existing_repository_ids, stored_local_path_ids, store_is_multi_domain) = {
         let sink = sink
             .read()
@@ -1339,7 +1351,12 @@ fn validate_no_local_path_identity_in_shared_store(
 
     // Inverse check: if the store already has local_path repos, block writes that would
     // make the store shared (different repo ID or non-codegraph records).
+    // Exception: a batch that tombstones the stored local-path repo is a migration write;
+    // allow it so callers can retire a LocalPath identity and adopt a Remote one atomically.
     for stored_local_path_id in &stored_local_path_ids {
+        if incoming_tombstoned_ids.contains(stored_local_path_id.as_str()) {
+            continue;
+        }
         let incoming_adds_different_repo = incoming_repo_ids
             .iter()
             .any(|id| *id != stored_local_path_id.as_str());
