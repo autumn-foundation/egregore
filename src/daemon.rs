@@ -1522,6 +1522,92 @@ fn validate_evidence_endpoint_constraints(
 // not used in time-range queries.
 const EVIDENCE_EDGE_ROUTING_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 
+/// Agent kinds defined in docs/schema/agent-memory.md.
+const VALID_AGENT_KINDS: &[&str] = &[
+    "codex",
+    "claude-code",
+    "vantage",
+    "rust-swe-agent",
+    "human",
+    "other",
+];
+
+/// Node kinds that belong to the agent-memory domain.
+const AGENT_MEMORY_NODE_KINDS: &[NodeKind] = &[
+    NodeKind::Agent,
+    NodeKind::AgentSession,
+    NodeKind::Observation,
+    NodeKind::Task,
+    NodeKind::Artifact,
+    NodeKind::Verification,
+    NodeKind::CommandEvidence,
+];
+
+// Validates that the source and target IDs of a directly submitted agent-memory edge
+// are in the domains required by the cross-domain registry (docs/schema/agent-memory.md §6).
+fn validate_agent_memory_edge_endpoints(
+    edge_id: &str,
+    label: EdgeLabel,
+    source: &str,
+    target: &str,
+) -> WriteResult<()> {
+    // Source-domain constraints per schema registry.
+    match label {
+        EdgeLabel::SessionOf
+        | EdgeLabel::Observes
+        | EdgeLabel::MentionsSymbol
+        | EdgeLabel::TouchedFile
+        | EdgeLabel::ProducedPatch
+        | EdgeLabel::ValidatedBy
+        | EdgeLabel::FailedOn
+        | EdgeLabel::ExplainsChange
+        | EdgeLabel::ReferencesTask
+        | EdgeLabel::Contradicts
+        | EdgeLabel::Supersedes => {
+            if !source.starts_with("agent_memory:v1:") {
+                return Err(ApiError::bad_request(format!(
+                    "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: source; got source '{source}'",
+                    label.as_str()
+                )));
+            }
+        }
+        // AUTHORED_BY, HAS_EVIDENCE, RELATES_TO: any source domain is permitted.
+        _ => {}
+    }
+    // Target-domain constraints per schema registry.
+    match label {
+        EdgeLabel::SessionOf
+        | EdgeLabel::AuthoredBy
+        | EdgeLabel::HasEvidence
+        | EdgeLabel::ValidatedBy
+        | EdgeLabel::ReferencesTask
+        | EdgeLabel::Contradicts
+        | EdgeLabel::Supersedes => {
+            if !target.starts_with("agent_memory:v1:") {
+                return Err(ApiError::bad_request(format!(
+                    "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: target; got target '{target}'",
+                    label.as_str()
+                )));
+            }
+        }
+        EdgeLabel::Observes
+        | EdgeLabel::MentionsSymbol
+        | EdgeLabel::TouchedFile
+        | EdgeLabel::FailedOn
+        | EdgeLabel::ExplainsChange => {
+            if !target.starts_with("codegraph:v1:") {
+                return Err(ApiError::bad_request(format!(
+                    "agent-memory edge '{edge_id}' label '{}' requires a codegraph:v1: target; got target '{target}'",
+                    label.as_str()
+                )));
+            }
+        }
+        // PRODUCED_PATCH, RELATES_TO: any target domain is permitted.
+        _ => {}
+    }
+    Ok(())
+}
+
 // Returns (synthesized_edges, canonical_source_nodes).
 // Canonical source nodes are copies of source records that had triple-resolved evidence links,
 // with target_record_id filled in from the resolved canonical ID so both the denormalized
@@ -1539,14 +1625,22 @@ fn validate_and_synthesize_evidence_edges(
         let mut resolved = Vec::new();
         for record in records {
             // Validate directly submitted agent-memory edge records.
-            if let GraphRecord::Edge { id, label, .. } = record
+            if let GraphRecord::Edge {
+                id,
+                label,
+                source,
+                target,
+                ..
+            } = record
                 && id.starts_with("agent_memory:v1:")
-                && label.is_codegraph_topology_label()
             {
-                return Err(ApiError::bad_request(format!(
-                    "agent-memory edge '{id}' uses codegraph-topology label '{}'; only evidence-link and agent-memory structural labels are permitted for agent-memory edges",
-                    label.as_str()
-                )));
+                if label.is_codegraph_topology_label() {
+                    return Err(ApiError::bad_request(format!(
+                        "agent-memory edge '{id}' uses codegraph-topology label '{}'; only evidence-link and agent-memory structural labels are permitted for agent-memory edges",
+                        label.as_str()
+                    )));
+                }
+                validate_agent_memory_edge_endpoints(id, *label, source, target)?;
             }
             if let GraphRecord::Node {
                 id,
@@ -1574,6 +1668,13 @@ fn validate_and_synthesize_evidence_edges(
                 }
                 // Validate and enforce schema constraints for all agent-memory node kinds.
                 if id.starts_with("agent_memory:v1:") {
+                    // Reject codegraph node kinds stored under an agent-memory ID.
+                    if !AGENT_MEMORY_NODE_KINDS.contains(kind) {
+                        return Err(ApiError::bad_request(format!(
+                            "node kind '{}' is not permitted under the agent_memory:v1: namespace; use codegraph:v1: IDs for code-graph nodes",
+                            kind.as_str()
+                        )));
+                    }
                     // Schema version must match the published agent-memory v1 contract.
                     if *schema_version != AGENT_MEMORY_SCHEMA_VERSION {
                         return Err(ApiError::bad_request(format!(
@@ -1612,6 +1713,15 @@ fn validate_and_synthesize_evidence_edges(
                                 kind.as_str()
                             )));
                         }
+                    }
+                    // Validate agent_kind against the published enum.
+                    if let Some(ak) = agent_kind.as_deref().filter(|s| !s.is_empty())
+                        && !VALID_AGENT_KINDS.contains(&ak)
+                    {
+                        return Err(ApiError::bad_request(format!(
+                            "agent_kind '{ak}' is not a recognized value; expected one of: {}",
+                            VALID_AGENT_KINDS.join(", ")
+                        )));
                     }
                     // Validate timestamp format for required timestamp fields.
                     for (ts_field, ts_val) in [
@@ -1687,6 +1797,36 @@ fn validate_and_synthesize_evidence_edges(
                             link.relation
                         )));
                     }
+                    // Validate that target_domain matches the registry's TO domain for this relation.
+                    match edge_label {
+                        EdgeLabel::Observes
+                        | EdgeLabel::MentionsSymbol
+                        | EdgeLabel::TouchedFile
+                        | EdgeLabel::ExplainsChange => {
+                            if link.target_domain != "codegraph" {
+                                return Err(ApiError::bad_request(format!(
+                                    "evidence link relation '{}' requires target_domain 'codegraph'; got '{}'",
+                                    edge_label.as_str(),
+                                    link.target_domain
+                                )));
+                            }
+                        }
+                        EdgeLabel::ValidatedBy
+                        | EdgeLabel::ReferencesTask
+                        | EdgeLabel::Contradicts
+                        | EdgeLabel::Supersedes
+                        | EdgeLabel::HasEvidence => {
+                            if link.target_domain != "agent_memory" {
+                                return Err(ApiError::bad_request(format!(
+                                    "evidence link relation '{}' requires target_domain 'agent_memory'; got '{}'",
+                                    edge_label.as_str(),
+                                    link.target_domain
+                                )));
+                            }
+                        }
+                        // PRODUCED_PATCH, RELATES_TO: any target domain is permitted.
+                        _ => {}
+                    }
                     let target_kind = lookup_node_kind(&target_id, records, &sink_guard)?;
                     validate_evidence_endpoint_constraints(
                         *kind,
@@ -1724,9 +1864,10 @@ fn validate_and_synthesize_evidence_edges(
     }
 
     // Phase 2: synthesize edge records (no lock needed).
-    // Deduplicate by stable edge ID.  Same edge ID + same routing commit → skip silently.
-    // Same edge ID but different routing commits → conflict error (ambiguous temporal target).
-    let mut seen_edges: BTreeMap<String, Option<String>> = BTreeMap::new();
+    // Dedup key: (edge_id, routing_commit, confidence).  Same all three → skip silently.
+    // Same edge_id + same commit but different confidence → conflict error.
+    // Same edge_id + different commit → conflict error (ambiguous temporal target).
+    let mut seen_edges: BTreeMap<String, (Option<String>, String)> = BTreeMap::new();
     let mut edges = Vec::with_capacity(resolved.len());
     for rl in resolved {
         // edge_label and is_evidence_link_label were already validated in Phase 1.
@@ -1735,6 +1876,7 @@ fn validate_and_synthesize_evidence_edges(
             rl.node_id,
             rl.edge_label.as_str()
         );
+        let conf = rl.confidence.clone().unwrap_or_default();
         let edge = GraphRecord::agent_memory_edge(
             rl.edge_label,
             rl.node_id,
@@ -1758,8 +1900,13 @@ fn validate_and_synthesize_evidence_edges(
         };
         let edge_id = edge.id().to_owned();
         match seen_edges.get(&edge_id) {
-            Some(existing) if *existing == rl.routing_commit => {
-                // exact duplicate (same target + relation + commit), skip silently
+            Some((existing_commit, existing_conf)) if *existing_commit == rl.routing_commit => {
+                if existing_conf.as_str() != conf.as_str() {
+                    return Err(ApiError::bad_request(format!(
+                        "evidence links for edge '{edge_id}' have conflicting confidence values"
+                    )));
+                }
+                // exact duplicate, skip silently
             }
             Some(_) => {
                 return Err(ApiError::bad_request(format!(
@@ -1767,7 +1914,7 @@ fn validate_and_synthesize_evidence_edges(
                 )));
             }
             None => {
-                seen_edges.insert(edge_id, rl.routing_commit);
+                seen_edges.insert(edge_id, (rl.routing_commit, conf));
                 edges.push(edge);
             }
         }
@@ -2211,7 +2358,16 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
         }
     };
     let agent_kind = match non_empty(registration.agent_kind.as_deref()) {
-        Some(kind) => kind.to_owned(),
+        Some(kind) if VALID_AGENT_KINDS.contains(&kind) => kind.to_owned(),
+        Some(kind) => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::bad_request(format!(
+                    "agent_kind '{kind}' is not a recognized value; expected one of: {}",
+                    VALID_AGENT_KINDS.join(", ")
+                )),
+            );
+        }
         None => {
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("agent_kind"));
         }

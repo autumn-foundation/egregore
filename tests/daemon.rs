@@ -2374,7 +2374,7 @@ fn contract_conformance_all_routes() {
                 "request_id": "conf-register-success",
                 "agent_id": "conf-agent",
                 "session_id": "conf-session",
-                "agent_kind": "test",
+                "agent_kind": "other",
                 "project_scope": "egregore",
                 "created_at": "2026-05-18T00:00:00Z"
             }),
@@ -2762,7 +2762,7 @@ fn evidence_link_with_missing_target_is_rejected() {
                     "schema_version": 1,
                     "text": "test observation",
                     "agent_id": "test-agent",
-                    "agent_kind": "coding",
+                    "agent_kind": "other",
                     "session_id": "test-session",
                     "observed_at": "2026-05-18T00:00:00Z",
                     "ingested_at": "2026-05-18T00:00:00Z",
