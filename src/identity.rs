@@ -215,9 +215,10 @@ fn is_local_remote_url(url: &str) -> bool {
         return false;
     }
     // No scheme: scp form ([user@]host:path) if ':' appears before any '/'.
+    // colon_pos > 1 rejects Windows drive letters like C:/repos (single-char prefix).
     if url
         .find(':')
-        .is_some_and(|colon_pos| !url[..colon_pos].contains('/'))
+        .is_some_and(|colon_pos| colon_pos > 1 && !url[..colon_pos].contains('/'))
     {
         return false; // scp form — portable
     }
@@ -281,10 +282,12 @@ pub fn normalize_remote_url(url: &str) -> String {
         return format!("https://{host}");
     }
 
-    // https:// or http://
+    // https://, http://, or git:// (git:// coerced to https)
     let scheme_rest = if let Some(s) = url.strip_prefix("https://") {
         s
     } else if let Some(s) = url.strip_prefix("http://") {
+        s
+    } else if let Some(s) = url.strip_prefix("git://") {
         s
     } else {
         return url.to_owned();
@@ -412,5 +415,18 @@ mod tests {
             normalize_remote_url("https://alice@github.com/owner/repo.git"),
             "https://github.com/owner/repo"
         );
+    }
+
+    #[test]
+    fn git_protocol_coerced_to_https() {
+        assert_eq!(
+            normalize_remote_url("git://github.com/owner/repo.git"),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn windows_drive_letter_not_treated_as_scp() {
+        assert!(super::is_local_remote_url("C:/repos/mirror.git"));
     }
 }

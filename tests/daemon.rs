@@ -1593,7 +1593,7 @@ fn daemon_ingest_idempotency_keys_are_scoped_by_agent_session() {
     let shared_key = "shared-scan-key";
     let first_record = GraphRecord::node(
         "codegraph:v3:agent-scope-first".to_owned(),
-        NodeKind::Repository,
+        NodeKind::Module,
         None,
         None,
         Some("repo".to_owned()),
@@ -1601,7 +1601,7 @@ fn daemon_ingest_idempotency_keys_are_scoped_by_agent_session() {
     );
     let second_record = GraphRecord::node(
         "codegraph:v3:agent-scope-second".to_owned(),
-        NodeKind::Repository,
+        NodeKind::Module,
         None,
         None,
         Some("repo".to_owned()),
@@ -2066,7 +2066,7 @@ fn contract_conformance_all_routes() {
         "record_type": "node",
         "id": "codegraph:v3:conformance-ingest-node",
         "schema_version": 1,
-        "kind": "Repository",
+        "kind": "Module",
         "name": "conformance",
         "summary": "conformance test node"
     });
@@ -2250,7 +2250,7 @@ fn contract_conformance_all_routes() {
             "record_type": "node",
             "id": "codegraph:v3:conformance-conflict-node",
             "schema_version": 1,
-            "kind": "Repository",
+            "kind": "Module",
             "name": "conflict",
             "summary": "a different node"
         });

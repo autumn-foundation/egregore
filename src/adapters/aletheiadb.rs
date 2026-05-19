@@ -489,13 +489,11 @@ impl EmbeddedAletheiaSink {
                 ..
             }) = self.read_back(record_id)?
             {
-                // Legacy repos written before the identity feature (v1/v2 IDs) have no
-                // payload but were keyed by machine-local basename — treat as unsafe.
-                // New v3 repos without a payload are test fixtures; skip them.
-                let is_unsafe = repository_identity.as_deref().map_or_else(
-                    || !record_id.starts_with("codegraph:v3:"),
-                    |payload| payload.identity_source == IdentitySource::LocalPath,
-                );
+                // Any Repository node without an identity payload may be machine-local
+                // (legacy v1/v2 write or an unverifiable write path). Treat as unsafe.
+                let is_unsafe = repository_identity
+                    .as_deref()
+                    .is_none_or(|payload| payload.identity_source == IdentitySource::LocalPath);
                 if is_unsafe {
                     ids.push(record_id.clone());
                 }
@@ -542,12 +540,13 @@ impl EmbeddedAletheiaSink {
     ///
     /// Returns an error if an embedded read or edge operation fails.
     pub fn has_non_codegraph_records(&self) -> AdapterResult<bool> {
-        // Check node records.
+        let tombstoned = self.active_deleted_ids()?;
+        // Check node records (skip tombstoned).
         if self
             .node_lookup
             .latest
             .keys()
-            .any(|id| !id.starts_with("codegraph:"))
+            .any(|id| !tombstoned.contains(id.as_str()) && !id.starts_with("codegraph:"))
         {
             return Ok(true);
         }
@@ -558,12 +557,16 @@ impl EmbeddedAletheiaSink {
                     .db
                     .get_edge(edge_id)
                     .map_err(|e| read_back_error("has_non_codegraph_records", e.to_string()))?;
-                if optional_str_property(
+                let Some(edge_id_str) = optional_str_property(
                     "has_non_codegraph_records",
                     "codegraph_id",
                     edge.get_property("codegraph_id"),
                 )?
-                .is_some_and(|id| !id.starts_with("codegraph:"))
+                else {
+                    continue;
+                };
+                if !tombstoned.contains(edge_id_str.as_str())
+                    && !edge_id_str.starts_with("codegraph:")
                 {
                     return Ok(true);
                 }
