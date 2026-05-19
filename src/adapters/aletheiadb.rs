@@ -477,12 +477,20 @@ impl EmbeddedAletheiaSink {
         for record_id in self.node_lookup.latest.keys() {
             if let Some(GraphRecord::Node {
                 kind: NodeKind::Repository,
-                repository_identity: Some(payload),
+                repository_identity,
                 ..
             }) = self.read_back(record_id)?
-                && payload.identity_source == IdentitySource::LocalPath
             {
-                ids.push(record_id.clone());
+                // Legacy repos written before the identity feature (v1/v2 IDs) have no
+                // payload but were keyed by machine-local basename — treat as unsafe.
+                // New v3 repos without a payload are test fixtures; skip them.
+                let is_unsafe = repository_identity.as_deref().map_or_else(
+                    || !record_id.starts_with("codegraph:v3:"),
+                    |payload| payload.identity_source == IdentitySource::LocalPath,
+                );
+                if is_unsafe {
+                    ids.push(record_id.clone());
+                }
             }
         }
         Ok(ids)

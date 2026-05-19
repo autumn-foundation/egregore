@@ -1361,8 +1361,9 @@ fn validate_no_local_path_identity_in_shared_store(
     for incoming_id in incoming_local_path_ids {
         let has_other_repo = existing_repository_ids
             .iter()
-            .any(|existing| existing != incoming_id);
-        if has_other_repo || store_is_multi_domain {
+            .any(|existing| existing != incoming_id)
+            || incoming_repo_ids.iter().any(|id| *id != incoming_id);
+        if has_other_repo || store_is_multi_domain || incoming_has_non_codegraph {
             return Err(ApiError::new(
                 ErrorCode::LocalPathIdentityUnsupported,
                 "Repository node with identity_source 'local_path' cannot be ingested into a \

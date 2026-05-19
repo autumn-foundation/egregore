@@ -91,10 +91,19 @@ pub fn scan_repository_incremental(
     }
 
     let mut tombstoned_files = Vec::new();
-    for removed in previous_cache.files.keys() {
+    for (removed, cached_file) in &previous_cache.files {
         if !seen_files.contains(removed) {
             tombstoned_files.push(removed.clone());
-            graph.push(file_tombstone(removed, &repository_id));
+            if can_reuse_cache_records {
+                // repository_id is stable — tombstone the expected current file ID.
+                graph.push(file_tombstone(removed, &repository_id));
+            } else {
+                // repository_id changed; emit tombstones from the actual cached record IDs
+                // so stale records from the old identity are correctly deleted.
+                for record in &cached_file.records {
+                    graph.push(invalidated_record_tombstone(removed, record.id()));
+                }
+            }
         }
     }
 

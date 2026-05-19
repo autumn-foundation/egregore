@@ -194,6 +194,12 @@ fn git_canonical_remote_url(repo_root: &Path) -> Option<String> {
         return None;
     }
 
+    // Reject local-path remotes: they are machine-specific and must not be used
+    // as shared identity. Fall through to LocalRootCommit or LocalPath instead.
+    if url.starts_with('/') || url.starts_with("file://") {
+        return None;
+    }
+
     Some(normalize_remote_url(url))
 }
 
