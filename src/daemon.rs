@@ -2700,11 +2700,15 @@ fn rfc3339_now() -> String {
 }
 
 /// Builds the standard verb success result: `{ verb, snapshot, records, page }`.
-fn verb_success_result(verb: &str, records: &[serde_json::Value]) -> serde_json::Value {
+fn verb_success_result(
+    verb: &str,
+    snapshot: &str,
+    records: &[serde_json::Value],
+) -> serde_json::Value {
     let returned = records.len() as u64;
     json!({
         "verb": verb,
-        "snapshot": rfc3339_now(),
+        "snapshot": snapshot,
         "records": records,
         "page": {
             "cursor": serde_json::Value::Null,
@@ -2715,18 +2719,29 @@ fn verb_success_result(verb: &str, records: &[serde_json::Value]) -> serde_json:
 }
 
 /// Loads all records from the embedded sink, respecting the read budget.
+/// Returns the records filtered to the given domain and the RFC3339 snapshot
+/// timestamp captured at read-lock acquisition time.
 fn load_all_records_for_verb(
     state: &ServerState,
     started: Instant,
     budget: Option<Duration>,
-) -> std::result::Result<Vec<GraphRecord>, ApiError> {
+    domain: &str,
+) -> std::result::Result<(Vec<GraphRecord>, String), ApiError> {
     let sink = query_sink_read(state, started, budget)?;
+    // Capture the snapshot while the read lock is held.
+    let snapshot = rfc3339_now();
     let records = sink
         .read_all_records()
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    drop(sink);
     // Post-read check: the read itself may have overrun the deadline.
     check_query_budget(started, budget)?;
-    Ok(records)
+    // Filter to the requested domain.
+    let records = records
+        .into_iter()
+        .filter(|r| record_id_matches_domain(r.id(), domain))
+        .collect();
+    Ok((records, snapshot))
 }
 
 /// Collects the IDs of tombstoned records in the slice.
@@ -2858,9 +2873,7 @@ fn handle_verb_get_records(
                     None => {
                         return HttpResponse::error_with_id(
                             request_id,
-                            ApiError::bad_request(
-                                "params.record_ids must be an array of strings",
-                            ),
+                            ApiError::bad_request("params.record_ids must be an array of strings"),
                         );
                     }
                 }
@@ -2882,6 +2895,9 @@ fn handle_verb_get_records(
         .iter()
         .filter(|id| record_id_matches_domain(id, domain))
         .collect();
+
+    // Capture snapshot before the first read-lock acquisition.
+    let snapshot = rfc3339_now();
 
     for record_id in domain_filtered.iter().take(limit) {
         if let Err(error) = check_query_budget(started, budget) {
@@ -2918,12 +2934,13 @@ fn handle_verb_get_records(
     HttpResponse::success(
         Some(request_id),
         200,
-        verb_success_result("get_records", &records),
+        verb_success_result("get_records", &snapshot, &records),
     )
 }
 
 // ── Verb handler: symbol_by_name ──────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn handle_verb_symbol_by_name(
     request_id: &str,
     params: &serde_json::Value,
@@ -2931,6 +2948,7 @@ fn handle_verb_symbol_by_name(
     limit: usize,
     started: Instant,
     budget: Option<Duration>,
+    domain: &str,
     state: &ServerState,
 ) -> HttpResponse {
     let name = match params.get("name").and_then(serde_json::Value::as_str) {
@@ -2944,7 +2962,7 @@ fn handle_verb_symbol_by_name(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
 
-    let records = match load_all_records_for_verb(state, started, budget) {
+    let (records, snapshot) = match load_all_records_for_verb(state, started, budget, domain) {
         Ok(r) => r,
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
@@ -3001,13 +3019,17 @@ fn handle_verb_symbol_by_name(
                 .then_with(|| av["record_id"].as_str().cmp(&bv["record_id"].as_str()))
         });
         results.truncate(limit);
+        // Enforce timeout after the in-memory filter/sort phase.
+        if let Err(e) = check_query_budget(started, budget) {
+            return HttpResponse::error_with_id(request_id, e);
+        }
         results.into_iter().map(|(v, _)| v).collect()
     };
 
     HttpResponse::success(
         Some(request_id),
         200,
-        verb_success_result("symbol_by_name", &result_records),
+        verb_success_result("symbol_by_name", &snapshot, &result_records),
     )
 }
 
@@ -3018,6 +3040,7 @@ fn handle_verb_symbol_at_commit(
     params: &serde_json::Value,
     started: Instant,
     budget: Option<Duration>,
+    domain: &str,
     state: &ServerState,
 ) -> HttpResponse {
     let name = match params.get("name").and_then(serde_json::Value::as_str) {
@@ -3036,7 +3059,7 @@ fn handle_verb_symbol_at_commit(
         }
     };
 
-    let records = match load_all_records_for_verb(state, started, budget) {
+    let (records, snapshot) = match load_all_records_for_verb(state, started, budget, domain) {
         Ok(r) => r,
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
@@ -3083,18 +3106,132 @@ fn handle_verb_symbol_at_commit(
     HttpResponse::success(
         Some(request_id),
         200,
-        verb_success_result("symbol_at_commit", &result_records),
+        verb_success_result("symbol_at_commit", &snapshot, &result_records),
     )
 }
 
 // ── Verb handler: file_defines ────────────────────────────────────────────────
 
+/// Collects the symbols defined in `path` as of `as_of_dt` (one per name, most recent).
+fn file_defines_as_of(
+    records: &[GraphRecord],
+    path: &str,
+    as_of_dt: chrono::DateTime<chrono::FixedOffset>,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let mut best_by_name: std::collections::BTreeMap<
+        String,
+        (
+            serde_json::Value,
+            Option<usize>,
+            chrono::DateTime<chrono::FixedOffset>,
+        ),
+    > = std::collections::BTreeMap::new();
+    for r in records {
+        let GraphRecord::Node {
+            kind: NodeKind::Symbol,
+            name: node_name,
+            repo_relative_path,
+            span,
+            temporal,
+            valid_time,
+            ..
+        } = r
+        else {
+            continue;
+        };
+        if repo_relative_path.as_deref() != Some(path) {
+            continue;
+        }
+        let vt_str = temporal
+            .as_ref()
+            .map(|t| t.valid_time.as_str())
+            .or(valid_time.as_deref());
+        let Some(vt_str) = vt_str else { continue };
+        let Ok(vt) = chrono::DateTime::parse_from_rfc3339(vt_str) else {
+            continue;
+        };
+        if vt > as_of_dt {
+            continue;
+        }
+        let Some(name_str) = node_name.as_deref() else {
+            continue;
+        };
+        let Some(json) = symbol_node_to_query_json(r) else {
+            continue;
+        };
+        let line = span.map(|s| s.start_line);
+        let is_better = best_by_name.get(name_str).is_none_or(|(pv, _, pvt)| {
+            vt > *pvt || (vt == *pvt && json["record_id"].as_str() < pv["record_id"].as_str())
+        });
+        if is_better {
+            best_by_name.insert(name_str.to_owned(), (json, line, vt));
+        }
+    }
+    let mut results: Vec<(serde_json::Value, Option<usize>)> =
+        best_by_name.into_values().map(|(v, l, _)| (v, l)).collect();
+    sort_and_truncate_symbol_results(&mut results, limit);
+    results.into_iter().map(|(v, _)| v).collect()
+}
+
+/// Collects the current-state symbols defined in `path` (tombstones excluded).
+fn file_defines_current(
+    records: &[GraphRecord],
+    path: &str,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let deleted = tombstoned_ids_in(records);
+    let mut results: Vec<(serde_json::Value, Option<usize>)> = records
+        .iter()
+        .filter_map(|r| {
+            let GraphRecord::Node {
+                id,
+                kind: NodeKind::Symbol,
+                repo_relative_path,
+                span,
+                temporal,
+                ..
+            } = r
+            else {
+                return None;
+            };
+            if repo_relative_path.as_deref() != Some(path) {
+                return None;
+            }
+            if temporal.is_none() && deleted.contains(id.as_str()) {
+                return None;
+            }
+            let json = symbol_node_to_query_json(r)?;
+            let line = span.map(|s| s.start_line);
+            Some((json, line))
+        })
+        .collect();
+    // Sort first so that limit truncates the tail, not an arbitrary prefix.
+    sort_and_truncate_symbol_results(&mut results, limit);
+    results.into_iter().map(|(v, _)| v).collect()
+}
+
+/// Sorts a `(json, start_line)` results list and truncates to `limit`.
+fn sort_and_truncate_symbol_results(
+    results: &mut Vec<(serde_json::Value, Option<usize>)>,
+    limit: usize,
+) {
+    results.sort_by(|(av, al), (bv, bl)| {
+        al.cmp(bl)
+            .then_with(|| av["record_id"].as_str().cmp(&bv["record_id"].as_str()))
+    });
+    results.truncate(limit);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_verb_file_defines(
     request_id: &str,
     params: &serde_json::Value,
+    as_of_valid_time: Option<&str>,
     limit: usize,
     started: Instant,
     budget: Option<Duration>,
+    domain: &str,
     state: &ServerState,
 ) -> HttpResponse {
     let path = match params
@@ -3110,78 +3247,96 @@ fn handle_verb_file_defines(
         }
     };
 
-    let records = match load_all_records_for_verb(state, started, budget) {
+    let (records, snapshot) = match load_all_records_for_verb(state, started, budget, domain) {
         Ok(r) => r,
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
 
-    let deleted = tombstoned_ids_in(&records);
-    let mut results: Vec<(serde_json::Value, Option<usize>)> = records
-        .iter()
-        .filter_map(|r| {
-            let GraphRecord::Node {
-                id,
-                kind: NodeKind::Symbol,
-                repo_relative_path,
-                span,
-                temporal,
-                ..
-            } = r
-            else {
-                return None;
-            };
-            if repo_relative_path.as_deref() != Some(path.as_str()) {
-                return None;
+    // When as_of_valid_time is set, keep the most-recent-per-symbol-name at or
+    // before the given instant. Records without valid_time are excluded (they are
+    // untimed current-state records, not part of any historical point-in-time view).
+    let result_records: Vec<serde_json::Value> = if let Some(as_of) = as_of_valid_time {
+        let as_of_dt = match chrono::DateTime::parse_from_rfc3339(as_of) {
+            Ok(dt) => dt,
+            Err(e) => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request(format!("invalid as_of.valid_time: {e}")),
+                );
             }
-            if temporal.is_none() && deleted.contains(id.as_str()) {
-                return None;
-            }
-            let json = symbol_node_to_query_json(r)?;
-            let line = span.map(|s| s.start_line);
-            Some((json, line))
-        })
-        .collect();
-
-    // Sort first so that limit truncates the tail, not an arbitrary prefix.
-    results.sort_by(|(av, al), (bv, bl)| {
-        al.cmp(bl)
-            .then_with(|| av["record_id"].as_str().cmp(&bv["record_id"].as_str()))
-    });
-    results.truncate(limit);
+        };
+        file_defines_as_of(&records, &path, as_of_dt, limit)
+    } else {
+        file_defines_current(&records, &path, limit)
+    };
 
     HttpResponse::success(
         Some(request_id),
         200,
-        verb_success_result(
-            "file_defines",
-            &results.into_iter().map(|(v, _)| v).collect::<Vec<_>>(),
-        ),
+        verb_success_result("file_defines", &snapshot, &result_records),
     )
 }
 
 // ── Verb handler: drift_top_n ─────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn handle_verb_drift_top_n(
     request_id: &str,
     params: &serde_json::Value,
+    as_of_valid_time: Option<&str>,
+    budget_limit: usize,
     started: Instant,
     budget: Option<Duration>,
+    domain: &str,
     state: &ServerState,
 ) -> HttpResponse {
-    let limit = params
+    // Effective limit: min(params.limit capped at DRIFT_TOP_N_MAX, budget_limit).
+    let params_limit = params
         .get("limit")
         .and_then(serde_json::Value::as_u64)
         .map_or(DRIFT_TOP_N_DEFAULT, |n| {
             usize::try_from(n).unwrap_or(DRIFT_TOP_N_MAX)
         })
         .min(DRIFT_TOP_N_MAX);
+    let effective_limit = params_limit.min(budget_limit);
 
-    let records = match load_all_records_for_verb(state, started, budget) {
+    let (mut records, snapshot) = match load_all_records_for_verb(state, started, budget, domain) {
         Ok(r) => r,
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
 
-    let drifts = graph_query::largest_semantic_drifts(&records, limit);
+    // When as_of_valid_time is set, exclude drift records whose valid_time
+    // exceeds the given instant. Records without valid_time are current-state
+    // records with no temporal stamp; they are excluded from point-in-time queries.
+    if let Some(as_of) = as_of_valid_time {
+        let as_of_dt = match chrono::DateTime::parse_from_rfc3339(as_of) {
+            Ok(dt) => dt,
+            Err(e) => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request(format!("invalid as_of.valid_time: {e}")),
+                );
+            }
+        };
+        records.retain(|r| match r {
+            GraphRecord::Node {
+                temporal,
+                valid_time,
+                ..
+            } => {
+                let vt_str = temporal
+                    .as_ref()
+                    .map(|t| t.valid_time.as_str())
+                    .or(valid_time.as_deref());
+                vt_str
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .is_some_and(|vt| vt <= as_of_dt)
+            }
+            _ => true,
+        });
+    }
+
+    let drifts = graph_query::largest_semantic_drifts(&records, effective_limit);
     let result_records = drifts
         .into_iter()
         .filter_map(|r| drift_node_to_query_json(r, &records))
@@ -3190,7 +3345,7 @@ fn handle_verb_drift_top_n(
     HttpResponse::success(
         Some(request_id),
         200,
-        verb_success_result("drift_top_n", &result_records),
+        verb_success_result("drift_top_n", &snapshot, &result_records),
     )
 }
 
@@ -3276,6 +3431,13 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         .params
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
 
+    if !params.is_object() {
+        return HttpResponse::error_with_id(
+            &request_id,
+            ApiError::bad_request("params must be a JSON object"),
+        );
+    }
+
     match verb.as_str() {
         "get_records" => {
             handle_verb_get_records(&request_id, &params, &domain, limit, started, budget, state)
@@ -3287,15 +3449,32 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             limit,
             started,
             budget,
+            &domain,
             state,
         ),
         "symbol_at_commit" => {
-            handle_verb_symbol_at_commit(&request_id, &params, started, budget, state)
+            handle_verb_symbol_at_commit(&request_id, &params, started, budget, &domain, state)
         }
-        "file_defines" => {
-            handle_verb_file_defines(&request_id, &params, limit, started, budget, state)
-        }
-        "drift_top_n" => handle_verb_drift_top_n(&request_id, &params, started, budget, state),
+        "file_defines" => handle_verb_file_defines(
+            &request_id,
+            &params,
+            as_of_valid_time.as_deref(),
+            limit,
+            started,
+            budget,
+            &domain,
+            state,
+        ),
+        "drift_top_n" => handle_verb_drift_top_n(
+            &request_id,
+            &params,
+            as_of_valid_time.as_deref(),
+            limit,
+            started,
+            budget,
+            &domain,
+            state,
+        ),
         "observations_for_symbol" | "agent_sessions_for_repo" => HttpResponse::error_with_id(
             &request_id,
             ApiError::new(

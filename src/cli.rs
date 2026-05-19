@@ -525,7 +525,13 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 let dir = data_dir
                     .as_deref()
                     .expect("clap requires --data-dir with --daemon");
-                return query_symbol_via_daemon(&name, dir, at.as_deref(), as_of.as_deref(), format);
+                return query_symbol_via_daemon(
+                    &name,
+                    dir,
+                    at.as_deref(),
+                    as_of.as_deref(),
+                    format,
+                );
             }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             as_of.map_or_else(
@@ -639,7 +645,7 @@ fn query_drift_via_daemon(data_dir: &Path, limit: usize, format: OutputFormat) -
     Ok(())
 }
 
-/// Prints a daemon symbol/file record (serde_json::Value) in the requested format.
+/// Prints a daemon symbol/file record (`serde_json::Value`) in the requested format.
 #[cfg(feature = "embedded-aletheiadb")]
 fn print_daemon_symbol_record(rec: &serde_json::Value, format: OutputFormat) -> Result<()> {
     match format {
@@ -658,7 +664,7 @@ fn print_daemon_symbol_record(rec: &serde_json::Value, format: OutputFormat) -> 
     Ok(())
 }
 
-/// Prints a daemon drift record (serde_json::Value) in the requested format.
+/// Prints a daemon drift record (`serde_json::Value`) in the requested format.
 #[cfg(feature = "embedded-aletheiadb")]
 fn print_daemon_drift_record(rec: &serde_json::Value, format: OutputFormat) -> Result<()> {
     match format {
