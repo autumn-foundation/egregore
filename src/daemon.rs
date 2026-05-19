@@ -2721,8 +2721,12 @@ fn load_all_records_for_verb(
     budget: Option<Duration>,
 ) -> std::result::Result<Vec<GraphRecord>, ApiError> {
     let sink = query_sink_read(state, started, budget)?;
-    sink.read_all_records()
-        .map_err(|e| ApiError::internal(e.to_string()))
+    let records = sink
+        .read_all_records()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    // Post-read check: the read itself may have overrun the deadline.
+    check_query_budget(started, budget)?;
+    Ok(records)
 }
 
 /// Collects the IDs of tombstoned records in the slice.
@@ -2846,10 +2850,23 @@ fn handle_verb_get_records(
     state: &ServerState,
 ) -> HttpResponse {
     let record_ids: Vec<String> = match params.get("record_ids") {
-        Some(serde_json::Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect(),
+        Some(serde_json::Value::Array(arr)) => {
+            let mut ids = Vec::with_capacity(arr.len());
+            for v in arr {
+                match v.as_str() {
+                    Some(s) => ids.push(s.to_owned()),
+                    None => {
+                        return HttpResponse::error_with_id(
+                            request_id,
+                            ApiError::bad_request(
+                                "params.record_ids must be an array of strings",
+                            ),
+                        );
+                    }
+                }
+            }
+            ids
+        }
         Some(_) => {
             return HttpResponse::error_with_id(
                 request_id,
@@ -2934,7 +2951,14 @@ fn handle_verb_symbol_by_name(
 
     let result_records: Vec<serde_json::Value> = if let Some(as_of) = as_of_valid_time {
         match graph_query::symbol_as_of_valid_time(&records, &name, as_of) {
-            Ok(Some(record)) => symbol_node_to_query_json(record).into_iter().collect(),
+            Ok(Some(record)) => {
+                // kind_filter only recognises "Symbol" in v1; anything else → empty.
+                if kind_filter.as_deref().is_some_and(|kf| kf != "Symbol") {
+                    vec![]
+                } else {
+                    symbol_node_to_query_json(record).into_iter().collect()
+                }
+            }
             Ok(None) => vec![],
             Err(msg) => {
                 return HttpResponse::error_with_id(request_id, ApiError::bad_request(msg));
@@ -2970,12 +2994,13 @@ fn handle_verb_symbol_by_name(
                 let line = span.map(|s| s.start_line);
                 Some((json, line))
             })
-            .take(limit)
             .collect();
+        // Sort first so that limit truncates the tail, not an arbitrary prefix.
         results.sort_by(|(av, al), (bv, bl)| {
             al.cmp(bl)
                 .then_with(|| av["record_id"].as_str().cmp(&bv["record_id"].as_str()))
         });
+        results.truncate(limit);
         results.into_iter().map(|(v, _)| v).collect()
     };
 
@@ -3115,13 +3140,14 @@ fn handle_verb_file_defines(
             let line = span.map(|s| s.start_line);
             Some((json, line))
         })
-        .take(limit)
         .collect();
 
+    // Sort first so that limit truncates the tail, not an arbitrary prefix.
     results.sort_by(|(av, al), (bv, bl)| {
         al.cmp(bl)
             .then_with(|| av["record_id"].as_str().cmp(&bv["record_id"].as_str()))
     });
+    results.truncate(limit);
 
     HttpResponse::success(
         Some(request_id),

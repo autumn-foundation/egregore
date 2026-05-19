@@ -132,9 +132,9 @@ enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Route the query through the running daemon (requires --data-dir).
+        /// Route the query through the running daemon (requires --data-dir, conflicts with --graph).
         #[cfg(feature = "embedded-aletheiadb")]
-        #[arg(long, requires = "data_dir")]
+        #[arg(long, requires = "data_dir", conflicts_with = "graph")]
         daemon: bool,
         /// Restrict to the record at this commit SHA or unique prefix.
         /// Shorthand for --as-of keyed by a Git SHA. Mutually exclusive with --as-of.
@@ -162,9 +162,9 @@ enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Route the query through the running daemon (requires --data-dir).
+        /// Route the query through the running daemon (requires --data-dir, conflicts with --graph).
         #[cfg(feature = "embedded-aletheiadb")]
-        #[arg(long, requires = "data_dir")]
+        #[arg(long, requires = "data_dir", conflicts_with = "graph")]
         daemon: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
@@ -178,9 +178,9 @@ enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Route the query through the running daemon (requires --data-dir).
+        /// Route the query through the running daemon (requires --data-dir, conflicts with --graph).
         #[cfg(feature = "embedded-aletheiadb")]
-        #[arg(long, requires = "data_dir")]
+        #[arg(long, requires = "data_dir", conflicts_with = "graph")]
         daemon: bool,
         /// Maximum number of results (default 10).
         #[arg(long, default_value_t = 10)]
@@ -525,7 +525,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 let dir = data_dir
                     .as_deref()
                     .expect("clap requires --data-dir with --daemon");
-                return query_symbol_via_daemon(&name, dir, at.as_deref(), as_of.as_deref());
+                return query_symbol_via_daemon(&name, dir, at.as_deref(), as_of.as_deref(), format);
             }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             as_of.map_or_else(
@@ -551,7 +551,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 let dir = data_dir
                     .as_deref()
                     .expect("clap requires --data-dir with --daemon");
-                return query_file_via_daemon(&path, dir);
+                return query_file_via_daemon(&path, dir, format);
             }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_file(&records, &path, format)
@@ -569,7 +569,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 let dir = data_dir
                     .as_deref()
                     .expect("clap requires --data-dir with --daemon");
-                return query_drift_via_daemon(dir, limit);
+                return query_drift_via_daemon(dir, limit, format);
             }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_drift(&records, limit, format)
@@ -583,6 +583,7 @@ fn query_symbol_via_daemon(
     data_dir: &Path,
     at: Option<&str>,
     as_of: Option<&str>,
+    format: OutputFormat,
 ) -> Result<()> {
     let client = DaemonClient::from_data_dir(data_dir)
         .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
@@ -601,13 +602,13 @@ fn query_symbol_via_daemon(
         std::process::exit(2);
     }
     for rec in &records {
-        println!("{}", serde_json::to_string(rec)?);
+        print_daemon_symbol_record(rec, format)?;
     }
     Ok(())
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
-fn query_file_via_daemon(path: &str, data_dir: &Path) -> Result<()> {
+fn query_file_via_daemon(path: &str, data_dir: &Path, format: OutputFormat) -> Result<()> {
     let client = DaemonClient::from_data_dir(data_dir)
         .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
     let params = serde_json::json!({ "repo_relative_path": path });
@@ -617,13 +618,13 @@ fn query_file_via_daemon(path: &str, data_dir: &Path) -> Result<()> {
         std::process::exit(2);
     }
     for rec in &records {
-        println!("{}", serde_json::to_string(rec)?);
+        print_daemon_symbol_record(rec, format)?;
     }
     Ok(())
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
-fn query_drift_via_daemon(data_dir: &Path, limit: usize) -> Result<()> {
+fn query_drift_via_daemon(data_dir: &Path, limit: usize, format: OutputFormat) -> Result<()> {
     let client = DaemonClient::from_data_dir(data_dir)
         .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
     let params = serde_json::json!({ "limit": limit as u64 });
@@ -633,7 +634,43 @@ fn query_drift_via_daemon(data_dir: &Path, limit: usize) -> Result<()> {
         std::process::exit(2);
     }
     for rec in &records {
-        println!("{}", serde_json::to_string(rec)?);
+        print_daemon_drift_record(rec, format)?;
+    }
+    Ok(())
+}
+
+/// Prints a daemon symbol/file record (serde_json::Value) in the requested format.
+#[cfg(feature = "embedded-aletheiadb")]
+fn print_daemon_symbol_record(rec: &serde_json::Value, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string(rec)?),
+        OutputFormat::Text => {
+            let name = rec["name"].as_str().unwrap_or("(unknown)");
+            let kind = rec["kind"].as_str().unwrap_or("Symbol");
+            let path = rec["repo_relative_path"].as_str().unwrap_or("(unknown)");
+            let line = rec["span"]["start_line"].as_u64().unwrap_or(0);
+            let commit = rec["git_commit"]
+                .as_str()
+                .map_or(String::new(), |c| format!(" [{c}]"));
+            println!("{name} ({kind}) @ {path}:{line}{commit}");
+        }
+    }
+    Ok(())
+}
+
+/// Prints a daemon drift record (serde_json::Value) in the requested format.
+#[cfg(feature = "embedded-aletheiadb")]
+fn print_daemon_drift_record(rec: &serde_json::Value, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string(rec)?),
+        OutputFormat::Text => {
+            let name = rec["name"].as_str().unwrap_or("(unknown)");
+            let score = rec["score"].as_str().unwrap_or("?");
+            let before = rec["before_commit"].as_str().unwrap_or("?");
+            let after = rec["after_commit"].as_str().unwrap_or("?");
+            let path = rec["repo_relative_path"].as_str().unwrap_or("(unknown)");
+            println!("{name} score={score} {before}..{after} @ {path}");
+        }
     }
     Ok(())
 }
