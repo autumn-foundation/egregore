@@ -11,6 +11,10 @@ The HTTP/JSON wire contract for `egregored` is frozen in
 single source of truth for request envelopes, response envelopes, error-code
 identifiers, idempotency semantics, and versioning policy.
 
+The `POST /v1/query` verb set and payload contract are specified in
+[docs/schema/daemon-query.md](../schema/daemon-query.md). That document is the
+read-side complement to the write-side wire contract above.
+
 ## Context
 
 Egregore stores code facts, agent memory, project/task state, artifacts, and
