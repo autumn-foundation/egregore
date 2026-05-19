@@ -17,14 +17,16 @@ fn deterministic_scan_produces_stable_jsonl() {
 
     // Use both a fixed time and --repo-id-override so the output is deterministic
     // across machines and repeated runs regardless of directory name or wall clock.
-    let first = scan_repository_at_with_override(&repo, fixed_time, Some("fixture-stable-test-repo"))
-        .expect("fixture repo should scan")
-        .to_jsonl()
-        .expect("graph should serialize");
-    let second = scan_repository_at_with_override(&repo, fixed_time, Some("fixture-stable-test-repo"))
-        .expect("fixture repo should scan")
-        .to_jsonl()
-        .expect("graph should serialize");
+    let first =
+        scan_repository_at_with_override(&repo, fixed_time, Some("fixture-stable-test-repo"))
+            .expect("fixture repo should scan")
+            .to_jsonl()
+            .expect("graph should serialize");
+    let second =
+        scan_repository_at_with_override(&repo, fixed_time, Some("fixture-stable-test-repo"))
+            .expect("fixture repo should scan")
+            .to_jsonl()
+            .expect("graph should serialize");
 
     assert_eq!(first, second);
     assert!(first.contains(r#""kind":"Repository""#));

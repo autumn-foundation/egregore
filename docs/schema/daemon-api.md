@@ -111,6 +111,7 @@ All error codes are snake\_case identifiers. String literals at call sites in
 | `query_timeout`       | 408  | yes       | no               | query  |
 | `internal_error`      | 500  | yes       | no               | all    |
 | `not_implemented`     | 501  | no        | no               | reserved |
+| `ambiguous_commit_prefix` | 400 | no     | no               | query (symbol_at_commit) |
 | `shutdown_in_progress`| 503  | yes       | yes              | all    |
 | `redaction_required`  | 422  | no        | no               | ingest (future) |
 | `unresolved_evidence_target` | 422 | no  | no               | ingest, jobs/ingest |
@@ -204,19 +205,25 @@ Success result: `{ "record": <GraphRecord or null> }`
 
 ### `POST /v1/query`
 
-`payload`: `{ "budget": { "max_results": N, "timeout_ms": N }, "record_ids": ["..."] }`
+Verb-dispatched query surface. Full spec: [`docs/schema/daemon-query.md`](daemon-query.md).
+
+Top-level fields: `request_id`, `agent_id` (optional), `verb` (required),
+`params` (verb-specific), `as_of` (optional bi-temporal selector), `budget`
+(optional read limits).
 
 Success result:
 
 ```json
 {
-  "agent_id": "...",
-  "session_id": "...",
-  "domain": "...",
-  "records": [ <GraphRecord...> ],
-  "snapshot": "<unix_ms>"
+  "verb":     "<verb>",
+  "snapshot": "<RFC 3339>",
+  "records":  [ /* verb-specific objects */ ],
+  "page":     { "cursor": null, "has_more": false, "returned": N }
 }
 ```
+
+Verb set: `get_records`, `symbol_by_name`, `symbol_at_commit`, `file_defines`,
+`drift_top_n`; reserved: `observations_for_symbol`, `agent_sessions_for_repo`.
 
 ### `POST /v1/agents/register`
 

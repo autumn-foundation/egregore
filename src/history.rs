@@ -386,4 +386,3 @@ fn normalize_git_path(path: &str) -> String {
 fn short_sha(sha: &str) -> String {
     sha.chars().take(12).collect()
 }
-

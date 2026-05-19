@@ -1414,11 +1414,9 @@ fn daemon_query_honors_positive_timeout_budget() {
         &serde_json::json!({
             "request_id": "tiny-budget-query",
             "agent_id": "test-agent",
-            "session_id": "test-session",
-            "payload": {
-                "budget": { "max_results": 1000, "timeout_ms": 1 },
-                "record_ids": record_ids
-            }
+            "verb": "get_records",
+            "params": { "record_ids": record_ids },
+            "budget": { "max_results": 1000, "timeout_ms": 1 }
         }),
     );
     assert!(
@@ -1710,11 +1708,9 @@ fn daemon_registers_agents_runs_ingest_jobs_and_queries_records() {
         &serde_json::json!({
             "request_id": "query-1",
             "agent_id": "test-agent",
-            "session_id": "test-session",
-            "payload": {
-                "budget": { "max_results": 1 },
-                "record_ids": [first_record_id]
-            }
+            "verb": "get_records",
+            "params": { "record_ids": [&first_record_id] },
+            "budget": { "max_results": 1 }
         }),
     );
     assert!(
@@ -2293,8 +2289,8 @@ fn contract_conformance_all_routes() {
             "/v1/query",
             &serde_json::json!({
                 "agent_id": "test-agent",
-                "session_id": "test-session",
-                "payload": { "record_ids": [] }
+                "verb": "get_records",
+                "params": { "record_ids": [] }
             }),
         );
         assert!(
@@ -2313,7 +2309,7 @@ fn contract_conformance_all_routes() {
         assert_eq!(body["error"]["field"], "request_id");
     }
 
-    // (e) success envelope
+    // (e) success envelope — verb envelope format
     {
         let res = http_json(
             &metadata,
@@ -2322,8 +2318,8 @@ fn contract_conformance_all_routes() {
             &serde_json::json!({
                 "request_id": "conf-query-success",
                 "agent_id": "test-agent",
-                "session_id": "test-session",
-                "payload": { "record_ids": [] }
+                "verb": "get_records",
+                "params": { "record_ids": [] }
             }),
         );
         assert!(
@@ -2890,6 +2886,603 @@ fn local_path_repository_identity_rejected_in_shared_store() {
         body["error"]["code"], "local_path_identity_unsupported",
         "rejection must carry local_path_identity_unsupported code, got {body}"
     );
+
+    daemon.stop();
+}
+
+// ── RED: query verb conformance ───────────────────────────────────────────────
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn query_verb_conformance() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("graph.jsonl");
+    let mut daemon = start_daemon(&data_dir);
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(fixture_repo())
+        .arg("--repo-id-override")
+        .arg("fixture-rust-basic-stable")
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let metadata = read_metadata(&data_dir);
+
+    let records = graph_records_json(&graph_path);
+    let ingest_res = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "vqc-ingest",
+            "agent_id": "verb-test-agent",
+            "session_id": "verb-test-session",
+            "idempotency_key": "vqc-ingest-key",
+            "domain": "codegraph",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": { "records": records }
+        }),
+    );
+    assert!(
+        ingest_res.starts_with("HTTP/1.1 200"),
+        "fixture ingest should succeed, got {ingest_res}"
+    );
+
+    // ── (e) unknown verb → bad_request with field: "verb" ─────────────────────
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-unknown-verb",
+                "agent_id": "verb-test-agent",
+                "verb": "totally_unknown_verb_xyz",
+                "params": {}
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 400"),
+            "unknown verb should return 400, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
+        assert_eq!(
+            body["error"]["code"], "bad_request",
+            "unknown verb must return bad_request code, got {body}"
+        );
+        assert_eq!(
+            body["error"]["field"], "verb",
+            "unknown verb error must name field:verb, got {body}"
+        );
+    }
+
+    // ── (b) reserved: observations_for_symbol → not_implemented ───────────────
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-reserved-obs",
+                "agent_id": "verb-test-agent",
+                "verb": "observations_for_symbol",
+                "params": { "symbol_id": "codegraph:v1:fake" }
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 501"),
+            "observations_for_symbol should return 501, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
+        assert_eq!(
+            body["error"]["code"], "not_implemented",
+            "reserved verb must return not_implemented, got {body}"
+        );
+    }
+
+    // ── (b) reserved: agent_sessions_for_repo → not_implemented ───────────────
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-reserved-sessions",
+                "agent_id": "verb-test-agent",
+                "verb": "agent_sessions_for_repo",
+                "params": { "repository_id": "some-repo" }
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 501"),
+            "agent_sessions_for_repo should return 501, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
+        assert_eq!(
+            body["error"]["code"], "not_implemented",
+            "reserved verb must return not_implemented, got {body}"
+        );
+    }
+
+    // ── (c) as_of.transaction_time set → not_implemented ──────────────────────
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-tx-time",
+                "agent_id": "verb-test-agent",
+                "verb": "symbol_by_name",
+                "params": { "name": "Widget" },
+                "as_of": { "transaction_time": "2026-01-01T00:00:00Z" }
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 501"),
+            "as_of.transaction_time should return 501, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["error"]["code"], "not_implemented",
+            "as_of.transaction_time must return not_implemented, got {body}"
+        );
+    }
+
+    // ── (d) as_of.since set → not_implemented ─────────────────────────────────
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-since",
+                "agent_id": "verb-test-agent",
+                "verb": "symbol_by_name",
+                "params": { "name": "Widget" },
+                "as_of": { "since": "2026-01-01T00:00:00Z" }
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 501"),
+            "as_of.since should return 501, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["error"]["code"], "not_implemented",
+            "as_of.since must return not_implemented, got {body}"
+        );
+    }
+
+    // ── get_records: existing batch-read behavior preserved ───────────────────
+    {
+        let first_id = first_record_id(&graph_path);
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-get-records",
+                "agent_id": "verb-test-agent",
+                "verb": "get_records",
+                "params": { "record_ids": [&first_id] }
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "get_records should return 200, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], true,
+            "get_records must have ok:true, got {body}"
+        );
+        assert_eq!(
+            body["result"]["verb"], "get_records",
+            "result.verb must be get_records, got {body}"
+        );
+        assert!(
+            body["result"].get("snapshot").is_some(),
+            "result must include snapshot, got {body}"
+        );
+        assert!(
+            body["result"].get("page").is_some(),
+            "result must include page, got {body}"
+        );
+        assert_eq!(
+            body["result"]["page"]["has_more"], false,
+            "page.has_more must be false, got {body}"
+        );
+        let records_arr = body["result"]["records"]
+            .as_array()
+            .expect("records must be array");
+        assert!(
+            !records_arr.is_empty(),
+            "get_records should return at least one record, got {body}"
+        );
+        assert!(
+            res.contains(&first_id),
+            "get_records response must contain the requested record_id"
+        );
+    }
+
+    // ── symbol_by_name: finds nested::Widget ──────────────────────────────────
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-symbol-by-name",
+                "agent_id": "verb-test-agent",
+                "verb": "symbol_by_name",
+                "params": { "name": "nested::Widget" }
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "symbol_by_name should return 200, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], true,
+            "symbol_by_name must have ok:true, got {body}"
+        );
+        assert_eq!(
+            body["result"]["verb"], "symbol_by_name",
+            "result.verb must be symbol_by_name, got {body}"
+        );
+        let records_arr = body["result"]["records"]
+            .as_array()
+            .expect("records must be array");
+        assert!(
+            !records_arr.is_empty(),
+            "symbol_by_name(nested::Widget) must return at least one record"
+        );
+        for r in records_arr {
+            assert!(
+                r.get("record_id").is_some(),
+                "record must have record_id, got {r}"
+            );
+            assert_eq!(
+                r["name"], "nested::Widget",
+                "record must have name=nested::Widget, got {r}"
+            );
+            assert_eq!(r["kind"], "Symbol", "record must have kind=Symbol, got {r}");
+        }
+    }
+
+    // ── symbol_at_commit: no history in current-tree fixture → empty ──────────
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-symbol-at-commit",
+                "agent_id": "verb-test-agent",
+                "verb": "symbol_at_commit",
+                "params": { "name": "nested::Widget", "commit": "abc123dummy" }
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "symbol_at_commit should return 200, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], true,
+            "symbol_at_commit must have ok:true, got {body}"
+        );
+        assert_eq!(
+            body["result"]["verb"], "symbol_at_commit",
+            "result.verb must be symbol_at_commit, got {body}"
+        );
+        let records_arr = body["result"]["records"]
+            .as_array()
+            .expect("records must be array");
+        // Current-tree fixture has no temporal metadata, so commit query returns empty
+        assert_eq!(
+            records_arr.len(),
+            0,
+            "symbol_at_commit on non-history fixture should return empty, got {body}"
+        );
+    }
+
+    // ── file_defines: lists symbols in src/lib.rs ──────────────────────────────
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-file-defines",
+                "agent_id": "verb-test-agent",
+                "verb": "file_defines",
+                "params": { "repo_relative_path": "src/lib.rs" }
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "file_defines should return 200, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], true,
+            "file_defines must have ok:true, got {body}"
+        );
+        assert_eq!(
+            body["result"]["verb"], "file_defines",
+            "result.verb must be file_defines, got {body}"
+        );
+        let records_arr = body["result"]["records"]
+            .as_array()
+            .expect("records must be array");
+        assert!(
+            !records_arr.is_empty(),
+            "file_defines(src/lib.rs) must return at least one symbol"
+        );
+        for r in records_arr {
+            assert!(
+                r.get("record_id").is_some(),
+                "record must have record_id, got {r}"
+            );
+            assert_eq!(
+                r["kind"], "Symbol",
+                "file_defines must return Symbol records, got {r}"
+            );
+        }
+    }
+
+    // ── drift_top_n: empty for current-tree fixture ───────────────────────────
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-drift-top-n",
+                "agent_id": "verb-test-agent",
+                "verb": "drift_top_n",
+                "params": {}
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "drift_top_n should return 200, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["ok"], true,
+            "drift_top_n must have ok:true, got {body}"
+        );
+        assert_eq!(
+            body["result"]["verb"], "drift_top_n",
+            "result.verb must be drift_top_n, got {body}"
+        );
+        // Current-tree fixture has no SemanticDrift records
+        let records_arr = body["result"]["records"]
+            .as_array()
+            .expect("records must be array");
+        assert_eq!(
+            records_arr.len(),
+            0,
+            "fixture has no drift records, expected empty list, got {body}"
+        );
+    }
+
+    // ── response envelope: snapshot is RFC3339, page has correct shape ─────────
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-envelope-check",
+                "agent_id": "verb-test-agent",
+                "verb": "get_records",
+                "params": { "record_ids": [] }
+            }),
+        );
+        let body = response_json(&res);
+        let snapshot = body["result"]["snapshot"]
+            .as_str()
+            .expect("snapshot must be a string");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(snapshot).is_ok(),
+            "snapshot must be a valid RFC3339 instant, got '{snapshot}'"
+        );
+        let page = &body["result"]["page"];
+        assert!(
+            page.get("has_more").is_some(),
+            "page must include has_more, got {page}"
+        );
+        assert!(
+            page.get("returned").is_some(),
+            "page must include returned, got {page}"
+        );
+        assert_eq!(
+            page["has_more"], false,
+            "page.has_more must be false for empty result, got {page}"
+        );
+        assert_eq!(
+            page["returned"], 0,
+            "page.returned must be 0 for empty result, got {page}"
+        );
+    }
+
+    // ── missing verb → missing_field ──────────────────────────────────────────
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-missing-verb",
+                "agent_id": "verb-test-agent",
+                "params": {}
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 400"),
+            "missing verb should return 400, got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(
+            body["error"]["code"], "missing_field",
+            "missing verb must return missing_field code, got {body}"
+        );
+        assert_eq!(
+            body["error"]["field"], "verb",
+            "missing verb error must name field:verb, got {body}"
+        );
+    }
+
+    // ── parity: symbol_by_name daemon matches eg query symbol JSONL output ─────
+    {
+        // Run CLI to get JSONL output for nested::Widget
+        let cli_output = Command::cargo_bin("egregore")
+            .expect("binary should run")
+            .arg("query")
+            .arg("symbol")
+            .arg("nested::Widget")
+            .arg("--graph")
+            .arg(&graph_path)
+            .output()
+            .expect("CLI query should succeed");
+        let cli_lines: Vec<serde_json::Value> = String::from_utf8_lossy(&cli_output.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("CLI output must be valid JSON"))
+            .collect();
+
+        // Query daemon
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-parity-symbol",
+                "agent_id": "verb-test-agent",
+                "verb": "symbol_by_name",
+                "params": { "name": "nested::Widget" }
+            }),
+        );
+        let body = response_json(&res);
+        let daemon_records = body["result"]["records"]
+            .as_array()
+            .expect("records must be array");
+
+        // Both sides must be non-empty (the fixture always has nested::Widget)
+        assert!(
+            !cli_lines.is_empty(),
+            "CLI query symbol nested::Widget must return at least one record"
+        );
+        // Compare record_ids (parity check)
+        let mut cli_ids: Vec<&str> = cli_lines
+            .iter()
+            .filter_map(|v| v["record_id"].as_str())
+            .collect();
+        let mut daemon_ids: Vec<&str> = daemon_records
+            .iter()
+            .filter_map(|v| v["record_id"].as_str())
+            .collect();
+        cli_ids.sort_unstable();
+        daemon_ids.sort_unstable();
+        assert_eq!(
+            cli_ids, daemon_ids,
+            "daemon symbol_by_name record_ids must match CLI eg query symbol output"
+        );
+    }
+
+    daemon.stop();
+}
+
+#[test]
+fn eg_query_daemon_smoke() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("graph.jsonl");
+    let mut daemon = start_daemon(&data_dir);
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(fixture_repo())
+        .arg("--repo-id-override")
+        .arg("fixture-rust-basic-stable")
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    let metadata = read_metadata(&data_dir);
+    let records = graph_records_json(&graph_path);
+    let ingest_res = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "smoke-ingest",
+            "agent_id": "smoke-agent",
+            "session_id": "smoke-session",
+            "idempotency_key": "smoke-ingest-key",
+            "domain": "codegraph",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": { "records": records }
+        }),
+    );
+    assert!(
+        ingest_res.starts_with("HTTP/1.1 200"),
+        "smoke ingest should succeed, got {ingest_res}"
+    );
+
+    // eg query symbol nested::Widget --daemon --data-dir <dir>
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("query")
+        .arg("symbol")
+        .arg("nested::Widget")
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nested::Widget"))
+        .stdout(predicate::str::contains("Symbol"));
+
+    // eg query file src/lib.rs --daemon --data-dir <dir>
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("query")
+        .arg("file")
+        .arg("src/lib.rs")
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Symbol"));
+
+    // eg query drift --daemon --data-dir <dir> → no drift records → exit 2
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("query")
+        .arg("drift")
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no match found"));
 
     daemon.stop();
 }
