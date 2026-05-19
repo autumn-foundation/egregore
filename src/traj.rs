@@ -415,9 +415,13 @@ fn emit_turn(
         .filter(|a| !a.is_empty())
     {
         actions
-    } else {
-        fallback = vec![extract_bash_command(assistant_msg.content_str())];
+    } else if let Some(cmd) = extract_bash_command(assistant_msg.content_str()) {
+        fallback = vec![cmd];
         &fallback
+    } else {
+        // Prose-only turn (e.g. final submit sentinel) — AgentTurn already emitted,
+        // but no bash block means no real tool action to record.
+        return;
     };
 
     let num_actions = effective_actions.len();
@@ -436,14 +440,13 @@ fn emit_turn(
             graph,
             action_idx,
             &turn_id,
+            command,
             &redacted_cmd,
             timestamp.as_deref(),
             this_exit,
             output_summary,
-            stdout,
             run_id,
             ctx,
-            opts,
             turn_index,
         );
     }
@@ -456,14 +459,13 @@ fn emit_command_action(
     graph: &mut Graph,
     action_idx: usize,
     turn_id: &str,
+    raw_cmd: &str,
     redacted_cmd: &str,
     timestamp: Option<&str>,
     this_exit: Option<i64>,
     output_summary: String,
-    stdout: Option<&str>,
     run_id: &str,
     ctx: &ImportCtx,
-    opts: &ImportOptions,
     turn_index: u64,
 ) {
     let tool_call_id =
@@ -516,10 +518,10 @@ fn emit_command_action(
     ));
 
     // ── FileEdit ──────────────────────────────────────────────────────────────
-    if is_file_edit_command(redacted_cmd) {
+    if is_file_edit_command(raw_cmd) {
         let file_edit_id =
             agent_memory_stable_id(&["node", "file_edit", turn_id, &action_idx.to_string()]);
-        let target = extract_target_file(redacted_cmd).unwrap_or("unknown");
+        let target = extract_target_file(raw_cmd).unwrap_or("unknown");
         graph.push(make_node(
             file_edit_id.clone(),
             NodeKind::FileEdit,
@@ -541,7 +543,7 @@ fn emit_command_action(
     }
 
     // ── PatchArtifact / Failure ───────────────────────────────────────────────
-    if is_patch_command(redacted_cmd) {
+    if is_patch_command(raw_cmd) {
         emit_patch_action(
             graph,
             action_idx,
@@ -549,10 +551,8 @@ fn emit_command_action(
             redacted_cmd,
             timestamp,
             this_exit,
-            stdout,
             run_id,
             ctx,
-            opts,
             turn_index,
             &output_summary,
         );
@@ -564,14 +564,14 @@ fn emit_command_action(
             timestamp,
             this_exit,
             &cmd_run_id,
-            output_summary,
+            &output_summary,
             ctx,
             turn_index,
         );
     }
 
     // ── Verification ──────────────────────────────────────────────────────────
-    if is_test_command(redacted_cmd) {
+    if is_test_command(raw_cmd) {
         let verification_id =
             agent_memory_stable_id(&["node", "verification", turn_id, &action_idx.to_string()]);
         let verified = this_exit.is_some_and(|c| c == 0);
@@ -585,7 +585,7 @@ fn emit_command_action(
             ctx,
             NodeExtra {
                 observed_at: timestamp.map(str::to_owned),
-                text: Some(stdout.map_or_else(|| "unknown".to_owned(), |s| redact(s, opts))),
+                text: Some(output_summary),
                 exit_code: this_exit,
                 ..Default::default()
             },
@@ -615,10 +615,8 @@ fn emit_patch_action(
     redacted_cmd: &str,
     timestamp: Option<&str>,
     this_exit: Option<i64>,
-    stdout: Option<&str>,
     run_id: &str,
     ctx: &ImportCtx,
-    opts: &ImportOptions,
     turn_index: u64,
     output_summary: &str,
 ) {
@@ -655,7 +653,8 @@ fn emit_patch_action(
     ));
 
     if failed {
-        let error_text = stdout.map_or_else(|| output_summary.to_owned(), |s| redact(s, opts));
+        // Use the combined stdout+stderr summary; it already has stderr and redaction applied.
+        let error_text = output_summary.to_owned();
         let failure_id = agent_memory_stable_id(&[
             "node",
             "failure",
@@ -701,7 +700,7 @@ fn emit_command_failure(
     timestamp: Option<&str>,
     this_exit: Option<i64>,
     cmd_run_id: &str,
-    output_summary: String,
+    output_summary: &str,
     ctx: &ImportCtx,
     turn_index: u64,
 ) {
@@ -722,7 +721,7 @@ fn emit_command_failure(
         ctx,
         NodeExtra {
             observed_at: timestamp.map(str::to_owned),
-            text: Some(output_summary),
+            text: Some(output_summary.to_owned()),
             failure_kind: Some("command_failure".to_owned()),
             exit_code: this_exit,
             ..Default::default()
@@ -776,19 +775,11 @@ fn is_test_command(cmd: &str) -> bool {
         || cmd.starts_with("mvn test")
 }
 
-fn extract_bash_command(content: &str) -> String {
-    if let Some(start) = content.find("```bash\n") {
-        let after = &content[start + 8..];
-        if let Some(end) = after.find("```") {
-            return after[..end].trim().to_owned();
-        }
-    }
-    content
-        .lines()
-        .find(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
-        .unwrap_or("(no command)")
-        .trim()
-        .to_owned()
+fn extract_bash_command(content: &str) -> Option<String> {
+    let start = content.find("```bash\n")?;
+    let after = &content[start + 8..];
+    let end = after.find("```")?;
+    Some(after[..end].trim().to_owned())
 }
 
 fn extract_target_file(cmd: &str) -> Option<&str> {
@@ -809,11 +800,23 @@ fn build_output_summary(
         (None, None) => String::new(),
     };
     let truncated = if combined.len() > MAX_LEN {
-        format!("{}…", &combined[..MAX_LEN])
+        format!("{}…", safe_truncate(&combined, MAX_LEN))
     } else {
         combined
     };
     redact(&truncated, opts)
+}
+
+/// Truncate `s` to at most `max_bytes` bytes while keeping valid UTF-8.
+fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &s[..boundary]
 }
 
 // ── Node / edge construction helpers ─────────────────────────────────────────
@@ -940,7 +943,31 @@ mod unit_tests {
     #[test]
     fn bash_extraction_from_fenced_block() {
         let content = "Let me look.\n\n```bash\ncat foo.py\n```";
-        assert_eq!(extract_bash_command(content), "cat foo.py");
+        assert_eq!(extract_bash_command(content), Some("cat foo.py".to_owned()));
+        assert_eq!(extract_bash_command("Just prose, no code block."), None);
+    }
+
+    #[test]
+    fn utf8_truncation_stays_on_boundary() {
+        let multibyte = "a".repeat(499) + "é"; // é is 2 bytes — would panic at [..500]
+        let result = build_output_summary(
+            Some(&multibyte),
+            None,
+            &crate::traj::ImportOptions::default(),
+        );
+        assert!(result.is_char_boundary(result.len()));
+    }
+
+    #[test]
+    fn classify_before_redact() {
+        // A redactor that blanks everything should not suppress FileEdit classification.
+        let opts = crate::traj::ImportOptions {
+            redact: Box::new(|_| "[REDACTED]".to_owned()),
+        };
+        assert!(is_file_edit_command("sed -i 's/a/b/' foo.py"));
+        // Confirm the redactor would destroy classification signal.
+        let redacted = (opts.redact)("sed -i 's/a/b/' foo.py");
+        assert!(!is_file_edit_command(&redacted));
     }
 
     #[test]
