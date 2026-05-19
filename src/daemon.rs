@@ -1508,13 +1508,33 @@ fn validate_evidence_endpoint_constraints(
                 )));
             }
         }
-        EdgeLabel::HasEvidence | EdgeLabel::ValidatedBy => {
+        EdgeLabel::HasEvidence => {
             if !matches!(
                 target_kind,
                 Some(NodeKind::Verification | NodeKind::CommandEvidence)
             ) {
                 return Err(ApiError::bad_request(format!(
                     "evidence link relation '{}' requires a Verification or CommandEvidence target; target '{}' has kind {}",
+                    label.as_str(),
+                    target_id,
+                    target_kind_str()
+                )));
+            }
+        }
+        EdgeLabel::ValidatedBy => {
+            if !matches!(target_kind, Some(NodeKind::Verification)) {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires a Verification target; target '{}' has kind {}",
+                    label.as_str(),
+                    target_id,
+                    target_kind_str()
+                )));
+            }
+        }
+        EdgeLabel::ExplainsChange => {
+            if !matches!(target_kind, Some(NodeKind::Commit | NodeKind::Change)) {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires a Commit or Change target; target '{}' has kind {}",
                     label.as_str(),
                     target_id,
                     target_kind_str()
@@ -1720,6 +1740,7 @@ fn validate_and_synthesize_evidence_edges(
                 kind,
                 schema_version,
                 evidence_links,
+                name,
                 confidence,
                 text,
                 agent_id,
@@ -1759,7 +1780,10 @@ fn validate_and_synthesize_evidence_edges(
                             "evidence_links (Observation requires at least one evidence link)",
                         ));
                     }
-                    // Required provenance fields for all agent-memory node kinds.
+                    // Required provenance fields. Agent nodes represent a stable identity
+                    // and omit session-specific timestamp fields so their payload is
+                    // invariant across multiple session registrations for the same agent_id.
+                    let session_fields_required = *kind != NodeKind::Agent;
                     let required: &[(&str, bool)] = &[
                         ("agent_id", agent_id.as_ref().is_some_and(|s| !s.is_empty())),
                         (
@@ -1768,15 +1792,18 @@ fn validate_and_synthesize_evidence_edges(
                         ),
                         (
                             "session_id",
-                            session_id.as_ref().is_some_and(|s| !s.is_empty()),
+                            !session_fields_required
+                                || session_id.as_ref().is_some_and(|s| !s.is_empty()),
                         ),
                         (
                             "observed_at",
-                            observed_at.as_ref().is_some_and(|s| !s.is_empty()),
+                            !session_fields_required
+                                || observed_at.as_ref().is_some_and(|s| !s.is_empty()),
                         ),
                         (
                             "ingested_at",
-                            ingested_at.as_ref().is_some_and(|s| !s.is_empty()),
+                            !session_fields_required
+                                || ingested_at.as_ref().is_some_and(|s| !s.is_empty()),
                         ),
                     ];
                     for (field, present) in required {
@@ -1836,6 +1863,15 @@ fn validate_and_synthesize_evidence_edges(
                         return Err(ApiError::missing_field(
                             "text (required for Observation nodes)",
                         ));
+                    }
+                    // name is required for Agent and AgentSession nodes per schema v1.
+                    if matches!(kind, NodeKind::Agent | NodeKind::AgentSession)
+                        && name.as_ref().is_none_or(String::is_empty)
+                    {
+                        return Err(ApiError::missing_field(format!(
+                            "name (required for {} nodes)",
+                            kind.as_str()
+                        )));
                     }
                 }
                 for (link_index, link) in links.iter().enumerate() {
@@ -2473,10 +2509,12 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
             );
         }
         Some(ts) => ts.to_owned(),
-        // Use the Unix epoch as a stable sentinel when created_at is omitted so that
-        // registration retries for the same (agent_id, session_id) pair hash-stabilise
-        // and hit the idempotency cache rather than producing a hash conflict.
-        None => "1970-01-01T00:00:00Z".to_owned(),
+        // created_at is required so that registration retries for the same
+        // (agent_id, session_id) pair produce hash-stable records and correctly
+        // hit the idempotency cache.
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("created_at"));
+        }
     };
 
     let agent_status = AgentStatus {
@@ -2910,21 +2948,17 @@ fn agent_registration_records(registration: &AgentRegisterFull) -> Vec<GraphReco
         schema_version,
         agent_id,
         agent_kind,
-        session_id,
         confidence,
-        observed_at,
-        ingested_at,
         ..
     } = &mut agent_node
     {
         *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
         *agent_id = Some(registration.agent_id.clone());
         *agent_kind = Some(registration.agent_kind.clone());
-        // The session that performed this registration is the provenance session.
-        *session_id = Some(registration.session_id.clone());
+        // The Agent node represents a stable identity, so no session-specific or
+        // time-varying fields are stored here; the payload must be identical on
+        // every registration that shares the same agent_id.
         *confidence = Some("1.0".to_owned());
-        *observed_at = Some(now.clone());
-        *ingested_at = Some(now.clone());
     }
     let mut session_node = GraphRecord::node(
         session_node_id.clone(),
