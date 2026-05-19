@@ -646,12 +646,31 @@ struct QueryBudget {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct QuerySelector {
+    // Parsed from request but not yet acted on; schema-reserved for future valid-time filtering.
+    #[allow(dead_code)]
+    #[serde(default)]
+    as_of: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    since: Option<String>,
+    /// Reserved; returns `not_implemented` until the transaction-time axis is wired up.
+    #[serde(default)]
+    tx_as_of: Option<String>,
+    /// Reserved; returns `not_implemented` until the transaction-time axis is wired up.
+    #[serde(default)]
+    tx_since: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct QueryPayload {
     #[serde(default)]
     budget: Option<QueryBudget>,
     #[serde(default)]
     record_ids: Vec<String>,
+    #[serde(default)]
+    selector: Option<QuerySelector>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2598,6 +2617,7 @@ fn handle_get_record(record_id: &str, state: &ServerState) -> HttpResponse {
 const DEFAULT_QUERY_MAX_RESULTS: usize = 5_000;
 const DEFAULT_QUERY_TIMEOUT_MS: u64 = 5_000;
 
+#[allow(clippy::too_many_lines)]
 fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     let started = Instant::now();
     let query = match parse_json::<QueryRequest>(&request.body) {
@@ -2627,6 +2647,18 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     let Some(payload) = query.payload else {
         return HttpResponse::error_with_id(&request_id, ApiError::missing_field("payload"));
     };
+
+    if let Some(sel) = payload.selector.as_ref()
+        && (sel.tx_as_of.is_some() || sel.tx_since.is_some())
+    {
+        return HttpResponse::error_with_id(
+            &request_id,
+            ApiError::new(
+                ErrorCode::NotImplemented,
+                "tx_as_of and tx_since are reserved; transaction-time axis is not yet wired up",
+            ),
+        );
+    }
 
     let (limit, timeout_ms) =
         payload

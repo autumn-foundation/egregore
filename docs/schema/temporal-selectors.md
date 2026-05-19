@@ -21,7 +21,7 @@ Both times are **RFC 3339** strings (e.g. `2026-05-19T00:00:00Z`).
 
 | Domain | `valid_time` source | Notes |
 |--------|--------------------|----|
-| `code_graph` | Commit committer date (`git_commit_committer_date`) for history records; inferred from transaction time (`inferred_from_transaction_time`) for current-tree scans | See `valid_time_source` field |
+| `codegraph` | Commit committer date (`git_commit_committer_date`) for history records; inferred from transaction time (`inferred_from_transaction_time`) for current-tree scans | See `valid_time_source` field |
 | `agent_memory` | Author-provided; falls back to ingestion time | Agent sets the logical observation instant |
 | `project` / `task` | Author-provided | Event time of the task or milestone |
 | `artifact` | Build or release timestamp | When the artifact was produced |

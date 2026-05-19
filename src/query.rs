@@ -103,7 +103,8 @@ pub fn symbol_as_of_valid_time<'records>(
         let GraphRecord::Node {
             kind: NodeKind::Symbol,
             name,
-            temporal: Some(t),
+            temporal,
+            valid_time,
             ..
         } = record
         else {
@@ -112,7 +113,16 @@ pub fn symbol_as_of_valid_time<'records>(
         if name.as_deref() != Some(symbol_name) {
             continue;
         }
-        let Ok(vt) = DateTime::parse_from_rfc3339(&t.valid_time) else {
+        // Resolve valid_time from history temporal block (history records) or
+        // node-level field (current-tree records stamped by with_valid_time_inferred).
+        let vt_str = temporal
+            .as_ref()
+            .map(|t| t.valid_time.as_str())
+            .or(valid_time.as_deref());
+        let Some(vt_str) = vt_str else {
+            continue;
+        };
+        let Ok(vt) = DateTime::parse_from_rfc3339(vt_str) else {
             continue;
         };
         if vt > as_of_dt {
