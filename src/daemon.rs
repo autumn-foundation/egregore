@@ -28,8 +28,8 @@ use crate::{
         AdapterError, EmbeddedAletheiaSink, ExpectedRecordState, IngestReport, ingest_records,
     },
     ir::{
-        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord, NodeKind,
-        TemporalMetadata, agent_memory_stable_id,
+        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord, IdentitySource,
+        NodeKind, TemporalMetadata, agent_memory_stable_id,
     },
 };
 
@@ -359,6 +359,7 @@ enum ErrorCode {
     ShutdownInProgress,
     RedactionRequired,
     UnresolvedEvidenceTarget,
+    LocalPathIdentityUnsupported,
 }
 
 impl ErrorCode {
@@ -378,6 +379,7 @@ impl ErrorCode {
             Self::ShutdownInProgress => "shutdown_in_progress",
             Self::RedactionRequired => "redaction_required",
             Self::UnresolvedEvidenceTarget => "unresolved_evidence_target",
+            Self::LocalPathIdentityUnsupported => "local_path_identity_unsupported",
         }
     }
 
@@ -393,7 +395,9 @@ impl ErrorCode {
             Self::InternalError => 500,
             Self::NotImplemented => 501,
             Self::ShutdownInProgress => 503,
-            Self::RedactionRequired | Self::UnresolvedEvidenceTarget => 422,
+            Self::RedactionRequired
+            | Self::UnresolvedEvidenceTarget
+            | Self::LocalPathIdentityUnsupported => 422,
         }
     }
 }
@@ -1081,6 +1085,7 @@ fn apply_write(
     idempotency: &Arc<Mutex<IdempotencyStore>>,
 ) -> WriteResult {
     validate_unique_recovery_keys(&command.records)?;
+    validate_no_local_path_identity_in_shared_store(&command.records, sink)?;
 
     // Consult the idempotency cache BEFORE running evidence-link validation so that
     // a committed replay returns the cached response immediately without re-executing
@@ -1268,6 +1273,56 @@ fn recover_pending_write(
     Ok(Some(response))
 }
 
+fn validate_no_local_path_identity_in_shared_store(
+    records: &[GraphRecord],
+    sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
+) -> WriteResult<()> {
+    let incoming_local_path_ids: Vec<&str> = records
+        .iter()
+        .filter_map(|record| {
+            if let GraphRecord::Node {
+                id,
+                kind: NodeKind::Repository,
+                repository_identity: Some(payload),
+                ..
+            } = record
+                && payload.identity_source == IdentitySource::LocalPath
+            {
+                return Some(id.as_str());
+            }
+            None
+        })
+        .collect();
+
+    if incoming_local_path_ids.is_empty() {
+        return Ok(());
+    }
+
+    let existing_repository_ids = {
+        let sink = sink
+            .read()
+            .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
+        sink.stored_repository_ids()
+            .map_err(|error| ApiError::internal(error.to_string()))?
+    };
+
+    for incoming_id in incoming_local_path_ids {
+        let has_other_repo = existing_repository_ids
+            .iter()
+            .any(|existing| existing != incoming_id);
+        if has_other_repo {
+            return Err(ApiError::new(
+                ErrorCode::LocalPathIdentityUnsupported,
+                "Repository node with identity_source 'local_path' cannot be ingested into a \
+                 shared store. Use a remote-backed clone or --repo-id-override to assign a \
+                 stable identity before ingesting into a shared daemon store.",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {
     if has_duplicate_recovery_keys(records) || has_ambiguous_recovery_keys(records) {
         return Err(ApiError::conflict(
@@ -1280,7 +1335,7 @@ fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {
 // Returns true when `id` has the expected record-ID prefix for `domain`.
 fn record_id_matches_domain(id: &str, domain: &str) -> bool {
     match domain {
-        "codegraph" => id.starts_with("codegraph:v1:"),
+        "codegraph" => id.starts_with("codegraph:v2:"),
         "agent_memory" => id.starts_with("agent_memory:v1:"),
         _ => true,
     }
@@ -1293,9 +1348,9 @@ fn record_id_matches_domain(id: &str, domain: &str) -> bool {
 fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult<()> {
     match target_domain {
         "codegraph" => {
-            if !id.starts_with("codegraph:v1:") {
+            if !id.starts_with("codegraph:v2:") {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link declares target_domain 'codegraph' but target '{id}' does not have the expected 'codegraph:v1:' prefix",
+                    "evidence link declares target_domain 'codegraph' but target '{id}' does not have the expected 'codegraph:v2:' prefix",
                 )));
             }
         }
@@ -1718,9 +1773,9 @@ fn validate_agent_memory_edge_endpoints(
         | EdgeLabel::TouchedFile
         | EdgeLabel::FailedOn
         | EdgeLabel::ExplainsChange => {
-            if !target.starts_with("codegraph:v1:") {
+            if !target.starts_with("codegraph:v2:") {
                 return Err(ApiError::bad_request(format!(
-                    "agent-memory edge '{edge_id}' label '{}' requires a codegraph:v1: target; got target '{target}'",
+                    "agent-memory edge '{edge_id}' label '{}' requires a codegraph:v2: target; got target '{target}'",
                     label.as_str()
                 )));
             }
@@ -1883,7 +1938,7 @@ fn validate_and_synthesize_evidence_edges(
                     // Reject codegraph node kinds stored under an agent-memory ID.
                     if !AGENT_MEMORY_NODE_KINDS.contains(kind) {
                         return Err(ApiError::bad_request(format!(
-                            "node kind '{}' is not permitted under the agent_memory:v1: namespace; use codegraph:v1: IDs for code-graph nodes",
+                            "node kind '{}' is not permitted under the agent_memory:v1: namespace; use codegraph:v2: IDs for code-graph nodes",
                             kind.as_str()
                         )));
                     }
@@ -3506,7 +3561,7 @@ mod tests {
                 "session_id": "test-session",
                 "payload": {
                     "budget": { "timeout_ms": 1_u64 },
-                    "record_ids": ["codegraph:v1:missing"]
+                    "record_ids": ["codegraph:v2:missing"]
                 }
             }))?,
         };
@@ -3533,7 +3588,7 @@ mod tests {
             entries: BTreeMap::new(),
         }));
         let record = GraphRecord::node(
-            "codegraph:v1:cross-key-current-node".to_owned(),
+            "codegraph:v2:cross-key-current-node".to_owned(),
             NodeKind::Repository,
             None,
             None,
@@ -3560,7 +3615,7 @@ mod tests {
                 .read()
                 .map_err(|_| anyhow!("embedded sink lock poisoned"))?;
             assert_eq!(
-                sink.node_observation_count_for_test("codegraph:v1:cross-key-current-node"),
+                sink.node_observation_count_for_test("codegraph:v2:cross-key-current-node"),
                 1
             );
             drop(sink);
@@ -3578,8 +3633,8 @@ mod tests {
             path: temp.path().join("idempotency.json"),
             entries: BTreeMap::new(),
         }));
-        let file_id = "codegraph:v1:cross-key-edge-file".to_owned();
-        let symbol_id = "codegraph:v1:cross-key-edge-symbol".to_owned();
+        let file_id = "codegraph:v2:cross-key-edge-file".to_owned();
+        let symbol_id = "codegraph:v2:cross-key-edge-symbol".to_owned();
         let edge = GraphRecord::edge(
             EdgeLabel::Defines,
             file_id.clone(),

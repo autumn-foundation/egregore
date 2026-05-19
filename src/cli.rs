@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::{
     adapters::{DryRunSink, ingest_records, records_from_jsonl},
     ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan},
-    query, scan_repository, scan_repository_history,
+    query, scan_repository_history_with_override, scan_repository_with_override,
     traj::{self, ImportOptions},
 };
 
@@ -40,6 +40,12 @@ enum Commands {
         /// Output JSONL path.
         #[arg(long)]
         out: PathBuf,
+        /// Override the auto-detected repository identity.
+        ///
+        /// Forces `identity_source = operator_override`. Use for fixture-stable
+        /// tests or when the auto-detected remote is wrong (e.g. a mirror).
+        #[arg(long)]
+        repo_id_override: Option<String>,
     },
     /// Replay Git history and write temporal graph JSONL.
     ScanHistory {
@@ -48,6 +54,12 @@ enum Commands {
         /// Output JSONL path.
         #[arg(long)]
         out: PathBuf,
+        /// Override the auto-detected repository identity.
+        ///
+        /// Forces `identity_source = operator_override`. Use for fixture-stable
+        /// tests or when the auto-detected remote is wrong (e.g. a mirror).
+        #[arg(long)]
+        repo_id_override: Option<String>,
     },
     /// Inspect a graph JSONL file.
     Inspect {
@@ -229,8 +241,16 @@ pub fn run() -> Result<()> {
 
 fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
-        Commands::Scan { repo_path, out } => scan(&repo_path, &out),
-        Commands::ScanHistory { repo_path, out } => scan_history(&repo_path, &out),
+        Commands::Scan {
+            repo_path,
+            out,
+            repo_id_override,
+        } => scan(&repo_path, &out, repo_id_override.as_deref()),
+        Commands::ScanHistory {
+            repo_path,
+            out,
+            repo_id_override,
+        } => scan_history(&repo_path, &out, repo_id_override.as_deref()),
         Commands::Inspect { graph } => inspect(&graph),
         Commands::Ingest {
             graph,
@@ -270,8 +290,8 @@ fn import_traj_cmd(traj_path: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn scan(repo_path: &Path, out: &Path) -> Result<()> {
-    let graph = scan_repository(repo_path)
+fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<()> {
+    let graph = scan_repository_with_override(repo_path, repo_id_override)
         .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
     let jsonl = graph
         .to_jsonl()
@@ -281,8 +301,8 @@ fn scan(repo_path: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn scan_history(repo_path: &Path, out: &Path) -> Result<()> {
-    let graph = scan_repository_history(repo_path)
+fn scan_history(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<()> {
+    let graph = scan_repository_history_with_override(repo_path, repo_id_override)
         .with_context(|| format!("failed to scan Git history for {}", repo_path.display()))?;
     let jsonl = graph
         .to_jsonl()
@@ -301,6 +321,9 @@ fn inspect(graph: &Path) -> Result<()> {
     println!("edges: {}", counts.edges);
     println!("tombstones: {}", counts.tombstones);
     println!("diagnostics: {}", counts.diagnostics);
+    for repo in &counts.repositories {
+        println!("repository: {} ({})", repo.id, repo.identity_summary);
+    }
     Ok(())
 }
 
@@ -868,6 +891,12 @@ impl PrintText for DriftResult<'_> {
 
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
+struct RepositorySummary {
+    id: String,
+    identity_summary: String,
+}
+
 #[derive(Debug, Default)]
 struct InspectCounts {
     records: usize,
@@ -875,6 +904,7 @@ struct InspectCounts {
     edges: usize,
     tombstones: usize,
     diagnostics: usize,
+    repositories: Vec<RepositorySummary>,
 }
 
 impl InspectCounts {
@@ -888,11 +918,41 @@ impl InspectCounts {
             let record = serde_json::from_str::<GraphRecord>(line)
                 .with_context(|| format!("failed to parse graph record on line {}", index + 1))?;
             counts.records += 1;
-            match record {
-                GraphRecord::Node { kind, .. } => {
+            match &record {
+                GraphRecord::Node {
+                    id,
+                    kind,
+                    repository_identity,
+                    ..
+                } => {
                     counts.nodes += 1;
-                    if kind == NodeKind::Diagnostic {
+                    if *kind == NodeKind::Diagnostic {
                         counts.diagnostics += 1;
+                    }
+                    if *kind == NodeKind::Repository {
+                        let identity_summary = repository_identity.as_deref().map_or_else(
+                            || "unknown".to_owned(),
+                            |p| {
+                                use crate::ir::IdentitySource;
+                                let source_str = match p.identity_source {
+                                    IdentitySource::Remote => "remote",
+                                    IdentitySource::LocalRootCommit => "local_root_commit",
+                                    IdentitySource::LocalPath => "local_path",
+                                    IdentitySource::OperatorOverride => "operator_override",
+                                };
+                                let canonical = p
+                                    .remote_url
+                                    .as_deref()
+                                    .or(p.root_commit_sha.as_deref())
+                                    .or(p.canonical_path.as_deref())
+                                    .unwrap_or(p.basename.as_str());
+                                format!("{source_str}: {canonical}")
+                            },
+                        );
+                        counts.repositories.push(RepositorySummary {
+                            id: id.clone(),
+                            identity_summary,
+                        });
                     }
                 }
                 GraphRecord::Edge { .. } => counts.edges += 1,

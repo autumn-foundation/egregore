@@ -2,7 +2,7 @@
 
 use std::{fs, path::PathBuf};
 
-use aletheia_egregore::scan_repository;
+use aletheia_egregore::{scan_repository, scan_repository_with_override};
 use serde_json::Value;
 
 fn fixture_repo() -> PathBuf {
@@ -13,11 +13,14 @@ fn fixture_repo() -> PathBuf {
 fn deterministic_scan_produces_stable_jsonl() {
     let repo = fixture_repo();
 
-    let first = scan_repository(&repo)
+    // Use --repo-id-override so the test does not depend on the fixture
+    // directory's basename or absolute path (which would both vary across
+    // machines and rename operations).
+    let first = scan_repository_with_override(&repo, Some("fixture-stable-test-repo"))
         .expect("fixture repo should scan")
         .to_jsonl()
         .expect("graph should serialize");
-    let second = scan_repository(&repo)
+    let second = scan_repository_with_override(&repo, Some("fixture-stable-test-repo"))
         .expect("fixture repo should scan")
         .to_jsonl()
         .expect("graph should serialize");

@@ -59,6 +59,7 @@ Query output is newline-delimited JSON by default (`--format json`). Pass `--for
 - **Agent-memory domain schema (v1):** [docs/schema/agent-memory.md](docs/schema/agent-memory.md)
 - Architecture decisions: [docs/adr/README.md](docs/adr/README.md)
 - **Daemon HTTP wire contract (v1):** [docs/schema/daemon-api.md](docs/schema/daemon-api.md)
+- **Repository node identity (v2):** [docs/schema/repository-identity.md](docs/schema/repository-identity.md)
 - Implementation plans: [docs/plans/](docs/plans/)
 - PM issue prompt: [docs/prompts/vantage-egregore.md](docs/prompts/vantage-egregore.md)
 

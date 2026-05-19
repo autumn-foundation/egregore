@@ -444,6 +444,34 @@ impl EmbeddedAletheiaSink {
     /// # Errors
     ///
     /// Returns an error if an embedded read operation fails.
+    /// Returns the codegraph IDs of all `Repository` nodes currently in the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an embedded read operation fails.
+    pub fn stored_repository_ids(&self) -> AdapterResult<Vec<String>> {
+        let mut ids = Vec::new();
+        for record_id in self.record_handles.keys() {
+            if let Some(record) = self.read_back(record_id)?
+                && matches!(
+                    record,
+                    GraphRecord::Node {
+                        kind: NodeKind::Repository,
+                        ..
+                    }
+                )
+            {
+                ids.push(record_id.clone());
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Returns true if the embedded graph contains a Commit -> Change -> Symbol path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an embedded read operation fails.
     pub fn has_commit_change_symbol_path(&self, commit_id: &str) -> AdapterResult<bool> {
         let Some(commit_node_id) = self.lookup_node_id_by_codegraph_id(commit_id) else {
             return Ok(false);
@@ -596,6 +624,7 @@ impl EmbeddedAletheiaSink {
             temporal,
             semantic_drift,
             evidence_links,
+            repository_identity,
             text,
             superseded_by,
             agent_id,
@@ -636,6 +665,11 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(links)
         {
             builder = builder.insert("evidence_links_json", json.as_str());
+        }
+        if let Some(identity) = repository_identity
+            && let Ok(json) = serde_json::to_string(identity.as_ref())
+        {
+            builder = builder.insert("repository_identity_json", json.as_str());
         }
         builder = insert_optional(builder, "text", text.as_deref());
         builder = insert_optional(builder, "superseded_by", superseded_by.as_deref());
@@ -1040,6 +1074,18 @@ impl EmbeddedAletheiaSink {
                 "redaction_policy_version",
                 node.get_property("redaction_policy_version"),
             )?,
+            repository_identity: optional_str_property(
+                record_id,
+                "repository_identity_json",
+                node.get_property("repository_identity_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::RepositoryIdentityPayload>)
+            .transpose()
+            .map_err(|e| {
+                read_back_error(record_id, format!("repository_identity_json invalid: {e}"))
+            })?
+            .map(Box::new),
             summary: required_str_property(record_id, "summary", node.get_property("summary"))?,
             domain: optional_str_property(record_id, "domain", node.get_property("domain"))?,
             importer_id: optional_str_property(
@@ -1733,7 +1779,7 @@ mod tests {
         sink.write_record(&edge).expect("edge should write");
 
         let error = sink
-            .read_back_until("codegraph:v1:missing-edge", Some(Instant::now()))
+            .read_back_until("codegraph:v2:missing-edge", Some(Instant::now()))
             .expect_err("expired deadline should stop the edge scan");
         assert!(matches!(error, AdapterError::TimedOut { .. }));
     }

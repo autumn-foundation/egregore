@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{CodegraphError, Result},
+    identity,
     ir::{Graph, GraphRecord, SCHEMA_VERSION, stable_id},
-    repository_record, scan_source_file_records,
+    repository_record_from_identity, scan_source_file_records,
 };
 
 /// Incremental cache schema for extractor output stored on disk.
@@ -43,12 +44,8 @@ pub fn scan_repository_incremental(
     let repo_root = repo_path.as_ref();
     crate::validate_repository(repo_root)?;
 
-    let repo_name = repo_root
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .filter(|name| !name.is_empty())
-        .unwrap_or("repository");
-    let (repository_id, repository) = repository_record(repo_name);
+    let repo_identity = identity::compute_repository_identity(repo_root, None);
+    let (repository_id, repository) = repository_record_from_identity(&repo_identity);
     let previous_cache = CacheFile::load(cache_path.as_ref())?;
     let can_reuse_cache_records = previous_cache.schema_version == CACHE_SCHEMA_VERSION;
     let mut next_cache = CacheFile::default();

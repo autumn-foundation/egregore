@@ -548,7 +548,9 @@ fn embedded_history_edges_attach_to_matching_temporal_symbol_node() {
     drop(sink);
 
     let db = reopen_embedded_db(&data_dir);
-    let first_commit_id = stable_id(&["node", "commit", "repo", &first]);
+    // Repo has no remote; identity derived from root commit SHA (= first commit).
+    let repository_id = stable_id(&["repository", "local-root-commit", &first]);
+    let first_commit_id = stable_id(&["node", "commit", &repository_id, &first]);
     let symbol_observation_commits =
         changed_symbol_git_commits_for_commit(&db, &first_commit_id, "stable");
 
@@ -708,6 +710,7 @@ fn seed_history_repo(repo: &Path) {
     git(repo, ["config", "user.email", "codegraph@example.invalid"]);
     git(repo, ["config", "user.name", "Codegraph Test"]);
     git(repo, ["config", "core.autocrlf", "false"]);
+    git(repo, ["config", "commit.gpgsign", "false"]);
 
     write(repo, "src/lib.rs", "pub fn original() -> u32 { 1 }\n");
     commit(repo, "initial symbol", "2026-01-01T00:00:00Z");
@@ -722,6 +725,7 @@ fn seed_stable_symbol_history_repo(repo: &Path) -> [String; 2] {
     git(repo, ["config", "user.email", "codegraph@example.invalid"]);
     git(repo, ["config", "user.name", "Codegraph Test"]);
     git(repo, ["config", "core.autocrlf", "false"]);
+    git(repo, ["config", "commit.gpgsign", "false"]);
 
     write(repo, "src/lib.rs", "pub fn stable() -> u32 { 1 }\n");
     let first = commit_with_sha(repo, "initial stable symbol", "2026-03-01T00:00:00Z");

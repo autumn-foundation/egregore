@@ -1,0 +1,264 @@
+//! Repository identity computation for stable cross-clone node IDs.
+//!
+//! Three identity cases, selected in priority order:
+//! 1. `Remote` – `.git` exists and has at least one remote URL.
+//! 2. `LocalRootCommit` – `.git` exists with commits but no remotes.
+//! 3. `LocalPath` – no `.git` or no commits; uses canonical absolute path.
+//!
+//! A fourth case, `OperatorOverride`, is used when `--repo-id-override` is passed.
+//! See `docs/schema/repository-identity.md` for the full specification.
+
+use std::{
+    path::Path,
+    process::{Command, Stdio},
+};
+
+use crate::ir::{IdentitySource, RepositoryIdentityPayload, stable_id};
+
+/// Computed repository identity, including its stable ID and full payload.
+#[derive(Debug, Clone)]
+pub struct RepositoryIdentity {
+    /// Stable graph record ID for this repository.
+    pub id: String,
+    /// Structured payload describing how the ID was derived.
+    pub payload: RepositoryIdentityPayload,
+}
+
+/// Computes the stable identity for a repository at `repo_root`.
+///
+/// Falls through three cases in order:
+/// 1. Remote URL (if `.git` exists and has at least one remote)
+/// 2. Root commit SHA (if `.git` exists with commits but no remotes)
+/// 3. Canonical absolute path (fallback for non-git directories)
+///
+/// If `override_id` is `Some`, it directly replaces the canonical-inputs
+/// hash and forces `identity_source = OperatorOverride`.
+#[must_use]
+pub fn compute_repository_identity(
+    repo_root: &Path,
+    override_id: Option<&str>,
+) -> RepositoryIdentity {
+    let basename = repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("repository")
+        .to_owned();
+
+    if let Some(override_str) = override_id {
+        let id = stable_id(&["repository", "operator-override", override_str]);
+        return RepositoryIdentity {
+            id,
+            payload: RepositoryIdentityPayload {
+                identity_source: IdentitySource::OperatorOverride,
+                remote_url: None,
+                root_commit_sha: None,
+                canonical_path: None,
+                basename,
+            },
+        };
+    }
+
+    // Case 1: .git with at least one remote → use lowest-name-sorted remote URL.
+    if let Some(canonical_url) = git_canonical_remote_url(repo_root) {
+        let id = stable_id(&["repository", "remote", &canonical_url]);
+        return RepositoryIdentity {
+            id,
+            payload: RepositoryIdentityPayload {
+                identity_source: IdentitySource::Remote,
+                remote_url: Some(canonical_url),
+                root_commit_sha: None,
+                canonical_path: None,
+                basename,
+            },
+        };
+    }
+
+    // Case 2: .git with commits but no remotes → use root commit SHA.
+    if let Some(root_sha) = git_root_commit_sha(repo_root) {
+        let id = stable_id(&["repository", "local-root-commit", &root_sha]);
+        return RepositoryIdentity {
+            id,
+            payload: RepositoryIdentityPayload {
+                identity_source: IdentitySource::LocalRootCommit,
+                remote_url: None,
+                root_commit_sha: Some(root_sha),
+                canonical_path: None,
+                basename,
+            },
+        };
+    }
+
+    // Case 3: fallback to canonical absolute path.
+    let canonical = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let canonical_str = canonical.to_string_lossy().into_owned();
+    let id = stable_id(&["repository", "local-path", &canonical_str]);
+    RepositoryIdentity {
+        id,
+        payload: RepositoryIdentityPayload {
+            identity_source: IdentitySource::LocalPath,
+            remote_url: None,
+            root_commit_sha: None,
+            canonical_path: Some(canonical_str),
+            basename,
+        },
+    }
+}
+
+/// Returns the normalized canonical URL of the lowest-name-sorted remote,
+/// or `None` if `.git` does not exist or has no remotes.
+fn git_canonical_remote_url(repo_root: &Path) -> Option<String> {
+    if !repo_root.join(".git").is_dir() {
+        return None;
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["remote"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let remotes_text = String::from_utf8(output.stdout).ok()?;
+    let mut remotes: Vec<&str> = remotes_text
+        .lines()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .collect();
+
+    if remotes.is_empty() {
+        return None;
+    }
+
+    remotes.sort_unstable();
+    let first_remote = remotes[0];
+
+    let url_output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["remote", "get-url", first_remote])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !url_output.status.success() {
+        return None;
+    }
+
+    let url = String::from_utf8(url_output.stdout).ok()?;
+    let url = url.trim();
+
+    if url.is_empty() {
+        return None;
+    }
+
+    Some(normalize_remote_url(url))
+}
+
+/// Returns the root commit SHA (oldest first-parent ancestor of HEAD),
+/// or `None` if `.git` does not exist or HEAD has no commits.
+fn git_root_commit_sha(repo_root: &Path) -> Option<String> {
+    if !repo_root.join(".git").is_dir() {
+        return None;
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-list", "--max-parents=0", "HEAD"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let sha = String::from_utf8(output.stdout).ok()?;
+    let sha = sha.trim().to_owned();
+
+    if sha.is_empty() { None } else { Some(sha) }
+}
+
+/// Normalizes a git remote URL to its canonical `https` form.
+///
+/// Normalizations applied (in order):
+/// - `git@host:owner/repo` → `https://host/owner/repo`
+/// - Scheme coerced from `http` to `https`
+/// - Host portion lowercased
+/// - Trailing `.git` stripped
+pub fn normalize_remote_url(url: &str) -> String {
+    // SSH form: git@github.com:owner/repo.git
+    if let Some(stripped) = url.strip_prefix("git@")
+        && let Some(colon) = stripped.find(':')
+    {
+        let host = stripped[..colon].to_lowercase();
+        let path = &stripped[colon + 1..];
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        return format!("https://{host}/{path}");
+    }
+
+    // https:// or http://
+    let scheme_rest = if let Some(s) = url.strip_prefix("https://") {
+        s
+    } else if let Some(s) = url.strip_prefix("http://") {
+        s
+    } else {
+        return url.to_owned();
+    };
+
+    let normalized = scheme_rest.find('/').map_or_else(
+        || format!("https://{}", scheme_rest.to_lowercase()),
+        |slash| {
+            let host = scheme_rest[..slash].to_lowercase();
+            let path = &scheme_rest[slash..];
+            format!("https://{host}{path}")
+        },
+    );
+
+    normalized
+        .strip_suffix(".git")
+        .map_or_else(|| normalized.clone(), ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_remote_url;
+
+    #[test]
+    fn ssh_remote_normalized() {
+        assert_eq!(
+            normalize_remote_url("git@github.com:owner/repo.git"),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn https_git_suffix_stripped() {
+        assert_eq!(
+            normalize_remote_url("https://github.com/owner/repo.git"),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn http_coerced_to_https() {
+        assert_eq!(
+            normalize_remote_url("http://example.com/owner/repo"),
+            "https://example.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn host_lowercased() {
+        assert_eq!(
+            normalize_remote_url("https://GITHUB.COM/owner/repo"),
+            "https://github.com/owner/repo"
+        );
+    }
+}
