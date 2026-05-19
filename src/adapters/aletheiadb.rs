@@ -19,6 +19,9 @@ pub struct EmbeddedAletheiaSink {
     node_lookup: NodeLookupIndex,
     tombstone_ids: BTreeMap<String, ::aletheiadb::NodeId>,
     record_handles: BTreeMap<String, StoredRecord>,
+    /// Counts how many physical `AletheiaDB` edges exist for each edge `codegraph_id`.
+    /// A count > 1 means the edge was tombstoned and then re-ingested, so its tombstone is stale.
+    edge_codegraph_counts: BTreeMap<String, usize>,
     _lease: Option<StoreLease>,
 }
 
@@ -175,6 +178,7 @@ impl EmbeddedAletheiaSink {
             node_lookup: NodeLookupIndex::default(),
             tombstone_ids: BTreeMap::new(),
             record_handles: BTreeMap::new(),
+            edge_codegraph_counts: BTreeMap::new(),
             _lease: lease,
         };
         sink.rebuild_lookup_indexes()?;
@@ -518,13 +522,19 @@ impl EmbeddedAletheiaSink {
             else {
                 continue;
             };
-            // Tombstone is stale if the record was re-ingested after it (higher NodeId).
-            let is_stale = self
+            // Tombstone is stale if the node record was re-ingested after it (higher NodeId).
+            let node_stale = self
                 .node_lookup
                 .non_temporal
                 .get(deleted_id.as_str())
                 .is_some_and(|&live_node_id| live_node_id > tombstone_node_id);
-            if !is_stale {
+            // Tombstone is also stale if the edge was re-ingested: a re-ingested edge creates a
+            // second physical AletheiaDB edge with the same codegraph_id (count > 1).
+            let edge_stale = self
+                .edge_codegraph_counts
+                .get(deleted_id.as_str())
+                .is_some_and(|&count| count > 1);
+            if !node_stale && !edge_stale {
                 deleted.insert(deleted_id);
             }
         }
@@ -675,6 +685,21 @@ impl EmbeddedAletheiaSink {
     fn rebuild_lookup_indexes(&mut self) -> AdapterResult<()> {
         for node_id in self.db.get_all_node_ids() {
             self.index_stored_node(node_id, "embedded-store")?;
+            // Count physical AletheiaDB edges per codegraph_id so that `active_deleted_ids`
+            // can detect whether an edge was re-ingested after its tombstone (count > 1).
+            for edge_id in self.db.get_outgoing_edges(node_id) {
+                let edge = self
+                    .db
+                    .get_edge(edge_id)
+                    .map_err(|e| read_back_error("rebuild_lookup_indexes", e.to_string()))?;
+                if let Some(id) = optional_str_property(
+                    "rebuild_lookup_indexes",
+                    "codegraph_id",
+                    edge.get_property("codegraph_id"),
+                )? {
+                    *self.edge_codegraph_counts.entry(id).or_default() += 1;
+                }
+            }
         }
         Ok(())
     }
@@ -952,6 +977,7 @@ impl EmbeddedAletheiaSink {
 
         self.record_handles
             .insert(id.clone(), StoredRecord::Edge(edge_id));
+        *self.edge_codegraph_counts.entry(id.clone()).or_default() += 1;
         Ok(())
     }
 

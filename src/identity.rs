@@ -59,30 +59,38 @@ pub fn compute_repository_identity(
         };
     }
 
-    // Case 1: .git with at least one remote → use lowest-name-sorted remote URL.
-    if let Some(canonical_url) = git_canonical_remote_url(repo_root) {
-        let id = stable_id(&["repository", "remote", &canonical_url]);
-        let stable_basename = canonical_url
-            .strip_prefix("https://")
-            .or_else(|| canonical_url.strip_prefix("http://"))
-            .and_then(|rest| rest.split_once('/'))
-            .map(|(_, path)| path.to_owned())
-            .filter(|path| !path.is_empty())
-            .unwrap_or_else(|| basename.clone());
-        return RepositoryIdentity {
-            id,
-            payload: RepositoryIdentityPayload {
-                identity_source: IdentitySource::Remote,
-                remote_url: Some(canonical_url),
-                root_commit_sha: None,
-                canonical_path: None,
-                basename: stable_basename,
-            },
-        };
-    }
+    // Case 1: .git with at least one non-local remote → use lowest-name-sorted remote URL.
+    // Case 1b: all remotes are machine-local (file://, /path, ../rel) → skip Case 2 and go
+    //   directly to Case 3 (LocalPath) so the daemon's local-path shared-store guard applies.
+    //   LocalRootCommit is intentionally skipped: root commits are shared across unrelated forks
+    //   that clone the same template, so they are not a reliable shared-store-safe identity.
+    let all_local_remotes = match git_canonical_remote_url(repo_root) {
+        RemoteStatus::Found(canonical_url) => {
+            let id = stable_id(&["repository", "remote", &canonical_url]);
+            let stable_basename = canonical_url
+                .strip_prefix("https://")
+                .and_then(|rest| rest.split_once('/'))
+                .map(|(_, path)| path.to_owned())
+                .filter(|path| !path.is_empty())
+                .unwrap_or_else(|| basename.clone());
+            return RepositoryIdentity {
+                id,
+                payload: RepositoryIdentityPayload {
+                    identity_source: IdentitySource::Remote,
+                    remote_url: Some(canonical_url),
+                    root_commit_sha: None,
+                    canonical_path: None,
+                    basename: stable_basename,
+                },
+            };
+        }
+        RemoteStatus::AllLocal => true,
+        RemoteStatus::None => false,
+    };
 
-    // Case 2: .git with commits but no remotes → use root commit SHA.
-    if let Some(root_sha) = git_root_commit_sha(repo_root) {
+    // Case 2: .git with commits and no remotes at all → use root commit SHA.
+    // Skipped when all configured remotes are machine-local (all_local_remotes = true).
+    if !all_local_remotes && let Some(root_sha) = git_root_commit_sha(repo_root) {
         let id = stable_id(&["repository", "local-root-commit", &root_sha]);
         let stable_basename = format!("commit-{}", root_sha.chars().take(12).collect::<String>());
         return RepositoryIdentity {
@@ -142,11 +150,23 @@ fn git_is_repo_root(repo_root: &Path) -> bool {
     canonical_root == canonical_top
 }
 
-/// Returns the normalized canonical URL of the lowest-name-sorted remote,
-/// or `None` if `.git` does not exist or has no usable non-local remote.
-fn git_canonical_remote_url(repo_root: &Path) -> Option<String> {
+/// Outcome of the remote-URL probe: distinguishes "no remotes configured" from
+/// "remotes exist but every one is a machine-local path".
+enum RemoteStatus {
+    /// At least one non-local remote was found; contains its normalized URL.
+    Found(String),
+    /// Remotes are configured but every URL is machine-local (`file://`, `/path`, `../rel`).
+    /// Shared-store protection requires these repos to use `LocalPath` identity (not root-commit).
+    AllLocal,
+    /// No git repository root, no remotes configured, or git is unavailable.
+    None,
+}
+
+/// Returns the normalized canonical URL of the lowest-name-sorted remote, or a
+/// `RemoteStatus` indicating why no portable URL is available.
+fn git_canonical_remote_url(repo_root: &Path) -> RemoteStatus {
     if !git_is_repo_root(repo_root) {
-        return None;
+        return RemoteStatus::None;
     }
 
     let output = Command::new("git")
@@ -154,14 +174,20 @@ fn git_canonical_remote_url(repo_root: &Path) -> Option<String> {
         .arg(repo_root)
         .args(["remote"])
         .stdin(Stdio::null())
-        .output()
-        .ok()?;
+        .output();
+
+    let Ok(output) = output else {
+        return RemoteStatus::None;
+    };
 
     if !output.status.success() {
-        return None;
+        return RemoteStatus::None;
     }
 
-    let remotes_text = String::from_utf8(output.stdout).ok()?;
+    let Ok(remotes_text) = String::from_utf8(output.stdout) else {
+        return RemoteStatus::None;
+    };
+
     let mut remotes: Vec<&str> = remotes_text
         .lines()
         .map(str::trim)
@@ -169,36 +195,50 @@ fn git_canonical_remote_url(repo_root: &Path) -> Option<String> {
         .collect();
 
     if remotes.is_empty() {
-        return None;
+        return RemoteStatus::None;
     }
 
     remotes.sort_unstable();
 
-    // Iterate sorted remotes; skip local remotes and use the first non-local URL.
+    // Iterate sorted remotes; return the first non-local URL.
+    // If all remotes are local, return AllLocal so the caller can use LocalPath identity.
+    let mut saw_local = false;
     for remote in &remotes {
         let url_output = Command::new("git")
             .arg("-C")
             .arg(repo_root)
             .args(["remote", "get-url", remote])
             .stdin(Stdio::null())
-            .output()
-            .ok()?;
+            .output();
+
+        let Ok(url_output) = url_output else { continue };
 
         if !url_output.status.success() {
             continue;
         }
 
-        let url = String::from_utf8(url_output.stdout).ok()?;
-        let url = url.trim();
+        let Ok(url_str) = String::from_utf8(url_output.stdout) else {
+            continue;
+        };
+        let url = url_str.trim();
 
-        if url.is_empty() || is_local_remote_url(url) {
+        if url.is_empty() {
             continue;
         }
 
-        return Some(normalize_remote_url(url));
+        if is_local_remote_url(url) {
+            saw_local = true;
+            continue;
+        }
+
+        return RemoteStatus::Found(normalize_remote_url(url));
     }
 
-    None
+    if saw_local {
+        RemoteStatus::AllLocal
+    } else {
+        RemoteStatus::None
+    }
 }
 
 /// Returns `true` for URLs that are machine-specific local paths rather than
@@ -208,7 +248,11 @@ fn git_canonical_remote_url(repo_root: &Path) -> Option<String> {
 /// Userless scp form (`host:path`, no `@`) is distinguished from relative paths
 /// by the presence of `:` with no `/` before it.
 fn is_local_remote_url(url: &str) -> bool {
-    if url.starts_with('/') || url.starts_with("file://") {
+    if url.starts_with('/') {
+        return true;
+    }
+    // file:// scheme is local regardless of case (git may preserve the user's casing).
+    if url.len() >= 7 && url[..7].eq_ignore_ascii_case("file://") {
         return true;
     }
     if url.contains("://") {
@@ -270,36 +314,40 @@ pub fn normalize_remote_url(url: &str) -> String {
         }
     }
 
-    // SSH URL form: ssh://[user@]host/path
+    // SSH URL form: ssh://[user@]host[:22]/path
     if let Some(rest) = url.strip_prefix("ssh://") {
         let rest = rest.split_once('@').map_or(rest, |(_, after)| after);
         if let Some(slash) = rest.find('/') {
-            let host = rest[..slash].to_lowercase();
+            let host_lower = rest[..slash].to_lowercase();
+            let host = strip_default_port(&host_lower, 22);
             let path = &rest[slash..];
             return format!("https://{host}{}", strip_git_suffix(path));
         }
-        let host = rest.to_lowercase();
+        let host_lower = rest.to_lowercase();
+        let host = strip_default_port(&host_lower, 22);
         return format!("https://{host}");
     }
 
     // https://, http://, or git:// (git:// coerced to https)
-    let scheme_rest = if let Some(s) = url.strip_prefix("https://") {
-        s
+    let (scheme_rest, default_port) = if let Some(s) = url.strip_prefix("https://") {
+        (s, 443u16)
     } else if let Some(s) = url.strip_prefix("http://") {
-        s
+        (s, 80u16)
     } else if let Some(s) = url.strip_prefix("git://") {
-        s
+        (s, 9418u16)
     } else {
         return url.to_owned();
     };
 
     scheme_rest.find('/').map_or_else(
         || {
-            let host = strip_userinfo(scheme_rest).to_lowercase();
+            let host_lower = strip_userinfo(scheme_rest).to_lowercase();
+            let host = strip_default_port(&host_lower, default_port);
             format!("https://{host}")
         },
         |slash| {
-            let host = strip_userinfo(&scheme_rest[..slash]).to_lowercase();
+            let host_lower = strip_userinfo(&scheme_rest[..slash]).to_lowercase();
+            let host = strip_default_port(&host_lower, default_port);
             let path = &scheme_rest[slash..];
             format!("https://{host}{}", strip_git_suffix(path))
         },
@@ -309,6 +357,12 @@ pub fn normalize_remote_url(url: &str) -> String {
 /// Strips a leading `user@` from a host string, if present.
 fn strip_userinfo(host: &str) -> &str {
     host.split_once('@').map_or(host, |(_, h)| h)
+}
+
+/// Strips a trailing `:<port>` if it matches the given default port.
+fn strip_default_port(host: &str, default_port: u16) -> &str {
+    let suffix = format!(":{default_port}");
+    host.strip_suffix(suffix.as_str()).unwrap_or(host)
 }
 
 /// Trims trailing slashes then strips a trailing `.git` extension, then trims again.
@@ -428,5 +482,43 @@ mod tests {
     #[test]
     fn windows_drive_letter_not_treated_as_scp() {
         assert!(super::is_local_remote_url("C:/repos/mirror.git"));
+    }
+
+    #[test]
+    fn file_url_uppercase_scheme_is_local() {
+        assert!(super::is_local_remote_url("FILE:///var/mirror.git"));
+        assert!(super::is_local_remote_url("File:///var/mirror.git"));
+    }
+
+    #[test]
+    fn ssh_url_default_port_stripped() {
+        assert_eq!(
+            normalize_remote_url("ssh://git@github.com:22/owner/repo.git"),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn ssh_url_nondefault_port_preserved() {
+        assert_eq!(
+            normalize_remote_url("ssh://git@github.com:2222/owner/repo.git"),
+            "https://github.com:2222/owner/repo"
+        );
+    }
+
+    #[test]
+    fn https_url_default_port_stripped() {
+        assert_eq!(
+            normalize_remote_url("https://github.com:443/owner/repo.git"),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn http_url_default_port_stripped() {
+        assert_eq!(
+            normalize_remote_url("http://example.com:80/owner/repo"),
+            "https://example.com/owner/repo"
+        );
     }
 }

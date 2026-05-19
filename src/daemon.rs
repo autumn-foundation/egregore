@@ -1278,18 +1278,25 @@ fn validate_no_local_path_identity_in_shared_store(
     records: &[GraphRecord],
     sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
 ) -> WriteResult<()> {
+    // A Repository node is considered "local-path unsafe" if it has no identity payload
+    // (machine-local write path; can't verify the source) or if the payload explicitly
+    // declares LocalPath identity.
     let incoming_local_path_ids: Vec<&str> = records
         .iter()
         .filter_map(|record| {
             if let GraphRecord::Node {
                 id,
                 kind: NodeKind::Repository,
-                repository_identity: Some(payload),
+                repository_identity,
                 ..
             } = record
-                && payload.identity_source == IdentitySource::LocalPath
             {
-                return Some(id.as_str());
+                let is_unsafe = repository_identity
+                    .as_deref()
+                    .is_none_or(|p| p.identity_source == IdentitySource::LocalPath);
+                if is_unsafe {
+                    return Some(id.as_str());
+                }
             }
             None
         })
