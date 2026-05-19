@@ -701,6 +701,7 @@ fn temporal_observed(git_commit: &str, valid_time: &str, observed_at: &str) -> T
         valid_time: valid_time.to_owned(),
         author_time: Some(valid_time.to_owned()),
         observed_at: observed_at.to_owned(),
+        valid_time_source: None,
     }
 }
 

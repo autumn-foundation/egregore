@@ -41,6 +41,7 @@ eg query symbol scan_repository --graph graph.jsonl
 eg query file src/lib.rs --graph graph.jsonl
 eg query drift --graph history.graph.jsonl --limit 5
 eg query symbol scan_repository --graph history.graph.jsonl --at <commit-sha>
+eg query symbol scan_repository --graph history.graph.jsonl --as-of 2026-05-01T00:00:00Z
 
 # Query directly from an ingested AletheiaDB store
 eg query symbol scan_repository --data-dir .egregore
@@ -57,6 +58,7 @@ Query output is newline-delimited JSON by default (`--format json`). Pass `--for
 - Product vision: [docs/prd/0000-egregore-vision.md](docs/prd/0000-egregore-vision.md)
 - Code graph requirements: [docs/prd/0001-codebase-knowledge-graph.md](docs/prd/0001-codebase-knowledge-graph.md)
 - **Agent-memory domain schema (v1):** [docs/schema/agent-memory.md](docs/schema/agent-memory.md)
+- **Bi-temporal selector grammar (v2):** [docs/schema/temporal-selectors.md](docs/schema/temporal-selectors.md)
 - Architecture decisions: [docs/adr/README.md](docs/adr/README.md)
 - **Daemon HTTP wire contract (v1):** [docs/schema/daemon-api.md](docs/schema/daemon-api.md)
 - **Repository node identity (v2):** [docs/schema/repository-identity.md](docs/schema/repository-identity.md)

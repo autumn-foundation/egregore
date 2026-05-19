@@ -251,6 +251,14 @@ pub enum GraphRecord {
         /// Redaction policy version when any field passed through redaction.
         #[serde(skip_serializing_if = "Option::is_none")]
         redaction_policy_version: Option<String>,
+        /// RFC 3339 valid time for current-tree (non-history) scan records.
+        /// For history-backed records use `temporal.valid_time` instead.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        valid_time: Option<String>,
+        /// Source of the `valid_time` field for current-tree records.
+        /// For history-backed records see `temporal.valid_time_source`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        valid_time_source: Option<String>,
         /// Agent-facing summary.
         summary: String,
         // ── Importer provenance fields (absent for non-imported records) ─────
@@ -368,6 +376,8 @@ impl GraphRecord {
             confidence: None,
             source_handle: None,
             redaction_policy_version: None,
+            valid_time: None,
+            valid_time_source: None,
             summary,
             domain: None,
             importer_id: None,
@@ -415,6 +425,8 @@ impl GraphRecord {
             confidence: None,
             source_handle: None,
             redaction_policy_version: None,
+            valid_time: None,
+            valid_time_source: None,
             summary,
             domain: None,
             importer_id: None,
@@ -461,6 +473,8 @@ impl GraphRecord {
             confidence: None,
             source_handle: None,
             redaction_policy_version: None,
+            valid_time: None,
+            valid_time_source: None,
             summary,
             domain: None,
             importer_id: None,
@@ -552,6 +566,26 @@ impl GraphRecord {
         }
         self
     }
+
+    /// Stamps inferred `valid_time` and `valid_time_source` on current-tree scan records.
+    ///
+    /// Used by `scan_repository_at` to satisfy the rule from
+    /// `docs/schema/temporal-selectors.md`: when no commit anchors the record,
+    /// set `valid_time` = `transaction_time` and `valid_time_source` =
+    /// `"inferred_from_transaction_time"`.
+    #[must_use]
+    pub fn with_valid_time_inferred(mut self, transaction_time: &str) -> Self {
+        if let Self::Node {
+            valid_time,
+            valid_time_source,
+            ..
+        } = &mut self
+        {
+            *valid_time = Some(transaction_time.to_owned());
+            *valid_time_source = Some("inferred_from_transaction_time".to_owned());
+        }
+        self
+    }
 }
 
 /// Git and bitemporal provenance attached to history-backed records.
@@ -568,6 +602,9 @@ pub struct TemporalMetadata {
     pub author_time: Option<String>,
     /// Observation timestamp for the replay artifact.
     pub observed_at: String,
+    /// Source of the `valid_time` field. See `docs/schema/temporal-selectors.md`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_time_source: Option<String>,
 }
 
 /// Structured metadata for a semantic drift measurement.

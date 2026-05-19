@@ -2,7 +2,7 @@
 
 use std::{fs, path::PathBuf};
 
-use aletheia_egregore::{scan_repository, scan_repository_with_override};
+use aletheia_egregore::{scan_repository, scan_repository_at_with_override};
 use serde_json::Value;
 
 fn fixture_repo() -> PathBuf {
@@ -12,15 +12,16 @@ fn fixture_repo() -> PathBuf {
 #[test]
 fn deterministic_scan_produces_stable_jsonl() {
     let repo = fixture_repo();
+    // Fix the transaction time so that valid_time in output is identical across both calls.
+    let fixed_time = "2026-05-19T00:00:00Z";
 
-    // Use --repo-id-override so the test does not depend on the fixture
-    // directory's basename or absolute path (which would both vary across
-    // machines and rename operations).
-    let first = scan_repository_with_override(&repo, Some("fixture-stable-test-repo"))
+    // Use both a fixed time and --repo-id-override so the output is deterministic
+    // across machines and repeated runs regardless of directory name or wall clock.
+    let first = scan_repository_at_with_override(&repo, fixed_time, Some("fixture-stable-test-repo"))
         .expect("fixture repo should scan")
         .to_jsonl()
         .expect("graph should serialize");
-    let second = scan_repository_with_override(&repo, Some("fixture-stable-test-repo"))
+    let second = scan_repository_at_with_override(&repo, fixed_time, Some("fixture-stable-test-repo"))
         .expect("fixture repo should scan")
         .to_jsonl()
         .expect("graph should serialize");

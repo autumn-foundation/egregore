@@ -2285,6 +2285,7 @@ fn validate_and_synthesize_evidence_edges(
                 valid_time: EVIDENCE_EDGE_ROUTING_TIMESTAMP.to_owned(),
                 observed_at: EVIDENCE_EDGE_ROUTING_TIMESTAMP.to_owned(),
                 author_time: None,
+                valid_time_source: None,
             })
         } else {
             edge

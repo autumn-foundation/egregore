@@ -885,6 +885,8 @@ fn make_node(
         exit_code: extra.exit_code,
         turn_index: extra.turn_index,
         repository_identity: None,
+        valid_time: None,
+        valid_time_source: None,
     }
 }
 

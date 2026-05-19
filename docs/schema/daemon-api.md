@@ -149,7 +149,10 @@ Server-enforced defaults (when budget is omitted): `max_results = 5000`,
 with `"partial_result": false`; no partial JSON is emitted.
 
 Valid-time and transaction-time selectors are **reserved** (named, not yet
-honored) and will be added additively in a future slice.
+honored) and will be added additively in a future slice.  The selector grammar
+is specified in [`docs/schema/temporal-selectors.md`](temporal-selectors.md).
+Any request including `tx_as_of` or `tx_since` fields must receive a
+`not_implemented` error response until the transaction-time axis is wired up.
 
 ---
 

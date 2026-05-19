@@ -77,6 +77,7 @@ fn fixture_graph_with_temporal_symbols() -> (tempfile::TempDir, PathBuf) {
         valid_time: "2026-01-01T00:00:00Z".to_owned(),
         author_time: None,
         observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
     });
 
     let sym_b = GraphRecord::symbol(
@@ -93,6 +94,7 @@ fn fixture_graph_with_temporal_symbols() -> (tempfile::TempDir, PathBuf) {
         valid_time: "2026-01-02T00:00:00Z".to_owned(),
         author_time: None,
         observed_at: "2026-01-02T00:00:00Z".to_owned(),
+        valid_time_source: None,
     });
 
     let mut graph = Graph::new();
@@ -124,6 +126,7 @@ fn fixture_graph_with_cross_symbol_commits() -> (tempfile::TempDir, PathBuf) {
         valid_time: "2026-01-01T00:00:00Z".to_owned(),
         author_time: None,
         observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
     });
 
     let sym_b = GraphRecord::symbol(
@@ -140,6 +143,7 @@ fn fixture_graph_with_cross_symbol_commits() -> (tempfile::TempDir, PathBuf) {
         valid_time: "2026-01-02T00:00:00Z".to_owned(),
         author_time: None,
         observed_at: "2026-01-02T00:00:00Z".to_owned(),
+        valid_time_source: None,
     });
 
     let mut graph = Graph::new();
@@ -238,6 +242,7 @@ fn fixture_graph_with_drift() -> (tempfile::TempDir, PathBuf) {
         valid_time: "2026-01-02T00:00:00Z".to_owned(),
         author_time: None,
         observed_at: "2026-01-02T00:00:00Z".to_owned(),
+        valid_time_source: None,
     })
     .with_semantic_drift(SemanticDriftMetadata {
         model_id: "test-model-v1".to_owned(),
@@ -263,6 +268,7 @@ fn fixture_graph_with_drift() -> (tempfile::TempDir, PathBuf) {
         valid_time: "2026-01-03T00:00:00Z".to_owned(),
         author_time: None,
         observed_at: "2026-01-03T00:00:00Z".to_owned(),
+        valid_time_source: None,
     })
     .with_semantic_drift(SemanticDriftMetadata {
         model_id: "test-model-v1".to_owned(),
@@ -876,6 +882,7 @@ fn fixture_graph_with_drift_stale_target_id() -> (tempfile::TempDir, PathBuf) {
         valid_time: "2026-01-02T00:00:00Z".to_owned(),
         author_time: None,
         observed_at: "2026-01-02T00:00:00Z".to_owned(),
+        valid_time_source: None,
     })
     .with_semantic_drift(SemanticDriftMetadata {
         model_id: "test-model-v1".to_owned(),
@@ -1071,6 +1078,7 @@ fn fixture_graph_with_tombstoned_temporal_symbol() -> (tempfile::TempDir, PathBu
         valid_time: "2026-01-01T00:00:00Z".to_owned(),
         author_time: None,
         observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
     });
     let tombstone = GraphRecord::Tombstone {
         id: tombstone_id,
@@ -1131,6 +1139,7 @@ fn fixture_graph_with_temporal_file_and_symbol() -> (tempfile::TempDir, PathBuf)
         valid_time: "2026-01-01T00:00:00Z".to_owned(),
         author_time: None,
         observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
     });
     let sym_node = GraphRecord::symbol(
         sym_id,
@@ -1146,6 +1155,7 @@ fn fixture_graph_with_temporal_file_and_symbol() -> (tempfile::TempDir, PathBuf)
         valid_time: "2026-01-01T00:00:00Z".to_owned(),
         author_time: None,
         observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
     });
 
     let mut graph = Graph::new();
