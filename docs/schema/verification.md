@@ -206,18 +206,30 @@ The `validate_verification_domain_records` function in `src/daemon.rs` enforces
 these rules on every ingest write that contains verification-domain records.
 
 A record is treated as verification-domain when:
-- Its `id` starts with `verification:v`, **or**
+- Its `id` starts with `verification:v1:`, **or**
 - Its `domain` field equals `"verification"`.
 
 Rules enforced at write time:
 
-1. **Evidence handle required** — at least one of `source_artifact_hash`,
+1. **Schema version** — `schema_version` must equal `1` (`VERIFICATION_SCHEMA_VERSION`).  
+   Error: `bad_request` (HTTP 400).
+
+2. **Node kind** — `kind` must be one of `TestRun`, `CIStatus`, `BenchmarkRun`,
+   `CoverageReport`, or `ProofResult`.  
+   Error: `bad_request` (HTTP 400).
+
+3. **`executed_at` format** — when present, `executed_at` must be a valid RFC 3339
+   timestamp.  
+   Error: `bad_request` (HTTP 400).
+
+4. **Evidence handle required** — at least one of `source_artifact_hash`,
    `source_artifact_path`, `stdout_handle.hash`, or `stderr_handle.hash` must
    be present and non-empty.  
    Error: `missing_evidence_handle` (HTTP 422).
 
-2. **Inline ceiling** — `stdout_handle.inline` and `stderr_handle.inline` must
-   be `None` when the corresponding `bytes` field exceeds 16 384.  
+5. **Inline ceiling** — `stdout_handle.inline` and `stderr_handle.inline` must
+   be `None` when the corresponding actual content length or `bytes` field
+   exceeds 16 384.  
    Error: `bad_request` (HTTP 400).
 
 ---
@@ -227,7 +239,7 @@ Rules enforced at write time:
 | Code | HTTP | Meaning |
 |------|------|---------|
 | `missing_evidence_handle` | 422 | A verification-domain node was submitted without any evidence handle. |
-| `bad_request` | 400 | `stdout_handle.inline` or `stderr_handle.inline` exceeds the 16 KiB inline ceiling. |
+| `bad_request` | 400 | Wrong `schema_version`, disallowed `kind`, invalid `executed_at` format, or inline ceiling exceeded. |
 
 See `docs/schema/daemon-api.md` §5 for the full error-code table.
 

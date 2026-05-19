@@ -1522,34 +1522,48 @@ fn incoming_identity_is_local(payload: &crate::ir::RepositoryIdentityPayload) ->
     }
 }
 
+/// Verification-domain node kinds permitted under `verification:v1:` IDs.
+const VERIFICATION_NODE_KINDS: &[NodeKind] = &[
+    NodeKind::TestRun,
+    NodeKind::CIStatus,
+    NodeKind::BenchmarkRun,
+    NodeKind::CoverageReport,
+    NodeKind::ProofResult,
+];
+
 /// Validates verification-domain records against the rules in
 /// `docs/schema/verification.md`:
 /// - Every record MUST carry an evidence handle (`source_artifact_hash`,
 ///   `source_artifact_path`, or `stdout_handle.hash`).
 /// - `stdout_handle.inline` MUST be `None` when `stdout_handle.bytes` exceeds
 ///   the 16 KiB inline ceiling.
+/// - `kind` must be one of the five verification node kinds.
+/// - `executed_at`, when present, must be a valid RFC 3339 timestamp.
+/// - `schema_version` must equal `VERIFICATION_SCHEMA_VERSION`.
 ///
 /// A record is treated as verification-domain when its ID starts with
-/// `verification:v` (per `record_id_matches_domain`) or when it carries
+/// `verification:v1:` (per `record_id_matches_domain`) or when it carries
 /// `domain = "verification"` explicitly.
 fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<()> {
     const INLINE_CEILING: u64 = 16 * 1024;
     for record in records {
         let GraphRecord::Node {
             id,
+            kind,
             domain,
             schema_version,
             source_artifact_hash,
             source_artifact_path,
             stdout_handle,
             stderr_handle,
+            executed_at,
             ..
         } = record
         else {
             continue;
         };
         let is_verification =
-            id.starts_with("verification:v") || domain.as_deref() == Some("verification");
+            id.starts_with("verification:v1:") || domain.as_deref() == Some("verification");
         if !is_verification {
             continue;
         }
@@ -1558,6 +1572,23 @@ fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<
             return Err(ApiError::bad_request(format!(
                 "verification node '{id}' has schema_version {schema_version} but only \
                  version {VERIFICATION_SCHEMA_VERSION} is accepted"
+            )));
+        }
+
+        if !VERIFICATION_NODE_KINDS.contains(kind) {
+            return Err(ApiError::bad_request(format!(
+                "node kind '{}' is not permitted under the verification domain; \
+                 allowed kinds: TestRun, CIStatus, BenchmarkRun, CoverageReport, ProofResult",
+                kind.as_str()
+            )));
+        }
+
+        if let Some(ts) = executed_at.as_deref()
+            && DateTime::parse_from_rfc3339(ts).is_err()
+        {
+            return Err(ApiError::bad_request(format!(
+                "verification node '{id}' has invalid executed_at timestamp '{ts}'; \
+                 must be RFC 3339"
             )));
         }
 
@@ -1583,8 +1614,8 @@ fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<
             let inline_len = h.inline.as_deref().map_or(0, |s| s.len() as u64);
             if inline_len > INLINE_CEILING || (h.inline.is_some() && h.bytes > INLINE_CEILING) {
                 return Err(ApiError::bad_request(
-                    "verification-domain CommandRun: stdout_handle.inline must be None when \
-                     bytes exceeds the 16 KiB ceiling; demote to handle-only before writing",
+                    "verification-domain stdout_handle.inline must be None when bytes exceeds \
+                     the 16 KiB ceiling; demote to handle-only before writing",
                 ));
             }
         }
@@ -1592,8 +1623,8 @@ fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<
             let inline_len = h.inline.as_deref().map_or(0, |s| s.len() as u64);
             if inline_len > INLINE_CEILING || (h.inline.is_some() && h.bytes > INLINE_CEILING) {
                 return Err(ApiError::bad_request(
-                    "verification-domain CommandRun: stderr_handle.inline must be None when \
-                     bytes exceeds the 16 KiB ceiling; demote to handle-only before writing",
+                    "verification-domain stderr_handle.inline must be None when bytes exceeds \
+                     the 16 KiB ceiling; demote to handle-only before writing",
                 ));
             }
         }
@@ -1615,7 +1646,7 @@ fn record_id_matches_domain(id: &str, domain: &str) -> bool {
     match domain {
         "codegraph" => id.starts_with("codegraph:"),
         "agent_memory" => id.starts_with("agent_memory:v1:"),
-        "verification" => id.starts_with("verification:v"),
+        "verification" => id.starts_with("verification:v1:"),
         _ => true,
     }
 }
