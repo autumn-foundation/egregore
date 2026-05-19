@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{CodegraphError, Result},
     identity,
-    ir::{Graph, GraphRecord, SCHEMA_VERSION, stable_id},
+    ir::{Graph, GraphRecord, SCHEMA_VERSION, stable_id, versioned_stable_id},
     repository_record_from_identity, scan_source_file_records,
 };
 
@@ -78,7 +78,12 @@ pub fn scan_repository_incremental(
             .and_then(|n| n.to_str())
             .filter(|n| !n.is_empty())
             .unwrap_or("repository");
-        let legacy_repo_id = stable_id(&["node", "repository", basename]);
+        // Use the old cache's schema version so the deleted_id matches what the old
+        // extractor actually wrote (e.g. `codegraph:v1:…` for a v1 cache).
+        let legacy_repo_id = versioned_stable_id(
+            previous_cache.schema_version,
+            &["node", "repository", basename],
+        );
         if legacy_repo_id != repository_id {
             graph.push(GraphRecord::Tombstone {
                 id: stable_id(&["tombstone", "repository-identity-changed", &legacy_repo_id]),

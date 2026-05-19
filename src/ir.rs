@@ -867,6 +867,20 @@ pub fn stable_id(parts: &[&str]) -> String {
     format!("codegraph:v{SCHEMA_VERSION}:{}", hasher.finalize().to_hex())
 }
 
+/// Builds a code-graph ID using an explicit schema version rather than the current one.
+///
+/// Used when tombstoning records that were produced by an older version of the extractor;
+/// the deleted ID must match the prefix that was in use when the record was first written.
+#[must_use]
+pub(crate) fn versioned_stable_id(version: u32, parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("codegraph:v{version}:{}", hasher.finalize().to_hex())
+}
+
 /// Builds a stable agent-memory record ID.
 ///
 /// Uses the `agent_memory:v1:` prefix so agent-memory IDs cannot collide with

@@ -205,10 +205,12 @@ fn git_canonical_remote_url(repo_root: &Path) -> RemoteStatus {
     // If all remotes are local, return AllLocal so the caller can use LocalPath identity.
     let mut saw_local = false;
     for remote in &remotes {
+        // Use `git config --get remote.<name>.url` to read the raw stored URL,
+        // avoiding `insteadOf`/`pushInsteadOf` rewrites that `get-url` applies.
         let url_output = Command::new("git")
             .arg("-C")
             .arg(repo_root)
-            .args(["remote", "get-url", remote])
+            .args(["config", "--get", &format!("remote.{remote}.url")])
             .stdin(Stdio::null())
             .output();
 
@@ -264,11 +266,11 @@ pub(crate) fn is_local_remote_url(url: &str) -> bool {
     }
     // No scheme: scp form ([user@]host:path) if ':' appears before any '/'.
     // colon_pos > 1 rejects Windows drive letters like C:/repos (single-char prefix).
-    if url
-        .find(':')
-        .is_some_and(|colon_pos| colon_pos > 1 && !url[..colon_pos].contains('/'))
-    {
-        return false; // scp form — portable
+    if let Some(colon_pos) = url.find(':').filter(|&p| p > 1 && !url[..p].contains('/')) {
+        // scp form: [user@]host:path — portable unless the host is loopback.
+        let host_field = &url[..colon_pos];
+        let host = host_field.split('@').next_back().unwrap_or(host_field);
+        return is_loopback_host(host);
     }
     true // relative path or other local form
 }
@@ -645,6 +647,24 @@ mod tests {
             normalize_remote_url("FTP://EXAMPLE.com"),
             "ftp://example.com"
         );
+    }
+
+    #[test]
+    fn scp_localhost_is_local() {
+        assert!(super::is_local_remote_url("localhost:/srv/repo.git"));
+        assert!(super::is_local_remote_url("git@localhost:/srv/repo.git"));
+    }
+
+    #[test]
+    fn scp_loopback_ipv4_is_local() {
+        assert!(super::is_local_remote_url("git@127.0.0.1:/repo.git"));
+        assert!(super::is_local_remote_url("127.0.0.1:/repo.git"));
+    }
+
+    #[test]
+    fn scp_real_host_is_not_local() {
+        assert!(!super::is_local_remote_url("git@github.com:owner/repo.git"));
+        assert!(!super::is_local_remote_url("github.com:owner/repo.git"));
     }
 
     #[test]
