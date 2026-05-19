@@ -1446,7 +1446,8 @@ fn daemon_agent_registration_distinguishes_colon_bearing_ids() {
                 "agent_id": agent_id,
                 "session_id": session_id,
                 "agent_kind": "codex",
-                "project_scope": "egregore"
+                "project_scope": "egregore",
+                "created_at": "2026-05-18T00:00:00Z"
             }),
         );
         assert!(
@@ -1658,7 +1659,8 @@ fn daemon_registers_agents_runs_ingest_jobs_and_queries_records() {
             "agent_id": "test-agent",
             "session_id": "test-session",
             "agent_kind": "codex",
-            "project_scope": "egregore"
+            "project_scope": "egregore",
+            "created_at": "2026-05-17T00:00:00Z"
         }),
     );
     assert!(
@@ -2373,7 +2375,8 @@ fn contract_conformance_all_routes() {
                 "agent_id": "conf-agent",
                 "session_id": "conf-session",
                 "agent_kind": "test",
-                "project_scope": "egregore"
+                "project_scope": "egregore",
+                "created_at": "2026-05-18T00:00:00Z"
             }),
         );
         assert!(
@@ -2681,7 +2684,8 @@ fn agent_registration_produces_agent_memory_ids() {
             "agent_id": "test-agent-schema",
             "session_id": "test-session-schema",
             "agent_kind": "claude-code",
-            "project_scope": "egregore"
+            "project_scope": "egregore",
+            "created_at": "2026-05-18T00:00:00Z"
         }),
     );
     assert!(

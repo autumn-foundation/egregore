@@ -618,6 +618,8 @@ struct AgentRegisterRequest {
     agent_kind: Option<String>,
     #[serde(default)]
     project_scope: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -670,6 +672,7 @@ struct AgentRegisterFull {
     session_id: String,
     agent_kind: String,
     project_scope: String,
+    registered_at: String,
 }
 
 /// Starts a daemon in the background and waits until it responds.
@@ -1058,11 +1061,11 @@ fn apply_write(
             None
         }
     };
-    if let Some(pending_records) = pending_records
+    if pending_records.is_some()
         && let Some(response) = recover_pending_write(
             &command.idempotency_key,
             &command.payload_hash,
-            &pending_records,
+            &all_records,
             sink,
             idempotency,
         )?
@@ -1179,16 +1182,18 @@ fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult
     Ok(())
 }
 
-// Resolves an evidence link's target ID.  Returns the canonical record ID or an error.
+// Resolves an evidence link's target ID.  Returns (canonical_record_id, routing_commit) or an error.
 // Accepts either a direct `target_record_id` or a (path, span, commit) triple.
 // `batch` is the current ingest payload; targets that have not yet been written but
 // appear in the same batch are accepted so one request can atomically create a target
 // node and an observation that cites it.
+// For triple resolution, routing_commit is link.target_git_commit.
+// For direct ID with as_of_commit, validates the commit exists as a temporal observation.
 fn resolve_evidence_target(
     link: &EvidenceLink,
     sink: &EmbeddedAletheiaSink,
     batch: &[GraphRecord],
-) -> WriteResult<String> {
+) -> WriteResult<(String, Option<String>)> {
     if let Some(id) = &link.target_record_id {
         let in_sink = match sink.read_back(id) {
             Ok(found) => found.is_some(),
@@ -1202,7 +1207,33 @@ fn resolve_evidence_target(
             ));
         }
         validate_evidence_target_domain(id, &link.target_domain)?;
-        return Ok(id.clone());
+        if let Some(commit) = &link.as_of_commit {
+            let store_records = sink
+                .read_all_records()
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            let commit_found = store_records.iter().chain(batch.iter()).any(|record| {
+                if let GraphRecord::Node {
+                    id: record_id,
+                    temporal: Some(t),
+                    ..
+                } = record
+                {
+                    record_id == id && &t.git_commit == commit
+                } else {
+                    false
+                }
+            });
+            if !commit_found {
+                return Err(ApiError::new(
+                    ErrorCode::UnresolvedEvidenceTarget,
+                    format!(
+                        "evidence link target '{id}' has no temporal observation at commit '{commit}'"
+                    ),
+                ));
+            }
+            return Ok((id.clone(), Some(commit.clone())));
+        }
+        return Ok((id.clone(), None));
     }
     // Triple-based resolution: scan store + batch for matching path + commit [+ span].
     let path = link.target_repo_relative_path.as_deref().ok_or_else(|| {
@@ -1240,7 +1271,9 @@ fn resolve_evidence_target(
     match found_id {
         Some(id) => {
             validate_evidence_target_domain(&id, &link.target_domain)?;
-            Ok(id)
+            // For triple resolution, route by the target commit so multi-observation
+            // temporal targets resolve to the correct historical endpoint.
+            Ok((id, link.target_git_commit.clone()))
         }
         None => Err(ApiError::new(
             ErrorCode::UnresolvedEvidenceTarget,
@@ -1255,8 +1288,10 @@ struct ResolvedLink {
     target_id: String,
     relation: String,
     confidence: Option<String>,
-    // Propagated to the synthesized edge so multi-observation temporal targets can be resolved.
-    as_of_commit: Option<String>,
+    // Commit used to route the synthesized edge to the correct temporal observation.
+    // For direct-ID links this is the validated as_of_commit; for triple links it is
+    // the target_git_commit from the triple.
+    routing_commit: Option<String>,
 }
 
 // Sentinel timestamps used for evidence-edge temporal routing metadata.
@@ -1265,6 +1300,7 @@ struct ResolvedLink {
 const EVIDENCE_EDGE_ROUTING_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 
 // Returns the synthesized edges, which the caller must include in the write set.
+#[allow(clippy::too_many_lines)]
 fn validate_and_synthesize_evidence_edges(
     records: &[GraphRecord],
     sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
@@ -1331,18 +1367,17 @@ fn validate_and_synthesize_evidence_edges(
                     }
                 }
                 for link in links {
-                    let target_id = resolve_evidence_target(link, &sink_guard, records)?;
-                    let link_confidence = if link.confidence.is_empty() {
-                        confidence.clone()
-                    } else {
-                        Some(link.confidence.clone())
-                    };
+                    let (target_id, routing_commit) =
+                        resolve_evidence_target(link, &sink_guard, records)?;
+                    if link.confidence.is_empty() {
+                        return Err(ApiError::missing_field("evidence_links[].confidence"));
+                    }
                     resolved.push(ResolvedLink {
                         node_id: id.clone(),
                         target_id,
                         relation: link.relation.clone(),
-                        confidence: link_confidence,
-                        as_of_commit: link.as_of_commit.clone(),
+                        confidence: Some(link.confidence.clone()),
+                        routing_commit,
                     });
                 }
             }
@@ -1352,9 +1387,9 @@ fn validate_and_synthesize_evidence_edges(
     };
 
     // Phase 2: synthesize edge records (no lock needed).
-    // Deduplicate by stable edge ID so duplicate links (same target+relation) don't
-    // create multiple physical edges with the same logical ID.
-    let mut seen_edge_ids = std::collections::BTreeSet::new();
+    // Deduplicate by stable edge ID.  Same edge ID + same routing commit → skip silently.
+    // Same edge ID but different routing commits → conflict error (ambiguous temporal target).
+    let mut seen_edges: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut edges = Vec::with_capacity(resolved.len());
     for rl in resolved {
         let edge_label = EdgeLabel::from_relation(&rl.relation).ok_or_else(|| {
@@ -1377,9 +1412,9 @@ fn validate_and_synthesize_evidence_edges(
         // If the citation anchors a specific commit, attach it as routing-only temporal metadata
         // so write_edge can resolve the correct temporal endpoint when the target has multiple
         // historical observations.
-        let edge = if let Some(commit) = rl.as_of_commit {
+        let edge = if let Some(ref commit) = rl.routing_commit {
             edge.with_temporal(TemporalMetadata {
-                git_commit: commit,
+                git_commit: commit.clone(),
                 git_parent_commits: Vec::new(),
                 valid_time: EVIDENCE_EDGE_ROUTING_TIMESTAMP.to_owned(),
                 observed_at: EVIDENCE_EDGE_ROUTING_TIMESTAMP.to_owned(),
@@ -1388,8 +1423,20 @@ fn validate_and_synthesize_evidence_edges(
         } else {
             edge
         };
-        if seen_edge_ids.insert(edge.id().to_owned()) {
-            edges.push(edge);
+        let edge_id = edge.id().to_owned();
+        match seen_edges.get(&edge_id) {
+            Some(existing) if *existing == rl.routing_commit => {
+                // exact duplicate (same target + relation + commit), skip silently
+            }
+            Some(_) => {
+                return Err(ApiError::bad_request(format!(
+                    "evidence links for edge '{edge_id}' have conflicting as_of_commit values"
+                )));
+            }
+            None => {
+                seen_edges.insert(edge_id, rl.routing_commit);
+                edges.push(edge);
+            }
         }
     }
     Ok(edges)
@@ -1692,7 +1739,12 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     }
     let deadline = budget.and_then(|b| started.checked_add(b));
     let mut records = Vec::new();
-    for record_id in payload.record_ids.iter().take(limit) {
+    let domain_filtered_ids: Vec<&String> = payload
+        .record_ids
+        .iter()
+        .filter(|id| record_id_matches_domain(id, &domain))
+        .collect();
+    for record_id in domain_filtered_ids.iter().take(limit) {
         if let Err(error) = check_query_budget(started, budget) {
             return HttpResponse::error_with_id(&request_id, error);
         }
@@ -1803,6 +1855,18 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
             );
         }
     };
+    let registered_at = match non_empty(registration.created_at.as_deref()) {
+        None => {
+            return HttpResponse::error_with_id(&request_id, ApiError::missing_field("created_at"));
+        }
+        Some(ts) if DateTime::parse_from_rfc3339(ts).is_err() => {
+            return HttpResponse::error_with_id(
+                &request_id,
+                ApiError::bad_request("created_at must be RFC 3339"),
+            );
+        }
+        Some(ts) => ts.to_owned(),
+    };
 
     let agent_status = AgentStatus {
         agent_id: agent_id.clone(),
@@ -1828,6 +1892,7 @@ fn handle_agent_register(request: &HttpRequest, state: &ServerState) -> HttpResp
         session_id,
         agent_kind,
         project_scope,
+        registered_at,
     };
     let records = agent_registration_records(&reg);
     let idempotency_key = stable_pair_key("agent-register", &reg.agent_id, &reg.session_id);
@@ -2218,7 +2283,7 @@ fn agent_registration_records(registration: &AgentRegisterFull) -> Vec<GraphReco
         &registration.agent_id,
         &registration.session_id,
     ]);
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = registration.registered_at.clone();
     let mut agent_node = GraphRecord::node(
         agent_node_id.clone(),
         NodeKind::Agent,
