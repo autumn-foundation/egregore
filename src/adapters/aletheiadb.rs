@@ -450,8 +450,12 @@ impl EmbeddedAletheiaSink {
     ///
     /// Returns an error if an embedded read operation fails.
     pub fn stored_repository_ids(&self) -> AdapterResult<Vec<String>> {
+        let tombstoned = self.active_deleted_ids()?;
         let mut ids = Vec::new();
         for record_id in self.node_lookup.latest.keys() {
+            if tombstoned.contains(record_id.as_str()) {
+                continue;
+            }
             if let Some(record) = self.read_back(record_id)?
                 && matches!(
                     record,
@@ -473,8 +477,12 @@ impl EmbeddedAletheiaSink {
     ///
     /// Returns an error if an embedded read operation fails.
     pub fn stored_local_path_repository_ids(&self) -> AdapterResult<Vec<String>> {
+        let tombstoned = self.active_deleted_ids()?;
         let mut ids = Vec::new();
         for record_id in self.node_lookup.latest.keys() {
+            if tombstoned.contains(record_id.as_str()) {
+                continue;
+            }
             if let Some(GraphRecord::Node {
                 kind: NodeKind::Repository,
                 repository_identity,
@@ -494,6 +502,35 @@ impl EmbeddedAletheiaSink {
             }
         }
         Ok(ids)
+    }
+
+    /// Returns the set of record IDs that have active (non-stale) tombstones.
+    fn active_deleted_ids(&self) -> AdapterResult<std::collections::BTreeSet<String>> {
+        let mut deleted = std::collections::BTreeSet::new();
+        for &tombstone_node_id in self.tombstone_ids.values() {
+            let node = self
+                .db
+                .get_node(tombstone_node_id)
+                .map_err(|e| read_back_error("active_deleted_ids", e.to_string()))?;
+            let Some(deleted_id) = optional_str_property(
+                "active_deleted_ids",
+                "deleted_id",
+                node.get_property("deleted_id"),
+            )?
+            else {
+                continue;
+            };
+            // Tombstone is stale if the record was re-ingested after it (higher NodeId).
+            let is_stale = self
+                .node_lookup
+                .non_temporal
+                .get(deleted_id.as_str())
+                .is_some_and(|&live_node_id| live_node_id > tombstone_node_id);
+            if !is_stale {
+                deleted.insert(deleted_id);
+            }
+        }
+        Ok(deleted)
     }
 
     /// Returns true if the store contains any records whose ID does not start with `codegraph:`.

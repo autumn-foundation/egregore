@@ -143,7 +143,7 @@ fn git_is_repo_root(repo_root: &Path) -> bool {
 }
 
 /// Returns the normalized canonical URL of the lowest-name-sorted remote,
-/// or `None` if `.git` does not exist or has no remotes.
+/// or `None` if `.git` does not exist or has no usable non-local remote.
 fn git_canonical_remote_url(repo_root: &Path) -> Option<String> {
     if !git_is_repo_root(repo_root) {
         return None;
@@ -173,34 +173,40 @@ fn git_canonical_remote_url(repo_root: &Path) -> Option<String> {
     }
 
     remotes.sort_unstable();
-    let first_remote = remotes[0];
 
-    let url_output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["remote", "get-url", first_remote])
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+    // Iterate sorted remotes; skip local remotes and use the first non-local URL.
+    for remote in &remotes {
+        let url_output = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["remote", "get-url", remote])
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
 
-    if !url_output.status.success() {
-        return None;
+        if !url_output.status.success() {
+            continue;
+        }
+
+        let url = String::from_utf8(url_output.stdout).ok()?;
+        let url = url.trim();
+
+        if url.is_empty() || is_local_remote_url(url) {
+            continue;
+        }
+
+        return Some(normalize_remote_url(url));
     }
 
-    let url = String::from_utf8(url_output.stdout).ok()?;
-    let url = url.trim();
+    None
+}
 
-    if url.is_empty() {
-        return None;
-    }
-
-    // Reject local-path remotes: they are machine-specific and must not be used
-    // as shared identity. Fall through to LocalRootCommit or LocalPath instead.
-    if url.starts_with('/') || url.starts_with("file://") {
-        return None;
-    }
-
-    Some(normalize_remote_url(url))
+/// Returns `true` for URLs that are machine-specific local paths rather than
+/// portable remote addresses: absolute paths, `file://` URLs, and relative paths.
+fn is_local_remote_url(url: &str) -> bool {
+    url.starts_with('/')
+        || url.starts_with("file://")
+        || (!url.contains("://") && !url.contains('@'))
 }
 
 /// Returns the root commit SHA (oldest first-parent ancestor of HEAD),
