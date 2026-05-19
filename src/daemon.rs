@@ -1295,6 +1295,54 @@ fn validate_no_local_path_identity_in_shared_store(
         })
         .collect();
 
+    let incoming_repo_ids: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|record| {
+            if let GraphRecord::Node {
+                id,
+                kind: NodeKind::Repository,
+                ..
+            } = record
+            {
+                return Some(id.as_str());
+            }
+            None
+        })
+        .collect();
+
+    let incoming_has_non_codegraph = records
+        .iter()
+        .any(|record| !record.id().starts_with("codegraph:"));
+
+    let (existing_repository_ids, stored_local_path_ids, store_is_multi_domain) = {
+        let sink = sink
+            .read()
+            .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
+        (
+            sink.stored_repository_ids()
+                .map_err(|error| ApiError::internal(error.to_string()))?,
+            sink.stored_local_path_repository_ids()
+                .map_err(|error| ApiError::internal(error.to_string()))?,
+            sink.has_non_codegraph_records(),
+        )
+    };
+
+    // Inverse check: if the store already has local_path repos, block writes that would
+    // make the store shared (different repo ID or non-codegraph records).
+    for stored_local_path_id in &stored_local_path_ids {
+        let incoming_adds_different_repo = incoming_repo_ids
+            .iter()
+            .any(|id| *id != stored_local_path_id.as_str());
+        if incoming_adds_different_repo || incoming_has_non_codegraph {
+            return Err(ApiError::new(
+                ErrorCode::LocalPathIdentityUnsupported,
+                "store already contains a Repository with identity_source 'local_path'; \
+                 adding a different repository or non-codegraph records would make it shared. \
+                 Use a remote-backed clone or --repo-id-override.",
+            ));
+        }
+    }
+
     if incoming_local_path_ids.is_empty() {
         return Ok(());
     }
@@ -1309,17 +1357,6 @@ fn validate_no_local_path_identity_in_shared_store(
              ingested into a store",
         ));
     }
-
-    let (existing_repository_ids, store_is_multi_domain) = {
-        let sink = sink
-            .read()
-            .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
-        (
-            sink.stored_repository_ids()
-                .map_err(|error| ApiError::internal(error.to_string()))?,
-            sink.has_non_codegraph_records(),
-        )
-    };
 
     for incoming_id in incoming_local_path_ids {
         let has_other_repo = existing_repository_ids

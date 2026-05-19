@@ -8,8 +8,8 @@ use crate::{
     adapters::{AdapterError, AdapterResult, ExpectedRecordState, GraphSink},
     daemon::StoreLease,
     ir::{
-        EdgeLabel, EvidenceLink, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan,
-        TemporalMetadata,
+        EdgeLabel, EvidenceLink, GraphRecord, IdentitySource, NodeKind, SemanticDriftMetadata,
+        SourceSpan, TemporalMetadata,
     },
 };
 
@@ -460,6 +460,27 @@ impl EmbeddedAletheiaSink {
                         ..
                     }
                 )
+            {
+                ids.push(record_id.clone());
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Returns the codegraph IDs of all `Repository` nodes with `identity_source = local_path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an embedded read operation fails.
+    pub fn stored_local_path_repository_ids(&self) -> AdapterResult<Vec<String>> {
+        let mut ids = Vec::new();
+        for record_id in self.node_lookup.latest.keys() {
+            if let Some(GraphRecord::Node {
+                kind: NodeKind::Repository,
+                repository_identity: Some(payload),
+                ..
+            }) = self.read_back(record_id)?
+                && payload.identity_source == IdentitySource::LocalPath
             {
                 ids.push(record_id.clone());
             }

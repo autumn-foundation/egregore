@@ -62,6 +62,13 @@ pub fn compute_repository_identity(
     // Case 1: .git with at least one remote → use lowest-name-sorted remote URL.
     if let Some(canonical_url) = git_canonical_remote_url(repo_root) {
         let id = stable_id(&["repository", "remote", &canonical_url]);
+        let stable_basename = canonical_url
+            .strip_prefix("https://")
+            .or_else(|| canonical_url.strip_prefix("http://"))
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(_, path)| path.to_owned())
+            .filter(|path| !path.is_empty())
+            .unwrap_or_else(|| basename.clone());
         return RepositoryIdentity {
             id,
             payload: RepositoryIdentityPayload {
@@ -69,7 +76,7 @@ pub fn compute_repository_identity(
                 remote_url: Some(canonical_url),
                 root_commit_sha: None,
                 canonical_path: None,
-                basename,
+                basename: stable_basename,
             },
         };
     }
@@ -77,6 +84,7 @@ pub fn compute_repository_identity(
     // Case 2: .git with commits but no remotes → use root commit SHA.
     if let Some(root_sha) = git_root_commit_sha(repo_root) {
         let id = stable_id(&["repository", "local-root-commit", &root_sha]);
+        let stable_basename = format!("commit-{}", root_sha.chars().take(12).collect::<String>());
         return RepositoryIdentity {
             id,
             payload: RepositoryIdentityPayload {
@@ -84,7 +92,7 @@ pub fn compute_repository_identity(
                 remote_url: None,
                 root_commit_sha: Some(root_sha),
                 canonical_path: None,
-                basename,
+                basename: stable_basename,
             },
         };
     }
@@ -104,7 +112,6 @@ pub fn compute_repository_identity(
         },
     }
 }
-
 
 /// Returns the canonicalized absolute path of `repo_root`'s git top-level,
 /// or `None` if git cannot discover a repository at `repo_root`.
@@ -129,7 +136,8 @@ fn git_is_repo_root(repo_root: &Path) -> bool {
     let Some(top_level) = git_top_level(repo_root) else {
         return false;
     };
-    let canonical_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let canonical_root =
+        std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let canonical_top = std::fs::canonicalize(&top_level).unwrap_or(top_level);
     canonical_root == canonical_top
 }
@@ -235,7 +243,7 @@ pub fn normalize_remote_url(url: &str) -> String {
 
     // SSH URL form: ssh://[user@]host/path
     if let Some(rest) = url.strip_prefix("ssh://") {
-        let rest = rest.strip_prefix("git@").unwrap_or(rest);
+        let rest = rest.split_once('@').map_or(rest, |(_, after)| after);
         if let Some(slash) = rest.find('/') {
             let host = rest[..slash].to_lowercase();
             let path = &rest[slash..];
@@ -317,6 +325,14 @@ mod tests {
     fn ssh_url_without_user_normalized() {
         assert_eq!(
             normalize_remote_url("ssh://github.com/owner/repo"),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn ssh_url_arbitrary_user_stripped() {
+        assert_eq!(
+            normalize_remote_url("ssh://alice@github.com/owner/repo.git"),
             "https://github.com/owner/repo"
         );
     }

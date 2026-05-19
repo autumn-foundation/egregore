@@ -114,23 +114,21 @@ fn stable_display_name(payload: &RepositoryIdentityPayload) -> String {
             .remote_url
             .as_deref()
             .and_then(|url| {
-                url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))
+                url.strip_prefix("https://")
+                    .or_else(|| url.strip_prefix("http://"))
             })
             .and_then(|rest| rest.split_once('/'))
             .map(|(_, path)| path)
             .filter(|path| !path.is_empty())
             .unwrap_or(&payload.basename)
             .to_owned(),
-        IdentitySource::LocalRootCommit => payload
-            .root_commit_sha
-            .as_deref()
-            .map_or_else(
-                || payload.basename.clone(),
-                |sha| {
-                    let short: String = sha.chars().take(12).collect();
-                    format!("commit-{short}")
-                },
-            ),
+        IdentitySource::LocalRootCommit => payload.root_commit_sha.as_deref().map_or_else(
+            || payload.basename.clone(),
+            |sha| {
+                let short: String = sha.chars().take(12).collect();
+                format!("commit-{short}")
+            },
+        ),
         IdentitySource::OperatorOverride | IdentitySource::LocalPath => payload.basename.clone(),
     }
 }

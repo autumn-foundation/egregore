@@ -94,7 +94,7 @@ pub fn scan_repository_incremental(
     for removed in previous_cache.files.keys() {
         if !seen_files.contains(removed) {
             tombstoned_files.push(removed.clone());
-            graph.push(file_tombstone(removed));
+            graph.push(file_tombstone(removed, &repository_id));
         }
     }
 
@@ -167,10 +167,16 @@ fn file_hash(path: &Path) -> Result<String> {
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
-fn file_tombstone(repo_relative_path: &str) -> GraphRecord {
-    let deleted_id = stable_id(&["node", "file", repo_relative_path]);
+fn file_tombstone(repo_relative_path: &str, repository_id: &str) -> GraphRecord {
+    let deleted_id = stable_id(&["node", "file", repository_id, repo_relative_path]);
     GraphRecord::Tombstone {
-        id: stable_id(&["tombstone", "file", repo_relative_path, &deleted_id]),
+        id: stable_id(&[
+            "tombstone",
+            "file",
+            repository_id,
+            repo_relative_path,
+            &deleted_id,
+        ]),
         schema_version: SCHEMA_VERSION,
         deleted_id,
         summary: format!("Removed source file {repo_relative_path}"),

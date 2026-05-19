@@ -170,7 +170,13 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
 
     fn extract_import(&mut self, node: Node<'_>) {
         let name = import_name(self.node_text(node));
-        let id = stable_id(&["node", "import", self.repository_id, &self.file.repo_relative_path, &name]);
+        let id = stable_id(&[
+            "node",
+            "import",
+            self.repository_id,
+            &self.file.repo_relative_path,
+            &name,
+        ]);
         self.graph.push(GraphRecord::syntax_node(
             id.clone(),
             NodeKind::Import,
