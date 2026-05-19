@@ -30,7 +30,7 @@ use crate::{
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord, IdentitySource,
-        NodeKind, TemporalMetadata, agent_memory_stable_id,
+        NodeKind, TemporalMetadata, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
     },
     query as graph_query,
 };
@@ -1538,6 +1538,7 @@ fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<
         let GraphRecord::Node {
             id,
             domain,
+            schema_version,
             source_artifact_hash,
             source_artifact_path,
             stdout_handle,
@@ -1553,7 +1554,19 @@ fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<
             continue;
         }
 
-        let has_artifact_handle = source_artifact_hash.is_some() || source_artifact_path.is_some();
+        if *schema_version != VERIFICATION_SCHEMA_VERSION {
+            return Err(ApiError::bad_request(format!(
+                "verification node '{id}' has schema_version {schema_version} but only \
+                 version {VERIFICATION_SCHEMA_VERSION} is accepted"
+            )));
+        }
+
+        let has_artifact_handle = source_artifact_hash
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+            || source_artifact_path
+                .as_deref()
+                .is_some_and(|s| !s.is_empty());
         let stdout_hash = stdout_handle.as_deref().is_some_and(|h| !h.hash.is_empty());
         let stderr_hash = stderr_handle.as_deref().is_some_and(|h| !h.hash.is_empty());
 
@@ -1566,23 +1579,23 @@ fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<
             ));
         }
 
-        if let Some(h) = stdout_handle.as_deref()
-            && h.inline.is_some()
-            && h.bytes > INLINE_CEILING
-        {
-            return Err(ApiError::bad_request(
-                "verification-domain CommandRun: stdout_handle.inline must be None when \
-                 bytes exceeds the 16 KiB ceiling; demote to handle-only before writing",
-            ));
+        if let Some(h) = stdout_handle.as_deref() {
+            let inline_len = h.inline.as_deref().map_or(0, |s| s.len() as u64);
+            if inline_len > INLINE_CEILING || (h.inline.is_some() && h.bytes > INLINE_CEILING) {
+                return Err(ApiError::bad_request(
+                    "verification-domain CommandRun: stdout_handle.inline must be None when \
+                     bytes exceeds the 16 KiB ceiling; demote to handle-only before writing",
+                ));
+            }
         }
-        if let Some(h) = stderr_handle.as_deref()
-            && h.inline.is_some()
-            && h.bytes > INLINE_CEILING
-        {
-            return Err(ApiError::bad_request(
-                "verification-domain CommandRun: stderr_handle.inline must be None when \
-                 bytes exceeds the 16 KiB ceiling; demote to handle-only before writing",
-            ));
+        if let Some(h) = stderr_handle.as_deref() {
+            let inline_len = h.inline.as_deref().map_or(0, |s| s.len() as u64);
+            if inline_len > INLINE_CEILING || (h.inline.is_some() && h.bytes > INLINE_CEILING) {
+                return Err(ApiError::bad_request(
+                    "verification-domain CommandRun: stderr_handle.inline must be None when \
+                     bytes exceeds the 16 KiB ceiling; demote to handle-only before writing",
+                ));
+            }
         }
     }
     Ok(())

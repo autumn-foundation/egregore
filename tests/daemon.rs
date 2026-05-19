@@ -3640,3 +3640,144 @@ fn verification_command_run_oversized_inline_rejected() {
 
     daemon.stop();
 }
+
+#[test]
+fn verification_empty_artifact_hash_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // source_artifact_hash present but empty — must be treated as missing
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-empty-hash-reject",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-empty-hash-reject-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:empty-hash-fixture",
+                    "kind": "TestRun",
+                    "schema_version": 1,
+                    "summary": "TestRun with empty source_artifact_hash - should be rejected",
+                    "source_artifact_hash": ""
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "empty source_artifact_hash should be rejected; got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_evidence_handle",
+        "empty hash must produce missing_evidence_handle, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn verification_wrong_schema_version_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-wrong-schema-version",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-wrong-schema-version-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:wrong-schema-version-fixture",
+                    "kind": "TestRun",
+                    "schema_version": 2,
+                    "summary": "TestRun with unsupported schema_version",
+                    "source_artifact_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "unsupported schema_version should be rejected; got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "wrong schema_version must produce bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn verification_spoofed_bytes_oversized_inline_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // 17 KiB inline but bytes field claims only 100 bytes — should still be rejected
+    let oversized_inline: String = "x".repeat(17 * 1024);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-spoofed-bytes-reject",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-spoofed-bytes-reject-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:spoofed-bytes-fixture",
+                    "kind": "CommandRun",
+                    "schema_version": 1,
+                    "summary": "CommandRun with spoofed bytes field",
+                    "source_artifact_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "stdout_handle": {
+                        "inline": oversized_inline,
+                        "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                        "bytes": 100_u64
+                    }
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "spoofed bytes with oversized inline should be rejected; got {response}"
+    );
+    let body = response_json(&response);
+    assert!(
+        body["error"]["code"] == "bad_request" || body["error"]["code"] == "payload_too_large",
+        "spoofed bytes rejection must carry bad_request or payload_too_large, got {body}"
+    );
+
+    daemon.stop();
+}
