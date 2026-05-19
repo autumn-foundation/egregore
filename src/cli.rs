@@ -671,7 +671,14 @@ fn print_daemon_drift_record(rec: &serde_json::Value, format: OutputFormat) -> R
         OutputFormat::Json => println!("{}", serde_json::to_string(rec)?),
         OutputFormat::Text => {
             let name = rec["name"].as_str().unwrap_or("(unknown)");
-            let score = rec["score"].as_str().unwrap_or("?");
+            // score may be a JSON string ("0.92") or a JSON number (0.92);
+            // accept both so text output is correct regardless of serialisation path.
+            let score_owned = rec["score"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| rec["score"].as_f64().map(|f| f.to_string()))
+                .unwrap_or_else(|| "?".to_owned());
+            let score = score_owned.as_str();
             let before = rec["before_commit"].as_str().unwrap_or("?");
             let after = rec["after_commit"].as_str().unwrap_or("?");
             let path = rec["repo_relative_path"].as_str().unwrap_or("(unknown)");

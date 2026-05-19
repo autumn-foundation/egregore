@@ -2898,8 +2898,15 @@ fn handle_verb_get_records(
         .filter(|id| record_id_matches_domain(id, domain))
         .collect();
 
-    // Capture snapshot before the first read-lock acquisition.
-    let snapshot = rfc3339_now();
+    // Capture snapshot under a brief read lock so it is bound to the store
+    // state at the start of the read sequence rather than before any lock.
+    let snapshot = {
+        let _snap_guard = match query_sink_read(state, started, budget) {
+            Ok(g) => g,
+            Err(e) => return HttpResponse::error_with_id(request_id, e),
+        };
+        rfc3339_now()
+    };
 
     for record_id in domain_filtered.iter().take(limit) {
         if let Err(error) = check_query_budget(started, budget) {
@@ -3123,20 +3130,20 @@ fn handle_verb_symbol_at_commit(
 
 // ── Verb handler: file_defines ────────────────────────────────────────────────
 
-/// Collects the symbols defined in `path` as of `as_of_dt` (most-recent per
-/// `(name, start_line)` key so that same-name symbols at different spans are preserved).
-/// For span-absent records the `record_id` is used as the key component, preventing
-/// distinct same-name symbols from being coalesced when line information is missing.
+/// Collects the symbols defined in `path` as of `as_of_dt`.
+/// Deduplicates by `name` for spanned records (history records with the same name
+/// are the same logical symbol, even when it moves lines across commits) and by
+/// `record_id` for span-absent records to avoid coalescing distinct same-name symbols
+/// that have no positional information.
 fn file_defines_as_of(
     records: &[GraphRecord],
     path: &str,
     as_of_dt: chrono::DateTime<chrono::FixedOffset>,
     limit: usize,
 ) -> Vec<serde_json::Value> {
-    // Key: (name, span_key) where span_key is "line:<n>" when a span is present
-    // or "id:<record_id>" when it is absent.  This preserves distinct same-name
-    // symbols at different positions while still deduplicating the same logical
-    // symbol across history commits when its position is known.
+    // Key: (name, span_key) where span_key is "" for spanned records (dedup by
+    // name so the same logical symbol is collapsed across line-moving commits)
+    // or "id:<record_id>" for span-absent records.
     #[allow(clippy::type_complexity)]
     let mut best: std::collections::BTreeMap<
         (String, String),
@@ -3181,7 +3188,12 @@ fn file_defines_as_of(
             continue;
         };
         let line = span.map(|s| s.start_line);
-        let span_key = line.map_or_else(|| format!("id:{}", id.as_str()), |l| format!("line:{l}"));
+        // For spanned records, dedup by name only: the same logical symbol is
+        // coalesced to its most-recent version even when it moves lines across
+        // commits (history records with the same name are always the same symbol).
+        // For span-absent records, fall back to record_id so distinct same-name
+        // symbols without positional info are not incorrectly merged.
+        let span_key = line.map_or_else(|| format!("id:{}", id.as_str()), |_| String::new());
         let key = (name_str.to_owned(), span_key);
         let is_better = best.get(&key).is_none_or(|(pv, _, pvt)| {
             vt > *pvt || (vt == *pvt && json["record_id"].as_str() < pv["record_id"].as_str())
@@ -3359,7 +3371,18 @@ fn handle_verb_drift_top_n(
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .is_some_and(|vt| vt <= as_of_dt)
             }
-            _ => true,
+            // Edges: temporal edges are filtered to valid_time <= as_of_dt so
+            // DriftsFrom edges newer than as_of don't decorate older drift nodes.
+            // Edges without temporal info are current-state and always kept.
+            GraphRecord::Edge { temporal, .. } => {
+                let vt_str = temporal.as_ref().map(|t| t.valid_time.as_str());
+                vt_str.is_none_or(|s| {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .ok()
+                        .is_some_and(|vt| vt <= as_of_dt)
+                })
+            }
+            GraphRecord::Tombstone { .. } => true,
         });
     }
 
