@@ -1617,6 +1617,11 @@ fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<
                 ));
             }
             let inline_len = h.inline.as_deref().map_or(0, |s| s.len() as u64);
+            if inline_len > h.bytes {
+                return Err(ApiError::bad_request(
+                    "verification-domain stdout_handle.bytes must be >= inline payload length",
+                ));
+            }
             if inline_len > INLINE_CEILING || (h.inline.is_some() && h.bytes > INLINE_CEILING) {
                 return Err(ApiError::bad_request(
                     "verification-domain stdout_handle.inline must be None when bytes exceeds \
@@ -1631,6 +1636,11 @@ fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<
                 ));
             }
             let inline_len = h.inline.as_deref().map_or(0, |s| s.len() as u64);
+            if inline_len > h.bytes {
+                return Err(ApiError::bad_request(
+                    "verification-domain stderr_handle.bytes must be >= inline payload length",
+                ));
+            }
             if inline_len > INLINE_CEILING || (h.inline.is_some() && h.bytes > INLINE_CEILING) {
                 return Err(ApiError::bad_request(
                     "verification-domain stderr_handle.inline must be None when bytes exceeds \
@@ -1935,11 +1945,18 @@ fn validate_evidence_endpoint_constraints(
                 )));
             }
         }
-        // FAILED_ON is reserved for a Failure source node kind that does not yet exist.
+        // FAILED_ON: now supported from verification-domain sources (TestRun, CIStatus)
+        // targeting codegraph (Symbol, File). Reject unsupported source kinds.
         EdgeLabel::FailedOn => {
-            return Err(ApiError::bad_request(
-                "evidence link relation 'FAILED_ON' requires a Failure source node; the Failure node kind is not yet supported",
-            ));
+            if let Some(sk) = source_kind
+                && !VERIFICATION_NODE_KINDS.contains(&sk)
+            {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation 'FAILED_ON' requires a verification-domain source \
+                     (TestRun or CIStatus); got source kind {}",
+                    sk.as_str()
+                )));
+            }
         }
         // TouchedFile, MentionsSymbol, and all other labels: any agent-memory source kind is permitted.
         _ => {}
@@ -2112,7 +2129,6 @@ fn validate_agent_memory_edge_endpoints(
         EdgeLabel::SessionOf
         | EdgeLabel::AuthoredBy
         | EdgeLabel::ReferencesTask
-        | EdgeLabel::Contradicts
         | EdgeLabel::Supersedes => {
             if !target.starts_with("agent_memory:v1:") {
                 return Err(ApiError::bad_request(format!(
@@ -2455,10 +2471,21 @@ fn validate_and_synthesize_evidence_edges(
                                 )));
                             }
                         }
-                        EdgeLabel::ValidatedBy
-                        | EdgeLabel::Contradicts
-                        | EdgeLabel::Supersedes
-                        | EdgeLabel::HasEvidence => {
+                        // ValidatedBy and HasEvidence can target agent_memory OR verification.
+                        EdgeLabel::ValidatedBy | EdgeLabel::HasEvidence => {
+                            if !matches!(
+                                link.target_domain.as_str(),
+                                "agent_memory" | "verification"
+                            ) {
+                                return Err(ApiError::bad_request(format!(
+                                    "evidence link relation '{}' requires target_domain 'agent_memory' or 'verification'; got '{}'",
+                                    edge_label.as_str(),
+                                    link.target_domain
+                                )));
+                            }
+                        }
+                        // Supersedes: agent_memory only.
+                        EdgeLabel::Supersedes => {
                             if link.target_domain != "agent_memory" {
                                 return Err(ApiError::bad_request(format!(
                                     "evidence link relation '{}' requires target_domain 'agent_memory'; got '{}'",
@@ -2467,6 +2494,7 @@ fn validate_and_synthesize_evidence_edges(
                                 )));
                             }
                         }
+                        // CONTRADICTS: TO any — no target_domain restriction.
                         // REFERENCES_TASK: the schema registry documents the TO domain as
                         // "project", but Task nodes currently live in agent_memory.
                         // Accept both to cover clients using the documented domain name.
