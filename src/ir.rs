@@ -648,6 +648,29 @@ impl EdgeLabel {
         )
     }
 
+    /// Returns `true` when this label belongs to the codegraph topology set and
+    /// must not appear on agent-memory (`agent_memory:v1:`) edge records.
+    ///
+    /// Agent-memory structural labels (`SESSION_OF`, `AUTHORED_BY`) and the full
+    /// evidence-link registry are permitted; only extractor-specific topology labels
+    /// such as `CONTAINS`, `CALLS`, `DEFINES`, etc. are rejected.
+    #[must_use]
+    pub const fn is_codegraph_topology_label(self) -> bool {
+        matches!(
+            self,
+            Self::Contains
+                | Self::Defines
+                | Self::Imports
+                | Self::References
+                | Self::Calls
+                | Self::Implements
+                | Self::Mentions
+                | Self::ChangedIn
+                | Self::ParentOf
+                | Self::DriftsFrom
+        )
+    }
+
     /// Returns the serialized edge label.
     #[must_use]
     pub const fn as_str(self) -> &'static str {

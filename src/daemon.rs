@@ -1015,19 +1015,13 @@ fn apply_write(
     idempotency: &Arc<Mutex<IdempotencyStore>>,
 ) -> WriteResult {
     validate_unique_recovery_keys(&command.records)?;
-    let synthesized_edges = validate_and_synthesize_evidence_edges(&command.records, sink)?;
-    let all_records: Vec<GraphRecord> = command
-        .records
-        .iter()
-        .cloned()
-        .chain(synthesized_edges)
-        .collect();
-    let record_ids = all_records
-        .iter()
-        .map(|record| record.id().to_owned())
-        .collect::<Vec<_>>();
-    let pending_records = {
-        let mut store = idempotency
+
+    // Consult the idempotency cache BEFORE running evidence-link validation so that
+    // a committed replay returns the cached response immediately without re-executing
+    // validation against the current store state (which can differ from the original
+    // write, e.g. the target has since grown additional temporal observations).
+    let is_pending = {
+        let store = idempotency
             .lock()
             .map_err(|_| ApiError::internal("idempotency store lock poisoned"))?;
         if let Some(entry) = store.entries.get(&command.idempotency_key) {
@@ -1042,26 +1036,45 @@ fn apply_write(
                     response.idempotent = true;
                     return Ok(response);
                 }
-                IdempotencyEntry::Pending { records, .. } => Some(records.clone()),
+                IdempotencyEntry::Pending { .. } => true,
             }
         } else {
-            store
-                .set_entry_durably(
-                    command.idempotency_key.clone(),
-                    IdempotencyEntry::Pending {
-                        payload_hash: command.payload_hash.clone(),
-                        record_ids: record_ids.clone(),
-                        // Store original records so restart recovery re-enqueues the
-                        // same payload and recomputes the same hash.  Synthesized edges
-                        // are re-derived from the original records on recovery.
-                        records: command.records.clone(),
-                    },
-                )
-                .map_err(|error| ApiError::internal(error.to_string()))?;
-            None
+            false
         }
     };
-    if pending_records.is_some()
+
+    let synthesized_edges = validate_and_synthesize_evidence_edges(&command.records, sink)?;
+    let all_records: Vec<GraphRecord> = command
+        .records
+        .iter()
+        .cloned()
+        .chain(synthesized_edges)
+        .collect();
+    let record_ids = all_records
+        .iter()
+        .map(|record| record.id().to_owned())
+        .collect::<Vec<_>>();
+
+    if !is_pending {
+        let mut store = idempotency
+            .lock()
+            .map_err(|_| ApiError::internal("idempotency store lock poisoned"))?;
+        store
+            .set_entry_durably(
+                command.idempotency_key.clone(),
+                IdempotencyEntry::Pending {
+                    payload_hash: command.payload_hash.clone(),
+                    record_ids: record_ids.clone(),
+                    // Store original records so restart recovery re-enqueues the
+                    // same payload and recomputes the same hash.  Synthesized edges
+                    // are re-derived from the original records on recovery.
+                    records: command.records.clone(),
+                },
+            )
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
+
+    if is_pending
         && let Some(response) = recover_pending_write(
             &command.idempotency_key,
             &command.payload_hash,
@@ -1364,12 +1377,106 @@ fn resolve_evidence_target(
 struct ResolvedLink {
     node_id: String,
     target_id: String,
-    relation: String,
+    // Validated edge label stored directly to avoid re-parsing in Phase 2.
+    edge_label: EdgeLabel,
     confidence: Option<String>,
     // Commit used to route the synthesized edge to the correct temporal observation.
     // For direct-ID links this is the validated as_of_commit; for triple links it is
     // the target_git_commit from the triple.
     routing_commit: Option<String>,
+}
+
+// Looks up a node's kind from the current batch, or falls back to the store.
+fn lookup_node_kind(
+    id: &str,
+    batch: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<Option<NodeKind>> {
+    for r in batch {
+        if r.id() == id {
+            return Ok(if let GraphRecord::Node { kind, .. } = r {
+                Some(*kind)
+            } else {
+                None
+            });
+        }
+    }
+    match sink.read_back(id) {
+        Ok(Some(GraphRecord::Node { kind, .. })) => Ok(Some(kind)),
+        Ok(_) => Ok(None),
+        Err(e) => Err(ApiError::internal(e.to_string())),
+    }
+}
+
+// Validates source-kind and target-kind constraints per evidence-link relation.
+fn validate_evidence_endpoint_constraints(
+    source_kind: NodeKind,
+    label: EdgeLabel,
+    target_kind: Option<NodeKind>,
+    target_id: &str,
+) -> WriteResult<()> {
+    // Source-side constraints.
+    match label {
+        EdgeLabel::Observes | EdgeLabel::MentionsSymbol | EdgeLabel::ExplainsChange => {
+            if source_kind != NodeKind::Observation {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires an Observation source node, not {}",
+                    label.as_str(),
+                    source_kind.as_str()
+                )));
+            }
+        }
+        EdgeLabel::TouchedFile | EdgeLabel::FailedOn => {
+            if !matches!(
+                source_kind,
+                NodeKind::Observation | NodeKind::CommandEvidence | NodeKind::Verification
+            ) {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires an Observation, CommandEvidence, or Verification source node, not {}",
+                    label.as_str(),
+                    source_kind.as_str()
+                )));
+            }
+        }
+        _ => {} // other labels do not constrain source kind
+    }
+    // Target-side constraints.
+    let target_kind_str =
+        || target_kind.map_or_else(|| "unknown".to_owned(), |k| k.as_str().to_owned());
+    match label {
+        EdgeLabel::MentionsSymbol => {
+            if !matches!(target_kind, Some(NodeKind::Symbol)) {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires a Symbol target; target '{}' has kind {}",
+                    label.as_str(),
+                    target_id,
+                    target_kind_str()
+                )));
+            }
+        }
+        EdgeLabel::TouchedFile => {
+            if !matches!(target_kind, Some(NodeKind::File | NodeKind::Commit)) {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires a File or Commit target; target '{}' has kind {}",
+                    label.as_str(),
+                    target_id,
+                    target_kind_str()
+                )));
+            }
+        }
+        EdgeLabel::ReferencesTask => {
+            if !matches!(target_kind, Some(NodeKind::Task)) {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires a Task target; target '{}' has kind {}",
+                    label.as_str(),
+                    target_id,
+                    target_kind_str()
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 // Sentinel timestamps used for evidence-edge temporal routing metadata.
@@ -1390,9 +1497,20 @@ fn validate_and_synthesize_evidence_edges(
             .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
         let mut resolved = Vec::new();
         for record in records {
+            // Validate directly submitted agent-memory edge records.
+            if let GraphRecord::Edge { id, label, .. } = record
+                && id.starts_with("agent_memory:v1:")
+                && label.is_codegraph_topology_label()
+            {
+                return Err(ApiError::bad_request(format!(
+                    "agent-memory edge '{id}' uses codegraph-topology label '{}'; only evidence-link and agent-memory structural labels are permitted for agent-memory edges",
+                    label.as_str()
+                )));
+            }
             if let GraphRecord::Node {
                 id,
                 kind,
+                schema_version,
                 evidence_links,
                 confidence,
                 text,
@@ -1413,13 +1531,20 @@ fn validate_and_synthesize_evidence_edges(
                         "node '{id}' has evidence_links but is not an agent-memory record; evidence links are only supported for agent_memory:v1: nodes"
                     )));
                 }
-                // Enforce required provenance fields for all agent-memory node kinds.
+                // Validate and enforce schema constraints for all agent-memory node kinds.
                 if id.starts_with("agent_memory:v1:") {
+                    // Schema version must match the published agent-memory v1 contract.
+                    if *schema_version != AGENT_MEMORY_SCHEMA_VERSION {
+                        return Err(ApiError::bad_request(format!(
+                            "agent-memory node '{id}' has schema_version {schema_version} but only version {AGENT_MEMORY_SCHEMA_VERSION} is accepted"
+                        )));
+                    }
                     if *kind == NodeKind::Observation && links.is_empty() {
                         return Err(ApiError::missing_field(
                             "evidence_links (Observation requires at least one evidence link)",
                         ));
                     }
+                    // Required provenance fields for all agent-memory node kinds.
                     let required: &[(&str, bool)] = &[
                         ("agent_id", agent_id.as_ref().is_some_and(|s| !s.is_empty())),
                         (
@@ -1438,16 +1563,46 @@ fn validate_and_synthesize_evidence_edges(
                             "ingested_at",
                             ingested_at.as_ref().is_some_and(|s| !s.is_empty()),
                         ),
-                        (
-                            "confidence",
-                            confidence.as_ref().is_some_and(|s| !s.is_empty()),
-                        ),
                     ];
                     for (field, present) in required {
                         if !present {
                             return Err(ApiError::missing_field(format!(
                                 "{field} (required for agent-memory {} nodes)",
                                 kind.as_str()
+                            )));
+                        }
+                    }
+                    // Validate timestamp format for required timestamp fields.
+                    for (ts_field, ts_val) in [
+                        ("observed_at", observed_at.as_deref()),
+                        ("ingested_at", ingested_at.as_deref()),
+                    ] {
+                        if let Some(ts) = ts_val.filter(|s| !s.is_empty())
+                            && DateTime::parse_from_rfc3339(ts).is_err()
+                        {
+                            return Err(ApiError::bad_request(format!(
+                                "{ts_field} '{ts}' is not a valid RFC 3339 timestamp"
+                            )));
+                        }
+                    }
+                    // confidence is required only for Observation nodes; optional for others.
+                    if *kind == NodeKind::Observation
+                        && confidence.as_ref().is_none_or(String::is_empty)
+                    {
+                        return Err(ApiError::missing_field(
+                            "confidence (required for Observation nodes)",
+                        ));
+                    }
+                    // Validate confidence format when present (applies to all kinds).
+                    if let Some(conf_str) = confidence.as_deref().filter(|s| !s.is_empty()) {
+                        let conf_val: f64 = conf_str.parse().map_err(|_| {
+                            ApiError::bad_request(format!(
+                                "confidence '{conf_str}' must be a numeric float string"
+                            ))
+                        })?;
+                        if !(0.0..=1.0).contains(&conf_val) {
+                            return Err(ApiError::bad_request(format!(
+                                "confidence '{conf_str}' must be in the range [0.0, 1.0]"
                             )));
                         }
                     }
@@ -1477,10 +1632,30 @@ fn validate_and_synthesize_evidence_edges(
                             link.confidence
                         )));
                     }
+                    // Validate edge label and source/target endpoint constraints.
+                    let edge_label = EdgeLabel::from_relation(&link.relation).ok_or_else(|| {
+                        ApiError::bad_request(format!(
+                            "unknown evidence link relation '{}'",
+                            link.relation
+                        ))
+                    })?;
+                    if !edge_label.is_evidence_link_label() {
+                        return Err(ApiError::bad_request(format!(
+                            "evidence link relation '{}' is a codegraph-internal label and may not be used in evidence links",
+                            link.relation
+                        )));
+                    }
+                    let target_kind = lookup_node_kind(&target_id, records, &sink_guard)?;
+                    validate_evidence_endpoint_constraints(
+                        *kind,
+                        edge_label,
+                        target_kind,
+                        &target_id,
+                    )?;
                     resolved.push(ResolvedLink {
                         node_id: id.clone(),
                         target_id,
-                        relation: link.relation.clone(),
+                        edge_label,
                         confidence: Some(link.confidence.clone()),
                         routing_commit,
                     });
@@ -1497,18 +1672,14 @@ fn validate_and_synthesize_evidence_edges(
     let mut seen_edges: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut edges = Vec::with_capacity(resolved.len());
     for rl in resolved {
-        let edge_label = EdgeLabel::from_relation(&rl.relation).ok_or_else(|| {
-            ApiError::bad_request(format!("unknown evidence link relation '{}'", rl.relation))
-        })?;
-        if !edge_label.is_evidence_link_label() {
-            return Err(ApiError::bad_request(format!(
-                "evidence link relation '{}' is a code-graph-internal label and may not be used in evidence links",
-                rl.relation
-            )));
-        }
-        let summary = format!("{} {} (from evidence link)", rl.node_id, rl.relation);
+        // edge_label and is_evidence_link_label were already validated in Phase 1.
+        let summary = format!(
+            "{} {} (from evidence link)",
+            rl.node_id,
+            rl.edge_label.as_str()
+        );
         let edge = GraphRecord::agent_memory_edge(
-            edge_label,
+            rl.edge_label,
             rl.node_id,
             rl.target_id,
             rl.confidence,
