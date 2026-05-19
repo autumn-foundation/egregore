@@ -2790,7 +2790,8 @@ fn symbol_node_to_query_json(record: &GraphRecord) -> Option<serde_json::Value> 
 }
 
 /// Converts a `SemanticDrift` node to the query JSON shape that matches CLI `eg query drift`.
-/// Resolves target path/name from the `DRIFTS_FROM` edge when present.
+/// Resolves target path/name first from a `DriftsFrom` edge, then from
+/// `semantic_drift.target_record_id`, and finally from inline node fields.
 fn drift_node_to_query_json(
     record: &GraphRecord,
     all_records: &[GraphRecord],
@@ -2807,7 +2808,9 @@ fn drift_node_to_query_json(
         return None;
     };
 
-    let target_id = all_records.iter().find_map(|r| {
+    // Prefer target id from a DriftsFrom edge; fall back to the inline
+    // target_record_id on the drift metadata when the edge is absent or filtered.
+    let edge_target: Option<&str> = all_records.iter().find_map(|r| {
         if let GraphRecord::Edge {
             source,
             target,
@@ -2820,23 +2823,22 @@ fn drift_node_to_query_json(
         }
         None
     });
+    let target_id: &str = edge_target.unwrap_or(drift.target_record_id.as_str());
 
-    let (resolved_path, resolved_name) = target_id
-        .and_then(|tid| all_records.iter().find(|r| r.id() == tid))
-        .map_or(
-            (drift_path.as_deref(), drift_name.as_deref()),
-            |target| match target {
-                GraphRecord::Node {
-                    repo_relative_path,
-                    name,
-                    ..
-                } => (
-                    repo_relative_path.as_deref().or(drift_path.as_deref()),
-                    name.as_deref().or(drift_name.as_deref()),
-                ),
-                _ => (drift_path.as_deref(), drift_name.as_deref()),
-            },
-        );
+    let (resolved_path, resolved_name) = all_records.iter().find(|r| r.id() == target_id).map_or(
+        (drift_path.as_deref(), drift_name.as_deref()),
+        |target| match target {
+            GraphRecord::Node {
+                repo_relative_path,
+                name,
+                ..
+            } => (
+                repo_relative_path.as_deref().or(drift_path.as_deref()),
+                name.as_deref().or(drift_name.as_deref()),
+            ),
+            _ => (drift_path.as_deref(), drift_name.as_deref()),
+        },
+    );
 
     let mut obj = serde_json::Map::new();
     obj.insert("record_id".to_owned(), json!(id.as_str()));
@@ -3123,21 +3125,30 @@ fn handle_verb_symbol_at_commit(
 
 /// Collects the symbols defined in `path` as of `as_of_dt` (most-recent per
 /// `(name, start_line)` key so that same-name symbols at different spans are preserved).
+/// For span-absent records the `record_id` is used as the key component, preventing
+/// distinct same-name symbols from being coalesced when line information is missing.
 fn file_defines_as_of(
     records: &[GraphRecord],
     path: &str,
     as_of_dt: chrono::DateTime<chrono::FixedOffset>,
     limit: usize,
 ) -> Vec<serde_json::Value> {
-    // Key: (name, start_line) — preserves distinct symbols that share the same
-    // name but appear at different line positions (e.g. same method in different
-    // impl blocks). Within each key, keep the most-recent record at or before as_of_dt.
+    // Key: (name, span_key) where span_key is "line:<n>" when a span is present
+    // or "id:<record_id>" when it is absent.  This preserves distinct same-name
+    // symbols at different positions while still deduplicating the same logical
+    // symbol across history commits when its position is known.
+    #[allow(clippy::type_complexity)]
     let mut best: std::collections::BTreeMap<
-        (String, Option<usize>),
-        (serde_json::Value, chrono::DateTime<chrono::FixedOffset>),
+        (String, String),
+        (
+            serde_json::Value,
+            Option<usize>,
+            chrono::DateTime<chrono::FixedOffset>,
+        ),
     > = std::collections::BTreeMap::new();
     for r in records {
         let GraphRecord::Node {
+            id,
             kind: NodeKind::Symbol,
             name: node_name,
             repo_relative_path,
@@ -3170,18 +3181,17 @@ fn file_defines_as_of(
             continue;
         };
         let line = span.map(|s| s.start_line);
-        let key = (name_str.to_owned(), line);
-        let is_better = best.get(&key).is_none_or(|(pv, pvt)| {
+        let span_key = line.map_or_else(|| format!("id:{}", id.as_str()), |l| format!("line:{l}"));
+        let key = (name_str.to_owned(), span_key);
+        let is_better = best.get(&key).is_none_or(|(pv, _, pvt)| {
             vt > *pvt || (vt == *pvt && json["record_id"].as_str() < pv["record_id"].as_str())
         });
         if is_better {
-            best.insert(key, (json, vt));
+            best.insert(key, (json, line, vt));
         }
     }
-    let mut results: Vec<(serde_json::Value, Option<usize>)> = best
-        .into_iter()
-        .map(|((_, line), (v, _))| (v, line))
-        .collect();
+    let mut results: Vec<(serde_json::Value, Option<usize>)> =
+        best.into_values().map(|(v, l, _)| (v, l)).collect();
     sort_and_truncate_symbol_results(&mut results, limit);
     results.into_iter().map(|(v, _)| v).collect()
 }
