@@ -1043,11 +1043,36 @@ fn apply_write(
         }
     };
 
-    let synthesized_edges = validate_and_synthesize_evidence_edges(&command.records, sink)?;
+    let (synthesized_edges, canonical_nodes) =
+        validate_and_synthesize_evidence_edges(&command.records, sink)?;
+
+    // Reject any submitted record whose ID matches a synthesized evidence-edge ID.
+    // This prevents a partial ingest where the submitted record is written first and
+    // the synthesized edge is then rejected as a mismatched record with the same ID.
+    let submitted_ids: BTreeSet<&str> = command.records.iter().map(GraphRecord::id).collect();
+    for edge in &synthesized_edges {
+        if submitted_ids.contains(edge.id()) {
+            return Err(ApiError::conflict(format!(
+                "synthesized evidence-edge ID '{}' conflicts with a submitted record",
+                edge.id()
+            )));
+        }
+    }
+
+    // Replace triple-resolved source nodes with their canonical versions (evidence_links
+    // filled with the resolved target_record_id) so both representations agree.
+    let canonical_node_map: BTreeMap<&str, &GraphRecord> =
+        canonical_nodes.iter().map(|r| (r.id(), r)).collect();
     let all_records: Vec<GraphRecord> = command
         .records
         .iter()
-        .cloned()
+        .map(|r| {
+            canonical_node_map
+                .get(r.id())
+                .copied()
+                .cloned()
+                .unwrap_or_else(|| r.clone())
+        })
         .chain(synthesized_edges)
         .collect();
     let record_ids = all_records
@@ -1376,6 +1401,9 @@ fn resolve_evidence_target(
 // Validates evidence link invariants and synthesizes the required graph Edge records.
 struct ResolvedLink {
     node_id: String,
+    // Index of this link within the parent node's evidence_links array.
+    // Used to canonicalize triple-resolved links back into the source node.
+    link_index: usize,
     target_id: String,
     // Validated edge label stored directly to avoid re-parsing in Phase 2.
     edge_label: EdgeLabel,
@@ -1384,6 +1412,9 @@ struct ResolvedLink {
     // For direct-ID links this is the validated as_of_commit; for triple links it is
     // the target_git_commit from the triple.
     routing_commit: Option<String>,
+    // True when the link was resolved from the (path, span, commit) triple rather
+    // than a direct target_record_id — so the stored node needs canonicalization.
+    was_triple_resolved: bool,
 }
 
 // Looks up a node's kind from the current batch, or falls back to the store.
@@ -1417,7 +1448,7 @@ fn validate_evidence_endpoint_constraints(
 ) -> WriteResult<()> {
     // Source-side constraints.
     match label {
-        EdgeLabel::Observes | EdgeLabel::MentionsSymbol | EdgeLabel::ExplainsChange => {
+        EdgeLabel::Observes | EdgeLabel::ExplainsChange => {
             if source_kind != NodeKind::Observation {
                 return Err(ApiError::bad_request(format!(
                     "evidence link relation '{}' requires an Observation source node, not {}",
@@ -1426,7 +1457,7 @@ fn validate_evidence_endpoint_constraints(
                 )));
             }
         }
-        EdgeLabel::TouchedFile | EdgeLabel::FailedOn => {
+        EdgeLabel::TouchedFile => {
             if !matches!(
                 source_kind,
                 NodeKind::Observation | NodeKind::CommandEvidence | NodeKind::Verification
@@ -1438,7 +1469,14 @@ fn validate_evidence_endpoint_constraints(
                 )));
             }
         }
-        _ => {} // other labels do not constrain source kind
+        // FAILED_ON is reserved for a Failure source node kind that does not yet exist.
+        EdgeLabel::FailedOn => {
+            return Err(ApiError::bad_request(
+                "evidence link relation 'FAILED_ON' requires a Failure source node; the Failure node kind is not yet supported",
+            ));
+        }
+        // MentionsSymbol and all other labels: any agent-memory source kind is permitted.
+        _ => {}
     }
     // Target-side constraints.
     let target_kind_str =
@@ -1455,9 +1493,9 @@ fn validate_evidence_endpoint_constraints(
             }
         }
         EdgeLabel::TouchedFile => {
-            if !matches!(target_kind, Some(NodeKind::File | NodeKind::Commit)) {
+            if !matches!(target_kind, Some(NodeKind::File)) {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a File or Commit target; target '{}' has kind {}",
+                    "evidence link relation '{}' requires a File target; target '{}' has kind {}",
                     label.as_str(),
                     target_id,
                     target_kind_str()
@@ -1484,12 +1522,15 @@ fn validate_evidence_endpoint_constraints(
 // not used in time-range queries.
 const EVIDENCE_EDGE_ROUTING_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 
-// Returns the synthesized edges, which the caller must include in the write set.
+// Returns (synthesized_edges, canonical_source_nodes).
+// Canonical source nodes are copies of source records that had triple-resolved evidence links,
+// with target_record_id filled in from the resolved canonical ID so both the denormalized
+// JSON and the traversal edge agree on the target.
 #[allow(clippy::too_many_lines)]
 fn validate_and_synthesize_evidence_edges(
     records: &[GraphRecord],
     sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
-) -> WriteResult<Vec<GraphRecord>> {
+) -> WriteResult<(Vec<GraphRecord>, Vec<GraphRecord>)> {
     // Phase 1: validate and resolve all targets while holding the read lock.
     let resolved: Vec<ResolvedLink> = {
         let sink_guard = sink
@@ -1614,7 +1655,8 @@ fn validate_and_synthesize_evidence_edges(
                         ));
                     }
                 }
-                for link in links {
+                for (link_index, link) in links.iter().enumerate() {
+                    let was_triple_resolved = link.target_record_id.is_none();
                     let (target_id, routing_commit) =
                         resolve_evidence_target(link, &sink_guard, records)?;
                     if link.confidence.is_empty() {
@@ -1654,10 +1696,12 @@ fn validate_and_synthesize_evidence_edges(
                     )?;
                     resolved.push(ResolvedLink {
                         node_id: id.clone(),
+                        link_index,
                         target_id,
                         edge_label,
                         confidence: Some(link.confidence.clone()),
                         routing_commit,
+                        was_triple_resolved,
                     });
                 }
             }
@@ -1665,6 +1709,19 @@ fn validate_and_synthesize_evidence_edges(
         drop(sink_guard); // release read lock before Phase 2
         resolved
     };
+
+    // Collect triple-resolution data before Phase 2 moves `resolved`.
+    // Maps node_id → (link_index → resolved canonical target_id) for any link that was
+    // submitted without a target_record_id and resolved from the (path, span, commit) triple.
+    let mut node_resolutions: BTreeMap<String, BTreeMap<usize, String>> = BTreeMap::new();
+    for rl in &resolved {
+        if rl.was_triple_resolved {
+            node_resolutions
+                .entry(rl.node_id.clone())
+                .or_default()
+                .insert(rl.link_index, rl.target_id.clone());
+        }
+    }
 
     // Phase 2: synthesize edge records (no lock needed).
     // Deduplicate by stable edge ID.  Same edge ID + same routing commit → skip silently.
@@ -1715,7 +1772,44 @@ fn validate_and_synthesize_evidence_edges(
             }
         }
     }
-    Ok(edges)
+
+    // Build canonical source nodes: for any node that had triple-resolved links (submitted
+    // without target_record_id), fill in the resolved canonical ID so that the stored
+    // evidence_links JSON and the synthesized traversal edge both point to the same target.
+    let canonical_nodes: Vec<GraphRecord> = records
+        .iter()
+        .filter_map(|record| {
+            let resolutions = node_resolutions.get(record.id())?;
+            if let GraphRecord::Node {
+                evidence_links: Some(links),
+                ..
+            } = record
+            {
+                let canonical_links: Vec<EvidenceLink> = links
+                    .iter()
+                    .enumerate()
+                    .map(|(i, link)| {
+                        resolutions.get(&i).map_or_else(
+                            || link.clone(),
+                            |resolved_id| EvidenceLink {
+                                target_record_id: Some(resolved_id.clone()),
+                                ..link.clone()
+                            },
+                        )
+                    })
+                    .collect();
+                let mut canonical = record.clone();
+                if let GraphRecord::Node { evidence_links, .. } = &mut canonical {
+                    *evidence_links = Some(canonical_links);
+                }
+                Some(canonical)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Ok((edges, canonical_nodes))
 }
 
 fn has_duplicate_recovery_keys(records: &[GraphRecord]) -> bool {
