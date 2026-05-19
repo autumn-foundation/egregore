@@ -27,7 +27,7 @@ use crate::{
     adapters::{
         AdapterError, EmbeddedAletheiaSink, ExpectedRecordState, IngestReport, ingest_records,
     },
-    identity::is_local_remote_url,
+    identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord, IdentitySource,
         NodeKind, TemporalMetadata, agent_memory_stable_id,
@@ -1292,9 +1292,10 @@ fn validate_no_local_path_identity_in_shared_store(
                 ..
             } = record
             {
-                let is_unsafe = repository_identity
-                    .as_deref()
-                    .is_none_or(incoming_identity_is_local);
+                let is_unsafe = repository_identity.as_deref().is_none_or(|payload| {
+                    incoming_identity_is_local(payload)
+                        || !repository_id_matches_payload(id, payload)
+                });
                 if is_unsafe {
                     return Some(id.as_str());
                 }

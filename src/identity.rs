@@ -280,7 +280,7 @@ fn git_root_commit_sha(repo_root: &Path) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["rev-list", "--max-parents=0", "HEAD"])
+        .args(["rev-list", "--first-parent", "--max-parents=0", "HEAD"])
         .stdin(Stdio::null())
         .output()
         .ok()?;
@@ -289,8 +289,10 @@ fn git_root_commit_sha(repo_root: &Path) -> Option<String> {
         return None;
     }
 
-    let sha = String::from_utf8(output.stdout).ok()?;
-    let sha = sha.trim().to_owned();
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    // Take only the first line: --first-parent --max-parents=0 should yield exactly one root,
+    // but take the first line defensively to avoid joining multiple SHAs into a composite key.
+    let sha = stdout.lines().next()?.trim().to_owned();
 
     if sha.is_empty() { None } else { Some(sha) }
 }
@@ -348,8 +350,20 @@ pub fn normalize_remote_url(url: &str) -> String {
     } else if scheme_lower == "git" {
         (after_scheme_sep, 9418u16)
     } else {
-        // Unknown scheme: return with lowercase scheme applied.
-        return format!("{scheme_lower}://{after_scheme_sep}");
+        // Unknown scheme: lowercase the scheme and host, strip userinfo and .git suffix for
+        // consistent identity (two remotes that differ only by case or trailing .git must hash
+        // the same even when the scheme is not recognised by the normaliser).
+        return after_scheme_sep.find('/').map_or_else(
+            || {
+                let host_lower = strip_userinfo(after_scheme_sep).to_lowercase();
+                format!("{scheme_lower}://{host_lower}")
+            },
+            |slash| {
+                let host_lower = strip_userinfo(&after_scheme_sep[..slash]).to_lowercase();
+                let path = &after_scheme_sep[slash..];
+                format!("{scheme_lower}://{host_lower}{}", strip_git_suffix(path))
+            },
+        );
     };
 
     scheme_rest.find('/').map_or_else(
@@ -382,6 +396,31 @@ fn strip_default_port(host: &str, default_port: u16) -> &str {
 fn strip_git_suffix(s: &str) -> &str {
     let s = s.trim_end_matches('/');
     s.strip_suffix(".git").unwrap_or(s).trim_end_matches('/')
+}
+
+/// Returns `true` when `submitted_id` is the stable ID that would be computed from `payload`.
+///
+/// A mismatch indicates either a tampered payload or a bug in the write path; such records
+/// should be treated as machine-local unsafe regardless of the declared `identity_source`.
+pub(crate) fn repository_id_matches_payload(
+    submitted_id: &str,
+    payload: &RepositoryIdentityPayload,
+) -> bool {
+    match payload.identity_source {
+        IdentitySource::Remote => payload.remote_url.as_deref().is_some_and(|url| {
+            stable_id(&["repository", "remote", &normalize_remote_url(url)]) == submitted_id
+        }),
+        IdentitySource::LocalRootCommit => payload.root_commit_sha.as_deref().is_some_and(|sha| {
+            stable_id(&["repository", "local-root-commit", sha]) == submitted_id
+        }),
+        IdentitySource::LocalPath => payload
+            .canonical_path
+            .as_deref()
+            .is_some_and(|path| stable_id(&["repository", "local-path", path]) == submitted_id),
+        IdentitySource::OperatorOverride => {
+            stable_id(&["repository", "operator-override", &payload.basename]) == submitted_id
+        }
+    }
 }
 
 #[cfg(test)]
@@ -560,10 +599,45 @@ mod tests {
     }
 
     #[test]
-    fn unknown_scheme_lowercased_but_otherwise_preserved() {
+    fn unknown_scheme_host_lowercased_and_git_suffix_stripped() {
         assert_eq!(
-            normalize_remote_url("FTP://example.com/repo"),
-            "ftp://example.com/repo"
+            normalize_remote_url("FTP://EXAMPLE.com/org/repo.git"),
+            "ftp://example.com/org/repo"
         );
+    }
+
+    #[test]
+    fn unknown_scheme_userinfo_stripped() {
+        assert_eq!(
+            normalize_remote_url("ftp://user@EXAMPLE.com/org/repo"),
+            "ftp://example.com/org/repo"
+        );
+    }
+
+    #[test]
+    fn unknown_scheme_no_path() {
+        assert_eq!(
+            normalize_remote_url("FTP://EXAMPLE.com"),
+            "ftp://example.com"
+        );
+    }
+
+    #[test]
+    fn repository_id_matches_remote_payload() {
+        use crate::ir::{IdentitySource, RepositoryIdentityPayload};
+        let payload = RepositoryIdentityPayload {
+            identity_source: IdentitySource::Remote,
+            remote_url: Some("git@github.com:owner/repo.git".to_owned()),
+            root_commit_sha: None,
+            canonical_path: None,
+            basename: "owner/repo".to_owned(),
+        };
+        let expected_id =
+            crate::ir::stable_id(&["repository", "remote", "https://github.com/owner/repo"]);
+        assert!(super::repository_id_matches_payload(&expected_id, &payload));
+        assert!(!super::repository_id_matches_payload(
+            "codegraph:v3:wrong-hash",
+            &payload
+        ));
     }
 }

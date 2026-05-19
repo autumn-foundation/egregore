@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use crate::{
     adapters::{AdapterError, AdapterResult, ExpectedRecordState, GraphSink},
     daemon::StoreLease,
-    identity::is_local_remote_url,
+    identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
         EdgeLabel, EvidenceLink, GraphRecord, IdentitySource, NodeKind, SemanticDriftMetadata,
         SourceSpan, TemporalMetadata,
@@ -27,6 +27,10 @@ pub struct EmbeddedAletheiaSink {
     edge_seqs: BTreeMap<String, u64>,
     /// `egregore_seq` stored on each tombstone node, keyed by `AletheiaDB` `NodeId`.
     tombstone_node_seqs: BTreeMap<::aletheiadb::NodeId, u64>,
+    /// Count of physical `AletheiaDB` edges per `codegraph_id` that were written before the
+    /// `egregore_seq` system was introduced (i.e., they have no `egregore_seq` property).
+    /// Used as a fallback staleness check when both the edge and tombstone lack sequence metadata.
+    legacy_edge_counts: BTreeMap<String, usize>,
     _lease: Option<StoreLease>,
 }
 
@@ -186,6 +190,7 @@ impl EmbeddedAletheiaSink {
             write_seq: 0,
             edge_seqs: BTreeMap::new(),
             tombstone_node_seqs: BTreeMap::new(),
+            legacy_edge_counts: BTreeMap::new(),
             _lease: lease,
         };
         sink.rebuild_lookup_indexes()?;
@@ -467,9 +472,10 @@ impl EmbeddedAletheiaSink {
                 ..
             }) = self.read_back(record_id)?
             {
-                let is_unsafe = repository_identity
-                    .as_deref()
-                    .is_none_or(identity_payload_is_local);
+                let is_unsafe = repository_identity.as_deref().is_none_or(|payload| {
+                    identity_payload_is_local(payload)
+                        || !repository_id_matches_payload(record_id, payload)
+                });
                 if is_unsafe {
                     ids.push(record_id.clone());
                 }
@@ -504,16 +510,24 @@ impl EmbeddedAletheiaSink {
             // tombstone (higher egregore_seq). Using seq rather than a simple count correctly
             // handles updates: an edge that was re-written before being tombstoned has a higher
             // write count but a lower seq than the tombstone, so the tombstone is not stale.
-            // Legacy records without egregore_seq default to seq 0 (tombstone assumed valid).
-            let tombstone_seq = self
-                .tombstone_node_seqs
-                .get(&tombstone_node_id)
-                .copied()
-                .unwrap_or(0);
-            let edge_stale = self
-                .edge_seqs
-                .get(deleted_id.as_str())
-                .is_some_and(|&edge_seq| edge_seq > tombstone_seq);
+            //
+            // Four cases based on whether seq metadata is present:
+            //   (edge_seq, tombstone_seq): comparison
+            //   (Some(e), Some(t)):        e > t   — compare directly
+            //   (Some(e), None):           true    — edge written after upgrade ⇒ newer than tombstone
+            //   (None, Some(_)):           false   — edge written before upgrade ⇒ older than tombstone
+            //   (None, None):              legacy  — fall back to count-based duplicate detection
+            let tombstone_seq = self.tombstone_node_seqs.get(&tombstone_node_id).copied();
+            let edge_seq = self.edge_seqs.get(deleted_id.as_str()).copied();
+            let edge_stale = match (edge_seq, tombstone_seq) {
+                (Some(es), Some(ts)) => es > ts,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => self
+                    .legacy_edge_counts
+                    .get(deleted_id.as_str())
+                    .is_some_and(|&count| count > 1),
+            };
             if !node_stale && !edge_stale {
                 deleted.insert(deleted_id);
             }
@@ -680,21 +694,24 @@ impl EmbeddedAletheiaSink {
                 else {
                     continue;
                 };
-                let Some(seq_str) = optional_str_property(
+                let seq_str = optional_str_property(
                     "rebuild_lookup_indexes",
                     "egregore_seq",
                     edge.get_property("egregore_seq"),
-                )?
-                else {
-                    continue;
-                };
-                if let Ok(seq) = seq_str.parse::<u64>() {
-                    let entry = self.edge_seqs.entry(id).or_insert(0);
-                    if seq > *entry {
-                        *entry = seq;
+                )?;
+                match seq_str.as_deref().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(seq) => {
+                        let entry = self.edge_seqs.entry(id).or_insert(0);
+                        if seq > *entry {
+                            *entry = seq;
+                        }
+                        if seq > self.write_seq {
+                            self.write_seq = seq;
+                        }
                     }
-                    if seq > self.write_seq {
-                        self.write_seq = seq;
+                    None => {
+                        // Edge predates egregore_seq; count it for the legacy staleness fallback.
+                        *self.legacy_edge_counts.entry(id).or_default() += 1;
                     }
                 }
             }
