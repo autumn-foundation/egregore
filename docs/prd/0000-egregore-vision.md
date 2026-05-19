@@ -52,6 +52,8 @@ Egregore starts with typed graph domains. Domains share one AletheiaDB store and
 
 **Agent-memory schema:** [`docs/schema/agent-memory.md`](../schema/agent-memory.md) is the single source of truth for the agent-memory domain record shapes, provenance fields, `EvidenceLink` type, and cross-domain edge registry.
 
+**Bi-temporal selector grammar:** [`docs/schema/temporal-selectors.md`](../schema/temporal-selectors.md) is the single source of truth for `valid_time`/`transaction_time` axes, the `as_of`/`since` selector JSON shape, CLI flag surfaces, and per-domain mapping rules.
+
 | Domain | Owns | Examples |
 |--------|------|----------|
 | Code Graph | Source-derived facts | Repository, File, Symbol, Import, Call, Commit, Change, SemanticDrift |
@@ -240,6 +242,8 @@ Acceptance criteria:
 - Agent observations preserve observation time and ingestion time.
 - Project/task records preserve source update time when imported.
 - Queries can ask what was believed, planned, or verified at a chosen time.
+
+**Bi-temporal selector grammar** (`SCHEMA_VERSION = 2`): see [`docs/schema/temporal-selectors.md`](../schema/temporal-selectors.md) for the `valid_time`/`transaction_time` model, selector JSON shape, CLI surface (`--as-of`, `--tx-as-of`), and per-domain mapping table.
 
 ### PR-7: First-Class Transcript Imports
 

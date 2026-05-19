@@ -179,5 +179,6 @@ fn temporal(commit: &str, valid_time: &str) -> TemporalMetadata {
         valid_time: valid_time.to_owned(),
         author_time: None,
         observed_at: valid_time.to_owned(),
+        valid_time_source: None,
     }
 }

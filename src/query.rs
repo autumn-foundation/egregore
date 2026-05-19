@@ -2,6 +2,8 @@
 
 use std::cmp::Ordering;
 
+use chrono::DateTime;
+
 use crate::ir::{GraphRecord, NodeKind, SemanticDriftMetadata};
 
 /// Finds a symbol record by name at a specific Git commit.
@@ -76,4 +78,63 @@ fn semantic_drift(record: &GraphRecord) -> Option<&SemanticDriftMetadata> {
 
 fn drift_score(drift: &SemanticDriftMetadata) -> f32 {
     drift.score.parse::<f32>().unwrap_or(0.0)
+}
+
+/// Finds a symbol record by name at the most recent commit at or before `as_of`.
+///
+/// `as_of` must be an RFC 3339 timestamp string. Returns an error string if the
+/// timestamp cannot be parsed. Returns `None` when no record exists at or before
+/// the given instant.
+///
+/// # Errors
+///
+/// Returns an error string when `as_of` is not a valid RFC 3339 timestamp.
+pub fn symbol_as_of_valid_time<'records>(
+    records: &'records [GraphRecord],
+    symbol_name: &str,
+    as_of: &str,
+) -> Result<Option<&'records GraphRecord>, String> {
+    let as_of_dt = DateTime::parse_from_rfc3339(as_of)
+        .map_err(|e| format!("invalid --as-of timestamp '{as_of}': {e}"))?;
+
+    let mut best: Option<(&GraphRecord, DateTime<chrono::FixedOffset>)> = None;
+
+    for record in records {
+        let GraphRecord::Node {
+            kind: NodeKind::Symbol,
+            name,
+            temporal,
+            valid_time,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if name.as_deref() != Some(symbol_name) {
+            continue;
+        }
+        // Resolve valid_time from history temporal block (history records) or
+        // node-level field (current-tree records stamped by with_valid_time_inferred).
+        let vt_str = temporal
+            .as_ref()
+            .map(|t| t.valid_time.as_str())
+            .or(valid_time.as_deref());
+        let Some(vt_str) = vt_str else {
+            continue;
+        };
+        let Ok(vt) = DateTime::parse_from_rfc3339(vt_str) else {
+            continue;
+        };
+        if vt > as_of_dt {
+            continue;
+        }
+        let is_better = best.as_ref().is_none_or(|(prev_r, prev_vt)| {
+            vt > *prev_vt || (vt == *prev_vt && record.id() < prev_r.id())
+        });
+        if is_better {
+            best = Some((record, vt));
+        }
+    }
+
+    Ok(best.map(|(r, _)| r))
 }

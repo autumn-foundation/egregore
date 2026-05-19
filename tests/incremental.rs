@@ -2,7 +2,7 @@
 
 use std::fs;
 
-use aletheia_egregore::incremental::scan_repository_incremental;
+use aletheia_egregore::incremental::{scan_repository_incremental, scan_repository_incremental_at};
 use aletheia_egregore::{GraphRecord, NodeKind, SourceSpan, stable_id};
 
 #[test]
@@ -15,13 +15,15 @@ fn incremental_reuses_unchanged_files_and_tombstones_removed_files() {
     fs::write(&lib, "pub fn answer() -> usize { 42 }\n").expect("fixture should write");
     let cache_path = temp.path().join("codegraph-cache.json");
 
-    let first = scan_repository_incremental(&repo, &cache_path).expect("first scan should work");
+    let tx_time = "2026-05-19T00:00:00Z";
+    let first = scan_repository_incremental_at(&repo, &cache_path, tx_time)
+        .expect("first scan should work");
     assert_eq!(first.rebuilt_files, ["src/lib.rs"]);
     assert!(first.reused_files.is_empty());
     assert!(first.tombstoned_files.is_empty());
 
-    let unchanged =
-        scan_repository_incremental(&repo, &cache_path).expect("unchanged scan should work");
+    let unchanged = scan_repository_incremental_at(&repo, &cache_path, tx_time)
+        .expect("unchanged scan should work");
     assert_eq!(unchanged.reused_files, ["src/lib.rs"]);
     assert!(unchanged.rebuilt_files.is_empty());
     assert!(unchanged.tombstoned_files.is_empty());

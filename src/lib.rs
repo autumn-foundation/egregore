@@ -50,6 +50,10 @@ pub use traj::import_traj;
 /// Repository identity is derived from VCS remote URL, root commit SHA, or
 /// canonical path — see `docs/schema/repository-identity.md`.
 ///
+/// Each node record carries `valid_time` (set to the current wall-clock instant)
+/// and `valid_time_source: "inferred_from_transaction_time"` per the rule in
+/// `docs/schema/temporal-selectors.md`.
+///
 /// # Errors
 ///
 /// Returns an error when the repository path is missing, is not a directory, or
@@ -58,7 +62,19 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<Graph> {
     scan_repository_with_override(repo_path, None)
 }
 
-/// Scans a repository into deterministic graph records with an optional identity override.
+/// Like `scan_repository` but accepts an explicit `transaction_time` (RFC 3339).
+///
+/// Primarily useful for deterministic tests that need to fix the scan timestamp.
+///
+/// # Errors
+///
+/// Returns an error when the repository path is missing, is not a directory, or
+/// source discovery cannot read the filesystem.
+pub fn scan_repository_at(repo_path: impl AsRef<Path>, transaction_time: &str) -> Result<Graph> {
+    scan_repository_at_with_override(repo_path, transaction_time, None)
+}
+
+/// Scans a repository with an optional identity override.
 ///
 /// When `repo_id_override` is `Some`, its value is used directly as the
 /// canonical input for the repository's stable ID (forcing
@@ -72,17 +88,32 @@ pub fn scan_repository_with_override(
     repo_path: impl AsRef<Path>,
     repo_id_override: Option<&str>,
 ) -> Result<Graph> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    scan_repository_at_with_override(repo_path, &now, repo_id_override)
+}
+
+/// Scans a repository with an explicit `transaction_time` and optional identity override.
+///
+/// # Errors
+///
+/// Returns an error when the repository path is missing, is not a directory, or
+/// source discovery cannot read the filesystem.
+pub fn scan_repository_at_with_override(
+    repo_path: impl AsRef<Path>,
+    transaction_time: &str,
+    repo_id_override: Option<&str>,
+) -> Result<Graph> {
     let repo_root = repo_path.as_ref();
     validate_repository(repo_root)?;
 
     let repo_identity = identity::compute_repository_identity(repo_root, repo_id_override);
     let mut graph = Graph::new();
     let (repository_id, repo_record) = repository_record_from_identity(&repo_identity);
-    graph.push(repo_record);
+    graph.push(repo_record.with_valid_time_inferred(transaction_time));
 
     for source_file in fs::discover_rust_source_files(repo_root)? {
         for record in scan_source_file_records(&source_file, &repository_id)? {
-            graph.push(record);
+            graph.push(record.with_valid_time_inferred(transaction_time));
         }
     }
 

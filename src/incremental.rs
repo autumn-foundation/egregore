@@ -8,6 +8,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use chrono::Utc;
+
 use crate::{
     error::{CodegraphError, Result},
     identity,
@@ -41,6 +43,22 @@ pub fn scan_repository_incremental(
     repo_path: impl AsRef<Path>,
     cache_path: impl AsRef<Path>,
 ) -> Result<IncrementalScan> {
+    let transaction_time = Utc::now().to_rfc3339();
+    scan_repository_incremental_at(repo_path, cache_path, &transaction_time)
+}
+
+/// Like [`scan_repository_incremental`] but accepts an explicit `transaction_time` (RFC 3339).
+///
+/// # Errors
+///
+/// Returns an error when repository discovery, source parsing, cache parsing, or
+/// cache persistence fails.
+#[allow(clippy::too_many_lines)]
+pub fn scan_repository_incremental_at(
+    repo_path: impl AsRef<Path>,
+    cache_path: impl AsRef<Path>,
+    transaction_time: &str,
+) -> Result<IncrementalScan> {
     let repo_root = repo_path.as_ref();
     crate::validate_repository(repo_root)?;
 
@@ -55,7 +73,7 @@ pub fn scan_repository_incremental(
     let mut reused_files = Vec::new();
     let mut seen_files = BTreeSet::new();
 
-    graph.push(repository);
+    graph.push(repository.with_valid_time_inferred(transaction_time));
 
     // If the repository identity changed from a previous scan, tombstone the old Repository node
     // so it does not remain live in persisted stores alongside the new identity.  Without this,
@@ -104,10 +122,20 @@ pub fn scan_repository_incremental(
 
         let records = if let Some(cached) = cached.filter(|entry| entry.hash == hash) {
             reused_files.push(source_file.repo_relative_path.clone());
-            cached.records.clone()
+            // Restamp reused records so valid_time reflects this scan's transaction time,
+            // not the prior scan's time when they were first extracted.
+            cached
+                .records
+                .iter()
+                .cloned()
+                .map(|r| r.with_valid_time_inferred(transaction_time))
+                .collect::<Vec<_>>()
         } else {
             rebuilt_files.push(source_file.repo_relative_path.clone());
-            let records = scan_source_file_records(&source_file, &repository_id)?;
+            let records = scan_source_file_records(&source_file, &repository_id)?
+                .into_iter()
+                .map(|r| r.with_valid_time_inferred(transaction_time))
+                .collect::<Vec<_>>();
             if !can_reuse_cache_records && let Some(invalidated) = previous_entry {
                 for tombstone in invalidated_record_tombstones(
                     &source_file.repo_relative_path,

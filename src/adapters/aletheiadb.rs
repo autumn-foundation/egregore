@@ -830,6 +830,8 @@ impl EmbeddedAletheiaSink {
             confidence,
             source_handle,
             redaction_policy_version,
+            valid_time,
+            valid_time_source,
             summary,
             domain,
             importer_id,
@@ -853,6 +855,12 @@ impl EmbeddedAletheiaSink {
         builder = insert_optional(builder, "symbol_kind", symbol_kind.as_deref());
         builder = insert_temporal(builder, temporal.as_ref());
         builder = insert_semantic_drift(builder, semantic_drift.as_deref());
+        builder = insert_optional(builder, "node_valid_time", valid_time.as_deref());
+        builder = insert_optional(
+            builder,
+            "node_valid_time_source",
+            valid_time_source.as_deref(),
+        );
         if let Some(span) = span {
             builder = insert_span(builder, *span);
         }
@@ -1291,6 +1299,16 @@ impl EmbeddedAletheiaSink {
                 read_back_error(record_id, format!("repository_identity_json invalid: {e}"))
             })?
             .map(Box::new),
+            valid_time: optional_str_property(
+                record_id,
+                "node_valid_time",
+                node.get_property("node_valid_time"),
+            )?,
+            valid_time_source: optional_str_property(
+                record_id,
+                "node_valid_time_source",
+                node.get_property("node_valid_time_source"),
+            )?,
             summary: required_str_property(record_id, "summary", node.get_property("summary"))?,
             domain: optional_str_property(record_id, "domain", node.get_property("domain"))?,
             importer_id: optional_str_property(
@@ -1588,6 +1606,11 @@ fn temporal_from_properties<'a>(
         valid_time: required_str_property(record_id, "valid_time", get("valid_time"))?,
         author_time: optional_str_property(record_id, "author_time", get("author_time"))?,
         observed_at: required_str_property(record_id, "observed_at", get("observed_at"))?,
+        valid_time_source: optional_str_property(
+            record_id,
+            "valid_time_source",
+            get("valid_time_source"),
+        )?,
     }))
 }
 
@@ -1805,6 +1828,9 @@ fn insert_temporal(
         }
         if !temporal.git_parent_commits.is_empty() {
             builder = builder.insert("git_parent_commits", temporal.git_parent_commits.join(" "));
+        }
+        if let Some(source) = &temporal.valid_time_source {
+            builder = builder.insert("valid_time_source", source.as_str());
         }
     }
     builder
@@ -2257,6 +2283,7 @@ mod tests {
             valid_time: valid_time.to_owned(),
             author_time: Some(valid_time.to_owned()),
             observed_at: observed_at.to_owned(),
+            valid_time_source: None,
         }
     }
 }

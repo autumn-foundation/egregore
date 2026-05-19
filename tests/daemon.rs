@@ -1949,6 +1949,7 @@ fn temporal_node(id: &str, git_commit: &str, valid_time: &str, summary: &str) ->
         valid_time: valid_time.to_owned(),
         author_time: Some(valid_time.to_owned()),
         observed_at: valid_time.to_owned(),
+        valid_time_source: None,
     })
 }
 

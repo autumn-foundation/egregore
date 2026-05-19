@@ -137,6 +137,8 @@ Bi-temporal mapping:
 - **Transaction time:** the time AletheiaDB observes and ingests the fact. Re-indexing the same repo later should create a new observation without pretending the Git history itself changed.
 - **Identity:** stable IDs identify logical code entities across observations; temporal validity captures when a definition or relationship was present.
 
+The selector grammar for querying across both axes is specified in [`docs/schema/temporal-selectors.md`](../schema/temporal-selectors.md) and implemented at `SCHEMA_VERSION = 2`. Current-tree records carry `valid_time_source: "inferred_from_transaction_time"`; history records carry `valid_time_source: "git_commit_committer_date"`.
+
 History replay must not mutate the user's working tree. Use Git object reads, temporary worktrees, or a safe staging directory. If checkout-based replay is used, it must run outside the user's active checkout and clean up after itself.
 
 ### Embedded AletheiaDB Ingestion

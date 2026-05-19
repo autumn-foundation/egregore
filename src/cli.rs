@@ -133,8 +133,17 @@ enum QuerySubcommand {
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Restrict to the record at this commit SHA or unique prefix.
-        #[arg(long)]
+        /// Shorthand for --as-of keyed by a Git SHA. Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
         at: Option<String>,
+        /// Return the symbol state at the most recent commit at or before this
+        /// RFC 3339 instant (valid-time axis). Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Transaction-time selector (reserved, not yet implemented).
+        /// Returns a `not_implemented` error envelope rather than silently ignoring the flag.
+        #[arg(long)]
+        tx_as_of: Option<String>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -481,12 +490,33 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             graph,
             data_dir,
             at,
+            as_of,
+            tx_as_of,
             format,
         } => {
+            // --tx-as-of is reserved: always return a not_implemented envelope.
+            if tx_as_of.is_some() {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "not_implemented",
+                        "message": "--tx-as-of: transaction-time queries are reserved and not yet \
+                                    implemented for JSONL queries; see docs/schema/temporal-selectors.md"
+                    }
+                });
+                println!("{}", serde_json::to_string(&envelope)?);
+                std::process::exit(1);
+            }
+
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            at.map_or_else(
-                || query_symbol_all(&records, &name, format),
-                |prefix| query_symbol_at(&records, &name, &prefix, format),
+            as_of.map_or_else(
+                || {
+                    at.map_or_else(
+                        || query_symbol_all(&records, &name, format),
+                        |prefix| query_symbol_at(&records, &name, &prefix, format),
+                    )
+                },
+                |instant| query_symbol_as_of(&records, &name, &instant, format),
             )
         }
         QuerySubcommand::File {
@@ -637,6 +667,34 @@ fn symbol_result<'a>(record: &'a GraphRecord, name: &str) -> Option<SymbolResult
         span: *span,
         git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
     })
+}
+
+// ---------------------------------------------------------------------------
+// query symbol --as-of <instant>
+// ---------------------------------------------------------------------------
+
+fn query_symbol_as_of(
+    records: &[GraphRecord],
+    name: &str,
+    as_of: &str,
+    format: OutputFormat,
+) -> Result<()> {
+    match query::symbol_as_of_valid_time(records, name, as_of) {
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            std::process::exit(1);
+        }
+        Ok(None) => {
+            eprintln!("error: no match found for symbol `{name}` at or before `{as_of}`");
+            std::process::exit(2);
+        }
+        Ok(Some(record)) => {
+            if let Some(result) = symbol_result(record, name) {
+                print_result(&result, format)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -162,6 +162,7 @@ impl GitCommit {
             valid_time: self.committed_at.clone(),
             author_time: Some(self.authored_at.clone()),
             observed_at: self.committed_at.clone(),
+            valid_time_source: Some("git_commit_committer_date".to_owned()),
         }
     }
 
@@ -385,3 +386,4 @@ fn normalize_git_path(path: &str) -> String {
 fn short_sha(sha: &str) -> String {
     sha.chars().take(12).collect()
 }
+
