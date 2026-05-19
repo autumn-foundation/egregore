@@ -14,7 +14,10 @@ use std::{
 use aletheia_egregore::{
     adapters::EmbeddedAletheiaSink,
     daemon::{DaemonClient, DaemonMetadata as ClientDaemonMetadata, StoreLease},
-    ir::{EdgeLabel, GraphRecord, IdentitySource, NodeKind, RepositoryIdentityPayload, TemporalMetadata},
+    ir::{
+        EdgeLabel, GraphRecord, IdentitySource, NodeKind, RepositoryIdentityPayload,
+        TemporalMetadata,
+    },
 };
 use assert_cmd::Command;
 use predicates::prelude::*;

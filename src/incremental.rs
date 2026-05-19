@@ -47,7 +47,8 @@ pub fn scan_repository_incremental(
     let repo_identity = identity::compute_repository_identity(repo_root, None);
     let (repository_id, repository) = repository_record_from_identity(&repo_identity);
     let previous_cache = CacheFile::load(cache_path.as_ref())?;
-    let can_reuse_cache_records = previous_cache.schema_version == CACHE_SCHEMA_VERSION;
+    let can_reuse_cache_records = previous_cache.schema_version == CACHE_SCHEMA_VERSION
+        && previous_cache.repository_id == repository_id;
     let mut next_cache = CacheFile::default();
     let mut graph = Graph::new();
     let mut rebuilt_files = Vec::new();
@@ -97,6 +98,7 @@ pub fn scan_repository_incremental(
         }
     }
 
+    next_cache.repository_id.clone_from(&repository_id);
     next_cache.save(cache_path.as_ref())?;
     Ok(IncrementalScan {
         graph,
@@ -109,6 +111,8 @@ pub fn scan_repository_incremental(
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct CacheFile {
     schema_version: u32,
+    #[serde(default)]
+    repository_id: String,
     files: BTreeMap<String, CachedFile>,
 }
 
@@ -116,6 +120,7 @@ impl Default for CacheFile {
     fn default() -> Self {
         Self {
             schema_version: CACHE_SCHEMA_VERSION,
+            repository_id: String::new(),
             files: BTreeMap::new(),
         }
     }

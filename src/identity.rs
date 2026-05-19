@@ -105,10 +105,24 @@ pub fn compute_repository_identity(
     }
 }
 
+/// Returns `true` if `repo_root` is the root of a git repository.
+///
+/// Works for regular clones, worktrees, and submodules (where `.git` is a file,
+/// not a directory).
+fn git_is_repo(repo_root: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--git-dir"])
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 /// Returns the normalized canonical URL of the lowest-name-sorted remote,
 /// or `None` if `.git` does not exist or has no remotes.
 fn git_canonical_remote_url(repo_root: &Path) -> Option<String> {
-    if !repo_root.join(".git").is_dir() {
+    if !git_is_repo(repo_root) {
         return None;
     }
 
@@ -163,7 +177,7 @@ fn git_canonical_remote_url(repo_root: &Path) -> Option<String> {
 /// Returns the root commit SHA (oldest first-parent ancestor of HEAD),
 /// or `None` if `.git` does not exist or HEAD has no commits.
 fn git_root_commit_sha(repo_root: &Path) -> Option<String> {
-    if !repo_root.join(".git").is_dir() {
+    if !git_is_repo(repo_root) {
         return None;
     }
 

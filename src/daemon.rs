@@ -1085,7 +1085,6 @@ fn apply_write(
     idempotency: &Arc<Mutex<IdempotencyStore>>,
 ) -> WriteResult {
     validate_unique_recovery_keys(&command.records)?;
-    validate_no_local_path_identity_in_shared_store(&command.records, sink)?;
 
     // Consult the idempotency cache BEFORE running evidence-link validation so that
     // a committed replay returns the cached response immediately without re-executing
@@ -1123,6 +1122,8 @@ fn apply_write(
     {
         return Ok(response);
     }
+
+    validate_no_local_path_identity_in_shared_store(&command.records, sink)?;
 
     let (synthesized_edges, canonical_nodes) =
         validate_and_synthesize_evidence_edges(&command.records, sink)?;
@@ -1298,19 +1299,33 @@ fn validate_no_local_path_identity_in_shared_store(
         return Ok(());
     }
 
-    let existing_repository_ids = {
+    // Reject if the incoming batch itself contains 2+ distinct local_path Repository IDs.
+    let distinct_incoming: BTreeSet<&str> = incoming_local_path_ids.iter().copied().collect();
+    if distinct_incoming.len() > 1 {
+        return Err(ApiError::new(
+            ErrorCode::LocalPathIdentityUnsupported,
+            "ingest batch contains multiple distinct Repository nodes with \
+             identity_source 'local_path'; only one local-path repository may be \
+             ingested into a store",
+        ));
+    }
+
+    let (existing_repository_ids, store_is_multi_domain) = {
         let sink = sink
             .read()
             .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
-        sink.stored_repository_ids()
-            .map_err(|error| ApiError::internal(error.to_string()))?
+        (
+            sink.stored_repository_ids()
+                .map_err(|error| ApiError::internal(error.to_string()))?,
+            sink.has_non_codegraph_records(),
+        )
     };
 
     for incoming_id in incoming_local_path_ids {
         let has_other_repo = existing_repository_ids
             .iter()
             .any(|existing| existing != incoming_id);
-        if has_other_repo {
+        if has_other_repo || store_is_multi_domain {
             return Err(ApiError::new(
                 ErrorCode::LocalPathIdentityUnsupported,
                 "Repository node with identity_source 'local_path' cannot be ingested into a \

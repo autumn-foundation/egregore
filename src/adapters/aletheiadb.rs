@@ -451,7 +451,7 @@ impl EmbeddedAletheiaSink {
     /// Returns an error if an embedded read operation fails.
     pub fn stored_repository_ids(&self) -> AdapterResult<Vec<String>> {
         let mut ids = Vec::new();
-        for record_id in self.record_handles.keys() {
+        for record_id in self.node_lookup.latest.keys() {
             if let Some(record) = self.read_back(record_id)?
                 && matches!(
                     record,
@@ -465,6 +465,19 @@ impl EmbeddedAletheiaSink {
             }
         }
         Ok(ids)
+    }
+
+    /// Returns true if the store contains any records whose ID does not start with `codegraph:`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an embedded read operation fails.
+    #[must_use]
+    pub fn has_non_codegraph_records(&self) -> bool {
+        self.node_lookup
+            .latest
+            .keys()
+            .any(|id| !id.starts_with("codegraph:"))
     }
 
     /// Returns true if the embedded graph contains a Commit -> Change -> Symbol path.
