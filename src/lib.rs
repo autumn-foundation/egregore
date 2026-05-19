@@ -29,6 +29,8 @@ pub mod languages;
 pub mod parser;
 /// Agent-facing graph query helpers.
 pub mod query;
+/// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
+pub mod traj;
 
 use std::{ffi::OsStr, path::Path};
 
@@ -39,6 +41,7 @@ pub use ir::{
     NodeProvenance, SCHEMA_VERSION, SemanticDriftMetadata, SourceSpan, TemporalMetadata,
     agent_memory_stable_id, stable_id,
 };
+pub use traj::import_traj;
 
 /// Scans a repository into deterministic graph records.
 ///
