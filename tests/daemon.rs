@@ -3911,3 +3911,52 @@ fn verification_v2_id_prefix_rejected() {
 
     daemon.stop();
 }
+
+#[test]
+fn verification_stdout_handle_empty_hash_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // stdout_handle present with empty hash — must be rejected even when source_artifact_hash is valid
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-empty-stdout-hash",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-empty-stdout-hash-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:empty-stdout-hash-fixture",
+                    "kind": "TestRun",
+                    "schema_version": 1,
+                    "summary": "TestRun with empty stdout_handle.hash",
+                    "source_artifact_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "stdout_handle": {
+                        "hash": "",
+                        "bytes": 100_u64
+                    }
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "stdout_handle with empty hash should be rejected; got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "empty stdout_handle.hash must produce bad_request, got {body}"
+    );
+
+    daemon.stop();
+}

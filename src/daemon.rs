@@ -1611,6 +1611,11 @@ fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<
         }
 
         if let Some(h) = stdout_handle.as_deref() {
+            if h.hash.is_empty() {
+                return Err(ApiError::bad_request(
+                    "verification-domain stdout_handle.hash must not be empty",
+                ));
+            }
             let inline_len = h.inline.as_deref().map_or(0, |s| s.len() as u64);
             if inline_len > INLINE_CEILING || (h.inline.is_some() && h.bytes > INLINE_CEILING) {
                 return Err(ApiError::bad_request(
@@ -1620,6 +1625,11 @@ fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<
             }
         }
         if let Some(h) = stderr_handle.as_deref() {
+            if h.hash.is_empty() {
+                return Err(ApiError::bad_request(
+                    "verification-domain stderr_handle.hash must not be empty",
+                ));
+            }
             let inline_len = h.inline.as_deref().map_or(0, |s| s.len() as u64);
             if inline_len > INLINE_CEILING || (h.inline.is_some() && h.bytes > INLINE_CEILING) {
                 return Err(ApiError::bad_request(
@@ -1668,6 +1678,13 @@ fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult
             if !id.starts_with("agent_memory:v1:") {
                 return Err(ApiError::bad_request(format!(
                     "evidence link declares target_domain 'agent_memory' but target '{id}' does not have the expected 'agent_memory:v1:' prefix",
+                )));
+            }
+        }
+        "verification" => {
+            if !id.starts_with("verification:v1:") {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link declares target_domain 'verification' but target '{id}' does not have the expected 'verification:v1:' prefix",
                 )));
             }
         }
@@ -1964,10 +1981,18 @@ fn validate_evidence_endpoint_constraints(
         EdgeLabel::HasEvidence => {
             if !matches!(
                 target_kind,
-                Some(NodeKind::Verification | NodeKind::CommandEvidence)
+                Some(
+                    NodeKind::Verification
+                        | NodeKind::CommandEvidence
+                        | NodeKind::TestRun
+                        | NodeKind::CIStatus
+                        | NodeKind::BenchmarkRun
+                        | NodeKind::CoverageReport
+                        | NodeKind::ProofResult
+                )
             ) {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a Verification or CommandEvidence target; target '{}' has kind {}",
+                    "evidence link relation '{}' requires a verification-evidence or CommandEvidence target; target '{}' has kind {}",
                     label.as_str(),
                     target_id,
                     target_kind_str()
@@ -1975,9 +2000,19 @@ fn validate_evidence_endpoint_constraints(
             }
         }
         EdgeLabel::ValidatedBy => {
-            if !matches!(target_kind, Some(NodeKind::Verification)) {
+            if !matches!(
+                target_kind,
+                Some(
+                    NodeKind::Verification
+                        | NodeKind::TestRun
+                        | NodeKind::CIStatus
+                        | NodeKind::BenchmarkRun
+                        | NodeKind::CoverageReport
+                        | NodeKind::ProofResult
+                )
+            ) {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a Verification target; target '{}' has kind {}",
+                    "evidence link relation '{}' requires a verification-evidence target; target '{}' has kind {}",
                     label.as_str(),
                     target_id,
                     target_kind_str()
@@ -2041,20 +2076,29 @@ fn validate_agent_memory_edge_endpoints(
 ) -> WriteResult<()> {
     // Source-domain constraints per schema registry.
     match label {
+        // Labels that require an agent_memory:v1: source exclusively.
         EdgeLabel::SessionOf
         | EdgeLabel::Observes
-        | EdgeLabel::MentionsSymbol
-        | EdgeLabel::TouchedFile
         | EdgeLabel::ProducedPatch
         | EdgeLabel::ValidatedBy
-        | EdgeLabel::FailedOn
         | EdgeLabel::ExplainsChange
         | EdgeLabel::ReferencesTask
-        | EdgeLabel::Contradicts
         | EdgeLabel::Supersedes => {
             if !source.starts_with("agent_memory:v1:") {
                 return Err(ApiError::bad_request(format!(
                     "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: source; got source '{source}'",
+                    label.as_str()
+                )));
+            }
+        }
+        // Labels that allow agent_memory:v1: OR verification:v1: sources.
+        EdgeLabel::MentionsSymbol
+        | EdgeLabel::TouchedFile
+        | EdgeLabel::FailedOn
+        | EdgeLabel::Contradicts => {
+            if !source.starts_with("agent_memory:v1:") && !source.starts_with("verification:v1:") {
+                return Err(ApiError::bad_request(format!(
+                    "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: or verification:v1: source; got source '{source}'",
                     label.as_str()
                 )));
             }
@@ -2064,16 +2108,24 @@ fn validate_agent_memory_edge_endpoints(
     }
     // Target-domain constraints per schema registry.
     match label {
+        // Must target agent_memory exclusively.
         EdgeLabel::SessionOf
         | EdgeLabel::AuthoredBy
-        | EdgeLabel::HasEvidence
-        | EdgeLabel::ValidatedBy
         | EdgeLabel::ReferencesTask
         | EdgeLabel::Contradicts
         | EdgeLabel::Supersedes => {
             if !target.starts_with("agent_memory:v1:") {
                 return Err(ApiError::bad_request(format!(
                     "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: target; got target '{target}'",
+                    label.as_str()
+                )));
+            }
+        }
+        // ValidatedBy and HAS_EVIDENCE can target agent_memory OR verification.
+        EdgeLabel::ValidatedBy | EdgeLabel::HasEvidence => {
+            if !target.starts_with("agent_memory:v1:") && !target.starts_with("verification:v1:") {
+                return Err(ApiError::bad_request(format!(
+                    "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: or verification:v1: target; got target '{target}'",
                     label.as_str()
                 )));
             }
