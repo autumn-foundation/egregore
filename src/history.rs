@@ -2,7 +2,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsStr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -10,8 +9,9 @@ use std::{
 use crate::{
     error::{CodegraphError, Result},
     fs::SourceFile,
+    identity,
     ir::{EdgeLabel, Graph, GraphRecord, NodeKind, TemporalMetadata, stable_id},
-    repository_record, scan_source_text_records, validate_repository,
+    repository_record_from_identity, scan_source_text_records, validate_repository,
 };
 
 /// Scans every Git commit reachable from `HEAD` into deterministic temporal
@@ -25,21 +25,32 @@ use crate::{
 /// Returns an error when the repository path is invalid, Git is unavailable, or
 /// a reachable Rust source blob cannot be parsed.
 pub fn scan_repository_history(repo_path: impl AsRef<Path>) -> Result<Graph> {
+    scan_repository_history_with_override(repo_path, None)
+}
+
+/// Scans Git history with an optional identity override.
+///
+/// See `scan_repository_history` for full documentation.
+///
+/// # Errors
+///
+/// Returns an error when the repository path is invalid, Git is unavailable, or
+/// a reachable Rust source blob cannot be parsed.
+pub fn scan_repository_history_with_override(
+    repo_path: impl AsRef<Path>,
+    repo_id_override: Option<&str>,
+) -> Result<Graph> {
     let repo_root = repo_path.as_ref();
     validate_repository(repo_root)?;
 
-    let repo_name = repo_root
-        .file_name()
-        .and_then(OsStr::to_str)
-        .filter(|name| !name.is_empty())
-        .unwrap_or("repository");
-    let (repository_id, repository) = repository_record(repo_name);
+    let repo_identity = identity::compute_repository_identity(repo_root, repo_id_override);
+    let (repository_id, repository) = repository_record_from_identity(&repo_identity);
 
     let mut graph = Graph::new();
     graph.push(repository);
 
     for commit in list_commits(repo_root)? {
-        let commit_record = commit_record(repo_name, &commit);
+        let commit_record = commit_record(&repository_id, &commit);
         let commit_id = commit_record.id().to_owned();
         graph.push(commit_record);
         graph.push(GraphRecord::edge(
@@ -51,7 +62,7 @@ pub fn scan_repository_history(repo_path: impl AsRef<Path>) -> Result<Graph> {
         ));
 
         for parent in &commit.parents {
-            let parent_id = stable_id(&["node", "commit", repo_name, parent]);
+            let parent_id = stable_id(&["node", "commit", &repository_id, parent]);
             graph.push(
                 GraphRecord::edge(
                     EdgeLabel::ParentOf,
@@ -70,7 +81,7 @@ pub fn scan_repository_history(repo_path: impl AsRef<Path>) -> Result<Graph> {
 
         let mut change_ids_by_path = BTreeMap::new();
         for change in list_changes(repo_root, &commit)? {
-            let change_record = change_record(repo_name, &commit, &change);
+            let change_record = change_record(&repository_id, &commit, &change);
             let change_id = change_record.id().to_owned();
             change_ids_by_path.insert(change.path.clone(), change_id.clone());
             graph.push(change_record);
@@ -196,10 +207,16 @@ fn commit_metadata(repo_root: &Path, sha: &str) -> Result<GitCommit> {
             .filter(|parent| !parent.is_empty())
             .map(ToOwned::to_owned)
             .collect(),
-        committed_at: committed_at.to_owned(),
-        authored_at: authored_at.to_owned(),
+        committed_at: normalize_timestamp(committed_at),
+        authored_at: normalize_timestamp(authored_at),
         subject,
     })
+}
+
+/// Normalizes ISO 8601 timestamps to use `Z` suffix for UTC.
+fn normalize_timestamp(ts: &str) -> String {
+    ts.strip_suffix("+00:00")
+        .map_or_else(|| ts.to_owned(), |s| format!("{s}Z"))
 }
 
 fn list_changes(repo_root: &Path, commit: &GitCommit) -> Result<Vec<GitChange>> {
@@ -256,8 +273,8 @@ fn git_blob(repo_root: &Path, sha: &str, path: &str) -> Result<String> {
     git_output(repo_root, &["show", &format!("{sha}:{path}")])
 }
 
-fn commit_record(repo_name: &str, commit: &GitCommit) -> GraphRecord {
-    let id = stable_id(&["node", "commit", repo_name, &commit.sha]);
+fn commit_record(repository_id: &str, commit: &GitCommit) -> GraphRecord {
+    let id = stable_id(&["node", "commit", repository_id, &commit.sha]);
     GraphRecord::node(
         id,
         NodeKind::Commit,
@@ -274,11 +291,11 @@ fn commit_record(repo_name: &str, commit: &GitCommit) -> GraphRecord {
     .with_temporal(commit.temporal())
 }
 
-fn change_record(repo_name: &str, commit: &GitCommit, change: &GitChange) -> GraphRecord {
+fn change_record(repository_id: &str, commit: &GitCommit, change: &GitChange) -> GraphRecord {
     let id = stable_id(&[
         "node",
         "change",
-        repo_name,
+        repository_id,
         &commit.sha,
         &change.status,
         &change.path,

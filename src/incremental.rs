@@ -10,12 +10,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{CodegraphError, Result},
-    ir::{Graph, GraphRecord, SCHEMA_VERSION, stable_id},
-    repository_record, scan_source_file_records,
+    identity,
+    ir::{Graph, GraphRecord, SCHEMA_VERSION, stable_id, versioned_stable_id},
+    repository_record_from_identity, scan_source_file_records,
 };
 
 /// Incremental cache schema for extractor output stored on disk.
-const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -43,14 +44,11 @@ pub fn scan_repository_incremental(
     let repo_root = repo_path.as_ref();
     crate::validate_repository(repo_root)?;
 
-    let repo_name = repo_root
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .filter(|name| !name.is_empty())
-        .unwrap_or("repository");
-    let (repository_id, repository) = repository_record(repo_name);
+    let repo_identity = identity::compute_repository_identity(repo_root, None);
+    let (repository_id, repository) = repository_record_from_identity(&repo_identity);
     let previous_cache = CacheFile::load(cache_path.as_ref())?;
-    let can_reuse_cache_records = previous_cache.schema_version == CACHE_SCHEMA_VERSION;
+    let can_reuse_cache_records = previous_cache.schema_version == CACHE_SCHEMA_VERSION
+        && previous_cache.repository_id == repository_id;
     let mut next_cache = CacheFile::default();
     let mut graph = Graph::new();
     let mut rebuilt_files = Vec::new();
@@ -58,6 +56,45 @@ pub fn scan_repository_incremental(
     let mut seen_files = BTreeSet::new();
 
     graph.push(repository);
+
+    // If the repository identity changed from a previous scan, tombstone the old Repository node
+    // so it does not remain live in persisted stores alongside the new identity.  Without this,
+    // a store first scanned with local_path identity keeps the stale Repository node even after
+    // the identity changes to Remote, which causes the daemon's shared-store guard to keep
+    // rejecting otherwise valid writes.
+    if !previous_cache.repository_id.is_empty() && previous_cache.repository_id != repository_id {
+        let old_repo_id = &previous_cache.repository_id;
+        graph.push(GraphRecord::Tombstone {
+            id: stable_id(&["tombstone", "repository-identity-changed", old_repo_id]),
+            schema_version: SCHEMA_VERSION,
+            deleted_id: old_repo_id.clone(),
+            summary: format!("Repository identity changed; stale Repository {old_repo_id} removed"),
+        });
+    } else if previous_cache.repository_id.is_empty() && !previous_cache.files.is_empty() {
+        // Legacy cache written before the repository_id field existed: infer the old
+        // basename-derived ID and tombstone it so persisted stores can retire stale records.
+        let basename = repo_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or("repository");
+        // Use the old cache's schema version so the deleted_id matches what the old
+        // extractor actually wrote (e.g. `codegraph:v1:…` for a v1 cache).
+        let legacy_repo_id = versioned_stable_id(
+            previous_cache.schema_version,
+            &["node", "repository", basename],
+        );
+        if legacy_repo_id != repository_id {
+            graph.push(GraphRecord::Tombstone {
+                id: stable_id(&["tombstone", "repository-identity-changed", &legacy_repo_id]),
+                schema_version: SCHEMA_VERSION,
+                deleted_id: legacy_repo_id.clone(),
+                summary: format!(
+                    "Repository identity changed; stale Repository {legacy_repo_id} removed"
+                ),
+            });
+        }
+    }
 
     for source_file in crate::fs::discover_rust_source_files(repo_root)? {
         let hash = file_hash(&source_file.path)?;
@@ -93,13 +130,23 @@ pub fn scan_repository_incremental(
     }
 
     let mut tombstoned_files = Vec::new();
-    for removed in previous_cache.files.keys() {
+    for (removed, cached_file) in &previous_cache.files {
         if !seen_files.contains(removed) {
             tombstoned_files.push(removed.clone());
-            graph.push(file_tombstone(removed));
+            if can_reuse_cache_records {
+                // repository_id is stable — tombstone the expected current file ID.
+                graph.push(file_tombstone(removed, &repository_id));
+            } else {
+                // repository_id changed; emit tombstones from the actual cached record IDs
+                // so stale records from the old identity are correctly deleted.
+                for record in &cached_file.records {
+                    graph.push(invalidated_record_tombstone(removed, record.id()));
+                }
+            }
         }
     }
 
+    next_cache.repository_id.clone_from(&repository_id);
     next_cache.save(cache_path.as_ref())?;
     Ok(IncrementalScan {
         graph,
@@ -112,6 +159,8 @@ pub fn scan_repository_incremental(
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct CacheFile {
     schema_version: u32,
+    #[serde(default)]
+    repository_id: String,
     files: BTreeMap<String, CachedFile>,
 }
 
@@ -119,6 +168,7 @@ impl Default for CacheFile {
     fn default() -> Self {
         Self {
             schema_version: CACHE_SCHEMA_VERSION,
+            repository_id: String::new(),
             files: BTreeMap::new(),
         }
     }
@@ -165,10 +215,16 @@ fn file_hash(path: &Path) -> Result<String> {
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
-fn file_tombstone(repo_relative_path: &str) -> GraphRecord {
-    let deleted_id = stable_id(&["node", "file", repo_relative_path]);
+fn file_tombstone(repo_relative_path: &str, repository_id: &str) -> GraphRecord {
+    let deleted_id = stable_id(&["node", "file", repository_id, repo_relative_path]);
     GraphRecord::Tombstone {
-        id: stable_id(&["tombstone", "file", repo_relative_path, &deleted_id]),
+        id: stable_id(&[
+            "tombstone",
+            "file",
+            repository_id,
+            repo_relative_path,
+            &deleted_id,
+        ]),
         schema_version: SCHEMA_VERSION,
         deleted_id,
         summary: format!("Removed source file {repo_relative_path}"),

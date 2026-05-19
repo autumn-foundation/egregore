@@ -16,13 +16,18 @@ use crate::{
 ///
 /// Returns an error when the file cannot be read, the Rust grammar cannot be
 /// loaded, or Tree-sitter cannot produce a syntax tree.
-pub fn extract_file(file: &SourceFile, file_id: &str, graph: &mut Graph) -> Result<()> {
+pub fn extract_file(
+    file: &SourceFile,
+    file_id: &str,
+    repository_id: &str,
+    graph: &mut Graph,
+) -> Result<()> {
     let source =
         std::fs::read_to_string(&file.path).map_err(|source| CodegraphError::ReadFile {
             path: file.path.clone(),
             source,
         })?;
-    extract_file_source(file, &source, file_id, graph)
+    extract_file_source(file, &source, file_id, repository_id, graph)
 }
 
 /// Extracts Rust syntax records from supplied source text.
@@ -35,6 +40,7 @@ pub fn extract_file_source(
     file: &SourceFile,
     source: &str,
     file_id: &str,
+    repository_id: &str,
     graph: &mut Graph,
 ) -> Result<()> {
     let mut parser = Parser::new();
@@ -47,7 +53,7 @@ pub fn extract_file_source(
             path: file.path.clone(),
         })?;
 
-    let mut extractor = RustExtractor::new(file, file_id, graph, source);
+    let mut extractor = RustExtractor::new(file, file_id, repository_id, graph, source);
     extractor.walk(tree.root_node());
     extractor.emit_reference_edges();
     Ok(())
@@ -70,6 +76,7 @@ struct SymbolBody {
 struct RustExtractor<'graph, 'source> {
     file: &'source SourceFile,
     file_id: &'source str,
+    repository_id: &'source str,
     graph: &'graph mut Graph,
     source: &'source str,
     module_names: Vec<String>,
@@ -83,12 +90,14 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     fn new(
         file: &'source SourceFile,
         file_id: &'source str,
+        repository_id: &'source str,
         graph: &'graph mut Graph,
         source: &'source str,
     ) -> Self {
         Self {
             file,
             file_id,
+            repository_id,
             graph,
             source,
             module_names: file_module_path(&file.repo_relative_path),
@@ -132,6 +141,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let id = stable_id(&[
             "node",
             "module",
+            self.repository_id,
             &self.file.repo_relative_path,
             &qualified_name,
         ]);
@@ -160,7 +170,13 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
 
     fn extract_import(&mut self, node: Node<'_>) {
         let name = import_name(self.node_text(node));
-        let id = stable_id(&["node", "import", &self.file.repo_relative_path, &name]);
+        let id = stable_id(&[
+            "node",
+            "import",
+            self.repository_id,
+            &self.file.repo_relative_path,
+            &name,
+        ]);
         self.graph.push(GraphRecord::syntax_node(
             id.clone(),
             NodeKind::Import,
@@ -252,6 +268,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let id = stable_id(&[
             "node",
             "diagnostic",
+            self.repository_id,
             &self.file.repo_relative_path,
             &invocation,
             &span(node).start_byte.to_string(),
@@ -272,6 +289,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             "node",
             "symbol",
             symbol_kind,
+            self.repository_id,
             &self.file.repo_relative_path,
             qualified_name,
             &span(node).start_byte.to_string(),

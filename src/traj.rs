@@ -884,6 +884,7 @@ fn make_node(
         failure_kind: extra.failure_kind,
         exit_code: extra.exit_code,
         turn_index: extra.turn_index,
+        repository_identity: None,
     }
 }
 

@@ -99,6 +99,8 @@ after acquiring the same lock and proving the daemon is not active.
 This gives Egregore one rule: a data directory has one active embedded owner.
 Everything else is a client.
 
+**Repository identity and shared stores.** Every `Repository` node carries a structured `repository_identity` payload (see [docs/schema/repository-identity.md](../schema/repository-identity.md)) with one of three `identity_source` values: `remote`, `local_root_commit`, or `local_path`. The daemon write applier must reject ingest of any `Repository` node whose `identity_source` is `local_path` when the target data directory is a shared store (i.e., already contains more than one distinct `Repository` ID, or contains records from any non-`code_graph` domain). The rejection error code is `local_path_identity_unsupported`. Single-repo embedded stores remain permitted. Use `--repo-id-override` or a remote-backed clone for operator-controlled shared-store identity.
+
 ## Request Model
 
 Every request carries a request envelope:

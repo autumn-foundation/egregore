@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 /// Current schema version for code-graph records.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Schema version for agent-memory records (`Agent`, `AgentSession`, `Observation`, etc.).
 /// Documented in `docs/schema/agent-memory.md`.
@@ -98,6 +98,46 @@ pub struct NodeProvenance {
     pub redaction_policy_version: Option<String>,
 }
 
+/// How a `Repository` node's stable ID was determined.
+///
+/// Documented in `docs/schema/repository-identity.md`.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentitySource {
+    /// Derived from the lowest-name-sorted git remote URL (normalized).
+    Remote,
+    /// Derived from the root commit SHA (no remote available).
+    LocalRootCommit,
+    /// Derived from the canonical absolute path (no git or no commits).
+    /// Not stable across machines; unsafe for shared daemon stores.
+    LocalPath,
+    /// Supplied directly by the operator via `--repo-id-override`.
+    OperatorOverride,
+}
+
+/// Identity payload carried on every `Repository` node.
+///
+/// Describes how the node's stable ID was derived. Present only on
+/// `NodeKind::Repository` nodes; absent on all other node kinds.
+///
+/// Documented in `docs/schema/repository-identity.md`.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryIdentityPayload {
+    /// How the stable ID was computed.
+    pub identity_source: IdentitySource,
+    /// Normalized canonical remote URL (when `identity_source = remote`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
+    /// Root commit SHA (when `identity_source = local_root_commit`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_commit_sha: Option<String>,
+    /// Canonical absolute path (when `identity_source = local_path`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_path: Option<String>,
+    /// Directory basename; for display only, never an identity input.
+    pub basename: String,
+}
+
 /// A typed citation from an agent-memory node to another graph record.
 ///
 /// Evidence links are stored both on the source node (for fast read) and as
@@ -177,6 +217,9 @@ pub enum GraphRecord {
         /// Evidence citations for agent-memory nodes.
         #[serde(skip_serializing_if = "Option::is_none")]
         evidence_links: Option<Vec<EvidenceLink>>,
+        /// Identity payload for `Repository` nodes; absent on all other kinds.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        repository_identity: Option<Box<RepositoryIdentityPayload>>,
         // ── Agent-memory provenance fields (absent for code-graph nodes) ─────
         /// Observation body text (Observation nodes).
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -314,6 +357,7 @@ impl GraphRecord {
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
+            repository_identity: None,
             text: None,
             superseded_by: None,
             agent_id: None,
@@ -360,6 +404,7 @@ impl GraphRecord {
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
+            repository_identity: None,
             text: None,
             superseded_by: None,
             agent_id: None,
@@ -405,6 +450,7 @@ impl GraphRecord {
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
+            repository_identity: None,
             text: None,
             superseded_by: None,
             agent_id: None,
@@ -490,6 +536,19 @@ impl GraphRecord {
     pub fn with_semantic_drift(mut self, drift: SemanticDriftMetadata) -> Self {
         if let Self::Node { semantic_drift, .. } = &mut self {
             *semantic_drift = Some(Box::new(drift));
+        }
+        self
+    }
+
+    /// Attaches repository identity payload to a `Repository` node.
+    #[must_use]
+    pub fn with_repository_identity(mut self, payload: RepositoryIdentityPayload) -> Self {
+        if let Self::Node {
+            repository_identity,
+            ..
+        } = &mut self
+        {
+            *repository_identity = Some(Box::new(payload));
         }
         self
     }
@@ -808,10 +867,24 @@ pub fn stable_id(parts: &[&str]) -> String {
     format!("codegraph:v{SCHEMA_VERSION}:{}", hasher.finalize().to_hex())
 }
 
+/// Builds a code-graph ID using an explicit schema version rather than the current one.
+///
+/// Used when tombstoning records that were produced by an older version of the extractor;
+/// the deleted ID must match the prefix that was in use when the record was first written.
+#[must_use]
+pub(crate) fn versioned_stable_id(version: u32, parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("codegraph:v{version}:{}", hasher.finalize().to_hex())
+}
+
 /// Builds a stable agent-memory record ID.
 ///
 /// Uses the `agent_memory:v1:` prefix so agent-memory IDs cannot collide with
-/// code-graph `codegraph:v1:` IDs even when the content hashes are identical.
+/// code-graph `codegraph:v2:` IDs even when the content hashes are identical.
 /// Documented in docs/schema/agent-memory.md.
 #[must_use]
 pub fn agent_memory_stable_id(parts: &[&str]) -> String {

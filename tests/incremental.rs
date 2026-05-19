@@ -3,7 +3,7 @@
 use std::fs;
 
 use aletheia_egregore::incremental::scan_repository_incremental;
-use aletheia_egregore::{GraphRecord, SourceSpan, stable_id};
+use aletheia_egregore::{GraphRecord, NodeKind, SourceSpan, stable_id};
 
 #[test]
 fn incremental_reuses_unchanged_files_and_tombstones_removed_files() {
@@ -131,5 +131,68 @@ fn incremental_ignores_old_cache_when_extractor_output_schema_changes() {
             } if deleted_id == &stale_symbol_id
         )),
         "invalidated cached symbol IDs must be tombstoned so persisted stores can retire stale records"
+    );
+}
+
+#[test]
+fn incremental_tombstones_stale_repository_when_identity_changes() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    let src = repo.join("src");
+    fs::create_dir_all(&src).expect("fixture src dir should be created");
+    fs::write(src.join("lib.rs"), "pub fn answer() -> usize { 42 }\n")
+        .expect("fixture should write");
+    let cache_path = temp.path().join("codegraph-cache.json");
+
+    // Establish the current repository_id by doing a first scan.
+    let first = scan_repository_incremental(&repo, &cache_path).expect("first scan should work");
+    let actual_repo_id = first
+        .graph
+        .records()
+        .iter()
+        .find_map(|r| {
+            if let GraphRecord::Node {
+                kind: NodeKind::Repository,
+                id,
+                ..
+            } = r
+            {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .expect("first scan should contain a Repository node");
+
+    // Inject a stale cache with a different repository_id at the same schema version.
+    let old_repo_id = stable_id(&[
+        "repository",
+        "local-path",
+        "/old/path/that/no/longer/exists",
+    ]);
+    assert_ne!(
+        old_repo_id, actual_repo_id,
+        "old and new repo IDs must differ"
+    );
+    let stale_cache = serde_json::json!({
+        "schema_version": 3,
+        "repository_id": old_repo_id,
+        "files": {},
+    });
+    fs::write(
+        &cache_path,
+        serde_json::to_string_pretty(&stale_cache).expect("stale cache should serialize"),
+    )
+    .expect("fixture should write stale cache");
+
+    let second =
+        scan_repository_incremental(&repo, &cache_path).expect("second scan after id change");
+
+    assert!(
+        second.graph.records().iter().any(|record| matches!(
+            record,
+            GraphRecord::Tombstone { deleted_id, .. } if deleted_id == &old_repo_id
+        )),
+        "must emit a tombstone for the stale Repository node when identity changes"
     );
 }

@@ -14,7 +14,10 @@ use std::{
 use aletheia_egregore::{
     adapters::EmbeddedAletheiaSink,
     daemon::{DaemonClient, DaemonMetadata as ClientDaemonMetadata, StoreLease},
-    ir::{EdgeLabel, GraphRecord, NodeKind, TemporalMetadata},
+    ir::{
+        EdgeLabel, GraphRecord, IdentitySource, NodeKind, RepositoryIdentityPayload,
+        TemporalMetadata,
+    },
 };
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -382,7 +385,7 @@ fn daemon_ingest_preflights_wrong_service_before_sending_records() {
     write_graph(
         &graph_path,
         &[GraphRecord::node(
-            "codegraph:v1:wrong-service-ingest-node".to_owned(),
+            "codegraph:v3:wrong-service-ingest-node".to_owned(),
             NodeKind::Repository,
             None,
             None,
@@ -518,7 +521,7 @@ fn embedded_cli_ingest_refuses_while_daemon_owns_data_dir() {
     let mut daemon = start_daemon(&data_dir);
 
     let record = GraphRecord::node(
-        "codegraph:v1:restart-recovery-node".to_owned(),
+        "codegraph:v3:restart-recovery-node".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -557,7 +560,7 @@ fn embedded_cli_ingest_refuses_when_daemon_lock_exists_without_metadata() {
     let metadata = fs::read_to_string(&metadata_path).expect("metadata should be readable");
     fs::remove_file(&metadata_path).expect("metadata should be removable");
     let record = GraphRecord::node(
-        "codegraph:v1:restart-recovery-node".to_owned(),
+        "codegraph:v3:restart-recovery-node".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -677,7 +680,7 @@ fn daemon_recovers_pending_idempotency_receipt_after_restart() {
     let mut daemon = start_daemon(&data_dir);
 
     let record = GraphRecord::node(
-        "codegraph:v1:restart-recovery-node".to_owned(),
+        "codegraph:v3:restart-recovery-node".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -764,7 +767,7 @@ fn daemon_pending_recovery_rejects_same_id_mismatch() {
     let mut daemon = start_daemon(&data_dir);
 
     let first = GraphRecord::node(
-        "codegraph:v1:same-id-node".to_owned(),
+        "codegraph:v3:same-id-node".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -772,7 +775,7 @@ fn daemon_pending_recovery_rejects_same_id_mismatch() {
         "old".to_owned(),
     );
     let second = GraphRecord::node(
-        "codegraph:v1:same-id-node".to_owned(),
+        "codegraph:v3:same-id-node".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -815,7 +818,7 @@ fn daemon_pending_recovery_rejects_same_id_mismatch() {
     idempotency_json["entries"][same_id_second_key.as_str()] = serde_json::json!({
         "state": "pending",
         "payload_hash": second_hash,
-        "record_ids": ["codegraph:v1:same-id-node"],
+        "record_ids": ["codegraph:v3:same-id-node"],
         "records": [second],
     });
     fs::write(
@@ -846,7 +849,7 @@ fn daemon_pending_recovery_rejects_same_id_mismatch() {
     let read_response = http_request(
         &metadata.address,
         &format!(
-            "GET /v1/records/codegraph:v1:same-id-node HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            "GET /v1/records/codegraph:v3:same-id-node HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
             metadata.token
         ),
     );
@@ -863,7 +866,7 @@ fn daemon_pending_recovery_rejects_stale_same_id_replay() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
     let old = GraphRecord::node(
-        "codegraph:v1:stale-pending-node".to_owned(),
+        "codegraph:v3:stale-pending-node".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -871,7 +874,7 @@ fn daemon_pending_recovery_rejects_stale_same_id_replay() {
         "old".to_owned(),
     );
     let new = GraphRecord::node(
-        "codegraph:v1:stale-pending-node".to_owned(),
+        "codegraph:v3:stale-pending-node".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -899,7 +902,7 @@ fn daemon_pending_recovery_rejects_stale_same_id_replay() {
                 stale_old_key: {
                     "state": "pending",
                     "payload_hash": old_hash,
-                    "record_ids": ["codegraph:v1:stale-pending-node"],
+                    "record_ids": ["codegraph:v3:stale-pending-node"],
                     "records": [old],
                 }
             }
@@ -948,7 +951,7 @@ fn daemon_pending_recovery_rejects_stale_same_id_replay() {
     let read_response = http_request(
         &metadata.address,
         &format!(
-            "GET /v1/records/codegraph:v1:stale-pending-node HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            "GET /v1/records/codegraph:v3:stale-pending-node HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
             metadata.token
         ),
     );
@@ -966,7 +969,7 @@ fn daemon_pending_recovery_rejects_duplicate_id_batches() {
     let data_dir = temp.path().join("store");
     let graph_path = temp.path().join("duplicate-id.jsonl");
     let first = GraphRecord::node(
-        "codegraph:v1:duplicate-pending-node".to_owned(),
+        "codegraph:v3:duplicate-pending-node".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -974,7 +977,7 @@ fn daemon_pending_recovery_rejects_duplicate_id_batches() {
         "first".to_owned(),
     );
     let second = GraphRecord::node(
-        "codegraph:v1:duplicate-pending-node".to_owned(),
+        "codegraph:v3:duplicate-pending-node".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -1007,8 +1010,8 @@ fn daemon_pending_recovery_rejects_duplicate_id_batches() {
                     "state": "pending",
                     "payload_hash": payload_hash,
                     "record_ids": [
-                        "codegraph:v1:duplicate-pending-node",
-                        "codegraph:v1:duplicate-pending-node"
+                        "codegraph:v3:duplicate-pending-node",
+                        "codegraph:v3:duplicate-pending-node"
                     ],
                     "records": records,
                 }
@@ -1042,7 +1045,7 @@ fn daemon_rejects_fresh_duplicate_current_record_ids_before_commit() {
     let data_dir = temp.path().join("store");
     let graph_path = temp.path().join("duplicate-fresh.jsonl");
     let first = GraphRecord::node(
-        "codegraph:v1:fresh-duplicate-node".to_owned(),
+        "codegraph:v3:fresh-duplicate-node".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -1050,7 +1053,7 @@ fn daemon_rejects_fresh_duplicate_current_record_ids_before_commit() {
         "first".to_owned(),
     );
     let second = GraphRecord::node(
-        "codegraph:v1:fresh-duplicate-node".to_owned(),
+        "codegraph:v3:fresh-duplicate-node".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -1078,7 +1081,7 @@ fn daemon_rejects_fresh_duplicate_current_record_ids_before_commit() {
     let read_response = http_request(
         &metadata.address,
         &format!(
-            "GET /v1/records/codegraph:v1:fresh-duplicate-node HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            "GET /v1/records/codegraph:v3:fresh-duplicate-node HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
             metadata.token
         ),
     );
@@ -1096,7 +1099,7 @@ fn daemon_rejects_identical_fresh_duplicate_current_record_ids_before_commit() {
     let data_dir = temp.path().join("store");
     let graph_path = temp.path().join("identical-duplicate-fresh.jsonl");
     let record = GraphRecord::node(
-        "codegraph:v1:identical-fresh-duplicate-node".to_owned(),
+        "codegraph:v3:identical-fresh-duplicate-node".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -1124,7 +1127,7 @@ fn daemon_rejects_identical_fresh_duplicate_current_record_ids_before_commit() {
     let read_response = http_request(
         &metadata.address,
         &format!(
-            "GET /v1/records/codegraph:v1:identical-fresh-duplicate-node HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            "GET /v1/records/codegraph:v3:identical-fresh-duplicate-node HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
             metadata.token
         ),
     );
@@ -1141,8 +1144,8 @@ fn daemon_rejects_identical_duplicate_edge_observations_before_commit() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
     let graph_path = temp.path().join("duplicate-edge-fresh.jsonl");
-    let file_id = "codegraph:v1:duplicate-edge-file".to_owned();
-    let symbol_id = "codegraph:v1:duplicate-edge-symbol".to_owned();
+    let file_id = "codegraph:v3:duplicate-edge-file".to_owned();
+    let symbol_id = "codegraph:v3:duplicate-edge-symbol".to_owned();
     let file = GraphRecord::node(
         file_id.clone(),
         NodeKind::File,
@@ -1192,13 +1195,13 @@ fn daemon_pending_recovery_accepts_temporal_duplicate_ids() {
     let data_dir = temp.path().join("store");
     let graph_path = temp.path().join("temporal-duplicates.jsonl");
     let first = temporal_node(
-        "codegraph:v1:temporal-file",
+        "codegraph:v3:temporal-file",
         "1111111111111111111111111111111111111111",
         "2026-05-17T00:00:00Z",
         "first temporal observation",
     );
     let second = temporal_node(
-        "codegraph:v1:temporal-file",
+        "codegraph:v3:temporal-file",
         "2222222222222222222222222222222222222222",
         "2026-05-18T00:00:00Z",
         "second temporal observation",
@@ -1299,7 +1302,7 @@ fn daemon_reports_error_when_committed_receipt_cannot_be_persisted() {
     let data_dir = temp.path().join("store");
     let graph_path = temp.path().join("graph.jsonl");
     let record = GraphRecord::node(
-        "codegraph:v1:blocked-commit-receipt-node".to_owned(),
+        "codegraph:v3:blocked-commit-receipt-node".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -1402,7 +1405,7 @@ fn daemon_query_honors_positive_timeout_budget() {
     let mut daemon = start_daemon(&data_dir);
     let metadata = read_metadata(&data_dir);
     let record_ids = (0..1000)
-        .map(|index| format!("codegraph:v1:missing-query-record-{index}"))
+        .map(|index| format!("codegraph:v3:missing-query-record-{index}"))
         .collect::<Vec<_>>();
     let response = http_json(
         &metadata,
@@ -1479,7 +1482,7 @@ fn daemon_job_ingest_retry_returns_original_job_handle() {
     let mut daemon = start_daemon(&data_dir);
     let metadata = read_metadata(&data_dir);
     let record = GraphRecord::node(
-        "codegraph:v1:job-retry-node".to_owned(),
+        "codegraph:v3:job-retry-node".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -1533,7 +1536,7 @@ fn daemon_job_ingest_rejects_same_key_with_different_payload() {
     let mut daemon = start_daemon(&data_dir);
     let metadata = read_metadata(&data_dir);
     let first_record = GraphRecord::node(
-        "codegraph:v1:job-conflict-first".to_owned(),
+        "codegraph:v3:job-conflict-first".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -1541,7 +1544,7 @@ fn daemon_job_ingest_rejects_same_key_with_different_payload() {
         "job conflict first".to_owned(),
     );
     let second_record = GraphRecord::node(
-        "codegraph:v1:job-conflict-second".to_owned(),
+        "codegraph:v3:job-conflict-second".to_owned(),
         NodeKind::Repository,
         None,
         None,
@@ -1589,16 +1592,16 @@ fn daemon_ingest_idempotency_keys_are_scoped_by_agent_session() {
     let metadata = read_metadata(&data_dir);
     let shared_key = "shared-scan-key";
     let first_record = GraphRecord::node(
-        "codegraph:v1:agent-scope-first".to_owned(),
-        NodeKind::Repository,
+        "codegraph:v3:agent-scope-first".to_owned(),
+        NodeKind::Module,
         None,
         None,
         Some("repo".to_owned()),
         "agent scoped first".to_owned(),
     );
     let second_record = GraphRecord::node(
-        "codegraph:v1:agent-scope-second".to_owned(),
-        NodeKind::Repository,
+        "codegraph:v3:agent-scope-second".to_owned(),
+        NodeKind::Module,
         None,
         None,
         Some("repo".to_owned()),
@@ -1644,6 +1647,8 @@ fn daemon_registers_agents_runs_ingest_jobs_and_queries_records() {
         .expect("binary should run")
         .arg("scan")
         .arg(fixture_repo())
+        .arg("--repo-id-override")
+        .arg("fixture-rust-basic-stable")
         .arg("--out")
         .arg(&graph_path)
         .assert()
@@ -2059,9 +2064,9 @@ fn contract_conformance_all_routes() {
     // ── POST /v1/records/ingest ─────────────────────────────────────────────────
     let ingest_record = serde_json::json!({
         "record_type": "node",
-        "id": "codegraph:v1:conformance-ingest-node",
+        "id": "codegraph:v3:conformance-ingest-node",
         "schema_version": 1,
-        "kind": "Repository",
+        "kind": "Module",
         "name": "conformance",
         "summary": "conformance test node"
     });
@@ -2243,9 +2248,9 @@ fn contract_conformance_all_routes() {
     {
         let other_record = serde_json::json!({
             "record_type": "node",
-            "id": "codegraph:v1:conformance-conflict-node",
+            "id": "codegraph:v3:conformance-conflict-node",
             "schema_version": 1,
-            "kind": "Repository",
+            "kind": "Module",
             "name": "conflict",
             "summary": "a different node"
         });
@@ -2562,7 +2567,7 @@ fn contract_conformance_all_routes() {
     {
         let res = http_get_authed(
             &metadata,
-            "/v1/records/codegraph:v1:conformance-ingest-node",
+            "/v1/records/codegraph:v3:conformance-ingest-node",
         );
         assert!(
             res.starts_with("HTTP/1.1 200"),
@@ -2778,7 +2783,7 @@ fn evidence_link_with_missing_target_is_rejected() {
                     "confidence": "0.9",
                     "summary": "test observation with unresolved evidence link",
                     "evidence_links": [{
-                        "target_record_id": "codegraph:v1:nonexistent-symbol-xyzzy",
+                        "target_record_id": "codegraph:v3:nonexistent-symbol-xyzzy",
                         "target_domain": "codegraph",
                         "relation": "OBSERVES",
                         "confidence": "0.9"
@@ -2797,6 +2802,92 @@ fn evidence_link_with_missing_target_is_rejected() {
     assert_eq!(
         body["error"]["code"], "unresolved_evidence_target",
         "rejection must carry unresolved_evidence_target code per schema doc, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn local_path_repository_identity_rejected_in_shared_store() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let first_repo = GraphRecord::node(
+        "codegraph:v3:local-path-repo-first".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo-a".to_owned()),
+        "Repo A".to_owned(),
+    )
+    .with_repository_identity(RepositoryIdentityPayload {
+        identity_source: IdentitySource::LocalRootCommit,
+        remote_url: None,
+        root_commit_sha: Some("aaaa1111".to_owned()),
+        canonical_path: None,
+        basename: "repo-a".to_owned(),
+    });
+
+    let first_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "local-path-shared-store-first",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "local-path-shared-store-first",
+            "domain": "codegraph",
+            "created_at": "2026-05-18T00:00:00Z",
+            "payload": { "records": [first_repo] }
+        }),
+    );
+    assert!(
+        first_response.starts_with("HTTP/1.1 200"),
+        "first repo ingest should succeed, got {first_response}"
+    );
+
+    let local_path_repo = GraphRecord::node(
+        "codegraph:v3:local-path-repo-second".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo-b".to_owned()),
+        "Repo B".to_owned(),
+    )
+    .with_repository_identity(RepositoryIdentityPayload {
+        identity_source: IdentitySource::LocalPath,
+        remote_url: None,
+        root_commit_sha: None,
+        canonical_path: Some("/tmp/some-path/repo-b".to_owned()),
+        basename: "repo-b".to_owned(),
+    });
+
+    let second_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "local-path-shared-store-second",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "local-path-shared-store-second",
+            "domain": "codegraph",
+            "created_at": "2026-05-18T00:00:00Z",
+            "payload": { "records": [local_path_repo] }
+        }),
+    );
+    assert!(
+        !second_response.starts_with("HTTP/1.1 200"),
+        "local_path repository in shared store should be rejected, got {second_response}"
+    );
+
+    let body = response_json(&second_response);
+    assert_eq!(
+        body["error"]["code"], "local_path_identity_unsupported",
+        "rejection must carry local_path_identity_unsupported code, got {body}"
     );
 
     daemon.stop();

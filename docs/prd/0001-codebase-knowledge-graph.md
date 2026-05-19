@@ -84,7 +84,7 @@ Initial node kinds:
 
 | Kind | Purpose | Stable ID Input |
 |------|---------|-----------------|
-| `Repository` | Indexed repo root | canonical repo root plus VCS remote when available |
+| `Repository` | Indexed repo root | VCS remote URL (case 1), root commit SHA (case 2), or canonical absolute path (case 3) — see [docs/schema/repository-identity.md](../schema/repository-identity.md) |
 | `File` | Source file | repo-relative path |
 | `Module` | Language module namespace | repo-relative path plus module path |
 | `Symbol` | Function, struct, enum, trait, impl, const, static, type alias, route, or test | file path plus syntax span plus normalized name |

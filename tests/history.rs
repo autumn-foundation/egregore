@@ -86,14 +86,16 @@ fn changed_in_commit_edges_only_target_changed_paths() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir should be created");
-    let [_first, second] = seed_two_file_history_repo(&repo);
+    let [first, second] = seed_two_file_history_repo(&repo);
 
     let jsonl = scan_repository_history(&repo)
         .expect("history should scan")
         .to_jsonl()
         .expect("history graph should serialize");
     let records = parse_jsonl(&jsonl);
-    let second_commit_id = stable_id(&["node", "commit", "repo", &second]);
+    // Repo has no remote; identity is derived from the root commit SHA (= first commit).
+    let repository_id = stable_id(&["repository", "local-root-commit", &first]);
+    let second_commit_id = stable_id(&["node", "commit", &repository_id, &second]);
     let changed_sources = changed_in_sources_targeting(&records, &second_commit_id);
 
     assert_path_has_changed_source(&records, &changed_sources, "src/a.rs");
@@ -112,7 +114,10 @@ fn merge_commits_with_rust_resolutions_keep_commit_changed_in_edges() {
         .to_jsonl()
         .expect("history graph should serialize");
     let records = parse_jsonl(&jsonl);
-    let merge_commit_id = stable_id(&["node", "commit", "repo", &merge]);
+    // Repo has no remote; identity is derived from the root commit SHA.
+    let root_sha = git_root_sha(&repo);
+    let repository_id = stable_id(&["repository", "local-root-commit", &root_sha]);
+    let merge_commit_id = stable_id(&["node", "commit", &repository_id, &merge]);
     let changed_sources = changed_in_sources_targeting(&records, &merge_commit_id);
 
     assert_path_has_changed_source(&records, &changed_sources, "src/lib.rs");
@@ -123,6 +128,7 @@ fn seed_history_repo(repo: &Path) -> [String; 3] {
     git(repo, ["config", "user.email", "codegraph@example.invalid"]);
     git(repo, ["config", "user.name", "Codegraph Test"]);
     git(repo, ["config", "core.autocrlf", "false"]);
+    git(repo, ["config", "commit.gpgsign", "false"]);
 
     write(repo, "src/lib.rs", "pub fn original() -> u32 { 1 }\n");
     let first = commit(repo, "initial symbol", "2026-01-01T00:00:00Z");
@@ -145,6 +151,7 @@ fn seed_two_file_history_repo(repo: &Path) -> [String; 2] {
     git(repo, ["config", "user.email", "codegraph@example.invalid"]);
     git(repo, ["config", "user.name", "Codegraph Test"]);
     git(repo, ["config", "core.autocrlf", "false"]);
+    git(repo, ["config", "commit.gpgsign", "false"]);
 
     write(repo, "src/a.rs", "pub fn a() -> u32 { 1 }\n");
     write(repo, "src/b.rs", "pub fn b() -> u32 { 1 }\n");
@@ -161,6 +168,7 @@ fn seed_conflict_resolution_merge_repo(repo: &Path) -> String {
     git(repo, ["config", "user.email", "codegraph@example.invalid"]);
     git(repo, ["config", "user.name", "Codegraph Test"]);
     git(repo, ["config", "core.autocrlf", "false"]);
+    git(repo, ["config", "commit.gpgsign", "false"]);
 
     write(repo, "src/lib.rs", "pub fn value() -> u32 { 1 }\n");
     commit(repo, "base value", "2026-03-01T00:00:00Z");
@@ -253,6 +261,10 @@ fn git_output<const N: usize>(repo: &Path, args: [&str; N]) -> String {
         .expect("git output should be utf-8")
         .trim()
         .to_owned()
+}
+
+fn git_root_sha(repo: &Path) -> String {
+    git_output(repo, ["rev-list", "--max-parents=0", "HEAD"])
 }
 
 fn parse_jsonl(jsonl: &str) -> Vec<Value> {

@@ -19,6 +19,8 @@ pub mod error;
 pub mod fs;
 /// Git history replay.
 pub mod history;
+/// Repository identity computation.
+pub mod identity;
 /// Incremental scan cache.
 pub mod incremental;
 /// Stable graph intermediate representation.
@@ -32,38 +34,51 @@ pub mod query;
 /// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
 pub mod traj;
 
-use std::{ffi::OsStr, path::Path};
+use std::path::Path;
 
 pub use error::{CodegraphError, Result};
-pub use history::scan_repository_history;
+pub use history::{scan_repository_history, scan_repository_history_with_override};
 pub use ir::{
-    AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind,
-    NodeProvenance, SCHEMA_VERSION, SemanticDriftMetadata, SourceSpan, TemporalMetadata,
-    agent_memory_stable_id, stable_id,
+    AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, Graph, GraphRecord, IdentitySource,
+    NodeKind, NodeProvenance, RepositoryIdentityPayload, SCHEMA_VERSION, SemanticDriftMetadata,
+    SourceSpan, TemporalMetadata, agent_memory_stable_id, stable_id,
 };
 pub use traj::import_traj;
 
 /// Scans a repository into deterministic graph records.
 ///
-/// This emits repository, Rust source file, syntax-backed symbol, import,
-/// diagnostic, and relationship records without requiring an `AletheiaDB` store.
+/// Repository identity is derived from VCS remote URL, root commit SHA, or
+/// canonical path — see `docs/schema/repository-identity.md`.
 ///
 /// # Errors
 ///
 /// Returns an error when the repository path is missing, is not a directory, or
 /// source discovery cannot read the filesystem.
 pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<Graph> {
+    scan_repository_with_override(repo_path, None)
+}
+
+/// Scans a repository into deterministic graph records with an optional identity override.
+///
+/// When `repo_id_override` is `Some`, its value is used directly as the
+/// canonical input for the repository's stable ID (forcing
+/// `identity_source = operator_override`). Pass `None` for normal auto-detection.
+///
+/// # Errors
+///
+/// Returns an error when the repository path is missing, is not a directory, or
+/// source discovery cannot read the filesystem.
+pub fn scan_repository_with_override(
+    repo_path: impl AsRef<Path>,
+    repo_id_override: Option<&str>,
+) -> Result<Graph> {
     let repo_root = repo_path.as_ref();
     validate_repository(repo_root)?;
 
-    let repo_name = repo_root
-        .file_name()
-        .and_then(OsStr::to_str)
-        .filter(|name| !name.is_empty())
-        .unwrap_or("repository");
+    let repo_identity = identity::compute_repository_identity(repo_root, repo_id_override);
     let mut graph = Graph::new();
-    let (repository_id, repository_record) = repository_record(repo_name);
-    graph.push(repository_record);
+    let (repository_id, repo_record) = repository_record_from_identity(&repo_identity);
+    graph.push(repo_record);
 
     for source_file in fs::discover_rust_source_files(repo_root)? {
         for record in scan_source_file_records(&source_file, &repository_id)? {
@@ -74,17 +89,48 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<Graph> {
     Ok(graph)
 }
 
-pub(crate) fn repository_record(repo_name: &str) -> (String, GraphRecord) {
-    let repository_id = stable_id(&["node", "repository", repo_name]);
+pub(crate) fn repository_record_from_identity(
+    identity: &identity::RepositoryIdentity,
+) -> (String, GraphRecord) {
+    let id = identity.id.clone();
+    let display_name = stable_display_name(&identity.payload);
     let record = GraphRecord::node(
-        repository_id.clone(),
+        id.clone(),
         NodeKind::Repository,
         None,
         None,
-        Some(repo_name.to_owned()),
-        format!("Repository {repo_name}"),
-    );
-    (repository_id, record)
+        Some(display_name.clone()),
+        format!("Repository {display_name}"),
+    )
+    .with_repository_identity(identity.payload.clone());
+    (id, record)
+}
+
+/// Returns a stable display name for the repository that does not depend on the
+/// local checkout directory basename when a more canonical source is available.
+fn stable_display_name(payload: &RepositoryIdentityPayload) -> String {
+    match &payload.identity_source {
+        IdentitySource::Remote => payload
+            .remote_url
+            .as_deref()
+            .and_then(|url| {
+                url.strip_prefix("https://")
+                    .or_else(|| url.strip_prefix("http://"))
+            })
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(_, path)| path)
+            .filter(|path| !path.is_empty())
+            .unwrap_or(&payload.basename)
+            .to_owned(),
+        IdentitySource::LocalRootCommit => payload.root_commit_sha.as_deref().map_or_else(
+            || payload.basename.clone(),
+            |sha| {
+                let short: String = sha.chars().take(12).collect();
+                format!("commit-{short}")
+            },
+        ),
+        IdentitySource::OperatorOverride | IdentitySource::LocalPath => payload.basename.clone(),
+    }
 }
 
 pub(crate) fn scan_source_file_records(
@@ -106,7 +152,7 @@ pub(crate) fn scan_source_text_records(
 ) -> Result<Vec<GraphRecord>> {
     let mut graph = Graph::new();
     let repo_relative_path = source_file.repo_relative_path.clone();
-    let file_id = stable_id(&["node", "file", &repo_relative_path]);
+    let file_id = stable_id(&["node", "file", repository_id, &repo_relative_path]);
     graph.push(GraphRecord::node(
         file_id.clone(),
         NodeKind::File,
@@ -116,7 +162,7 @@ pub(crate) fn scan_source_text_records(
         format!("Rust source file {repo_relative_path}"),
     ));
     parser::add_repository_file_edge(&mut graph, repository_id, &file_id);
-    parser::extract_source_text(source_file, source, &file_id, &mut graph)?;
+    parser::extract_source_text(source_file, source, &file_id, repository_id, &mut graph)?;
     Ok(graph.records().to_vec())
 }
 
