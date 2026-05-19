@@ -625,6 +625,29 @@ impl EdgeLabel {
         }
     }
 
+    /// Returns `true` when this label is permitted in an evidence link citation.
+    ///
+    /// Code-graph-internal labels (`CONTAINS`, `DEFINES`, `CALLS`, etc.) are
+    /// reserved for the extractor and must not appear in evidence links.
+    #[must_use]
+    pub const fn is_evidence_link_label(self) -> bool {
+        matches!(
+            self,
+            Self::HasEvidence
+                | Self::Observes
+                | Self::MentionsSymbol
+                | Self::TouchedFile
+                | Self::ProducedPatch
+                | Self::ValidatedBy
+                | Self::FailedOn
+                | Self::ExplainsChange
+                | Self::ReferencesTask
+                | Self::Contradicts
+                | Self::Supersedes
+                | Self::RelatesTo
+        )
+    }
+
     /// Returns the serialized edge label.
     #[must_use]
     pub const fn as_str(self) -> &'static str {

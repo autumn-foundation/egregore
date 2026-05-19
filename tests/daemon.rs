@@ -2748,7 +2748,7 @@ fn evidence_link_with_missing_target_is_rejected() {
             "agent_id": "test-agent",
             "session_id": "test-session",
             "idempotency_key": "evidence-link-missing-target-key",
-            "domain": "codegraph",
+            "domain": "agent_memory",
             "created_at": "2026-05-18T00:00:00Z",
             "payload": {
                 "records": [{
@@ -2756,6 +2756,13 @@ fn evidence_link_with_missing_target_is_rejected() {
                     "id": "agent_memory:v1:evidence-link-test-obs",
                     "kind": "Observation",
                     "schema_version": 1,
+                    "text": "test observation",
+                    "agent_id": "test-agent",
+                    "agent_kind": "coding",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-18T00:00:00Z",
+                    "ingested_at": "2026-05-18T00:00:00Z",
+                    "confidence": "0.9",
                     "summary": "test observation with unresolved evidence link",
                     "evidence_links": [{
                         "target_record_id": "codegraph:v1:nonexistent-symbol-xyzzy",

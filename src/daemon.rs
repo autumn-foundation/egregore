@@ -29,7 +29,7 @@ use crate::{
     },
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord, NodeKind,
-        agent_memory_stable_id,
+        TemporalMetadata, agent_memory_stable_id,
     },
 };
 
@@ -1048,7 +1048,10 @@ fn apply_write(
                     IdempotencyEntry::Pending {
                         payload_hash: command.payload_hash.clone(),
                         record_ids: record_ids.clone(),
-                        records: all_records.clone(),
+                        // Store original records so restart recovery re-enqueues the
+                        // same payload and recomputes the same hash.  Synthesized edges
+                        // are re-derived from the original records on recovery.
+                        records: command.records.clone(),
                     },
                 )
                 .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -1157,23 +1160,51 @@ fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {
     Ok(())
 }
 
+// Returns true when `id` has the expected record-ID prefix for `domain`.
+fn record_id_matches_domain(id: &str, domain: &str) -> bool {
+    match domain {
+        "codegraph" => id.starts_with("codegraph:v1:"),
+        "agent_memory" => id.starts_with("agent_memory:v1:"),
+        _ => true,
+    }
+}
+
+// Validates that a resolved target ID is consistent with the declared target_domain.
+fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult<()> {
+    if !record_id_matches_domain(id, target_domain) {
+        return Err(ApiError::bad_request(format!(
+            "evidence link declares target_domain '{target_domain}' but target '{id}' has a different ID prefix",
+        )));
+    }
+    Ok(())
+}
+
 // Resolves an evidence link's target ID.  Returns the canonical record ID or an error.
 // Accepts either a direct `target_record_id` or a (path, span, commit) triple.
+// `batch` is the current ingest payload; targets that have not yet been written but
+// appear in the same batch are accepted so one request can atomically create a target
+// node and an observation that cites it.
 fn resolve_evidence_target(
     link: &EvidenceLink,
     sink: &EmbeddedAletheiaSink,
+    batch: &[GraphRecord],
 ) -> WriteResult<String> {
     if let Some(id) = &link.target_record_id {
-        return match sink.read_back(id) {
-            Ok(Some(_)) => Ok(id.clone()),
-            Ok(None) => Err(ApiError::new(
-                ErrorCode::UnresolvedEvidenceTarget,
-                format!("evidence link target '{id}' not found in store"),
-            )),
-            Err(e) => Err(ApiError::internal(e.to_string())),
+        let in_sink = match sink.read_back(id) {
+            Ok(found) => found.is_some(),
+            Err(e) => return Err(ApiError::internal(e.to_string())),
         };
+        let in_batch = batch.iter().any(|r| r.id() == id.as_str());
+        if !in_sink && !in_batch {
+            return Err(ApiError::new(
+                ErrorCode::UnresolvedEvidenceTarget,
+                format!("evidence link target '{id}' not found in store or batch"),
+            ));
+        }
+        validate_evidence_target_domain(id, &link.target_domain)?;
+        return Ok(id.clone());
     }
-    // Triple-based resolution: scan all records for matching path + commit [+ span].
+    // Triple-based resolution: scan store + batch for matching path + commit [+ span].
     let path = link.target_repo_relative_path.as_deref().ok_or_else(|| {
         ApiError::missing_field(
             "evidence_links[].target_record_id or (target_repo_relative_path, target_git_commit)",
@@ -1183,10 +1214,10 @@ fn resolve_evidence_target(
         .target_git_commit
         .as_deref()
         .ok_or_else(|| ApiError::missing_field("evidence_links[].target_git_commit"))?;
-    let all = sink
+    let store_records = sink
         .read_all_records()
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    for record in &all {
+    let found_id = store_records.iter().chain(batch.iter()).find_map(|record| {
         if let GraphRecord::Node {
             id,
             repo_relative_path: Some(rp),
@@ -1201,13 +1232,21 @@ fn resolve_evidence_target(
                 .as_ref()
                 .is_none_or(|ts| span.as_ref() == Some(ts))
         {
-            return Ok(id.clone());
+            Some(id.clone())
+        } else {
+            None
         }
+    });
+    match found_id {
+        Some(id) => {
+            validate_evidence_target_domain(&id, &link.target_domain)?;
+            Ok(id)
+        }
+        None => Err(ApiError::new(
+            ErrorCode::UnresolvedEvidenceTarget,
+            format!("evidence link target not found by triple (path={path}, commit={commit})"),
+        )),
     }
-    Err(ApiError::new(
-        ErrorCode::UnresolvedEvidenceTarget,
-        format!("evidence link target not found by triple (path={path}, commit={commit})"),
-    ))
 }
 
 // Validates evidence link invariants and synthesizes the required graph Edge records.
@@ -1216,7 +1255,14 @@ struct ResolvedLink {
     target_id: String,
     relation: String,
     confidence: Option<String>,
+    // Propagated to the synthesized edge so multi-observation temporal targets can be resolved.
+    as_of_commit: Option<String>,
 }
+
+// Sentinel timestamps used for evidence-edge temporal routing metadata.
+// These are valid RFC 3339 but semantically unimportant; agent-memory edges are
+// not used in time-range queries.
+const EVIDENCE_EDGE_ROUTING_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 
 // Returns the synthesized edges, which the caller must include in the write set.
 fn validate_and_synthesize_evidence_edges(
@@ -1235,17 +1281,57 @@ fn validate_and_synthesize_evidence_edges(
                 kind,
                 evidence_links,
                 confidence,
+                text,
+                agent_id,
+                agent_kind,
+                session_id,
+                observed_at,
+                ingested_at,
                 ..
             } = record
             {
                 let links = evidence_links.as_deref().unwrap_or(&[]);
-                if *kind == NodeKind::Observation && links.is_empty() {
-                    return Err(ApiError::missing_field(
-                        "evidence_links (Observation requires at least one evidence link)",
-                    ));
+                if *kind == NodeKind::Observation {
+                    if links.is_empty() {
+                        return Err(ApiError::missing_field(
+                            "evidence_links (Observation requires at least one evidence link)",
+                        ));
+                    }
+                    // Enforce required Observation provenance fields.
+                    let required: &[(&str, bool)] = &[
+                        ("text", text.as_ref().is_some_and(|s| !s.is_empty())),
+                        ("agent_id", agent_id.as_ref().is_some_and(|s| !s.is_empty())),
+                        (
+                            "agent_kind",
+                            agent_kind.as_ref().is_some_and(|s| !s.is_empty()),
+                        ),
+                        (
+                            "session_id",
+                            session_id.as_ref().is_some_and(|s| !s.is_empty()),
+                        ),
+                        (
+                            "observed_at",
+                            observed_at.as_ref().is_some_and(|s| !s.is_empty()),
+                        ),
+                        (
+                            "ingested_at",
+                            ingested_at.as_ref().is_some_and(|s| !s.is_empty()),
+                        ),
+                        (
+                            "confidence",
+                            confidence.as_ref().is_some_and(|s| !s.is_empty()),
+                        ),
+                    ];
+                    for (field, present) in required {
+                        if !present {
+                            return Err(ApiError::missing_field(format!(
+                                "{field} (required for Observation nodes)"
+                            )));
+                        }
+                    }
                 }
                 for link in links {
-                    let target_id = resolve_evidence_target(link, &sink_guard)?;
+                    let target_id = resolve_evidence_target(link, &sink_guard, records)?;
                     let link_confidence = if link.confidence.is_empty() {
                         confidence.clone()
                     } else {
@@ -1256,6 +1342,7 @@ fn validate_and_synthesize_evidence_edges(
                         target_id,
                         relation: link.relation.clone(),
                         confidence: link_confidence,
+                        as_of_commit: link.as_of_commit.clone(),
                     });
                 }
             }
@@ -1265,19 +1352,45 @@ fn validate_and_synthesize_evidence_edges(
     };
 
     // Phase 2: synthesize edge records (no lock needed).
+    // Deduplicate by stable edge ID so duplicate links (same target+relation) don't
+    // create multiple physical edges with the same logical ID.
+    let mut seen_edge_ids = std::collections::BTreeSet::new();
     let mut edges = Vec::with_capacity(resolved.len());
     for rl in resolved {
         let edge_label = EdgeLabel::from_relation(&rl.relation).ok_or_else(|| {
             ApiError::bad_request(format!("unknown evidence link relation '{}'", rl.relation))
         })?;
+        if !edge_label.is_evidence_link_label() {
+            return Err(ApiError::bad_request(format!(
+                "evidence link relation '{}' is a code-graph-internal label and may not be used in evidence links",
+                rl.relation
+            )));
+        }
         let summary = format!("{} {} (from evidence link)", rl.node_id, rl.relation);
-        edges.push(GraphRecord::agent_memory_edge(
+        let edge = GraphRecord::agent_memory_edge(
             edge_label,
             rl.node_id,
             rl.target_id,
             rl.confidence,
             summary,
-        ));
+        );
+        // If the citation anchors a specific commit, attach it as routing-only temporal metadata
+        // so write_edge can resolve the correct temporal endpoint when the target has multiple
+        // historical observations.
+        let edge = if let Some(commit) = rl.as_of_commit {
+            edge.with_temporal(TemporalMetadata {
+                git_commit: commit,
+                git_parent_commits: Vec::new(),
+                valid_time: EVIDENCE_EDGE_ROUTING_TIMESTAMP.to_owned(),
+                observed_at: EVIDENCE_EDGE_ROUTING_TIMESTAMP.to_owned(),
+                author_time: None,
+            })
+        } else {
+            edge
+        };
+        if seen_edge_ids.insert(edge.id().to_owned()) {
+            edges.push(edge);
+        }
     }
     Ok(edges)
 }
@@ -1459,15 +1572,15 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             );
         }
     };
-    match non_empty(envelope.domain.as_deref()) {
+    let domain = match non_empty(envelope.domain.as_deref()) {
         None => {
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("domain"));
         }
         Some(d) if !matches!(d, "codegraph" | "agent_memory") => {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
         }
-        _ => {}
-    }
+        Some(d) => d.to_owned(),
+    };
     match envelope
         .created_at
         .as_deref()
@@ -1496,6 +1609,19 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             );
         }
     };
+    if let Some(bad) = payload
+        .records
+        .iter()
+        .find(|r| !record_id_matches_domain(r.id(), &domain))
+    {
+        return HttpResponse::error_with_id(
+            &request_id,
+            ApiError::bad_request(format!(
+                "record '{}' has ID inconsistent with domain '{domain}'",
+                bad.id()
+            )),
+        );
+    }
     let scoped_key = scoped_idempotency_key(&agent_id, "records/ingest", &idempotency_key);
     match enqueue_write(state, scoped_key, payload.records, &request_id) {
         Ok(response) => HttpResponse::success(Some(&request_id), 200, json!(response)),
@@ -1782,15 +1908,15 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
             );
         }
     };
-    match non_empty(envelope.domain.as_deref()) {
+    let domain = match non_empty(envelope.domain.as_deref()) {
         None => {
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("domain"));
         }
         Some(d) if !matches!(d, "codegraph" | "agent_memory") => {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
         }
-        _ => {}
-    }
+        Some(d) => d.to_owned(),
+    };
     match envelope
         .created_at
         .as_deref()
@@ -1819,6 +1945,19 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
             );
         }
     };
+    if let Some(bad) = payload
+        .records
+        .iter()
+        .find(|r| !record_id_matches_domain(r.id(), &domain))
+    {
+        return HttpResponse::error_with_id(
+            &request_id,
+            ApiError::bad_request(format!(
+                "record '{}' has ID inconsistent with domain '{domain}'",
+                bad.id()
+            )),
+        );
+    }
     let scoped_key = scoped_idempotency_key(&agent_id, "jobs/ingest", &idempotency_key);
     let payload_hash = match records_hash(&payload.records) {
         Ok(hash) => hash,
@@ -2079,6 +2218,7 @@ fn agent_registration_records(registration: &AgentRegisterFull) -> Vec<GraphReco
         &registration.agent_id,
         &registration.session_id,
     ]);
+    let now = chrono::Utc::now().to_rfc3339();
     let mut agent_node = GraphRecord::node(
         agent_node_id.clone(),
         NodeKind::Agent,
@@ -2090,8 +2230,20 @@ fn agent_registration_records(registration: &AgentRegisterFull) -> Vec<GraphReco
             registration.agent_id, registration.agent_kind, registration.project_scope
         ),
     );
-    if let GraphRecord::Node { schema_version, .. } = &mut agent_node {
+    if let GraphRecord::Node {
+        schema_version,
+        agent_id,
+        agent_kind,
+        observed_at,
+        ingested_at,
+        ..
+    } = &mut agent_node
+    {
         *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some(registration.agent_id.clone());
+        *agent_kind = Some(registration.agent_kind.clone());
+        *observed_at = Some(now.clone());
+        *ingested_at = Some(now.clone());
     }
     let mut session_node = GraphRecord::node(
         session_node_id.clone(),
@@ -2104,8 +2256,22 @@ fn agent_registration_records(registration: &AgentRegisterFull) -> Vec<GraphReco
             registration.session_id, registration.agent_id
         ),
     );
-    if let GraphRecord::Node { schema_version, .. } = &mut session_node {
+    if let GraphRecord::Node {
+        schema_version,
+        agent_id,
+        agent_kind,
+        session_id,
+        observed_at,
+        ingested_at,
+        ..
+    } = &mut session_node
+    {
         *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some(registration.agent_id.clone());
+        *agent_kind = Some(registration.agent_kind.clone());
+        *session_id = Some(registration.session_id.clone());
+        *observed_at = Some(now.clone());
+        *ingested_at = Some(now);
     }
     vec![
         agent_node,
