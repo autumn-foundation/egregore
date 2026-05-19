@@ -53,6 +53,7 @@ pub fn scan_repository_incremental(
 ///
 /// Returns an error when repository discovery, source parsing, cache parsing, or
 /// cache persistence fails.
+#[allow(clippy::too_many_lines)]
 pub fn scan_repository_incremental_at(
     repo_path: impl AsRef<Path>,
     cache_path: impl AsRef<Path>,
