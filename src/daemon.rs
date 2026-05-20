@@ -1945,15 +1945,17 @@ fn validate_evidence_endpoint_constraints(
                 )));
             }
         }
-        // FAILED_ON: now supported from verification-domain sources (TestRun, CIStatus)
-        // targeting codegraph (Symbol, File). Reject unsupported source kinds.
+        // FAILED_ON: supported from TestRun, CIStatus (verification), and Failure (agent_memory).
         EdgeLabel::FailedOn => {
             if let Some(sk) = source_kind
-                && !VERIFICATION_NODE_KINDS.contains(&sk)
+                && !matches!(
+                    sk,
+                    NodeKind::TestRun | NodeKind::CIStatus | NodeKind::Failure
+                )
             {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link relation 'FAILED_ON' requires a verification-domain source \
-                     (TestRun or CIStatus); got source kind {}",
+                    "evidence link relation 'FAILED_ON' requires a TestRun, CIStatus, or \
+                     Failure source node; got source kind {}",
                     sk.as_str()
                 )));
             }
@@ -2040,6 +2042,16 @@ fn validate_evidence_endpoint_constraints(
             if !matches!(target_kind, Some(NodeKind::Commit | NodeKind::Change)) {
                 return Err(ApiError::bad_request(format!(
                     "evidence link relation '{}' requires a Commit or Change target; target '{}' has kind {}",
+                    label.as_str(),
+                    target_id,
+                    target_kind_str()
+                )));
+            }
+        }
+        EdgeLabel::FailedOn => {
+            if !matches!(target_kind, Some(NodeKind::Symbol | NodeKind::File)) {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires a Symbol or File target; target '{}' has kind {}",
                     label.as_str(),
                     target_id,
                     target_kind_str()
@@ -2304,11 +2316,14 @@ fn validate_and_synthesize_evidence_edges(
             {
                 let links = evidence_links.as_deref().unwrap_or(&[]);
                 // Reject evidence links on codegraph nodes — they would produce
-                // agent_memory:v1: edges from a non-agent-memory source, bypassing
+                // edges from a non-agent-memory/verification source, bypassing
                 // the envelope domain check.
-                if !links.is_empty() && !id.starts_with("agent_memory:v1:") {
+                if !links.is_empty()
+                    && !id.starts_with("agent_memory:v1:")
+                    && !id.starts_with("verification:v1:")
+                {
                     return Err(ApiError::bad_request(format!(
-                        "node '{id}' has evidence_links but is not an agent-memory record; evidence links are only supported for agent_memory:v1: nodes"
+                        "node '{id}' has evidence_links but is not an agent-memory or verification record; evidence links are only supported for agent_memory:v1: and verification:v1: nodes"
                     )));
                 }
                 // Validate and enforce schema constraints for all agent-memory node kinds.
@@ -2462,6 +2477,7 @@ fn validate_and_synthesize_evidence_edges(
                         EdgeLabel::Observes
                         | EdgeLabel::MentionsSymbol
                         | EdgeLabel::TouchedFile
+                        | EdgeLabel::FailedOn
                         | EdgeLabel::ExplainsChange => {
                             if link.target_domain != "codegraph" {
                                 return Err(ApiError::bad_request(format!(
