@@ -2,22 +2,148 @@
 
 Egregore is an `AletheiaDB`-backed knowledge graph substrate for agentic software engineering. It connects deterministic code facts, agent memory, project state, artifacts, and verification evidence in one temporal graph.
 
-The current implemented slice is the code graph domain: it parses Rust with Tree-sitter, emits stable JSONL graph records, replays Git history without mutating the working checkout, ingests records into an embedded AletheiaDB store, and exposes semantic-drift/query helpers for agent workflows.
+The current implemented slice is the code graph domain: it parses Rust with Tree-sitter, emits stable JSONL graph records, replays Git history without mutating the working checkout, ingests records into an embedded AletheiaDB store, and exposes structural and semantic query helpers for agent workflows.
+
+## Getting Started
+
+This section walks you from a fresh clone to a fully queryable semantic search index of your codebase.
+
+### 1. Prerequisites
+
+- **Rust** (stable, edition 2024) — install via [rustup](https://rustup.rs)
+- **Git** — for history replay
+- **Python 3.8+** with **pip** — required once to download the embedding model
+
+On MSVC (Windows), `.cargo/config.toml` sets `CXXFLAGS_x86_64_pc_windows_msvc=/MT` to align the C++ runtime used by the `embed_anything` / tokenizers native stack. This is already committed; no manual action needed.
+
+### 2. Build
+
+```powershell
+cargo build --release
+```
+
+The release binary lands at `target/release/egregore.exe` (and `eg.exe` as a short alias). During development, substitute `cargo run --` for `egregore`.
+
+### 3. Scan your codebase
+
+Point `scan` at any Rust repository. It parses every `.rs` file with Tree-sitter and emits a deterministic JSONL graph of nodes (files, modules, symbols, imports, diagnostics) and edges (DEFINES, CALLS, IMPORTS, MENTIONS, CONTAINS).
+
+```powershell
+egregore scan . --out graph.jsonl
+egregore inspect graph.jsonl
+# records: 4386   nodes: 1353   edges: 3033   tombstones: 0   diagnostics: 599
+```
+
+### 4. Ingest into AletheiaDB (structural index)
+
+```powershell
+egregore ingest graph.jsonl --adapter embedded --data-dir .egregore
+```
+
+This writes the graph into a local AletheiaDB store. The store is self-contained in `.egregore/` and does not require a running server.
+
+### 5. Download the embedding model (first time only)
+
+The semantic search feature uses `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions, ~90 MB). Rust's TLS stack may not share your OS certificate store, so the most reliable way to prime the cache is via Python:
+
+```powershell
+pip install -U sentence-transformers
+python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+```
+
+This downloads the model to `~/.cache/huggingface/hub/`, where Rust's `hf-hub` will find it on subsequent runs. You only need to do this once per machine.
+
+### 6. Ingest with semantic embeddings
+
+```powershell
+egregore ingest graph.jsonl --adapter embedded --data-dir .egregore-semantic --embed
+# Generating embeddings for 650 file/symbol nodes…
+# attempted: 4386   succeeded: 4386   failed: 0
+```
+
+The `--embed` flag generates a 384-dimensional dense vector for every file and symbol node and stores it in AletheiaDB's HNSW vector index. The store at `.egregore-semantic/` supports both structural and semantic queries.
+
+> **Tip:** Use a separate `--data-dir` for the embedded store so you can keep a fast structural-only store alongside the larger semantic one.
+
+### 7. Query
+
+**Structural queries** (exact name, file, or drift — works with or without `--embed`):
+
+```powershell
+# Find a symbol by fully-qualified name
+egregore query symbol daemon::handle_query --data-dir .egregore --format text
+
+# List all symbols defined in a file
+egregore query file src/daemon.rs --data-dir .egregore --format text
+
+# Show semantic drift records ranked by change score
+egregore query drift --data-dir .egregore --limit 10 --format text
+
+# Pin a symbol query to a specific commit
+egregore query symbol daemon::handle_query --data-dir .egregore --at <commit-sha>
+```
+
+**Semantic queries** (natural language — requires `--embed` store):
+
+```powershell
+# Ask in plain English; results are ranked by cosine similarity
+egregore query semantic "error handling and budget limits" --data-dir .egregore-semantic --format text
+egregore query semantic "temporal history git commit tracking" --data-dir .egregore-semantic --format text
+egregore query semantic "write nodes to database storage" --data-dir .egregore-semantic --format text
+```
+
+Example output:
+
+```
+history::GitCommit score=0.4974 @ src/history.rs:138
+history::list_commits score=0.4767 @ src/history.rs:168
+history::git_output score=0.4610 @ src/history.rs:312
+```
+
+The semantic index finds code by **meaning**, not by name. Querying `"write nodes to database storage"` surfaces `EmbeddedAletheiaSink::write_record` even though none of those words appear in the function name.
+
+Query output is newline-delimited JSON by default (`--format json`). Pass `--format text` for human-readable terminal output. See [docs/cli/query.md](docs/cli/query.md) for the full output schema.
+
+---
+
+## Why not just use ripgrep?
+
+Structural queries are ~10× cheaper in tokens than grepping because the graph gives you typed edges — CALLS, DEFINES, IMPORTS — with no false positives from comments or string literals. Semantic queries go further: they find code by concept, not by text match, reducing the context you need to send to an agent by 10–15× compared to grep + manual filtering.
+
+---
+
+## All commands
+
+```powershell
+egregore scan . --out graph.jsonl                          # current-tree extraction
+egregore scan-history . --out history.graph.jsonl          # commit-by-commit temporal extraction
+egregore inspect graph.jsonl                               # graph summary
+egregore ingest graph.jsonl --adapter dry-run              # validate without writing
+egregore ingest graph.jsonl --adapter embedded \
+    --data-dir .egregore                                   # structural store
+egregore ingest graph.jsonl --adapter embedded \
+    --data-dir .egregore-semantic --embed                  # structural + semantic store
+egregore query symbol <name>  --data-dir .egregore
+egregore query file   <path>  --data-dir .egregore
+egregore query drift          --data-dir .egregore
+egregore query semantic <text> --data-dir .egregore-semantic
+```
+
+---
 
 ## Status
 
-Implemented MVP surfaces:
+Implemented surfaces:
 
-- `scan` for current-tree JSONL extraction
-- `scan-history` for commit-by-commit temporal extraction
-- `inspect` for graph summaries
-- `ingest --adapter dry-run`
-- `ingest --adapter embedded --data-dir <path>`
-- `query symbol`, `query file`, `query drift` for agent-callable graph queries
-- Rust symbol extraction for common modules, imports, definitions, calls, mentions, impls, and diagnostics
+- `scan` — current-tree JSONL extraction (Rust via Tree-sitter)
+- `scan-history` — commit-by-commit temporal extraction
+- `inspect` — graph summary
+- `ingest` — dry-run, embedded AletheiaDB, and daemon adapters
+- `query symbol / file / drift / semantic` — structural and semantic agent queries
 - Incremental file-cache planning with tombstones
 - AletheiaDB embedding re-export through the optional `embeddings` feature
 - Semantic drift records and query helpers for symbol-at-commit and largest-drift workflows
+- HNSW vector index via `embeddings` feature (enabled by default)
 
 `embedded-aletheiadb` is enabled by default and uses the published `aletheiadb` crate with `semantic-search`, `semantic-temporal`, and `semantic-diagnostics`.
 
@@ -65,7 +191,6 @@ Query output is newline-delimited JSON by default (`--format json`). Pass `--for
 - **Daemon query verb set (v1):** [docs/schema/daemon-query.md](docs/schema/daemon-query.md)
 - **Repository node identity (v2):** [docs/schema/repository-identity.md](docs/schema/repository-identity.md)
 - Implementation plans: [docs/plans/](docs/plans/)
-- PM issue prompt: [docs/prompts/vantage-egregore.md](docs/prompts/vantage-egregore.md)
 
 ## Development
 

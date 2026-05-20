@@ -18,6 +18,8 @@ use crate::{
 
 #[cfg(feature = "embedded-aletheiadb")]
 use crate::adapters::EmbeddedAletheiaSink;
+#[cfg(feature = "embeddings")]
+use crate::adapters::SemanticMatch;
 #[cfg(feature = "embedded-aletheiadb")]
 use crate::daemon::{DaemonClient, DaemonConfig};
 
@@ -85,6 +87,10 @@ enum Commands {
         /// Idempotency key for daemon-backed writes.
         #[arg(long)]
         idempotency_key: Option<String>,
+        /// Generate and store semantic embeddings for file and symbol nodes.
+        #[cfg(feature = "embeddings")]
+        #[arg(long)]
+        embed: bool,
     },
     /// Import a rust-swe-agent .traj trajectory file into agent-memory JSONL.
     ImportTraj {
@@ -189,6 +195,21 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Find similar code by semantic embedding.
+    #[cfg(feature = "embeddings")]
+    Semantic {
+        /// Query text (symbol name, description, or code snippet).
+        query: String,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Maximum number of results (default 10).
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -280,6 +301,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             agent_id,
             session_id,
             idempotency_key,
+            #[cfg(feature = "embeddings")]
+            embed,
         } => ingest(
             &graph,
             adapter,
@@ -287,6 +310,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             &agent_id,
             &session_id,
             idempotency_key.as_deref(),
+            #[cfg(feature = "embeddings")]
+            embed,
         ),
         Commands::ImportTraj { traj_path, out } => import_traj_cmd(&traj_path, &out),
         Commands::Query { subcommand } => query_cmd(subcommand),
@@ -355,6 +380,7 @@ fn ingest(
     agent_id: &str,
     session_id: &str,
     idempotency_key: Option<&str>,
+    #[cfg(feature = "embeddings")] embed: bool,
 ) -> Result<()> {
     #[cfg(not(feature = "embedded-aletheiadb"))]
     let _ = (data_dir, agent_id, session_id, idempotency_key);
@@ -371,6 +397,19 @@ fn ingest(
         #[cfg(feature = "embedded-aletheiadb")]
         IngestAdapter::Embedded => {
             let data_dir = data_dir.map_or_else(|| PathBuf::from(".egregore"), Path::to_path_buf);
+            #[cfg(feature = "embeddings")]
+            let mut sink = if embed {
+                let (vectors, dimensions) = generate_embeddings(&records)?;
+                EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, dimensions)
+                    .with_context(|| {
+                        format!("failed to open embedded store {}", data_dir.display())
+                    })?
+            } else {
+                EmbeddedAletheiaSink::open(&data_dir).with_context(|| {
+                    format!("failed to open embedded store {}", data_dir.display())
+                })?
+            };
+            #[cfg(not(feature = "embeddings"))]
             let mut sink = EmbeddedAletheiaSink::open(&data_dir)
                 .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
             let report = ingest_records(&records, &mut sink);
@@ -491,6 +530,33 @@ struct DriftResult<'a> {
     name: Option<&'a str>,
 }
 
+/// Output row for a semantic similarity result.
+#[cfg(feature = "embeddings")]
+#[derive(Serialize)]
+struct SemanticResult<'a> {
+    record_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+}
+
+#[cfg(feature = "embeddings")]
+impl<'a> From<&'a SemanticMatch> for SemanticResult<'a> {
+    fn from(m: &'a SemanticMatch) -> Self {
+        Self {
+            record_id: &m.record_id,
+            name: m.name.as_deref(),
+            repo_relative_path: m.repo_relative_path.as_deref(),
+            score: m.score,
+            span: m.span,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // query_cmd — dispatch
 // ---------------------------------------------------------------------------
@@ -580,6 +646,13 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_drift(&records, limit, format)
         }
+        #[cfg(feature = "embeddings")]
+        QuerySubcommand::Semantic {
+            query,
+            data_dir,
+            limit,
+            format,
+        } => query_semantic(&query, &data_dir, limit, format),
     }
 }
 
@@ -740,6 +813,100 @@ fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
         let _ = data_dir;
         anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
     }
+}
+
+// ---------------------------------------------------------------------------
+// Embedding helpers
+// ---------------------------------------------------------------------------
+
+/// Generates dense embeddings for all file and symbol candidates in `records`.
+///
+/// Returns a `(record_id → vector, dimension)` map ready for
+/// `EmbeddedAletheiaSink::open_with_embeddings`.
+#[cfg(feature = "embeddings")]
+fn generate_embeddings(
+    records: &[GraphRecord],
+) -> Result<(std::collections::BTreeMap<String, Vec<f32>>, usize)> {
+    use crate::embeddings::{aletheia_embeddings, embedding_candidates};
+
+    let candidates = embedding_candidates(records);
+    if candidates.is_empty() {
+        return Ok((std::collections::BTreeMap::new(), 0));
+    }
+
+    eprintln!(
+        "Generating embeddings for {} file/symbol nodes…",
+        candidates.len()
+    );
+
+    let embedder = aletheia_embeddings::EmbedderBuilder::new()
+        .model_architecture("bert")
+        .model_id(Some("sentence-transformers/all-MiniLM-L6-v2"))
+        .from_pretrained_hf()
+        .context("failed to load embedding model")?;
+
+    let texts: Vec<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
+
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    let embed_data = rt
+        .block_on(aletheia_embeddings::embed_query(&texts, &embedder, None))
+        .context("embedding generation failed")?;
+
+    let dense: Vec<Vec<f32>> = aletheia_embeddings::embed_data_to_dense_iter(embed_data, None)
+        .collect::<Result<Vec<_>, _>>()
+        .context("embedding result was not dense")?
+        .into_iter()
+        .map(|d| d.embedding)
+        .collect();
+
+    let dimensions = dense.first().map_or(0, Vec::len);
+    let map = candidates
+        .into_iter()
+        .zip(dense)
+        .map(|(c, v)| (c.record_id, v))
+        .collect();
+
+    Ok((map, dimensions))
+}
+
+/// Semantic similarity search against an embedded store.
+#[cfg(feature = "embeddings")]
+fn query_semantic(query: &str, data_dir: &Path, limit: usize, format: OutputFormat) -> Result<()> {
+    use crate::embeddings::aletheia_embeddings;
+
+    let embedder = aletheia_embeddings::EmbedderBuilder::new()
+        .model_architecture("bert")
+        .model_id(Some("sentence-transformers/all-MiniLM-L6-v2"))
+        .from_pretrained_hf()
+        .context("failed to load embedding model")?;
+
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    let embed_data = rt
+        .block_on(aletheia_embeddings::embed_query(&[query], &embedder, None))
+        .context("failed to embed query")?;
+
+    let query_vector = aletheia_embeddings::embed_data_to_dense_iter(embed_data, Some(1))
+        .next()
+        .context("no embedding returned for query")?
+        .context("embedding result was not dense")?
+        .embedding;
+
+    let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+        .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+
+    let matches = sink
+        .semantic_search(&query_vector, limit)
+        .with_context(|| "semantic search failed — was the store ingested with --embed?")?;
+
+    if matches.is_empty() {
+        eprintln!("no results — store may not have embeddings (re-run ingest with --embed)");
+        std::process::exit(2);
+    }
+
+    for m in matches {
+        print_result(&SemanticResult::from(&m), format)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,6 +1259,16 @@ impl PrintText for DriftResult<'_> {
             "{name} score={} {}..{} @ {path}",
             self.score, self.before_commit, self.after_commit
         )
+    }
+}
+
+#[cfg(feature = "embeddings")]
+impl PrintText for SemanticResult<'_> {
+    fn as_text(&self) -> String {
+        let name = self.name.unwrap_or("(unknown)");
+        let path = self.repo_relative_path.unwrap_or("(unknown)");
+        let line = self.span.map_or(0, |s| s.start_line);
+        format!("{name} score={:.4} @ {path}:{line}", self.score)
     }
 }
 

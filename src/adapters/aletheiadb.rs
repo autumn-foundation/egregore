@@ -14,6 +14,21 @@ use crate::{
     },
 };
 
+/// A single result from a semantic similarity search.
+#[derive(Debug, Clone)]
+pub struct SemanticMatch {
+    /// Stable codegraph record ID.
+    pub record_id: String,
+    /// Human-readable name when available.
+    pub name: Option<String>,
+    /// Repository-relative path when available.
+    pub repo_relative_path: Option<String>,
+    /// Cosine similarity score (higher = more similar).
+    pub score: f32,
+    /// Source span when available.
+    pub span: Option<SourceSpan>,
+}
+
 /// Graph sink backed by an embedded `AletheiaDB` store.
 pub struct EmbeddedAletheiaSink {
     db: ::aletheiadb::AletheiaDB,
@@ -32,6 +47,8 @@ pub struct EmbeddedAletheiaSink {
     /// Used as a fallback staleness check when both the edge and tombstone lack sequence metadata.
     legacy_edge_counts: BTreeMap<String, usize>,
     _lease: Option<StoreLease>,
+    #[cfg(feature = "embeddings")]
+    embedding_vectors: BTreeMap<String, Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -192,9 +209,97 @@ impl EmbeddedAletheiaSink {
             tombstone_node_seqs: BTreeMap::new(),
             legacy_edge_counts: BTreeMap::new(),
             _lease: lease,
+            #[cfg(feature = "embeddings")]
+            embedding_vectors: BTreeMap::new(),
         };
         sink.rebuild_lookup_indexes()?;
         Ok(sink)
+    }
+
+    /// Opens a store and pre-loads embedding vectors so they are stored in each
+    /// node during ingest. Enables an HNSW vector index on the `"embedding"`
+    /// property for semantic search.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be opened or the vector index fails
+    /// to initialise.
+    #[cfg(feature = "embeddings")]
+    pub fn open_with_embeddings(
+        data_dir: impl AsRef<std::path::Path>,
+        vectors: BTreeMap<String, Vec<f32>>,
+        dimensions: usize,
+    ) -> AdapterResult<Self> {
+        let data_dir = data_dir.as_ref();
+        let lease = StoreLease::acquire(data_dir).map_err(|error| AdapterError::Rejected {
+            record_id: "embedded-store".to_owned(),
+            message: error.to_string(),
+        })?;
+        let mut sink = Self::open_inner(data_dir, Some(lease))?;
+        sink.embedding_vectors = vectors;
+        let hnsw = ::aletheiadb::index::vector::hnsw::HnswConfig {
+            dimensions,
+            metric: ::aletheiadb::index::vector::DistanceMetric::Cosine,
+            ..Default::default()
+        };
+        sink.db
+            .enable_vector_index("embedding", hnsw)
+            .map_err(|error| AdapterError::Rejected {
+                record_id: "embedded-store".to_owned(),
+                message: error.to_string(),
+            })?;
+        Ok(sink)
+    }
+
+    /// Searches for nodes whose stored embedding is most similar to `query_vector`.
+    ///
+    /// Returns up to `limit` results ordered by descending similarity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no vector index exists or the search fails.
+    #[cfg(feature = "embeddings")]
+    pub fn semantic_search(
+        &self,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> AdapterResult<Vec<SemanticMatch>> {
+        let raw = self
+            .db
+            .find_similar_by_embedding(query_vector, limit)
+            .map_err(|error| AdapterError::ReadBack {
+                record_id: "semantic-search".to_owned(),
+                message: error.to_string(),
+            })?;
+
+        let mut results = Vec::with_capacity(raw.len());
+        for (node_id, score) in raw {
+            let Ok(node) = self.db.get_node(node_id) else {
+                continue;
+            };
+            let record_id = node
+                .get_property("codegraph_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let name = node
+                .get_property("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let repo_relative_path = node
+                .get_property("repo_relative_path")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let span = span_from_properties(|key| node.get_property(key));
+            results.push(SemanticMatch {
+                record_id,
+                name,
+                repo_relative_path,
+                score,
+                span,
+            });
+        }
+        Ok(results)
     }
 
     /// Persists embedded indexes so a subsequent process can reopen without
@@ -930,6 +1035,10 @@ impl EmbeddedAletheiaSink {
         builder = insert_optional(builder, "executed_at", executed_at.as_deref());
         builder = insert_optional(builder, "verification_kind", verification_kind.as_deref());
         builder = insert_optional(builder, "status", status.as_deref());
+        #[cfg(feature = "embeddings")]
+        if let Some(vector) = self.embedding_vectors.get(id.as_str()) {
+            builder = builder.insert_vector("embedding", vector);
+        }
 
         let node_id = self
             .db
@@ -1856,6 +1965,22 @@ fn insert_optional(
     } else {
         builder
     }
+}
+
+fn span_from_properties<'a, F>(get: F) -> Option<SourceSpan>
+where
+    F: Fn(&str) -> Option<&'a ::aletheiadb::PropertyValue>,
+{
+    let start_byte = usize::try_from(get("start_byte")?.as_int()?).ok()?;
+    let end_byte = usize::try_from(get("end_byte")?.as_int()?).ok()?;
+    let start_line = usize::try_from(get("start_line")?.as_int()?).ok()?;
+    let end_line = usize::try_from(get("end_line")?.as_int()?).ok()?;
+    Some(SourceSpan {
+        start_byte,
+        end_byte,
+        start_line,
+        end_line,
+    })
 }
 
 fn insert_span(
