@@ -18,6 +18,11 @@ use crate::{
 #[cfg(feature = "embeddings")]
 use ::aletheiadb::api::transaction::WriteOps;
 
+#[cfg(feature = "embeddings")]
+const SEMANTIC_INITIAL_CANDIDATE_MULTIPLIER: usize = 8;
+#[cfg(feature = "embeddings")]
+const SEMANTIC_MAX_CANDIDATE_MULTIPLIER: usize = 64;
+
 /// A single result from a semantic similarity search.
 #[derive(Debug, Clone)]
 pub struct SemanticMatch {
@@ -277,62 +282,73 @@ impl EmbeddedAletheiaSink {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let raw_limit = self.db.get_all_node_ids().len().max(limit);
-        let raw = self
-            .db
-            .find_similar_by_embedding(query_vector, raw_limit)
-            .map_err(|error| AdapterError::ReadBack {
-                record_id: "semantic-search".to_owned(),
-                message: error.to_string(),
-            })?;
+        let candidate_limits =
+            semantic_candidate_fetch_limits(limit, self.db.get_all_node_ids().len());
+        if candidate_limits.is_empty() {
+            return Ok(Vec::new());
+        }
         let active_tombstoned = self.active_deleted_ids()?;
 
-        let mut results = Vec::with_capacity(raw.len());
-        let mut seen_record_ids = std::collections::BTreeSet::new();
-        for (node_id, score) in raw {
-            let Ok(node) = self.db.get_node(node_id) else {
-                continue;
-            };
-            let Some(record_id) = node
-                .get_property("codegraph_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-            else {
-                continue;
-            };
-            if active_tombstoned.contains(record_id.as_str()) {
-                continue;
+        let mut results = Vec::with_capacity(limit);
+        for raw_limit in candidate_limits {
+            let raw = self
+                .db
+                .find_similar_by_embedding(query_vector, raw_limit)
+                .map_err(|error| AdapterError::ReadBack {
+                    record_id: "semantic-search".to_owned(),
+                    message: error.to_string(),
+                })?;
+            let raw_len = raw.len();
+            results.clear();
+            let mut seen_record_ids = std::collections::BTreeSet::new();
+            for (node_id, score) in raw {
+                let Ok(node) = self.db.get_node(node_id) else {
+                    continue;
+                };
+                let Some(record_id) = node
+                    .get_property("codegraph_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                if active_tombstoned.contains(record_id.as_str()) {
+                    continue;
+                }
+                if node
+                    .get_property("superseded_by")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|superseded_by| !superseded_by.is_empty())
+                {
+                    continue;
+                }
+                if self.node_lookup.latest_node(&record_id) != Some(node_id) {
+                    continue;
+                }
+                if !seen_record_ids.insert(record_id.clone()) {
+                    continue;
+                }
+                let name = node
+                    .get_property("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let repo_relative_path = node
+                    .get_property("repo_relative_path")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let span = span_from_properties(|key| node.get_property(key));
+                results.push(SemanticMatch {
+                    record_id,
+                    name,
+                    repo_relative_path,
+                    score,
+                    span,
+                });
+                if results.len() == limit {
+                    break;
+                }
             }
-            if node
-                .get_property("superseded_by")
-                .and_then(|v| v.as_str())
-                .is_some_and(|superseded_by| !superseded_by.is_empty())
-            {
-                continue;
-            }
-            if self.node_lookup.latest_node(&record_id) != Some(node_id) {
-                continue;
-            }
-            if !seen_record_ids.insert(record_id.clone()) {
-                continue;
-            }
-            let name = node
-                .get_property("name")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned);
-            let repo_relative_path = node
-                .get_property("repo_relative_path")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned);
-            let span = span_from_properties(|key| node.get_property(key));
-            results.push(SemanticMatch {
-                record_id,
-                name,
-                repo_relative_path,
-                score,
-                span,
-            });
-            if results.len() == limit {
+            if results.len() == limit || raw_len < raw_limit {
                 break;
             }
         }
@@ -1075,10 +1091,8 @@ impl EmbeddedAletheiaSink {
         builder = insert_optional(builder, "verification_kind", verification_kind.as_deref());
         builder = insert_optional(builder, "status", status.as_deref());
         #[cfg(feature = "embeddings")]
-        if let Some(key) = EmbeddingVectorKey::from_record(record)
-            && let Some(vector) = self.embedding_vectors.get(&key)
-        {
-            builder = builder.insert_vector("embedding", vector);
+        if let Some(vector) = self.embedding_for_node_write(record) {
+            builder = builder.insert_vector("embedding", &vector);
         }
 
         let node_id = self
@@ -1111,6 +1125,29 @@ impl EmbeddedAletheiaSink {
         self.record_handles
             .insert(id.clone(), StoredRecord::Node(node_id));
         Ok(())
+    }
+
+    #[cfg(feature = "embeddings")]
+    fn embedding_for_node_write(&self, record: &GraphRecord) -> Option<Vec<f32>> {
+        let key = EmbeddingVectorKey::from_record(record)?;
+        if let Some(vector) = self.embedding_vectors.get(&key) {
+            return Some(vector.clone());
+        }
+        self.existing_embedding_for_record(record)
+    }
+
+    #[cfg(feature = "embeddings")]
+    fn existing_embedding_for_record(&self, record: &GraphRecord) -> Option<Vec<f32>> {
+        let GraphRecord::Node { id, temporal, .. } = record else {
+            return None;
+        };
+        let node_id = self.node_id_for_observation(id, temporal.as_ref())?;
+        self.db
+            .get_node(node_id)
+            .ok()?
+            .get_property("embedding")
+            .and_then(::aletheiadb::PropertyValue::as_vector)
+            .map(<[f32]>::to_vec)
     }
 
     #[cfg(feature = "embeddings")]
@@ -2196,6 +2233,33 @@ fn is_fresh_data_dir(data_dir: &Path) -> bool {
     }
 }
 
+#[cfg(feature = "embeddings")]
+fn semantic_candidate_fetch_limits(limit: usize, total_nodes: usize) -> Vec<usize> {
+    if limit == 0 || total_nodes == 0 {
+        return Vec::new();
+    }
+
+    let initial_limit = limit
+        .saturating_mul(SEMANTIC_INITIAL_CANDIDATE_MULTIPLIER)
+        .max(limit)
+        .min(total_nodes);
+    let max_limit = limit
+        .saturating_mul(SEMANTIC_MAX_CANDIDATE_MULTIPLIER)
+        .max(initial_limit)
+        .min(total_nodes);
+
+    let mut limits = vec![initial_limit];
+    let mut current = initial_limit;
+    while current < max_limit {
+        current = current.saturating_mul(2).min(max_limit);
+        if limits.last().copied() == Some(current) {
+            break;
+        }
+        limits.push(current);
+    }
+    limits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2308,6 +2372,65 @@ mod tests {
             .expect("identical current write should be a no-op");
 
         assert_eq!(sink.node_lookup.candidate_count(&file_id), 1);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn semantic_candidate_fetch_limits_are_bounded_multiples_of_query_limit() {
+        assert_eq!(
+            semantic_candidate_fetch_limits(0, 1_000),
+            Vec::<usize>::new()
+        );
+        assert_eq!(semantic_candidate_fetch_limits(10, 0), Vec::<usize>::new());
+        assert_eq!(
+            semantic_candidate_fetch_limits(10, 1_000_000),
+            vec![80, 160, 320, 640],
+            "large stores should not fetch the full corpus for a small semantic limit"
+        );
+        assert_eq!(
+            semantic_candidate_fetch_limits(10, 100),
+            vec![80, 100],
+            "small stores may exhaust the corpus only after the bounded initial window"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn node_rewrite_without_embedding_map_preserves_previous_latest_vector() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("preserve-vector-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "preserve-vector"]);
+        let original = current_symbol_record(&symbol_id, "original semantic symbol", 20);
+        let updated = current_symbol_record(&symbol_id, "updated semantic symbol", 80);
+        let mut vectors = EmbeddingVectorMap::new();
+        vectors.insert(
+            EmbeddingVectorKey::from_record(&original).expect("symbol should be embeddable"),
+            vec![1.0, 0.0],
+        );
+        let mut sink = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, 2)
+            .expect("semantic store should open");
+
+        sink.write_record(&original)
+            .expect("original symbol should write with an embedding");
+        sink.embedding_vectors.clear();
+        sink.write_record(&updated)
+            .expect("updated symbol should write without a fresh embedding");
+
+        let latest_node_id = sink
+            .node_lookup
+            .latest_node(&symbol_id)
+            .expect("latest node should be indexed");
+        let latest = sink
+            .db
+            .get_node(latest_node_id)
+            .expect("latest node should be readable");
+        assert_eq!(
+            latest
+                .get_property("embedding")
+                .and_then(::aletheiadb::PropertyValue::as_vector),
+            Some(&[1.0, 0.0][..]),
+            "rewritten latest nodes should inherit prior semantic coverage"
+        );
     }
 
     #[test]

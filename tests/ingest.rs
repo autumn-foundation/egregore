@@ -383,6 +383,61 @@ fn semantic_ingest_backfills_vectors_for_matched_existing_nodes() {
     );
 }
 
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+#[test]
+fn non_embed_reingest_preserves_existing_embedding_on_latest_node() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("semantic-preserve-store");
+    let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "preserved"]);
+    let original = current_symbol_record(&symbol_id, "preserved", "original semantic symbol", 20);
+    let updated = current_symbol_record(&symbol_id, "preserved", "updated semantic symbol", 80);
+
+    let mut vectors = EmbeddingVectorMap::new();
+    vectors.insert(
+        EmbeddingVectorKey::from_record(&original).expect("symbol should be embeddable"),
+        vec![1.0, 0.0],
+    );
+    {
+        let mut semantic = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, 2)
+            .expect("semantic store should open");
+        let report = ingest_records(std::slice::from_ref(&original), &mut semantic);
+        assert!(report.is_success(), "{report:?}");
+        assert!(
+            semantic
+                .semantic_search(&[1.0, 0.0], 10)
+                .expect("semantic search should succeed")
+                .iter()
+                .any(|m| m.record_id == symbol_id),
+            "initial semantic ingest should make the record searchable"
+        );
+        semantic
+            .persist_indexes()
+            .expect("semantic indexes should persist");
+    }
+
+    let mut structural =
+        EmbeddedAletheiaSink::open(&data_dir).expect("structural store should reopen");
+    let report = ingest_records(std::slice::from_ref(&updated), &mut structural);
+    assert!(report.is_success(), "{report:?}");
+    assert_eq!(
+        structural.read_back(&symbol_id).expect("read back updated"),
+        Some(updated)
+    );
+
+    let semantic_matches = structural
+        .semantic_search(&[1.0, 0.0], 10)
+        .expect("semantic search should succeed after structural reingest");
+    let preserved_match = semantic_matches
+        .iter()
+        .find(|m| m.record_id == symbol_id)
+        .expect("non-embed rewrite should preserve semantic coverage for latest node");
+    assert_eq!(
+        preserved_match.span.map(|span| span.end_byte),
+        Some(80),
+        "semantic search should return the rewritten latest node"
+    );
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn embedded_history_ingest_traverses_commit_change_symbol() {
