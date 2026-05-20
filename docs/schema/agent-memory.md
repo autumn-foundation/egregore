@@ -329,14 +329,14 @@ removing a label is a schema version bump.
 | `AUTHORED_BY` | any | `agent_memory` | any | `AgentSession` | many:1 | no |
 | `HAS_EVIDENCE` | any | `agent_memory` | any | `Verification`, `CommandEvidence` | many:many | no |
 | `OBSERVES` | `agent_memory` | `codegraph` | `Observation` | any | many:many | yes |
-| `MENTIONS_SYMBOL` | `agent_memory` | `codegraph` | any agent-memory | `Symbol` | many:many | yes |
-| `TOUCHED_FILE` | `agent_memory` | `codegraph` | any agent-memory | `File` | many:many | no |
+| `MENTIONS_SYMBOL` | `agent_memory`, `verification` | `codegraph` | any | `Symbol` | many:many | yes |
+| `TOUCHED_FILE` | `agent_memory`, `verification` | `codegraph` | any | `File` | many:many | no |
 | `PRODUCED_PATCH` | `agent_memory` | any | `ToolCall`, `CommandRun` | `PatchArtifact` | 1:1 | no |
-| `VALIDATED_BY` | `agent_memory` | `agent_memory` | `Observation`, `Decision` | `Verification` | many:many | no |
-| `FAILED_ON` | `agent_memory` | `codegraph` | `Failure` | `Symbol`, `File` | many:many | no |
+| `VALIDATED_BY` | `agent_memory` | `verification` | `Observation`, `Decision` | any verification | many:many | no |
+| `FAILED_ON` | `agent_memory`, `verification` | `codegraph` | `Failure`, `TestRun`, `CIStatus` | `Symbol`, `File` | many:many | no |
 | `EXPLAINS_CHANGE` | `agent_memory` | `codegraph` | `Observation`, `Decision` | `Commit`, `Change` | many:many | yes |
 | `REFERENCES_TASK` | `agent_memory` | `project` | any agent-memory | `Task` | many:many | no |
-| `CONTRADICTS` | `agent_memory` | `agent_memory` | any agent-memory | any agent-memory | many:many | yes |
+| `CONTRADICTS` | `agent_memory`, `verification` | any | any | any | many:many | yes |
 | `SUPERSEDES` | `agent_memory` | `agent_memory` | any agent-memory | any agent-memory | many:1 | no |
 | `RELATES_TO` | any | any | any | any | many:many | no |
 

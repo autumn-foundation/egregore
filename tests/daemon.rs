@@ -2603,7 +2603,7 @@ fn first_record_id(graph_path: &Path) -> String {
 // ── Schema conformance: issue #6 ─────────────────────────────────────────────
 
 // (a) Every NodeKind variant is either code-graph-documented,
-// agent-memory-documented, or agent-memory-reserved.
+// agent-memory-documented, agent-memory-reserved, or verification-domain-documented.
 // The exhaustive match enforces this at compile time: adding a new
 // NodeKind variant without updating this list is a compile error.
 #[test]
@@ -2624,10 +2624,7 @@ fn all_node_kinds_have_documented_schema() {
             "agent-memory-documented"
         }
         // Reserved with one-line definitions in docs/schema/agent-memory.md §4b
-        NodeKind::Task
-        | NodeKind::Artifact
-        | NodeKind::Verification
-        | NodeKind::CommandEvidence => "agent-memory-reserved",
+        NodeKind::Task | NodeKind::Artifact | NodeKind::CommandEvidence => "agent-memory-reserved",
         // M2 trajectory-importer node kinds (docs/schema/agent-memory.md §4b + PRD M2)
         NodeKind::AgentRun
         | NodeKind::AgentTurn
@@ -2637,6 +2634,14 @@ fn all_node_kinds_have_documented_schema() {
         | NodeKind::PatchArtifact
         | NodeKind::Failure
         | NodeKind::Decision => "agent-memory-m2-traj-importer",
+        // Documented in docs/schema/verification.md (full schema, day-one shapes)
+        NodeKind::Verification => "verification-documented",
+        // Reserved in docs/schema/verification.md §5 with one-line definitions
+        NodeKind::TestRun
+        | NodeKind::CIStatus
+        | NodeKind::BenchmarkRun
+        | NodeKind::CoverageReport
+        | NodeKind::ProofResult => "verification-domain-documented",
     };
 }
 
@@ -3483,6 +3488,475 @@ fn eg_query_daemon_smoke() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("no match found"));
+
+    daemon.stop();
+}
+
+// ── Schema conformance: issue #11 (verification domain) ──────────────────────
+
+// RED: (d) A Verification record without an evidence handle is rejected
+// with the documented `missing_evidence_handle` error code.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn verification_missing_evidence_handle_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-missing-evidence-handle",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-missing-evidence-handle-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:no-evidence-handle-fixture",
+                    "kind": "TestRun",
+                    "schema_version": 1,
+                    "summary": "TestRun with no evidence handle",
+                    "executed_at": "2026-05-19T00:00:00Z",
+                    "ingested_at": "2026-05-19T00:00:00Z",
+                    "verification_kind": "command_run",
+                    "status": "passed",
+                    "evidence_quality": "verbatim"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "Verification record without evidence handle should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_evidence_handle",
+        "rejection must carry missing_evidence_handle code per schema doc, got {body}"
+    );
+
+    daemon.stop();
+}
+
+// RED: (c) A CommandRun with stdout_handle.inline set and bytes > 16 KiB
+// is rejected; accepted when correctly demoted to handle-only (inline=null).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn verification_command_run_oversized_inline_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // 17 KiB of inline content — exceeds the 16 KiB ceiling
+    let oversized_inline: String = "x".repeat(17 * 1024);
+
+    let reject_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-oversized-inline-reject",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-oversized-inline-reject-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:oversized-inline-fixture",
+                    "kind": "TestRun",
+                    "schema_version": 1,
+                    "summary": "TestRun with oversized inline stdout",
+                    "source_artifact_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "executed_at": "2026-05-19T00:00:00Z",
+                    "ingested_at": "2026-05-19T00:00:00Z",
+                    "evidence_quality": "verbatim",
+                    "stdout_handle": {
+                        "inline": oversized_inline,
+                        "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                        "bytes": 17408_u64
+                    }
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !reject_response.starts_with("HTTP/1.1 200"),
+        "CommandRun with oversized stdout_handle.inline should be rejected, got {reject_response}"
+    );
+    let reject_body = response_json(&reject_response);
+    assert!(
+        reject_body["error"]["code"] == "bad_request"
+            || reject_body["error"]["code"] == "payload_too_large",
+        "oversized inline stdout rejection must carry bad_request or payload_too_large, got {reject_body}"
+    );
+
+    // Accept when inline demoted to null (handle-only)
+    let accept_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-oversized-inline-accept",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-oversized-inline-accept-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:handle-only-fixture",
+                    "kind": "TestRun",
+                    "schema_version": 1,
+                    "summary": "TestRun with handle-only stdout (demoted)",
+                    "source_artifact_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "executed_at": "2026-05-19T00:00:00Z",
+                    "ingested_at": "2026-05-19T00:00:00Z",
+                    "evidence_quality": "referenced_only",
+                    "stdout_handle": {
+                        "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                        "bytes": 17408_u64
+                    }
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        accept_response.starts_with("HTTP/1.1 200"),
+        "CommandRun with handle-only stdout (inline=null) should be accepted, got {accept_response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn verification_empty_artifact_hash_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // source_artifact_hash present but empty — must be treated as missing
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-empty-hash-reject",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-empty-hash-reject-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:empty-hash-fixture",
+                    "kind": "TestRun",
+                    "schema_version": 1,
+                    "summary": "TestRun with empty source_artifact_hash - should be rejected",
+                    "source_artifact_hash": ""
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "empty source_artifact_hash should be rejected; got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_evidence_handle",
+        "empty hash must produce missing_evidence_handle, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn verification_wrong_schema_version_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-wrong-schema-version",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-wrong-schema-version-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:wrong-schema-version-fixture",
+                    "kind": "TestRun",
+                    "schema_version": 2,
+                    "summary": "TestRun with unsupported schema_version",
+                    "source_artifact_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "unsupported schema_version should be rejected; got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "wrong schema_version must produce bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn verification_spoofed_bytes_oversized_inline_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // 17 KiB inline but bytes field claims only 100 bytes — should still be rejected
+    let oversized_inline: String = "x".repeat(17 * 1024);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-spoofed-bytes-reject",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-spoofed-bytes-reject-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:spoofed-bytes-fixture",
+                    "kind": "TestRun",
+                    "schema_version": 1,
+                    "summary": "TestRun with spoofed bytes field",
+                    "source_artifact_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "stdout_handle": {
+                        "inline": oversized_inline,
+                        "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                        "bytes": 100_u64
+                    }
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "spoofed bytes with oversized inline should be rejected; got {response}"
+    );
+    let body = response_json(&response);
+    assert!(
+        body["error"]["code"] == "bad_request" || body["error"]["code"] == "payload_too_large",
+        "spoofed bytes rejection must carry bad_request or payload_too_large, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn verification_wrong_node_kind_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // NodeKind::File is not a verification kind
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-wrong-kind",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-wrong-kind-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:wrong-kind-fixture",
+                    "kind": "File",
+                    "schema_version": 1,
+                    "summary": "File node under verification domain - should be rejected",
+                    "source_artifact_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "non-verification kind under verification domain should be rejected; got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "wrong kind must produce bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn verification_invalid_executed_at_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-bad-executed-at",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-bad-executed-at-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:bad-executed-at-fixture",
+                    "kind": "TestRun",
+                    "schema_version": 1,
+                    "summary": "TestRun with malformed executed_at",
+                    "source_artifact_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "executed_at": "not-a-timestamp"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "invalid executed_at should be rejected; got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "invalid executed_at must produce bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn verification_v2_id_prefix_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // verification:v2: does not match the accepted v1 prefix
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-v2-prefix",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-v2-prefix-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v2:some-future-fixture",
+                    "kind": "TestRun",
+                    "schema_version": 1,
+                    "summary": "TestRun with v2 ID prefix - should be rejected",
+                    "source_artifact_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "verification:v2: prefix should be rejected; got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn verification_stdout_handle_empty_hash_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // stdout_handle present with empty hash — must be rejected even when source_artifact_hash is valid
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ver-empty-stdout-hash",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "ver-empty-stdout-hash-key",
+            "domain": "verification",
+            "created_at": "2026-05-19T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "verification:v1:empty-stdout-hash-fixture",
+                    "kind": "TestRun",
+                    "schema_version": 1,
+                    "summary": "TestRun with empty stdout_handle.hash",
+                    "source_artifact_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "stdout_handle": {
+                        "hash": "",
+                        "bytes": 100_u64
+                    }
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "stdout_handle with empty hash should be rejected; got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "empty stdout_handle.hash must produce bad_request, got {body}"
+    );
 
     daemon.stop();
 }

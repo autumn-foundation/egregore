@@ -90,7 +90,12 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::FileEdit
         | NodeKind::PatchArtifact
         | NodeKind::Failure
-        | NodeKind::Decision => return None,
+        | NodeKind::Decision
+        | NodeKind::TestRun
+        | NodeKind::CIStatus
+        | NodeKind::BenchmarkRun
+        | NodeKind::CoverageReport
+        | NodeKind::ProofResult => return None,
     };
 
     Some(EmbeddingCandidate {

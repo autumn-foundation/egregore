@@ -842,6 +842,12 @@ impl EmbeddedAletheiaSink {
             failure_kind,
             exit_code,
             turn_index,
+            stdout_handle,
+            stderr_handle,
+            evidence_quality,
+            executed_at,
+            verification_kind,
+            status,
         } = record
         else {
             unreachable!("write_node called with non-node record");
@@ -910,6 +916,20 @@ impl EmbeddedAletheiaSink {
         if let Some(idx) = turn_index {
             builder = builder.insert("turn_index", idx.to_string().as_str());
         }
+        if let Some(handle) = stdout_handle
+            && let Ok(json) = serde_json::to_string(handle.as_ref())
+        {
+            builder = builder.insert("stdout_handle_json", json.as_str());
+        }
+        if let Some(handle) = stderr_handle
+            && let Ok(json) = serde_json::to_string(handle.as_ref())
+        {
+            builder = builder.insert("stderr_handle_json", json.as_str());
+        }
+        builder = insert_optional(builder, "evidence_quality", evidence_quality.as_deref());
+        builder = insert_optional(builder, "executed_at", executed_at.as_deref());
+        builder = insert_optional(builder, "verification_kind", verification_kind.as_deref());
+        builder = insert_optional(builder, "status", status.as_deref());
 
         let node_id = self
             .db
@@ -1359,6 +1379,42 @@ impl EmbeddedAletheiaSink {
             .map(str::parse::<u64>)
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("turn_index parse error: {e}")))?,
+            stdout_handle: optional_str_property(
+                record_id,
+                "stdout_handle_json",
+                node.get_property("stdout_handle_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::OutputHandle>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("stdout_handle_json invalid: {e}")))?
+            .map(Box::new),
+            stderr_handle: optional_str_property(
+                record_id,
+                "stderr_handle_json",
+                node.get_property("stderr_handle_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::OutputHandle>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("stderr_handle_json invalid: {e}")))?
+            .map(Box::new),
+            evidence_quality: optional_str_property(
+                record_id,
+                "evidence_quality",
+                node.get_property("evidence_quality"),
+            )?,
+            executed_at: optional_str_property(
+                record_id,
+                "executed_at",
+                node.get_property("executed_at"),
+            )?,
+            verification_kind: optional_str_property(
+                record_id,
+                "verification_kind",
+                node.get_property("verification_kind"),
+            )?,
+            status: optional_str_property(record_id, "status", node.get_property("status"))?,
         })
     }
 
@@ -1732,6 +1788,11 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "PatchArtifact" => Ok(NodeKind::PatchArtifact),
         "Failure" => Ok(NodeKind::Failure),
         "Decision" => Ok(NodeKind::Decision),
+        "TestRun" => Ok(NodeKind::TestRun),
+        "CIStatus" => Ok(NodeKind::CIStatus),
+        "BenchmarkRun" => Ok(NodeKind::BenchmarkRun),
+        "CoverageReport" => Ok(NodeKind::CoverageReport),
+        "ProofResult" => Ok(NodeKind::ProofResult),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded node kind {kind}"),
@@ -1878,7 +1939,12 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::FileEdit
         | NodeKind::PatchArtifact
         | NodeKind::Failure
-        | NodeKind::Decision => kind.as_str(),
+        | NodeKind::Decision
+        | NodeKind::TestRun
+        | NodeKind::CIStatus
+        | NodeKind::BenchmarkRun
+        | NodeKind::CoverageReport
+        | NodeKind::ProofResult => kind.as_str(),
     }
 }
 

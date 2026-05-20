@@ -30,7 +30,7 @@ use crate::{
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord, IdentitySource,
-        NodeKind, TemporalMetadata, agent_memory_stable_id,
+        NodeKind, TemporalMetadata, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
     },
     query as graph_query,
 };
@@ -369,6 +369,10 @@ enum ErrorCode {
     /// Reserved on #5's error-code enum; returned when a commit prefix matches
     /// more than one distinct commit SHA in the store.
     AmbiguousCommitPrefix,
+    /// Added by #11 (verification schema): a verification-domain record is
+    /// missing a required evidence handle (`source_artifact_hash`,
+    /// `source_artifact_path`, or `stdout_handle.hash`).
+    MissingEvidenceHandle,
 }
 
 impl ErrorCode {
@@ -390,6 +394,7 @@ impl ErrorCode {
             Self::UnresolvedEvidenceTarget => "unresolved_evidence_target",
             Self::LocalPathIdentityUnsupported => "local_path_identity_unsupported",
             Self::AmbiguousCommitPrefix => "ambiguous_commit_prefix",
+            Self::MissingEvidenceHandle => "missing_evidence_handle",
         }
     }
 
@@ -410,7 +415,8 @@ impl ErrorCode {
             Self::ShutdownInProgress => 503,
             Self::RedactionRequired
             | Self::UnresolvedEvidenceTarget
-            | Self::LocalPathIdentityUnsupported => 422,
+            | Self::LocalPathIdentityUnsupported
+            | Self::MissingEvidenceHandle => 422,
         }
     }
 }
@@ -471,7 +477,7 @@ impl ApiError {
     fn invalid_domain() -> Self {
         Self::new(
             ErrorCode::InvalidDomain,
-            r#"domain must be "codegraph" or "agent_memory""#,
+            r#"domain must be "codegraph", "agent_memory", or "verification""#,
         )
     }
 
@@ -1219,6 +1225,7 @@ fn apply_write(
     }
 
     validate_no_local_path_identity_in_shared_store(&command.records, sink)?;
+    validate_verification_domain_records(&command.records)?;
 
     let (synthesized_edges, canonical_nodes) =
         validate_and_synthesize_evidence_edges(&command.records, sink)?;
@@ -1515,6 +1522,136 @@ fn incoming_identity_is_local(payload: &crate::ir::RepositoryIdentityPayload) ->
     }
 }
 
+/// Verification-domain node kinds permitted under `verification:v1:` IDs.
+const VERIFICATION_NODE_KINDS: &[NodeKind] = &[
+    NodeKind::TestRun,
+    NodeKind::CIStatus,
+    NodeKind::BenchmarkRun,
+    NodeKind::CoverageReport,
+    NodeKind::ProofResult,
+];
+
+/// Validates verification-domain records against the rules in
+/// `docs/schema/verification.md`:
+/// - Every record MUST carry an evidence handle (`source_artifact_hash`,
+///   `source_artifact_path`, or `stdout_handle.hash`).
+/// - `stdout_handle.inline` MUST be `None` when `stdout_handle.bytes` exceeds
+///   the 16 KiB inline ceiling.
+/// - `kind` must be one of the five verification node kinds.
+/// - `executed_at`, when present, must be a valid RFC 3339 timestamp.
+/// - `schema_version` must equal `VERIFICATION_SCHEMA_VERSION`.
+///
+/// A record is treated as verification-domain when its ID starts with
+/// `verification:v1:` (per `record_id_matches_domain`) or when it carries
+/// `domain = "verification"` explicitly.
+fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<()> {
+    const INLINE_CEILING: u64 = 16 * 1024;
+    for record in records {
+        let GraphRecord::Node {
+            id,
+            kind,
+            domain,
+            schema_version,
+            source_artifact_hash,
+            source_artifact_path,
+            stdout_handle,
+            stderr_handle,
+            executed_at,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        let is_verification =
+            id.starts_with("verification:v1:") || domain.as_deref() == Some("verification");
+        if !is_verification {
+            continue;
+        }
+
+        if *schema_version != VERIFICATION_SCHEMA_VERSION {
+            return Err(ApiError::bad_request(format!(
+                "verification node '{id}' has schema_version {schema_version} but only \
+                 version {VERIFICATION_SCHEMA_VERSION} is accepted"
+            )));
+        }
+
+        if !VERIFICATION_NODE_KINDS.contains(kind) {
+            return Err(ApiError::bad_request(format!(
+                "node kind '{}' is not permitted under the verification domain; \
+                 allowed kinds: TestRun, CIStatus, BenchmarkRun, CoverageReport, ProofResult",
+                kind.as_str()
+            )));
+        }
+
+        if let Some(ts) = executed_at.as_deref()
+            && DateTime::parse_from_rfc3339(ts).is_err()
+        {
+            return Err(ApiError::bad_request(format!(
+                "verification node '{id}' has invalid executed_at timestamp '{ts}'; \
+                 must be RFC 3339"
+            )));
+        }
+
+        let has_artifact_handle = source_artifact_hash
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+            || source_artifact_path
+                .as_deref()
+                .is_some_and(|s| !s.is_empty());
+        let stdout_hash = stdout_handle.as_deref().is_some_and(|h| !h.hash.is_empty());
+        let stderr_hash = stderr_handle.as_deref().is_some_and(|h| !h.hash.is_empty());
+
+        if !has_artifact_handle && !stdout_hash && !stderr_hash {
+            return Err(ApiError::new(
+                ErrorCode::MissingEvidenceHandle,
+                "verification-domain records must carry an evidence handle \
+                 (source_artifact_hash, source_artifact_path, stdout_handle.hash, \
+                 or stderr_handle.hash)",
+            ));
+        }
+
+        if let Some(h) = stdout_handle.as_deref() {
+            if h.hash.is_empty() {
+                return Err(ApiError::bad_request(
+                    "verification-domain stdout_handle.hash must not be empty",
+                ));
+            }
+            let inline_len = h.inline.as_deref().map_or(0, |s| s.len() as u64);
+            if inline_len > h.bytes {
+                return Err(ApiError::bad_request(
+                    "verification-domain stdout_handle.bytes must be >= inline payload length",
+                ));
+            }
+            if inline_len > INLINE_CEILING || (h.inline.is_some() && h.bytes > INLINE_CEILING) {
+                return Err(ApiError::bad_request(
+                    "verification-domain stdout_handle.inline must be None when bytes exceeds \
+                     the 16 KiB ceiling; demote to handle-only before writing",
+                ));
+            }
+        }
+        if let Some(h) = stderr_handle.as_deref() {
+            if h.hash.is_empty() {
+                return Err(ApiError::bad_request(
+                    "verification-domain stderr_handle.hash must not be empty",
+                ));
+            }
+            let inline_len = h.inline.as_deref().map_or(0, |s| s.len() as u64);
+            if inline_len > h.bytes {
+                return Err(ApiError::bad_request(
+                    "verification-domain stderr_handle.bytes must be >= inline payload length",
+                ));
+            }
+            if inline_len > INLINE_CEILING || (h.inline.is_some() && h.bytes > INLINE_CEILING) {
+                return Err(ApiError::bad_request(
+                    "verification-domain stderr_handle.inline must be None when bytes exceeds \
+                     the 16 KiB ceiling; demote to handle-only before writing",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {
     if has_duplicate_recovery_keys(records) || has_ambiguous_recovery_keys(records) {
         return Err(ApiError::conflict(
@@ -1529,6 +1666,7 @@ fn record_id_matches_domain(id: &str, domain: &str) -> bool {
     match domain {
         "codegraph" => id.starts_with("codegraph:"),
         "agent_memory" => id.starts_with("agent_memory:v1:"),
+        "verification" => id.starts_with("verification:v1:"),
         _ => true,
     }
 }
@@ -1550,6 +1688,13 @@ fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult
             if !id.starts_with("agent_memory:v1:") {
                 return Err(ApiError::bad_request(format!(
                     "evidence link declares target_domain 'agent_memory' but target '{id}' does not have the expected 'agent_memory:v1:' prefix",
+                )));
+            }
+        }
+        "verification" => {
+            if !id.starts_with("verification:v1:") {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link declares target_domain 'verification' but target '{id}' does not have the expected 'verification:v1:' prefix",
                 )));
             }
         }
@@ -1800,11 +1945,20 @@ fn validate_evidence_endpoint_constraints(
                 )));
             }
         }
-        // FAILED_ON is reserved for a Failure source node kind that does not yet exist.
+        // FAILED_ON: supported from TestRun, CIStatus (verification), and Failure (agent_memory).
         EdgeLabel::FailedOn => {
-            return Err(ApiError::bad_request(
-                "evidence link relation 'FAILED_ON' requires a Failure source node; the Failure node kind is not yet supported",
-            ));
+            if let Some(sk) = source_kind
+                && !matches!(
+                    sk,
+                    NodeKind::TestRun | NodeKind::CIStatus | NodeKind::Failure
+                )
+            {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation 'FAILED_ON' requires a TestRun, CIStatus, or \
+                     Failure source node; got source kind {}",
+                    sk.as_str()
+                )));
+            }
         }
         // TouchedFile, MentionsSymbol, and all other labels: any agent-memory source kind is permitted.
         _ => {}
@@ -1846,10 +2000,18 @@ fn validate_evidence_endpoint_constraints(
         EdgeLabel::HasEvidence => {
             if !matches!(
                 target_kind,
-                Some(NodeKind::Verification | NodeKind::CommandEvidence)
+                Some(
+                    NodeKind::Verification
+                        | NodeKind::CommandEvidence
+                        | NodeKind::TestRun
+                        | NodeKind::CIStatus
+                        | NodeKind::BenchmarkRun
+                        | NodeKind::CoverageReport
+                        | NodeKind::ProofResult
+                )
             ) {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a Verification or CommandEvidence target; target '{}' has kind {}",
+                    "evidence link relation '{}' requires a verification-evidence or CommandEvidence target; target '{}' has kind {}",
                     label.as_str(),
                     target_id,
                     target_kind_str()
@@ -1857,9 +2019,19 @@ fn validate_evidence_endpoint_constraints(
             }
         }
         EdgeLabel::ValidatedBy => {
-            if !matches!(target_kind, Some(NodeKind::Verification)) {
+            if !matches!(
+                target_kind,
+                Some(
+                    NodeKind::Verification
+                        | NodeKind::TestRun
+                        | NodeKind::CIStatus
+                        | NodeKind::BenchmarkRun
+                        | NodeKind::CoverageReport
+                        | NodeKind::ProofResult
+                )
+            ) {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a Verification target; target '{}' has kind {}",
+                    "evidence link relation '{}' requires a verification-evidence target; target '{}' has kind {}",
                     label.as_str(),
                     target_id,
                     target_kind_str()
@@ -1870,6 +2042,16 @@ fn validate_evidence_endpoint_constraints(
             if !matches!(target_kind, Some(NodeKind::Commit | NodeKind::Change)) {
                 return Err(ApiError::bad_request(format!(
                     "evidence link relation '{}' requires a Commit or Change target; target '{}' has kind {}",
+                    label.as_str(),
+                    target_id,
+                    target_kind_str()
+                )));
+            }
+        }
+        EdgeLabel::FailedOn => {
+            if !matches!(target_kind, Some(NodeKind::Symbol | NodeKind::File)) {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires a Symbol or File target; target '{}' has kind {}",
                     label.as_str(),
                     target_id,
                     target_kind_str()
@@ -1923,20 +2105,29 @@ fn validate_agent_memory_edge_endpoints(
 ) -> WriteResult<()> {
     // Source-domain constraints per schema registry.
     match label {
+        // Labels that require an agent_memory:v1: source exclusively.
         EdgeLabel::SessionOf
         | EdgeLabel::Observes
-        | EdgeLabel::MentionsSymbol
-        | EdgeLabel::TouchedFile
         | EdgeLabel::ProducedPatch
         | EdgeLabel::ValidatedBy
-        | EdgeLabel::FailedOn
         | EdgeLabel::ExplainsChange
         | EdgeLabel::ReferencesTask
-        | EdgeLabel::Contradicts
         | EdgeLabel::Supersedes => {
             if !source.starts_with("agent_memory:v1:") {
                 return Err(ApiError::bad_request(format!(
                     "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: source; got source '{source}'",
+                    label.as_str()
+                )));
+            }
+        }
+        // Labels that allow agent_memory:v1: OR verification:v1: sources.
+        EdgeLabel::MentionsSymbol
+        | EdgeLabel::TouchedFile
+        | EdgeLabel::FailedOn
+        | EdgeLabel::Contradicts => {
+            if !source.starts_with("agent_memory:v1:") && !source.starts_with("verification:v1:") {
+                return Err(ApiError::bad_request(format!(
+                    "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: or verification:v1: source; got source '{source}'",
                     label.as_str()
                 )));
             }
@@ -1946,16 +2137,23 @@ fn validate_agent_memory_edge_endpoints(
     }
     // Target-domain constraints per schema registry.
     match label {
+        // Must target agent_memory exclusively.
         EdgeLabel::SessionOf
         | EdgeLabel::AuthoredBy
-        | EdgeLabel::HasEvidence
-        | EdgeLabel::ValidatedBy
         | EdgeLabel::ReferencesTask
-        | EdgeLabel::Contradicts
         | EdgeLabel::Supersedes => {
             if !target.starts_with("agent_memory:v1:") {
                 return Err(ApiError::bad_request(format!(
                     "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: target; got target '{target}'",
+                    label.as_str()
+                )));
+            }
+        }
+        // ValidatedBy and HAS_EVIDENCE can target agent_memory OR verification.
+        EdgeLabel::ValidatedBy | EdgeLabel::HasEvidence => {
+            if !target.starts_with("agent_memory:v1:") && !target.starts_with("verification:v1:") {
+                return Err(ApiError::bad_request(format!(
+                    "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: or verification:v1: target; got target '{target}'",
                     label.as_str()
                 )));
             }
@@ -2118,11 +2316,14 @@ fn validate_and_synthesize_evidence_edges(
             {
                 let links = evidence_links.as_deref().unwrap_or(&[]);
                 // Reject evidence links on codegraph nodes — they would produce
-                // agent_memory:v1: edges from a non-agent-memory source, bypassing
+                // edges from a non-agent-memory/verification source, bypassing
                 // the envelope domain check.
-                if !links.is_empty() && !id.starts_with("agent_memory:v1:") {
+                if !links.is_empty()
+                    && !id.starts_with("agent_memory:v1:")
+                    && !id.starts_with("verification:v1:")
+                {
                     return Err(ApiError::bad_request(format!(
-                        "node '{id}' has evidence_links but is not an agent-memory record; evidence links are only supported for agent_memory:v1: nodes"
+                        "node '{id}' has evidence_links but is not an agent-memory or verification record; evidence links are only supported for agent_memory:v1: and verification:v1: nodes"
                     )));
                 }
                 // Validate and enforce schema constraints for all agent-memory node kinds.
@@ -2276,6 +2477,7 @@ fn validate_and_synthesize_evidence_edges(
                         EdgeLabel::Observes
                         | EdgeLabel::MentionsSymbol
                         | EdgeLabel::TouchedFile
+                        | EdgeLabel::FailedOn
                         | EdgeLabel::ExplainsChange => {
                             if link.target_domain != "codegraph" {
                                 return Err(ApiError::bad_request(format!(
@@ -2285,10 +2487,21 @@ fn validate_and_synthesize_evidence_edges(
                                 )));
                             }
                         }
-                        EdgeLabel::ValidatedBy
-                        | EdgeLabel::Contradicts
-                        | EdgeLabel::Supersedes
-                        | EdgeLabel::HasEvidence => {
+                        // ValidatedBy and HasEvidence can target agent_memory OR verification.
+                        EdgeLabel::ValidatedBy | EdgeLabel::HasEvidence => {
+                            if !matches!(
+                                link.target_domain.as_str(),
+                                "agent_memory" | "verification"
+                            ) {
+                                return Err(ApiError::bad_request(format!(
+                                    "evidence link relation '{}' requires target_domain 'agent_memory' or 'verification'; got '{}'",
+                                    edge_label.as_str(),
+                                    link.target_domain
+                                )));
+                            }
+                        }
+                        // Supersedes: agent_memory only.
+                        EdgeLabel::Supersedes => {
                             if link.target_domain != "agent_memory" {
                                 return Err(ApiError::bad_request(format!(
                                     "evidence link relation '{}' requires target_domain 'agent_memory'; got '{}'",
@@ -2297,6 +2510,7 @@ fn validate_and_synthesize_evidence_edges(
                                 )));
                             }
                         }
+                        // CONTRADICTS: TO any — no target_domain restriction.
                         // REFERENCES_TASK: the schema registry documents the TO domain as
                         // "project", but Task nodes currently live in agent_memory.
                         // Accept both to cover clients using the documented domain name.
@@ -2626,7 +2840,7 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         None => {
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("domain"));
         }
-        Some(d) if !matches!(d, "codegraph" | "agent_memory") => {
+        Some(d) if !matches!(d, "codegraph" | "agent_memory" | "verification") => {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
         }
         Some(d) => d.to_owned(),
@@ -3506,7 +3720,7 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     }
 
     if non_empty(query.domain.as_deref())
-        .is_some_and(|d| !matches!(d, "codegraph" | "agent_memory"))
+        .is_some_and(|d| !matches!(d, "codegraph" | "agent_memory" | "verification"))
     {
         return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
     }
@@ -3818,7 +4032,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         None => {
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("domain"));
         }
-        Some(d) if !matches!(d, "codegraph" | "agent_memory") => {
+        Some(d) if !matches!(d, "codegraph" | "agent_memory" | "verification") => {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
         }
         Some(d) => d.to_owned(),

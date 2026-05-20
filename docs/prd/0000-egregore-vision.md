@@ -216,6 +216,8 @@ Acceptance criteria:
 
 Egregore must answer agent-useful questions with citations to graph records, not just prose.
 
+Verification-evidence schema: [`docs/schema/verification.md`](../schema/verification.md).
+
 Acceptance criteria:
 
 - A query can answer "what do we know about this symbol?" with code location, related tasks, agent observations, and verification evidence.

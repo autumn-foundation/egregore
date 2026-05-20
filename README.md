@@ -58,6 +58,7 @@ Query output is newline-delimited JSON by default (`--format json`). Pass `--for
 - Product vision: [docs/prd/0000-egregore-vision.md](docs/prd/0000-egregore-vision.md)
 - Code graph requirements: [docs/prd/0001-codebase-knowledge-graph.md](docs/prd/0001-codebase-knowledge-graph.md)
 - **Agent-memory domain schema (v1):** [docs/schema/agent-memory.md](docs/schema/agent-memory.md)
+- **Verification-evidence domain schema (v1):** [docs/schema/verification.md](docs/schema/verification.md)
 - **Bi-temporal selector grammar (v2):** [docs/schema/temporal-selectors.md](docs/schema/temporal-selectors.md)
 - Architecture decisions: [docs/adr/README.md](docs/adr/README.md)
 - **Daemon HTTP wire contract (v1):** [docs/schema/daemon-api.md](docs/schema/daemon-api.md)

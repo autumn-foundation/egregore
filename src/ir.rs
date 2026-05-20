@@ -9,6 +9,10 @@ pub const SCHEMA_VERSION: u32 = 3;
 /// Documented in `docs/schema/agent-memory.md`.
 pub const AGENT_MEMORY_SCHEMA_VERSION: u32 = 1;
 
+/// Schema version for verification-domain records (`CommandRun`, `TestRun`, `Verification`, etc.).
+/// Documented in `docs/schema/verification.md`.
+pub const VERIFICATION_SCHEMA_VERSION: u32 = 1;
+
 /// Complete in-memory graph emitted by a scan.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
@@ -58,6 +62,22 @@ impl Default for Graph {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Output or error handle for verification-domain `CommandRun` records.
+///
+/// Inline content is bounded by a 16 KiB ceiling.  When the output exceeds
+/// that ceiling the `inline` field MUST be `None` and the full content is
+/// referenced by `hash` only.  Documented in `docs/schema/verification.md`.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutputHandle {
+    /// Inline content (None when bytes exceeds the 16 KiB ceiling).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline: Option<String>,
+    /// BLAKE3 hash of the full output content.
+    pub hash: String,
+    /// Total byte length of the output.
+    pub bytes: u64,
 }
 
 /// Agent-memory provenance fields for agent-authored nodes.
@@ -290,6 +310,28 @@ pub enum GraphRecord {
         /// Zero-based turn index within an `AgentRun` for `AgentTurn` records.
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_index: Option<u64>,
+        // ── Verification-domain fields (docs/schema/verification.md) ─────────
+        /// Standard output handle for verification-domain `CommandRun` records.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stdout_handle: Option<Box<OutputHandle>>,
+        /// Standard error handle for verification-domain `CommandRun` records.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stderr_handle: Option<Box<OutputHandle>>,
+        /// Evidence quality enum for verification-domain records:
+        /// `verbatim`, `summarized`, or `referenced_only`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        evidence_quality: Option<String>,
+        /// RFC 3339 timestamp when the evidence was produced (verification domain).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        executed_at: Option<String>,
+        /// Verification kind for `Verification` umbrella records:
+        /// `test_run`, `command_run`, `ci_status`, etc.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        verification_kind: Option<String>,
+        /// Pass/fail status for verification-domain records:
+        /// `passed`, `failed`, `errored`, `skipped`, or `inconclusive`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
     /// A graph edge.
     Edge {
@@ -388,6 +430,12 @@ impl GraphRecord {
             failure_kind: None,
             exit_code: None,
             turn_index: None,
+            stdout_handle: None,
+            stderr_handle: None,
+            evidence_quality: None,
+            executed_at: None,
+            verification_kind: None,
+            status: None,
         }
     }
 
@@ -437,6 +485,12 @@ impl GraphRecord {
             failure_kind: None,
             exit_code: None,
             turn_index: None,
+            stdout_handle: None,
+            stderr_handle: None,
+            evidence_quality: None,
+            executed_at: None,
+            verification_kind: None,
+            status: None,
         }
     }
 
@@ -485,6 +539,12 @@ impl GraphRecord {
             failure_kind: None,
             exit_code: None,
             turn_index: None,
+            stdout_handle: None,
+            stderr_handle: None,
+            evidence_quality: None,
+            executed_at: None,
+            verification_kind: None,
+            status: None,
         }
     }
 
@@ -679,6 +739,17 @@ pub enum NodeKind {
     Failure,
     /// Durable decision inferred from explicit context (reserved, agent-memory §4a).
     Decision,
+    // ── Verification-domain node kinds (docs/schema/verification.md) ─────────
+    /// One test command invocation that ran one or more tests (verification domain).
+    TestRun,
+    /// CI/CD run status — reserved for M9-adjacent project-graph integration.
+    CIStatus,
+    /// Criterion/cargo-bench/perf benchmark result — reserved.
+    BenchmarkRun,
+    /// Coverage tool output with per-file/per-line coverage data — reserved.
+    CoverageReport,
+    /// Verus/Kani/CBMC/Lean/Coq proof outcome — reserved.
+    ProofResult,
 }
 
 impl NodeKind {
@@ -710,6 +781,11 @@ impl NodeKind {
             Self::PatchArtifact => "PatchArtifact",
             Self::Failure => "Failure",
             Self::Decision => "Decision",
+            Self::TestRun => "TestRun",
+            Self::CIStatus => "CIStatus",
+            Self::BenchmarkRun => "BenchmarkRun",
+            Self::CoverageReport => "CoverageReport",
+            Self::ProofResult => "ProofResult",
         }
     }
 }
@@ -916,6 +992,23 @@ pub(crate) fn versioned_stable_id(version: u32, parts: &[&str]) -> String {
         hasher.update(b"\0");
     }
     format!("codegraph:v{version}:{}", hasher.finalize().to_hex())
+}
+
+/// Builds a stable verification-domain record ID.
+///
+/// Uses the `verification:v1:` prefix so verification IDs cannot collide with
+/// code-graph or agent-memory IDs. Documented in `docs/schema/verification.md`.
+#[must_use]
+pub fn verification_stable_id(parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part.to_ascii_lowercase().as_bytes());
+        hasher.update(b"\0");
+    }
+    format!(
+        "verification:v{VERIFICATION_SCHEMA_VERSION}:{}",
+        hasher.finalize().to_hex()
+    )
 }
 
 /// Builds a stable agent-memory record ID.

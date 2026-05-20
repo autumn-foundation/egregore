@@ -115,6 +115,7 @@ All error codes are snake\_case identifiers. String literals at call sites in
 | `shutdown_in_progress`| 503  | yes       | yes              | all    |
 | `redaction_required`  | 422  | no        | no               | ingest (future) |
 | `unresolved_evidence_target` | 422 | no  | no               | ingest, jobs/ingest |
+| `missing_evidence_handle` | 422 | no    | no               | ingest, jobs/ingest |
 
 Adding a new code is additive. Renaming or removing a code requires `/v2/`.
 
