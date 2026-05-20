@@ -1143,20 +1143,14 @@ fn recover_pending_write_pre_validation(
         let originals_ok = command.records.iter().all(|r| {
             sink_guard
                 .expected_record_state(r)
-                .map(|s| matches!(s, ExpectedRecordState::Matched))
-                .unwrap_or(false)
+                .is_ok_and(|s| matches!(s, ExpectedRecordState::Matched))
         });
         // Presence-check synthesized edge IDs (those in the pending entry but not in the
         // original batch) to avoid falsely completing recovery when edges are missing.
         let synthesized_ok = pending_record_ids
             .iter()
             .filter(|id| !original_ids.contains(id.as_str()))
-            .all(|id| {
-                sink_guard
-                    .read_back(id)
-                    .map(|r| r.is_some())
-                    .unwrap_or(false)
-            });
+            .all(|id| sink_guard.read_back(id).is_ok_and(|r| r.is_some()));
         originals_ok && synthesized_ok
     };
     if !all_matched {
@@ -1677,26 +1671,20 @@ fn record_id_matches_domain(id: &str, domain: &str) -> bool {
 // relation-specific checks in validate_evidence_endpoint_constraints enforce per-label rules.
 fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult<()> {
     match target_domain {
-        "codegraph" => {
-            if !id.starts_with("codegraph:") {
-                return Err(ApiError::bad_request(format!(
-                    "evidence link declares target_domain 'codegraph' but target '{id}' does not have the expected 'codegraph:' prefix",
-                )));
-            }
+        "codegraph" if !id.starts_with("codegraph:") => {
+            return Err(ApiError::bad_request(format!(
+                "evidence link declares target_domain 'codegraph' but target '{id}' does not have the expected 'codegraph:' prefix",
+            )));
         }
-        "agent_memory" => {
-            if !id.starts_with("agent_memory:v1:") {
-                return Err(ApiError::bad_request(format!(
-                    "evidence link declares target_domain 'agent_memory' but target '{id}' does not have the expected 'agent_memory:v1:' prefix",
-                )));
-            }
+        "agent_memory" if !id.starts_with("agent_memory:v1:") => {
+            return Err(ApiError::bad_request(format!(
+                "evidence link declares target_domain 'agent_memory' but target '{id}' does not have the expected 'agent_memory:v1:' prefix",
+            )));
         }
-        "verification" => {
-            if !id.starts_with("verification:v1:") {
-                return Err(ApiError::bad_request(format!(
-                    "evidence link declares target_domain 'verification' but target '{id}' does not have the expected 'verification:v1:' prefix",
-                )));
-            }
+        "verification" if !id.starts_with("verification:v1:") => {
+            return Err(ApiError::bad_request(format!(
+                "evidence link declares target_domain 'verification' but target '{id}' does not have the expected 'verification:v1:' prefix",
+            )));
         }
         // "project" and any other declared domain: no universal prefix requirement.
         _ => {}
@@ -1967,37 +1955,31 @@ fn validate_evidence_endpoint_constraints(
     let target_kind_str =
         || target_kind.map_or_else(|| "unknown".to_owned(), |k| k.as_str().to_owned());
     match label {
-        EdgeLabel::MentionsSymbol => {
-            if !matches!(target_kind, Some(NodeKind::Symbol)) {
-                return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a Symbol target; target '{}' has kind {}",
-                    label.as_str(),
-                    target_id,
-                    target_kind_str()
-                )));
-            }
+        EdgeLabel::MentionsSymbol if !matches!(target_kind, Some(NodeKind::Symbol)) => {
+            return Err(ApiError::bad_request(format!(
+                "evidence link relation '{}' requires a Symbol target; target '{}' has kind {}",
+                label.as_str(),
+                target_id,
+                target_kind_str()
+            )));
         }
-        EdgeLabel::TouchedFile => {
-            if !matches!(target_kind, Some(NodeKind::File)) {
-                return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a File target; target '{}' has kind {}",
-                    label.as_str(),
-                    target_id,
-                    target_kind_str()
-                )));
-            }
+        EdgeLabel::TouchedFile if !matches!(target_kind, Some(NodeKind::File)) => {
+            return Err(ApiError::bad_request(format!(
+                "evidence link relation '{}' requires a File target; target '{}' has kind {}",
+                label.as_str(),
+                target_id,
+                target_kind_str()
+            )));
         }
-        EdgeLabel::ReferencesTask => {
-            if !matches!(target_kind, Some(NodeKind::Task)) {
-                return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a Task target; target '{}' has kind {}",
-                    label.as_str(),
-                    target_id,
-                    target_kind_str()
-                )));
-            }
+        EdgeLabel::ReferencesTask if !matches!(target_kind, Some(NodeKind::Task)) => {
+            return Err(ApiError::bad_request(format!(
+                "evidence link relation '{}' requires a Task target; target '{}' has kind {}",
+                label.as_str(),
+                target_id,
+                target_kind_str()
+            )));
         }
-        EdgeLabel::HasEvidence => {
+        EdgeLabel::HasEvidence
             if !matches!(
                 target_kind,
                 Some(
@@ -2009,16 +1991,16 @@ fn validate_evidence_endpoint_constraints(
                         | NodeKind::CoverageReport
                         | NodeKind::ProofResult
                 )
-            ) {
-                return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a verification-evidence or CommandEvidence target; target '{}' has kind {}",
-                    label.as_str(),
-                    target_id,
-                    target_kind_str()
-                )));
-            }
+            ) =>
+        {
+            return Err(ApiError::bad_request(format!(
+                "evidence link relation '{}' requires a verification-evidence or CommandEvidence target; target '{}' has kind {}",
+                label.as_str(),
+                target_id,
+                target_kind_str()
+            )));
         }
-        EdgeLabel::ValidatedBy => {
+        EdgeLabel::ValidatedBy
             if !matches!(
                 target_kind,
                 Some(
@@ -2029,34 +2011,32 @@ fn validate_evidence_endpoint_constraints(
                         | NodeKind::CoverageReport
                         | NodeKind::ProofResult
                 )
-            ) {
-                return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a verification-evidence target; target '{}' has kind {}",
-                    label.as_str(),
-                    target_id,
-                    target_kind_str()
-                )));
-            }
+            ) =>
+        {
+            return Err(ApiError::bad_request(format!(
+                "evidence link relation '{}' requires a verification-evidence target; target '{}' has kind {}",
+                label.as_str(),
+                target_id,
+                target_kind_str()
+            )));
         }
-        EdgeLabel::ExplainsChange => {
-            if !matches!(target_kind, Some(NodeKind::Commit | NodeKind::Change)) {
-                return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a Commit or Change target; target '{}' has kind {}",
-                    label.as_str(),
-                    target_id,
-                    target_kind_str()
-                )));
-            }
+        EdgeLabel::ExplainsChange
+            if !matches!(target_kind, Some(NodeKind::Commit | NodeKind::Change)) =>
+        {
+            return Err(ApiError::bad_request(format!(
+                "evidence link relation '{}' requires a Commit or Change target; target '{}' has kind {}",
+                label.as_str(),
+                target_id,
+                target_kind_str()
+            )));
         }
-        EdgeLabel::FailedOn => {
-            if !matches!(target_kind, Some(NodeKind::Symbol | NodeKind::File)) {
-                return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a Symbol or File target; target '{}' has kind {}",
-                    label.as_str(),
-                    target_id,
-                    target_kind_str()
-                )));
-            }
+        EdgeLabel::FailedOn if !matches!(target_kind, Some(NodeKind::Symbol | NodeKind::File)) => {
+            return Err(ApiError::bad_request(format!(
+                "evidence link relation '{}' requires a Symbol or File target; target '{}' has kind {}",
+                label.as_str(),
+                target_id,
+                target_kind_str()
+            )));
         }
         // PRODUCED_PATCH requires a PatchArtifact target, which does not yet exist as a NodeKind.
         EdgeLabel::ProducedPatch => {
@@ -2112,25 +2092,26 @@ fn validate_agent_memory_edge_endpoints(
         | EdgeLabel::ValidatedBy
         | EdgeLabel::ExplainsChange
         | EdgeLabel::ReferencesTask
-        | EdgeLabel::Supersedes => {
-            if !source.starts_with("agent_memory:v1:") {
-                return Err(ApiError::bad_request(format!(
-                    "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: source; got source '{source}'",
-                    label.as_str()
-                )));
-            }
+        | EdgeLabel::Supersedes
+            if !source.starts_with("agent_memory:v1:") =>
+        {
+            return Err(ApiError::bad_request(format!(
+                "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: source; got source '{source}'",
+                label.as_str()
+            )));
         }
         // Labels that allow agent_memory:v1: OR verification:v1: sources.
         EdgeLabel::MentionsSymbol
         | EdgeLabel::TouchedFile
         | EdgeLabel::FailedOn
-        | EdgeLabel::Contradicts => {
-            if !source.starts_with("agent_memory:v1:") && !source.starts_with("verification:v1:") {
-                return Err(ApiError::bad_request(format!(
-                    "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: or verification:v1: source; got source '{source}'",
-                    label.as_str()
-                )));
-            }
+        | EdgeLabel::Contradicts
+            if !source.starts_with("agent_memory:v1:")
+                && !source.starts_with("verification:v1:") =>
+        {
+            return Err(ApiError::bad_request(format!(
+                "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: or verification:v1: source; got source '{source}'",
+                label.as_str()
+            )));
         }
         // AUTHORED_BY, HAS_EVIDENCE, RELATES_TO: any source domain is permitted.
         _ => {}
@@ -2141,34 +2122,35 @@ fn validate_agent_memory_edge_endpoints(
         EdgeLabel::SessionOf
         | EdgeLabel::AuthoredBy
         | EdgeLabel::ReferencesTask
-        | EdgeLabel::Supersedes => {
-            if !target.starts_with("agent_memory:v1:") {
-                return Err(ApiError::bad_request(format!(
-                    "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: target; got target '{target}'",
-                    label.as_str()
-                )));
-            }
+        | EdgeLabel::Supersedes
+            if !target.starts_with("agent_memory:v1:") =>
+        {
+            return Err(ApiError::bad_request(format!(
+                "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: target; got target '{target}'",
+                label.as_str()
+            )));
         }
         // ValidatedBy and HAS_EVIDENCE can target agent_memory OR verification.
-        EdgeLabel::ValidatedBy | EdgeLabel::HasEvidence => {
-            if !target.starts_with("agent_memory:v1:") && !target.starts_with("verification:v1:") {
-                return Err(ApiError::bad_request(format!(
-                    "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: or verification:v1: target; got target '{target}'",
-                    label.as_str()
-                )));
-            }
+        EdgeLabel::ValidatedBy | EdgeLabel::HasEvidence
+            if !target.starts_with("agent_memory:v1:")
+                && !target.starts_with("verification:v1:") =>
+        {
+            return Err(ApiError::bad_request(format!(
+                "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: or verification:v1: target; got target '{target}'",
+                label.as_str()
+            )));
         }
         EdgeLabel::Observes
         | EdgeLabel::MentionsSymbol
         | EdgeLabel::TouchedFile
         | EdgeLabel::FailedOn
-        | EdgeLabel::ExplainsChange => {
-            if !target.starts_with("codegraph:") {
-                return Err(ApiError::bad_request(format!(
-                    "agent-memory edge '{edge_id}' label '{}' requires a codegraph: target; got target '{target}'",
-                    label.as_str()
-                )));
-            }
+        | EdgeLabel::ExplainsChange
+            if !target.starts_with("codegraph:") =>
+        {
+            return Err(ApiError::bad_request(format!(
+                "agent-memory edge '{edge_id}' label '{}' requires a codegraph: target; got target '{target}'",
+                label.as_str()
+            )));
         }
         // PRODUCED_PATCH, RELATES_TO: any target domain is permitted.
         _ => {}
@@ -2478,50 +2460,51 @@ fn validate_and_synthesize_evidence_edges(
                         | EdgeLabel::MentionsSymbol
                         | EdgeLabel::TouchedFile
                         | EdgeLabel::FailedOn
-                        | EdgeLabel::ExplainsChange => {
-                            if link.target_domain != "codegraph" {
-                                return Err(ApiError::bad_request(format!(
-                                    "evidence link relation '{}' requires target_domain 'codegraph'; got '{}'",
-                                    edge_label.as_str(),
-                                    link.target_domain
-                                )));
-                            }
+                        | EdgeLabel::ExplainsChange
+                            if link.target_domain != "codegraph" =>
+                        {
+                            return Err(ApiError::bad_request(format!(
+                                "evidence link relation '{}' requires target_domain 'codegraph'; got '{}'",
+                                edge_label.as_str(),
+                                link.target_domain
+                            )));
                         }
                         // ValidatedBy and HasEvidence can target agent_memory OR verification.
-                        EdgeLabel::ValidatedBy | EdgeLabel::HasEvidence => {
+                        EdgeLabel::ValidatedBy | EdgeLabel::HasEvidence
                             if !matches!(
                                 link.target_domain.as_str(),
                                 "agent_memory" | "verification"
-                            ) {
-                                return Err(ApiError::bad_request(format!(
-                                    "evidence link relation '{}' requires target_domain 'agent_memory' or 'verification'; got '{}'",
-                                    edge_label.as_str(),
-                                    link.target_domain
-                                )));
-                            }
+                            ) =>
+                        {
+                            return Err(ApiError::bad_request(format!(
+                                "evidence link relation '{}' requires target_domain 'agent_memory' or 'verification'; got '{}'",
+                                edge_label.as_str(),
+                                link.target_domain
+                            )));
                         }
                         // Supersedes: agent_memory only.
-                        EdgeLabel::Supersedes => {
-                            if link.target_domain != "agent_memory" {
-                                return Err(ApiError::bad_request(format!(
-                                    "evidence link relation '{}' requires target_domain 'agent_memory'; got '{}'",
-                                    edge_label.as_str(),
-                                    link.target_domain
-                                )));
-                            }
+                        EdgeLabel::Supersedes if link.target_domain != "agent_memory" => {
+                            return Err(ApiError::bad_request(format!(
+                                "evidence link relation '{}' requires target_domain 'agent_memory'; got '{}'",
+                                edge_label.as_str(),
+                                link.target_domain
+                            )));
                         }
                         // CONTRADICTS: TO any — no target_domain restriction.
                         // REFERENCES_TASK: the schema registry documents the TO domain as
                         // "project", but Task nodes currently live in agent_memory.
                         // Accept both to cover clients using the documented domain name.
-                        EdgeLabel::ReferencesTask => {
-                            if !matches!(link.target_domain.as_str(), "project" | "agent_memory") {
-                                return Err(ApiError::bad_request(format!(
-                                    "evidence link relation '{}' requires target_domain 'project' or 'agent_memory'; got '{}'",
-                                    edge_label.as_str(),
-                                    link.target_domain
-                                )));
-                            }
+                        EdgeLabel::ReferencesTask
+                            if !matches!(
+                                link.target_domain.as_str(),
+                                "project" | "agent_memory"
+                            ) =>
+                        {
+                            return Err(ApiError::bad_request(format!(
+                                "evidence link relation '{}' requires target_domain 'project' or 'agent_memory'; got '{}'",
+                                edge_label.as_str(),
+                                link.target_domain
+                            )));
                         }
                         // PRODUCED_PATCH, RELATES_TO: any target domain is permitted.
                         _ => {}

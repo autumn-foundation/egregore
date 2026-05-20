@@ -10,9 +10,11 @@ use std::{
 
 #[cfg(feature = "embedded-aletheiadb")]
 use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink, records_from_jsonl};
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+use aletheia_egregore::embeddings::{EmbeddingVectorKey, EmbeddingVectorMap};
 #[cfg(feature = "embedded-aletheiadb")]
 use aletheia_egregore::{
-    EdgeLabel, GraphRecord, NodeKind, SCHEMA_VERSION, SourceSpan, TemporalMetadata,
+    EdgeLabel, Graph, GraphRecord, NodeKind, SCHEMA_VERSION, SourceSpan, TemporalMetadata,
     scan_repository_history, stable_id,
 };
 use aletheia_egregore::{
@@ -108,6 +110,105 @@ fn embedded_cli_ingest_accepts_data_dir() {
         .stderr(predicate::str::is_empty());
 }
 
+#[cfg(feature = "embeddings")]
+#[test]
+fn embed_flag_is_rejected_for_dry_run_ingest() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let graph_path = temp.path().join("graph.jsonl");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(fixture_repo())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("dry-run")
+        .arg("--embed")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--embed requires --adapter embedded",
+        ));
+}
+
+#[cfg(feature = "embeddings")]
+#[test]
+fn embed_flag_is_rejected_for_daemon_ingest() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let graph_path = temp.path().join("graph.jsonl");
+    let data_dir = temp.path().join("daemon-store");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("scan")
+        .arg(fixture_repo())
+        .arg("--out")
+        .arg(&graph_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--idempotency-key")
+        .arg("embed-daemon-reject")
+        .arg("--embed")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--embed requires --adapter embedded",
+        ));
+}
+
+#[cfg(feature = "embeddings")]
+#[test]
+fn embedded_embed_ingest_without_candidates_skips_zero_dimension_index() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let graph_path = temp.path().join("repo-only.graph.jsonl");
+    let data_dir = temp.path().join("repo-only-store");
+    let mut graph = Graph::new();
+    graph.push(GraphRecord::node(
+        stable_id(&["repository", "operator-override", "repo-only"]),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo-only".to_owned()),
+        "Repository repo-only".to_owned(),
+    ));
+    fs::write(
+        &graph_path,
+        graph.to_jsonl().expect("repo-only graph should serialize"),
+    )
+    .expect("repo-only graph should be written");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("embedded")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--embed")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("failed: 0"))
+        .stderr(predicate::str::is_empty());
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn embedded_ingest_reads_back_and_traverses_repository_file_symbol() {
@@ -134,6 +235,151 @@ fn embedded_ingest_reads_back_and_traverses_repository_file_symbol() {
         sink.has_repository_file_symbol_path(repository.id())
             .expect("embedded traversal should run"),
         "embedded store should contain Repository -> File -> Symbol path"
+    );
+}
+
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+#[test]
+fn semantic_search_returns_latest_live_records_only() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("semantic-live-store");
+    let stable_symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+    let old_symbol = symbol_record_with_span(
+        &stable_symbol_id,
+        "stable",
+        "old stable implementation",
+        10,
+        temporal("aaaaaaaa", "2026-01-01T00:00:00Z"),
+    );
+    let latest_symbol = symbol_record_with_span(
+        &stable_symbol_id,
+        "stable",
+        "latest stable implementation",
+        40,
+        temporal("bbbbbbbb", "2026-01-02T00:00:00Z"),
+    );
+    let deleted_symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "deleted"]);
+    let deleted_symbol = current_symbol_record(&deleted_symbol_id, "deleted", "deleted symbol", 20);
+    let tombstone = GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &deleted_symbol_id]),
+        schema_version: SCHEMA_VERSION,
+        deleted_id: deleted_symbol_id.clone(),
+        summary: "deleted symbol tombstone".to_owned(),
+    };
+    let superseded_symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "superseded"]);
+    let superseding_symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "superseding"]);
+    let superseding_symbol =
+        current_symbol_record(&superseding_symbol_id, "superseding", "live successor", 30);
+    let superseded_symbol = superseded_symbol(
+        &superseded_symbol_id,
+        "superseded",
+        "superseded predecessor",
+        &superseding_symbol_id,
+    );
+
+    let mut vectors = EmbeddingVectorMap::new();
+    vectors.insert(
+        EmbeddingVectorKey::from_record(&old_symbol).expect("old symbol should be embeddable"),
+        vec![1.0, 0.0],
+    );
+    vectors.insert(
+        EmbeddingVectorKey::from_record(&latest_symbol)
+            .expect("latest symbol should be embeddable"),
+        vec![0.7, 0.3],
+    );
+    vectors.insert(
+        EmbeddingVectorKey::from_record(&deleted_symbol)
+            .expect("deleted symbol should be embeddable"),
+        vec![1.0, 0.0],
+    );
+    vectors.insert(
+        EmbeddingVectorKey::from_record(&superseded_symbol)
+            .expect("superseded symbol should be embeddable"),
+        vec![1.0, 0.0],
+    );
+    vectors.insert(
+        EmbeddingVectorKey::from_record(&superseding_symbol)
+            .expect("superseding symbol should be embeddable"),
+        vec![0.7, 0.3],
+    );
+
+    let mut sink = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, 2)
+        .expect("embedded semantic store should open");
+    for record in [
+        &old_symbol,
+        &latest_symbol,
+        &deleted_symbol,
+        &tombstone,
+        &superseded_symbol,
+        &superseding_symbol,
+    ] {
+        sink.write_record(record)
+            .expect("semantic fixture record should write");
+    }
+
+    let matches = sink
+        .semantic_search(&[1.0, 0.0], 10)
+        .expect("semantic search should succeed");
+
+    let stable_matches = matches
+        .iter()
+        .filter(|m| m.record_id == stable_symbol_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stable_matches.len(),
+        1,
+        "semantic search must deduplicate physical versions by stable record_id"
+    );
+    assert_eq!(
+        stable_matches[0].span.map(|span| span.end_byte),
+        Some(40),
+        "semantic search must return the latest live physical observation"
+    );
+    assert!(
+        matches.iter().all(|m| m.record_id != deleted_symbol_id),
+        "semantic search must not return active tombstones"
+    );
+    assert!(
+        matches.iter().all(|m| m.record_id != superseded_symbol_id),
+        "semantic search must not return superseded nodes"
+    );
+}
+
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+#[test]
+fn semantic_ingest_backfills_vectors_for_matched_existing_nodes() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("matched-semantic-store");
+    let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "matched"]);
+    let symbol = current_symbol_record(&symbol_id, "matched", "matched existing symbol", 50);
+
+    {
+        let mut structural =
+            EmbeddedAletheiaSink::open(&data_dir).expect("structural store should open");
+        let report = ingest_records(std::slice::from_ref(&symbol), &mut structural);
+        assert!(report.is_success(), "{report:?}");
+        structural
+            .persist_indexes()
+            .expect("structural indexes should persist");
+    }
+
+    let mut vectors = EmbeddingVectorMap::new();
+    vectors.insert(
+        EmbeddingVectorKey::from_record(&symbol).expect("symbol should be embeddable"),
+        vec![1.0, 0.0],
+    );
+    let mut semantic = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, 2)
+        .expect("semantic store should reopen");
+
+    let report = ingest_records(std::slice::from_ref(&symbol), &mut semantic);
+    assert!(report.is_success(), "{report:?}");
+
+    let matches = semantic
+        .semantic_search(&[1.0, 0.0], 10)
+        .expect("semantic search should succeed");
+    assert!(
+        matches.iter().any(|m| m.record_id == symbol_id),
+        "matched structural nodes must be re-embedded when semantic ingest is requested"
     );
 }
 
@@ -643,6 +889,30 @@ fn symbol_record(id: &str, name: &str, summary: &str, temporal: TemporalMetadata
     .with_temporal(temporal)
 }
 
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+fn symbol_record_with_span(
+    id: &str,
+    name: &str,
+    summary: &str,
+    end_byte: usize,
+    temporal: TemporalMetadata,
+) -> GraphRecord {
+    GraphRecord::symbol(
+        id.to_owned(),
+        "function",
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 0,
+            end_byte,
+            start_line: 1,
+            end_line: 1,
+        },
+        name.to_owned(),
+        summary.to_owned(),
+    )
+    .with_temporal(temporal)
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 fn current_symbol_record(id: &str, name: &str, summary: &str, end_byte: usize) -> GraphRecord {
     GraphRecord::symbol(
@@ -658,6 +928,16 @@ fn current_symbol_record(id: &str, name: &str, summary: &str, end_byte: usize) -
         name.to_owned(),
         summary.to_owned(),
     )
+}
+
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+fn superseded_symbol(id: &str, name: &str, summary: &str, superseded_by_id: &str) -> GraphRecord {
+    let mut record = current_symbol_record(id, name, summary, 25);
+    let GraphRecord::Node { superseded_by, .. } = &mut record else {
+        unreachable!("current_symbol_record must create a node");
+    };
+    *superseded_by = Some(superseded_by_id.to_owned());
+    record
 }
 
 #[cfg(feature = "embedded-aletheiadb")]

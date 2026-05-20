@@ -385,6 +385,11 @@ fn ingest(
     #[cfg(not(feature = "embedded-aletheiadb"))]
     let _ = (data_dir, agent_id, session_id, idempotency_key);
 
+    #[cfg(feature = "embeddings")]
+    if embed && adapter != IngestAdapter::Embedded {
+        anyhow::bail!("--embed requires --adapter embedded");
+    }
+
     let jsonl = fs::read_to_string(graph)
         .with_context(|| format!("failed to read graph JSONL from {}", graph.display()))?;
     let records = records_from_jsonl(&jsonl).context("failed to parse graph JSONL")?;
@@ -400,10 +405,16 @@ fn ingest(
             #[cfg(feature = "embeddings")]
             let mut sink = if embed {
                 let (vectors, dimensions) = generate_embeddings(&records)?;
-                EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, dimensions)
-                    .with_context(|| {
+                if vectors.is_empty() {
+                    EmbeddedAletheiaSink::open(&data_dir).with_context(|| {
                         format!("failed to open embedded store {}", data_dir.display())
                     })?
+                } else {
+                    EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, dimensions)
+                        .with_context(|| {
+                            format!("failed to open embedded store {}", data_dir.display())
+                        })?
+                }
             } else {
                 EmbeddedAletheiaSink::open(&data_dir).with_context(|| {
                     format!("failed to open embedded store {}", data_dir.display())
@@ -826,12 +837,14 @@ fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
 #[cfg(feature = "embeddings")]
 fn generate_embeddings(
     records: &[GraphRecord],
-) -> Result<(std::collections::BTreeMap<String, Vec<f32>>, usize)> {
-    use crate::embeddings::{aletheia_embeddings, embedding_candidates};
+) -> Result<(crate::embeddings::EmbeddingVectorMap, usize)> {
+    use crate::embeddings::{
+        EmbeddingVectorKey, EmbeddingVectorMap, aletheia_embeddings, embedding_candidates,
+    };
 
     let candidates = embedding_candidates(records);
     if candidates.is_empty() {
-        return Ok((std::collections::BTreeMap::new(), 0));
+        return Ok((EmbeddingVectorMap::new(), 0));
     }
 
     eprintln!(
@@ -860,10 +873,13 @@ fn generate_embeddings(
         .collect();
 
     let dimensions = dense.first().map_or(0, Vec::len);
+    if dimensions == 0 {
+        anyhow::bail!("embedding model returned zero-dimension vectors");
+    }
     let map = candidates
         .into_iter()
         .zip(dense)
-        .map(|(c, v)| (c.record_id, v))
+        .map(|(candidate, vector)| (EmbeddingVectorKey::from_candidate(&candidate), vector))
         .collect();
 
     Ok((map, dimensions))

@@ -41,6 +41,51 @@ pub struct CandidateVector {
     pub vector: Vec<f32>,
 }
 
+/// Key for storing an embedding against one physical graph observation.
+///
+/// Current-tree records use only `record_id`. History-backed records include
+/// commit and bitemporal fields so two observations of the same stable symbol
+/// can keep different vectors.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub struct EmbeddingVectorKey {
+    record_id: String,
+    git_commit: Option<String>,
+    valid_time: Option<String>,
+    observed_at: Option<String>,
+}
+
+/// Dense vectors keyed by physical graph observation.
+pub type EmbeddingVectorMap = BTreeMap<EmbeddingVectorKey, Vec<f32>>;
+
+impl EmbeddingVectorKey {
+    /// Builds a vector key for an embeddable graph node.
+    ///
+    /// Returns `None` for edges and tombstones because they are not embedding
+    /// candidates.
+    #[must_use]
+    pub fn from_record(record: &GraphRecord) -> Option<Self> {
+        let GraphRecord::Node { id, temporal, .. } = record else {
+            return None;
+        };
+        Some(Self::from_parts(id, temporal.as_ref()))
+    }
+
+    /// Builds a vector key from a selected embedding candidate.
+    #[must_use]
+    pub fn from_candidate(candidate: &EmbeddingCandidate) -> Self {
+        Self::from_parts(&candidate.record_id, candidate.temporal.as_ref())
+    }
+
+    fn from_parts(record_id: &str, temporal: Option<&TemporalMetadata>) -> Self {
+        Self {
+            record_id: record_id.to_owned(),
+            git_commit: temporal.map(|metadata| metadata.git_commit.clone()),
+            valid_time: temporal.map(|metadata| metadata.valid_time.clone()),
+            observed_at: temporal.map(|metadata| metadata.observed_at.clone()),
+        }
+    }
+}
+
 /// Selects agent-useful file and symbol summaries for semantic embedding.
 #[must_use]
 pub fn embedding_candidates(records: &[GraphRecord]) -> Vec<EmbeddingCandidate> {
@@ -48,7 +93,9 @@ pub fn embedding_candidates(records: &[GraphRecord]) -> Vec<EmbeddingCandidate> 
         .iter()
         .filter_map(candidate_from_record)
         .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| left.record_id.cmp(&right.record_id));
+    candidates.sort_by(|left, right| {
+        EmbeddingVectorKey::from_candidate(left).cmp(&EmbeddingVectorKey::from_candidate(right))
+    });
     candidates
 }
 

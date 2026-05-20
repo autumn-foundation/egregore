@@ -4,6 +4,8 @@ use std::{collections::BTreeMap, fs, path::Path, time::Instant};
 
 use chrono::{DateTime, Utc};
 
+#[cfg(feature = "embeddings")]
+use crate::embeddings::{EmbeddingVectorKey, EmbeddingVectorMap};
 use crate::{
     adapters::{AdapterError, AdapterResult, ExpectedRecordState, GraphSink},
     daemon::StoreLease,
@@ -13,6 +15,8 @@ use crate::{
         SourceSpan, TemporalMetadata,
     },
 };
+#[cfg(feature = "embeddings")]
+use ::aletheiadb::api::transaction::WriteOps;
 
 /// A single result from a semantic similarity search.
 #[derive(Debug, Clone)]
@@ -48,7 +52,7 @@ pub struct EmbeddedAletheiaSink {
     legacy_edge_counts: BTreeMap<String, usize>,
     _lease: Option<StoreLease>,
     #[cfg(feature = "embeddings")]
-    embedding_vectors: BTreeMap<String, Vec<f32>>,
+    embedding_vectors: EmbeddingVectorMap,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -227,9 +231,15 @@ impl EmbeddedAletheiaSink {
     #[cfg(feature = "embeddings")]
     pub fn open_with_embeddings(
         data_dir: impl AsRef<std::path::Path>,
-        vectors: BTreeMap<String, Vec<f32>>,
+        vectors: EmbeddingVectorMap,
         dimensions: usize,
     ) -> AdapterResult<Self> {
+        if dimensions == 0 {
+            return Err(AdapterError::Rejected {
+                record_id: "embedded-store".to_owned(),
+                message: "embedding vector dimensions must be greater than zero".to_owned(),
+            });
+        }
         let data_dir = data_dir.as_ref();
         let lease = StoreLease::acquire(data_dir).map_err(|error| AdapterError::Rejected {
             record_id: "embedded-store".to_owned(),
@@ -264,24 +274,48 @@ impl EmbeddedAletheiaSink {
         query_vector: &[f32],
         limit: usize,
     ) -> AdapterResult<Vec<SemanticMatch>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let raw_limit = self.db.get_all_node_ids().len().max(limit);
         let raw = self
             .db
-            .find_similar_by_embedding(query_vector, limit)
+            .find_similar_by_embedding(query_vector, raw_limit)
             .map_err(|error| AdapterError::ReadBack {
                 record_id: "semantic-search".to_owned(),
                 message: error.to_string(),
             })?;
+        let active_tombstoned = self.active_deleted_ids()?;
 
         let mut results = Vec::with_capacity(raw.len());
+        let mut seen_record_ids = std::collections::BTreeSet::new();
         for (node_id, score) in raw {
             let Ok(node) = self.db.get_node(node_id) else {
                 continue;
             };
-            let record_id = node
+            let Some(record_id) = node
                 .get_property("codegraph_id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            if active_tombstoned.contains(record_id.as_str()) {
+                continue;
+            }
+            if node
+                .get_property("superseded_by")
+                .and_then(|v| v.as_str())
+                .is_some_and(|superseded_by| !superseded_by.is_empty())
+            {
+                continue;
+            }
+            if self.node_lookup.latest_node(&record_id) != Some(node_id) {
+                continue;
+            }
+            if !seen_record_ids.insert(record_id.clone()) {
+                continue;
+            }
             let name = node
                 .get_property("name")
                 .and_then(|v| v.as_str())
@@ -298,6 +332,9 @@ impl EmbeddedAletheiaSink {
                 score,
                 span,
             });
+            if results.len() == limit {
+                break;
+            }
         }
         Ok(results)
     }
@@ -910,6 +947,8 @@ impl EmbeddedAletheiaSink {
     #[allow(clippy::too_many_lines)]
     fn write_node(&mut self, record: &GraphRecord) -> AdapterResult<()> {
         if self.expected_record_state(record)? == ExpectedRecordState::Matched {
+            #[cfg(feature = "embeddings")]
+            self.backfill_embedding_for_matched_node(record)?;
             return Ok(());
         }
         let GraphRecord::Node {
@@ -1036,7 +1075,9 @@ impl EmbeddedAletheiaSink {
         builder = insert_optional(builder, "verification_kind", verification_kind.as_deref());
         builder = insert_optional(builder, "status", status.as_deref());
         #[cfg(feature = "embeddings")]
-        if let Some(vector) = self.embedding_vectors.get(id.as_str()) {
+        if let Some(key) = EmbeddingVectorKey::from_record(record)
+            && let Some(vector) = self.embedding_vectors.get(&key)
+        {
             builder = builder.insert_vector("embedding", vector);
         }
 
@@ -1070,6 +1111,75 @@ impl EmbeddedAletheiaSink {
         self.record_handles
             .insert(id.clone(), StoredRecord::Node(node_id));
         Ok(())
+    }
+
+    #[cfg(feature = "embeddings")]
+    fn backfill_embedding_for_matched_node(&self, record: &GraphRecord) -> AdapterResult<()> {
+        let GraphRecord::Node { id, temporal, .. } = record else {
+            return Ok(());
+        };
+        let Some(key) = EmbeddingVectorKey::from_record(record) else {
+            return Ok(());
+        };
+        let Some(vector) = self.embedding_vectors.get(&key).cloned() else {
+            return Ok(());
+        };
+        let Some(node_id) = self.node_id_for_observation(id, temporal.as_ref()) else {
+            return Ok(());
+        };
+
+        let node = self
+            .db
+            .get_node(node_id)
+            .map_err(|error| read_back_error(id, error.to_string()))?;
+        if node
+            .get_property("embedding")
+            .and_then(::aletheiadb::PropertyValue::as_vector)
+            .is_some_and(|existing| existing == vector.as_slice())
+        {
+            return Ok(());
+        }
+
+        let properties = ::aletheiadb::PropertyMapBuilder::new()
+            .insert_vector("embedding", &vector)
+            .build();
+        self.db
+            .write(|tx| tx.update_node(node_id, properties))
+            .map_err(|error| AdapterError::Rejected {
+                record_id: id.clone(),
+                message: error.to_string(),
+            })?;
+
+        let node = self
+            .db
+            .get_node(node_id)
+            .map_err(|error| read_back_error(id, error.to_string()))?;
+        if node
+            .get_property("embedding")
+            .and_then(::aletheiadb::PropertyValue::as_vector)
+            != Some(vector.as_slice())
+        {
+            return Err(AdapterError::ReadBack {
+                record_id: id.clone(),
+                message: "embedded node embedding was not persisted".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn node_id_for_observation(
+        &self,
+        record_id: &str,
+        temporal: Option<&TemporalMetadata>,
+    ) -> Option<::aletheiadb::NodeId> {
+        if let Some(temporal) = temporal
+            && let Some(node_id) = self
+                .node_lookup
+                .node_for_commit(record_id, &temporal.git_commit)
+        {
+            return Some(node_id);
+        }
+        self.node_lookup.latest_node(record_id)
     }
 
     fn write_tombstone(&mut self, record: &GraphRecord) -> AdapterResult<()> {
