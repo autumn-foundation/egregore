@@ -84,6 +84,8 @@ struct ReadBackCandidate<Id> {
 struct NodeLookupIndex {
     latest: BTreeMap<String, ReadBackCandidate<::aletheiadb::NodeId>>,
     by_commit: BTreeMap<String, BTreeMap<String, ReadBackCandidate<::aletheiadb::NodeId>>>,
+    by_observation:
+        BTreeMap<String, BTreeMap<TemporalReadKey, ReadBackCandidate<::aletheiadb::NodeId>>>,
     non_temporal: BTreeMap<String, ::aletheiadb::NodeId>,
     single_candidate: BTreeMap<String, ::aletheiadb::NodeId>,
     candidate_counts: BTreeMap<String, usize>,
@@ -110,6 +112,11 @@ impl NodeLookupIndex {
         }
 
         if let Some(key) = temporal_key {
+            let observation_candidates = self.by_observation.entry(record_id.clone()).or_default();
+            if should_replace_read_back_candidate(observation_candidates.get(&key), &candidate) {
+                observation_candidates.insert(key.clone(), candidate.clone());
+            }
+
             let commit_candidates = self.by_commit.entry(record_id).or_default();
             let commit = key.git_commit;
             if should_replace_read_back_candidate(commit_candidates.get(&commit), &candidate) {
@@ -137,6 +144,17 @@ impl NodeLookupIndex {
         self.by_commit
             .get(record_id)
             .and_then(|commits| commits.get(git_commit))
+            .map(|candidate| candidate.storage_id)
+    }
+
+    fn node_for_observation(
+        &self,
+        record_id: &str,
+        temporal_key: &TemporalReadKey,
+    ) -> Option<::aletheiadb::NodeId> {
+        self.by_observation
+            .get(record_id)
+            .and_then(|observations| observations.get(temporal_key))
             .map(|candidate| candidate.storage_id)
     }
 
@@ -549,11 +567,15 @@ impl EmbeddedAletheiaSink {
     ) -> AdapterResult<ExpectedRecordState> {
         match record {
             GraphRecord::Node { id, temporal, .. } => {
-                if let Some(temporal) = temporal
-                    && let Some(node_id) =
-                        self.node_lookup.node_for_commit(id, &temporal.git_commit)
-                {
-                    return self.compare_node_record(id, node_id, record);
+                if let Some(temporal) = temporal {
+                    let Some(temporal_key) = temporal_read_key_from_metadata(id, temporal) else {
+                        return self.compare_latest_record(record);
+                    };
+                    if let Some(node_id) = self.node_lookup.node_for_observation(id, &temporal_key)
+                    {
+                        return self.compare_node_record(id, node_id, record);
+                    }
+                    return Ok(ExpectedRecordState::Missing);
                 }
                 self.compare_latest_record(record)
             }
@@ -1237,13 +1259,18 @@ impl EmbeddedAletheiaSink {
         temporal: Option<&TemporalMetadata>,
     ) -> Option<::aletheiadb::NodeId> {
         if let Some(temporal) = temporal
+            && let Some(temporal_key) = temporal_read_key_from_metadata(record_id, temporal)
             && let Some(node_id) = self
                 .node_lookup
-                .node_for_commit(record_id, &temporal.git_commit)
+                .node_for_observation(record_id, &temporal_key)
         {
             return Some(node_id);
         }
-        self.node_lookup.latest_node(record_id)
+        if temporal.is_some() {
+            None
+        } else {
+            self.node_lookup.latest_node(record_id)
+        }
     }
 
     fn write_tombstone(&mut self, record: &GraphRecord) -> AdapterResult<()> {
@@ -1969,6 +1996,21 @@ fn temporal_read_key_from_properties<'a>(
     }))
 }
 
+fn temporal_read_key_from_metadata(
+    _record_id: &str,
+    temporal: &TemporalMetadata,
+) -> Option<TemporalReadKey> {
+    Some(TemporalReadKey {
+        valid_time: DateTime::parse_from_rfc3339(&temporal.valid_time)
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .ok()?,
+        observed_at: DateTime::parse_from_rfc3339(&temporal.observed_at)
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .ok()?,
+        git_commit: temporal.git_commit.clone(),
+    })
+}
+
 fn required_rfc3339_property(
     record_id: &str,
     key: &str,
@@ -2460,6 +2502,189 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn node_id_for_observation_uses_full_temporal_identity() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("full-temporal-identity-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "same-commit"]);
+        let first_temporal =
+            temporal_observed("aaaaaaaa", "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z");
+        let second_temporal =
+            temporal_observed("aaaaaaaa", "2026-01-01T00:00:00Z", "2026-01-01T00:00:02Z");
+        let first = symbol_record(
+            &symbol_id,
+            "first same-commit observation",
+            first_temporal.clone(),
+        );
+        let second = symbol_record(
+            &symbol_id,
+            "second same-commit observation",
+            second_temporal.clone(),
+        );
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+        sink.write_record(&first)
+            .expect("first observation should write");
+        sink.write_record(&second)
+            .expect("second observation should write");
+
+        let first_node = node_id_for_temporal_properties(
+            &sink,
+            &symbol_id,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:01Z",
+        );
+        let second_node = node_id_for_temporal_properties(
+            &sink,
+            &symbol_id,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:02Z",
+        );
+
+        assert_ne!(
+            first_node, second_node,
+            "fixture should create two physical observations for the same commit"
+        );
+        assert_eq!(
+            sink.node_id_for_observation(&symbol_id, Some(&first_temporal)),
+            Some(first_node),
+            "semantic observation lookup must resolve the first bitemporal identity"
+        );
+        assert_eq!(
+            sink.node_id_for_observation(&symbol_id, Some(&second_temporal)),
+            Some(second_node),
+            "semantic observation lookup must resolve the second bitemporal identity"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn embedding_backfill_uses_full_temporal_observation_identity() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("same-commit-observation-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "same-commit"]);
+        let same_commit = "aaaaaaaa";
+        let first_temporal =
+            temporal_observed(same_commit, "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z");
+        let second_temporal =
+            temporal_observed(same_commit, "2026-01-01T00:00:00Z", "2026-01-01T00:00:02Z");
+        let first = symbol_record(&symbol_id, "first same-commit observation", first_temporal);
+        let second = symbol_record(
+            &symbol_id,
+            "second same-commit observation",
+            second_temporal,
+        );
+
+        {
+            let mut structural =
+                EmbeddedAletheiaSink::open(&data_dir).expect("structural store should open");
+            structural
+                .write_record(&first)
+                .expect("first observation should write");
+            structural
+                .write_record(&second)
+                .expect("second observation should write");
+            structural
+                .persist_indexes()
+                .expect("structural indexes should persist");
+        }
+
+        let mut vectors = EmbeddingVectorMap::new();
+        vectors.insert(
+            EmbeddingVectorKey::from_record(&first).expect("symbol should be embeddable"),
+            vec![1.0, 0.0],
+        );
+        let mut semantic = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, 2)
+            .expect("semantic store should reopen");
+        semantic
+            .write_record(&first)
+            .expect("matched first observation should be backfilled");
+
+        let first_node = node_id_for_temporal_properties(
+            &semantic,
+            &symbol_id,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:01Z",
+        );
+        let second_node = node_id_for_temporal_properties(
+            &semantic,
+            &symbol_id,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:02Z",
+        );
+        let first_embedding = semantic
+            .db
+            .get_node(first_node)
+            .expect("first node should be readable")
+            .get_property("embedding")
+            .and_then(::aletheiadb::PropertyValue::as_vector)
+            .map(<[f32]>::to_vec);
+        let second_embedding = semantic
+            .db
+            .get_node(second_node)
+            .expect("second node should be readable")
+            .get_property("embedding")
+            .and_then(::aletheiadb::PropertyValue::as_vector)
+            .map(<[f32]>::to_vec);
+
+        assert_eq!(first_embedding.as_deref(), Some(&[1.0, 0.0][..]));
+        assert_eq!(
+            second_embedding, None,
+            "backfill must not write a vector to a different observation from the same commit"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn temporal_write_without_embedding_map_does_not_inherit_prior_commit_vector() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("temporal-unseen-commit-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "new-commit"]);
+        let original = symbol_record(
+            &symbol_id,
+            "original semantic symbol",
+            temporal_observed("aaaaaaaa", "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z"),
+        );
+        let new_commit = symbol_record(
+            &symbol_id,
+            "new commit without fresh embedding",
+            temporal_observed("bbbbbbbb", "2026-01-02T00:00:00Z", "2026-01-02T00:00:01Z"),
+        );
+        let mut vectors = EmbeddingVectorMap::new();
+        vectors.insert(
+            EmbeddingVectorKey::from_record(&original).expect("symbol should be embeddable"),
+            vec![1.0, 0.0],
+        );
+        let mut sink = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, 2)
+            .expect("semantic store should open");
+
+        sink.write_record(&original)
+            .expect("original observation should write with an embedding");
+        sink.embedding_vectors.clear();
+        sink.write_record(&new_commit)
+            .expect("new temporal observation should write without a fresh embedding");
+
+        let new_node = node_id_for_temporal_properties(
+            &sink,
+            &symbol_id,
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:01Z",
+        );
+        let new_embedding = sink
+            .db
+            .get_node(new_node)
+            .expect("new commit node should be readable")
+            .get_property("embedding")
+            .and_then(::aletheiadb::PropertyValue::as_vector)
+            .map(<[f32]>::to_vec);
+
+        assert_eq!(
+            new_embedding, None,
+            "non-embed temporal writes must not inherit stale vectors from prior commits"
+        );
+    }
+
     #[test]
     fn read_back_until_honors_expired_deadline_before_edge_scan() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -2736,5 +2961,35 @@ mod tests {
             observed_at: observed_at.to_owned(),
             valid_time_source: None,
         }
+    }
+
+    #[cfg(feature = "embeddings")]
+    fn node_id_for_temporal_properties(
+        sink: &EmbeddedAletheiaSink,
+        record_id: &str,
+        valid_time: &str,
+        observed_at: &str,
+    ) -> ::aletheiadb::NodeId {
+        for node_id in sink.db.get_all_node_ids() {
+            let node = sink.db.get_node(node_id).expect("node should be readable");
+            if node
+                .get_property("codegraph_id")
+                .and_then(::aletheiadb::PropertyValue::as_str)
+                == Some(record_id)
+                && node
+                    .get_property("valid_time")
+                    .and_then(::aletheiadb::PropertyValue::as_str)
+                    == Some(valid_time)
+                && node
+                    .get_property("observed_at")
+                    .and_then(::aletheiadb::PropertyValue::as_str)
+                    == Some(observed_at)
+            {
+                return node_id;
+            }
+        }
+        panic!(
+            "node {record_id} with valid_time {valid_time} observed_at {observed_at} should exist"
+        );
     }
 }

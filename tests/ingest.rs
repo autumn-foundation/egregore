@@ -11,7 +11,9 @@ use std::{
 #[cfg(feature = "embedded-aletheiadb")]
 use aletheia_egregore::adapters::{EmbeddedAletheiaSink, GraphSink, records_from_jsonl};
 #[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
-use aletheia_egregore::embeddings::{EmbeddingVectorKey, EmbeddingVectorMap};
+use aletheia_egregore::embeddings::{
+    DEFAULT_EMBEDDING_MODEL_DIMENSIONS, EmbeddingVectorKey, EmbeddingVectorMap,
+};
 #[cfg(feature = "embedded-aletheiadb")]
 use aletheia_egregore::{
     EdgeLabel, Graph, GraphRecord, NodeKind, SCHEMA_VERSION, SourceSpan, TemporalMetadata,
@@ -175,7 +177,7 @@ fn embed_flag_is_rejected_for_daemon_ingest() {
 
 #[cfg(feature = "embeddings")]
 #[test]
-fn embedded_embed_ingest_without_candidates_skips_zero_dimension_index() {
+fn embedded_embed_ingest_without_candidates_creates_empty_queryable_index() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let graph_path = temp.path().join("repo-only.graph.jsonl");
     let data_dir = temp.path().join("repo-only-store");
@@ -207,6 +209,16 @@ fn embedded_embed_ingest_without_candidates_skips_zero_dimension_index() {
         .success()
         .stdout(predicate::str::contains("failed: 0"))
         .stderr(predicate::str::is_empty());
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let query_vector = vec![0.0; DEFAULT_EMBEDDING_MODEL_DIMENSIONS];
+    let matches = sink
+        .semantic_search(&query_vector, 10)
+        .expect("zero-candidate --embed ingest should still create a queryable vector index");
+    assert!(
+        matches.is_empty(),
+        "zero-candidate semantic stores should return clean empty results"
+    );
 }
 
 #[cfg(feature = "embedded-aletheiadb")]

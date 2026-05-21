@@ -15,6 +15,15 @@ pub use aletheiadb::embeddings as aletheia_embeddings;
 #[cfg(feature = "embeddings")]
 pub use aletheiadb::embeddings::embed_anything;
 
+/// Default embedding model used by the CLI.
+pub const DEFAULT_EMBEDDING_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
+
+/// Model architecture passed through to `AletheiaDB`'s embedding boundary.
+pub const DEFAULT_EMBEDDING_MODEL_ARCHITECTURE: &str = "bert";
+
+/// Dense vector dimensions for [`DEFAULT_EMBEDDING_MODEL_ID`].
+pub const DEFAULT_EMBEDDING_MODEL_DIMENSIONS: usize = 384;
+
 /// Text unit selected for embedding.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct EmbeddingCandidate {

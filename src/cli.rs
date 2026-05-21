@@ -405,16 +405,10 @@ fn ingest(
             #[cfg(feature = "embeddings")]
             let mut sink = if embed {
                 let (vectors, dimensions) = generate_embeddings(&records)?;
-                if vectors.is_empty() {
-                    EmbeddedAletheiaSink::open(&data_dir).with_context(|| {
+                EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, dimensions)
+                    .with_context(|| {
                         format!("failed to open embedded store {}", data_dir.display())
                     })?
-                } else {
-                    EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, dimensions)
-                        .with_context(|| {
-                            format!("failed to open embedded store {}", data_dir.display())
-                        })?
-                }
             } else {
                 EmbeddedAletheiaSink::open(&data_dir).with_context(|| {
                     format!("failed to open embedded store {}", data_dir.display())
@@ -843,12 +837,17 @@ fn generate_embeddings(
     records: &[GraphRecord],
 ) -> Result<(crate::embeddings::EmbeddingVectorMap, usize)> {
     use crate::embeddings::{
-        EmbeddingVectorKey, EmbeddingVectorMap, aletheia_embeddings, embedding_candidates,
+        DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_DIMENSIONS,
+        DEFAULT_EMBEDDING_MODEL_ID, EmbeddingVectorKey, EmbeddingVectorMap, aletheia_embeddings,
+        embedding_candidates,
     };
 
     let candidates = embedding_candidates(records);
     if candidates.is_empty() {
-        return Ok((EmbeddingVectorMap::new(), 0));
+        return Ok((
+            EmbeddingVectorMap::new(),
+            DEFAULT_EMBEDDING_MODEL_DIMENSIONS,
+        ));
     }
 
     eprintln!(
@@ -857,8 +856,8 @@ fn generate_embeddings(
     );
 
     let embedder = aletheia_embeddings::EmbedderBuilder::new()
-        .model_architecture("bert")
-        .model_id(Some("sentence-transformers/all-MiniLM-L6-v2"))
+        .model_architecture(DEFAULT_EMBEDDING_MODEL_ARCHITECTURE)
+        .model_id(Some(DEFAULT_EMBEDDING_MODEL_ID))
         .from_pretrained_hf()
         .context("failed to load embedding model")?;
 
@@ -892,13 +891,15 @@ fn generate_embeddings(
 /// Semantic similarity search against an embedded store.
 #[cfg(feature = "embeddings")]
 fn query_semantic(query: &str, data_dir: &Path, limit: usize, format: OutputFormat) -> Result<()> {
-    use crate::embeddings::aletheia_embeddings;
+    use crate::embeddings::{
+        DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_ID, aletheia_embeddings,
+    };
 
     validate_existing_embedded_store(data_dir)?;
 
     let embedder = aletheia_embeddings::EmbedderBuilder::new()
-        .model_architecture("bert")
-        .model_id(Some("sentence-transformers/all-MiniLM-L6-v2"))
+        .model_architecture(DEFAULT_EMBEDDING_MODEL_ARCHITECTURE)
+        .model_id(Some(DEFAULT_EMBEDDING_MODEL_ID))
         .from_pretrained_hf()
         .context("failed to load embedding model")?;
 
