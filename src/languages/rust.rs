@@ -84,6 +84,8 @@ struct RustExtractor<'graph, 'source> {
     impl_context: Option<ImplContext>,
     definitions: BTreeMap<String, String>,
     symbol_bodies: Vec<SymbolBody>,
+    symbol_ordinals: BTreeMap<(String, String), u64>,
+    diagnostic_ordinals: BTreeMap<String, u64>,
 }
 
 impl<'graph, 'source> RustExtractor<'graph, 'source> {
@@ -105,6 +107,8 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             impl_context: None,
             definitions: BTreeMap::new(),
             symbol_bodies: Vec::new(),
+            symbol_ordinals: BTreeMap::new(),
+            diagnostic_ordinals: BTreeMap::new(),
         }
     }
 
@@ -265,13 +269,14 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
 
     fn extract_macro_diagnostic(&mut self, node: Node<'_>) {
         let invocation = macro_invocation_name(self.node_text(node));
+        let disambiguator = self.next_diagnostic_disambiguator(&invocation);
         let id = stable_id(&[
             "node",
             "diagnostic",
             self.repository_id,
             &self.file.repo_relative_path,
             &invocation,
-            &span(node).start_byte.to_string(),
+            &disambiguator.to_string(),
         ]);
         self.graph.push(GraphRecord::syntax_node(
             id,
@@ -285,6 +290,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     fn add_symbol(&mut self, node: Node<'_>, symbol_kind: &str, qualified_name: &str) -> String {
+        let disambiguator = self.next_symbol_disambiguator(symbol_kind, qualified_name);
         let id = stable_id(&[
             "node",
             "symbol",
@@ -292,16 +298,24 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             self.repository_id,
             &self.file.repo_relative_path,
             qualified_name,
-            &span(node).start_byte.to_string(),
+            &disambiguator.to_string(),
         ]);
-        self.graph.push(GraphRecord::symbol(
+        let mut record = GraphRecord::symbol(
             id.clone(),
             symbol_kind,
             self.file.repo_relative_path.clone(),
             span(node),
             qualified_name.to_owned(),
             format!("Rust {symbol_kind} {qualified_name}"),
-        ));
+        );
+        if let GraphRecord::Node {
+            disambiguator: node_disambiguator,
+            ..
+        } = &mut record
+        {
+            *node_disambiguator = Some(disambiguator);
+        }
+        self.graph.push(record);
         self.add_edge(
             EdgeLabel::Defines,
             self.owner_id(),
@@ -309,6 +323,24 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             format!("{} defines {qualified_name}", self.owner_name()),
         );
         id
+    }
+
+    fn next_symbol_disambiguator(&mut self, symbol_kind: &str, qualified_name: &str) -> u64 {
+        let key = (symbol_kind.to_owned(), qualified_name.to_owned());
+        let disambiguator = self.symbol_ordinals.entry(key).or_default();
+        let current = *disambiguator;
+        *disambiguator += 1;
+        current
+    }
+
+    fn next_diagnostic_disambiguator(&mut self, invocation: &str) -> u64 {
+        let disambiguator = self
+            .diagnostic_ordinals
+            .entry(invocation.to_owned())
+            .or_default();
+        let current = *disambiguator;
+        *disambiguator += 1;
+        current
     }
 
     fn add_edge(&mut self, label: EdgeLabel, source: String, target: String, summary: String) {

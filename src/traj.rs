@@ -856,6 +856,7 @@ fn make_node(
         name: None,
         language: None,
         symbol_kind: None,
+        disambiguator: None,
         temporal: None,
         semantic_drift: None,
         evidence_links: None,
