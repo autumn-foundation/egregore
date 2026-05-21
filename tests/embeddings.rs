@@ -4,7 +4,9 @@ use std::path::PathBuf;
 
 use aletheia_egregore::{
     GraphRecord, NodeKind, TemporalMetadata,
-    embeddings::{CandidateVector, embedding_candidates, semantic_drift_records},
+    embeddings::{
+        CandidateVector, EmbeddingVectorKey, embedding_candidates, semantic_drift_records,
+    },
     scan_repository,
 };
 use serde_json::Value;
@@ -169,6 +171,40 @@ fn semantic_drift_records_compare_same_symbol_across_commits() {
                 && record["semantic_drift"]["after_git_commit"] == "bbbbbbbb"
         }),
         "missing symbol semantic drift node"
+    );
+}
+
+#[test]
+fn embedding_vector_keys_preserve_per_commit_observations_for_stable_record_ids() {
+    let before = GraphRecord::node(
+        "symbol:stable".to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("stable".to_owned()),
+        "Rust function stable computes the old behavior".to_owned(),
+    )
+    .with_temporal(temporal("aaaaaaaa", "2026-01-01T00:00:00Z"));
+    let after = GraphRecord::node(
+        "symbol:stable".to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("stable".to_owned()),
+        "Rust function stable computes the new behavior".to_owned(),
+    )
+    .with_temporal(temporal("bbbbbbbb", "2026-01-02T00:00:00Z"));
+
+    let candidates = embedding_candidates(&[before, after]);
+    let keys = candidates
+        .iter()
+        .map(EmbeddingVectorKey::from_candidate)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(
+        keys.len(),
+        2,
+        "same stable record_id must still retain one embedding key per commit observation"
     );
 }
 

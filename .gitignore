@@ -1,1 +1,6 @@
 /target
+.claude/
+
+# Generated egregore stores and graph snapshots
+*.jsonl
+.egregore*/
