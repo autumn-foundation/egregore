@@ -227,12 +227,12 @@ impl EmbeddedAletheiaSink {
 
     /// Opens a store and pre-loads embedding vectors so they are stored in each
     /// node during ingest. Enables an HNSW vector index on the `"embedding"`
-    /// property for semantic search.
+    /// property for semantic search when the store does not already have one.
     ///
     /// # Errors
     ///
-    /// Returns an error if the store cannot be opened or the vector index fails
-    /// to initialise.
+    /// Returns an error if the store cannot be opened, the existing embedding
+    /// index is incompatible, or the vector index fails to initialise.
     #[cfg(feature = "embeddings")]
     pub fn open_with_embeddings(
         data_dir: impl AsRef<std::path::Path>,
@@ -252,17 +252,44 @@ impl EmbeddedAletheiaSink {
         })?;
         let mut sink = Self::open_inner(data_dir, Some(lease))?;
         sink.embedding_vectors = vectors;
-        let hnsw = ::aletheiadb::index::vector::hnsw::HnswConfig {
-            dimensions,
-            metric: ::aletheiadb::index::vector::DistanceMetric::Cosine,
-            ..Default::default()
-        };
-        sink.db
-            .enable_vector_index("embedding", hnsw)
-            .map_err(|error| AdapterError::Rejected {
-                record_id: "embedded-store".to_owned(),
-                message: error.to_string(),
-            })?;
+        let metric = ::aletheiadb::index::vector::DistanceMetric::Cosine;
+        if let Some(existing) = sink
+            .db
+            .list_vector_indexes()
+            .into_iter()
+            .find(|index| index.property_name == "embedding")
+        {
+            if existing.dimensions != dimensions {
+                return Err(AdapterError::Rejected {
+                    record_id: "embedded-store".to_owned(),
+                    message: format!(
+                        "existing embedding vector index has {} dimensions but ingest generated {}",
+                        existing.dimensions, dimensions
+                    ),
+                });
+            }
+            if existing.distance_metric != metric {
+                return Err(AdapterError::Rejected {
+                    record_id: "embedded-store".to_owned(),
+                    message: format!(
+                        "existing embedding vector index uses {:?} but ingest requires {:?}",
+                        existing.distance_metric, metric
+                    ),
+                });
+            }
+        } else {
+            let hnsw = ::aletheiadb::index::vector::hnsw::HnswConfig {
+                dimensions,
+                metric,
+                ..Default::default()
+            };
+            sink.db
+                .enable_vector_index("embedding", hnsw)
+                .map_err(|error| AdapterError::Rejected {
+                    record_id: "embedded-store".to_owned(),
+                    message: error.to_string(),
+                })?;
+        }
         Ok(sink)
     }
 

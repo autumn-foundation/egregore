@@ -438,6 +438,36 @@ fn non_embed_reingest_preserves_existing_embedding_on_latest_node() {
     );
 }
 
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+#[test]
+fn embed_reingest_reopens_existing_semantic_store_without_reenabling_index_error() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("repeat-semantic-store");
+    let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "repeat-semantic"]);
+    let symbol = current_symbol_record(&symbol_id, "repeat", "repeat semantic symbol", 20);
+
+    let mut vectors = EmbeddingVectorMap::new();
+    vectors.insert(
+        EmbeddingVectorKey::from_record(&symbol).expect("symbol should be embeddable"),
+        vec![1.0, 0.0],
+    );
+
+    {
+        let mut first = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors.clone(), 2)
+            .expect("first semantic store open should succeed");
+        let report = ingest_records(std::slice::from_ref(&symbol), &mut first);
+        assert!(report.is_success(), "{report:?}");
+        first
+            .persist_indexes()
+            .expect("semantic indexes should persist");
+    }
+
+    let mut second = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, 2)
+        .expect("repeat semantic store open should reuse the existing vector index");
+    let report = ingest_records(std::slice::from_ref(&symbol), &mut second);
+    assert!(report.is_success(), "{report:?}");
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn embedded_history_ingest_traverses_commit_change_symbol() {

@@ -790,30 +790,34 @@ fn load_records_from_jsonl(graph: &Path) -> Result<Vec<GraphRecord>> {
         .map_err(|e| anyhow::anyhow!("failed to parse graph JSONL: {e}"))
 }
 
-fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
-    #[cfg(feature = "embedded-aletheiadb")]
-    {
-        // Reject missing or empty directories before opening — a fresh/nonexistent
-        // directory means the caller made a typo or forgot to run `eg ingest` first.
-        match std::fs::read_dir(data_dir) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+#[cfg(feature = "embedded-aletheiadb")]
+fn validate_existing_embedded_store(data_dir: &Path) -> Result<()> {
+    match fs::read_dir(data_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "error: embedded store not found at {} - \
+                 run `eg ingest --adapter embedded --data-dir <path>` first",
+                data_dir.display()
+            );
+        }
+        Ok(mut entries) => {
+            if entries.next().is_none() {
                 anyhow::bail!(
-                    "error: embedded store not found at {} — \
+                    "error: embedded store at {} is empty - \
                      run `eg ingest --adapter embedded --data-dir <path>` first",
                     data_dir.display()
                 );
             }
-            Ok(mut entries) => {
-                if entries.next().is_none() {
-                    anyhow::bail!(
-                        "error: embedded store at {} is empty — \
-                         run `eg ingest --adapter embedded --data-dir <path>` first",
-                        data_dir.display()
-                    );
-                }
-            }
-            Err(_) => {}
         }
+        Err(_) => {}
+    }
+    Ok(())
+}
+
+fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
         let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
             .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
         sink.read_all_records()
@@ -889,6 +893,8 @@ fn generate_embeddings(
 #[cfg(feature = "embeddings")]
 fn query_semantic(query: &str, data_dir: &Path, limit: usize, format: OutputFormat) -> Result<()> {
     use crate::embeddings::aletheia_embeddings;
+
+    validate_existing_embedded_store(data_dir)?;
 
     let embedder = aletheia_embeddings::EmbedderBuilder::new()
         .model_architecture("bert")
