@@ -2878,7 +2878,7 @@ fn agent_actions_edge_registry_rows_are_documented_with_endpoint_rules() {
     let registry = read_repo_text("docs/schema/agent-memory.md");
     for needle in [
         "| `PRODUCED_PATCH` | `agent_memory` | `artifact` | `FileEdit`, `AgentTurn` | `PatchArtifact` | many:1; FileEdit at most one | no |",
-        "| `TOUCHED_FILE` | `agent_memory`, `verification` | `codegraph` | `FileEdit`, `ToolCall`, `CommandRun` | `File` | many:many | no |",
+        "| `TOUCHED_FILE` | `agent_memory`, `verification` | `codegraph` | `FileEdit`, `ToolCall`, `CommandRun`, `TestRun`, `CIStatus` | `File` | many:many | no |",
         "| `PRODUCED_EVIDENCE` | `agent_memory` | `verification` | `ToolCall` | `CommandRun`, `TestRun` | many:1 | no |",
     ] {
         assert!(
@@ -4025,6 +4025,55 @@ fn invalid_syntax_patch_artifact_requires_empty_target_files() {
 }
 
 #[test]
+fn invalid_no_base_patch_artifact_rejects_base_commit() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    ingest_patch_producer_session(&metadata, "invalid-no-base-producer-session-key");
+    let mut patch = patch_artifact_fixture(
+        "artifact:v1:invalid-no-base-with-base-commit",
+        "invalid_no_base",
+        &serde_json::json!({"path": "artifacts/invalid-no-base.diff", "inline": "diff --git a/src/lib.rs b/src/lib.rs\n"}),
+    );
+    let patch_obj = patch
+        .as_object_mut()
+        .expect("patch fixture should be an object");
+    patch_obj.insert(
+        "base_commit".to_owned(),
+        serde_json::json!("0123456789abcdef0123456789abcdef01234567"),
+    );
+    patch_obj.remove("unknown_base_reason");
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "invalid-no-base-with-base-commit",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "invalid-no-base-with-base-commit-key",
+            "domain": "artifact",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [patch] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "invalid_no_base PatchArtifact with base_commit should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "invalid_no_base base_commit should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
 fn tool_call_and_file_edit_reject_confidence() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -4311,6 +4360,48 @@ fn file_edit_create_and_delete_forbid_opposite_side_hashes() {
 }
 
 #[test]
+fn file_edit_rename_to_forbidden_unless_edit_kind_is_rename() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let turn_id = "agent_memory:v1:file-edit-rename-to-non-rename-turn";
+    let mut file_edit =
+        valid_file_edit_json("agent_memory:v1:file-edit-modify-with-rename-to", turn_id);
+    file_edit
+        .as_object_mut()
+        .expect("file edit fixture should be an object")
+        .insert("rename_to".to_owned(), serde_json::json!("src/new_lib.rs"));
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "file-edit-rename-to-non-rename",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "file-edit-rename-to-non-rename-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(turn_id), file_edit] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "FileEdit modify with rename_to should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "rename_to on non-rename FileEdit should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
 fn artifact_patch_records_can_supersede_artifact_patches() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -4360,6 +4451,133 @@ fn artifact_patch_records_can_supersede_artifact_patches() {
     assert!(
         response.starts_with("HTTP/1.1 200"),
         "artifact-domain PatchArtifact SUPERSEDES edge should be accepted, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn artifact_domain_edge_rejects_unsupported_labels() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    ingest_patch_producer_session(&metadata, "artifact-unsupported-label-producer-session-key");
+    let source_patch = patch_artifact_fixture(
+        "artifact:v1:unsupported-label-source-patch",
+        "invalid_syntax",
+        &serde_json::json!({"path": "artifacts/source.diff", "inline": "not a diff"}),
+    );
+    let target_patch = patch_artifact_fixture(
+        "artifact:v1:unsupported-label-target-patch",
+        "unverified",
+        &serde_json::json!({"path": "artifacts/target.diff", "inline": "diff --git a/src/lib.rs b/src/lib.rs\n"}),
+    );
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "artifact-unsupported-label-edge",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "artifact-unsupported-label-edge-key",
+            "domain": "artifact",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    source_patch,
+                    target_patch,
+                    {
+                        "record_type": "edge",
+                        "id": "artifact:v1:unsupported-contains-edge",
+                        "schema_version": 1,
+                        "label": "CONTAINS",
+                        "source": "artifact:v1:unsupported-label-source-patch",
+                        "target": "artifact:v1:unsupported-label-target-patch",
+                        "summary": "Unsupported artifact edge label"
+                    }
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "artifact-domain edge with unsupported label should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "unsupported artifact edge label should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn verification_touched_file_evidence_links_accept_verification_sources() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let touched_file_id = "codegraph:v3:verification-touched-file-target";
+    {
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        let touched_file = GraphRecord::node(
+            touched_file_id.to_owned(),
+            NodeKind::File,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("src/lib.rs".to_owned()),
+            "verification touched file target".to_owned(),
+        );
+        sink.write_record(&touched_file)
+            .expect("touched file target should pre-seed");
+        sink.persist_indexes()
+            .expect("pre-seeded touched file target should persist");
+    }
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "verification-touched-file-link",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "verification-touched-file-link-key",
+            "domain": "verification",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    {
+                        "record_type": "node",
+                        "id": "verification:v1:test-run-touched-file-source",
+                        "kind": "TestRun",
+                        "schema_version": 1,
+                        "domain": "verification",
+                        "summary": "TestRun touched file source",
+                        "source_artifact_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+                        "executed_at": "2026-05-22T00:00:00Z",
+                        "evidence_links": [
+                            {
+                                "relation": "TOUCHED_FILE",
+                                "target_domain": "codegraph",
+                                "target_record_id": touched_file_id,
+                                "confidence": "1.0"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "verification TestRun TOUCHED_FILE evidence link should be accepted, got {response}"
     );
 
     daemon.stop();

@@ -300,7 +300,7 @@ removing a label is a schema version bump.
 | `HAS_EVIDENCE` | any | `agent_memory` | any | `Verification`, `CommandEvidence` | many:many | no |
 | `OBSERVES` | `agent_memory` | `codegraph` | `Observation` | any | many:many | yes |
 | `MENTIONS_SYMBOL` | `agent_memory`, `verification` | `codegraph` | any | `Symbol` | many:many | yes |
-| `TOUCHED_FILE` | `agent_memory`, `verification` | `codegraph` | `FileEdit`, `ToolCall`, `CommandRun` | `File` | many:many | no |
+| `TOUCHED_FILE` | `agent_memory`, `verification` | `codegraph` | `FileEdit`, `ToolCall`, `CommandRun`, `TestRun`, `CIStatus` | `File` | many:many | no |
 | `PRODUCED_PATCH` | `agent_memory` | `artifact` | `FileEdit`, `AgentTurn` | `PatchArtifact` | many:1; FileEdit at most one | no |
 | `PRODUCED_EVIDENCE` | `agent_memory` | `verification` | `ToolCall` | `CommandRun`, `TestRun` | many:1 | no |
 | `VALIDATED_BY` | `agent_memory` | `verification` | `Observation`, `Decision` | any verification | many:many | no |

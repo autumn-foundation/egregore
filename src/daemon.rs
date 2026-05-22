@@ -1722,6 +1722,11 @@ fn validate_artifact_domain_records(
             )));
         }
         let has_base_commit = base_commit.as_deref().is_some_and(|commit| !commit.is_empty());
+        if status == "invalid_no_base" && has_base_commit {
+            return Err(ApiError::bad_request(
+                "PatchArtifact.base_commit must be null when patch_status is invalid_no_base",
+            ));
+        }
         if has_base_commit
             && unknown_base_reason
                 .as_deref()
@@ -2043,6 +2048,11 @@ fn validate_file_edit_record(
             "FileEdit.edit_kind '{edit_kind}' is not recognized; expected one of: {}",
             FILE_EDIT_KIND_VALUES.join(", ")
         )));
+    }
+    if edit_kind != "rename" && rename_to.is_some() {
+        return Err(ApiError::bad_request(
+            "FileEdit.rename_to is only permitted when edit_kind is rename",
+        ));
     }
     match edit_kind {
         "create" => {
@@ -2592,11 +2602,15 @@ fn validate_evidence_endpoint_constraints(
             if let Some(sk) = source_kind
                 && !matches!(
                     sk,
-                    NodeKind::FileEdit | NodeKind::ToolCall | NodeKind::CommandRun
+                    NodeKind::FileEdit
+                        | NodeKind::ToolCall
+                        | NodeKind::CommandRun
+                        | NodeKind::TestRun
+                        | NodeKind::CIStatus
                 )
             {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a FileEdit, ToolCall, or CommandRun source node, not {}",
+                    "evidence link relation '{}' requires a FileEdit, ToolCall, CommandRun, TestRun, or CIStatus source node, not {}",
                     label.as_str(),
                     sk.as_str()
                 )));
@@ -2904,6 +2918,15 @@ fn validate_and_synthesize_evidence_edges(
             {
                 return Err(ApiError::bad_request(format!(
                     "edge '{id}' uses evidence-link label '{}' but is not an agent_memory:v1: edge; evidence relations are only permitted on agent-memory edges",
+                    label.as_str()
+                )));
+            }
+            if let GraphRecord::Edge { id, label, .. } = record
+                && id.starts_with("artifact:v1:")
+                && *label != EdgeLabel::Supersedes
+            {
+                return Err(ApiError::bad_request(format!(
+                    "artifact edge '{id}' uses unsupported label '{}'; artifact-domain edges only permit SUPERSEDES",
                     label.as_str()
                 )));
             }
