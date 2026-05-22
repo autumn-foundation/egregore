@@ -54,6 +54,8 @@ Egregore starts with typed graph domains. Domains share one AletheiaDB store and
 
 **Agent-actions schema:** [`docs/schema/agent-actions.md`](../schema/agent-actions.md) is the single source of truth for `ToolCall`, `FileEdit`, and `PatchArtifact`. `Patch`/`PatchArtifact` lives in the Artifact Graph (`domain: artifact`), while `ToolCall` and `FileEdit` live in Agent Memory (`domain: agent_memory`) as session-bound events.
 
+**Project-graph schema:** [`docs/schema/project-graph.md`](../schema/project-graph.md) is the single source of truth for project-domain `Task`, `AcceptanceCriterion`, and `ExternalLink` records, reserved project kinds, trust-class rules, and project cross-domain edges.
+
 **Redaction schema:** [`docs/schema/redaction.md`](../schema/redaction.md) owns the redaction marker grammar and policy-version field for agent-authored records; producer schemas name the concrete fields that pass through it.
 
 **Bi-temporal selector grammar:** [`docs/schema/temporal-selectors.md`](../schema/temporal-selectors.md) is the single source of truth for `valid_time`/`transaction_time` axes, the `as_of`/`since` selector JSON shape, CLI flag surfaces, and per-domain mapping rules.
@@ -279,6 +281,8 @@ Acceptance criteria:
 ### PR-9: First-Class Project/Task Imports
 
 Egregore must import GitHub Issues/PRs and local project/task JSONL into one normalized project graph without depending on Harness.
+
+Project-domain record shapes are versioned in [`docs/schema/project-graph.md`](../schema/project-graph.md); importers must target that schema instead of defining task, acceptance-criterion, or external-link fields inline.
 
 Acceptance criteria:
 

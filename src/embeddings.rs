@@ -136,6 +136,15 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::AgentSession
         | NodeKind::Observation
         | NodeKind::Task
+        | NodeKind::AcceptanceCriterion
+        | NodeKind::ExternalLink
+        | NodeKind::Product
+        | NodeKind::Project
+        | NodeKind::Plan
+        | NodeKind::GitHubIssue
+        | NodeKind::PR
+        | NodeKind::Review
+        | NodeKind::LocalTask
         | NodeKind::Artifact
         | NodeKind::Verification
         | NodeKind::CommandEvidence

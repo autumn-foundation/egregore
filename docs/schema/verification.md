@@ -193,6 +193,7 @@ records to records in other domains.
 | Label | FROM | TO domain(s) | FROM kind(s) | TO kind(s) | Notes |
 |-------|------|-------------|-------------|-----------|-------|
 | `VALIDATED_BY` | `agent_memory` | `verification` | `Observation`, `Decision` | any verification | An observation or decision is backed by a verification run. |
+| `CLOSES_ACCEPTANCE_CRITERION` | `project` | `verification` | `AcceptanceCriterion` | `Verification`, `CommandRun`, `TestRun` | Project-side AC closure edge defined in [`docs/schema/project-graph.md`](project-graph.md); verification owns the target kinds. |
 | `FAILED_ON` | `verification` | `codegraph` | `TestRun`, `CIStatus` | `Symbol`, `File` | A specific failure targets a code symbol or file. |
 | `CONTRADICTS` | `verification` | any | any verification | any | A later run contradicts an earlier claim. |
 | `MENTIONS_SYMBOL` | `verification` | `codegraph` | any verification | `Symbol` | A verification record references a specific symbol. |
@@ -202,6 +203,9 @@ records to records in other domains.
 ### TO verification
 
 Any domain may write `HAS_EVIDENCE` edges that terminate at verification nodes.
+Project-domain `AcceptanceCriterion` records may also write
+`CLOSES_ACCEPTANCE_CRITERION` to `Verification`, `CommandRun`, or `TestRun`;
+the project side is defined in [`docs/schema/project-graph.md`](project-graph.md).
 
 ---
 
