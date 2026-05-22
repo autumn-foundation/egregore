@@ -177,7 +177,7 @@ fn incremental_tombstones_stale_repository_when_identity_changes() {
         "old and new repo IDs must differ"
     );
     let stale_cache = serde_json::json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "repository_id": old_repo_id,
         "files": {},
     });

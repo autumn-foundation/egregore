@@ -87,7 +87,7 @@ Initial node kinds:
 | `Repository` | Indexed repo root | VCS remote URL (case 1), root commit SHA (case 2), or canonical absolute path (case 3) — see [docs/schema/repository-identity.md](../schema/repository-identity.md) |
 | `File` | Source file | repo-relative path |
 | `Module` | Language module namespace | repo-relative path plus module path |
-| `Symbol` | Function, struct, enum, trait, impl, const, static, type alias, route, or test | file path plus syntax span plus normalized name |
+| `Symbol` | Function, struct, enum, trait, impl, const, static, type alias, route, or test | repository namespace plus repo-relative path, symbol kind, qualified name, and source-order disambiguator; see [ADR 0004](../adr/0004-symbol-identity.md) |
 | `Import` | Import/use declaration | file path plus syntax span |
 | `Diagnostic` | Extractor warning or unsupported construct | file path plus message hash |
 | `Commit` | Git commit observed during history replay | repository identity plus commit SHA |
@@ -136,6 +136,11 @@ Bi-temporal mapping:
 - **Valid time:** the Git commit timestamp for when a code fact became true in repository history. Author time should be preserved as metadata; committer time is the default valid-time ordering because it reflects when the commit entered the project timeline.
 - **Transaction time:** the time AletheiaDB observes and ingests the fact. Re-indexing the same repo later should create a new observation without pretending the Git history itself changed.
 - **Identity:** stable IDs identify logical code entities across observations; temporal validity captures when a definition or relationship was present.
+
+Symbol identity is defined in [ADR 0004](../adr/0004-symbol-identity.md):
+`span` is a source-coordinate field, not an identity component, and the
+source-order `disambiguator` resolves same-file collisions such as multiple
+`impl Widget` blocks.
 
 The selector grammar for querying across both axes is specified in [`docs/schema/temporal-selectors.md`](../schema/temporal-selectors.md) and implemented at `SCHEMA_VERSION = 2`. Current-tree records carry `valid_time_source: "inferred_from_transaction_time"`; history records carry `valid_time_source: "git_commit_committer_date"`.
 

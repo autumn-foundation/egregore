@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 /// Current schema version for code-graph records.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Schema version for agent-memory records (`Agent`, `AgentSession`, `Observation`, etc.).
 /// Documented in `docs/schema/agent-memory.md`.
@@ -228,6 +228,12 @@ pub enum GraphRecord {
         /// Language-specific symbol category.
         #[serde(skip_serializing_if = "Option::is_none")]
         symbol_kind: Option<String>,
+        /// Source-order ordinal scoped to `(repo_relative_path, symbol_kind, name)`.
+        ///
+        /// Present on `Symbol` nodes. This is an identity component for symbols,
+        /// but `span` is not; see `docs/adr/0004-symbol-identity.md`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        disambiguator: Option<u64>,
         /// Git and bitemporal provenance for history-backed records.
         #[serde(skip_serializing_if = "Option::is_none")]
         temporal: Option<TemporalMetadata>,
@@ -404,6 +410,7 @@ impl GraphRecord {
             name,
             language: None,
             symbol_kind: None,
+            disambiguator: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -459,6 +466,7 @@ impl GraphRecord {
             name: Some(name),
             language: Some(language.to_owned()),
             symbol_kind: None,
+            disambiguator: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -513,6 +521,7 @@ impl GraphRecord {
             name: Some(name),
             language: Some("rust".to_owned()),
             symbol_kind: Some(symbol_kind.to_owned()),
+            disambiguator: Some(0),
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
