@@ -1982,6 +1982,44 @@ fn response_json(response: &str) -> serde_json::Value {
     serde_json::from_str(body).expect("response body should be JSON")
 }
 
+fn read_repo_text(path: &str) -> String {
+    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
+        .unwrap_or_else(|error| panic!("{path} should be readable: {error}"))
+}
+
+fn patch_artifact_fixture(
+    id: &str,
+    patch_status: &str,
+    patch_handle: &serde_json::Value,
+) -> serde_json::Value {
+    let patch_bytes_size = patch_handle
+        .get("inline")
+        .and_then(serde_json::Value::as_str)
+        .map_or(32_u64, |inline| inline.len() as u64);
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "PatchArtifact",
+        "schema_version": 1,
+        "domain": "artifact",
+        "summary": format!("PatchArtifact status={patch_status}"),
+        "patch_status": patch_status,
+        "base_commit": null,
+        "unknown_base_reason": "unknown_base",
+        "target_files": [],
+        "patch_bytes_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "patch_bytes_size": patch_bytes_size,
+        "patch_handle": patch_handle,
+        "validation_summary": "fixture patch status",
+        "source_artifact_path": "fixtures/session.traj",
+        "source_artifact_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "producer_session_id": "agent_memory:v1:producer-session",
+        "valid_time": "2026-05-21T00:00:00Z",
+        "valid_time_source": "produced_at",
+        "ingested_at": "2026-05-21T00:00:00Z"
+    })
+}
+
 fn http_get_authed(metadata: &DaemonMetadata, path: &str) -> String {
     http_request(
         &metadata.address,
@@ -2626,18 +2664,17 @@ fn all_node_kinds_have_documented_schema() {
         // Reserved with one-line definitions in docs/schema/agent-memory.md §4b
         NodeKind::Task | NodeKind::Artifact | NodeKind::CommandEvidence => "agent-memory-reserved",
         // M2 trajectory-importer node kinds (docs/schema/agent-memory.md §4b + PRD M2)
-        NodeKind::AgentRun
-        | NodeKind::AgentTurn
-        | NodeKind::ToolCall
-        | NodeKind::CommandRun
-        | NodeKind::FileEdit
-        | NodeKind::PatchArtifact
-        | NodeKind::Failure
-        | NodeKind::Decision => "agent-memory-m2-traj-importer",
+        NodeKind::AgentRun | NodeKind::AgentTurn | NodeKind::Failure | NodeKind::Decision => {
+            "agent-memory-m2-traj-importer"
+        }
+        NodeKind::ToolCall | NodeKind::FileEdit | NodeKind::PatchArtifact => {
+            "agent-actions-documented"
+        }
         // Documented in docs/schema/verification.md (full schema, day-one shapes)
         NodeKind::Verification => "verification-documented",
         // Reserved in docs/schema/verification.md §5 with one-line definitions
-        NodeKind::TestRun
+        NodeKind::CommandRun
+        | NodeKind::TestRun
         | NodeKind::CIStatus
         | NodeKind::BenchmarkRun
         | NodeKind::CoverageReport
@@ -2670,6 +2707,7 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::MentionsSymbol
         | EdgeLabel::TouchedFile
         | EdgeLabel::ProducedPatch
+        | EdgeLabel::ProducedEvidence
         | EdgeLabel::ValidatedBy
         | EdgeLabel::FailedOn
         | EdgeLabel::ExplainsChange
@@ -2678,6 +2716,178 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::Supersedes
         | EdgeLabel::RelatesTo => "cross-domain-registry",
     };
+}
+
+#[test]
+fn agent_actions_schema_doc_is_linked_and_defines_day_one_shapes() {
+    let actions = read_repo_text("docs/schema/agent-actions.md");
+    for needle in [
+        "PatchArtifact -> `artifact` domain",
+        "FileEdit -> `agent_memory` domain",
+        "ToolCall -> `agent_memory` domain",
+        "patch_status",
+        "applied_clean",
+        "applied_with_conflicts",
+        "invalid_syntax",
+        "invalid_no_base",
+        "rejected_validation",
+        "unverified",
+        "superseded",
+        "PatchArtifact record shape",
+        "FileEdit record shape",
+        "ToolCall record shape",
+        "PatchArtifact.validation_summary",
+        "ToolCall.arguments_summary",
+        "validity-pinning",
+        "SUPERSEDED_BY",
+        "schema_version` is `1`",
+    ] {
+        assert!(
+            actions.contains(needle),
+            "agent-actions schema must document `{needle}`"
+        );
+    }
+
+    for path in [
+        "README.md",
+        "docs/prd/0000-egregore-vision.md",
+        "docs/schema/agent-memory.md",
+        "docs/schema/verification.md",
+        "docs/plans/2026-05-17-egregore-daemon-design.md",
+    ] {
+        let text = read_repo_text(path);
+        assert!(
+            text.contains("docs/schema/agent-actions.md") || text.contains("agent-actions.md"),
+            "{path} must link to docs/schema/agent-actions.md"
+        );
+    }
+}
+
+#[test]
+fn agent_actions_edge_registry_rows_are_documented_with_endpoint_rules() {
+    let registry = read_repo_text("docs/schema/agent-memory.md");
+    for needle in [
+        "| `PRODUCED_PATCH` | `agent_memory` | `artifact` | `FileEdit`, `AgentTurn` | `PatchArtifact` | many:1; FileEdit at most one | no |",
+        "| `TOUCHED_FILE` | `agent_memory`, `verification` | `codegraph` | `FileEdit`, `ToolCall`, `CommandRun` | `File` | many:many | no |",
+        "| `PRODUCED_EVIDENCE` | `agent_memory` | `verification` | `ToolCall` | `CommandRun`, `TestRun` | many:1 | no |",
+    ] {
+        assert!(
+            registry.contains(needle),
+            "agent-memory edge registry must contain exact row: {needle}"
+        );
+    }
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn patch_artifact_patch_status_is_pinned() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let first_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "patch-status-pinned-first",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "patch-status-pinned-first-key",
+            "domain": "artifact",
+            "created_at": "2026-05-21T00:00:00Z",
+            "payload": {
+                "records": [patch_artifact_fixture(
+                    "artifact:v1:patch-status-pinned-fixture",
+                    "invalid_syntax",
+                    &serde_json::json!({"path": "artifacts/rejected.diff", "inline": "not a diff"}),
+                )]
+            }
+        }),
+    );
+    assert!(
+        first_response.starts_with("HTTP/1.1 200"),
+        "initial invalid PatchArtifact should be accepted, got {first_response}"
+    );
+
+    let update_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "patch-status-pinned-update",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "patch-status-pinned-update-key",
+            "domain": "artifact",
+            "created_at": "2026-05-21T00:01:00Z",
+            "payload": {
+                "records": [patch_artifact_fixture(
+                    "artifact:v1:patch-status-pinned-fixture",
+                    "applied_clean",
+                    &serde_json::json!({"path": "artifacts/repaired.diff", "inline": "diff --git a/src/lib.rs b/src/lib.rs\n"}),
+                )]
+            }
+        }),
+    );
+    assert!(
+        !update_response.starts_with("HTTP/1.1 200"),
+        "editing PatchArtifact.patch_status should be rejected, got {update_response}"
+    );
+    let body = response_json(&update_response);
+    assert_eq!(
+        body["error"]["code"], "patch_status_pinned",
+        "patch-status mutation must return patch_status_pinned, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn patch_artifact_oversized_inline_patch_handle_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let oversized_inline = "x".repeat(17 * 1024);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "patch-oversized-inline",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "patch-oversized-inline-key",
+            "domain": "artifact",
+            "created_at": "2026-05-21T00:00:00Z",
+            "payload": {
+                "records": [patch_artifact_fixture(
+                    "artifact:v1:oversized-inline-patch-fixture",
+                    "unverified",
+                    &serde_json::json!({
+                        "path": "artifacts/too-large.diff",
+                        "inline": oversized_inline
+                    }),
+                )]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "PatchArtifact.patch_handle.inline over 16 KiB should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "inline_payload_exceeds_ceiling",
+        "oversized patch inline payload must reuse inline_payload_exceeds_ceiling, got {body}"
+    );
+
+    daemon.stop();
 }
 
 // (c) Agent and AgentSession records produced by POST /v1/agents/register
@@ -3595,10 +3805,9 @@ fn verification_command_run_oversized_inline_rejected() {
         "CommandRun with oversized stdout_handle.inline should be rejected, got {reject_response}"
     );
     let reject_body = response_json(&reject_response);
-    assert!(
-        reject_body["error"]["code"] == "bad_request"
-            || reject_body["error"]["code"] == "payload_too_large",
-        "oversized inline stdout rejection must carry bad_request or payload_too_large, got {reject_body}"
+    assert_eq!(
+        reject_body["error"]["code"], "inline_payload_exceeds_ceiling",
+        "oversized inline stdout rejection must carry inline_payload_exceeds_ceiling, got {reject_body}"
     );
 
     // Accept when inline demoted to null (handle-only)
@@ -3774,9 +3983,9 @@ fn verification_spoofed_bytes_oversized_inline_rejected() {
         "spoofed bytes with oversized inline should be rejected; got {response}"
     );
     let body = response_json(&response);
-    assert!(
-        body["error"]["code"] == "bad_request" || body["error"]["code"] == "payload_too_large",
-        "spoofed bytes rejection must carry bad_request or payload_too_large, got {body}"
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "spoofed bytes rejection must carry bad_request, got {body}"
     );
 
     daemon.stop();

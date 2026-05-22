@@ -10,6 +10,7 @@ functions) and `src/daemon.rs` (write applier validation) must conform to it.
 
 **Related documents:**
 - Wire contract: [`docs/schema/daemon-api.md`](daemon-api.md)
+- Agent actions and patch artifacts: [`docs/schema/agent-actions.md`](agent-actions.md)
 - Code-graph schema: [`docs/prd/0001-codebase-knowledge-graph.md`](../prd/0001-codebase-knowledge-graph.md)
 - Vision PRD: [`docs/prd/0000-egregore-vision.md`](../prd/0000-egregore-vision.md)
 - Daemon design: [`docs/plans/2026-05-17-egregore-daemon-design.md`](../plans/2026-05-17-egregore-daemon-design.md)
@@ -102,10 +103,8 @@ compile time.
 | `AgentSession` | `agent_memory` | `["node", "agent_session", agent_id, session_id]` | `Session {session_id} for agent {agent_id}` | One bounded run or conversation session. |
 | `AgentRun` | `agent_memory` | `["node", "agent_run", session_id, "run-0"]` | `AgentRun outcome={outcome} exit_reason={exit_reason}` | One trajectory / invocation of an agent within a session. |
 | `AgentTurn` | `agent_memory` | `["node", "agent_turn", run_id, turn_index]` | `AgentTurn {turn_index}` | One assistant→user message pair in an AgentRun. |
-| `ToolCall` | `agent_memory` | `["node", "tool_call", turn_id, action_idx]` | `ToolCall bash turn={t} action={a}` | Structured tool invocation (bash, patch, etc.) within a turn. |
-| `CommandRun` | `agent_memory` | `["node", "command_run", turn_id, action_idx]` | `CommandRun exit={code} turn={t}` | Shell command execution with exit code and output. |
-| `FileEdit` | `agent_memory` | `["node", "file_edit", turn_id, action_idx]` | `FileEdit {target} turn={t}` | Agent write to a file path. |
-| `PatchArtifact` | `agent_memory` | `["node", "patch_artifact", turn_id, action_idx]` | `PatchArtifact status={status} turn={t}` | Patch command execution; `patch_status` = `invalid` or `unverified`. |
+| `ToolCall` | `agent_memory` | see `docs/schema/agent-actions.md` | `ToolCall {tool_name} status={status}` | Full field set belongs to [`docs/schema/agent-actions.md`](agent-actions.md). |
+| `FileEdit` | `agent_memory` | see `docs/schema/agent-actions.md` | `FileEdit {repo_relative_path} kind={edit_kind}` | Full field set belongs to [`docs/schema/agent-actions.md`](agent-actions.md). |
 | `Failure` | `agent_memory` | `["node", "failure", kind, turn_id, action_idx]` | `Failure {kind} turn={t}` | Failed command or invalid patch; `failure_kind` = `command_failure` or `patch_invalid`. |
 | `Observation` | `agent_memory` | writer-chosen | free | Agent-authored claim with confidence and provenance. Carries `evidence_links`. |
 
@@ -184,43 +183,14 @@ or discovery.
 | traj-importer provenance | see above | yes | `domain`, `importer_id`, etc. |
 | `observed_at` | RFC 3339 | optional | Timestamp from `extra.timestamp`. |
 
-#### `ToolCall` record shape
+#### Agent-action record shapes delegated to issue #13
 
-| Field | Type | Required | Notes |
-|-------|------|----------|-------|
-| `id` | `agent_memory:v1:{hash}` | yes | |
-| `kind` | `"ToolCall"` | yes | |
-| `text` | string | yes | Redacted command text. |
-| traj-importer provenance | see above | yes | |
-
-#### `CommandRun` record shape
-
-| Field | Type | Required | Notes |
-|-------|------|----------|-------|
-| `id` | `agent_memory:v1:{hash}` | yes | |
-| `kind` | `"CommandRun"` | yes | |
-| `text` | string | yes | Redacted command text. |
-| `exit_code` | i64 | yes | Shell exit code. |
-| traj-importer provenance | see above | yes | |
-
-#### `FileEdit` record shape
-
-| Field | Type | Required | Notes |
-|-------|------|----------|-------|
-| `id` | `agent_memory:v1:{hash}` | yes | |
-| `kind` | `"FileEdit"` | yes | |
-| `text` | string | yes | Redacted command text. |
-| traj-importer provenance | see above | yes | |
-
-#### `PatchArtifact` record shape
-
-| Field | Type | Required | Notes |
-|-------|------|----------|-------|
-| `id` | `agent_memory:v1:{hash}` | yes | |
-| `kind` | `"PatchArtifact"` | yes | |
-| `text` | string | yes | Redacted patch command text. |
-| `patch_status` | string | yes | `"invalid"` (failed apply) or `"unverified"` (succeeded apply but not tested). |
-| traj-importer provenance | see above | yes | |
+`ToolCall` and `FileEdit` are agent-memory records, but their full field sets,
+trust-class rules, stable ID inputs, and redaction field list belong to
+[`docs/schema/agent-actions.md`](agent-actions.md). `PatchArtifact` is not an
+agent-memory record; it lives in the `artifact` domain and is defined in the
+same agent-actions schema. `CommandRun` runtime evidence is defined in
+[`docs/schema/verification.md`](verification.md).
 
 #### `Failure` record shape
 
@@ -330,8 +300,9 @@ removing a label is a schema version bump.
 | `HAS_EVIDENCE` | any | `agent_memory` | any | `Verification`, `CommandEvidence` | many:many | no |
 | `OBSERVES` | `agent_memory` | `codegraph` | `Observation` | any | many:many | yes |
 | `MENTIONS_SYMBOL` | `agent_memory`, `verification` | `codegraph` | any | `Symbol` | many:many | yes |
-| `TOUCHED_FILE` | `agent_memory`, `verification` | `codegraph` | any | `File` | many:many | no |
-| `PRODUCED_PATCH` | `agent_memory` | any | `ToolCall`, `CommandRun` | `PatchArtifact` | 1:1 | no |
+| `TOUCHED_FILE` | `agent_memory`, `verification` | `codegraph` | `FileEdit`, `ToolCall`, `CommandRun` | `File` | many:many | no |
+| `PRODUCED_PATCH` | `agent_memory` | `artifact` | `FileEdit`, `AgentTurn` | `PatchArtifact` | many:1; FileEdit at most one | no |
+| `PRODUCED_EVIDENCE` | `agent_memory` | `verification` | `ToolCall` | `CommandRun`, `TestRun` | many:1 | no |
 | `VALIDATED_BY` | `agent_memory` | `verification` | `Observation`, `Decision` | any verification | many:many | no |
 | `FAILED_ON` | `agent_memory`, `verification` | `codegraph` | `Failure`, `TestRun`, `CIStatus` | `Symbol`, `File` | many:many | no |
 | `EXPLAINS_CHANGE` | `agent_memory` | `codegraph` | `Observation`, `Decision` | `Commit`, `Change` | many:many | yes |
@@ -370,10 +341,8 @@ Both functions null-terminate each input part before hashing, so
 | `AgentSession` (traj) | `["node", "agent_session", "traj-importer", importer_version, blake3_hex]` |
 | `AgentRun` (traj) | `["node", "agent_run", session_id, "run-0"]` |
 | `AgentTurn` (traj) | `["node", "agent_turn", run_id, turn_index]` |
-| `ToolCall` (traj) | `["node", "tool_call", turn_id, action_idx]` |
-| `CommandRun` (traj) | `["node", "command_run", turn_id, action_idx]` |
-| `FileEdit` (traj) | `["node", "file_edit", turn_id, action_idx]` |
-| `PatchArtifact` (traj) | `["node", "patch_artifact", turn_id, action_idx]` |
+| `ToolCall` | defined in [`docs/schema/agent-actions.md`](agent-actions.md) |
+| `FileEdit` | defined in [`docs/schema/agent-actions.md`](agent-actions.md) |
 | `Failure` (command) | `["node", "failure", "command_failure", turn_id, action_idx]` |
 | `Failure` (patch) | `["node", "failure", "patch_invalid", turn_id, action_idx]` |
 
@@ -404,6 +373,10 @@ Both functions null-terminate each input part before hashing, so
 - **Issue #4 (redaction):** The `redaction_policy_version` field name on
   agent-authored nodes is reserved by this schema. Issue #4 owns the pipeline
   that populates it.
+- **Issue #13 (agent actions):** `PRODUCED_PATCH`, the `TOUCHED_FILE`
+  extension, and `PRODUCED_EVIDENCE` are contributed by
+  [`docs/schema/agent-actions.md`](agent-actions.md); this registry remains the
+  canonical edge table.
 - **Issue #5 (daemon wire):** `unresolved_evidence_target` is added to the
   daemon error-code enum. HTTP 422, non-retryable. See
   `docs/schema/daemon-api.md` §5.

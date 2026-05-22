@@ -47,7 +47,7 @@ top-level fields:
 | `agent_id`       | string       | yes                 | yes                | Identifies the calling agent |
 | `session_id`     | string       | yes                 | yes                | Identifies the agent session |
 | `idempotency_key`| string       | yes                 | n/a                | Unique per `(agent_id, route)` for ≥ 24 hours |
-| `domain`         | string enum  | yes                 | optional           | Must be `"codegraph"` for v1 |
+| `domain`         | string enum  | yes                 | optional           | `"codegraph"`, `"agent_memory"`, `"verification"`, or `"artifact"` |
 | `created_at`     | RFC 3339     | yes                 | n/a                | Wall-clock time of the write |
 | `payload`        | object       | yes                 | yes                | Route-specific content |
 
@@ -116,6 +116,8 @@ All error codes are snake\_case identifiers. String literals at call sites in
 | `redaction_required`  | 422  | no        | no               | ingest (future) |
 | `unresolved_evidence_target` | 422 | no  | no               | ingest, jobs/ingest |
 | `missing_evidence_handle` | 422 | no    | no               | ingest, jobs/ingest |
+| `patch_status_pinned` | 422 | no       | no               | ingest, jobs/ingest |
+| `inline_payload_exceeds_ceiling` | 400 | no | no             | ingest, jobs/ingest |
 
 Adding a new code is additive. Renaming or removing a code requires `/v2/`.
 

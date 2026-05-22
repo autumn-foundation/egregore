@@ -1049,6 +1049,29 @@ impl EmbeddedAletheiaSink {
             source_artifact_path,
             source_artifact_hash,
             patch_status,
+            base_commit,
+            unknown_base_reason,
+            target_files,
+            patch_bytes_hash,
+            patch_bytes_size,
+            patch_handle,
+            validation_summary,
+            producer_session_id,
+            edit_kind,
+            before_hash,
+            after_hash,
+            rename_to,
+            hunk_count,
+            linked_patch_id,
+            linked_turn_id,
+            tool_name,
+            tool_kind,
+            arguments_summary,
+            arguments_handle,
+            result_handle,
+            produced_evidence_id,
+            started_at,
+            finished_at,
             failure_kind,
             exit_code,
             turn_index,
@@ -1122,6 +1145,61 @@ impl EmbeddedAletheiaSink {
             source_artifact_hash.as_deref(),
         );
         builder = insert_optional(builder, "patch_status", patch_status.as_deref());
+        builder = insert_optional(builder, "base_commit", base_commit.as_deref());
+        builder = insert_optional(
+            builder,
+            "unknown_base_reason",
+            unknown_base_reason.as_deref(),
+        );
+        if let Some(files) = target_files
+            && let Ok(json) = serde_json::to_string(files)
+        {
+            builder = builder.insert("target_files_json", json.as_str());
+        }
+        builder = insert_optional(builder, "patch_bytes_hash", patch_bytes_hash.as_deref());
+        if let Some(size) = patch_bytes_size {
+            builder = builder.insert("patch_bytes_size", size.to_string().as_str());
+        }
+        if let Some(handle) = patch_handle
+            && let Ok(json) = serde_json::to_string(handle.as_ref())
+        {
+            builder = builder.insert("patch_handle_json", json.as_str());
+        }
+        builder = insert_optional(builder, "validation_summary", validation_summary.as_deref());
+        builder = insert_optional(
+            builder,
+            "producer_session_id",
+            producer_session_id.as_deref(),
+        );
+        builder = insert_optional(builder, "edit_kind", edit_kind.as_deref());
+        builder = insert_optional(builder, "before_hash", before_hash.as_deref());
+        builder = insert_optional(builder, "after_hash", after_hash.as_deref());
+        builder = insert_optional(builder, "rename_to", rename_to.as_deref());
+        if let Some(count) = hunk_count {
+            builder = builder.insert("hunk_count", count.to_string().as_str());
+        }
+        builder = insert_optional(builder, "linked_patch_id", linked_patch_id.as_deref());
+        builder = insert_optional(builder, "linked_turn_id", linked_turn_id.as_deref());
+        builder = insert_optional(builder, "tool_name", tool_name.as_deref());
+        builder = insert_optional(builder, "tool_kind", tool_kind.as_deref());
+        builder = insert_optional(builder, "arguments_summary", arguments_summary.as_deref());
+        if let Some(handle) = arguments_handle
+            && let Ok(json) = serde_json::to_string(handle.as_ref())
+        {
+            builder = builder.insert("arguments_handle_json", json.as_str());
+        }
+        if let Some(handle) = result_handle
+            && let Ok(json) = serde_json::to_string(handle.as_ref())
+        {
+            builder = builder.insert("result_handle_json", json.as_str());
+        }
+        builder = insert_optional(
+            builder,
+            "produced_evidence_id",
+            produced_evidence_id.as_deref(),
+        );
+        builder = insert_optional(builder, "started_at", started_at.as_deref());
+        builder = insert_optional(builder, "finished_at", finished_at.as_deref());
         builder = insert_optional(builder, "failure_kind", failure_kind.as_deref());
         if let Some(code) = exit_code {
             builder = builder.insert("exit_code", code.to_string().as_str());
@@ -1679,6 +1757,150 @@ impl EmbeddedAletheiaSink {
                 "patch_status",
                 node.get_property("patch_status"),
             )?,
+            base_commit: optional_str_property(
+                record_id,
+                "base_commit",
+                node.get_property("base_commit"),
+            )?,
+            unknown_base_reason: optional_str_property(
+                record_id,
+                "unknown_base_reason",
+                node.get_property("unknown_base_reason"),
+            )?,
+            target_files: optional_str_property(
+                record_id,
+                "target_files_json",
+                node.get_property("target_files_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<Vec<String>>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("target_files_json invalid: {e}")))?,
+            patch_bytes_hash: optional_str_property(
+                record_id,
+                "patch_bytes_hash",
+                node.get_property("patch_bytes_hash"),
+            )?,
+            patch_bytes_size: optional_str_property(
+                record_id,
+                "patch_bytes_size",
+                node.get_property("patch_bytes_size"),
+            )?
+            .as_deref()
+            .map(str::parse::<u64>)
+            .transpose()
+            .map_err(|e| {
+                read_back_error(record_id, format!("patch_bytes_size parse error: {e}"))
+            })?,
+            patch_handle: optional_str_property(
+                record_id,
+                "patch_handle_json",
+                node.get_property("patch_handle_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::PatchHandle>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("patch_handle_json invalid: {e}")))?
+            .map(Box::new),
+            validation_summary: optional_str_property(
+                record_id,
+                "validation_summary",
+                node.get_property("validation_summary"),
+            )?,
+            producer_session_id: optional_str_property(
+                record_id,
+                "producer_session_id",
+                node.get_property("producer_session_id"),
+            )?,
+            edit_kind: optional_str_property(
+                record_id,
+                "edit_kind",
+                node.get_property("edit_kind"),
+            )?,
+            before_hash: optional_str_property(
+                record_id,
+                "before_hash",
+                node.get_property("before_hash"),
+            )?,
+            after_hash: optional_str_property(
+                record_id,
+                "after_hash",
+                node.get_property("after_hash"),
+            )?,
+            rename_to: optional_str_property(
+                record_id,
+                "rename_to",
+                node.get_property("rename_to"),
+            )?,
+            hunk_count: optional_str_property(
+                record_id,
+                "hunk_count",
+                node.get_property("hunk_count"),
+            )?
+            .as_deref()
+            .map(str::parse::<u32>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("hunk_count parse error: {e}")))?,
+            linked_patch_id: optional_str_property(
+                record_id,
+                "linked_patch_id",
+                node.get_property("linked_patch_id"),
+            )?,
+            linked_turn_id: optional_str_property(
+                record_id,
+                "linked_turn_id",
+                node.get_property("linked_turn_id"),
+            )?,
+            tool_name: optional_str_property(
+                record_id,
+                "tool_name",
+                node.get_property("tool_name"),
+            )?,
+            tool_kind: optional_str_property(
+                record_id,
+                "tool_kind",
+                node.get_property("tool_kind"),
+            )?,
+            arguments_summary: optional_str_property(
+                record_id,
+                "arguments_summary",
+                node.get_property("arguments_summary"),
+            )?,
+            arguments_handle: optional_str_property(
+                record_id,
+                "arguments_handle_json",
+                node.get_property("arguments_handle_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::OutputHandle>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("arguments_handle_json invalid: {e}")))?
+            .map(Box::new),
+            result_handle: optional_str_property(
+                record_id,
+                "result_handle_json",
+                node.get_property("result_handle_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::OutputHandle>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("result_handle_json invalid: {e}")))?
+            .map(Box::new),
+            produced_evidence_id: optional_str_property(
+                record_id,
+                "produced_evidence_id",
+                node.get_property("produced_evidence_id"),
+            )?,
+            started_at: optional_str_property(
+                record_id,
+                "started_at",
+                node.get_property("started_at"),
+            )?,
+            finished_at: optional_str_property(
+                record_id,
+                "finished_at",
+                node.get_property("finished_at"),
+            )?,
             failure_kind: optional_str_property(
                 record_id,
                 "failure_kind",
@@ -2157,6 +2379,7 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "MENTIONS_SYMBOL" => Ok(EdgeLabel::MentionsSymbol),
         "TOUCHED_FILE" => Ok(EdgeLabel::TouchedFile),
         "PRODUCED_PATCH" => Ok(EdgeLabel::ProducedPatch),
+        "PRODUCED_EVIDENCE" => Ok(EdgeLabel::ProducedEvidence),
         "VALIDATED_BY" => Ok(EdgeLabel::ValidatedBy),
         "FAILED_ON" => Ok(EdgeLabel::FailedOn),
         "EXPLAINS_CHANGE" => Ok(EdgeLabel::ExplainsChange),

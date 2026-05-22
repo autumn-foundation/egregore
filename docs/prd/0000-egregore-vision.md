@@ -52,6 +52,10 @@ Egregore starts with typed graph domains. Domains share one AletheiaDB store and
 
 **Agent-memory schema:** [`docs/schema/agent-memory.md`](../schema/agent-memory.md) is the single source of truth for the agent-memory domain record shapes, provenance fields, `EvidenceLink` type, and cross-domain edge registry.
 
+**Agent-actions schema:** [`docs/schema/agent-actions.md`](../schema/agent-actions.md) is the single source of truth for `ToolCall`, `FileEdit`, and `PatchArtifact`. `Patch`/`PatchArtifact` lives in the Artifact Graph (`domain: artifact`), while `ToolCall` and `FileEdit` live in Agent Memory (`domain: agent_memory`) as session-bound events.
+
+**Redaction schema:** [`docs/schema/redaction.md`](../schema/redaction.md) owns the redaction marker grammar and policy-version field for agent-authored records; producer schemas name the concrete fields that pass through it.
+
 **Bi-temporal selector grammar:** [`docs/schema/temporal-selectors.md`](../schema/temporal-selectors.md) is the single source of truth for `valid_time`/`transaction_time` axes, the `as_of`/`since` selector JSON shape, CLI flag surfaces, and per-domain mapping rules.
 
 | Domain | Owns | Examples |
