@@ -547,6 +547,13 @@ fn emit_command_action(
                 text: Some(redacted_cmd.to_owned()),
                 repo_relative_path: Some(target.to_owned()),
                 edit_kind: Some("modify".to_owned()),
+                before_hash: Some(file_edit_surrogate_hash(
+                    ctx,
+                    target,
+                    "before",
+                    redacted_cmd,
+                )),
+                after_hash: Some(file_edit_surrogate_hash(ctx, target, "after", redacted_cmd)),
                 hunk_count: Some(1),
                 linked_turn_id: Some(turn_id.to_owned()),
                 ..Default::default()
@@ -861,6 +868,8 @@ struct NodeExtra {
     exit_code: Option<i64>,
     turn_index: Option<u64>,
     edit_kind: Option<String>,
+    before_hash: Option<String>,
+    after_hash: Option<String>,
     hunk_count: Option<u32>,
     linked_turn_id: Option<String>,
     tool_name: Option<String>,
@@ -929,8 +938,8 @@ fn make_node(
         validation_summary: None,
         producer_session_id: None,
         edit_kind: extra.edit_kind,
-        before_hash: None,
-        after_hash: None,
+        before_hash: extra.before_hash,
+        after_hash: extra.after_hash,
         rename_to: None,
         hunk_count: extra.hunk_count,
         linked_patch_id: None,
@@ -967,6 +976,23 @@ fn output_handle(content: &str) -> OutputHandle {
         hash: blake3_hex(content.as_bytes()),
         bytes,
     }
+}
+
+// Current .traj records do not carry file snapshots, so legacy FileEdit nodes
+// use deterministic provenance hashes until the importer can emit real file hashes.
+fn file_edit_surrogate_hash(
+    ctx: &ImportCtx,
+    target: &str,
+    phase: &str,
+    redacted_command: &str,
+) -> String {
+    blake3_hex(
+        format!(
+            "traj-importer-v1\0{}\0{target}\0{phase}\0{redacted_command}",
+            ctx.source_artifact_hash
+        )
+        .as_bytes(),
+    )
 }
 
 const fn tool_status(exit_code: Option<i64>) -> &'static str {

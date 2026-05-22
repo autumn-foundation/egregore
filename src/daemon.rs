@@ -1686,6 +1686,11 @@ fn validate_artifact_domain_records(
         if !is_artifact {
             continue;
         }
+        if !id.starts_with("artifact:v1:") {
+            return Err(ApiError::bad_request(format!(
+                "artifact-domain record '{id}' must use artifact:v1: ID prefix"
+            )));
+        }
 
         if *schema_version != ARTIFACT_SCHEMA_VERSION {
             return Err(ApiError::bad_request(format!(
@@ -1844,13 +1849,19 @@ const TOOL_KIND_VALUES: &[&str] = &[
 const TOOL_STATUS_VALUES: &[&str] = &["succeeded", "failed", "interrupted", "unknown"];
 const FILE_EDIT_KIND_VALUES: &[&str] = &["create", "modify", "delete", "rename"];
 
-fn validate_agent_action_record(record: &GraphRecord) -> WriteResult<()> {
+fn validate_agent_action_record(
+    record: &GraphRecord,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
     let GraphRecord::Node {
         id,
         kind,
         domain,
         repo_relative_path,
         edit_kind,
+        before_hash,
+        after_hash,
         rename_to,
         hunk_count,
         linked_turn_id,
@@ -1877,15 +1888,21 @@ fn validate_agent_action_record(record: &GraphRecord) -> WriteResult<()> {
             arguments_handle.as_deref(),
             started_at.as_deref(),
             status.as_deref(),
+            records,
+            sink,
         ),
         NodeKind::FileEdit => validate_file_edit_record(
             id,
             domain.as_deref(),
             repo_relative_path.as_deref(),
             edit_kind.as_deref(),
+            before_hash.as_deref(),
+            after_hash.as_deref(),
             rename_to.as_deref(),
             *hunk_count,
             linked_turn_id.as_deref(),
+            records,
+            sink,
         ),
         _ => Ok(()),
     }
@@ -1902,6 +1919,8 @@ fn validate_tool_call_record(
     arguments_handle: Option<&OutputHandle>,
     started_at: Option<&str>,
     status: Option<&str>,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<()> {
     validate_agent_action_domain("ToolCall", domain)?;
     required_str(tool_name, "tool_name (required for ToolCall nodes)")?;
@@ -1921,7 +1940,7 @@ fn validate_tool_call_record(
     validate_agent_action_output_handle("ToolCall.arguments_handle", arguments_handle)?;
     let linked_turn_id =
         required_str(linked_turn_id, "linked_turn_id (required for ToolCall nodes)")?;
-    validate_agent_turn_ref("ToolCall.linked_turn_id", linked_turn_id)?;
+    validate_agent_turn_ref("ToolCall.linked_turn_id", linked_turn_id, records, sink)?;
     let started_at = required_str(started_at, "started_at (required for ToolCall nodes)")?;
     if DateTime::parse_from_rfc3339(started_at).is_err() {
         return Err(ApiError::bad_request(format!(
@@ -1941,14 +1960,19 @@ fn validate_tool_call_record(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_file_edit_record(
     id: &str,
     domain: Option<&str>,
     repo_relative_path: Option<&str>,
     edit_kind: Option<&str>,
+    before_hash: Option<&str>,
+    after_hash: Option<&str>,
     rename_to: Option<&str>,
     hunk_count: Option<u32>,
     linked_turn_id: Option<&str>,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<()> {
     validate_agent_action_domain("FileEdit", domain)?;
     required_str(
@@ -1962,13 +1986,28 @@ fn validate_file_edit_record(
             FILE_EDIT_KIND_VALUES.join(", ")
         )));
     }
-    if edit_kind == "rename" {
-        required_str(rename_to, "rename_to (required for FileEdit rename nodes)")?;
+    match edit_kind {
+        "create" => {
+            required_str(after_hash, "after_hash (required for FileEdit create nodes)")?;
+        }
+        "delete" => {
+            required_str(before_hash, "before_hash (required for FileEdit delete nodes)")?;
+        }
+        "modify" => {
+            required_str(before_hash, "before_hash (required for FileEdit modify nodes)")?;
+            required_str(after_hash, "after_hash (required for FileEdit modify nodes)")?;
+        }
+        "rename" => {
+            required_str(before_hash, "before_hash (required for FileEdit rename nodes)")?;
+            required_str(after_hash, "after_hash (required for FileEdit rename nodes)")?;
+            required_str(rename_to, "rename_to (required for FileEdit rename nodes)")?;
+        }
+        _ => {}
     }
     hunk_count.ok_or_else(|| ApiError::missing_field("hunk_count (required for FileEdit nodes)"))?;
     let linked_turn_id =
         required_str(linked_turn_id, "linked_turn_id (required for FileEdit nodes)")?;
-    validate_agent_turn_ref("FileEdit.linked_turn_id", linked_turn_id)?;
+    validate_agent_turn_ref("FileEdit.linked_turn_id", linked_turn_id, records, sink)?;
     if id.is_empty() {
         return Err(ApiError::missing_field("id"));
     }
@@ -1987,13 +2026,27 @@ fn validate_agent_action_domain(kind: &'static str, domain: Option<&str>) -> Wri
     }
 }
 
-fn validate_agent_turn_ref(field: &'static str, value: &str) -> WriteResult<()> {
-    if value.starts_with("agent_memory:v1:") {
-        return Ok(());
+fn validate_agent_turn_ref(
+    field: &'static str,
+    value: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    if !value.starts_with("agent_memory:v1:") {
+        return Err(ApiError::bad_request(format!(
+            "{field} must reference an agent_memory:v1: AgentTurn; got '{value}'"
+        )));
     }
-    Err(ApiError::bad_request(format!(
-        "{field} must reference an agent_memory:v1: AgentTurn; got '{value}'"
-    )))
+    match lookup_node_kind(value, records, sink)? {
+        Some(NodeKind::AgentTurn) => Ok(()),
+        Some(kind) => Err(ApiError::bad_request(format!(
+            "{field} must reference an agent_memory:v1: AgentTurn; target '{value}' has kind {}",
+            kind.as_str()
+        ))),
+        None => Err(ApiError::bad_request(format!(
+            "{field} must reference an existing agent_memory:v1: AgentTurn; target '{value}' was not found"
+        ))),
+    }
 }
 
 fn validate_agent_action_output_handle(field: &'static str, handle: &OutputHandle) -> WriteResult<()> {
@@ -2902,7 +2955,7 @@ fn validate_and_synthesize_evidence_edges(
                             kind.as_str()
                         )));
                     }
-                    validate_agent_action_record(record)?;
+                    validate_agent_action_record(record, records, &sink_guard)?;
                 }
                 for (link_index, link) in links.iter().enumerate() {
                     let was_triple_resolved = link.target_record_id.is_none();
