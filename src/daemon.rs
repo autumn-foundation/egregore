@@ -29,8 +29,9 @@ use crate::{
     },
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
-        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord, IdentitySource,
-        NodeKind, TemporalMetadata, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
+        AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord,
+        IdentitySource, NodeKind, OutputHandle, TemporalMetadata, VERIFICATION_SCHEMA_VERSION,
+        agent_memory_stable_id,
     },
     query as graph_query,
 };
@@ -46,6 +47,7 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_LIMIT: usize = 1024 * 1024 * 32;
+const INLINE_PAYLOAD_CEILING: u64 = 16 * 1024;
 
 /// Configuration for launching the daemon.
 #[derive(Debug, Clone)]
@@ -373,6 +375,12 @@ enum ErrorCode {
     /// missing a required evidence handle (`source_artifact_hash`,
     /// `source_artifact_path`, or `stdout_handle.hash`).
     MissingEvidenceHandle,
+    /// Added by #13 (agent-actions schema): a `PatchArtifact.patch_status`
+    /// mutation attempted to rewrite a pinned validity result.
+    PatchStatusPinned,
+    /// Added by #13 and reused for #11 handles: inline payload exceeded the
+    /// 16 KiB ceiling and must be demoted to handle-only storage.
+    InlinePayloadExceedsCeiling,
 }
 
 impl ErrorCode {
@@ -395,6 +403,8 @@ impl ErrorCode {
             Self::LocalPathIdentityUnsupported => "local_path_identity_unsupported",
             Self::AmbiguousCommitPrefix => "ambiguous_commit_prefix",
             Self::MissingEvidenceHandle => "missing_evidence_handle",
+            Self::PatchStatusPinned => "patch_status_pinned",
+            Self::InlinePayloadExceedsCeiling => "inline_payload_exceeds_ceiling",
         }
     }
 
@@ -404,6 +414,7 @@ impl ErrorCode {
             Self::BadRequest
             | Self::MissingField
             | Self::InvalidDomain
+            | Self::InlinePayloadExceedsCeiling
             | Self::AmbiguousCommitPrefix => 400,
             Self::IdempotencyConflict => 409,
             Self::NotFound => 404,
@@ -416,7 +427,8 @@ impl ErrorCode {
             Self::RedactionRequired
             | Self::UnresolvedEvidenceTarget
             | Self::LocalPathIdentityUnsupported
-            | Self::MissingEvidenceHandle => 422,
+            | Self::MissingEvidenceHandle
+            | Self::PatchStatusPinned => 422,
         }
     }
 }
@@ -477,7 +489,7 @@ impl ApiError {
     fn invalid_domain() -> Self {
         Self::new(
             ErrorCode::InvalidDomain,
-            r#"domain must be "codegraph", "agent_memory", or "verification""#,
+            r#"domain must be "codegraph", "agent_memory", "verification", or "artifact""#,
         )
     }
 
@@ -531,6 +543,14 @@ impl ApiError {
 
     fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::InternalError, message)
+    }
+
+    fn inline_payload_exceeds_ceiling(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::InlinePayloadExceedsCeiling, message)
+    }
+
+    fn patch_status_pinned(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::PatchStatusPinned, message)
     }
 }
 
@@ -1220,6 +1240,7 @@ fn apply_write(
 
     validate_no_local_path_identity_in_shared_store(&command.records, sink)?;
     validate_verification_domain_records(&command.records)?;
+    validate_artifact_domain_records(&command.records, sink)?;
 
     let (synthesized_edges, canonical_nodes) =
         validate_and_synthesize_evidence_edges(&command.records, sink)?;
@@ -1518,6 +1539,8 @@ fn incoming_identity_is_local(payload: &crate::ir::RepositoryIdentityPayload) ->
 
 /// Verification-domain node kinds permitted under `verification:v1:` IDs.
 const VERIFICATION_NODE_KINDS: &[NodeKind] = &[
+    NodeKind::CommandRun,
+    NodeKind::Verification,
     NodeKind::TestRun,
     NodeKind::CIStatus,
     NodeKind::BenchmarkRun,
@@ -1531,7 +1554,7 @@ const VERIFICATION_NODE_KINDS: &[NodeKind] = &[
 ///   `source_artifact_path`, or `stdout_handle.hash`).
 /// - `stdout_handle.inline` MUST be `None` when `stdout_handle.bytes` exceeds
 ///   the 16 KiB inline ceiling.
-/// - `kind` must be one of the five verification node kinds.
+/// - `kind` must be one of the verification node kinds.
 /// - `executed_at`, when present, must be a valid RFC 3339 timestamp.
 /// - `schema_version` must equal `VERIFICATION_SCHEMA_VERSION`.
 ///
@@ -1539,7 +1562,6 @@ const VERIFICATION_NODE_KINDS: &[NodeKind] = &[
 /// `verification:v1:` (per `record_id_matches_domain`) or when it carries
 /// `domain = "verification"` explicitly.
 fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<()> {
-    const INLINE_CEILING: u64 = 16 * 1024;
     for record in records {
         let GraphRecord::Node {
             id,
@@ -1572,7 +1594,8 @@ fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<
         if !VERIFICATION_NODE_KINDS.contains(kind) {
             return Err(ApiError::bad_request(format!(
                 "node kind '{}' is not permitted under the verification domain; \
-                 allowed kinds: TestRun, CIStatus, BenchmarkRun, CoverageReport, ProofResult",
+                 allowed kinds: CommandRun, Verification, TestRun, CIStatus, BenchmarkRun, \
+                 CoverageReport, ProofResult",
                 kind.as_str()
             )));
         }
@@ -1605,43 +1628,651 @@ fn validate_verification_domain_records(records: &[GraphRecord]) -> WriteResult<
         }
 
         if let Some(h) = stdout_handle.as_deref() {
-            if h.hash.is_empty() {
-                return Err(ApiError::bad_request(
-                    "verification-domain stdout_handle.hash must not be empty",
-                ));
-            }
-            let inline_len = h.inline.as_deref().map_or(0, |s| s.len() as u64);
-            if inline_len > h.bytes {
-                return Err(ApiError::bad_request(
-                    "verification-domain stdout_handle.bytes must be >= inline payload length",
-                ));
-            }
-            if inline_len > INLINE_CEILING || (h.inline.is_some() && h.bytes > INLINE_CEILING) {
-                return Err(ApiError::bad_request(
-                    "verification-domain stdout_handle.inline must be None when bytes exceeds \
-                     the 16 KiB ceiling; demote to handle-only before writing",
-                ));
-            }
+            validate_verification_output_handle("stdout_handle", h)?;
         }
         if let Some(h) = stderr_handle.as_deref() {
-            if h.hash.is_empty() {
+            validate_verification_output_handle("stderr_handle", h)?;
+        }
+    }
+    Ok(())
+}
+
+/// Artifact-domain node kinds permitted under `artifact:v1:` IDs.
+const ARTIFACT_NODE_KINDS: &[NodeKind] = &[NodeKind::PatchArtifact];
+
+/// `PatchArtifact.patch_status` values defined by `docs/schema/agent-actions.md`.
+const PATCH_STATUS_VALUES: &[&str] = &[
+    "applied_clean",
+    "applied_with_conflicts",
+    "invalid_syntax",
+    "invalid_no_base",
+    "rejected_validation",
+    "unverified",
+    "superseded",
+];
+
+/// Validates artifact-domain records against `docs/schema/agent-actions.md`.
+#[allow(clippy::too_many_lines)]
+fn validate_artifact_domain_records(
+    records: &[GraphRecord],
+    sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
+) -> WriteResult<()> {
+    let sink_guard = sink
+        .read()
+        .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
+    for record in records {
+        let GraphRecord::Node {
+            id,
+            kind,
+            domain,
+            schema_version,
+            patch_status,
+            base_commit,
+            unknown_base_reason,
+            target_files,
+            patch_bytes_hash,
+            patch_bytes_size,
+            patch_handle,
+            validation_summary,
+            source_artifact_path,
+            source_artifact_hash,
+            producer_session_id,
+            valid_time,
+            valid_time_source,
+            ingested_at,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        let is_artifact = id.starts_with("artifact:v1:") || domain.as_deref() == Some("artifact");
+        if !is_artifact {
+            continue;
+        }
+        if !id.starts_with("artifact:v1:") {
+            return Err(ApiError::bad_request(format!(
+                "artifact-domain record '{id}' must use artifact:v1: ID prefix"
+            )));
+        }
+
+        if *schema_version != ARTIFACT_SCHEMA_VERSION {
+            return Err(ApiError::bad_request(format!(
+                "artifact node '{id}' has schema_version {schema_version} but only version \
+                 {ARTIFACT_SCHEMA_VERSION} is accepted"
+            )));
+        }
+        if !ARTIFACT_NODE_KINDS.contains(kind) {
+            return Err(ApiError::bad_request(format!(
+                "node kind '{}' is not permitted under the artifact domain; allowed kind: \
+                 PatchArtifact",
+                kind.as_str()
+            )));
+        }
+        if domain.as_deref() != Some("artifact") {
+            return Err(ApiError::missing_field(
+                "domain (PatchArtifact requires domain artifact)",
+            ));
+        }
+
+        let status = required_str(patch_status.as_deref(), "patch_status")?;
+        if !PATCH_STATUS_VALUES.contains(&status) {
+            return Err(ApiError::bad_request(format!(
+                "PatchArtifact.patch_status '{status}' is not recognized; expected one of: {}",
+                PATCH_STATUS_VALUES.join(", ")
+            )));
+        }
+        let has_base_commit = base_commit.as_deref().is_some_and(|commit| !commit.is_empty());
+        if status == "invalid_no_base" && has_base_commit {
+            return Err(ApiError::bad_request(
+                "PatchArtifact.base_commit must be null when patch_status is invalid_no_base",
+            ));
+        }
+        if has_base_commit
+            && unknown_base_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.is_empty())
+        {
+            return Err(ApiError::bad_request(
+                "PatchArtifact.unknown_base_reason must be null when base_commit is set",
+            ));
+        }
+        if !has_base_commit && unknown_base_reason.as_deref() != Some("unknown_base") {
+            return Err(ApiError::missing_field(
+                "unknown_base_reason (required when base_commit is null)",
+            ));
+        }
+        let target_files = target_files
+            .as_ref()
+            .ok_or_else(|| ApiError::missing_field("target_files"))?;
+        if status == "invalid_syntax" && !target_files.is_empty() {
+            return Err(ApiError::bad_request(
+                "PatchArtifact.target_files must be empty when patch_status is invalid_syntax",
+            ));
+        }
+        required_str(patch_bytes_hash.as_deref(), "patch_bytes_hash")?;
+        let patch_bytes_size =
+            patch_bytes_size.ok_or_else(|| ApiError::missing_field("patch_bytes_size"))?;
+        let handle = patch_handle
+            .as_deref()
+            .ok_or_else(|| ApiError::missing_field("patch_handle"))?;
+        if handle.path.is_empty() {
+            return Err(ApiError::missing_field("patch_handle.path"));
+        }
+        if let Some(inline) = handle.inline.as_deref() {
+            let inline_len = inline.len() as u64;
+            if inline_len > patch_bytes_size {
                 return Err(ApiError::bad_request(
-                    "verification-domain stderr_handle.hash must not be empty",
+                    "PatchArtifact.patch_bytes_size must be >= patch_handle.inline length",
                 ));
             }
-            let inline_len = h.inline.as_deref().map_or(0, |s| s.len() as u64);
-            if inline_len > h.bytes {
-                return Err(ApiError::bad_request(
-                    "verification-domain stderr_handle.bytes must be >= inline payload length",
-                ));
-            }
-            if inline_len > INLINE_CEILING || (h.inline.is_some() && h.bytes > INLINE_CEILING) {
-                return Err(ApiError::bad_request(
-                    "verification-domain stderr_handle.inline must be None when bytes exceeds \
-                     the 16 KiB ceiling; demote to handle-only before writing",
+            if inline_len > INLINE_PAYLOAD_CEILING || patch_bytes_size > INLINE_PAYLOAD_CEILING {
+                return Err(ApiError::inline_payload_exceeds_ceiling(
+                    "PatchArtifact.patch_handle.inline must be None when patch bytes exceed the \
+                     16 KiB ceiling; demote to handle-only before writing",
                 ));
             }
         }
+        required_str(validation_summary.as_deref(), "validation_summary")?;
+        required_str(source_artifact_path.as_deref(), "source_artifact_path")?;
+        required_str(source_artifact_hash.as_deref(), "source_artifact_hash")?;
+        let producer_session_id =
+            required_str(producer_session_id.as_deref(), "producer_session_id")?;
+        validate_agent_session_ref(
+            "PatchArtifact.producer_session_id",
+            producer_session_id,
+            records,
+            &sink_guard,
+        )?;
+        let valid_time = required_str(valid_time.as_deref(), "valid_time")?;
+        if DateTime::parse_from_rfc3339(valid_time).is_err() {
+            return Err(ApiError::bad_request(format!(
+                "PatchArtifact.valid_time '{valid_time}' is not a valid RFC 3339 timestamp"
+            )));
+        }
+        if valid_time_source.as_deref() != Some("produced_at") {
+            return Err(ApiError::bad_request(
+                "PatchArtifact.valid_time_source must equal produced_at",
+            ));
+        }
+        let ingested_at = required_str(ingested_at.as_deref(), "ingested_at")?;
+        if DateTime::parse_from_rfc3339(ingested_at).is_err() {
+            return Err(ApiError::bad_request(format!(
+                "PatchArtifact.ingested_at '{ingested_at}' is not a valid RFC 3339 timestamp"
+            )));
+        }
+    }
+
+    for record in records {
+        let GraphRecord::Node {
+            id,
+            kind: NodeKind::PatchArtifact,
+            patch_status: Some(new_status),
+            ..
+        } = record
+        else {
+            continue;
+        };
+        match sink_guard.read_back(id) {
+            Ok(Some(GraphRecord::Node {
+                kind: NodeKind::PatchArtifact,
+                patch_status: Some(existing_status),
+                ..
+            })) if existing_status != *new_status => {
+                return Err(ApiError::patch_status_pinned(format!(
+                    "PatchArtifact.patch_status is append-only for '{id}'; existing status \
+                     '{existing_status}' cannot be rewritten to '{new_status}'"
+                )));
+            }
+            Ok(_) => {}
+            Err(error) => return Err(ApiError::internal(error.to_string())),
+        }
+    }
+    Ok(())
+}
+
+fn validate_verification_output_handle(
+    field: &'static str,
+    handle: &OutputHandle,
+) -> WriteResult<()> {
+    if handle.hash.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "verification-domain {field}.hash must not be empty"
+        )));
+    }
+    let inline_len = handle.inline.as_deref().map_or(0, |s| s.len() as u64);
+    if inline_len > handle.bytes {
+        return Err(ApiError::bad_request(format!(
+            "verification-domain {field}.bytes must be >= inline payload length"
+        )));
+    }
+    if inline_len > INLINE_PAYLOAD_CEILING
+        || (handle.inline.is_some() && handle.bytes > INLINE_PAYLOAD_CEILING)
+    {
+        return Err(ApiError::inline_payload_exceeds_ceiling(format!(
+            "verification-domain {field}.inline must be None when bytes exceeds the 16 KiB \
+             ceiling; demote to handle-only before writing"
+        )));
+    }
+    Ok(())
+}
+
+fn required_str<'a>(value: Option<&'a str>, field: &'static str) -> WriteResult<&'a str> {
+    value
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::missing_field(field))
+}
+
+const TOOL_KIND_VALUES: &[&str] = &[
+    "bash",
+    "file_edit",
+    "file_read",
+    "search",
+    "network_request",
+    "code_execution",
+    "other",
+];
+const TOOL_STATUS_VALUES: &[&str] = &["succeeded", "failed", "interrupted", "unknown"];
+const FILE_EDIT_KIND_VALUES: &[&str] = &["create", "modify", "delete", "rename"];
+
+fn validate_agent_action_record(
+    record: &GraphRecord,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        domain,
+        repo_relative_path,
+        edit_kind,
+        before_hash,
+        after_hash,
+        rename_to,
+        hunk_count,
+        source_artifact_path,
+        source_artifact_hash,
+        linked_patch_id,
+        linked_turn_id,
+        tool_name,
+        tool_kind,
+        arguments_summary,
+        arguments_handle,
+        result_handle,
+        produced_evidence_id,
+        started_at,
+        finished_at,
+        status,
+        ..
+    } = record
+    else {
+        return Ok(());
+    };
+
+    match kind {
+        NodeKind::ToolCall => validate_tool_call_record(
+            id,
+            domain.as_deref(),
+            source_artifact_path.as_deref(),
+            source_artifact_hash.as_deref(),
+            linked_turn_id.as_deref(),
+            tool_name.as_deref(),
+            tool_kind.as_deref(),
+            arguments_summary.as_deref(),
+            arguments_handle.as_deref(),
+            result_handle.as_deref(),
+            produced_evidence_id.as_deref(),
+            started_at.as_deref(),
+            finished_at.as_deref(),
+            status.as_deref(),
+            records,
+            sink,
+        ),
+        NodeKind::FileEdit => validate_file_edit_record(
+            id,
+            domain.as_deref(),
+            source_artifact_path.as_deref(),
+            source_artifact_hash.as_deref(),
+            repo_relative_path.as_deref(),
+            edit_kind.as_deref(),
+            before_hash.as_deref(),
+            after_hash.as_deref(),
+            rename_to.as_deref(),
+            *hunk_count,
+            linked_patch_id.as_deref(),
+            linked_turn_id.as_deref(),
+            records,
+            sink,
+        ),
+        _ => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_tool_call_record(
+    id: &str,
+    domain: Option<&str>,
+    source_artifact_path: Option<&str>,
+    source_artifact_hash: Option<&str>,
+    linked_turn_id: Option<&str>,
+    tool_name: Option<&str>,
+    tool_kind: Option<&str>,
+    arguments_summary: Option<&str>,
+    arguments_handle: Option<&OutputHandle>,
+    result_handle: Option<&OutputHandle>,
+    produced_evidence_id: Option<&str>,
+    started_at: Option<&str>,
+    finished_at: Option<&str>,
+    status: Option<&str>,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    validate_agent_action_domain("ToolCall", domain)?;
+    validate_agent_action_source_artifact("ToolCall", source_artifact_path, source_artifact_hash)?;
+    required_str(tool_name, "tool_name (required for ToolCall nodes)")?;
+    let tool_kind = required_str(tool_kind, "tool_kind (required for ToolCall nodes)")?;
+    if !TOOL_KIND_VALUES.contains(&tool_kind) {
+        return Err(ApiError::bad_request(format!(
+            "ToolCall.tool_kind '{tool_kind}' is not recognized; expected one of: {}",
+            TOOL_KIND_VALUES.join(", ")
+        )));
+    }
+    required_str(
+        arguments_summary,
+        "arguments_summary (required for ToolCall nodes)",
+    )?;
+    let arguments_handle = arguments_handle
+        .ok_or_else(|| ApiError::missing_field("arguments_handle (required for ToolCall nodes)"))?;
+    validate_agent_action_output_handle("ToolCall.arguments_handle", arguments_handle)?;
+    if let Some(result_handle) = result_handle {
+        validate_agent_action_output_handle("ToolCall.result_handle", result_handle)?;
+    }
+    if let Some(produced_evidence_id) = produced_evidence_id {
+        let produced_evidence_id =
+            required_str(Some(produced_evidence_id), "produced_evidence_id")?;
+        validate_verification_evidence_ref(
+            "ToolCall.produced_evidence_id",
+            produced_evidence_id,
+            records,
+            sink,
+        )?;
+    }
+    let linked_turn_id =
+        required_str(linked_turn_id, "linked_turn_id (required for ToolCall nodes)")?;
+    validate_agent_turn_ref("ToolCall.linked_turn_id", linked_turn_id, records, sink)?;
+    let started_at = required_str(started_at, "started_at (required for ToolCall nodes)")?;
+    if DateTime::parse_from_rfc3339(started_at).is_err() {
+        return Err(ApiError::bad_request(format!(
+            "ToolCall.started_at '{started_at}' is not a valid RFC 3339 timestamp"
+        )));
+    }
+    let status = required_str(status, "status (required for ToolCall nodes)")?;
+    if !TOOL_STATUS_VALUES.contains(&status) {
+        return Err(ApiError::bad_request(format!(
+            "ToolCall.status '{status}' is not recognized; expected one of: {}",
+            TOOL_STATUS_VALUES.join(", ")
+        )));
+    }
+    validate_tool_call_finished_at(status, finished_at)?;
+    if id.is_empty() {
+        return Err(ApiError::missing_field("id"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_file_edit_record(
+    id: &str,
+    domain: Option<&str>,
+    source_artifact_path: Option<&str>,
+    source_artifact_hash: Option<&str>,
+    repo_relative_path: Option<&str>,
+    edit_kind: Option<&str>,
+    before_hash: Option<&str>,
+    after_hash: Option<&str>,
+    rename_to: Option<&str>,
+    hunk_count: Option<u32>,
+    linked_patch_id: Option<&str>,
+    linked_turn_id: Option<&str>,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    validate_agent_action_domain("FileEdit", domain)?;
+    validate_agent_action_source_artifact("FileEdit", source_artifact_path, source_artifact_hash)?;
+    required_str(
+        repo_relative_path,
+        "repo_relative_path (required for FileEdit nodes)",
+    )?;
+    let edit_kind = required_str(edit_kind, "edit_kind (required for FileEdit nodes)")?;
+    if !FILE_EDIT_KIND_VALUES.contains(&edit_kind) {
+        return Err(ApiError::bad_request(format!(
+            "FileEdit.edit_kind '{edit_kind}' is not recognized; expected one of: {}",
+            FILE_EDIT_KIND_VALUES.join(", ")
+        )));
+    }
+    if edit_kind != "rename" && rename_to.is_some() {
+        return Err(ApiError::bad_request(
+            "FileEdit.rename_to is only permitted when edit_kind is rename",
+        ));
+    }
+    match edit_kind {
+        "create" => {
+            if before_hash.is_some() {
+                return Err(ApiError::bad_request(
+                    "FileEdit.before_hash must be null or omitted when edit_kind is create",
+                ));
+            }
+            required_str(after_hash, "after_hash (required for FileEdit create nodes)")?;
+        }
+        "delete" => {
+            required_str(before_hash, "before_hash (required for FileEdit delete nodes)")?;
+            if after_hash.is_some() {
+                return Err(ApiError::bad_request(
+                    "FileEdit.after_hash must be null or omitted when edit_kind is delete",
+                ));
+            }
+        }
+        "modify" => {
+            required_str(before_hash, "before_hash (required for FileEdit modify nodes)")?;
+            required_str(after_hash, "after_hash (required for FileEdit modify nodes)")?;
+        }
+        "rename" => {
+            required_str(before_hash, "before_hash (required for FileEdit rename nodes)")?;
+            required_str(after_hash, "after_hash (required for FileEdit rename nodes)")?;
+            required_str(rename_to, "rename_to (required for FileEdit rename nodes)")?;
+        }
+        _ => {}
+    }
+    hunk_count.ok_or_else(|| ApiError::missing_field("hunk_count (required for FileEdit nodes)"))?;
+    if let Some(linked_patch_id) = linked_patch_id {
+        let linked_patch_id = required_str(Some(linked_patch_id), "linked_patch_id")?;
+        validate_patch_artifact_ref(
+            "FileEdit.linked_patch_id",
+            linked_patch_id,
+            records,
+            sink,
+        )?;
+    }
+    let linked_turn_id =
+        required_str(linked_turn_id, "linked_turn_id (required for FileEdit nodes)")?;
+    validate_agent_turn_ref("FileEdit.linked_turn_id", linked_turn_id, records, sink)?;
+    if id.is_empty() {
+        return Err(ApiError::missing_field("id"));
+    }
+    Ok(())
+}
+
+fn validate_agent_action_domain(kind: &'static str, domain: Option<&str>) -> WriteResult<()> {
+    match domain {
+        Some("agent_memory") => Ok(()),
+        Some(other) => Err(ApiError::bad_request(format!(
+            "{kind}.domain must be 'agent_memory'; got '{other}'"
+        ))),
+        None => Err(ApiError::missing_field(format!(
+            "domain (required for {kind} nodes)"
+        ))),
+    }
+}
+
+fn validate_agent_action_source_artifact(
+    _kind: &'static str,
+    source_artifact_path: Option<&str>,
+    source_artifact_hash: Option<&str>,
+) -> WriteResult<()> {
+    required_str(
+        source_artifact_path,
+        "source_artifact_path (required for agent-action nodes)",
+    )?;
+    required_str(
+        source_artifact_hash,
+        "source_artifact_hash (required for agent-action nodes)",
+    )?;
+    Ok(())
+}
+
+fn validate_tool_call_finished_at(status: &str, finished_at: Option<&str>) -> WriteResult<()> {
+    match status {
+        "succeeded" | "failed" => {
+            let finished_at = required_str(
+                finished_at,
+                "finished_at (required for completed ToolCall nodes)",
+            )?;
+            if DateTime::parse_from_rfc3339(finished_at).is_err() {
+                return Err(ApiError::bad_request(format!(
+                    "ToolCall.finished_at '{finished_at}' is not a valid RFC 3339 timestamp"
+                )));
+            }
+        }
+        "interrupted" => {
+            if finished_at.is_some() {
+                return Err(ApiError::bad_request(
+                    "ToolCall.finished_at must be null or omitted when status is interrupted",
+                ));
+            }
+        }
+        _ => {
+            if let Some(finished_at) = finished_at {
+                let finished_at = required_str(Some(finished_at), "finished_at")?;
+                if DateTime::parse_from_rfc3339(finished_at).is_err() {
+                    return Err(ApiError::bad_request(format!(
+                        "ToolCall.finished_at '{finished_at}' is not a valid RFC 3339 timestamp"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_agent_turn_ref(
+    field: &'static str,
+    value: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    validate_record_kind_ref(
+        field,
+        value,
+        "agent_memory:v1:",
+        "AgentTurn",
+        &[NodeKind::AgentTurn],
+        records,
+        sink,
+    )
+}
+
+fn validate_agent_session_ref(
+    field: &'static str,
+    value: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    validate_record_kind_ref(
+        field,
+        value,
+        "agent_memory:v1:",
+        "AgentSession",
+        &[NodeKind::AgentSession],
+        records,
+        sink,
+    )
+}
+
+fn validate_verification_evidence_ref(
+    field: &'static str,
+    value: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    validate_record_kind_ref(
+        field,
+        value,
+        "verification:v1:",
+        "CommandRun or TestRun",
+        &[NodeKind::CommandRun, NodeKind::TestRun],
+        records,
+        sink,
+    )
+}
+
+fn validate_patch_artifact_ref(
+    field: &'static str,
+    value: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    validate_record_kind_ref(
+        field,
+        value,
+        "artifact:v1:",
+        "PatchArtifact",
+        &[NodeKind::PatchArtifact],
+        records,
+        sink,
+    )
+}
+
+fn validate_record_kind_ref(
+    field: &'static str,
+    value: &str,
+    expected_prefix: &'static str,
+    expected_kind: &'static str,
+    allowed_kinds: &[NodeKind],
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    if !value.starts_with(expected_prefix) {
+        return Err(ApiError::bad_request(format!(
+            "{field} must reference a {expected_prefix} {expected_kind}; got '{value}'"
+        )));
+    }
+    match lookup_node_kind(value, records, sink)? {
+        Some(kind) if allowed_kinds.contains(&kind) => Ok(()),
+        Some(kind) => Err(ApiError::bad_request(format!(
+            "{field} must reference a {expected_prefix} {expected_kind}; target '{value}' has kind {}",
+            kind.as_str()
+        ))),
+        None => Err(ApiError::bad_request(format!(
+            "{field} must reference an existing {expected_prefix} {expected_kind}; target '{value}' was not found"
+        ))),
+    }
+}
+
+fn validate_agent_action_output_handle(field: &'static str, handle: &OutputHandle) -> WriteResult<()> {
+    if handle.hash.is_empty() {
+        return Err(ApiError::bad_request(format!("{field}.hash must not be empty")));
+    }
+    let inline_len = handle.inline.as_deref().map_or(0, |s| s.len() as u64);
+    if inline_len > handle.bytes {
+        return Err(ApiError::bad_request(format!(
+            "{field}.bytes must be >= inline payload length"
+        )));
+    }
+    if inline_len > INLINE_PAYLOAD_CEILING
+        || (handle.inline.is_some() && handle.bytes > INLINE_PAYLOAD_CEILING)
+    {
+        return Err(ApiError::inline_payload_exceeds_ceiling(format!(
+            "{field}.inline must be None when bytes exceeds the 16 KiB ceiling; demote to handle-only before writing"
+        )));
     }
     Ok(())
 }
@@ -1661,12 +2292,13 @@ fn record_id_matches_domain(id: &str, domain: &str) -> bool {
         "codegraph" => id.starts_with("codegraph:"),
         "agent_memory" => id.starts_with("agent_memory:v1:"),
         "verification" => id.starts_with("verification:v1:"),
+        "artifact" => id.starts_with("artifact:v1:"),
         _ => true,
     }
 }
 
 // Validates that a resolved target ID is consistent with the declared target_domain.
-// For "codegraph" and "agent_memory", enforces the expected ID prefix.
+// For domains with stable prefixes, enforces the expected ID prefix.
 // "project" and any other domain have no universal prefix requirement; the
 // relation-specific checks in validate_evidence_endpoint_constraints enforce per-label rules.
 fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult<()> {
@@ -1684,6 +2316,11 @@ fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult
         "verification" if !id.starts_with("verification:v1:") => {
             return Err(ApiError::bad_request(format!(
                 "evidence link declares target_domain 'verification' but target '{id}' does not have the expected 'verification:v1:' prefix",
+            )));
+        }
+        "artifact" if !id.starts_with("artifact:v1:") => {
+            return Err(ApiError::bad_request(format!(
+                "evidence link declares target_domain 'artifact' but target '{id}' does not have the expected 'artifact:v1:' prefix",
             )));
         }
         // "project" and any other declared domain: no universal prefix requirement.
@@ -1911,7 +2548,7 @@ fn validate_evidence_endpoint_constraints(
 ) -> WriteResult<()> {
     // Source-side constraints.
     match label {
-        EdgeLabel::Observes | EdgeLabel::ExplainsChange | EdgeLabel::ValidatedBy => {
+        EdgeLabel::Observes | EdgeLabel::ExplainsChange => {
             if let Some(sk) = source_kind
                 && sk != NodeKind::Observation
             {
@@ -1922,12 +2559,58 @@ fn validate_evidence_endpoint_constraints(
                 )));
             }
         }
-        EdgeLabel::ProducedPatch => {
+        EdgeLabel::ValidatedBy => {
             if let Some(sk) = source_kind
-                && sk != NodeKind::CommandEvidence
+                && !matches!(
+                    sk,
+                    NodeKind::Observation | NodeKind::Decision | NodeKind::AgentRun
+                )
             {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a CommandEvidence source node, not {}",
+                    "evidence link relation '{}' requires an Observation, Decision, or legacy AgentRun source node, not {}",
+                    label.as_str(),
+                    sk.as_str()
+                )));
+            }
+        }
+        EdgeLabel::ProducedPatch => {
+            if let Some(sk) = source_kind
+                && !matches!(
+                    sk,
+                    NodeKind::FileEdit | NodeKind::AgentTurn | NodeKind::AgentRun
+                )
+            {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires a FileEdit, AgentTurn, or legacy AgentRun source node, not {}",
+                    label.as_str(),
+                    sk.as_str()
+                )));
+            }
+        }
+        EdgeLabel::ProducedEvidence => {
+            if let Some(sk) = source_kind
+                && sk != NodeKind::ToolCall
+            {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires a ToolCall source node, not {}",
+                    label.as_str(),
+                    sk.as_str()
+                )));
+            }
+        }
+        EdgeLabel::TouchedFile => {
+            if let Some(sk) = source_kind
+                && !matches!(
+                    sk,
+                    NodeKind::FileEdit
+                        | NodeKind::ToolCall
+                        | NodeKind::CommandRun
+                        | NodeKind::TestRun
+                        | NodeKind::CIStatus
+                )
+            {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires a FileEdit, ToolCall, CommandRun, TestRun, or CIStatus source node, not {}",
                     label.as_str(),
                     sk.as_str()
                 )));
@@ -2030,19 +2713,36 @@ fn validate_evidence_endpoint_constraints(
                 target_kind_str()
             )));
         }
-        EdgeLabel::FailedOn if !matches!(target_kind, Some(NodeKind::Symbol | NodeKind::File)) => {
+        EdgeLabel::FailedOn
+            if !matches!(
+                target_kind,
+                Some(NodeKind::Symbol | NodeKind::File | NodeKind::PatchArtifact)
+            ) =>
+        {
             return Err(ApiError::bad_request(format!(
-                "evidence link relation '{}' requires a Symbol or File target; target '{}' has kind {}",
+                "evidence link relation '{}' requires a Symbol, File, or legacy PatchArtifact target; target '{}' has kind {}",
                 label.as_str(),
                 target_id,
                 target_kind_str()
             )));
         }
-        // PRODUCED_PATCH requires a PatchArtifact target, which does not yet exist as a NodeKind.
-        EdgeLabel::ProducedPatch => {
-            return Err(ApiError::bad_request(
-                "evidence link relation 'PRODUCED_PATCH' requires a PatchArtifact target; the PatchArtifact node kind is not yet supported",
-            ));
+        EdgeLabel::ProducedPatch if !matches!(target_kind, Some(NodeKind::PatchArtifact)) => {
+            return Err(ApiError::bad_request(format!(
+                "evidence link relation '{}' requires a PatchArtifact target; target '{}' has kind {}",
+                label.as_str(),
+                target_id,
+                target_kind_str()
+            )));
+        }
+        EdgeLabel::ProducedEvidence
+            if !matches!(target_kind, Some(NodeKind::CommandRun | NodeKind::TestRun)) =>
+        {
+            return Err(ApiError::bad_request(format!(
+                "evidence link relation '{}' requires a CommandRun or TestRun target; target '{}' has kind {}",
+                label.as_str(),
+                target_id,
+                target_kind_str()
+            )));
         }
         _ => {}
     }
@@ -2071,8 +2771,21 @@ const AGENT_MEMORY_NODE_KINDS: &[NodeKind] = &[
     NodeKind::Observation,
     NodeKind::Task,
     NodeKind::Artifact,
-    NodeKind::Verification,
     NodeKind::CommandEvidence,
+    // Legacy trajectory importer diagnostics kept ingestible during the same
+    // migration window as legacy action/evidence records.
+    NodeKind::Diagnostic,
+    NodeKind::AgentRun,
+    NodeKind::AgentTurn,
+    NodeKind::ToolCall,
+    // Legacy trajectory importer outputs kept ingestible until the emitter
+    // migrates these records into verification/artifact domains.
+    NodeKind::CommandRun,
+    NodeKind::Verification,
+    NodeKind::FileEdit,
+    NodeKind::PatchArtifact,
+    NodeKind::Failure,
+    NodeKind::Decision,
 ];
 
 // Validates that the source and target IDs of a directly submitted agent-memory edge
@@ -2089,6 +2802,7 @@ fn validate_agent_memory_edge_endpoints(
         EdgeLabel::SessionOf
         | EdgeLabel::Observes
         | EdgeLabel::ProducedPatch
+        | EdgeLabel::ProducedEvidence
         | EdgeLabel::ValidatedBy
         | EdgeLabel::ExplainsChange
         | EdgeLabel::ReferencesTask
@@ -2143,7 +2857,6 @@ fn validate_agent_memory_edge_endpoints(
         EdgeLabel::Observes
         | EdgeLabel::MentionsSymbol
         | EdgeLabel::TouchedFile
-        | EdgeLabel::FailedOn
         | EdgeLabel::ExplainsChange
             if !target.starts_with("codegraph:") =>
         {
@@ -2152,7 +2865,29 @@ fn validate_agent_memory_edge_endpoints(
                 label.as_str()
             )));
         }
-        // PRODUCED_PATCH, RELATES_TO: any target domain is permitted.
+        EdgeLabel::FailedOn
+            if !target.starts_with("codegraph:") && !target.starts_with("agent_memory:v1:") =>
+        {
+            return Err(ApiError::bad_request(format!(
+                "agent-memory edge '{edge_id}' label '{}' requires a codegraph: target or legacy agent_memory:v1: PatchArtifact target; got target '{target}'",
+                label.as_str()
+            )));
+        }
+        EdgeLabel::ProducedPatch
+            if !target.starts_with("artifact:v1:") && !target.starts_with("agent_memory:v1:") =>
+        {
+            return Err(ApiError::bad_request(format!(
+                "agent-memory edge '{edge_id}' label '{}' requires an artifact:v1: target or legacy agent_memory:v1: PatchArtifact target; got target '{target}'",
+                label.as_str()
+            )));
+        }
+        EdgeLabel::ProducedEvidence if !target.starts_with("verification:v1:") => {
+            return Err(ApiError::bad_request(format!(
+                "agent-memory edge '{edge_id}' label '{}' requires a verification:v1: target; got target '{target}'",
+                label.as_str()
+            )));
+        }
+        // RELATES_TO: any target domain is permitted.
         _ => {}
     }
     Ok(())
@@ -2178,12 +2913,53 @@ fn validate_and_synthesize_evidence_edges(
             // agent-memory envelope and its cross-domain checks, not the codegraph path.
             if let GraphRecord::Edge { id, label, .. } = record
                 && !id.starts_with("agent_memory:v1:")
+                && !(id.starts_with("artifact:v1:") && *label == EdgeLabel::Supersedes)
                 && label.is_evidence_link_label()
             {
                 return Err(ApiError::bad_request(format!(
                     "edge '{id}' uses evidence-link label '{}' but is not an agent_memory:v1: edge; evidence relations are only permitted on agent-memory edges",
                     label.as_str()
                 )));
+            }
+            if let GraphRecord::Edge { id, label, .. } = record
+                && id.starts_with("artifact:v1:")
+                && *label != EdgeLabel::Supersedes
+            {
+                return Err(ApiError::bad_request(format!(
+                    "artifact edge '{id}' uses unsupported label '{}'; artifact-domain edges only permit SUPERSEDES",
+                    label.as_str()
+                )));
+            }
+            if let GraphRecord::Edge {
+                id,
+                label: EdgeLabel::Supersedes,
+                source,
+                target,
+                schema_version,
+                ..
+            } = record
+                && id.starts_with("artifact:v1:")
+            {
+                if *schema_version != ARTIFACT_SCHEMA_VERSION {
+                    return Err(ApiError::bad_request(format!(
+                        "artifact edge '{id}' has schema_version {schema_version} but only version {ARTIFACT_SCHEMA_VERSION} is accepted"
+                    )));
+                }
+                if !source.starts_with("artifact:v1:") || !target.starts_with("artifact:v1:") {
+                    return Err(ApiError::bad_request(format!(
+                        "artifact SUPERSEDES edge '{id}' requires artifact:v1: source and target; got source '{source}' target '{target}'"
+                    )));
+                }
+                let source_kind = lookup_node_kind(source, records, &sink_guard)?;
+                let target_kind = lookup_node_kind(target, records, &sink_guard)?;
+                if !matches!(
+                    (source_kind, target_kind),
+                    (Some(NodeKind::PatchArtifact), Some(NodeKind::PatchArtifact))
+                ) {
+                    return Err(ApiError::bad_request(format!(
+                        "artifact SUPERSEDES edge '{id}' requires PatchArtifact source and target"
+                    )));
+                }
             }
             // Validate directly submitted agent-memory edge records.
             if let GraphRecord::Edge {
@@ -2233,30 +3009,41 @@ fn validate_and_synthesize_evidence_edges(
                     EdgeLabel::SessionOf => {
                         let source_kind = lookup_node_kind(source, records, &sink_guard)?;
                         let target_kind = lookup_node_kind(target, records, &sink_guard)?;
-                        if !matches!(source_kind, Some(NodeKind::AgentSession)) {
+                        let valid_documented = matches!(source_kind, Some(NodeKind::AgentSession))
+                            && matches!(target_kind, Some(NodeKind::Agent));
+                        let valid_legacy_traj = matches!(source_kind, Some(NodeKind::AgentRun))
+                            && matches!(target_kind, Some(NodeKind::AgentSession));
+                        if valid_documented || valid_legacy_traj {
+                            continue;
+                        }
+                        if !matches!(source_kind, Some(NodeKind::AgentSession | NodeKind::AgentRun))
+                        {
                             return Err(ApiError::bad_request(format!(
-                                "agent-memory edge '{id}' SESSION_OF requires an AgentSession source; got {}",
+                                "agent-memory edge '{id}' SESSION_OF requires an AgentSession source or legacy AgentRun source; got {}",
                                 source_kind.map_or_else(
                                     || "unknown".to_owned(),
                                     |k| k.as_str().to_owned()
                                 )
                             )));
                         }
-                        if !matches!(target_kind, Some(NodeKind::Agent)) {
-                            return Err(ApiError::bad_request(format!(
-                                "agent-memory edge '{id}' SESSION_OF requires an Agent target; got {}",
-                                target_kind.map_or_else(
-                                    || "unknown".to_owned(),
-                                    |k| k.as_str().to_owned()
-                                )
-                            )));
-                        }
+                        return Err(ApiError::bad_request(format!(
+                            "agent-memory edge '{id}' SESSION_OF requires an Agent target or legacy AgentSession target; got {}",
+                            target_kind.map_or_else(
+                                || "unknown".to_owned(),
+                                |k| k.as_str().to_owned()
+                            )
+                        )));
                     }
                     EdgeLabel::AuthoredBy => {
                         let target_kind = lookup_node_kind(target, records, &sink_guard)?;
-                        if !matches!(target_kind, Some(NodeKind::AgentSession)) {
+                        if !matches!(
+                            target_kind,
+                            Some(
+                                NodeKind::AgentSession | NodeKind::AgentRun | NodeKind::AgentTurn
+                            )
+                        ) {
                             return Err(ApiError::bad_request(format!(
-                                "agent-memory edge '{id}' AUTHORED_BY requires an AgentSession target; got {}",
+                                "agent-memory edge '{id}' AUTHORED_BY requires an AgentSession target or legacy AgentRun/AgentTurn target; got {}",
                                 target_kind.map_or_else(
                                     || "unknown".to_owned(),
                                     |k| k.as_str().to_owned()
@@ -2392,6 +3179,14 @@ fn validate_and_synthesize_evidence_edges(
                             "confidence (required for Observation nodes)",
                         ));
                     }
+                    if matches!(kind, NodeKind::ToolCall | NodeKind::FileEdit)
+                        && confidence.as_ref().is_some_and(|s| !s.is_empty())
+                    {
+                        return Err(ApiError::bad_request(format!(
+                            "{} nodes must not carry confidence",
+                            kind.as_str()
+                        )));
+                    }
                     // Validate confidence format when present (applies to all kinds).
                     if let Some(conf_str) = confidence.as_deref().filter(|s| !s.is_empty()) {
                         let conf_val: f64 = conf_str.parse().map_err(|_| {
@@ -2421,6 +3216,7 @@ fn validate_and_synthesize_evidence_edges(
                             kind.as_str()
                         )));
                     }
+                    validate_agent_action_record(record, records, &sink_guard)?;
                 }
                 for (link_index, link) in links.iter().enumerate() {
                     let was_triple_resolved = link.target_record_id.is_none();
@@ -2459,12 +3255,20 @@ fn validate_and_synthesize_evidence_edges(
                         EdgeLabel::Observes
                         | EdgeLabel::MentionsSymbol
                         | EdgeLabel::TouchedFile
-                        | EdgeLabel::FailedOn
                         | EdgeLabel::ExplainsChange
                             if link.target_domain != "codegraph" =>
                         {
                             return Err(ApiError::bad_request(format!(
                                 "evidence link relation '{}' requires target_domain 'codegraph'; got '{}'",
+                                edge_label.as_str(),
+                                link.target_domain
+                            )));
+                        }
+                        EdgeLabel::FailedOn
+                            if !matches!(link.target_domain.as_str(), "codegraph" | "agent_memory") =>
+                        {
+                            return Err(ApiError::bad_request(format!(
+                                "evidence link relation '{}' requires target_domain 'codegraph' or legacy 'agent_memory'; got '{}'",
                                 edge_label.as_str(),
                                 link.target_domain
                             )));
@@ -2506,7 +3310,21 @@ fn validate_and_synthesize_evidence_edges(
                                 link.target_domain
                             )));
                         }
-                        // PRODUCED_PATCH, RELATES_TO: any target domain is permitted.
+                        EdgeLabel::ProducedPatch if link.target_domain != "artifact" => {
+                            return Err(ApiError::bad_request(format!(
+                                "evidence link relation '{}' requires target_domain 'artifact'; got '{}'",
+                                edge_label.as_str(),
+                                link.target_domain
+                            )));
+                        }
+                        EdgeLabel::ProducedEvidence if link.target_domain != "verification" => {
+                            return Err(ApiError::bad_request(format!(
+                                "evidence link relation '{}' requires target_domain 'verification'; got '{}'",
+                                edge_label.as_str(),
+                                link.target_domain
+                            )));
+                        }
+                        // RELATES_TO: any target domain is permitted.
                         _ => {}
                     }
                     let target_kind = lookup_node_kind(&target_id, records, &sink_guard)?;
@@ -2823,7 +3641,12 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         None => {
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("domain"));
         }
-        Some(d) if !matches!(d, "codegraph" | "agent_memory" | "verification") => {
+        Some(d)
+            if !matches!(
+                d,
+                "codegraph" | "agent_memory" | "verification" | "artifact"
+            ) =>
+        {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
         }
         Some(d) => d.to_owned(),
@@ -3702,9 +4525,12 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         }
     }
 
-    if non_empty(query.domain.as_deref())
-        .is_some_and(|d| !matches!(d, "codegraph" | "agent_memory" | "verification"))
-    {
+    if non_empty(query.domain.as_deref()).is_some_and(|d| {
+        !matches!(
+            d,
+            "codegraph" | "agent_memory" | "verification" | "artifact"
+        )
+    }) {
         return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
     }
 
@@ -4015,7 +4841,12 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         None => {
             return HttpResponse::error_with_id(&request_id, ApiError::missing_field("domain"));
         }
-        Some(d) if !matches!(d, "codegraph" | "agent_memory" | "verification") => {
+        Some(d)
+            if !matches!(
+                d,
+                "codegraph" | "agent_memory" | "verification" | "artifact"
+            ) =>
+        {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
         }
         Some(d) => d.to_owned(),
@@ -4536,6 +5367,7 @@ const fn status_text(status: u16) -> &'static str {
         404 => "Not Found",
         408 => "Request Timeout",
         409 => "Conflict",
+        422 => "Unprocessable Entity",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         _ => "Unknown",

@@ -16,6 +16,7 @@ is not checkable by static analysis alone.
 **Related documents:**
 - Wire contract: [`docs/schema/daemon-api.md`](daemon-api.md)
 - Agent-memory domain (cross-domain edges): [`docs/schema/agent-memory.md`](agent-memory.md)
+- Agent actions and tool-call evidence links: [`docs/schema/agent-actions.md`](agent-actions.md)
 - Vision PRD: [`docs/prd/0000-egregore-vision.md`](../prd/0000-egregore-vision.md)
 - Daemon design: [`docs/plans/2026-05-17-egregore-daemon-design.md`](../plans/2026-05-17-egregore-daemon-design.md)
 
@@ -39,11 +40,13 @@ the Blake3 content hashes are identical.
 
 ## 2 — Node kinds
 
-All five kinds share the base `GraphRecord::Node` shape. The `verification_kind`
+All verification kinds share the base `GraphRecord::Node` shape. The `verification_kind`
 field disambiguates them at query time when the caller has mixed-kind results.
 
 | `NodeKind` | `verification_kind` string | Description |
 |------------|---------------------------|-------------|
+| `CommandRun` | `command_run` | Shell command execution with exit status and output handles. |
+| `Verification` | `verification` | Umbrella verification claim backed by handles or child evidence. |
 | `TestRun` | `test_run` | Result of one test-suite invocation (unit, integration, e2e). |
 | `CIStatus` | `ci_status` | Snapshot of a CI pipeline run (build, lint, full pipeline). |
 | `BenchmarkRun` | `benchmark_run` | Benchmark measurement (throughput, latency, memory). |
@@ -60,7 +63,7 @@ Relevant fields for this domain:
 | `id` | string | yes | `verification:v1:{blake3}` — see §3. |
 | `domain` | string | yes | `"verification"` |
 | `schema_version` | u32 | yes | `1` |
-| `kind` | NodeKind | yes | One of the five kinds above. |
+| `kind` | NodeKind | yes | One of the verification kinds above. |
 | `verification_kind` | string | no | Human-readable disambiguation; redundant with `kind` but aids plain-JSON consumers. |
 | `status` | string | no | `"pass"`, `"fail"`, `"skip"`, `"error"`, `"timeout"` — free string, no enum enforcement at v1. |
 | `executed_at` | string | no | RFC 3339 timestamp when execution completed. |
@@ -146,7 +149,8 @@ pub struct OutputHandle {
 ### 4a — Inline ceiling
 
 `inline` MUST be `None` when `bytes > 16 384` (16 KiB). The daemon write
-applier enforces this at ingestion time and returns `bad_request` if violated.
+applier enforces this at ingestion time and returns
+`inline_payload_exceeds_ceiling` if violated.
 Callers MUST demote to handle-only (`inline: None`, `hash` and `bytes` set)
 before writing large outputs.
 
@@ -193,6 +197,7 @@ records to records in other domains.
 | `CONTRADICTS` | `verification` | any | any verification | any | A later run contradicts an earlier claim. |
 | `MENTIONS_SYMBOL` | `verification` | `codegraph` | any verification | `Symbol` | A verification record references a specific symbol. |
 | `TOUCHED_FILE` | `verification` | `codegraph` | any verification | `File` | A verification run exercised a specific file. |
+| `PRODUCED_EVIDENCE` | `agent_memory` | `verification` | `ToolCall` | `CommandRun`, `TestRun` | A tool call produced verification evidence. |
 
 ### TO verification
 
@@ -230,7 +235,7 @@ Rules enforced at write time:
 5. **Inline ceiling** — `stdout_handle.inline` and `stderr_handle.inline` must
    be `None` when the corresponding actual content length or `bytes` field
    exceeds 16 384.  
-   Error: `bad_request` (HTTP 400).
+   Error: `inline_payload_exceeds_ceiling` (HTTP 400).
 
 ---
 
@@ -239,7 +244,8 @@ Rules enforced at write time:
 | Code | HTTP | Meaning |
 |------|------|---------|
 | `missing_evidence_handle` | 422 | A verification-domain node was submitted without any evidence handle. |
-| `bad_request` | 400 | Wrong `schema_version`, disallowed `kind`, invalid `executed_at` format, or inline ceiling exceeded. |
+| `inline_payload_exceeds_ceiling` | 400 | An inline output handle exceeded the 16 KiB ceiling. |
+| `bad_request` | 400 | Wrong `schema_version`, disallowed `kind`, invalid `executed_at` format, or invalid handle metadata. |
 
 See `docs/schema/daemon-api.md` §5 for the full error-code table.
 
@@ -247,7 +253,7 @@ See `docs/schema/daemon-api.md` §5 for the full error-code table.
 
 ## 9 — Appendix: NodeKind exhaustive-match requirement
 
-`src/embeddings.rs` contains an exhaustive match over `NodeKind`. All five
+`src/embeddings.rs` contains an exhaustive match over `NodeKind`. All
 verification node kinds must appear in the `return None` arm (they are not
 embedded). The `tests/daemon.rs::all_node_kinds_have_documented_schema` test
 enforces that every `NodeKind` variant is documented; verification kinds map to

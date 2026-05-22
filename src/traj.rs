@@ -29,7 +29,7 @@ use serde::Deserialize;
 use crate::{
     error::Result,
     ir::{
-        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, Graph, GraphRecord, NodeKind,
+        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, Graph, GraphRecord, NodeKind, OutputHandle,
         agent_memory_stable_id,
     },
 };
@@ -42,6 +42,8 @@ pub const IMPORTER_ID: &str = "traj-importer";
 pub const IMPORTER_VERSION: &str = "0.1.0";
 /// Domain value carried on every agent-memory record.
 pub const DOMAIN: &str = "agent_memory";
+const DEFAULT_TRAJ_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
+const INLINE_PAYLOAD_CEILING: u64 = 16 * 1024;
 
 // ── Import options ────────────────────────────────────────────────────────────
 
@@ -187,14 +189,6 @@ pub fn import_traj(path: &Path, opts: &ImportOptions) -> Result<Graph> {
 
     let traj: TrajFile = serde_json::from_slice(&raw_bytes)?;
 
-    let mut graph = Graph::new();
-
-    let ctx = ImportCtx {
-        source_artifact_path,
-        source_artifact_hash,
-        traj_format: traj.trajectory_format,
-    };
-
     // Derive stable session ID from artifact hash + importer version.
     // Identical input bytes → identical session ID (idempotency guarantee).
     let session_id = agent_memory_stable_id(&[
@@ -202,8 +196,22 @@ pub fn import_traj(path: &Path, opts: &ImportOptions) -> Result<Graph> {
         "agent_session",
         IMPORTER_ID,
         IMPORTER_VERSION,
-        &ctx.source_artifact_hash,
+        &source_artifact_hash,
     ]);
+
+    let ctx = ImportCtx {
+        source_artifact_path,
+        source_artifact_hash,
+        traj_format: traj.trajectory_format,
+        session_id: session_id.clone(),
+        default_timestamp: traj
+            .info
+            .started_at
+            .clone()
+            .unwrap_or_else(|| DEFAULT_TRAJ_TIMESTAMP.to_owned()),
+    };
+
+    let mut graph = Graph::new();
 
     let run_id = agent_memory_stable_id(&["node", "agent_run", &session_id, "run-0"]);
 
@@ -472,6 +480,8 @@ fn emit_command_action(
         agent_memory_stable_id(&["node", "tool_call", turn_id, &action_idx.to_string()]);
     let cmd_run_id =
         agent_memory_stable_id(&["node", "command_run", turn_id, &action_idx.to_string()]);
+    let status = tool_status(this_exit);
+    let action_timestamp = timestamp.unwrap_or(&ctx.default_timestamp);
 
     // ── ToolCall ──────────────────────────────────────────────────────────────
     graph.push(make_node(
@@ -482,6 +492,15 @@ fn emit_command_action(
         NodeExtra {
             observed_at: timestamp.map(str::to_owned),
             text: Some(redacted_cmd.to_owned()),
+            linked_turn_id: Some(turn_id.to_owned()),
+            tool_name: Some("Bash".to_owned()),
+            tool_kind: Some("bash".to_owned()),
+            arguments_summary: Some(redacted_cmd.to_owned()),
+            arguments_handle: Some(Box::new(output_handle(redacted_cmd))),
+            started_at: timestamp.map(str::to_owned),
+            finished_at: matches!(status, "succeeded" | "failed")
+                .then(|| action_timestamp.to_owned()),
+            status: Some(status.to_owned()),
             ..Default::default()
         },
     ));
@@ -530,6 +549,17 @@ fn emit_command_action(
             NodeExtra {
                 observed_at: timestamp.map(str::to_owned),
                 text: Some(redacted_cmd.to_owned()),
+                repo_relative_path: Some(target.to_owned()),
+                edit_kind: Some("modify".to_owned()),
+                before_hash: Some(file_edit_surrogate_hash(
+                    ctx,
+                    target,
+                    "before",
+                    redacted_cmd,
+                )),
+                after_hash: Some(file_edit_surrogate_hash(ctx, target, "after", redacted_cmd)),
+                hunk_count: Some(1),
+                linked_turn_id: Some(turn_id.to_owned()),
                 ..Default::default()
             },
         ));
@@ -826,11 +856,14 @@ struct ImportCtx {
     source_artifact_path: String,
     source_artifact_hash: String,
     traj_format: String,
+    session_id: String,
+    default_timestamp: String,
 }
 
 /// Optional extra fields for a single node emit call.
 #[derive(Default)]
 struct NodeExtra {
+    repo_relative_path: Option<String>,
     observed_at: Option<String>,
     agent_kind: Option<String>,
     text: Option<String>,
@@ -838,6 +871,18 @@ struct NodeExtra {
     failure_kind: Option<String>,
     exit_code: Option<i64>,
     turn_index: Option<u64>,
+    edit_kind: Option<String>,
+    before_hash: Option<String>,
+    after_hash: Option<String>,
+    hunk_count: Option<u32>,
+    linked_turn_id: Option<String>,
+    tool_name: Option<String>,
+    tool_kind: Option<String>,
+    arguments_summary: Option<String>,
+    arguments_handle: Option<Box<OutputHandle>>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    status: Option<String>,
 }
 
 fn make_node(
@@ -847,13 +892,18 @@ fn make_node(
     ctx: &ImportCtx,
     extra: NodeExtra,
 ) -> GraphRecord {
+    let name = if kind == NodeKind::AgentSession {
+        Some(summary.clone())
+    } else {
+        None
+    };
     GraphRecord::Node {
         id,
         kind,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
-        repo_relative_path: None,
+        repo_relative_path: extra.repo_relative_path,
         span: None,
-        name: None,
+        name,
         language: None,
         symbol_kind: None,
         disambiguator: None,
@@ -866,9 +916,11 @@ fn make_node(
         agent_kind: extra
             .agent_kind
             .or_else(|| Some("rust-swe-agent".to_owned())),
-        session_id: None,
-        observed_at: extra.observed_at,
-        ingested_at: None,
+        session_id: Some(ctx.session_id.clone()),
+        observed_at: extra
+            .observed_at
+            .or_else(|| Some(ctx.default_timestamp.clone())),
+        ingested_at: Some(ctx.default_timestamp.clone()),
         confidence: None,
         source_handle: Some(format!(
             "{}:{}",
@@ -882,6 +934,31 @@ fn make_node(
         source_artifact_path: Some(ctx.source_artifact_path.clone()),
         source_artifact_hash: Some(ctx.source_artifact_hash.clone()),
         patch_status: extra.patch_status,
+        base_commit: None,
+        unknown_base_reason: None,
+        target_files: None,
+        patch_bytes_hash: None,
+        patch_bytes_size: None,
+        patch_handle: None,
+        validation_summary: None,
+        producer_session_id: None,
+        edit_kind: extra.edit_kind,
+        before_hash: extra.before_hash,
+        after_hash: extra.after_hash,
+        rename_to: None,
+        hunk_count: extra.hunk_count,
+        linked_patch_id: None,
+        linked_turn_id: extra.linked_turn_id,
+        tool_name: extra.tool_name,
+        tool_kind: extra.tool_kind,
+        arguments_summary: extra.arguments_summary,
+        arguments_handle: extra.arguments_handle,
+        result_handle: None,
+        produced_evidence_id: None,
+        started_at: extra
+            .started_at
+            .or_else(|| Some(ctx.default_timestamp.clone())),
+        finished_at: extra.finished_at,
         failure_kind: extra.failure_kind,
         exit_code: extra.exit_code,
         turn_index: extra.turn_index,
@@ -893,7 +970,41 @@ fn make_node(
         evidence_quality: None,
         executed_at: None,
         verification_kind: None,
-        status: None,
+        status: extra.status,
+    }
+}
+
+fn output_handle(content: &str) -> OutputHandle {
+    let bytes = content.len() as u64;
+    OutputHandle {
+        inline: (bytes <= INLINE_PAYLOAD_CEILING).then(|| content.to_owned()),
+        hash: blake3_hex(content.as_bytes()),
+        bytes,
+    }
+}
+
+// Current .traj records do not carry file snapshots, so legacy FileEdit nodes
+// use deterministic provenance hashes until the importer can emit real file hashes.
+fn file_edit_surrogate_hash(
+    ctx: &ImportCtx,
+    target: &str,
+    phase: &str,
+    redacted_command: &str,
+) -> String {
+    blake3_hex(
+        format!(
+            "traj-importer-v1\0{}\0{target}\0{phase}\0{redacted_command}",
+            ctx.source_artifact_hash
+        )
+        .as_bytes(),
+    )
+}
+
+const fn tool_status(exit_code: Option<i64>) -> &'static str {
+    match exit_code {
+        Some(0) => "succeeded",
+        Some(_) => "failed",
+        None => "unknown",
     }
 }
 

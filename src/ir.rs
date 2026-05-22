@@ -13,6 +13,10 @@ pub const AGENT_MEMORY_SCHEMA_VERSION: u32 = 1;
 /// Documented in `docs/schema/verification.md`.
 pub const VERIFICATION_SCHEMA_VERSION: u32 = 1;
 
+/// Schema version for artifact-domain records (`PatchArtifact`, etc.).
+/// Documented in `docs/schema/agent-actions.md`.
+pub const ARTIFACT_SCHEMA_VERSION: u32 = 1;
+
 /// Complete in-memory graph emitted by a scan.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
@@ -78,6 +82,20 @@ pub struct OutputHandle {
     pub hash: String,
     /// Total byte length of the output.
     pub bytes: u64,
+}
+
+/// Handle for raw patch bytes in an artifact-domain `PatchArtifact`.
+///
+/// The patch may be inlined only under the 16 KiB ceiling; otherwise the path
+/// points at protected artifact storage. Documented in
+/// `docs/schema/agent-actions.md`.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PatchHandle {
+    /// Path to the stored patch bytes.
+    pub path: String,
+    /// Redacted inline patch bytes when the payload is small enough.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline: Option<String>,
 }
 
 /// Agent-memory provenance fields for agent-authored nodes.
@@ -304,9 +322,78 @@ pub enum GraphRecord {
         #[serde(skip_serializing_if = "Option::is_none")]
         source_artifact_hash: Option<String>,
         // ── Record-type-specific fields (M2 trajectory import) ───────────────
-        /// Patch validation status for `PatchArtifact` records: `"success"`, `"invalid"`, `"unverified"`.
+        /// Patch validation status for `PatchArtifact` records.
         #[serde(skip_serializing_if = "Option::is_none")]
         patch_status: Option<String>,
+        /// Git SHA the patch was authored against, when known.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        base_commit: Option<String>,
+        /// Reason `base_commit` is absent.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unknown_base_reason: Option<String>,
+        /// Repo-relative files touched by the patch.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_files: Option<Vec<String>>,
+        /// BLAKE3 hash of the raw patch bytes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        patch_bytes_hash: Option<String>,
+        /// Raw patch byte length.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        patch_bytes_size: Option<u64>,
+        /// Storage handle for raw patch bytes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        patch_handle: Option<Box<PatchHandle>>,
+        /// Human-readable validation reason, redacted by policy.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        validation_summary: Option<String>,
+        /// `AgentSession` record ID that produced this patch.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        producer_session_id: Option<String>,
+        /// File edit operation kind.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        edit_kind: Option<String>,
+        /// BLAKE3 hash before a file edit.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        before_hash: Option<String>,
+        /// BLAKE3 hash after a file edit.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after_hash: Option<String>,
+        /// Rename target path for rename edits.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rename_to: Option<String>,
+        /// Number of hunks in the edit.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hunk_count: Option<u32>,
+        /// `PatchArtifact` record ID containing this edit's bytes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        linked_patch_id: Option<String>,
+        /// `AgentTurn` record ID associated with this action.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        linked_turn_id: Option<String>,
+        /// Invoked tool name.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        /// Producer-classified tool behavior kind.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_kind: Option<String>,
+        /// Redacted one-line argument summary.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arguments_summary: Option<String>,
+        /// Raw arguments handle.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arguments_handle: Option<Box<OutputHandle>>,
+        /// Tool output handle for non-verification output.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result_handle: Option<Box<OutputHandle>>,
+        /// Verification record produced by this tool call.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        produced_evidence_id: Option<String>,
+        /// RFC 3339 tool start time.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        started_at: Option<String>,
+        /// RFC 3339 tool finish time; absent when interrupted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        finished_at: Option<String>,
         /// Failure classification for `Failure` records: `"command_failure"`, `"patch_invalid"`, etc.
         #[serde(skip_serializing_if = "Option::is_none")]
         failure_kind: Option<String>,
@@ -434,6 +521,29 @@ impl GraphRecord {
             source_artifact_path: None,
             source_artifact_hash: None,
             patch_status: None,
+            base_commit: None,
+            unknown_base_reason: None,
+            target_files: None,
+            patch_bytes_hash: None,
+            patch_bytes_size: None,
+            patch_handle: None,
+            validation_summary: None,
+            producer_session_id: None,
+            edit_kind: None,
+            before_hash: None,
+            after_hash: None,
+            rename_to: None,
+            hunk_count: None,
+            linked_patch_id: None,
+            linked_turn_id: None,
+            tool_name: None,
+            tool_kind: None,
+            arguments_summary: None,
+            arguments_handle: None,
+            result_handle: None,
+            produced_evidence_id: None,
+            started_at: None,
+            finished_at: None,
             failure_kind: None,
             exit_code: None,
             turn_index: None,
@@ -490,6 +600,29 @@ impl GraphRecord {
             source_artifact_path: None,
             source_artifact_hash: None,
             patch_status: None,
+            base_commit: None,
+            unknown_base_reason: None,
+            target_files: None,
+            patch_bytes_hash: None,
+            patch_bytes_size: None,
+            patch_handle: None,
+            validation_summary: None,
+            producer_session_id: None,
+            edit_kind: None,
+            before_hash: None,
+            after_hash: None,
+            rename_to: None,
+            hunk_count: None,
+            linked_patch_id: None,
+            linked_turn_id: None,
+            tool_name: None,
+            tool_kind: None,
+            arguments_summary: None,
+            arguments_handle: None,
+            result_handle: None,
+            produced_evidence_id: None,
+            started_at: None,
+            finished_at: None,
             failure_kind: None,
             exit_code: None,
             turn_index: None,
@@ -545,6 +678,29 @@ impl GraphRecord {
             source_artifact_path: None,
             source_artifact_hash: None,
             patch_status: None,
+            base_commit: None,
+            unknown_base_reason: None,
+            target_files: None,
+            patch_bytes_hash: None,
+            patch_bytes_size: None,
+            patch_handle: None,
+            validation_summary: None,
+            producer_session_id: None,
+            edit_kind: None,
+            before_hash: None,
+            after_hash: None,
+            rename_to: None,
+            hunk_count: None,
+            linked_patch_id: None,
+            linked_turn_id: None,
+            tool_name: None,
+            tool_kind: None,
+            arguments_summary: None,
+            arguments_handle: None,
+            result_handle: None,
+            produced_evidence_id: None,
+            started_at: None,
+            finished_at: None,
             failure_kind: None,
             exit_code: None,
             turn_index: None,
@@ -838,6 +994,8 @@ pub enum EdgeLabel {
     TouchedFile,
     /// Agent-memory node produced a patch artifact.
     ProducedPatch,
+    /// Agent-memory tool call produced verification evidence.
+    ProducedEvidence,
     /// Agent-memory node is validated by an evidence record.
     ValidatedBy,
     /// Agent-memory node describes a failure on a code entity.
@@ -876,6 +1034,7 @@ impl EdgeLabel {
             "MENTIONS_SYMBOL" => Some(Self::MentionsSymbol),
             "TOUCHED_FILE" => Some(Self::TouchedFile),
             "PRODUCED_PATCH" => Some(Self::ProducedPatch),
+            "PRODUCED_EVIDENCE" => Some(Self::ProducedEvidence),
             "VALIDATED_BY" => Some(Self::ValidatedBy),
             "FAILED_ON" => Some(Self::FailedOn),
             "EXPLAINS_CHANGE" => Some(Self::ExplainsChange),
@@ -900,6 +1059,7 @@ impl EdgeLabel {
                 | Self::MentionsSymbol
                 | Self::TouchedFile
                 | Self::ProducedPatch
+                | Self::ProducedEvidence
                 | Self::ValidatedBy
                 | Self::FailedOn
                 | Self::ExplainsChange
@@ -954,6 +1114,7 @@ impl EdgeLabel {
             Self::MentionsSymbol => "MENTIONS_SYMBOL",
             Self::TouchedFile => "TOUCHED_FILE",
             Self::ProducedPatch => "PRODUCED_PATCH",
+            Self::ProducedEvidence => "PRODUCED_EVIDENCE",
             Self::ValidatedBy => "VALIDATED_BY",
             Self::FailedOn => "FAILED_ON",
             Self::ExplainsChange => "EXPLAINS_CHANGE",
@@ -1016,6 +1177,24 @@ pub fn verification_stable_id(parts: &[&str]) -> String {
     }
     format!(
         "verification:v{VERIFICATION_SCHEMA_VERSION}:{}",
+        hasher.finalize().to_hex()
+    )
+}
+
+/// Builds a stable artifact-domain record ID.
+///
+/// Uses the `artifact:v1:` prefix so artifact IDs cannot collide with
+/// code-graph, agent-memory, or verification IDs. Documented in
+/// `docs/schema/agent-actions.md`.
+#[must_use]
+pub fn artifact_stable_id(parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!(
+        "artifact:v{ARTIFACT_SCHEMA_VERSION}:{}",
         hasher.finalize().to_hex()
     )
 }

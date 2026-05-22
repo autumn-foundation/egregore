@@ -13,6 +13,13 @@ response envelope, error-code taxonomy, idempotency semantics) is specified in
 [docs/schema/daemon-api.md](../schema/daemon-api.md). This design plan
 describes *how* the daemon is built; the schema doc owns *what* it exposes.
 
+**Agent-action schema:** `ToolCall`, `FileEdit`, and `PatchArtifact` validation
+rules, including artifact-domain placement and patch-status pinning, are
+specified in [docs/schema/agent-actions.md](../schema/agent-actions.md).
+
+**Redaction schema:** Agent-authored payload redaction markers and policy-version
+metadata are specified in [docs/schema/redaction.md](../schema/redaction.md).
+
 ## Design Principles
 
 - One process owns the embedded AletheiaDB handle for a data directory.

@@ -12,12 +12,14 @@ use std::{
 };
 
 use aletheia_egregore::{
-    adapters::EmbeddedAletheiaSink,
+    adapters::{EmbeddedAletheiaSink, GraphSink},
     daemon::{DaemonClient, DaemonMetadata as ClientDaemonMetadata, StoreLease},
+    import_traj,
     ir::{
         EdgeLabel, GraphRecord, IdentitySource, NodeKind, RepositoryIdentityPayload,
         TemporalMetadata,
     },
+    traj::ImportOptions,
 };
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -1982,6 +1984,152 @@ fn response_json(response: &str) -> serde_json::Value {
     serde_json::from_str(body).expect("response body should be JSON")
 }
 
+fn read_repo_text(path: &str) -> String {
+    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
+        .unwrap_or_else(|error| panic!("{path} should be readable: {error}"))
+}
+
+const PATCH_PRODUCER_SESSION_ID: &str = "agent_memory:v1:producer-session";
+
+fn agent_session_json(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "AgentSession",
+        "schema_version": 1,
+        "agent_id": "test-agent",
+        "agent_kind": "codex",
+        "session_id": "test-session",
+        "observed_at": "2026-05-22T00:00:00Z",
+        "ingested_at": "2026-05-22T00:00:00Z",
+        "name": "Test session",
+        "summary": "Test AgentSession"
+    })
+}
+
+fn agent_turn_json(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "AgentTurn",
+        "schema_version": 1,
+        "agent_id": "test-agent",
+        "agent_kind": "codex",
+        "session_id": "test-session",
+        "observed_at": "2026-05-22T00:00:00Z",
+        "ingested_at": "2026-05-22T00:00:00Z",
+        "summary": "Test AgentTurn"
+    })
+}
+
+fn valid_tool_call_json(id: &str, linked_turn_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "ToolCall",
+        "schema_version": 1,
+        "domain": "agent_memory",
+        "agent_id": "test-agent",
+        "agent_kind": "codex",
+        "session_id": "test-session",
+        "observed_at": "2026-05-22T00:00:00Z",
+        "ingested_at": "2026-05-22T00:00:00Z",
+        "summary": "ToolCall fixture",
+        "source_artifact_path": "fixtures/session.traj",
+        "source_artifact_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "linked_turn_id": linked_turn_id,
+        "tool_name": "Bash",
+        "tool_kind": "bash",
+        "arguments_summary": "cargo test",
+        "arguments_handle": {
+            "hash": "2222222222222222222222222222222222222222222222222222222222222222",
+            "bytes": 10,
+            "inline": "cargo test"
+        },
+        "started_at": "2026-05-22T00:00:00Z",
+        "finished_at": "2026-05-22T00:00:01Z",
+        "status": "succeeded"
+    })
+}
+
+fn valid_file_edit_json(id: &str, linked_turn_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "FileEdit",
+        "schema_version": 1,
+        "domain": "agent_memory",
+        "agent_id": "test-agent",
+        "agent_kind": "codex",
+        "session_id": "test-session",
+        "observed_at": "2026-05-22T00:00:00Z",
+        "ingested_at": "2026-05-22T00:00:00Z",
+        "summary": "FileEdit fixture",
+        "source_artifact_path": "fixtures/session.traj",
+        "source_artifact_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "repo_relative_path": "src/lib.rs",
+        "edit_kind": "modify",
+        "before_hash": "3333333333333333333333333333333333333333333333333333333333333333",
+        "after_hash": "4444444444444444444444444444444444444444444444444444444444444444",
+        "hunk_count": 1,
+        "linked_turn_id": linked_turn_id
+    })
+}
+
+fn ingest_patch_producer_session(metadata: &DaemonMetadata, idempotency_key: &str) {
+    let response = http_json(
+        metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": format!("seed-{idempotency_key}"),
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": idempotency_key,
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_session_json(PATCH_PRODUCER_SESSION_ID)] }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "producer AgentSession seed should succeed, got {response}"
+    );
+}
+
+fn patch_artifact_fixture(
+    id: &str,
+    patch_status: &str,
+    patch_handle: &serde_json::Value,
+) -> serde_json::Value {
+    let patch_bytes_size = patch_handle
+        .get("inline")
+        .and_then(serde_json::Value::as_str)
+        .map_or(32_u64, |inline| inline.len() as u64);
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "PatchArtifact",
+        "schema_version": 1,
+        "domain": "artifact",
+        "summary": format!("PatchArtifact status={patch_status}"),
+        "patch_status": patch_status,
+        "base_commit": null,
+        "unknown_base_reason": "unknown_base",
+        "target_files": [],
+        "patch_bytes_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "patch_bytes_size": patch_bytes_size,
+        "patch_handle": patch_handle,
+        "validation_summary": "fixture patch status",
+        "source_artifact_path": "fixtures/session.traj",
+        "source_artifact_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "producer_session_id": PATCH_PRODUCER_SESSION_ID,
+        "valid_time": "2026-05-21T00:00:00Z",
+        "valid_time_source": "produced_at",
+        "ingested_at": "2026-05-21T00:00:00Z"
+    })
+}
+
 fn http_get_authed(metadata: &DaemonMetadata, path: &str) -> String {
     http_request(
         &metadata.address,
@@ -2626,18 +2774,17 @@ fn all_node_kinds_have_documented_schema() {
         // Reserved with one-line definitions in docs/schema/agent-memory.md §4b
         NodeKind::Task | NodeKind::Artifact | NodeKind::CommandEvidence => "agent-memory-reserved",
         // M2 trajectory-importer node kinds (docs/schema/agent-memory.md §4b + PRD M2)
-        NodeKind::AgentRun
-        | NodeKind::AgentTurn
-        | NodeKind::ToolCall
-        | NodeKind::CommandRun
-        | NodeKind::FileEdit
-        | NodeKind::PatchArtifact
-        | NodeKind::Failure
-        | NodeKind::Decision => "agent-memory-m2-traj-importer",
+        NodeKind::AgentRun | NodeKind::AgentTurn | NodeKind::Failure | NodeKind::Decision => {
+            "agent-memory-m2-traj-importer"
+        }
+        NodeKind::ToolCall | NodeKind::FileEdit | NodeKind::PatchArtifact => {
+            "agent-actions-documented"
+        }
         // Documented in docs/schema/verification.md (full schema, day-one shapes)
         NodeKind::Verification => "verification-documented",
         // Reserved in docs/schema/verification.md §5 with one-line definitions
-        NodeKind::TestRun
+        NodeKind::CommandRun
+        | NodeKind::TestRun
         | NodeKind::CIStatus
         | NodeKind::BenchmarkRun
         | NodeKind::CoverageReport
@@ -2670,6 +2817,7 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::MentionsSymbol
         | EdgeLabel::TouchedFile
         | EdgeLabel::ProducedPatch
+        | EdgeLabel::ProducedEvidence
         | EdgeLabel::ValidatedBy
         | EdgeLabel::FailedOn
         | EdgeLabel::ExplainsChange
@@ -2678,6 +2826,180 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::Supersedes
         | EdgeLabel::RelatesTo => "cross-domain-registry",
     };
+}
+
+#[test]
+fn agent_actions_schema_doc_is_linked_and_defines_day_one_shapes() {
+    let actions = read_repo_text("docs/schema/agent-actions.md");
+    for needle in [
+        "PatchArtifact -> `artifact` domain",
+        "FileEdit -> `agent_memory` domain",
+        "ToolCall -> `agent_memory` domain",
+        "patch_status",
+        "applied_clean",
+        "applied_with_conflicts",
+        "invalid_syntax",
+        "invalid_no_base",
+        "rejected_validation",
+        "unverified",
+        "superseded",
+        "PatchArtifact record shape",
+        "FileEdit record shape",
+        "ToolCall record shape",
+        "PatchArtifact.validation_summary",
+        "ToolCall.arguments_summary",
+        "validity-pinning",
+        "SUPERSEDED_BY",
+        "schema_version` is `1`",
+    ] {
+        assert!(
+            actions.contains(needle),
+            "agent-actions schema must document `{needle}`"
+        );
+    }
+
+    for path in [
+        "README.md",
+        "docs/prd/0000-egregore-vision.md",
+        "docs/schema/agent-memory.md",
+        "docs/schema/verification.md",
+        "docs/plans/2026-05-17-egregore-daemon-design.md",
+    ] {
+        let text = read_repo_text(path);
+        assert!(
+            text.contains("docs/schema/agent-actions.md") || text.contains("agent-actions.md"),
+            "{path} must link to docs/schema/agent-actions.md"
+        );
+    }
+}
+
+#[test]
+fn agent_actions_edge_registry_rows_are_documented_with_endpoint_rules() {
+    let registry = read_repo_text("docs/schema/agent-memory.md");
+    for needle in [
+        "| `PRODUCED_PATCH` | `agent_memory` | `artifact` | `FileEdit`, `AgentTurn` | `PatchArtifact` | many:1; FileEdit at most one | no |",
+        "| `TOUCHED_FILE` | `agent_memory`, `verification` | `codegraph` | `FileEdit`, `ToolCall`, `CommandRun`, `TestRun`, `CIStatus` | `File` | many:many | no |",
+        "| `PRODUCED_EVIDENCE` | `agent_memory` | `verification` | `ToolCall` | `CommandRun`, `TestRun` | many:1 | no |",
+    ] {
+        assert!(
+            registry.contains(needle),
+            "agent-memory edge registry must contain exact row: {needle}"
+        );
+    }
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn patch_artifact_patch_status_is_pinned() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    ingest_patch_producer_session(&metadata, "patch-status-pinned-producer-session-key");
+
+    let first_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "patch-status-pinned-first",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "patch-status-pinned-first-key",
+            "domain": "artifact",
+            "created_at": "2026-05-21T00:00:00Z",
+            "payload": {
+                "records": [patch_artifact_fixture(
+                    "artifact:v1:patch-status-pinned-fixture",
+                    "invalid_syntax",
+                    &serde_json::json!({"path": "artifacts/rejected.diff", "inline": "not a diff"}),
+                )]
+            }
+        }),
+    );
+    assert!(
+        first_response.starts_with("HTTP/1.1 200"),
+        "initial invalid PatchArtifact should be accepted, got {first_response}"
+    );
+
+    let update_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "patch-status-pinned-update",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "patch-status-pinned-update-key",
+            "domain": "artifact",
+            "created_at": "2026-05-21T00:01:00Z",
+            "payload": {
+                "records": [patch_artifact_fixture(
+                    "artifact:v1:patch-status-pinned-fixture",
+                    "applied_clean",
+                    &serde_json::json!({"path": "artifacts/repaired.diff", "inline": "diff --git a/src/lib.rs b/src/lib.rs\n"}),
+                )]
+            }
+        }),
+    );
+    assert!(
+        !update_response.starts_with("HTTP/1.1 200"),
+        "editing PatchArtifact.patch_status should be rejected, got {update_response}"
+    );
+    let body = response_json(&update_response);
+    assert_eq!(
+        body["error"]["code"], "patch_status_pinned",
+        "patch-status mutation must return patch_status_pinned, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn patch_artifact_oversized_inline_patch_handle_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    ingest_patch_producer_session(&metadata, "patch-oversized-inline-producer-session-key");
+    let oversized_inline = "x".repeat(17 * 1024);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "patch-oversized-inline",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "patch-oversized-inline-key",
+            "domain": "artifact",
+            "created_at": "2026-05-21T00:00:00Z",
+            "payload": {
+                "records": [patch_artifact_fixture(
+                    "artifact:v1:oversized-inline-patch-fixture",
+                    "unverified",
+                    &serde_json::json!({
+                        "path": "artifacts/too-large.diff",
+                        "inline": oversized_inline
+                    }),
+                )]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "PatchArtifact.patch_handle.inline over 16 KiB should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "inline_payload_exceeds_ceiling",
+        "oversized patch inline payload must reuse inline_payload_exceeds_ceiling, got {body}"
+    );
+
+    daemon.stop();
 }
 
 // (c) Agent and AgentSession records produced by POST /v1/agents/register
@@ -2804,6 +3126,1458 @@ fn evidence_link_with_missing_target_is_rejected() {
     assert_eq!(
         body["error"]["code"], "unresolved_evidence_target",
         "rejection must carry unresolved_evidence_target code per schema doc, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn daemon_ingest_accepts_current_traj_importer_agent_memory_records() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let graph = import_traj(
+        Path::new("tests/fixtures/agent_memory/swe_agent_basic/trajectory.traj"),
+        &ImportOptions::default(),
+    )
+    .expect("fixture .traj should import");
+    let records = graph.records().to_vec();
+    let agent_run_ids = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record,
+                GraphRecord::Node {
+                    kind: NodeKind::AgentRun,
+                    ..
+                }
+            )
+        })
+        .map(|record| record.id().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        records.iter().any(|record| matches!(
+            record,
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::CommandRun | NodeKind::Verification | NodeKind::PatchArtifact,
+                ..
+            } if id.starts_with("agent_memory:v1:")
+        )),
+        ".traj fixture must exercise legacy agent_memory:v1 action/evidence node kinds"
+    );
+    assert!(
+        records.iter().any(|record| matches!(
+            record,
+            GraphRecord::Edge {
+                label: EdgeLabel::ProducedPatch,
+                source,
+                target,
+                ..
+            } if agent_run_ids.contains(source) && target.starts_with("agent_memory:v1:")
+        )),
+        ".traj fixture must exercise legacy AgentRun -> agent_memory PatchArtifact edge"
+    );
+    let records_json = records
+        .iter()
+        .map(|record| serde_json::to_value(record).expect("record should serialize"))
+        .collect::<Vec<_>>();
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "traj-importer-agent-memory-ingest",
+            "agent_id": "traj-test-agent",
+            "session_id": "traj-test-session",
+            "idempotency_key": "traj-importer-agent-memory-ingest-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": records_json }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "current .traj importer output should ingest during migration, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn produced_patch_evidence_link_requires_artifact_id_target() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let legacy_patch_id = "agent_memory:v1:legacy-patch-evidence-link-target";
+    {
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        let legacy_patch = GraphRecord::node(
+            legacy_patch_id.to_owned(),
+            NodeKind::PatchArtifact,
+            None,
+            None,
+            None,
+            "legacy agent-memory PatchArtifact target".to_owned(),
+        );
+        sink.write_record(&legacy_patch)
+            .expect("legacy patch target should pre-seed");
+        sink.persist_indexes()
+            .expect("pre-seeded target should persist");
+    }
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "produced-patch-evidence-link-artifact-prefix",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "produced-patch-evidence-link-artifact-prefix-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "agent_memory:v1:produced-patch-evidence-link-source",
+                    "kind": "AgentTurn",
+                    "schema_version": 1,
+                    "agent_id": "test-agent",
+                    "agent_kind": "other",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "AgentTurn with inconsistent PRODUCED_PATCH evidence link",
+                    "evidence_links": [{
+                        "target_record_id": legacy_patch_id,
+                        "target_domain": "artifact",
+                        "relation": "PRODUCED_PATCH",
+                        "confidence": "1.0"
+                    }]
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "PRODUCED_PATCH evidence links must reject non-artifact targets, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "artifact prefix mismatch should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("artifact:v1:")),
+        "artifact prefix mismatch should name artifact:v1:, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn failed_on_evidence_link_accepts_legacy_agent_memory_patch_target() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let legacy_patch_id = "agent_memory:v1:legacy-patch-failed-on-target";
+    {
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        let legacy_patch = GraphRecord::node(
+            legacy_patch_id.to_owned(),
+            NodeKind::PatchArtifact,
+            None,
+            None,
+            None,
+            "legacy agent-memory PatchArtifact failure target".to_owned(),
+        );
+        sink.write_record(&legacy_patch)
+            .expect("legacy patch target should pre-seed");
+        sink.persist_indexes()
+            .expect("pre-seeded target should persist");
+    }
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "failed-on-legacy-agent-memory-patch",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "failed-on-legacy-agent-memory-patch-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "agent_memory:v1:failed-on-legacy-source",
+                    "kind": "Failure",
+                    "schema_version": 1,
+                    "domain": "agent_memory",
+                    "agent_id": "test-agent",
+                    "agent_kind": "other",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "Failure with legacy patch evidence target",
+                    "failure_kind": "patch_invalid",
+                    "evidence_links": [{
+                        "target_record_id": legacy_patch_id,
+                        "target_domain": "agent_memory",
+                        "relation": "FAILED_ON",
+                        "confidence": "1.0"
+                    }]
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "FAILED_ON evidence links should accept legacy agent_memory PatchArtifact targets, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn legacy_agent_memory_artifact_and_diagnostic_nodes_are_accepted() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "legacy-agent-memory-artifact-diagnostic",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "legacy-agent-memory-artifact-diagnostic-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "agent_memory:v1:legacy-generic-artifact",
+                    "kind": "Artifact",
+                    "schema_version": 1,
+                    "domain": "agent_memory",
+                    "agent_id": "test-agent",
+                    "agent_kind": "other",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "Legacy generic artifact"
+                }, {
+                    "record_type": "node",
+                    "id": "agent_memory:v1:legacy-traj-diagnostic",
+                    "kind": "Diagnostic",
+                    "schema_version": 1,
+                    "domain": "agent_memory",
+                    "agent_id": "test-agent",
+                    "agent_kind": "other",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "Legacy trajectory diagnostic"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "legacy agent-memory Artifact and Diagnostic nodes should ingest during migration, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn incomplete_tool_call_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "incomplete-tool-call",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "incomplete-tool-call-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "agent_memory:v1:incomplete-tool-call",
+                    "kind": "ToolCall",
+                    "schema_version": 1,
+                    "domain": "agent_memory",
+                    "agent_id": "test-agent",
+                    "agent_kind": "other",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "Incomplete tool call"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "ToolCall missing required agent-actions fields should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "incomplete ToolCall should fail with missing_field, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn incomplete_file_edit_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "incomplete-file-edit",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "incomplete-file-edit-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "agent_memory:v1:incomplete-file-edit",
+                    "kind": "FileEdit",
+                    "schema_version": 1,
+                    "domain": "agent_memory",
+                    "agent_id": "test-agent",
+                    "agent_kind": "other",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "Incomplete file edit"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "FileEdit missing required agent-actions fields should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "incomplete FileEdit should fail with missing_field, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn file_edit_modify_requires_before_and_after_hashes() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "file-edit-missing-modify-hashes",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "file-edit-missing-modify-hashes-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "agent_memory:v1:turn-for-file-edit-hash-check",
+                    "kind": "AgentTurn",
+                    "schema_version": 1,
+                    "agent_id": "test-agent",
+                    "agent_kind": "codex",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "Turn anchoring a FileEdit"
+                }, {
+                    "record_type": "node",
+                    "id": "agent_memory:v1:file-edit-missing-modify-hashes",
+                    "kind": "FileEdit",
+                    "schema_version": 1,
+                    "domain": "agent_memory",
+                    "agent_id": "test-agent",
+                    "agent_kind": "codex",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "Modify without hashes",
+                    "repo_relative_path": "src/lib.rs",
+                    "edit_kind": "modify",
+                    "hunk_count": 1,
+                    "linked_turn_id": "agent_memory:v1:turn-for-file-edit-hash-check"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "FileEdit modify without before_hash/after_hash should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "missing FileEdit hashes should fail with missing_field, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn linked_turn_id_must_resolve_to_agent_turn() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "linked-turn-id-must-be-turn",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "linked-turn-id-must-be-turn-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "agent_memory:v1:not-a-turn-session",
+                    "kind": "AgentSession",
+                    "schema_version": 1,
+                    "agent_id": "test-agent",
+                    "agent_kind": "codex",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "name": "Not a turn",
+                    "summary": "Session, not AgentTurn"
+                }, {
+                    "record_type": "node",
+                    "id": "agent_memory:v1:tool-call-linked-to-session",
+                    "kind": "ToolCall",
+                    "schema_version": 1,
+                    "domain": "agent_memory",
+                    "agent_id": "test-agent",
+                    "agent_kind": "codex",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "ToolCall linked to wrong node kind",
+                    "source_artifact_path": "fixtures/session.traj",
+                    "source_artifact_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "linked_turn_id": "agent_memory:v1:not-a-turn-session",
+                    "tool_name": "Bash",
+                    "tool_kind": "bash",
+                    "arguments_summary": "cargo test",
+                    "arguments_handle": {
+                        "hash": "2222222222222222222222222222222222222222222222222222222222222222",
+                        "bytes": 10,
+                        "inline": "cargo test"
+                    },
+                    "started_at": "2026-05-22T00:00:00Z",
+                    "finished_at": "2026-05-22T00:00:01Z",
+                    "status": "succeeded"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "linked_turn_id pointing at AgentSession should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "wrong linked_turn_id kind should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn artifact_domain_record_requires_artifact_id_prefix() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let mut patch = patch_artifact_fixture(
+        "agent_memory:v1:artifact-domain-wrong-prefix",
+        "unverified",
+        &serde_json::json!({"path": "artifacts/legacy.diff", "inline": "diff --git a/src/lib.rs b/src/lib.rs\n"}),
+    );
+    let patch_obj = patch
+        .as_object_mut()
+        .expect("patch fixture should be a JSON object");
+    patch_obj.insert("agent_id".to_owned(), serde_json::json!("test-agent"));
+    patch_obj.insert("agent_kind".to_owned(), serde_json::json!("codex"));
+    patch_obj.insert("session_id".to_owned(), serde_json::json!("test-session"));
+    patch_obj.insert(
+        "observed_at".to_owned(),
+        serde_json::json!("2026-05-22T00:00:00Z"),
+    );
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "artifact-domain-wrong-prefix",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "artifact-domain-wrong-prefix-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [patch] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "artifact-domain record with agent_memory:v1: ID should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "artifact-domain ID prefix mismatch should fail with bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("artifact:v1:")),
+        "artifact-domain ID prefix mismatch should mention artifact:v1:, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn tool_call_produced_evidence_id_must_resolve_to_verification_record() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let turn_id = "agent_memory:v1:turn-for-produced-evidence-check";
+    let mut tool_call =
+        valid_tool_call_json("agent_memory:v1:tool-call-missing-produced-evidence", turn_id);
+    tool_call
+        .as_object_mut()
+        .expect("tool call fixture should be an object")
+        .insert(
+            "produced_evidence_id".to_owned(),
+            serde_json::json!("verification:v1:missing-produced-evidence"),
+        );
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "tool-call-missing-produced-evidence",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "tool-call-missing-produced-evidence-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(turn_id), tool_call] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "ToolCall.produced_evidence_id with missing verification target should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "missing produced_evidence_id target should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn file_edit_linked_patch_id_must_resolve_to_patch_artifact() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let turn_id = "agent_memory:v1:turn-for-linked-patch-check";
+    let mut file_edit =
+        valid_file_edit_json("agent_memory:v1:file-edit-missing-linked-patch", turn_id);
+    file_edit
+        .as_object_mut()
+        .expect("file edit fixture should be an object")
+        .insert(
+            "linked_patch_id".to_owned(),
+            serde_json::json!("artifact:v1:missing-linked-patch"),
+        );
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "file-edit-missing-linked-patch",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "file-edit-missing-linked-patch-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(turn_id), file_edit] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "FileEdit.linked_patch_id with missing artifact target should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "missing linked_patch_id target should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn tool_call_result_handle_must_be_valid_when_present() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let turn_id = "agent_memory:v1:turn-for-result-handle-check";
+    let mut tool_call =
+        valid_tool_call_json("agent_memory:v1:tool-call-invalid-result-handle", turn_id);
+    tool_call
+        .as_object_mut()
+        .expect("tool call fixture should be an object")
+        .insert(
+            "result_handle".to_owned(),
+            serde_json::json!({
+                "hash": "",
+                "bytes": 6,
+                "inline": "output"
+            }),
+        );
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "tool-call-invalid-result-handle",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "tool-call-invalid-result-handle-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(turn_id), tool_call] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "ToolCall.result_handle with empty hash should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "invalid result_handle should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn tool_call_finished_at_must_be_rfc3339_when_present() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let turn_id = "agent_memory:v1:turn-for-finished-at-check";
+    let mut tool_call =
+        valid_tool_call_json("agent_memory:v1:tool-call-invalid-finished-at", turn_id);
+    tool_call
+        .as_object_mut()
+        .expect("tool call fixture should be an object")
+        .insert("finished_at".to_owned(), serde_json::json!("not-rfc3339"));
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "tool-call-invalid-finished-at",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "tool-call-invalid-finished-at-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(turn_id), tool_call] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "ToolCall.finished_at with invalid timestamp should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "invalid finished_at should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn patch_artifact_producer_session_id_must_resolve_to_agent_session() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let mut patch = patch_artifact_fixture(
+        "artifact:v1:missing-producer-session-patch",
+        "unverified",
+        &serde_json::json!({"path": "artifacts/missing-producer.diff", "inline": "diff --git a/src/lib.rs b/src/lib.rs\n"}),
+    );
+    patch
+        .as_object_mut()
+        .expect("patch fixture should be an object")
+        .insert(
+            "producer_session_id".to_owned(),
+            serde_json::json!("agent_memory:v1:missing-producer-session"),
+        );
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "patch-missing-producer-session",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "patch-missing-producer-session-key",
+            "domain": "artifact",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [patch] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "PatchArtifact.producer_session_id with missing AgentSession should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "missing producer_session_id target should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn patch_artifact_rejects_unknown_base_reason_when_base_commit_is_set() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    ingest_patch_producer_session(&metadata, "patch-known-base-producer-session-key");
+    let mut patch = patch_artifact_fixture(
+        "artifact:v1:known-base-with-unknown-reason",
+        "unverified",
+        &serde_json::json!({"path": "artifacts/known-base.diff", "inline": "diff --git a/src/lib.rs b/src/lib.rs\n"}),
+    );
+    let patch_obj = patch
+        .as_object_mut()
+        .expect("patch fixture should be an object");
+    patch_obj.insert(
+        "base_commit".to_owned(),
+        serde_json::json!("0123456789abcdef0123456789abcdef01234567"),
+    );
+    patch_obj.insert(
+        "unknown_base_reason".to_owned(),
+        serde_json::json!("unknown_base"),
+    );
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "patch-known-base-with-unknown-reason",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "patch-known-base-with-unknown-reason-key",
+            "domain": "artifact",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [patch] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "PatchArtifact with base_commit and unknown_base_reason should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "contradictory base provenance should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn invalid_syntax_patch_artifact_requires_empty_target_files() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    ingest_patch_producer_session(&metadata, "invalid-syntax-target-files-producer-session-key");
+    let mut patch = patch_artifact_fixture(
+        "artifact:v1:invalid-syntax-with-target-files",
+        "invalid_syntax",
+        &serde_json::json!({"path": "artifacts/invalid.diff", "inline": "not a diff"}),
+    );
+    patch
+        .as_object_mut()
+        .expect("patch fixture should be an object")
+        .insert("target_files".to_owned(), serde_json::json!(["src/lib.rs"]));
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "invalid-syntax-target-files",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "invalid-syntax-target-files-key",
+            "domain": "artifact",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [patch] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "invalid_syntax PatchArtifact with target_files should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "invalid_syntax target_files should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn invalid_no_base_patch_artifact_rejects_base_commit() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    ingest_patch_producer_session(&metadata, "invalid-no-base-producer-session-key");
+    let mut patch = patch_artifact_fixture(
+        "artifact:v1:invalid-no-base-with-base-commit",
+        "invalid_no_base",
+        &serde_json::json!({"path": "artifacts/invalid-no-base.diff", "inline": "diff --git a/src/lib.rs b/src/lib.rs\n"}),
+    );
+    let patch_obj = patch
+        .as_object_mut()
+        .expect("patch fixture should be an object");
+    patch_obj.insert(
+        "base_commit".to_owned(),
+        serde_json::json!("0123456789abcdef0123456789abcdef01234567"),
+    );
+    patch_obj.remove("unknown_base_reason");
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "invalid-no-base-with-base-commit",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "invalid-no-base-with-base-commit-key",
+            "domain": "artifact",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [patch] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "invalid_no_base PatchArtifact with base_commit should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "invalid_no_base base_commit should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn tool_call_and_file_edit_reject_confidence() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let tool_turn_id = "agent_memory:v1:turn-for-tool-confidence-check";
+    let mut tool_call =
+        valid_tool_call_json("agent_memory:v1:tool-call-with-confidence", tool_turn_id);
+    tool_call
+        .as_object_mut()
+        .expect("tool call fixture should be an object")
+        .insert("confidence".to_owned(), serde_json::json!("0.5"));
+
+    let tool_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "tool-call-confidence",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "tool-call-confidence-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(tool_turn_id), tool_call] }
+        }),
+    );
+    assert!(
+        !tool_response.starts_with("HTTP/1.1 200"),
+        "ToolCall with confidence should be rejected, got {tool_response}"
+    );
+
+    let file_turn_id = "agent_memory:v1:turn-for-file-confidence-check";
+    let mut file_edit =
+        valid_file_edit_json("agent_memory:v1:file-edit-with-confidence", file_turn_id);
+    file_edit
+        .as_object_mut()
+        .expect("file edit fixture should be an object")
+        .insert("confidence".to_owned(), serde_json::json!("0.5"));
+
+    let file_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "file-edit-confidence",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "file-edit-confidence-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(file_turn_id), file_edit] }
+        }),
+    );
+    assert!(
+        !file_response.starts_with("HTTP/1.1 200"),
+        "FileEdit with confidence should be rejected, got {file_response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn tool_call_requires_source_artifact_fields() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let turn_id = "agent_memory:v1:turn-for-tool-source-artifact-check";
+    let mut tool_call =
+        valid_tool_call_json("agent_memory:v1:tool-call-missing-source-artifact", turn_id);
+    let tool_obj = tool_call
+        .as_object_mut()
+        .expect("tool call fixture should be an object");
+    tool_obj.remove("source_artifact_path");
+    tool_obj.remove("source_artifact_hash");
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "tool-call-missing-source-artifact",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "tool-call-missing-source-artifact-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(turn_id), tool_call] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "ToolCall without source artifact fields should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "missing ToolCall source artifact fields should fail with missing_field, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn file_edit_requires_source_artifact_fields() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let turn_id = "agent_memory:v1:turn-for-file-source-artifact-check";
+    let mut file_edit =
+        valid_file_edit_json("agent_memory:v1:file-edit-missing-source-artifact", turn_id);
+    let file_obj = file_edit
+        .as_object_mut()
+        .expect("file edit fixture should be an object");
+    file_obj.remove("source_artifact_path");
+    file_obj.remove("source_artifact_hash");
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "file-edit-missing-source-artifact",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "file-edit-missing-source-artifact-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(turn_id), file_edit] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "FileEdit without source artifact fields should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "missing FileEdit source artifact fields should fail with missing_field, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn tool_call_completed_status_requires_finished_at() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let turn_id = "agent_memory:v1:turn-for-completed-finished-at-check";
+    let mut tool_call =
+        valid_tool_call_json("agent_memory:v1:tool-call-completed-without-finished-at", turn_id);
+    tool_call
+        .as_object_mut()
+        .expect("tool call fixture should be an object")
+        .remove("finished_at");
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "tool-call-completed-without-finished-at",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "tool-call-completed-without-finished-at-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(turn_id), tool_call] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "completed ToolCall without finished_at should be rejected, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn tool_call_interrupted_status_forbids_finished_at() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let turn_id = "agent_memory:v1:turn-for-interrupted-finished-at-check";
+    let mut tool_call =
+        valid_tool_call_json("agent_memory:v1:tool-call-interrupted-with-finished-at", turn_id);
+    tool_call
+        .as_object_mut()
+        .expect("tool call fixture should be an object")
+        .insert("status".to_owned(), serde_json::json!("interrupted"));
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "tool-call-interrupted-with-finished-at",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "tool-call-interrupted-with-finished-at-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(turn_id), tool_call] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "interrupted ToolCall with finished_at should be rejected, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn file_edit_create_and_delete_forbid_opposite_side_hashes() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let create_turn_id = "agent_memory:v1:turn-for-create-opposite-hash-check";
+    let mut create_edit =
+        valid_file_edit_json("agent_memory:v1:file-edit-create-with-before-hash", create_turn_id);
+    create_edit
+        .as_object_mut()
+        .expect("file edit fixture should be an object")
+        .insert("edit_kind".to_owned(), serde_json::json!("create"));
+    let create_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "file-edit-create-with-before-hash",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "file-edit-create-with-before-hash-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(create_turn_id), create_edit] }
+        }),
+    );
+    assert!(
+        !create_response.starts_with("HTTP/1.1 200"),
+        "FileEdit create with before_hash should be rejected, got {create_response}"
+    );
+
+    let delete_turn_id = "agent_memory:v1:turn-for-delete-opposite-hash-check";
+    let mut delete_edit =
+        valid_file_edit_json("agent_memory:v1:file-edit-delete-with-after-hash", delete_turn_id);
+    delete_edit
+        .as_object_mut()
+        .expect("file edit fixture should be an object")
+        .insert("edit_kind".to_owned(), serde_json::json!("delete"));
+    let delete_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "file-edit-delete-with-after-hash",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "file-edit-delete-with-after-hash-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(delete_turn_id), delete_edit] }
+        }),
+    );
+    assert!(
+        !delete_response.starts_with("HTTP/1.1 200"),
+        "FileEdit delete with after_hash should be rejected, got {delete_response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn file_edit_rename_to_forbidden_unless_edit_kind_is_rename() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let turn_id = "agent_memory:v1:file-edit-rename-to-non-rename-turn";
+    let mut file_edit =
+        valid_file_edit_json("agent_memory:v1:file-edit-modify-with-rename-to", turn_id);
+    file_edit
+        .as_object_mut()
+        .expect("file edit fixture should be an object")
+        .insert("rename_to".to_owned(), serde_json::json!("src/new_lib.rs"));
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "file-edit-rename-to-non-rename",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "file-edit-rename-to-non-rename-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(turn_id), file_edit] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "FileEdit modify with rename_to should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "rename_to on non-rename FileEdit should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn artifact_patch_records_can_supersede_artifact_patches() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    ingest_patch_producer_session(&metadata, "artifact-supersedes-producer-session-key");
+    let prior_patch = patch_artifact_fixture(
+        "artifact:v1:prior-patch-to-supersede",
+        "invalid_syntax",
+        &serde_json::json!({"path": "artifacts/prior.diff", "inline": "not a diff"}),
+    );
+    let replacement_patch = patch_artifact_fixture(
+        "artifact:v1:replacement-patch-supersedes-prior",
+        "unverified",
+        &serde_json::json!({"path": "artifacts/replacement.diff", "inline": "diff --git a/src/lib.rs b/src/lib.rs\n"}),
+    );
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "artifact-patch-supersedes",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "artifact-patch-supersedes-key",
+            "domain": "artifact",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    prior_patch,
+                    replacement_patch,
+                    {
+                        "record_type": "edge",
+                        "id": "artifact:v1:replacement-supersedes-prior-edge",
+                        "schema_version": 1,
+                        "label": "SUPERSEDES",
+                        "source": "artifact:v1:replacement-patch-supersedes-prior",
+                        "target": "artifact:v1:prior-patch-to-supersede",
+                        "summary": "Replacement patch supersedes prior patch"
+                    }
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "artifact-domain PatchArtifact SUPERSEDES edge should be accepted, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn artifact_domain_edge_rejects_unsupported_labels() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    ingest_patch_producer_session(&metadata, "artifact-unsupported-label-producer-session-key");
+    let source_patch = patch_artifact_fixture(
+        "artifact:v1:unsupported-label-source-patch",
+        "invalid_syntax",
+        &serde_json::json!({"path": "artifacts/source.diff", "inline": "not a diff"}),
+    );
+    let target_patch = patch_artifact_fixture(
+        "artifact:v1:unsupported-label-target-patch",
+        "unverified",
+        &serde_json::json!({"path": "artifacts/target.diff", "inline": "diff --git a/src/lib.rs b/src/lib.rs\n"}),
+    );
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "artifact-unsupported-label-edge",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "artifact-unsupported-label-edge-key",
+            "domain": "artifact",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    source_patch,
+                    target_patch,
+                    {
+                        "record_type": "edge",
+                        "id": "artifact:v1:unsupported-contains-edge",
+                        "schema_version": 1,
+                        "label": "CONTAINS",
+                        "source": "artifact:v1:unsupported-label-source-patch",
+                        "target": "artifact:v1:unsupported-label-target-patch",
+                        "summary": "Unsupported artifact edge label"
+                    }
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "artifact-domain edge with unsupported label should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "unsupported artifact edge label should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn verification_touched_file_evidence_links_accept_verification_sources() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let touched_file_id = "codegraph:v3:verification-touched-file-target";
+    {
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        let touched_file = GraphRecord::node(
+            touched_file_id.to_owned(),
+            NodeKind::File,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("src/lib.rs".to_owned()),
+            "verification touched file target".to_owned(),
+        );
+        sink.write_record(&touched_file)
+            .expect("touched file target should pre-seed");
+        sink.persist_indexes()
+            .expect("pre-seeded touched file target should persist");
+    }
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "verification-touched-file-link",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "verification-touched-file-link-key",
+            "domain": "verification",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    {
+                        "record_type": "node",
+                        "id": "verification:v1:test-run-touched-file-source",
+                        "kind": "TestRun",
+                        "schema_version": 1,
+                        "domain": "verification",
+                        "summary": "TestRun touched file source",
+                        "source_artifact_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+                        "executed_at": "2026-05-22T00:00:00Z",
+                        "evidence_links": [
+                            {
+                                "relation": "TOUCHED_FILE",
+                                "target_domain": "codegraph",
+                                "target_record_id": touched_file_id,
+                                "confidence": "1.0"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "verification TestRun TOUCHED_FILE evidence link should be accepted, got {response}"
     );
 
     daemon.stop();
@@ -3595,10 +5369,9 @@ fn verification_command_run_oversized_inline_rejected() {
         "CommandRun with oversized stdout_handle.inline should be rejected, got {reject_response}"
     );
     let reject_body = response_json(&reject_response);
-    assert!(
-        reject_body["error"]["code"] == "bad_request"
-            || reject_body["error"]["code"] == "payload_too_large",
-        "oversized inline stdout rejection must carry bad_request or payload_too_large, got {reject_body}"
+    assert_eq!(
+        reject_body["error"]["code"], "inline_payload_exceeds_ceiling",
+        "oversized inline stdout rejection must carry inline_payload_exceeds_ceiling, got {reject_body}"
     );
 
     // Accept when inline demoted to null (handle-only)
@@ -3774,9 +5547,9 @@ fn verification_spoofed_bytes_oversized_inline_rejected() {
         "spoofed bytes with oversized inline should be rejected; got {response}"
     );
     let body = response_json(&response);
-    assert!(
-        body["error"]["code"] == "bad_request" || body["error"]["code"] == "payload_too_large",
-        "spoofed bytes rejection must carry bad_request or payload_too_large, got {body}"
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "spoofed bytes rejection must carry bad_request, got {body}"
     );
 
     daemon.stop();
