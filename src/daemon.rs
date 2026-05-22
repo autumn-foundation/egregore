@@ -1657,6 +1657,9 @@ fn validate_artifact_domain_records(
     records: &[GraphRecord],
     sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
 ) -> WriteResult<()> {
+    let sink_guard = sink
+        .read()
+        .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
     for record in records {
         let GraphRecord::Node {
             id,
@@ -1718,15 +1721,28 @@ fn validate_artifact_domain_records(
                 PATCH_STATUS_VALUES.join(", ")
             )));
         }
-        if base_commit.as_deref().is_none_or(str::is_empty)
-            && unknown_base_reason.as_deref() != Some("unknown_base")
+        let has_base_commit = base_commit.as_deref().is_some_and(|commit| !commit.is_empty());
+        if has_base_commit
+            && unknown_base_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.is_empty())
         {
+            return Err(ApiError::bad_request(
+                "PatchArtifact.unknown_base_reason must be null when base_commit is set",
+            ));
+        }
+        if !has_base_commit && unknown_base_reason.as_deref() != Some("unknown_base") {
             return Err(ApiError::missing_field(
                 "unknown_base_reason (required when base_commit is null)",
             ));
         }
-        if target_files.is_none() {
-            return Err(ApiError::missing_field("target_files"));
+        let target_files = target_files
+            .as_ref()
+            .ok_or_else(|| ApiError::missing_field("target_files"))?;
+        if status == "invalid_syntax" && !target_files.is_empty() {
+            return Err(ApiError::bad_request(
+                "PatchArtifact.target_files must be empty when patch_status is invalid_syntax",
+            ));
         }
         required_str(patch_bytes_hash.as_deref(), "patch_bytes_hash")?;
         let patch_bytes_size =
@@ -1754,7 +1770,14 @@ fn validate_artifact_domain_records(
         required_str(validation_summary.as_deref(), "validation_summary")?;
         required_str(source_artifact_path.as_deref(), "source_artifact_path")?;
         required_str(source_artifact_hash.as_deref(), "source_artifact_hash")?;
-        required_str(producer_session_id.as_deref(), "producer_session_id")?;
+        let producer_session_id =
+            required_str(producer_session_id.as_deref(), "producer_session_id")?;
+        validate_agent_session_ref(
+            "PatchArtifact.producer_session_id",
+            producer_session_id,
+            records,
+            &sink_guard,
+        )?;
         let valid_time = required_str(valid_time.as_deref(), "valid_time")?;
         if DateTime::parse_from_rfc3339(valid_time).is_err() {
             return Err(ApiError::bad_request(format!(
@@ -1774,9 +1797,6 @@ fn validate_artifact_domain_records(
         }
     }
 
-    let sink = sink
-        .read()
-        .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
     for record in records {
         let GraphRecord::Node {
             id,
@@ -1787,7 +1807,7 @@ fn validate_artifact_domain_records(
         else {
             continue;
         };
-        match sink.read_back(id) {
+        match sink_guard.read_back(id) {
             Ok(Some(GraphRecord::Node {
                 kind: NodeKind::PatchArtifact,
                 patch_status: Some(existing_status),
@@ -1864,12 +1884,16 @@ fn validate_agent_action_record(
         after_hash,
         rename_to,
         hunk_count,
+        linked_patch_id,
         linked_turn_id,
         tool_name,
         tool_kind,
         arguments_summary,
         arguments_handle,
+        result_handle,
+        produced_evidence_id,
         started_at,
+        finished_at,
         status,
         ..
     } = record
@@ -1886,7 +1910,10 @@ fn validate_agent_action_record(
             tool_kind.as_deref(),
             arguments_summary.as_deref(),
             arguments_handle.as_deref(),
+            result_handle.as_deref(),
+            produced_evidence_id.as_deref(),
             started_at.as_deref(),
+            finished_at.as_deref(),
             status.as_deref(),
             records,
             sink,
@@ -1900,6 +1927,7 @@ fn validate_agent_action_record(
             after_hash.as_deref(),
             rename_to.as_deref(),
             *hunk_count,
+            linked_patch_id.as_deref(),
             linked_turn_id.as_deref(),
             records,
             sink,
@@ -1917,7 +1945,10 @@ fn validate_tool_call_record(
     tool_kind: Option<&str>,
     arguments_summary: Option<&str>,
     arguments_handle: Option<&OutputHandle>,
+    result_handle: Option<&OutputHandle>,
+    produced_evidence_id: Option<&str>,
     started_at: Option<&str>,
+    finished_at: Option<&str>,
     status: Option<&str>,
     records: &[GraphRecord],
     sink: &EmbeddedAletheiaSink,
@@ -1938,6 +1969,19 @@ fn validate_tool_call_record(
     let arguments_handle = arguments_handle
         .ok_or_else(|| ApiError::missing_field("arguments_handle (required for ToolCall nodes)"))?;
     validate_agent_action_output_handle("ToolCall.arguments_handle", arguments_handle)?;
+    if let Some(result_handle) = result_handle {
+        validate_agent_action_output_handle("ToolCall.result_handle", result_handle)?;
+    }
+    if let Some(produced_evidence_id) = produced_evidence_id {
+        let produced_evidence_id =
+            required_str(Some(produced_evidence_id), "produced_evidence_id")?;
+        validate_verification_evidence_ref(
+            "ToolCall.produced_evidence_id",
+            produced_evidence_id,
+            records,
+            sink,
+        )?;
+    }
     let linked_turn_id =
         required_str(linked_turn_id, "linked_turn_id (required for ToolCall nodes)")?;
     validate_agent_turn_ref("ToolCall.linked_turn_id", linked_turn_id, records, sink)?;
@@ -1946,6 +1990,14 @@ fn validate_tool_call_record(
         return Err(ApiError::bad_request(format!(
             "ToolCall.started_at '{started_at}' is not a valid RFC 3339 timestamp"
         )));
+    }
+    if let Some(finished_at) = finished_at {
+        let finished_at = required_str(Some(finished_at), "finished_at")?;
+        if DateTime::parse_from_rfc3339(finished_at).is_err() {
+            return Err(ApiError::bad_request(format!(
+                "ToolCall.finished_at '{finished_at}' is not a valid RFC 3339 timestamp"
+            )));
+        }
     }
     let status = required_str(status, "status (required for ToolCall nodes)")?;
     if !TOOL_STATUS_VALUES.contains(&status) {
@@ -1970,6 +2022,7 @@ fn validate_file_edit_record(
     after_hash: Option<&str>,
     rename_to: Option<&str>,
     hunk_count: Option<u32>,
+    linked_patch_id: Option<&str>,
     linked_turn_id: Option<&str>,
     records: &[GraphRecord],
     sink: &EmbeddedAletheiaSink,
@@ -2005,6 +2058,15 @@ fn validate_file_edit_record(
         _ => {}
     }
     hunk_count.ok_or_else(|| ApiError::missing_field("hunk_count (required for FileEdit nodes)"))?;
+    if let Some(linked_patch_id) = linked_patch_id {
+        let linked_patch_id = required_str(Some(linked_patch_id), "linked_patch_id")?;
+        validate_patch_artifact_ref(
+            "FileEdit.linked_patch_id",
+            linked_patch_id,
+            records,
+            sink,
+        )?;
+    }
     let linked_turn_id =
         required_str(linked_turn_id, "linked_turn_id (required for FileEdit nodes)")?;
     validate_agent_turn_ref("FileEdit.linked_turn_id", linked_turn_id, records, sink)?;
@@ -2032,19 +2094,90 @@ fn validate_agent_turn_ref(
     records: &[GraphRecord],
     sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<()> {
-    if !value.starts_with("agent_memory:v1:") {
+    validate_record_kind_ref(
+        field,
+        value,
+        "agent_memory:v1:",
+        "AgentTurn",
+        &[NodeKind::AgentTurn],
+        records,
+        sink,
+    )
+}
+
+fn validate_agent_session_ref(
+    field: &'static str,
+    value: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    validate_record_kind_ref(
+        field,
+        value,
+        "agent_memory:v1:",
+        "AgentSession",
+        &[NodeKind::AgentSession],
+        records,
+        sink,
+    )
+}
+
+fn validate_verification_evidence_ref(
+    field: &'static str,
+    value: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    validate_record_kind_ref(
+        field,
+        value,
+        "verification:v1:",
+        "CommandRun or TestRun",
+        &[NodeKind::CommandRun, NodeKind::TestRun],
+        records,
+        sink,
+    )
+}
+
+fn validate_patch_artifact_ref(
+    field: &'static str,
+    value: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    validate_record_kind_ref(
+        field,
+        value,
+        "artifact:v1:",
+        "PatchArtifact",
+        &[NodeKind::PatchArtifact],
+        records,
+        sink,
+    )
+}
+
+fn validate_record_kind_ref(
+    field: &'static str,
+    value: &str,
+    expected_prefix: &'static str,
+    expected_kind: &'static str,
+    allowed_kinds: &[NodeKind],
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    if !value.starts_with(expected_prefix) {
         return Err(ApiError::bad_request(format!(
-            "{field} must reference an agent_memory:v1: AgentTurn; got '{value}'"
+            "{field} must reference a {expected_prefix} {expected_kind}; got '{value}'"
         )));
     }
     match lookup_node_kind(value, records, sink)? {
-        Some(NodeKind::AgentTurn) => Ok(()),
+        Some(kind) if allowed_kinds.contains(&kind) => Ok(()),
         Some(kind) => Err(ApiError::bad_request(format!(
-            "{field} must reference an agent_memory:v1: AgentTurn; target '{value}' has kind {}",
+            "{field} must reference a {expected_prefix} {expected_kind}; target '{value}' has kind {}",
             kind.as_str()
         ))),
         None => Err(ApiError::bad_request(format!(
-            "{field} must reference an existing agent_memory:v1: AgentTurn; target '{value}' was not found"
+            "{field} must reference an existing {expected_prefix} {expected_kind}; target '{value}' was not found"
         ))),
     }
 }
