@@ -480,6 +480,8 @@ fn emit_command_action(
         agent_memory_stable_id(&["node", "tool_call", turn_id, &action_idx.to_string()]);
     let cmd_run_id =
         agent_memory_stable_id(&["node", "command_run", turn_id, &action_idx.to_string()]);
+    let status = tool_status(this_exit);
+    let action_timestamp = timestamp.unwrap_or(&ctx.default_timestamp);
 
     // ── ToolCall ──────────────────────────────────────────────────────────────
     graph.push(make_node(
@@ -496,7 +498,9 @@ fn emit_command_action(
             arguments_summary: Some(redacted_cmd.to_owned()),
             arguments_handle: Some(Box::new(output_handle(redacted_cmd))),
             started_at: timestamp.map(str::to_owned),
-            status: Some(tool_status(this_exit).to_owned()),
+            finished_at: matches!(status, "succeeded" | "failed")
+                .then(|| action_timestamp.to_owned()),
+            status: Some(status.to_owned()),
             ..Default::default()
         },
     ));
@@ -877,6 +881,7 @@ struct NodeExtra {
     arguments_summary: Option<String>,
     arguments_handle: Option<Box<OutputHandle>>,
     started_at: Option<String>,
+    finished_at: Option<String>,
     status: Option<String>,
 }
 
@@ -953,7 +958,7 @@ fn make_node(
         started_at: extra
             .started_at
             .or_else(|| Some(ctx.default_timestamp.clone())),
-        finished_at: None,
+        finished_at: extra.finished_at,
         failure_kind: extra.failure_kind,
         exit_code: extra.exit_code,
         turn_index: extra.turn_index,

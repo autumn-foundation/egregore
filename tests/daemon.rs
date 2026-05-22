@@ -2035,6 +2035,8 @@ fn valid_tool_call_json(id: &str, linked_turn_id: &str) -> serde_json::Value {
         "observed_at": "2026-05-22T00:00:00Z",
         "ingested_at": "2026-05-22T00:00:00Z",
         "summary": "ToolCall fixture",
+        "source_artifact_path": "fixtures/session.traj",
+        "source_artifact_hash": "1111111111111111111111111111111111111111111111111111111111111111",
         "linked_turn_id": linked_turn_id,
         "tool_name": "Bash",
         "tool_kind": "bash",
@@ -2045,6 +2047,7 @@ fn valid_tool_call_json(id: &str, linked_turn_id: &str) -> serde_json::Value {
             "inline": "cargo test"
         },
         "started_at": "2026-05-22T00:00:00Z",
+        "finished_at": "2026-05-22T00:00:01Z",
         "status": "succeeded"
     })
 }
@@ -2062,6 +2065,8 @@ fn valid_file_edit_json(id: &str, linked_turn_id: &str) -> serde_json::Value {
         "observed_at": "2026-05-22T00:00:00Z",
         "ingested_at": "2026-05-22T00:00:00Z",
         "summary": "FileEdit fixture",
+        "source_artifact_path": "fixtures/session.traj",
+        "source_artifact_hash": "1111111111111111111111111111111111111111111111111111111111111111",
         "repo_relative_path": "src/lib.rs",
         "edit_kind": "modify",
         "before_hash": "3333333333333333333333333333333333333333333333333333333333333333",
@@ -3606,6 +3611,8 @@ fn linked_turn_id_must_resolve_to_agent_turn() {
                     "observed_at": "2026-05-22T00:00:00Z",
                     "ingested_at": "2026-05-22T00:00:00Z",
                     "summary": "ToolCall linked to wrong node kind",
+                    "source_artifact_path": "fixtures/session.traj",
+                    "source_artifact_hash": "1111111111111111111111111111111111111111111111111111111111111111",
                     "linked_turn_id": "agent_memory:v1:not-a-turn-session",
                     "tool_name": "Bash",
                     "tool_kind": "bash",
@@ -3616,6 +3623,7 @@ fn linked_turn_id_must_resolve_to_agent_turn() {
                         "inline": "cargo test"
                     },
                     "started_at": "2026-05-22T00:00:00Z",
+                    "finished_at": "2026-05-22T00:00:01Z",
                     "status": "succeeded"
                 }]
             }
@@ -4011,6 +4019,347 @@ fn invalid_syntax_patch_artifact_requires_empty_target_files() {
     assert_eq!(
         body["error"]["code"], "bad_request",
         "invalid_syntax target_files should fail with bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn tool_call_and_file_edit_reject_confidence() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let tool_turn_id = "agent_memory:v1:turn-for-tool-confidence-check";
+    let mut tool_call =
+        valid_tool_call_json("agent_memory:v1:tool-call-with-confidence", tool_turn_id);
+    tool_call
+        .as_object_mut()
+        .expect("tool call fixture should be an object")
+        .insert("confidence".to_owned(), serde_json::json!("0.5"));
+
+    let tool_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "tool-call-confidence",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "tool-call-confidence-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(tool_turn_id), tool_call] }
+        }),
+    );
+    assert!(
+        !tool_response.starts_with("HTTP/1.1 200"),
+        "ToolCall with confidence should be rejected, got {tool_response}"
+    );
+
+    let file_turn_id = "agent_memory:v1:turn-for-file-confidence-check";
+    let mut file_edit =
+        valid_file_edit_json("agent_memory:v1:file-edit-with-confidence", file_turn_id);
+    file_edit
+        .as_object_mut()
+        .expect("file edit fixture should be an object")
+        .insert("confidence".to_owned(), serde_json::json!("0.5"));
+
+    let file_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "file-edit-confidence",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "file-edit-confidence-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(file_turn_id), file_edit] }
+        }),
+    );
+    assert!(
+        !file_response.starts_with("HTTP/1.1 200"),
+        "FileEdit with confidence should be rejected, got {file_response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn tool_call_requires_source_artifact_fields() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let turn_id = "agent_memory:v1:turn-for-tool-source-artifact-check";
+    let mut tool_call =
+        valid_tool_call_json("agent_memory:v1:tool-call-missing-source-artifact", turn_id);
+    let tool_obj = tool_call
+        .as_object_mut()
+        .expect("tool call fixture should be an object");
+    tool_obj.remove("source_artifact_path");
+    tool_obj.remove("source_artifact_hash");
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "tool-call-missing-source-artifact",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "tool-call-missing-source-artifact-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(turn_id), tool_call] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "ToolCall without source artifact fields should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "missing ToolCall source artifact fields should fail with missing_field, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn file_edit_requires_source_artifact_fields() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let turn_id = "agent_memory:v1:turn-for-file-source-artifact-check";
+    let mut file_edit =
+        valid_file_edit_json("agent_memory:v1:file-edit-missing-source-artifact", turn_id);
+    let file_obj = file_edit
+        .as_object_mut()
+        .expect("file edit fixture should be an object");
+    file_obj.remove("source_artifact_path");
+    file_obj.remove("source_artifact_hash");
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "file-edit-missing-source-artifact",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "file-edit-missing-source-artifact-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(turn_id), file_edit] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "FileEdit without source artifact fields should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "missing FileEdit source artifact fields should fail with missing_field, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn tool_call_completed_status_requires_finished_at() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let turn_id = "agent_memory:v1:turn-for-completed-finished-at-check";
+    let mut tool_call =
+        valid_tool_call_json("agent_memory:v1:tool-call-completed-without-finished-at", turn_id);
+    tool_call
+        .as_object_mut()
+        .expect("tool call fixture should be an object")
+        .remove("finished_at");
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "tool-call-completed-without-finished-at",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "tool-call-completed-without-finished-at-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(turn_id), tool_call] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "completed ToolCall without finished_at should be rejected, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn tool_call_interrupted_status_forbids_finished_at() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let turn_id = "agent_memory:v1:turn-for-interrupted-finished-at-check";
+    let mut tool_call =
+        valid_tool_call_json("agent_memory:v1:tool-call-interrupted-with-finished-at", turn_id);
+    tool_call
+        .as_object_mut()
+        .expect("tool call fixture should be an object")
+        .insert("status".to_owned(), serde_json::json!("interrupted"));
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "tool-call-interrupted-with-finished-at",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "tool-call-interrupted-with-finished-at-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(turn_id), tool_call] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "interrupted ToolCall with finished_at should be rejected, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn file_edit_create_and_delete_forbid_opposite_side_hashes() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let create_turn_id = "agent_memory:v1:turn-for-create-opposite-hash-check";
+    let mut create_edit =
+        valid_file_edit_json("agent_memory:v1:file-edit-create-with-before-hash", create_turn_id);
+    create_edit
+        .as_object_mut()
+        .expect("file edit fixture should be an object")
+        .insert("edit_kind".to_owned(), serde_json::json!("create"));
+    let create_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "file-edit-create-with-before-hash",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "file-edit-create-with-before-hash-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(create_turn_id), create_edit] }
+        }),
+    );
+    assert!(
+        !create_response.starts_with("HTTP/1.1 200"),
+        "FileEdit create with before_hash should be rejected, got {create_response}"
+    );
+
+    let delete_turn_id = "agent_memory:v1:turn-for-delete-opposite-hash-check";
+    let mut delete_edit =
+        valid_file_edit_json("agent_memory:v1:file-edit-delete-with-after-hash", delete_turn_id);
+    delete_edit
+        .as_object_mut()
+        .expect("file edit fixture should be an object")
+        .insert("edit_kind".to_owned(), serde_json::json!("delete"));
+    let delete_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "file-edit-delete-with-after-hash",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "file-edit-delete-with-after-hash-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": [agent_turn_json(delete_turn_id), delete_edit] }
+        }),
+    );
+    assert!(
+        !delete_response.starts_with("HTTP/1.1 200"),
+        "FileEdit delete with after_hash should be rejected, got {delete_response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn artifact_patch_records_can_supersede_artifact_patches() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    ingest_patch_producer_session(&metadata, "artifact-supersedes-producer-session-key");
+    let prior_patch = patch_artifact_fixture(
+        "artifact:v1:prior-patch-to-supersede",
+        "invalid_syntax",
+        &serde_json::json!({"path": "artifacts/prior.diff", "inline": "not a diff"}),
+    );
+    let replacement_patch = patch_artifact_fixture(
+        "artifact:v1:replacement-patch-supersedes-prior",
+        "unverified",
+        &serde_json::json!({"path": "artifacts/replacement.diff", "inline": "diff --git a/src/lib.rs b/src/lib.rs\n"}),
+    );
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "artifact-patch-supersedes",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "artifact-patch-supersedes-key",
+            "domain": "artifact",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    prior_patch,
+                    replacement_patch,
+                    {
+                        "record_type": "edge",
+                        "id": "artifact:v1:replacement-supersedes-prior-edge",
+                        "schema_version": 1,
+                        "label": "SUPERSEDES",
+                        "source": "artifact:v1:replacement-patch-supersedes-prior",
+                        "target": "artifact:v1:prior-patch-to-supersede",
+                        "summary": "Replacement patch supersedes prior patch"
+                    }
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "artifact-domain PatchArtifact SUPERSEDES edge should be accepted, got {response}"
     );
 
     daemon.stop();

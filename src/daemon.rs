@@ -1884,6 +1884,8 @@ fn validate_agent_action_record(
         after_hash,
         rename_to,
         hunk_count,
+        source_artifact_path,
+        source_artifact_hash,
         linked_patch_id,
         linked_turn_id,
         tool_name,
@@ -1905,6 +1907,8 @@ fn validate_agent_action_record(
         NodeKind::ToolCall => validate_tool_call_record(
             id,
             domain.as_deref(),
+            source_artifact_path.as_deref(),
+            source_artifact_hash.as_deref(),
             linked_turn_id.as_deref(),
             tool_name.as_deref(),
             tool_kind.as_deref(),
@@ -1921,6 +1925,8 @@ fn validate_agent_action_record(
         NodeKind::FileEdit => validate_file_edit_record(
             id,
             domain.as_deref(),
+            source_artifact_path.as_deref(),
+            source_artifact_hash.as_deref(),
             repo_relative_path.as_deref(),
             edit_kind.as_deref(),
             before_hash.as_deref(),
@@ -1940,6 +1946,8 @@ fn validate_agent_action_record(
 fn validate_tool_call_record(
     id: &str,
     domain: Option<&str>,
+    source_artifact_path: Option<&str>,
+    source_artifact_hash: Option<&str>,
     linked_turn_id: Option<&str>,
     tool_name: Option<&str>,
     tool_kind: Option<&str>,
@@ -1954,6 +1962,7 @@ fn validate_tool_call_record(
     sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<()> {
     validate_agent_action_domain("ToolCall", domain)?;
+    validate_agent_action_source_artifact("ToolCall", source_artifact_path, source_artifact_hash)?;
     required_str(tool_name, "tool_name (required for ToolCall nodes)")?;
     let tool_kind = required_str(tool_kind, "tool_kind (required for ToolCall nodes)")?;
     if !TOOL_KIND_VALUES.contains(&tool_kind) {
@@ -1991,14 +2000,6 @@ fn validate_tool_call_record(
             "ToolCall.started_at '{started_at}' is not a valid RFC 3339 timestamp"
         )));
     }
-    if let Some(finished_at) = finished_at {
-        let finished_at = required_str(Some(finished_at), "finished_at")?;
-        if DateTime::parse_from_rfc3339(finished_at).is_err() {
-            return Err(ApiError::bad_request(format!(
-                "ToolCall.finished_at '{finished_at}' is not a valid RFC 3339 timestamp"
-            )));
-        }
-    }
     let status = required_str(status, "status (required for ToolCall nodes)")?;
     if !TOOL_STATUS_VALUES.contains(&status) {
         return Err(ApiError::bad_request(format!(
@@ -2006,6 +2007,7 @@ fn validate_tool_call_record(
             TOOL_STATUS_VALUES.join(", ")
         )));
     }
+    validate_tool_call_finished_at(status, finished_at)?;
     if id.is_empty() {
         return Err(ApiError::missing_field("id"));
     }
@@ -2016,6 +2018,8 @@ fn validate_tool_call_record(
 fn validate_file_edit_record(
     id: &str,
     domain: Option<&str>,
+    source_artifact_path: Option<&str>,
+    source_artifact_hash: Option<&str>,
     repo_relative_path: Option<&str>,
     edit_kind: Option<&str>,
     before_hash: Option<&str>,
@@ -2028,6 +2032,7 @@ fn validate_file_edit_record(
     sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<()> {
     validate_agent_action_domain("FileEdit", domain)?;
+    validate_agent_action_source_artifact("FileEdit", source_artifact_path, source_artifact_hash)?;
     required_str(
         repo_relative_path,
         "repo_relative_path (required for FileEdit nodes)",
@@ -2041,10 +2046,20 @@ fn validate_file_edit_record(
     }
     match edit_kind {
         "create" => {
+            if before_hash.is_some() {
+                return Err(ApiError::bad_request(
+                    "FileEdit.before_hash must be null or omitted when edit_kind is create",
+                ));
+            }
             required_str(after_hash, "after_hash (required for FileEdit create nodes)")?;
         }
         "delete" => {
             required_str(before_hash, "before_hash (required for FileEdit delete nodes)")?;
+            if after_hash.is_some() {
+                return Err(ApiError::bad_request(
+                    "FileEdit.after_hash must be null or omitted when edit_kind is delete",
+                ));
+            }
         }
         "modify" => {
             required_str(before_hash, "before_hash (required for FileEdit modify nodes)")?;
@@ -2086,6 +2101,56 @@ fn validate_agent_action_domain(kind: &'static str, domain: Option<&str>) -> Wri
             "domain (required for {kind} nodes)"
         ))),
     }
+}
+
+fn validate_agent_action_source_artifact(
+    _kind: &'static str,
+    source_artifact_path: Option<&str>,
+    source_artifact_hash: Option<&str>,
+) -> WriteResult<()> {
+    required_str(
+        source_artifact_path,
+        "source_artifact_path (required for agent-action nodes)",
+    )?;
+    required_str(
+        source_artifact_hash,
+        "source_artifact_hash (required for agent-action nodes)",
+    )?;
+    Ok(())
+}
+
+fn validate_tool_call_finished_at(status: &str, finished_at: Option<&str>) -> WriteResult<()> {
+    match status {
+        "succeeded" | "failed" => {
+            let finished_at = required_str(
+                finished_at,
+                "finished_at (required for completed ToolCall nodes)",
+            )?;
+            if DateTime::parse_from_rfc3339(finished_at).is_err() {
+                return Err(ApiError::bad_request(format!(
+                    "ToolCall.finished_at '{finished_at}' is not a valid RFC 3339 timestamp"
+                )));
+            }
+        }
+        "interrupted" => {
+            if finished_at.is_some() {
+                return Err(ApiError::bad_request(
+                    "ToolCall.finished_at must be null or omitted when status is interrupted",
+                ));
+            }
+        }
+        _ => {
+            if let Some(finished_at) = finished_at {
+                let finished_at = required_str(Some(finished_at), "finished_at")?;
+                if DateTime::parse_from_rfc3339(finished_at).is_err() {
+                    return Err(ApiError::bad_request(format!(
+                        "ToolCall.finished_at '{finished_at}' is not a valid RFC 3339 timestamp"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_agent_turn_ref(
@@ -2834,12 +2899,44 @@ fn validate_and_synthesize_evidence_edges(
             // agent-memory envelope and its cross-domain checks, not the codegraph path.
             if let GraphRecord::Edge { id, label, .. } = record
                 && !id.starts_with("agent_memory:v1:")
+                && !(id.starts_with("artifact:v1:") && *label == EdgeLabel::Supersedes)
                 && label.is_evidence_link_label()
             {
                 return Err(ApiError::bad_request(format!(
                     "edge '{id}' uses evidence-link label '{}' but is not an agent_memory:v1: edge; evidence relations are only permitted on agent-memory edges",
                     label.as_str()
                 )));
+            }
+            if let GraphRecord::Edge {
+                id,
+                label: EdgeLabel::Supersedes,
+                source,
+                target,
+                schema_version,
+                ..
+            } = record
+                && id.starts_with("artifact:v1:")
+            {
+                if *schema_version != ARTIFACT_SCHEMA_VERSION {
+                    return Err(ApiError::bad_request(format!(
+                        "artifact edge '{id}' has schema_version {schema_version} but only version {ARTIFACT_SCHEMA_VERSION} is accepted"
+                    )));
+                }
+                if !source.starts_with("artifact:v1:") || !target.starts_with("artifact:v1:") {
+                    return Err(ApiError::bad_request(format!(
+                        "artifact SUPERSEDES edge '{id}' requires artifact:v1: source and target; got source '{source}' target '{target}'"
+                    )));
+                }
+                let source_kind = lookup_node_kind(source, records, &sink_guard)?;
+                let target_kind = lookup_node_kind(target, records, &sink_guard)?;
+                if !matches!(
+                    (source_kind, target_kind),
+                    (Some(NodeKind::PatchArtifact), Some(NodeKind::PatchArtifact))
+                ) {
+                    return Err(ApiError::bad_request(format!(
+                        "artifact SUPERSEDES edge '{id}' requires PatchArtifact source and target"
+                    )));
+                }
             }
             // Validate directly submitted agent-memory edge records.
             if let GraphRecord::Edge {
@@ -3058,6 +3155,14 @@ fn validate_and_synthesize_evidence_edges(
                         return Err(ApiError::missing_field(
                             "confidence (required for Observation nodes)",
                         ));
+                    }
+                    if matches!(kind, NodeKind::ToolCall | NodeKind::FileEdit)
+                        && confidence.as_ref().is_some_and(|s| !s.is_empty())
+                    {
+                        return Err(ApiError::bad_request(format!(
+                            "{} nodes must not carry confidence",
+                            kind.as_str()
+                        )));
                     }
                     // Validate confidence format when present (applies to all kinds).
                     if let Some(conf_str) = confidence.as_deref().filter(|s| !s.is_empty()) {

@@ -308,8 +308,12 @@ removing a label is a schema version bump.
 | `EXPLAINS_CHANGE` | `agent_memory` | `codegraph` | `Observation`, `Decision` | `Commit`, `Change` | many:many | yes |
 | `REFERENCES_TASK` | `agent_memory` | `project` | any agent-memory | `Task` | many:many | no |
 | `CONTRADICTS` | `agent_memory`, `verification` | any | any | any | many:many | yes |
-| `SUPERSEDES` | `agent_memory` | `agent_memory` | any agent-memory | any agent-memory | many:1 | no |
+| `SUPERSEDES` | `agent_memory`, `artifact` | `agent_memory`, `artifact` | any agent-memory, `PatchArtifact` | any agent-memory, `PatchArtifact` | many:1 | no |
 | `RELATES_TO` | any | any | any | any | many:many | no |
+
+For the `artifact` domain, `SUPERSEDES` is restricted to `PatchArtifact` ->
+`PatchArtifact`; it represents a replacement patch preserving the pinned
+validity result of the prior artifact.
 
 ### 6b — Code-graph-internal edges
 
