@@ -3174,6 +3174,227 @@ fn produced_patch_evidence_link_requires_artifact_id_target() {
 }
 
 #[test]
+fn failed_on_evidence_link_accepts_legacy_agent_memory_patch_target() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let legacy_patch_id = "agent_memory:v1:legacy-patch-failed-on-target";
+    {
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        let legacy_patch = GraphRecord::node(
+            legacy_patch_id.to_owned(),
+            NodeKind::PatchArtifact,
+            None,
+            None,
+            None,
+            "legacy agent-memory PatchArtifact failure target".to_owned(),
+        );
+        sink.write_record(&legacy_patch)
+            .expect("legacy patch target should pre-seed");
+        sink.persist_indexes()
+            .expect("pre-seeded target should persist");
+    }
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "failed-on-legacy-agent-memory-patch",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "failed-on-legacy-agent-memory-patch-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "agent_memory:v1:failed-on-legacy-source",
+                    "kind": "Failure",
+                    "schema_version": 1,
+                    "domain": "agent_memory",
+                    "agent_id": "test-agent",
+                    "agent_kind": "other",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "Failure with legacy patch evidence target",
+                    "failure_kind": "patch_invalid",
+                    "evidence_links": [{
+                        "target_record_id": legacy_patch_id,
+                        "target_domain": "agent_memory",
+                        "relation": "FAILED_ON",
+                        "confidence": "1.0"
+                    }]
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "FAILED_ON evidence links should accept legacy agent_memory PatchArtifact targets, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn legacy_agent_memory_artifact_and_diagnostic_nodes_are_accepted() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "legacy-agent-memory-artifact-diagnostic",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "legacy-agent-memory-artifact-diagnostic-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "agent_memory:v1:legacy-generic-artifact",
+                    "kind": "Artifact",
+                    "schema_version": 1,
+                    "domain": "agent_memory",
+                    "agent_id": "test-agent",
+                    "agent_kind": "other",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "Legacy generic artifact"
+                }, {
+                    "record_type": "node",
+                    "id": "agent_memory:v1:legacy-traj-diagnostic",
+                    "kind": "Diagnostic",
+                    "schema_version": 1,
+                    "domain": "agent_memory",
+                    "agent_id": "test-agent",
+                    "agent_kind": "other",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "Legacy trajectory diagnostic"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "legacy agent-memory Artifact and Diagnostic nodes should ingest during migration, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn incomplete_tool_call_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "incomplete-tool-call",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "incomplete-tool-call-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "agent_memory:v1:incomplete-tool-call",
+                    "kind": "ToolCall",
+                    "schema_version": 1,
+                    "domain": "agent_memory",
+                    "agent_id": "test-agent",
+                    "agent_kind": "other",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "Incomplete tool call"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "ToolCall missing required agent-actions fields should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "incomplete ToolCall should fail with missing_field, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn incomplete_file_edit_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "incomplete-file-edit",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "incomplete-file-edit-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "agent_memory:v1:incomplete-file-edit",
+                    "kind": "FileEdit",
+                    "schema_version": 1,
+                    "domain": "agent_memory",
+                    "agent_id": "test-agent",
+                    "agent_kind": "other",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "Incomplete file edit"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "FileEdit missing required agent-actions fields should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "incomplete FileEdit should fail with missing_field, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
 fn local_path_repository_identity_rejected_in_shared_store() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");

@@ -1832,6 +1832,190 @@ fn required_str<'a>(value: Option<&'a str>, field: &'static str) -> WriteResult<
         .ok_or_else(|| ApiError::missing_field(field))
 }
 
+const TOOL_KIND_VALUES: &[&str] = &[
+    "bash",
+    "file_edit",
+    "file_read",
+    "search",
+    "network_request",
+    "code_execution",
+    "other",
+];
+const TOOL_STATUS_VALUES: &[&str] = &["succeeded", "failed", "interrupted", "unknown"];
+const FILE_EDIT_KIND_VALUES: &[&str] = &["create", "modify", "delete", "rename"];
+
+fn validate_agent_action_record(record: &GraphRecord) -> WriteResult<()> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        domain,
+        repo_relative_path,
+        edit_kind,
+        rename_to,
+        hunk_count,
+        linked_turn_id,
+        tool_name,
+        tool_kind,
+        arguments_summary,
+        arguments_handle,
+        started_at,
+        status,
+        ..
+    } = record
+    else {
+        return Ok(());
+    };
+
+    match kind {
+        NodeKind::ToolCall => validate_tool_call_record(
+            id,
+            domain.as_deref(),
+            linked_turn_id.as_deref(),
+            tool_name.as_deref(),
+            tool_kind.as_deref(),
+            arguments_summary.as_deref(),
+            arguments_handle.as_deref(),
+            started_at.as_deref(),
+            status.as_deref(),
+        ),
+        NodeKind::FileEdit => validate_file_edit_record(
+            id,
+            domain.as_deref(),
+            repo_relative_path.as_deref(),
+            edit_kind.as_deref(),
+            rename_to.as_deref(),
+            *hunk_count,
+            linked_turn_id.as_deref(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_tool_call_record(
+    id: &str,
+    domain: Option<&str>,
+    linked_turn_id: Option<&str>,
+    tool_name: Option<&str>,
+    tool_kind: Option<&str>,
+    arguments_summary: Option<&str>,
+    arguments_handle: Option<&OutputHandle>,
+    started_at: Option<&str>,
+    status: Option<&str>,
+) -> WriteResult<()> {
+    validate_agent_action_domain("ToolCall", domain)?;
+    required_str(tool_name, "tool_name (required for ToolCall nodes)")?;
+    let tool_kind = required_str(tool_kind, "tool_kind (required for ToolCall nodes)")?;
+    if !TOOL_KIND_VALUES.contains(&tool_kind) {
+        return Err(ApiError::bad_request(format!(
+            "ToolCall.tool_kind '{tool_kind}' is not recognized; expected one of: {}",
+            TOOL_KIND_VALUES.join(", ")
+        )));
+    }
+    required_str(
+        arguments_summary,
+        "arguments_summary (required for ToolCall nodes)",
+    )?;
+    let arguments_handle = arguments_handle
+        .ok_or_else(|| ApiError::missing_field("arguments_handle (required for ToolCall nodes)"))?;
+    validate_agent_action_output_handle("ToolCall.arguments_handle", arguments_handle)?;
+    let linked_turn_id =
+        required_str(linked_turn_id, "linked_turn_id (required for ToolCall nodes)")?;
+    validate_agent_turn_ref("ToolCall.linked_turn_id", linked_turn_id)?;
+    let started_at = required_str(started_at, "started_at (required for ToolCall nodes)")?;
+    if DateTime::parse_from_rfc3339(started_at).is_err() {
+        return Err(ApiError::bad_request(format!(
+            "ToolCall.started_at '{started_at}' is not a valid RFC 3339 timestamp"
+        )));
+    }
+    let status = required_str(status, "status (required for ToolCall nodes)")?;
+    if !TOOL_STATUS_VALUES.contains(&status) {
+        return Err(ApiError::bad_request(format!(
+            "ToolCall.status '{status}' is not recognized; expected one of: {}",
+            TOOL_STATUS_VALUES.join(", ")
+        )));
+    }
+    if id.is_empty() {
+        return Err(ApiError::missing_field("id"));
+    }
+    Ok(())
+}
+
+fn validate_file_edit_record(
+    id: &str,
+    domain: Option<&str>,
+    repo_relative_path: Option<&str>,
+    edit_kind: Option<&str>,
+    rename_to: Option<&str>,
+    hunk_count: Option<u32>,
+    linked_turn_id: Option<&str>,
+) -> WriteResult<()> {
+    validate_agent_action_domain("FileEdit", domain)?;
+    required_str(
+        repo_relative_path,
+        "repo_relative_path (required for FileEdit nodes)",
+    )?;
+    let edit_kind = required_str(edit_kind, "edit_kind (required for FileEdit nodes)")?;
+    if !FILE_EDIT_KIND_VALUES.contains(&edit_kind) {
+        return Err(ApiError::bad_request(format!(
+            "FileEdit.edit_kind '{edit_kind}' is not recognized; expected one of: {}",
+            FILE_EDIT_KIND_VALUES.join(", ")
+        )));
+    }
+    if edit_kind == "rename" {
+        required_str(rename_to, "rename_to (required for FileEdit rename nodes)")?;
+    }
+    hunk_count.ok_or_else(|| ApiError::missing_field("hunk_count (required for FileEdit nodes)"))?;
+    let linked_turn_id =
+        required_str(linked_turn_id, "linked_turn_id (required for FileEdit nodes)")?;
+    validate_agent_turn_ref("FileEdit.linked_turn_id", linked_turn_id)?;
+    if id.is_empty() {
+        return Err(ApiError::missing_field("id"));
+    }
+    Ok(())
+}
+
+fn validate_agent_action_domain(kind: &'static str, domain: Option<&str>) -> WriteResult<()> {
+    match domain {
+        Some("agent_memory") => Ok(()),
+        Some(other) => Err(ApiError::bad_request(format!(
+            "{kind}.domain must be 'agent_memory'; got '{other}'"
+        ))),
+        None => Err(ApiError::missing_field(format!(
+            "domain (required for {kind} nodes)"
+        ))),
+    }
+}
+
+fn validate_agent_turn_ref(field: &'static str, value: &str) -> WriteResult<()> {
+    if value.starts_with("agent_memory:v1:") {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(format!(
+        "{field} must reference an agent_memory:v1: AgentTurn; got '{value}'"
+    )))
+}
+
+fn validate_agent_action_output_handle(field: &'static str, handle: &OutputHandle) -> WriteResult<()> {
+    if handle.hash.is_empty() {
+        return Err(ApiError::bad_request(format!("{field}.hash must not be empty")));
+    }
+    let inline_len = handle.inline.as_deref().map_or(0, |s| s.len() as u64);
+    if inline_len > handle.bytes {
+        return Err(ApiError::bad_request(format!(
+            "{field}.bytes must be >= inline payload length"
+        )));
+    }
+    if inline_len > INLINE_PAYLOAD_CEILING
+        || (handle.inline.is_some() && handle.bytes > INLINE_PAYLOAD_CEILING)
+    {
+        return Err(ApiError::inline_payload_exceeds_ceiling(format!(
+            "{field}.inline must be None when bytes exceeds the 16 KiB ceiling; demote to handle-only before writing"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_unique_recovery_keys(records: &[GraphRecord]) -> WriteResult<()> {
     if has_duplicate_recovery_keys(records) || has_ambiguous_recovery_keys(records) {
         return Err(ApiError::conflict(
@@ -2321,7 +2505,11 @@ const AGENT_MEMORY_NODE_KINDS: &[NodeKind] = &[
     NodeKind::AgentSession,
     NodeKind::Observation,
     NodeKind::Task,
+    NodeKind::Artifact,
     NodeKind::CommandEvidence,
+    // Legacy trajectory importer diagnostics kept ingestible during the same
+    // migration window as legacy action/evidence records.
+    NodeKind::Diagnostic,
     NodeKind::AgentRun,
     NodeKind::AgentTurn,
     NodeKind::ToolCall,
@@ -2714,6 +2902,7 @@ fn validate_and_synthesize_evidence_edges(
                             kind.as_str()
                         )));
                     }
+                    validate_agent_action_record(record)?;
                 }
                 for (link_index, link) in links.iter().enumerate() {
                     let was_triple_resolved = link.target_record_id.is_none();
@@ -2752,12 +2941,20 @@ fn validate_and_synthesize_evidence_edges(
                         EdgeLabel::Observes
                         | EdgeLabel::MentionsSymbol
                         | EdgeLabel::TouchedFile
-                        | EdgeLabel::FailedOn
                         | EdgeLabel::ExplainsChange
                             if link.target_domain != "codegraph" =>
                         {
                             return Err(ApiError::bad_request(format!(
                                 "evidence link relation '{}' requires target_domain 'codegraph'; got '{}'",
+                                edge_label.as_str(),
+                                link.target_domain
+                            )));
+                        }
+                        EdgeLabel::FailedOn
+                            if !matches!(link.target_domain.as_str(), "codegraph" | "agent_memory") =>
+                        {
+                            return Err(ApiError::bad_request(format!(
+                                "evidence link relation '{}' requires target_domain 'codegraph' or legacy 'agent_memory'; got '{}'",
                                 edge_label.as_str(),
                                 link.target_domain
                             )));

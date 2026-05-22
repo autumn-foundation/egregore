@@ -29,7 +29,7 @@ use serde::Deserialize;
 use crate::{
     error::Result,
     ir::{
-        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, Graph, GraphRecord, NodeKind,
+        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, Graph, GraphRecord, NodeKind, OutputHandle,
         agent_memory_stable_id,
     },
 };
@@ -43,6 +43,7 @@ pub const IMPORTER_VERSION: &str = "0.1.0";
 /// Domain value carried on every agent-memory record.
 pub const DOMAIN: &str = "agent_memory";
 const DEFAULT_TRAJ_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
+const INLINE_PAYLOAD_CEILING: u64 = 16 * 1024;
 
 // ── Import options ────────────────────────────────────────────────────────────
 
@@ -489,6 +490,13 @@ fn emit_command_action(
         NodeExtra {
             observed_at: timestamp.map(str::to_owned),
             text: Some(redacted_cmd.to_owned()),
+            linked_turn_id: Some(turn_id.to_owned()),
+            tool_name: Some("Bash".to_owned()),
+            tool_kind: Some("bash".to_owned()),
+            arguments_summary: Some(redacted_cmd.to_owned()),
+            arguments_handle: Some(Box::new(output_handle(redacted_cmd))),
+            started_at: timestamp.map(str::to_owned),
+            status: Some(tool_status(this_exit).to_owned()),
             ..Default::default()
         },
     ));
@@ -537,6 +545,10 @@ fn emit_command_action(
             NodeExtra {
                 observed_at: timestamp.map(str::to_owned),
                 text: Some(redacted_cmd.to_owned()),
+                repo_relative_path: Some(target.to_owned()),
+                edit_kind: Some("modify".to_owned()),
+                hunk_count: Some(1),
+                linked_turn_id: Some(turn_id.to_owned()),
                 ..Default::default()
             },
         ));
@@ -840,6 +852,7 @@ struct ImportCtx {
 /// Optional extra fields for a single node emit call.
 #[derive(Default)]
 struct NodeExtra {
+    repo_relative_path: Option<String>,
     observed_at: Option<String>,
     agent_kind: Option<String>,
     text: Option<String>,
@@ -847,6 +860,15 @@ struct NodeExtra {
     failure_kind: Option<String>,
     exit_code: Option<i64>,
     turn_index: Option<u64>,
+    edit_kind: Option<String>,
+    hunk_count: Option<u32>,
+    linked_turn_id: Option<String>,
+    tool_name: Option<String>,
+    tool_kind: Option<String>,
+    arguments_summary: Option<String>,
+    arguments_handle: Option<Box<OutputHandle>>,
+    started_at: Option<String>,
+    status: Option<String>,
 }
 
 fn make_node(
@@ -865,7 +887,7 @@ fn make_node(
         id,
         kind,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
-        repo_relative_path: None,
+        repo_relative_path: extra.repo_relative_path,
         span: None,
         name,
         language: None,
@@ -906,20 +928,22 @@ fn make_node(
         patch_handle: None,
         validation_summary: None,
         producer_session_id: None,
-        edit_kind: None,
+        edit_kind: extra.edit_kind,
         before_hash: None,
         after_hash: None,
         rename_to: None,
-        hunk_count: None,
+        hunk_count: extra.hunk_count,
         linked_patch_id: None,
-        linked_turn_id: None,
-        tool_name: None,
-        tool_kind: None,
-        arguments_summary: None,
-        arguments_handle: None,
+        linked_turn_id: extra.linked_turn_id,
+        tool_name: extra.tool_name,
+        tool_kind: extra.tool_kind,
+        arguments_summary: extra.arguments_summary,
+        arguments_handle: extra.arguments_handle,
         result_handle: None,
         produced_evidence_id: None,
-        started_at: None,
+        started_at: extra
+            .started_at
+            .or_else(|| Some(ctx.default_timestamp.clone())),
         finished_at: None,
         failure_kind: extra.failure_kind,
         exit_code: extra.exit_code,
@@ -932,7 +956,24 @@ fn make_node(
         evidence_quality: None,
         executed_at: None,
         verification_kind: None,
-        status: None,
+        status: extra.status,
+    }
+}
+
+fn output_handle(content: &str) -> OutputHandle {
+    let bytes = content.len() as u64;
+    OutputHandle {
+        inline: (bytes <= INLINE_PAYLOAD_CEILING).then(|| content.to_owned()),
+        hash: blake3_hex(content.as_bytes()),
+        bytes,
+    }
+}
+
+const fn tool_status(exit_code: Option<i64>) -> &'static str {
+    match exit_code {
+        Some(0) => "succeeded",
+        Some(_) => "failed",
+        None => "unknown",
     }
 }
 
