@@ -1853,7 +1853,7 @@ fn record_id_matches_domain(id: &str, domain: &str) -> bool {
 }
 
 // Validates that a resolved target ID is consistent with the declared target_domain.
-// For "codegraph" and "agent_memory", enforces the expected ID prefix.
+// For domains with stable prefixes, enforces the expected ID prefix.
 // "project" and any other domain have no universal prefix requirement; the
 // relation-specific checks in validate_evidence_endpoint_constraints enforce per-label rules.
 fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult<()> {
@@ -1871,6 +1871,11 @@ fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult
         "verification" if !id.starts_with("verification:v1:") => {
             return Err(ApiError::bad_request(format!(
                 "evidence link declares target_domain 'verification' but target '{id}' does not have the expected 'verification:v1:' prefix",
+            )));
+        }
+        "artifact" if !id.starts_with("artifact:v1:") => {
+            return Err(ApiError::bad_request(format!(
+                "evidence link declares target_domain 'artifact' but target '{id}' does not have the expected 'artifact:v1:' prefix",
             )));
         }
         // "project" and any other declared domain: no universal prefix requirement.
@@ -2098,7 +2103,7 @@ fn validate_evidence_endpoint_constraints(
 ) -> WriteResult<()> {
     // Source-side constraints.
     match label {
-        EdgeLabel::Observes | EdgeLabel::ExplainsChange | EdgeLabel::ValidatedBy => {
+        EdgeLabel::Observes | EdgeLabel::ExplainsChange => {
             if let Some(sk) = source_kind
                 && sk != NodeKind::Observation
             {
@@ -2109,12 +2114,29 @@ fn validate_evidence_endpoint_constraints(
                 )));
             }
         }
-        EdgeLabel::ProducedPatch => {
+        EdgeLabel::ValidatedBy => {
             if let Some(sk) = source_kind
-                && !matches!(sk, NodeKind::FileEdit | NodeKind::AgentTurn)
+                && !matches!(
+                    sk,
+                    NodeKind::Observation | NodeKind::Decision | NodeKind::AgentRun
+                )
             {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a FileEdit or AgentTurn source node, not {}",
+                    "evidence link relation '{}' requires an Observation, Decision, or legacy AgentRun source node, not {}",
+                    label.as_str(),
+                    sk.as_str()
+                )));
+            }
+        }
+        EdgeLabel::ProducedPatch => {
+            if let Some(sk) = source_kind
+                && !matches!(
+                    sk,
+                    NodeKind::FileEdit | NodeKind::AgentTurn | NodeKind::AgentRun
+                )
+            {
+                return Err(ApiError::bad_request(format!(
+                    "evidence link relation '{}' requires a FileEdit, AgentTurn, or legacy AgentRun source node, not {}",
                     label.as_str(),
                     sk.as_str()
                 )));
@@ -2242,9 +2264,14 @@ fn validate_evidence_endpoint_constraints(
                 target_kind_str()
             )));
         }
-        EdgeLabel::FailedOn if !matches!(target_kind, Some(NodeKind::Symbol | NodeKind::File)) => {
+        EdgeLabel::FailedOn
+            if !matches!(
+                target_kind,
+                Some(NodeKind::Symbol | NodeKind::File | NodeKind::PatchArtifact)
+            ) =>
+        {
             return Err(ApiError::bad_request(format!(
-                "evidence link relation '{}' requires a Symbol or File target; target '{}' has kind {}",
+                "evidence link relation '{}' requires a Symbol, File, or legacy PatchArtifact target; target '{}' has kind {}",
                 label.as_str(),
                 target_id,
                 target_kind_str()
@@ -2298,7 +2325,12 @@ const AGENT_MEMORY_NODE_KINDS: &[NodeKind] = &[
     NodeKind::AgentRun,
     NodeKind::AgentTurn,
     NodeKind::ToolCall,
+    // Legacy trajectory importer outputs kept ingestible until the emitter
+    // migrates these records into verification/artifact domains.
+    NodeKind::CommandRun,
+    NodeKind::Verification,
     NodeKind::FileEdit,
+    NodeKind::PatchArtifact,
     NodeKind::Failure,
     NodeKind::Decision,
 ];
@@ -2372,7 +2404,6 @@ fn validate_agent_memory_edge_endpoints(
         EdgeLabel::Observes
         | EdgeLabel::MentionsSymbol
         | EdgeLabel::TouchedFile
-        | EdgeLabel::FailedOn
         | EdgeLabel::ExplainsChange
             if !target.starts_with("codegraph:") =>
         {
@@ -2381,9 +2412,19 @@ fn validate_agent_memory_edge_endpoints(
                 label.as_str()
             )));
         }
-        EdgeLabel::ProducedPatch if !target.starts_with("artifact:v1:") => {
+        EdgeLabel::FailedOn
+            if !target.starts_with("codegraph:") && !target.starts_with("agent_memory:v1:") =>
+        {
             return Err(ApiError::bad_request(format!(
-                "agent-memory edge '{edge_id}' label '{}' requires an artifact:v1: target; got target '{target}'",
+                "agent-memory edge '{edge_id}' label '{}' requires a codegraph: target or legacy agent_memory:v1: PatchArtifact target; got target '{target}'",
+                label.as_str()
+            )));
+        }
+        EdgeLabel::ProducedPatch
+            if !target.starts_with("artifact:v1:") && !target.starts_with("agent_memory:v1:") =>
+        {
+            return Err(ApiError::bad_request(format!(
+                "agent-memory edge '{edge_id}' label '{}' requires an artifact:v1: target or legacy agent_memory:v1: PatchArtifact target; got target '{target}'",
                 label.as_str()
             )));
         }
@@ -2474,30 +2515,41 @@ fn validate_and_synthesize_evidence_edges(
                     EdgeLabel::SessionOf => {
                         let source_kind = lookup_node_kind(source, records, &sink_guard)?;
                         let target_kind = lookup_node_kind(target, records, &sink_guard)?;
-                        if !matches!(source_kind, Some(NodeKind::AgentSession)) {
+                        let valid_documented = matches!(source_kind, Some(NodeKind::AgentSession))
+                            && matches!(target_kind, Some(NodeKind::Agent));
+                        let valid_legacy_traj = matches!(source_kind, Some(NodeKind::AgentRun))
+                            && matches!(target_kind, Some(NodeKind::AgentSession));
+                        if valid_documented || valid_legacy_traj {
+                            continue;
+                        }
+                        if !matches!(source_kind, Some(NodeKind::AgentSession | NodeKind::AgentRun))
+                        {
                             return Err(ApiError::bad_request(format!(
-                                "agent-memory edge '{id}' SESSION_OF requires an AgentSession source; got {}",
+                                "agent-memory edge '{id}' SESSION_OF requires an AgentSession source or legacy AgentRun source; got {}",
                                 source_kind.map_or_else(
                                     || "unknown".to_owned(),
                                     |k| k.as_str().to_owned()
                                 )
                             )));
                         }
-                        if !matches!(target_kind, Some(NodeKind::Agent)) {
-                            return Err(ApiError::bad_request(format!(
-                                "agent-memory edge '{id}' SESSION_OF requires an Agent target; got {}",
-                                target_kind.map_or_else(
-                                    || "unknown".to_owned(),
-                                    |k| k.as_str().to_owned()
-                                )
-                            )));
-                        }
+                        return Err(ApiError::bad_request(format!(
+                            "agent-memory edge '{id}' SESSION_OF requires an Agent target or legacy AgentSession target; got {}",
+                            target_kind.map_or_else(
+                                || "unknown".to_owned(),
+                                |k| k.as_str().to_owned()
+                            )
+                        )));
                     }
                     EdgeLabel::AuthoredBy => {
                         let target_kind = lookup_node_kind(target, records, &sink_guard)?;
-                        if !matches!(target_kind, Some(NodeKind::AgentSession)) {
+                        if !matches!(
+                            target_kind,
+                            Some(
+                                NodeKind::AgentSession | NodeKind::AgentRun | NodeKind::AgentTurn
+                            )
+                        ) {
                             return Err(ApiError::bad_request(format!(
-                                "agent-memory edge '{id}' AUTHORED_BY requires an AgentSession target; got {}",
+                                "agent-memory edge '{id}' AUTHORED_BY requires an AgentSession target or legacy AgentRun/AgentTurn target; got {}",
                                 target_kind.map_or_else(
                                     || "unknown".to_owned(),
                                     |k| k.as_str().to_owned()

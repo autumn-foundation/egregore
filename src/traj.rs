@@ -42,6 +42,7 @@ pub const IMPORTER_ID: &str = "traj-importer";
 pub const IMPORTER_VERSION: &str = "0.1.0";
 /// Domain value carried on every agent-memory record.
 pub const DOMAIN: &str = "agent_memory";
+const DEFAULT_TRAJ_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 
 // ── Import options ────────────────────────────────────────────────────────────
 
@@ -187,14 +188,6 @@ pub fn import_traj(path: &Path, opts: &ImportOptions) -> Result<Graph> {
 
     let traj: TrajFile = serde_json::from_slice(&raw_bytes)?;
 
-    let mut graph = Graph::new();
-
-    let ctx = ImportCtx {
-        source_artifact_path,
-        source_artifact_hash,
-        traj_format: traj.trajectory_format,
-    };
-
     // Derive stable session ID from artifact hash + importer version.
     // Identical input bytes → identical session ID (idempotency guarantee).
     let session_id = agent_memory_stable_id(&[
@@ -202,8 +195,22 @@ pub fn import_traj(path: &Path, opts: &ImportOptions) -> Result<Graph> {
         "agent_session",
         IMPORTER_ID,
         IMPORTER_VERSION,
-        &ctx.source_artifact_hash,
+        &source_artifact_hash,
     ]);
+
+    let ctx = ImportCtx {
+        source_artifact_path,
+        source_artifact_hash,
+        traj_format: traj.trajectory_format,
+        session_id: session_id.clone(),
+        default_timestamp: traj
+            .info
+            .started_at
+            .clone()
+            .unwrap_or_else(|| DEFAULT_TRAJ_TIMESTAMP.to_owned()),
+    };
+
+    let mut graph = Graph::new();
 
     let run_id = agent_memory_stable_id(&["node", "agent_run", &session_id, "run-0"]);
 
@@ -826,6 +833,8 @@ struct ImportCtx {
     source_artifact_path: String,
     source_artifact_hash: String,
     traj_format: String,
+    session_id: String,
+    default_timestamp: String,
 }
 
 /// Optional extra fields for a single node emit call.
@@ -847,13 +856,18 @@ fn make_node(
     ctx: &ImportCtx,
     extra: NodeExtra,
 ) -> GraphRecord {
+    let name = if kind == NodeKind::AgentSession {
+        Some(summary.clone())
+    } else {
+        None
+    };
     GraphRecord::Node {
         id,
         kind,
         schema_version: AGENT_MEMORY_SCHEMA_VERSION,
         repo_relative_path: None,
         span: None,
-        name: None,
+        name,
         language: None,
         symbol_kind: None,
         disambiguator: None,
@@ -866,9 +880,11 @@ fn make_node(
         agent_kind: extra
             .agent_kind
             .or_else(|| Some("rust-swe-agent".to_owned())),
-        session_id: None,
-        observed_at: extra.observed_at,
-        ingested_at: None,
+        session_id: Some(ctx.session_id.clone()),
+        observed_at: extra
+            .observed_at
+            .or_else(|| Some(ctx.default_timestamp.clone())),
+        ingested_at: Some(ctx.default_timestamp.clone()),
         confidence: None,
         source_handle: Some(format!(
             "{}:{}",

@@ -12,12 +12,14 @@ use std::{
 };
 
 use aletheia_egregore::{
-    adapters::EmbeddedAletheiaSink,
+    adapters::{EmbeddedAletheiaSink, GraphSink},
     daemon::{DaemonClient, DaemonMetadata as ClientDaemonMetadata, StoreLease},
+    import_traj,
     ir::{
         EdgeLabel, GraphRecord, IdentitySource, NodeKind, RepositoryIdentityPayload,
         TemporalMetadata,
     },
+    traj::ImportOptions,
 };
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -3014,6 +3016,158 @@ fn evidence_link_with_missing_target_is_rejected() {
     assert_eq!(
         body["error"]["code"], "unresolved_evidence_target",
         "rejection must carry unresolved_evidence_target code per schema doc, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn daemon_ingest_accepts_current_traj_importer_agent_memory_records() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let graph = import_traj(
+        Path::new("tests/fixtures/agent_memory/swe_agent_basic/trajectory.traj"),
+        &ImportOptions::default(),
+    )
+    .expect("fixture .traj should import");
+    let records = graph.records().to_vec();
+    let agent_run_ids = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record,
+                GraphRecord::Node {
+                    kind: NodeKind::AgentRun,
+                    ..
+                }
+            )
+        })
+        .map(|record| record.id().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        records.iter().any(|record| matches!(
+            record,
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::CommandRun | NodeKind::Verification | NodeKind::PatchArtifact,
+                ..
+            } if id.starts_with("agent_memory:v1:")
+        )),
+        ".traj fixture must exercise legacy agent_memory:v1 action/evidence node kinds"
+    );
+    assert!(
+        records.iter().any(|record| matches!(
+            record,
+            GraphRecord::Edge {
+                label: EdgeLabel::ProducedPatch,
+                source,
+                target,
+                ..
+            } if agent_run_ids.contains(source) && target.starts_with("agent_memory:v1:")
+        )),
+        ".traj fixture must exercise legacy AgentRun -> agent_memory PatchArtifact edge"
+    );
+    let records_json = records
+        .iter()
+        .map(|record| serde_json::to_value(record).expect("record should serialize"))
+        .collect::<Vec<_>>();
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "traj-importer-agent-memory-ingest",
+            "agent_id": "traj-test-agent",
+            "session_id": "traj-test-session",
+            "idempotency_key": "traj-importer-agent-memory-ingest-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": records_json }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "current .traj importer output should ingest during migration, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn produced_patch_evidence_link_requires_artifact_id_target() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let legacy_patch_id = "agent_memory:v1:legacy-patch-evidence-link-target";
+    {
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        let legacy_patch = GraphRecord::node(
+            legacy_patch_id.to_owned(),
+            NodeKind::PatchArtifact,
+            None,
+            None,
+            None,
+            "legacy agent-memory PatchArtifact target".to_owned(),
+        );
+        sink.write_record(&legacy_patch)
+            .expect("legacy patch target should pre-seed");
+        sink.persist_indexes()
+            .expect("pre-seeded target should persist");
+    }
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "produced-patch-evidence-link-artifact-prefix",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "produced-patch-evidence-link-artifact-prefix-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "agent_memory:v1:produced-patch-evidence-link-source",
+                    "kind": "AgentTurn",
+                    "schema_version": 1,
+                    "agent_id": "test-agent",
+                    "agent_kind": "other",
+                    "session_id": "test-session",
+                    "observed_at": "2026-05-22T00:00:00Z",
+                    "ingested_at": "2026-05-22T00:00:00Z",
+                    "summary": "AgentTurn with inconsistent PRODUCED_PATCH evidence link",
+                    "evidence_links": [{
+                        "target_record_id": legacy_patch_id,
+                        "target_domain": "artifact",
+                        "relation": "PRODUCED_PATCH",
+                        "confidence": "1.0"
+                    }]
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "PRODUCED_PATCH evidence links must reject non-artifact targets, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "artifact prefix mismatch should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("artifact:v1:")),
+        "artifact prefix mismatch should name artifact:v1:, got {body}"
     );
 
     daemon.stop();
