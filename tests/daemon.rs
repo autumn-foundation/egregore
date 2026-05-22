@@ -17,7 +17,7 @@ use aletheia_egregore::{
     import_traj,
     ir::{
         EdgeLabel, GraphRecord, IdentitySource, NodeKind, RepositoryIdentityPayload,
-        TemporalMetadata,
+        PROJECT_SCHEMA_VERSION, SCHEMA_VERSION, TemporalMetadata,
     },
     traj::ImportOptions,
 };
@@ -1989,6 +1989,111 @@ fn read_repo_text(path: &str) -> String {
         .unwrap_or_else(|error| panic!("{path} should be readable: {error}"))
 }
 
+const PROJECT_EXTERNAL_LINK_ID: &str = "project:v1:test-external-link";
+const PROJECT_TASK_ID: &str = "project:v1:test-task";
+
+fn project_external_link_json(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "ExternalLink",
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "domain": "project",
+        "entity_id": id,
+        "system": "github",
+        "url": "https://github.com/madmax983/egregore/issues/14",
+        "system_native_id": "14",
+        "repository_remote": "https://github.com/madmax983/egregore",
+        "discovered_at": "2026-05-18T05:16:46Z",
+        "valid_time": "2026-05-18T05:49:32Z",
+        "valid_time_source": "github_updated_at",
+        "transaction_time": "2026-05-22T00:00:00Z",
+        "summary": "External GitHub handle for issue 14"
+    })
+}
+
+fn project_task_json(id: &str, status: &str, transaction_time: &str) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "Task",
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "domain": "project",
+        "entity_id": id,
+        "title": "Spec Task/AcceptanceCriterion shapes before any project-graph writer",
+        "body_handle": {
+            "inline": "Issue body truncated in fixture",
+            "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bytes": 31
+        },
+        "status": status,
+        "source_kind": "github_issue",
+        "source_external_link_id": PROJECT_EXTERNAL_LINK_ID,
+        "assignees": ["markm"],
+        "labels": ["spec", "pm"],
+        "priority": "normal",
+        "confidence": "1.0",
+        "valid_time": "2026-05-18T05:49:32Z",
+        "valid_time_source": "github_updated_at",
+        "transaction_time": transaction_time,
+        "summary": format!("Project task issue 14 status {status}")
+    })
+}
+
+fn project_acceptance_criterion_json(
+    id: &str,
+    parent_task_id: &str,
+    status: &str,
+    verification_link_id: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "AcceptanceCriterion",
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "domain": "project",
+        "entity_id": id,
+        "parent_task_id": parent_task_id,
+        "ordinal": 1,
+        "text": "A new doc docs/schema/project-graph.md exists.",
+        "status": status,
+        "verification_link_id": verification_link_id,
+        "confidence": "1.0",
+        "valid_time": "2026-05-18T05:49:32Z",
+        "valid_time_source": "github_updated_at",
+        "transaction_time": "2026-05-22T00:00:02Z",
+        "summary": format!("Acceptance criterion for {parent_task_id}")
+    })
+}
+
+fn verification_record_json(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "Verification",
+        "schema_version": 1,
+        "domain": "verification",
+        "source_artifact_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "source_artifact_path": "tests/daemon.rs",
+        "executed_at": "2026-05-22T00:00:00Z",
+        "verification_kind": "manual",
+        "status": "passed",
+        "summary": "Manual verification fixture"
+    })
+}
+
+fn codegraph_file_json(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "File",
+        "schema_version": SCHEMA_VERSION,
+        "repo_relative_path": "src/lib.rs",
+        "name": "src/lib.rs",
+        "summary": "Fixture codegraph file"
+    })
+}
+
 const PATCH_PRODUCER_SESSION_ID: &str = "agent_memory:v1:producer-session";
 
 fn agent_session_json(id: &str) -> serde_json::Value {
@@ -2751,7 +2856,8 @@ fn first_record_id(graph_path: &Path) -> String {
 // ── Schema conformance: issue #6 ─────────────────────────────────────────────
 
 // (a) Every NodeKind variant is either code-graph-documented,
-// agent-memory-documented, agent-memory-reserved, or verification-domain-documented.
+// agent-memory-documented, agent-memory-reserved, project-domain-documented,
+// project-domain-reserved, or verification-domain-documented.
 // The exhaustive match enforces this at compile time: adding a new
 // NodeKind variant without updating this list is a compile error.
 #[test]
@@ -2771,8 +2877,20 @@ fn all_node_kinds_have_documented_schema() {
         NodeKind::Agent | NodeKind::AgentSession | NodeKind::Observation => {
             "agent-memory-documented"
         }
+        // Project-domain day-one shapes documented in docs/schema/project-graph.md
+        NodeKind::Task | NodeKind::AcceptanceCriterion | NodeKind::ExternalLink => {
+            "project-domain-documented"
+        }
+        // Project-domain reserved shapes documented in docs/schema/project-graph.md
+        NodeKind::Product
+        | NodeKind::Project
+        | NodeKind::Plan
+        | NodeKind::GitHubIssue
+        | NodeKind::PR
+        | NodeKind::Review
+        | NodeKind::LocalTask => "project-domain-reserved",
         // Reserved with one-line definitions in docs/schema/agent-memory.md §4b
-        NodeKind::Task | NodeKind::Artifact | NodeKind::CommandEvidence => "agent-memory-reserved",
+        NodeKind::Artifact | NodeKind::CommandEvidence => "agent-memory-reserved",
         // M2 trajectory-importer node kinds (docs/schema/agent-memory.md §4b + PRD M2)
         NodeKind::AgentRun | NodeKind::AgentTurn | NodeKind::Failure | NodeKind::Decision => {
             "agent-memory-m2-traj-importer"
@@ -2819,6 +2937,10 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::ProducedPatch
         | EdgeLabel::ProducedEvidence
         | EdgeLabel::ValidatedBy
+        | EdgeLabel::ClosesAcceptanceCriterion
+        | EdgeLabel::OwnedByTask
+        | EdgeLabel::ExternalHandle
+        | EdgeLabel::TouchesFile
         | EdgeLabel::FailedOn
         | EdgeLabel::ExplainsChange
         | EdgeLabel::ReferencesTask
@@ -2826,6 +2948,415 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::Supersedes
         | EdgeLabel::RelatesTo => "cross-domain-registry",
     };
+}
+
+#[test]
+fn project_graph_schema_doc_is_cross_linked_and_names_day_one_contract() {
+    let schema = read_repo_text("docs/schema/project-graph.md");
+    for needle in [
+        "# Project-Graph Domain Schema - v1",
+        "schema_version` = `1`",
+        "intent-shaped, externally-anchored when possible",
+        "Task record shape",
+        "AcceptanceCriterion record shape",
+        "ExternalLink record shape",
+        "acceptance_criterion_missing_verification",
+        "one AC per top-level checklist item under the `Acceptance Criteria` heading",
+        "project:v<schema_version>:<blake3(domain || kind || source_kind || source_native_id || entity_kind_identity)>",
+        "append-with-same-entity-id",
+        "Product` | Long-lived product/repository initiative",
+        "LocalTask` | Named in the PRD as a sibling of `GitHubIssue`",
+    ] {
+        assert!(
+            schema.contains(needle),
+            "project-graph schema must document `{needle}`"
+        );
+    }
+
+    for path in [
+        "README.md",
+        "docs/prd/0000-egregore-vision.md",
+        "docs/schema/agent-memory.md",
+        "docs/schema/verification.md",
+    ] {
+        let text = read_repo_text(path);
+        assert!(
+            text.contains("docs/schema/project-graph.md") || text.contains("project-graph.md"),
+            "{path} must link to docs/schema/project-graph.md"
+        );
+    }
+}
+
+#[test]
+fn project_graph_edge_registry_rows_are_documented() {
+    let registry = read_repo_text("docs/schema/agent-memory.md");
+    for needle in [
+        "| `REFERENCES_TASK` | `agent_memory` | `project` | `Observation`, `Decision`, `Failure`, `Lesson` | `Task` | many:many | no |",
+        "| `CLOSES_ACCEPTANCE_CRITERION` | `project` | `verification` | `AcceptanceCriterion` | `Verification`, `CommandRun`, `TestRun` | many:1 | no |",
+        "| `OWNED_BY_TASK` | `project` | `project` | `AcceptanceCriterion` | `Task` | many:1 | no |",
+        "| `EXTERNAL_HANDLE` | `project` | `project` | `Task`, `AcceptanceCriterion` | `ExternalLink` | many:1 | no |",
+        "| `TOUCHES_FILE` | `project` | `codegraph` | `Task` | `File` | many:many | no |",
+        "| `MENTIONS_SYMBOL` | `project` | `codegraph` | `Task` | `Symbol` | many:many | yes |",
+    ] {
+        assert!(
+            registry.contains(needle),
+            "agent-memory edge registry must contain exact project row: {needle}"
+        );
+    }
+}
+
+#[test]
+fn project_acceptance_criterion_verified_requires_verification_link() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-ac-missing-verification",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-ac-missing-verification-key",
+            "domain": "project",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    project_external_link_json(PROJECT_EXTERNAL_LINK_ID),
+                    project_task_json(PROJECT_TASK_ID, "open", "2026-05-22T00:00:01Z"),
+                    project_acceptance_criterion_json(
+                        "project:v1:test-ac-missing-verification",
+                        PROJECT_TASK_ID,
+                        "verified",
+                        None
+                    )
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 422"),
+        "verified AC missing verification should be rejected with 422, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "acceptance_criterion_missing_verification",
+        "verified AC missing verification must use documented error code, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn project_acceptance_criterion_parent_must_exist() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-ac-missing-parent",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-ac-missing-parent-key",
+            "domain": "project",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    project_acceptance_criterion_json(
+                        "project:v1:test-ac-missing-parent",
+                        "project:v1:missing-task",
+                        "unverified",
+                        None
+                    )
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 422"),
+        "AC with missing parent task should be rejected with 422, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "unresolved_evidence_target",
+        "missing parent task must use unresolved_evidence_target, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn project_acceptance_criterion_with_verification_synthesizes_edges() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let verification_id = "verification:v1:project-ac-verification";
+
+    let seed_verification = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-seed-verification",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-seed-verification-key",
+            "domain": "verification",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {"records": [verification_record_json(verification_id)]}
+        }),
+    );
+    assert!(
+        seed_verification.starts_with("HTTP/1.1 200"),
+        "verification fixture should ingest, got {seed_verification}"
+    );
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-ac-with-verification",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-ac-with-verification-key",
+            "domain": "project",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    project_external_link_json(PROJECT_EXTERNAL_LINK_ID),
+                    project_task_json(PROJECT_TASK_ID, "open", "2026-05-22T00:00:01Z"),
+                    project_acceptance_criterion_json(
+                        "project:v1:test-ac-with-verification",
+                        PROJECT_TASK_ID,
+                        "verified",
+                        Some(verification_id)
+                    )
+                ]
+            }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "verified AC with verification target should ingest, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let records = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    for label in [
+        EdgeLabel::ExternalHandle,
+        EdgeLabel::OwnedByTask,
+        EdgeLabel::ClosesAcceptanceCriterion,
+    ] {
+        assert!(
+            records
+                .iter()
+                .any(|record| matches!(record, GraphRecord::Edge { label: actual, .. } if *actual == label)),
+            "project ingest should synthesize {label:?} edge"
+        );
+    }
+}
+
+#[test]
+fn project_trust_class_rejects_wrong_domain_and_wrong_verification_target() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let mut wrong_domain_task = project_task_json(
+        "project:v1:test-task-wrong-domain",
+        "open",
+        "2026-05-22T00:00:01Z",
+    );
+    wrong_domain_task["domain"] = serde_json::Value::String("agent_memory".to_owned());
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-task-wrong-domain",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-task-wrong-domain-key",
+            "domain": "project",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    project_external_link_json(PROJECT_EXTERNAL_LINK_ID),
+                    wrong_domain_task
+                ]
+            }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "Task with non-project domain should be rejected, got {response}"
+    );
+
+    let file_id = "codegraph:v4:project-ac-not-verification";
+    let seed_file = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-seed-codegraph-file",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-seed-codegraph-file-key",
+            "domain": "codegraph",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {"records": [codegraph_file_json(file_id)]}
+        }),
+    );
+    assert!(
+        seed_file.starts_with("HTTP/1.1 200"),
+        "codegraph target fixture should ingest, got {seed_file}"
+    );
+
+    let wrong_target = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-ac-wrong-verification-target",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-ac-wrong-verification-target-key",
+            "domain": "project",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    project_external_link_json(PROJECT_EXTERNAL_LINK_ID),
+                    project_task_json(PROJECT_TASK_ID, "open", "2026-05-22T00:00:01Z"),
+                    project_acceptance_criterion_json(
+                        "project:v1:test-ac-wrong-verification-target",
+                        PROJECT_TASK_ID,
+                        "verified",
+                        Some(file_id)
+                    )
+                ]
+            }
+        }),
+    );
+    assert!(
+        wrong_target.starts_with("HTTP/1.1 400"),
+        "AC verification_link_id pointing at codegraph should be rejected, got {wrong_target}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn project_task_reimport_preserves_rows_by_transaction_time() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let first = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-task-first-import",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-task-first-import-key",
+            "domain": "project",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    project_external_link_json(PROJECT_EXTERNAL_LINK_ID),
+                    project_task_json(PROJECT_TASK_ID, "open", "2026-05-22T00:00:01Z")
+                ]
+            }
+        }),
+    );
+    assert!(
+        first.starts_with("HTTP/1.1 200"),
+        "first task import should succeed, got {first}"
+    );
+
+    let second = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-task-second-import",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-task-second-import-key",
+            "domain": "project",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    project_task_json(PROJECT_TASK_ID, "closed_completed", "2026-05-22T00:00:02Z")
+                ]
+            }
+        }),
+    );
+    assert!(
+        second.starts_with("HTTP/1.1 200"),
+        "second task import should succeed, got {second}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let records = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    let mut task_rows = records
+        .iter()
+        .filter_map(|record| {
+            if let GraphRecord::Node {
+                id,
+                kind: NodeKind::Task,
+                entity_id: Some(entity_id),
+                status: Some(status),
+                transaction_time: Some(transaction_time),
+                ..
+            } = record
+                && id == PROJECT_TASK_ID
+            {
+                Some((
+                    entity_id.as_str(),
+                    status.as_str(),
+                    transaction_time.as_str(),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    task_rows.sort_unstable();
+
+    assert_eq!(
+        task_rows,
+        vec![
+            (
+                PROJECT_TASK_ID,
+                "closed_completed",
+                "2026-05-22T00:00:02Z"
+            ),
+            (PROJECT_TASK_ID, "open", "2026-05-22T00:00:01Z")
+        ],
+        "re-importing the same task should preserve both mutation rows with the same entity_id"
+    );
 }
 
 #[test]

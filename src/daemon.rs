@@ -30,8 +30,8 @@ use crate::{
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord,
-        IdentitySource, NodeKind, OutputHandle, TemporalMetadata, VERIFICATION_SCHEMA_VERSION,
-        agent_memory_stable_id,
+        IdentitySource, NodeKind, OutputHandle, PROJECT_SCHEMA_VERSION, TemporalMetadata,
+        VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
     },
     query as graph_query,
 };
@@ -381,6 +381,9 @@ enum ErrorCode {
     /// Added by #13 and reused for #11 handles: inline payload exceeded the
     /// 16 KiB ceiling and must be demoted to handle-only storage.
     InlinePayloadExceedsCeiling,
+    /// Added by #14 (project graph schema): a verified AcceptanceCriterion is
+    /// missing the verification record that closed it.
+    AcceptanceCriterionMissingVerification,
 }
 
 impl ErrorCode {
@@ -405,6 +408,9 @@ impl ErrorCode {
             Self::MissingEvidenceHandle => "missing_evidence_handle",
             Self::PatchStatusPinned => "patch_status_pinned",
             Self::InlinePayloadExceedsCeiling => "inline_payload_exceeds_ceiling",
+            Self::AcceptanceCriterionMissingVerification => {
+                "acceptance_criterion_missing_verification"
+            }
         }
     }
 
@@ -428,7 +434,8 @@ impl ErrorCode {
             | Self::UnresolvedEvidenceTarget
             | Self::LocalPathIdentityUnsupported
             | Self::MissingEvidenceHandle
-            | Self::PatchStatusPinned => 422,
+            | Self::PatchStatusPinned
+            | Self::AcceptanceCriterionMissingVerification => 422,
         }
     }
 }
@@ -489,7 +496,7 @@ impl ApiError {
     fn invalid_domain() -> Self {
         Self::new(
             ErrorCode::InvalidDomain,
-            r#"domain must be "codegraph", "agent_memory", "verification", or "artifact""#,
+            r#"domain must be "codegraph", "agent_memory", "verification", "artifact", or "project""#,
         )
     }
 
@@ -1241,9 +1248,14 @@ fn apply_write(
     validate_no_local_path_identity_in_shared_store(&command.records, sink)?;
     validate_verification_domain_records(&command.records)?;
     validate_artifact_domain_records(&command.records, sink)?;
+    let project_edges = validate_project_domain_records(&command.records, sink)?;
 
     let (synthesized_edges, canonical_nodes) =
         validate_and_synthesize_evidence_edges(&command.records, sink)?;
+    let synthesized_edges = project_edges
+        .into_iter()
+        .chain(synthesized_edges)
+        .collect::<Vec<_>>();
 
     // Reject any submitted record whose ID matches a synthesized evidence-edge ID.
     // This prevents a partial ingest where the submitted record is written first and
@@ -1830,6 +1842,568 @@ fn validate_artifact_domain_records(
     Ok(())
 }
 
+/// Project-domain node kinds permitted under `project:v1:` IDs.
+const PROJECT_NODE_KINDS: &[NodeKind] = &[
+    NodeKind::Task,
+    NodeKind::AcceptanceCriterion,
+    NodeKind::ExternalLink,
+    NodeKind::Product,
+    NodeKind::Project,
+    NodeKind::Plan,
+    NodeKind::GitHubIssue,
+    NodeKind::PR,
+    NodeKind::Review,
+    NodeKind::LocalTask,
+];
+
+const PROJECT_FULL_NODE_KINDS: &[NodeKind] = &[
+    NodeKind::Task,
+    NodeKind::AcceptanceCriterion,
+    NodeKind::ExternalLink,
+];
+
+const PROJECT_EDGE_LABELS: &[EdgeLabel] = &[
+    EdgeLabel::ClosesAcceptanceCriterion,
+    EdgeLabel::OwnedByTask,
+    EdgeLabel::ExternalHandle,
+    EdgeLabel::TouchesFile,
+    EdgeLabel::MentionsSymbol,
+];
+
+#[allow(clippy::too_many_lines)]
+fn validate_project_domain_records(
+    records: &[GraphRecord],
+    sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
+) -> WriteResult<Vec<GraphRecord>> {
+    let sink_guard = sink
+        .read()
+        .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
+    let mut synthesized_edges = Vec::new();
+    for record in records {
+        match record {
+            GraphRecord::Node {
+                id,
+                kind,
+                schema_version,
+                domain,
+                entity_id,
+                title,
+                body_handle,
+                source_kind,
+                source_external_link_id,
+                assignees,
+                labels,
+                priority,
+                parent_task_id,
+                ordinal,
+                text,
+                status,
+                verification_link_id,
+                system,
+                url,
+                system_native_id,
+                discovered_at,
+                valid_time,
+                valid_time_source,
+                transaction_time,
+                ..
+            } => {
+                let is_project = id.starts_with("project:v1:")
+                    || domain.as_deref() == Some("project")
+                    || matches!(
+                        kind,
+                        NodeKind::AcceptanceCriterion
+                            | NodeKind::ExternalLink
+                            | NodeKind::Product
+                            | NodeKind::Project
+                            | NodeKind::Plan
+                            | NodeKind::GitHubIssue
+                            | NodeKind::PR
+                            | NodeKind::Review
+                            | NodeKind::LocalTask
+                    );
+                if !is_project {
+                    continue;
+                }
+                validate_project_node_base(
+                    id,
+                    *kind,
+                    *schema_version,
+                    domain.as_deref(),
+                    entity_id.as_deref(),
+                    valid_time.as_deref(),
+                    valid_time_source.as_deref(),
+                    transaction_time.as_deref(),
+                )?;
+                if !PROJECT_FULL_NODE_KINDS.contains(kind) {
+                    continue;
+                }
+                match kind {
+                    NodeKind::Task => {
+                        validate_project_task(
+                            id,
+                            title.as_deref(),
+                            body_handle.as_deref(),
+                            status.as_deref(),
+                            source_kind.as_deref(),
+                            source_external_link_id.as_deref(),
+                            assignees.as_deref(),
+                            labels.as_deref(),
+                            priority.as_deref(),
+                            records,
+                            &sink_guard,
+                        )?;
+                        let link_id = required_str(
+                            source_external_link_id.as_deref(),
+                            "Task.source_external_link_id",
+                        )?;
+                        synthesized_edges.push(project_edge(
+                            EdgeLabel::ExternalHandle,
+                            id,
+                            link_id,
+                            "Project Task external source handle",
+                        ));
+                    }
+                    NodeKind::AcceptanceCriterion => {
+                        validate_project_acceptance_criterion(
+                            id,
+                            parent_task_id.as_deref(),
+                            *ordinal,
+                            text.as_deref(),
+                            status.as_deref(),
+                            verification_link_id.as_deref(),
+                            records,
+                            &sink_guard,
+                        )?;
+                        let parent_id =
+                            required_str(parent_task_id.as_deref(), "AcceptanceCriterion.parent_task_id")?;
+                        synthesized_edges.push(project_edge(
+                            EdgeLabel::OwnedByTask,
+                            id,
+                            parent_id,
+                            "AcceptanceCriterion belongs to Task",
+                        ));
+                        if let Some(verification_id) = verification_link_id.as_deref() {
+                            synthesized_edges.push(project_edge(
+                                EdgeLabel::ClosesAcceptanceCriterion,
+                                id,
+                                verification_id,
+                                "AcceptanceCriterion closed by verification evidence",
+                            ));
+                        }
+                    }
+                    NodeKind::ExternalLink => validate_project_external_link(
+                        id,
+                        system.as_deref(),
+                        url.as_deref(),
+                        system_native_id.as_deref(),
+                        discovered_at.as_deref(),
+                    )?,
+                    _ => {}
+                }
+            }
+            GraphRecord::Edge {
+                id,
+                schema_version,
+                label,
+                source,
+                target,
+                confidence,
+                ..
+            } if id.starts_with("project:v1:") => {
+                validate_project_edge(
+                    id,
+                    *schema_version,
+                    *label,
+                    source,
+                    target,
+                    confidence.as_deref(),
+                    records,
+                    &sink_guard,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(synthesized_edges)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_project_node_base(
+    id: &str,
+    kind: NodeKind,
+    schema_version: u32,
+    domain: Option<&str>,
+    entity_id: Option<&str>,
+    valid_time: Option<&str>,
+    valid_time_source: Option<&str>,
+    transaction_time: Option<&str>,
+) -> WriteResult<()> {
+    if !id.starts_with("project:v1:") {
+        return Err(ApiError::bad_request(format!(
+            "project-domain record '{id}' must use project:v1: ID prefix"
+        )));
+    }
+    if schema_version != PROJECT_SCHEMA_VERSION {
+        return Err(ApiError::bad_request(format!(
+            "project node '{id}' has schema_version {schema_version} but only version {PROJECT_SCHEMA_VERSION} is accepted"
+        )));
+    }
+    if domain != Some("project") {
+        return Err(ApiError::bad_request(format!(
+            "project node '{id}' must carry domain 'project'"
+        )));
+    }
+    if !PROJECT_NODE_KINDS.contains(&kind) {
+        return Err(ApiError::bad_request(format!(
+            "node kind '{}' is not permitted under the project domain",
+            kind.as_str()
+        )));
+    }
+    let entity_id = required_str(entity_id, "entity_id")?;
+    if entity_id != id {
+        return Err(ApiError::bad_request(format!(
+            "project node '{id}' entity_id must equal its stable record id in v1"
+        )));
+    }
+    validate_rfc3339_field("valid_time", required_str(valid_time, "valid_time")?)?;
+    required_str(valid_time_source, "valid_time_source")?;
+    validate_rfc3339_field(
+        "transaction_time",
+        required_str(transaction_time, "transaction_time")?,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_project_task(
+    id: &str,
+    title: Option<&str>,
+    body_handle: Option<&OutputHandle>,
+    status: Option<&str>,
+    source_kind: Option<&str>,
+    source_external_link_id: Option<&str>,
+    assignees: Option<&[String]>,
+    labels: Option<&[String]>,
+    priority: Option<&str>,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    required_str(title, "Task.title")?;
+    let handle = body_handle.ok_or_else(|| ApiError::missing_field("Task.body_handle"))?;
+    validate_project_output_handle("Task.body_handle", handle)?;
+    required_str(status, "Task.status")?;
+    required_str(source_kind, "Task.source_kind")?;
+    let link_id = required_str(source_external_link_id, "Task.source_external_link_id")?;
+    validate_project_ref(
+        "Task.source_external_link_id",
+        link_id,
+        "project:v1:",
+        "ExternalLink",
+        &[NodeKind::ExternalLink],
+        records,
+        sink,
+    )?;
+    assignees.ok_or_else(|| ApiError::missing_field("Task.assignees"))?;
+    labels.ok_or_else(|| ApiError::missing_field("Task.labels"))?;
+    required_str(priority, "Task.priority")?;
+    if id != link_id && !id.starts_with("project:v1:") {
+        return Err(ApiError::bad_request("Task.id must use project:v1: prefix"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_project_acceptance_criterion(
+    _id: &str,
+    parent_task_id: Option<&str>,
+    ordinal: Option<u32>,
+    text: Option<&str>,
+    status: Option<&str>,
+    verification_link_id: Option<&str>,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    let parent_id = required_str(parent_task_id, "AcceptanceCriterion.parent_task_id")?;
+    validate_project_ref(
+        "AcceptanceCriterion.parent_task_id",
+        parent_id,
+        "project:v1:",
+        "Task",
+        &[NodeKind::Task],
+        records,
+        sink,
+    )?;
+    ordinal.ok_or_else(|| ApiError::missing_field("AcceptanceCriterion.ordinal"))?;
+    required_str(text, "AcceptanceCriterion.text")?;
+    let status = required_str(status, "AcceptanceCriterion.status")?;
+    if status == "verified" && verification_link_id.is_none() {
+        return Err(ApiError::new(
+            ErrorCode::AcceptanceCriterionMissingVerification,
+            "AcceptanceCriterion.status verified requires verification_link_id",
+        ));
+    }
+    if let Some(verification_id) = verification_link_id {
+        validate_project_verification_ref(
+            "AcceptanceCriterion.verification_link_id",
+            verification_id,
+            records,
+            sink,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_project_external_link(
+    _id: &str,
+    system: Option<&str>,
+    url: Option<&str>,
+    system_native_id: Option<&str>,
+    discovered_at: Option<&str>,
+) -> WriteResult<()> {
+    required_str(system, "ExternalLink.system")?;
+    required_str(url, "ExternalLink.url")?;
+    required_str(system_native_id, "ExternalLink.system_native_id")?;
+    validate_rfc3339_field(
+        "ExternalLink.discovered_at",
+        required_str(discovered_at, "ExternalLink.discovered_at")?,
+    )
+}
+
+fn validate_project_ref(
+    field: &'static str,
+    value: &str,
+    expected_prefix: &'static str,
+    expected_kind: &'static str,
+    allowed_kinds: &[NodeKind],
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    if !value.starts_with(expected_prefix) {
+        return Err(ApiError::bad_request(format!(
+            "{field} must reference a {expected_prefix} {expected_kind}; got '{value}'"
+        )));
+    }
+    match lookup_node_kind(value, records, sink)? {
+        Some(kind) if allowed_kinds.contains(&kind) => Ok(()),
+        Some(kind) => Err(ApiError::bad_request(format!(
+            "{field} must reference a {expected_prefix} {expected_kind}; target '{value}' has kind {}",
+            kind.as_str()
+        ))),
+        None => Err(ApiError::new(
+            ErrorCode::UnresolvedEvidenceTarget,
+            format!("{field} target '{value}' not found in store or batch"),
+        )),
+    }
+}
+
+fn validate_project_verification_ref(
+    field: &'static str,
+    value: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    validate_project_ref(
+        field,
+        value,
+        "verification:v1:",
+        "Verification, CommandRun, or TestRun",
+        &[
+            NodeKind::Verification,
+            NodeKind::CommandRun,
+            NodeKind::TestRun,
+        ],
+        records,
+        sink,
+    )
+}
+
+fn validate_project_edge(
+    edge_id: &str,
+    schema_version: u32,
+    label: EdgeLabel,
+    source: &str,
+    target: &str,
+    confidence: Option<&str>,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    if schema_version != PROJECT_SCHEMA_VERSION {
+        return Err(ApiError::bad_request(format!(
+            "project edge '{edge_id}' has schema_version {schema_version} but only version {PROJECT_SCHEMA_VERSION} is accepted"
+        )));
+    }
+    if !PROJECT_EDGE_LABELS.contains(&label) {
+        return Err(ApiError::bad_request(format!(
+            "project edge '{edge_id}' uses unsupported label '{}'",
+            label.as_str()
+        )));
+    }
+    let source_kind = lookup_node_kind(source, records, sink)?;
+    let target_kind = lookup_node_kind(target, records, sink)?;
+    match label {
+        EdgeLabel::OwnedByTask => {
+            validate_project_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                &[NodeKind::AcceptanceCriterion],
+                target_kind,
+                &[NodeKind::Task],
+            )?;
+        }
+        EdgeLabel::ExternalHandle => {
+            validate_project_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                &[NodeKind::Task, NodeKind::AcceptanceCriterion],
+                target_kind,
+                &[NodeKind::ExternalLink],
+            )?;
+        }
+        EdgeLabel::ClosesAcceptanceCriterion => {
+            validate_project_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                &[NodeKind::AcceptanceCriterion],
+                target_kind,
+                &[NodeKind::Verification, NodeKind::CommandRun, NodeKind::TestRun],
+            )?;
+        }
+        EdgeLabel::TouchesFile => {
+            validate_project_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                &[NodeKind::Task],
+                target_kind,
+                &[NodeKind::File],
+            )?;
+        }
+        EdgeLabel::MentionsSymbol => {
+            validate_project_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                &[NodeKind::Task],
+                target_kind,
+                &[NodeKind::Symbol],
+            )?;
+            validate_confidence(edge_id, label, confidence)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_project_edge_kinds(
+    edge_id: &str,
+    label: EdgeLabel,
+    source_kind: Option<NodeKind>,
+    allowed_sources: &[NodeKind],
+    target_kind: Option<NodeKind>,
+    allowed_targets: &[NodeKind],
+) -> WriteResult<()> {
+    match source_kind {
+        Some(kind) if allowed_sources.contains(&kind) => {}
+        Some(kind) => {
+            return Err(ApiError::bad_request(format!(
+                "project edge '{edge_id}' label '{}' has invalid source kind {}",
+                label.as_str(),
+                kind.as_str()
+            )));
+        }
+        None => {
+            return Err(ApiError::new(
+                ErrorCode::UnresolvedEvidenceTarget,
+                format!("project edge '{edge_id}' source not found"),
+            ));
+        }
+    }
+    match target_kind {
+        Some(kind) if allowed_targets.contains(&kind) => Ok(()),
+        Some(kind) => Err(ApiError::bad_request(format!(
+            "project edge '{edge_id}' label '{}' has invalid target kind {}",
+            label.as_str(),
+            kind.as_str()
+        ))),
+        None => Err(ApiError::new(
+            ErrorCode::UnresolvedEvidenceTarget,
+            format!("project edge '{edge_id}' target not found"),
+        )),
+    }
+}
+
+fn validate_project_output_handle(field: &'static str, handle: &OutputHandle) -> WriteResult<()> {
+    if handle.hash.is_empty() {
+        return Err(ApiError::bad_request(format!("{field}.hash must not be empty")));
+    }
+    let inline_len = handle.inline.as_deref().map_or(0, |s| s.len() as u64);
+    if inline_len > handle.bytes {
+        return Err(ApiError::bad_request(format!(
+            "{field}.bytes must be >= inline payload length"
+        )));
+    }
+    if inline_len > INLINE_PAYLOAD_CEILING
+        || (handle.inline.is_some() && handle.bytes > INLINE_PAYLOAD_CEILING)
+    {
+        return Err(ApiError::inline_payload_exceeds_ceiling(format!(
+            "{field}.inline must be None when bytes exceeds the 16 KiB ceiling; demote to handle-only before writing"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_rfc3339_field(field: &'static str, value: &str) -> WriteResult<()> {
+    if DateTime::parse_from_rfc3339(value).is_err() {
+        return Err(ApiError::bad_request(format!(
+            "{field} '{value}' is not a valid RFC 3339 timestamp"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_confidence(edge_id: &str, label: EdgeLabel, confidence: Option<&str>) -> WriteResult<()> {
+    let valid = confidence
+        .and_then(|s| s.parse::<f64>().ok())
+        .is_some_and(|v| (0.0..=1.0).contains(&v));
+    if !valid {
+        return Err(ApiError::bad_request(format!(
+            "project edge '{edge_id}' label '{}' requires a numeric confidence in [0.0, 1.0]",
+            label.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn project_edge(label: EdgeLabel, source: &str, target: &str, summary: &str) -> GraphRecord {
+    let id = project_edge_id(label, source, target);
+    GraphRecord::Edge {
+        id,
+        schema_version: PROJECT_SCHEMA_VERSION,
+        label,
+        source: source.to_owned(),
+        target: target.to_owned(),
+        confidence: None,
+        temporal: None,
+        summary: summary.to_owned(),
+    }
+}
+
+fn project_edge_id(label: EdgeLabel, source: &str, target: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in ["project", "edge", label.as_str(), source, target] {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!(
+        "project:v{PROJECT_SCHEMA_VERSION}:{}",
+        hasher.finalize().to_hex()
+    )
+}
+
 fn validate_verification_output_handle(
     field: &'static str,
     handle: &OutputHandle,
@@ -2293,6 +2867,7 @@ fn record_id_matches_domain(id: &str, domain: &str) -> bool {
         "agent_memory" => id.starts_with("agent_memory:v1:"),
         "verification" => id.starts_with("verification:v1:"),
         "artifact" => id.starts_with("artifact:v1:"),
+        "project" => id.starts_with("project:v1:"),
         _ => true,
     }
 }
@@ -2323,7 +2898,12 @@ fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult
                 "evidence link declares target_domain 'artifact' but target '{id}' does not have the expected 'artifact:v1:' prefix",
             )));
         }
-        // "project" and any other declared domain: no universal prefix requirement.
+        "project" if !id.starts_with("project:v1:") => {
+            return Err(ApiError::bad_request(format!(
+                "evidence link declares target_domain 'project' but target '{id}' does not have the expected 'project:v1:' prefix",
+            )));
+        }
+        // Other declared domains: no universal prefix requirement.
         _ => {}
     }
     Ok(())
@@ -2796,6 +3376,18 @@ fn validate_agent_memory_edge_endpoints(
     source: &str,
     target: &str,
 ) -> WriteResult<()> {
+    if matches!(
+        label,
+        EdgeLabel::ClosesAcceptanceCriterion
+            | EdgeLabel::OwnedByTask
+            | EdgeLabel::ExternalHandle
+            | EdgeLabel::TouchesFile
+    ) {
+        return Err(ApiError::bad_request(format!(
+            "agent-memory edge '{edge_id}' label '{}' is project-only; use a project:v1: edge",
+            label.as_str()
+        )));
+    }
     // Source-domain constraints per schema registry.
     match label {
         // Labels that require an agent_memory:v1: source exclusively.
@@ -2835,12 +3427,17 @@ fn validate_agent_memory_edge_endpoints(
         // Must target agent_memory exclusively.
         EdgeLabel::SessionOf
         | EdgeLabel::AuthoredBy
-        | EdgeLabel::ReferencesTask
         | EdgeLabel::Supersedes
             if !target.starts_with("agent_memory:v1:") =>
         {
             return Err(ApiError::bad_request(format!(
                 "agent-memory edge '{edge_id}' label '{}' requires an agent_memory:v1: target; got target '{target}'",
+                label.as_str()
+            )));
+        }
+        EdgeLabel::ReferencesTask if !target.starts_with("project:v1:") => {
+            return Err(ApiError::bad_request(format!(
+                "agent-memory edge '{edge_id}' label '{}' requires a project:v1: target; got target '{target}'",
                 label.as_str()
             )));
         }
@@ -2914,10 +3511,11 @@ fn validate_and_synthesize_evidence_edges(
             if let GraphRecord::Edge { id, label, .. } = record
                 && !id.starts_with("agent_memory:v1:")
                 && !(id.starts_with("artifact:v1:") && *label == EdgeLabel::Supersedes)
+                && !(id.starts_with("project:v1:") && PROJECT_EDGE_LABELS.contains(label))
                 && label.is_evidence_link_label()
             {
                 return Err(ApiError::bad_request(format!(
-                    "edge '{id}' uses evidence-link label '{}' but is not an agent_memory:v1: edge; evidence relations are only permitted on agent-memory edges",
+                    "edge '{id}' uses evidence-link label '{}' but is not an agent_memory:v1: or project:v1: edge; evidence relations are only permitted on agent-memory or project edges",
                     label.as_str()
                 )));
             }
@@ -3295,19 +3893,21 @@ fn validate_and_synthesize_evidence_edges(
                             )));
                         }
                         // CONTRADICTS: TO any — no target_domain restriction.
-                        // REFERENCES_TASK: the schema registry documents the TO domain as
-                        // "project", but Task nodes currently live in agent_memory.
-                        // Accept both to cover clients using the documented domain name.
-                        EdgeLabel::ReferencesTask
-                            if !matches!(
-                                link.target_domain.as_str(),
-                                "project" | "agent_memory"
-                            ) =>
+                        EdgeLabel::ReferencesTask if link.target_domain != "project" =>
                         {
                             return Err(ApiError::bad_request(format!(
-                                "evidence link relation '{}' requires target_domain 'project' or 'agent_memory'; got '{}'",
+                                "evidence link relation '{}' requires target_domain 'project'; got '{}'",
                                 edge_label.as_str(),
                                 link.target_domain
+                            )));
+                        }
+                        EdgeLabel::ClosesAcceptanceCriterion
+                        | EdgeLabel::OwnedByTask
+                        | EdgeLabel::ExternalHandle
+                        | EdgeLabel::TouchesFile => {
+                            return Err(ApiError::bad_request(format!(
+                                "evidence link relation '{}' is project-only and must be written as a project edge",
+                                edge_label.as_str()
                             )));
                         }
                         EdgeLabel::ProducedPatch if link.target_domain != "artifact" => {
@@ -3644,7 +4244,7 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         Some(d)
             if !matches!(
                 d,
-                "codegraph" | "agent_memory" | "verification" | "artifact"
+                "codegraph" | "agent_memory" | "verification" | "artifact" | "project"
             ) =>
         {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
@@ -4528,7 +5128,7 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     if non_empty(query.domain.as_deref()).is_some_and(|d| {
         !matches!(
             d,
-            "codegraph" | "agent_memory" | "verification" | "artifact"
+            "codegraph" | "agent_memory" | "verification" | "artifact" | "project"
         )
     }) {
         return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
@@ -4623,7 +5223,7 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             &domain,
             state,
         ),
-        "observations_for_symbol" | "agent_sessions_for_repo" => HttpResponse::error_with_id(
+        "observations_for_symbol" | "agent_sessions_for_repo" | "criteria_for_task" => HttpResponse::error_with_id(
             &request_id,
             ApiError::new(
                 ErrorCode::NotImplemented,
@@ -4844,7 +5444,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         Some(d)
             if !matches!(
                 d,
-                "codegraph" | "agent_memory" | "verification" | "artifact"
+                "codegraph" | "agent_memory" | "verification" | "artifact" | "project"
             ) =>
         {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());

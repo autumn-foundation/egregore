@@ -230,7 +230,7 @@ producer.
 
 | Kind | Reserved for |
 |------|-------------|
-| `Task` | Work item tracked by an agent (project domain may reuse). |
+| `Task` | Work item tracked by an agent; first-class project-domain shape is defined in [`docs/schema/project-graph.md`](project-graph.md). |
 | `Artifact` | File, patch, report, or generated output linked to work. |
 | `Verification` | Evidence for a claim, test, or check (emitted by traj importer for test commands). |
 | `CommandEvidence` | Command output or terminal evidence. |
@@ -264,7 +264,7 @@ The daemon write applier is the enforcement point. When a node with
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
 | `target_record_id` | string | yes | The code-graph or other-domain record being cited. |
-| `target_domain` | string | yes | Domain of the target: `"codegraph"`, `"agent_memory"`, etc. |
+| `target_domain` | string | yes | Domain of the target: `"codegraph"`, `"agent_memory"`, `"project"`, etc. |
 | `relation` | string | yes | Cross-domain edge label. See §6. |
 | `confidence` | float string | yes | `[0.0, 1.0]`. |
 | `as_of_commit` | string (SHA) | optional | Git commit anchoring a time-specific citation. |
@@ -272,7 +272,7 @@ The daemon write applier is the enforcement point. When a node with
 ### Target ID resolution
 
 A writer MAY specify the target either:
-- By its **stable `codegraph:v1:` or `agent_memory:v1:` ID** directly (no
+- By its **stable `codegraph:v1:`, `agent_memory:v1:`, or `project:v1:` ID** directly (no
   indirection required).
 - By a `(repo_relative_path, span, git_commit)` triple when the writer cannot
   compute the stable hash. The daemon write applier resolves the triple to the
@@ -300,13 +300,18 @@ removing a label is a schema version bump.
 | `HAS_EVIDENCE` | any | `agent_memory` | any | `Verification`, `CommandEvidence` | many:many | no |
 | `OBSERVES` | `agent_memory` | `codegraph` | `Observation` | any | many:many | yes |
 | `MENTIONS_SYMBOL` | `agent_memory`, `verification` | `codegraph` | any | `Symbol` | many:many | yes |
+| `MENTIONS_SYMBOL` | `project` | `codegraph` | `Task` | `Symbol` | many:many | yes |
 | `TOUCHED_FILE` | `agent_memory`, `verification` | `codegraph` | `FileEdit`, `ToolCall`, `CommandRun`, `TestRun`, `CIStatus` | `File` | many:many | no |
 | `PRODUCED_PATCH` | `agent_memory` | `artifact` | `FileEdit`, `AgentTurn` | `PatchArtifact` | many:1; FileEdit at most one | no |
 | `PRODUCED_EVIDENCE` | `agent_memory` | `verification` | `ToolCall` | `CommandRun`, `TestRun` | many:1 | no |
 | `VALIDATED_BY` | `agent_memory` | `verification` | `Observation`, `Decision` | any verification | many:many | no |
 | `FAILED_ON` | `agent_memory`, `verification` | `codegraph` | `Failure`, `TestRun`, `CIStatus` | `Symbol`, `File` | many:many | no |
 | `EXPLAINS_CHANGE` | `agent_memory` | `codegraph` | `Observation`, `Decision` | `Commit`, `Change` | many:many | yes |
-| `REFERENCES_TASK` | `agent_memory` | `project` | any agent-memory | `Task` | many:many | no |
+| `REFERENCES_TASK` | `agent_memory` | `project` | `Observation`, `Decision`, `Failure`, `Lesson` | `Task` | many:many | no |
+| `CLOSES_ACCEPTANCE_CRITERION` | `project` | `verification` | `AcceptanceCriterion` | `Verification`, `CommandRun`, `TestRun` | many:1 | no |
+| `OWNED_BY_TASK` | `project` | `project` | `AcceptanceCriterion` | `Task` | many:1 | no |
+| `EXTERNAL_HANDLE` | `project` | `project` | `Task`, `AcceptanceCriterion` | `ExternalLink` | many:1 | no |
+| `TOUCHES_FILE` | `project` | `codegraph` | `Task` | `File` | many:many | no |
 | `CONTRADICTS` | `agent_memory`, `verification` | any | any | any | many:many | yes |
 | `SUPERSEDES` | `agent_memory`, `artifact` | `agent_memory`, `artifact` | any agent-memory, `PatchArtifact` | any agent-memory, `PatchArtifact` | many:1 | no |
 | `RELATES_TO` | any | any | any | any | many:many | no |
@@ -384,3 +389,9 @@ Both functions null-terminate each input part before hashing, so
 - **Issue #5 (daemon wire):** `unresolved_evidence_target` is added to the
   daemon error-code enum. HTTP 422, non-retryable. See
   `docs/schema/daemon-api.md` §5.
+- **Issue #14 (project graph):** `REFERENCES_TASK` is promoted from reserved
+  to defined with `project.Task` as TO. `CLOSES_ACCEPTANCE_CRITERION`,
+  `OWNED_BY_TASK`, `EXTERNAL_HANDLE`, `TOUCHES_FILE`, and the project-domain
+  `MENTIONS_SYMBOL` row are contributed by
+  [`docs/schema/project-graph.md`](project-graph.md); this table remains the
+  canonical cross-domain edge registry.

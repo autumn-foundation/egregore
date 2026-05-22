@@ -1,6 +1,11 @@
 //! Embedded `AletheiaDB` adapter.
 
-use std::{collections::BTreeMap, fs, path::Path, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+    time::Instant,
+};
 
 use chrono::{DateTime, Utc};
 
@@ -453,11 +458,47 @@ impl EmbeddedAletheiaSink {
         }
 
         let mut records = Vec::new();
+        let mut emitted_project_node_ids = BTreeSet::new();
+
+        // Project records are mutable and append-with-same-entity-id. Include every
+        // physical project node so status/body mutations remain visible through
+        // transaction-time queries once that selector is wired up.
+        for node_id in self.db.get_all_node_ids() {
+            let node = self
+                .db
+                .get_node(node_id)
+                .map_err(|error| read_back_error("read_all_records", error.to_string()))?;
+            let Some(record_id) = optional_str_property(
+                "read_all_records",
+                "codegraph_id",
+                node.get_property("codegraph_id"),
+            )?
+            else {
+                continue;
+            };
+            if !record_id.starts_with("project:v1:")
+                || active_tombstoned.contains(record_id.as_str())
+                || optional_str_property(
+                    "read_all_records",
+                    "record_type",
+                    node.get_property("record_type"),
+                )?
+                .as_deref()
+                    != Some("node")
+            {
+                continue;
+            }
+            emitted_project_node_ids.insert(node_id);
+            records.push(self.read_node_record(&record_id, node_id)?);
+        }
 
         // Temporal observations: include ALL commit snapshots even for tombstoned records so
         // that `--at <commit>` queries can resolve past state after a deletion.
         for (record_id, commits) in &self.node_lookup.by_commit {
             for candidate in commits.values() {
+                if emitted_project_node_ids.contains(&candidate.storage_id) {
+                    continue;
+                }
                 records.push(self.read_node_record(record_id, candidate.storage_id)?);
             }
         }
@@ -465,6 +506,9 @@ impl EmbeddedAletheiaSink {
         // Non-temporal (current-state) nodes: skip records that have been tombstoned.
         for (record_id, &node_id) in &self.node_lookup.non_temporal {
             if active_tombstoned.contains(record_id.as_str()) {
+                continue;
+            }
+            if emitted_project_node_ids.contains(&node_id) {
                 continue;
             }
             records.push(self.read_node_record(record_id, node_id)?);
@@ -1042,6 +1086,23 @@ impl EmbeddedAletheiaSink {
             redaction_policy_version,
             valid_time,
             valid_time_source,
+            entity_id,
+            title,
+            body_handle,
+            source_kind,
+            source_external_link_id,
+            assignees,
+            labels,
+            priority,
+            parent_task_id,
+            ordinal,
+            verification_link_id,
+            system,
+            url,
+            system_native_id,
+            repository_remote,
+            discovered_at,
+            transaction_time,
             summary,
             domain,
             importer_id,
@@ -1103,6 +1164,45 @@ impl EmbeddedAletheiaSink {
             "node_valid_time_source",
             valid_time_source.as_deref(),
         );
+        builder = insert_optional(builder, "entity_id", entity_id.as_deref());
+        builder = insert_optional(builder, "title", title.as_deref());
+        if let Some(handle) = body_handle
+            && let Ok(json) = serde_json::to_string(handle.as_ref())
+        {
+            builder = builder.insert("body_handle_json", json.as_str());
+        }
+        builder = insert_optional(builder, "source_kind", source_kind.as_deref());
+        builder = insert_optional(
+            builder,
+            "source_external_link_id",
+            source_external_link_id.as_deref(),
+        );
+        if let Some(values) = assignees
+            && let Ok(json) = serde_json::to_string(values)
+        {
+            builder = builder.insert("assignees_json", json.as_str());
+        }
+        if let Some(values) = labels
+            && let Ok(json) = serde_json::to_string(values)
+        {
+            builder = builder.insert("labels_json", json.as_str());
+        }
+        builder = insert_optional(builder, "priority", priority.as_deref());
+        builder = insert_optional(builder, "parent_task_id", parent_task_id.as_deref());
+        if let Some(value) = ordinal {
+            builder = builder.insert("ordinal", value.to_string().as_str());
+        }
+        builder = insert_optional(
+            builder,
+            "verification_link_id",
+            verification_link_id.as_deref(),
+        );
+        builder = insert_optional(builder, "system", system.as_deref());
+        builder = insert_optional(builder, "url", url.as_deref());
+        builder = insert_optional(builder, "system_native_id", system_native_id.as_deref());
+        builder = insert_optional(builder, "repository_remote", repository_remote.as_deref());
+        builder = insert_optional(builder, "discovered_at", discovered_at.as_deref());
+        builder = insert_optional(builder, "transaction_time", transaction_time.as_deref());
         if let Some(span) = span {
             builder = insert_span(builder, *span);
         }
@@ -1730,6 +1830,80 @@ impl EmbeddedAletheiaSink {
                 "node_valid_time_source",
                 node.get_property("node_valid_time_source"),
             )?,
+            entity_id: optional_str_property(record_id, "entity_id", node.get_property("entity_id"))?,
+            title: optional_str_property(record_id, "title", node.get_property("title"))?,
+            body_handle: optional_str_property(
+                record_id,
+                "body_handle_json",
+                node.get_property("body_handle_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::OutputHandle>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("body_handle_json invalid: {e}")))?
+            .map(Box::new),
+            source_kind: optional_str_property(
+                record_id,
+                "source_kind",
+                node.get_property("source_kind"),
+            )?,
+            source_external_link_id: optional_str_property(
+                record_id,
+                "source_external_link_id",
+                node.get_property("source_external_link_id"),
+            )?,
+            assignees: optional_str_property(
+                record_id,
+                "assignees_json",
+                node.get_property("assignees_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<Vec<String>>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("assignees_json invalid: {e}")))?,
+            labels: optional_str_property(record_id, "labels_json", node.get_property("labels_json"))?
+                .as_deref()
+                .map(serde_json::from_str::<Vec<String>>)
+                .transpose()
+                .map_err(|e| read_back_error(record_id, format!("labels_json invalid: {e}")))?,
+            priority: optional_str_property(record_id, "priority", node.get_property("priority"))?,
+            parent_task_id: optional_str_property(
+                record_id,
+                "parent_task_id",
+                node.get_property("parent_task_id"),
+            )?,
+            ordinal: optional_str_property(record_id, "ordinal", node.get_property("ordinal"))?
+                .as_deref()
+                .map(str::parse::<u32>)
+                .transpose()
+                .map_err(|e| read_back_error(record_id, format!("ordinal parse error: {e}")))?,
+            verification_link_id: optional_str_property(
+                record_id,
+                "verification_link_id",
+                node.get_property("verification_link_id"),
+            )?,
+            system: optional_str_property(record_id, "system", node.get_property("system"))?,
+            url: optional_str_property(record_id, "url", node.get_property("url"))?,
+            system_native_id: optional_str_property(
+                record_id,
+                "system_native_id",
+                node.get_property("system_native_id"),
+            )?,
+            repository_remote: optional_str_property(
+                record_id,
+                "repository_remote",
+                node.get_property("repository_remote"),
+            )?,
+            discovered_at: optional_str_property(
+                record_id,
+                "discovered_at",
+                node.get_property("discovered_at"),
+            )?,
+            transaction_time: optional_str_property(
+                record_id,
+                "transaction_time",
+                node.get_property("transaction_time"),
+            )?,
             summary: required_str_property(record_id, "summary", node.get_property("summary"))?,
             domain: optional_str_property(record_id, "domain", node.get_property("domain"))?,
             importer_id: optional_str_property(
@@ -2337,6 +2511,15 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "AgentSession" => Ok(NodeKind::AgentSession),
         "Observation" => Ok(NodeKind::Observation),
         "Task" => Ok(NodeKind::Task),
+        "AcceptanceCriterion" => Ok(NodeKind::AcceptanceCriterion),
+        "ExternalLink" => Ok(NodeKind::ExternalLink),
+        "Product" => Ok(NodeKind::Product),
+        "Project" => Ok(NodeKind::Project),
+        "Plan" => Ok(NodeKind::Plan),
+        "GitHubIssue" => Ok(NodeKind::GitHubIssue),
+        "PR" => Ok(NodeKind::PR),
+        "Review" => Ok(NodeKind::Review),
+        "LocalTask" => Ok(NodeKind::LocalTask),
         "Artifact" => Ok(NodeKind::Artifact),
         "Verification" => Ok(NodeKind::Verification),
         "CommandEvidence" => Ok(NodeKind::CommandEvidence),
@@ -2381,6 +2564,10 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "PRODUCED_PATCH" => Ok(EdgeLabel::ProducedPatch),
         "PRODUCED_EVIDENCE" => Ok(EdgeLabel::ProducedEvidence),
         "VALIDATED_BY" => Ok(EdgeLabel::ValidatedBy),
+        "CLOSES_ACCEPTANCE_CRITERION" => Ok(EdgeLabel::ClosesAcceptanceCriterion),
+        "OWNED_BY_TASK" => Ok(EdgeLabel::OwnedByTask),
+        "EXTERNAL_HANDLE" => Ok(EdgeLabel::ExternalHandle),
+        "TOUCHES_FILE" => Ok(EdgeLabel::TouchesFile),
         "FAILED_ON" => Ok(EdgeLabel::FailedOn),
         "EXPLAINS_CHANGE" => Ok(EdgeLabel::ExplainsChange),
         "REFERENCES_TASK" => Ok(EdgeLabel::ReferencesTask),
@@ -2506,6 +2693,15 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::AgentSession
         | NodeKind::Observation
         | NodeKind::Task
+        | NodeKind::AcceptanceCriterion
+        | NodeKind::ExternalLink
+        | NodeKind::Product
+        | NodeKind::Project
+        | NodeKind::Plan
+        | NodeKind::GitHubIssue
+        | NodeKind::PR
+        | NodeKind::Review
+        | NodeKind::LocalTask
         | NodeKind::Artifact
         | NodeKind::Verification
         | NodeKind::CommandEvidence

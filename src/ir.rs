@@ -17,6 +17,10 @@ pub const VERIFICATION_SCHEMA_VERSION: u32 = 1;
 /// Documented in `docs/schema/agent-actions.md`.
 pub const ARTIFACT_SCHEMA_VERSION: u32 = 1;
 
+/// Schema version for project-domain records (`Task`, `AcceptanceCriterion`, etc.).
+/// Documented in `docs/schema/project-graph.md`.
+pub const PROJECT_SCHEMA_VERSION: u32 = 1;
+
 /// Complete in-memory graph emitted by a scan.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
@@ -303,6 +307,58 @@ pub enum GraphRecord {
         /// For history-backed records see `temporal.valid_time_source`.
         #[serde(skip_serializing_if = "Option::is_none")]
         valid_time_source: Option<String>,
+        // ── Project-domain fields (docs/schema/project-graph.md) ─────────────
+        /// Stable entity ID within the project domain across mutations.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        entity_id: Option<String>,
+        /// Task title.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// Redacted body handle for task body text.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        body_handle: Option<Box<OutputHandle>>,
+        /// Project task source kind.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_kind: Option<String>,
+        /// Record ID of the `ExternalLink` carrying the source-system handle.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_external_link_id: Option<String>,
+        /// Opaque assignee identifiers.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        assignees: Option<Vec<String>>,
+        /// Project labels.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        labels: Option<Vec<String>>,
+        /// Project priority enum value.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        priority: Option<String>,
+        /// Owning `Task` record ID for an `AcceptanceCriterion`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_task_id: Option<String>,
+        /// Position within the parent task's AC list.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ordinal: Option<u32>,
+        /// Optional verification-domain record that closed an AC.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        verification_link_id: Option<String>,
+        /// External system enum value for `ExternalLink`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        system: Option<String>,
+        /// Canonical URL or `file://` path for `ExternalLink`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// Source-system-native ID for `ExternalLink`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        system_native_id: Option<String>,
+        /// VCS remote when applicable.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        repository_remote: Option<String>,
+        /// RFC3339 timestamp when an importer first saw this external handle.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        discovered_at: Option<String>,
+        /// RFC3339 store transaction time for project-domain mutations.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transaction_time: Option<String>,
         /// Agent-facing summary.
         summary: String,
         // ── Importer provenance fields (absent for non-imported records) ─────
@@ -514,6 +570,23 @@ impl GraphRecord {
             redaction_policy_version: None,
             valid_time: None,
             valid_time_source: None,
+            entity_id: None,
+            title: None,
+            body_handle: None,
+            source_kind: None,
+            source_external_link_id: None,
+            assignees: None,
+            labels: None,
+            priority: None,
+            parent_task_id: None,
+            ordinal: None,
+            verification_link_id: None,
+            system: None,
+            url: None,
+            system_native_id: None,
+            repository_remote: None,
+            discovered_at: None,
+            transaction_time: None,
             summary,
             domain: None,
             importer_id: None,
@@ -593,6 +666,23 @@ impl GraphRecord {
             redaction_policy_version: None,
             valid_time: None,
             valid_time_source: None,
+            entity_id: None,
+            title: None,
+            body_handle: None,
+            source_kind: None,
+            source_external_link_id: None,
+            assignees: None,
+            labels: None,
+            priority: None,
+            parent_task_id: None,
+            ordinal: None,
+            verification_link_id: None,
+            system: None,
+            url: None,
+            system_native_id: None,
+            repository_remote: None,
+            discovered_at: None,
+            transaction_time: None,
             summary,
             domain: None,
             importer_id: None,
@@ -671,6 +761,23 @@ impl GraphRecord {
             redaction_policy_version: None,
             valid_time: None,
             valid_time_source: None,
+            entity_id: None,
+            title: None,
+            body_handle: None,
+            source_kind: None,
+            source_external_link_id: None,
+            assignees: None,
+            labels: None,
+            priority: None,
+            parent_task_id: None,
+            ordinal: None,
+            verification_link_id: None,
+            system: None,
+            url: None,
+            system_native_id: None,
+            repository_remote: None,
+            discovered_at: None,
+            transaction_time: None,
             summary,
             domain: None,
             importer_id: None,
@@ -879,8 +986,26 @@ pub enum NodeKind {
     AgentSession,
     /// Agent-authored memory or discovery.
     Observation,
-    /// Work item tracked by an agent.
+    /// Project-domain work item.
     Task,
+    /// Falsifiable requirement attached to a task.
+    AcceptanceCriterion,
+    /// Source-system handle for project-domain records.
+    ExternalLink,
+    /// Long-lived product/repository initiative (project domain, reserved).
+    Product,
+    /// Bounded area of work under a product (project domain, reserved).
+    Project,
+    /// Strategy, milestone, or implementation plan (project domain, reserved).
+    Plan,
+    /// GitHub-specific issue metadata (project domain, reserved).
+    GitHubIssue,
+    /// GitHub pull-request metadata (project domain, reserved).
+    PR,
+    /// Review comment, finding, approval, or requested change (project domain, reserved).
+    Review,
+    /// Local project/task JSONL work item (project domain, reserved).
+    LocalTask,
     /// File, patch, report, or generated output linked to work.
     Artifact,
     /// Evidence for a claim, test, or check.
@@ -935,6 +1060,15 @@ impl NodeKind {
             Self::AgentSession => "AgentSession",
             Self::Observation => "Observation",
             Self::Task => "Task",
+            Self::AcceptanceCriterion => "AcceptanceCriterion",
+            Self::ExternalLink => "ExternalLink",
+            Self::Product => "Product",
+            Self::Project => "Project",
+            Self::Plan => "Plan",
+            Self::GitHubIssue => "GitHubIssue",
+            Self::PR => "PR",
+            Self::Review => "Review",
+            Self::LocalTask => "LocalTask",
             Self::Artifact => "Artifact",
             Self::Verification => "Verification",
             Self::CommandEvidence => "CommandEvidence",
@@ -998,6 +1132,14 @@ pub enum EdgeLabel {
     ProducedEvidence,
     /// Agent-memory node is validated by an evidence record.
     ValidatedBy,
+    /// Project acceptance criterion is closed by verification evidence.
+    ClosesAcceptanceCriterion,
+    /// Project acceptance criterion belongs to a task.
+    OwnedByTask,
+    /// Project record points to its external source handle.
+    ExternalHandle,
+    /// Project task intends to touch a code-graph file.
+    TouchesFile,
     /// Agent-memory node describes a failure on a code entity.
     FailedOn,
     /// Agent-memory node explains a code change.
@@ -1036,6 +1178,10 @@ impl EdgeLabel {
             "PRODUCED_PATCH" => Some(Self::ProducedPatch),
             "PRODUCED_EVIDENCE" => Some(Self::ProducedEvidence),
             "VALIDATED_BY" => Some(Self::ValidatedBy),
+            "CLOSES_ACCEPTANCE_CRITERION" => Some(Self::ClosesAcceptanceCriterion),
+            "OWNED_BY_TASK" => Some(Self::OwnedByTask),
+            "EXTERNAL_HANDLE" => Some(Self::ExternalHandle),
+            "TOUCHES_FILE" => Some(Self::TouchesFile),
             "FAILED_ON" => Some(Self::FailedOn),
             "EXPLAINS_CHANGE" => Some(Self::ExplainsChange),
             "REFERENCES_TASK" => Some(Self::ReferencesTask),
@@ -1061,6 +1207,10 @@ impl EdgeLabel {
                 | Self::ProducedPatch
                 | Self::ProducedEvidence
                 | Self::ValidatedBy
+                | Self::ClosesAcceptanceCriterion
+                | Self::OwnedByTask
+                | Self::ExternalHandle
+                | Self::TouchesFile
                 | Self::FailedOn
                 | Self::ExplainsChange
                 | Self::ReferencesTask
@@ -1116,6 +1266,10 @@ impl EdgeLabel {
             Self::ProducedPatch => "PRODUCED_PATCH",
             Self::ProducedEvidence => "PRODUCED_EVIDENCE",
             Self::ValidatedBy => "VALIDATED_BY",
+            Self::ClosesAcceptanceCriterion => "CLOSES_ACCEPTANCE_CRITERION",
+            Self::OwnedByTask => "OWNED_BY_TASK",
+            Self::ExternalHandle => "EXTERNAL_HANDLE",
+            Self::TouchesFile => "TOUCHES_FILE",
             Self::FailedOn => "FAILED_ON",
             Self::ExplainsChange => "EXPLAINS_CHANGE",
             Self::ReferencesTask => "REFERENCES_TASK",
@@ -1195,6 +1349,24 @@ pub fn artifact_stable_id(parts: &[&str]) -> String {
     }
     format!(
         "artifact:v{ARTIFACT_SCHEMA_VERSION}:{}",
+        hasher.finalize().to_hex()
+    )
+}
+
+/// Builds a stable project-domain record ID.
+///
+/// Uses the `project:v1:` prefix so project IDs cannot collide with code-graph,
+/// agent-memory, artifact, or verification IDs. Documented in
+/// `docs/schema/project-graph.md`.
+#[must_use]
+pub fn project_stable_id(parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!(
+        "project:v{PROJECT_SCHEMA_VERSION}:{}",
         hasher.finalize().to_hex()
     )
 }

@@ -124,6 +124,7 @@ Error responses follow the standard envelope in
 | `drift_top_n`           | implemented | `limit?: u64` (default 10, max 100) | SemanticDrift records ranked by score |
 | `observations_for_symbol` | reserved  | —                             | Returns `not_implemented` |
 | `agent_sessions_for_repo` | reserved  | —                             | Returns `not_implemented` |
+| `criteria_for_task`      | reserved  | `task_id: string`              | Future project-graph query over [`docs/schema/project-graph.md`](project-graph.md); returns `not_implemented` until wired. |
 
 ---
 

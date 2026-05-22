@@ -186,6 +186,7 @@ Query output is newline-delimited JSON by default (`--format json`). Pass `--for
 - **Agent-memory domain schema (v1):** [docs/schema/agent-memory.md](docs/schema/agent-memory.md)
 - **Agent-actions and PatchArtifact schema (v1):** [docs/schema/agent-actions.md](docs/schema/agent-actions.md)
 - **Verification-evidence domain schema (v1):** [docs/schema/verification.md](docs/schema/verification.md)
+- **Project-graph domain schema (v1):** [docs/schema/project-graph.md](docs/schema/project-graph.md)
 - **Redaction schema (v1):** [docs/schema/redaction.md](docs/schema/redaction.md)
 - **Bi-temporal selector grammar (v2):** [docs/schema/temporal-selectors.md](docs/schema/temporal-selectors.md)
 - **Symbol identity ADR:** [docs/adr/0004-symbol-identity.md](docs/adr/0004-symbol-identity.md)

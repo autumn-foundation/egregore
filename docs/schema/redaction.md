@@ -9,6 +9,11 @@ Code-graph records are explicitly out of scope for redaction. Source-derived
 facts such as repository paths, symbol names, spans, commits, and topology edges
 remain plaintext by construction.
 
+Coordination: [`docs/schema/project-graph.md`](project-graph.md) reserves the
+six project fields that must pass through this policy:
+`Task.title`, `Task.body_handle.inline`, `Task.labels`, `Task.assignees`,
+`AcceptanceCriterion.text`, and `ExternalLink.url`.
+
 ## Secret Classes
 
 The default policy must redact at least these named classes before persistence:
