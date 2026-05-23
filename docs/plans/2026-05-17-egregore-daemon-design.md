@@ -13,6 +13,11 @@ response envelope, error-code taxonomy, idempotency semantics) is specified in
 [docs/schema/daemon-api.md](../schema/daemon-api.md). This design plan
 describes *how* the daemon is built; the schema doc owns *what* it exposes.
 
+**Runtime discovery contract:** The runtime sidecar layout, `egregored.json`
+schema, stale-file detection, discovery walk, and file-permissions guarantees
+are specified in [docs/schema/daemon-runtime.md](../schema/daemon-runtime.md).
+The store-locking example below is non-normative; that schema doc is normative.
+
 **Agent-action schema:** `ToolCall`, `FileEdit`, and `PatchArtifact` validation
 rules, including artifact-domain placement and patch-status pinning, are
 specified in [docs/schema/agent-actions.md](../schema/agent-actions.md).
@@ -90,7 +95,9 @@ driver too early.
 ## Store Ownership and Locking
 
 On startup, `egregored` acquires an exclusive advisory file lock in an adjacent
-runtime sidecar directory, for example:
+runtime sidecar directory. The precise path algorithm and file permissions are
+normative in [docs/schema/daemon-runtime.md](../schema/daemon-runtime.md); this
+example is illustrative:
 
 ```text
 <data-dir>.egregore-runtime/egregored.lock

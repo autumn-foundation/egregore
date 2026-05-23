@@ -13,7 +13,11 @@ use std::{
 
 use aletheia_egregore::{
     adapters::{EmbeddedAletheiaSink, GraphSink},
-    daemon::{DaemonClient, DaemonMetadata as ClientDaemonMetadata, StoreLease},
+    daemon::{
+        DaemonClient, DaemonMetadata as ClientDaemonMetadata, DaemonState,
+        StoreLease, discover_runtime_dir_for_working_dir, runtime_dir_for_data_dir,
+        runtime_metadata_is_stale,
+    },
     import_traj,
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, GraphRecord, IdentitySource, NodeKind,
@@ -32,9 +36,18 @@ fn fixture_repo() -> PathBuf {
 
 #[derive(Debug, Deserialize)]
 struct DaemonMetadata {
+    schema_version: u32,
     pid: u32,
     address: String,
     token: String,
+    data_dir: PathBuf,
+    version: String,
+    started_at_unix_ms: serde_json::Value,
+    state: String,
+    api_version: Option<String>,
+    transports: Option<Vec<serde_json::Value>>,
+    token_expires_at_unix_ms: Option<serde_json::Value>,
+    daemons_index_url: Option<String>,
 }
 
 #[test]
@@ -126,6 +139,8 @@ fn second_daemon_for_same_data_dir_fails() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
     let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let runtime_dir = runtime_dir(&data_dir);
 
     Command::cargo_bin("egregore")
         .expect("binary should run")
@@ -137,9 +152,152 @@ fn second_daemon_for_same_data_dir_fails() {
         .arg("0")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("daemon already running"));
+        .stderr(predicate::str::contains("daemon already running"))
+        .stderr(predicate::str::contains(format!("pid {}", metadata.pid)))
+        .stderr(predicate::str::contains(runtime_dir.display().to_string()));
 
     daemon.stop();
+}
+
+#[test]
+fn daemon_runtime_dir_contract_conforms() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join(".egregore");
+    fs::create_dir_all(data_dir.join("nested").join("work"))
+        .expect("working subdir should be created");
+    let mut daemon = start_daemon(&data_dir);
+
+    let runtime_dir = runtime_dir_for_data_dir(&data_dir);
+    let canonical_data_dir = data_dir
+        .canonicalize()
+        .expect("daemon data dir should canonicalize");
+    assert_eq!(
+        runtime_dir,
+        canonical_data_dir.with_file_name(".egregore.egregore-runtime"),
+        "runtime dir must be adjacent to, not nested inside, the data dir"
+    );
+    assert!(runtime_dir.is_dir(), "runtime dir should exist");
+    assert!(runtime_dir.join("egregored.lock").exists());
+    assert!(runtime_dir.join("egregored.json").exists());
+    wait_for_path(&runtime_dir.join("idempotency.json"));
+    assert!(runtime_dir.join("idempotency.json").exists());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let runtime_mode = fs::metadata(&runtime_dir)
+            .expect("runtime dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let lock_mode = fs::metadata(runtime_dir.join("egregored.lock"))
+            .expect("lock metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let metadata_mode = fs::metadata(runtime_dir.join("egregored.json"))
+            .expect("metadata file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(runtime_mode, 0o700);
+        assert_eq!(lock_mode, 0o600);
+        assert_eq!(metadata_mode, 0o600);
+    }
+
+    let metadata = read_metadata(&data_dir);
+    assert_eq!(metadata.schema_version, 1);
+    assert_ne!(metadata.pid, 0);
+    assert!(!metadata.address.is_empty());
+    assert!(!metadata.token.is_empty());
+    assert_eq!(
+        metadata.data_dir,
+        canonical_data_dir
+    );
+    assert_eq!(metadata.version, env!("CARGO_PKG_VERSION"));
+    assert!(metadata.started_at_unix_ms.is_u64() || metadata.started_at_unix_ms.is_string());
+    assert_eq!(metadata.state, "running");
+    assert!(metadata.api_version.is_none());
+    assert!(metadata.transports.is_none());
+    assert!(metadata.token_expires_at_unix_ms.is_none());
+    assert!(metadata.daemons_index_url.is_none());
+
+    let working_dir = data_dir.join("nested").join("work");
+    assert_eq!(
+        discover_runtime_dir_for_working_dir(&working_dir, None)
+            .expect("walk-up discovery should find daemon runtime dir"),
+        runtime_dir
+    );
+
+    let env_data_dir = temp.path().join("other-store");
+    fs::create_dir_all(&env_data_dir).expect("env data dir should be created");
+    let env_runtime_dir = runtime_dir_for_data_dir(&env_data_dir);
+    fs::create_dir_all(&env_runtime_dir).expect("env runtime dir should be created");
+    assert_eq!(
+        discover_runtime_dir_for_working_dir(&working_dir, Some(env_data_dir.as_path()))
+            .expect("env data dir should short-circuit walk-up discovery"),
+        env_runtime_dir
+    );
+
+    daemon.stop();
+    let stopped_metadata = read_metadata(&data_dir);
+    assert_eq!(stopped_metadata.state, "stopped");
+    assert!(
+        runtime_dir.join("egregored.json").exists(),
+        "graceful shutdown should preserve metadata for status/forensics"
+    );
+    assert!(
+        runtime_metadata_is_stale(&data_dir).expect("stale check should inspect lock"),
+        "stopped metadata with an unheld lock is stale for client connection"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn daemon_runtime_contract_windows_acl_gap_is_explicit() {
+    assert!(
+        aletheia_egregore::daemon::WINDOWS_RUNTIME_ACL_TODO
+            .contains("TODO(windows-acl-runtime-permissions)"),
+        "Windows runtime ACL enforcement must remain an explicit named gap until implemented"
+    );
+}
+
+#[test]
+fn daemon_runtime_schema_doc_is_cross_linked_and_names_contract() {
+    let schema = read_repo_text("docs/schema/daemon-runtime.md");
+    for needle in [
+        "# `egregored` Runtime Directory Contract",
+        "schema_version` | integer | Must be `1`",
+        "`state` | enum | `\"running\"`, `\"stopped\"`, or `\"crashed\"`",
+        "`runtime_permissions_unsafe`",
+        "`token_rotated`",
+        "EGREGORE_DATA_DIR",
+        "no daemon for this directory",
+    ] {
+        assert!(schema.contains(needle), "runtime schema must contain {needle}");
+    }
+
+    for (path, needle) in [
+        ("README.md", "docs/schema/daemon-runtime.md"),
+        (
+            "docs/adr/0003-egregore-daemon-shared-store.md",
+            "docs/schema/daemon-runtime.md",
+        ),
+        (
+            "docs/plans/2026-05-17-egregore-daemon-design.md",
+            "docs/schema/daemon-runtime.md",
+        ),
+        ("docs/schema/daemon-api.md", "daemon-runtime.md"),
+        ("docs/schema/daemon-query.md", "daemon-runtime.md"),
+    ] {
+        let text = read_repo_text(path);
+        assert!(
+            text.contains(needle),
+            "{path} must link to or coordinate with daemon-runtime.md"
+        );
+    }
 }
 
 #[test]
@@ -460,12 +618,18 @@ fn daemon_ingest_preflights_wrong_service_before_sending_records() {
 fn daemon_health_probe_bounds_unroutable_connect() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let client = DaemonClient::new(ClientDaemonMetadata {
+        schema_version: 1,
         pid: 999_995,
         address: "10.255.255.1:9".to_owned(),
         token: "blackhole-token".to_owned(),
         data_dir: temp.path().join("store"),
         version: "test".to_owned(),
         started_at_unix_ms: 0,
+        state: DaemonState::Running,
+        api_version: None,
+        transports: None,
+        token_expires_at_unix_ms: None,
+        daemons_index_url: None,
     });
 
     let started = Instant::now();
@@ -1768,7 +1932,7 @@ fn start_daemon(data_dir: &Path) -> RunningDaemon {
         .stderr(Stdio::null())
         .spawn()
         .expect("daemon should spawn");
-    let _ = read_metadata(data_dir);
+    let _ = read_running_metadata(data_dir);
     RunningDaemon {
         child: Some(child),
         data_dir: data_dir.to_path_buf(),
@@ -1799,6 +1963,34 @@ fn read_metadata(data_dir: &Path) -> DaemonMetadata {
             start.elapsed() < Duration::from_secs(5),
             "daemon metadata should appear at {}",
             metadata_path.display()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn read_running_metadata(data_dir: &Path) -> DaemonMetadata {
+    let start = Instant::now();
+    loop {
+        let metadata = read_metadata(data_dir);
+        if metadata.state == "running" {
+            return metadata;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "daemon metadata should transition to running for {}",
+            data_dir.display()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_path(path: &Path) {
+    let start = Instant::now();
+    while !path.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{} should appear",
+            path.display()
         );
         thread::sleep(Duration::from_millis(25));
     }

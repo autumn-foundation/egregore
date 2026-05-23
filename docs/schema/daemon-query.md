@@ -17,6 +17,9 @@ the `get_records` verb.
 
 Full transport and authentication rules are in
 [`docs/schema/daemon-api.md`](daemon-api.md).
+Daemon clients MUST first follow the runtime discovery and stale-file checks in
+[`docs/schema/daemon-runtime.md`](daemon-runtime.md); the query verb set runs
+over the `address` and bearer token discovered through that contract.
 
 Returned record-shaped rows include the record-level `schema_version` so mixed
 stores and bi-temporal reads do not hide version boundaries. Record compatibility

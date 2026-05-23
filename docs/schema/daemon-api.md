@@ -6,6 +6,8 @@ error codes, or remove response keys require a `/v2/` prefix.
 **Source of truth:** This document. `src/daemon.rs` must conform to it; the
 design plan (`docs/plans/2026-05-17-egregore-daemon-design.md`) describes
 *how* it is implemented, this document owns *what* it exposes.
+Daemon discovery before HTTP is specified separately in
+[`daemon-runtime.md`](daemon-runtime.md).
 
 ---
 
@@ -34,8 +36,9 @@ multiple record schema versions in one store, and must reject unknown
 - **Protocol**: HTTP/1.1, `Connection: close`.
 - **Auth**: every non-`/v1/health` request requires `Authorization: Bearer
   <token>`. The token is written to `egregored.json` in the daemon runtime
-  directory when the daemon starts. Requests missing or with wrong tokens
-  receive HTTP 401 + `unauthorized`.
+  directory when the daemon starts; clients find and validate that file through
+  [`daemon-runtime.md`](daemon-runtime.md). Requests missing or with wrong
+  tokens receive HTTP 401 + `unauthorized`.
 - **Future transports** (Unix socket, Windows named pipe) are reserved but out
   of scope for v1.
 
@@ -117,6 +120,8 @@ All error codes are snake\_case identifiers. String literals at call sites in
 | `internal_error`      | 500  | yes       | no               | all    |
 | `not_implemented`     | 501  | no        | no               | reserved |
 | `ambiguous_commit_prefix` | 400 | no     | no               | query (symbol_at_commit) |
+| `runtime_permissions_unsafe` | 500 | no | no               | daemon startup |
+| `token_rotated`       | 401  | yes       | no               | reserved |
 | `shutdown_in_progress`| 503  | yes       | yes              | all    |
 | `redaction_required`  | 422  | no        | no               | ingest (future) |
 | `unresolved_evidence_target` | 422 | no  | no               | ingest, jobs/ingest |
@@ -140,6 +145,10 @@ Coordination: issue #15 adds `semantic` domain writes,
 
 Coordination: issue #16 reserves `unknown_schema_version` for record-level
 version compatibility. See [`docs/schema/schema-versioning.md`](schema-versioning.md).
+
+Coordination: issue #18 reserves `runtime_permissions_unsafe` and
+`token_rotated`. Runtime-dir discovery, stale-file detection, and the
+`egregored.json` schema live in [`daemon-runtime.md`](daemon-runtime.md).
 
 ---
 

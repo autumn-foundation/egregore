@@ -11,6 +11,11 @@ The HTTP/JSON wire contract for `egregored` is frozen in
 single source of truth for request envelopes, response envelopes, error-code
 identifiers, idempotency semantics, and versioning policy.
 
+The runtime directory, `egregored.json` schema, bearer-token discovery, stale-file
+detection, and file-permissions contract are frozen in
+[docs/schema/daemon-runtime.md](../schema/daemon-runtime.md). Integration
+clients MUST follow that discovery contract before issuing HTTP requests.
+
 The `POST /v1/query` verb set and payload contract are specified in
 [docs/schema/daemon-query.md](../schema/daemon-query.md). That document is the
 read-side complement to the write-side wire contract above.

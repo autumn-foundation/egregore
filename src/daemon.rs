@@ -44,6 +44,12 @@ const RUNTIME_DIR_SUFFIX: &str = ".egregore-runtime";
 const LOCK_FILE: &str = "egregored.lock";
 const METADATA_FILE: &str = "egregored.json";
 const IDEMPOTENCY_FILE: &str = "idempotency.json";
+/// Schema version for the daemon runtime directory metadata contract.
+///
+/// Documented in `docs/schema/daemon-runtime.md`.
+pub const DAEMON_RUNTIME_SCHEMA_VERSION: u32 = 1;
+/// Environment variable that names a daemon data directory for discovery.
+pub const EGREGORE_DATA_DIR_ENV: &str = "EGREGORE_DATA_DIR";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 37_383;
 const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -79,9 +85,46 @@ impl DaemonConfig {
     }
 }
 
-/// Metadata written by a running daemon.
+/// Runtime state written to `egregored.json`.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonState {
+    /// The daemon held the lease when it last wrote metadata.
+    #[default]
+    Running,
+    /// The daemon stopped gracefully and released the lease.
+    Stopped,
+    /// A startup or client-side stale-file check found lingering metadata with no held lease.
+    Crashed,
+}
+
+/// Reserved transport kinds for future daemon transports.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonTransportKind {
+    /// Loopback HTTP transport used by v1.
+    Http,
+    /// Reserved Unix-domain socket transport.
+    Unix,
+    /// Reserved Windows named-pipe transport.
+    Pipe,
+}
+
+/// Reserved transport descriptor for future multi-transport metadata.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DaemonTransport {
+    /// Transport kind.
+    pub kind: DaemonTransportKind,
+    /// Address, socket path, or pipe name.
+    pub address: String,
+}
+
+/// Metadata written by a daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonMetadata {
+    /// Runtime metadata schema version.
+    #[serde(default = "daemon_runtime_schema_version")]
+    pub schema_version: u32,
     /// Daemon process ID.
     pub pid: u32,
     /// Bound TCP address.
@@ -94,6 +137,25 @@ pub struct DaemonMetadata {
     pub version: String,
     /// Unix milliseconds when the daemon started.
     pub started_at_unix_ms: u128,
+    /// Last-known daemon lifecycle state.
+    #[serde(default)]
+    pub state: DaemonState,
+    /// Reserved wire API version field. Null in v1 runtime metadata.
+    #[serde(default)]
+    pub api_version: Option<String>,
+    /// Reserved future transport descriptors. Null in v1 runtime metadata.
+    #[serde(default)]
+    pub transports: Option<Vec<DaemonTransport>>,
+    /// Reserved future token-rotation expiry. Null in v1 runtime metadata.
+    #[serde(default)]
+    pub token_expires_at_unix_ms: Option<u128>,
+    /// Reserved future multi-daemon index pointer. Null in v1 runtime metadata.
+    #[serde(default)]
+    pub daemons_index_url: Option<String>,
+}
+
+const fn daemon_runtime_schema_version() -> u32 {
+    DAEMON_RUNTIME_SCHEMA_VERSION
 }
 
 /// Response returned by daemon-backed ingestion.
@@ -178,18 +240,26 @@ struct IdempotencyStore {
 
 impl IdempotencyStore {
     fn load(path: PathBuf) -> Result<Self> {
+        let mut created = false;
         let entries = match fs::read_to_string(&path) {
             Ok(contents) => {
                 serde_json::from_str::<IdempotencyFile>(&contents)
                     .with_context(|| format!("failed to parse {}", path.display()))?
                     .entries
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                created = true;
+                BTreeMap::new()
+            }
             Err(error) => {
                 return Err(error).with_context(|| format!("failed to read {}", path.display()));
             }
         };
-        Ok(Self { path, entries })
+        let store = Self { path, entries };
+        if created {
+            store.persist_entries(&store.entries)?;
+        }
+        Ok(store)
     }
 
     fn set_entry_durably(&mut self, key: String, entry: IdempotencyEntry) -> Result<()> {
@@ -236,13 +306,17 @@ impl StoreLease {
 
     fn try_acquire(data_dir: &Path) -> Result<Option<Self>> {
         let path = lock_path(data_dir)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
             .open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
+        enforce_runtime_file_permissions(&path)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { file, path })),
             Err(_) => Ok(None),
@@ -273,9 +347,7 @@ impl Drop for StoreLease {
 }
 
 fn lock_path(data_dir: &Path) -> Result<PathBuf> {
-    let runtime_dir = runtime_dir(data_dir);
-    fs::create_dir_all(&runtime_dir)
-        .with_context(|| format!("failed to create {}", runtime_dir.display()))?;
+    let runtime_dir = ensure_runtime_dir(data_dir)?;
     Ok(runtime_dir.join(LOCK_FILE))
 }
 
@@ -289,6 +361,35 @@ fn remove_metadata_if_store_unleased(data_dir: &Path) -> Result<bool> {
             .with_context(|| format!("failed to remove stale {}", path.display()))?;
     }
     Ok(true)
+}
+
+fn mark_metadata_crashed_if_store_unleased(data_dir: &Path) -> Result<bool> {
+    let Some(_lease) = StoreLease::try_acquire(data_dir)? else {
+        return Ok(false);
+    };
+    let Ok(metadata) = read_metadata(data_dir) else {
+        return Ok(true);
+    };
+    let crashed = DaemonMetadata {
+        state: DaemonState::Crashed,
+        ..metadata
+    };
+    write_metadata(data_dir, &crashed)?;
+    Ok(true)
+}
+
+fn store_is_unleased(data_dir: &Path) -> Result<bool> {
+    Ok(StoreLease::try_acquire(data_dir)?.is_some())
+}
+
+fn already_running_error(data_dir: &Path, metadata: &DaemonMetadata) -> anyhow::Error {
+    anyhow!(
+        "daemon already running for {} at {} (pid {}, runtime dir {})",
+        data_dir.display(),
+        metadata.address,
+        metadata.pid,
+        runtime_dir(data_dir).display()
+    )
 }
 
 #[derive(Clone)]
@@ -385,6 +486,12 @@ enum ErrorCode {
     /// Added by #13 and reused for #11 handles: inline payload exceeded the
     /// 16 KiB ceiling and must be demoted to handle-only storage.
     InlinePayloadExceedsCeiling,
+    /// Reserved by #18: daemon startup refused to create or keep runtime files
+    /// with unsafe permissions.
+    RuntimePermissionsUnsafe,
+    /// Reserved by #18: future token rotation asks clients to re-read
+    /// `egregored.json` and retry with the fresh token.
+    TokenRotated,
     /// Added by #14 (project graph schema): a verified `AcceptanceCriterion` is
     /// missing the verification record that closed it.
     AcceptanceCriterionMissingVerification,
@@ -421,6 +528,8 @@ impl ErrorCode {
             Self::MissingEvidenceHandle => "missing_evidence_handle",
             Self::PatchStatusPinned => "patch_status_pinned",
             Self::InlinePayloadExceedsCeiling => "inline_payload_exceeds_ceiling",
+            Self::RuntimePermissionsUnsafe => "runtime_permissions_unsafe",
+            Self::TokenRotated => "token_rotated",
             Self::AcceptanceCriterionMissingVerification => {
                 "acceptance_criterion_missing_verification"
             }
@@ -432,7 +541,7 @@ impl ErrorCode {
 
     const fn http_status(self) -> u16 {
         match self {
-            Self::Unauthorized => 401,
+            Self::Unauthorized | Self::TokenRotated => 401,
             Self::BadRequest
             | Self::MissingField
             | Self::InvalidDomain
@@ -443,7 +552,7 @@ impl ErrorCode {
             Self::PayloadTooLarge => 413,
             Self::QueueFull => 429,
             Self::QueryTimeout => 408,
-            Self::InternalError => 500,
+            Self::InternalError | Self::RuntimePermissionsUnsafe => 500,
             Self::NotImplemented => 501,
             Self::ShutdownInProgress => 503,
             Self::RedactionRequired
@@ -801,11 +910,11 @@ struct AgentRegisterFull {
 /// or the daemon does not become healthy before the startup timeout.
 pub fn start_background(config: &DaemonConfig) -> Result<DaemonMetadata> {
     if let Some(metadata) = active_metadata(&config.data_dir) {
-        return Err(anyhow!("daemon already running at {}", metadata.address));
+        return Err(already_running_error(&config.data_dir, &metadata));
     }
     let metadata_path = metadata_path(&config.data_dir);
     if metadata_path.exists() {
-        if !remove_metadata_if_store_unleased(&config.data_dir)? {
+        if !mark_metadata_crashed_if_store_unleased(&config.data_dir)? {
             return Err(anyhow!(
                 "daemon metadata is unresponsive but store lease is still held for {}",
                 config.data_dir.display()
@@ -853,8 +962,15 @@ pub fn start_background(config: &DaemonConfig) -> Result<DaemonMetadata> {
 pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
     fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("failed to create {}", config.data_dir.display()))?;
-    let mut lease = StoreLease::acquire(&config.data_dir)
-        .with_context(|| format!("daemon already running for {}", config.data_dir.display()))?;
+    if let Some(metadata) = active_metadata(&config.data_dir) {
+        return Err(already_running_error(&config.data_dir, &metadata));
+    }
+    let mut lease = StoreLease::acquire(&config.data_dir).map_err(|error| {
+        read_metadata(&config.data_dir).map_or_else(
+            |_| anyhow!("daemon already running for {}: {error}", config.data_dir.display()),
+            |metadata| already_running_error(&config.data_dir, &metadata),
+        )
+    })?;
     let sink = EmbeddedAletheiaSink::open_unleased(&config.data_dir).with_context(|| {
         format!(
             "failed to open embedded store {}",
@@ -872,12 +988,18 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
         .to_string();
     let token = random_token();
     let metadata = DaemonMetadata {
+        schema_version: DAEMON_RUNTIME_SCHEMA_VERSION,
         pid: std::process::id(),
         address,
         token: token.clone(),
-        data_dir: config.data_dir.clone(),
+        data_dir: store_identity_dir(&config.data_dir),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         started_at_unix_ms: unix_ms(),
+        state: DaemonState::Running,
+        api_version: None,
+        transports: None,
+        token_expires_at_unix_ms: None,
+        daemons_index_url: None,
     };
     write_metadata(&config.data_dir, &metadata)?;
     lease.write_metadata(&metadata)?;
@@ -914,7 +1036,12 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
 
     drop(state);
     let _ = worker.join();
-    let _ = fs::remove_file(metadata_path(&config.data_dir));
+    let stopped_metadata = DaemonMetadata {
+        state: DaemonState::Stopped,
+        ..metadata
+    };
+    let _ = write_metadata(&config.data_dir, &stopped_metadata);
+    let _ = lease.write_metadata(&stopped_metadata);
     Ok(())
 }
 
@@ -6467,7 +6594,7 @@ fn wait_until_running(data_dir: &Path) -> Result<DaemonMetadata> {
 fn wait_until_stopped(data_dir: &Path) -> Result<()> {
     let start = Instant::now();
     loop {
-        if active_metadata(data_dir).is_none() && remove_metadata_if_store_unleased(data_dir)? {
+        if active_metadata(data_dir).is_none() && store_is_unleased(data_dir)? {
             return Ok(());
         }
         if start.elapsed() > START_TIMEOUT {
@@ -6492,6 +6619,126 @@ fn write_metadata(data_dir: &Path, metadata: &DaemonMetadata) -> Result<()> {
 
 fn metadata_path(data_dir: &Path) -> PathBuf {
     runtime_dir(data_dir).join(METADATA_FILE)
+}
+
+/// Returns the v1 runtime sidecar directory for a daemon data directory.
+#[must_use]
+pub fn runtime_dir_for_data_dir(data_dir: &Path) -> PathBuf {
+    runtime_dir(data_dir)
+}
+
+/// Returns true when metadata exists but the daemon lock is not held.
+///
+/// Clients use this as the cheap stale-file check before trusting
+/// `egregored.json` connection fields.
+///
+/// # Errors
+///
+/// Returns an error if the runtime lock file cannot be opened or inspected.
+pub fn runtime_metadata_is_stale(data_dir: &Path) -> Result<bool> {
+    let metadata_path = metadata_path(data_dir);
+    if !metadata_path.exists() {
+        return Ok(false);
+    }
+    let path = lock_path(data_dir)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    enforce_runtime_file_permissions(&path)?;
+    match file.try_lock_shared() {
+        Ok(()) => {
+            let _ = file.unlock();
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+/// Discovers the runtime dir for a client that starts with a working directory.
+///
+/// `data_dir_env` represents the already-read `EGREGORE_DATA_DIR` override.
+/// Passing `None` runs the walk-up discovery algorithm.
+///
+/// # Errors
+///
+/// Returns an error when no runtime directory is found. The error includes the
+/// candidate paths that were tried.
+pub fn discover_runtime_dir_for_working_dir(
+    working_dir: &Path,
+    data_dir_env: Option<&Path>,
+) -> Result<PathBuf> {
+    let mut tried = Vec::new();
+    if let Some(data_dir) = data_dir_env {
+        let runtime = runtime_dir(data_dir);
+        tried.push(runtime.clone());
+        if runtime.exists() {
+            return Ok(runtime);
+        }
+        return Err(no_runtime_dir_error(working_dir, &tried));
+    }
+
+    let mut cursor = if working_dir.is_dir() {
+        working_dir.to_path_buf()
+    } else {
+        working_dir
+            .parent()
+            .map_or_else(|| working_dir.to_path_buf(), Path::to_path_buf)
+    };
+
+    loop {
+        let direct_runtime = runtime_dir(&cursor);
+        tried.push(direct_runtime.clone());
+        if direct_runtime.exists() {
+            return Ok(direct_runtime);
+        }
+
+        let default_data_dir = cursor.join(".egregore");
+        let default_runtime = runtime_dir(&default_data_dir);
+        tried.push(default_runtime.clone());
+        if default_runtime.exists() {
+            return Ok(default_runtime);
+        }
+
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        if !same_mount(&cursor, parent)? {
+            break;
+        }
+        cursor = parent.to_path_buf();
+    }
+
+    Err(no_runtime_dir_error(working_dir, &tried))
+}
+
+/// Discovers the runtime dir using `EGREGORE_DATA_DIR` and then walk-up rules.
+///
+/// # Errors
+///
+/// Returns an error when no daemon runtime dir is discoverable.
+pub fn discover_runtime_dir(working_dir: &Path) -> Result<PathBuf> {
+    let env_data_dir = std::env::var_os(EGREGORE_DATA_DIR_ENV).map(PathBuf::from);
+    discover_runtime_dir_for_working_dir(working_dir, env_data_dir.as_deref())
+}
+
+fn no_runtime_dir_error(working_dir: &Path, tried: &[PathBuf]) -> anyhow::Error {
+    let tried = tried
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow!(
+        "no daemon for this directory {}; tried runtime dirs: {}",
+        working_dir.display(),
+        tried
+    )
 }
 
 fn runtime_dir(data_dir: &Path) -> PathBuf {
@@ -6522,15 +6769,134 @@ fn store_identity_text(data_dir: &Path) -> String {
     store_identity_dir(data_dir).to_string_lossy().into_owned()
 }
 
+fn ensure_runtime_dir(data_dir: &Path) -> Result<PathBuf> {
+    let runtime_dir = runtime_dir(data_dir);
+    fs::create_dir_all(&runtime_dir)
+        .with_context(|| format!("failed to create {}", runtime_dir.display()))?;
+    enforce_runtime_dir_permissions(&runtime_dir)?;
+    Ok(runtime_dir)
+}
+
+#[cfg(unix)]
+fn enforce_runtime_dir_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!(
+            "runtime_permissions_unsafe: failed to restrict runtime dir {}",
+            path.display()
+        )
+    })?;
+    let mode = fs::metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o700 {
+        return Err(anyhow!(
+            "runtime_permissions_unsafe: {} has mode {:o}, expected 700",
+            path.display(),
+            mode
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
+fn enforce_runtime_dir_permissions(_path: &Path) -> Result<()> {
+    // TODO(windows-acl-runtime-permissions): set the runtime directory ACL to
+    // the current user only, then fail startup with runtime_permissions_unsafe
+    // if the ACL cannot be enforced. The Windows conformance test asserts this
+    // named gap so the bearer-token leak surface is not silent.
+    Ok(())
+}
+
+#[cfg(unix)]
+fn enforce_runtime_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "runtime_permissions_unsafe: failed to restrict runtime file {}",
+            path.display()
+        )
+    })?;
+    let mode = fs::metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o600 {
+        return Err(anyhow!(
+            "runtime_permissions_unsafe: {} has mode {:o}, expected 600",
+            path.display(),
+            mode
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
+fn enforce_runtime_file_permissions(_path: &Path) -> Result<()> {
+    // TODO(windows-acl-runtime-permissions): set the lock, metadata, and
+    // idempotency journal ACL to the current user only, then fail startup with
+    // runtime_permissions_unsafe if the ACL cannot be enforced.
+    Ok(())
+}
+
+#[cfg(windows)]
+/// Explicit Windows ACL enforcement gap for issue #18.
+pub const WINDOWS_RUNTIME_ACL_TODO: &str =
+    "TODO(windows-acl-runtime-permissions): restrict egregored runtime files to the current user";
+
+#[cfg(unix)]
+fn same_mount(child: &Path, parent: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let child_dev = fs::metadata(child)
+        .with_context(|| format!("failed to inspect {}", child.display()))?
+        .dev();
+    let parent_dev = fs::metadata(parent)
+        .with_context(|| format!("failed to inspect {}", parent.display()))?
+        .dev();
+    Ok(child_dev == parent_dev)
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
+fn same_mount(_child: &Path, _parent: &Path) -> Result<bool> {
+    Ok(true)
+}
+
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
+        enforce_runtime_dir_permissions(parent)?;
     }
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&tmp, data).with_context(|| format!("failed to write {}", tmp.display()))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    {
+        let mut file = options
+            .open(&tmp)
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        file.write_all(data)
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", tmp.display()))?;
+    }
+    enforce_runtime_file_permissions(&tmp)?;
     fs::rename(&tmp, path)
-        .with_context(|| format!("failed to rename {} to {}", tmp.display(), path.display()))
+        .with_context(|| format!("failed to rename {} to {}", tmp.display(), path.display()))?;
+    enforce_runtime_file_permissions(path)
 }
 
 fn random_token() -> String {
