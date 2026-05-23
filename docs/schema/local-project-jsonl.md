@@ -105,7 +105,7 @@ Field set:
 | `kind` | string | yes | Always `task`. |
 | `local_id` | string | yes | Local-JSONL record identifier. Required and used in the local source handle. The first occurrence defines the record; later lines with the same `local_id` are revisions of that record. |
 | `title` | string | yes | Redacted per issue #4 at import time before persistence into the graph. |
-| `body` | string or body handle | no | Inline string for bodies up to 16 KiB, or `{"handle": "<repo-relative-path>", "hash": "<blake3>"}` for larger bodies. |
+| `body` | string or body handle | no | Inline string for bodies up to 16 KiB, or `{"handle": "<repo-relative-path>", "hash": "<blake3>", "bytes": <u64>}` for larger bodies. In handle form, `bytes` is required and is the byte length of the referenced body content; a missing `bytes` value emits `missing_body_bytes` and skips the line. |
 | `status` | enum | yes | `open`, `in_progress`, `blocked`, `closed_completed`, `closed_dropped`, `unknown`. Additive and aligned with `Task.status` in project-graph v1. |
 | `priority` | enum | yes | `low`, `normal`, `high`, `urgent`, `unknown`. |
 | `assignees` | string array | yes | Opaque human or agent identifiers. |
@@ -146,9 +146,15 @@ Field set:
 | `updated_at` | RFC3339 string | yes | Mutation timestamp for this AC line; this is `acceptance_criterion.updated_at`. |
 
 When `verification_handle` is present, the importer is responsible for resolving
-it to a verification record from issue #11 at import time. If it cannot resolve
-the handle, the importer leaves the in-graph `verification_link_id` null and
-emits a diagnostic.
+it to a verification record from issue #11 at import time.
+
+Rule: verified `acceptance_criterion` lines with unresolved `verification_handle` are skipped with an
+`acceptance_criterion_missing_verification` diagnostic. The importer MUST NOT
+write a `verified` acceptance criterion with a null `verification_link_id`.
+
+Rule: non-verified `acceptance_criterion` lines with unresolved
+`verification_handle` are imported with a null `verification_link_id` and emit
+an `unresolved_verification_handle` diagnostic.
 
 Rule: an `acceptance_criterion` line whose `parent_task_local_id` does not refer
 to a `task` line earlier in the same file is rejected by the importer with
@@ -188,6 +194,11 @@ Field set:
 Rule: external_link lines are optional; their absence does not block import;
 their presence produces one `project.ExternalLink` row per line in the graph.
 
+Rule: an `external_link` line whose `parent_local_id` does not refer to a
+`task` or `acceptance_criterion` line earlier in the same file is rejected by
+the importer with `unresolved_parent_local_id`. This is a `Diagnostic`, not a
+hard error; the line is skipped and a `Diagnostic` record is emitted.
+
 ## Mutation Model
 
 Local JSONL files are append-oriented. Edits to an existing task,
@@ -197,6 +208,13 @@ acceptance_criterion, or external_link append a revision line.
 
 Rule: task, acceptance_criterion, or external_link records all use the same
 append-revision mutation model.
+
+Rule: identity fields MUST NOT change across revisions with the same `local_id`.
+`AcceptanceCriterion` identity fields are `parent_task_local_id` and `ordinal`.
+`ExternalLink` identity fields are `system` and `system_native_id`. A same-kind,
+same-`local_id` revision that changes any identity field is rejected with a
+`revision_identity_mismatch` diagnostic and skipped. Non-identity field changes
+are valid revisions.
 
 Rule: latest line for a given `local_id` wins by file order. file order is the only current-state winner rule; `updated_at` sets graph `valid_time` but does not choose the winner. An importer that sees `updated_at` move backward for the same `local_id` SHOULD emit a `non_monotonic_updated_at` diagnostic while still using file order for current state.
 
