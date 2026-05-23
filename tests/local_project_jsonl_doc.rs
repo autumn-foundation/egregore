@@ -107,11 +107,19 @@ fn local_project_jsonl_schema_doc_locks_file_contract() {
             "external_link.url",
             "project:v<schema_version>:<blake3(domain || kind || source_kind || source_native_id || entity_kind_identity)>",
             "`<encoded_file_path>:<encoded_local_id>`",
+            "`source_handle` uses `<encoded_file_path>:<encoded_local_id>:<record_hash>`",
+            "`record_hash` is the BLAKE3 hash of the canonical source line bytes",
             "literal `:` MUST be percent-encoded as `%3A`",
+            "ASCII alphanumeric plus `-`, `.`, `_`, and `~` are the only unescaped bytes",
+            "literal `/` MUST be percent-encoded as `%2F`",
             "source_handle_encoding_error",
+            "explicit source-link refinement field precedence",
+            "explicit `external_link` row wins for `url`, `discovered_at`, and `updated_at`",
+            "materialized source link retains identity and task parent wiring",
             "`AcceptanceCriterion` | `(parent_task_id, ordinal)`",
             "`ExternalLink` | `(system, system_native_id)`",
             "renaming a local JSONL file produces new in-graph IDs",
+            ".egregore%2Ftasks%2Fsample.jsonl:sample-task",
             "idempotent re-import",
             ".egregore/tasks/sample.jsonl",
             "byte-equal graph output",
@@ -132,6 +140,7 @@ fn local_project_jsonl_schema_doc_locks_file_contract() {
             "Rule: external_link lines are optional; their absence does not block import",
             "ties broken by `updated_at`",
             "project:v<schema_version>:<blake3(domain || kind || source_kind || file_path || local_id)>",
+            r#"`system_native_id": ".egregore/tasks/sample.jsonl:sample-task""#,
         ],
     );
 }
@@ -156,6 +165,7 @@ fn local_project_jsonl_schema_doc_is_linked_and_coordinated() {
             "`source_kind: local_jsonl`",
             "<file_path>:<local_id>",
             "percent-encoded source handle",
+            "`source_handle` is `<encoded_file_path>:<encoded_local_id>:<record_hash>`",
         ],
     );
     assert_contains_all(
