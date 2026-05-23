@@ -22,8 +22,11 @@ Rules:
 - GitHub-sourced records MUST carry an `ExternalLink` to the canonical GitHub
   URL and MUST use the GitHub-side `updated_at` as `valid_time_source`.
 - Local-JSONL-sourced records MUST carry a `source_handle` containing file
-  path, line or record ID, and hash; the file modification time is the
-  `valid_time_source`.
+  path, line or record ID, and hash. The local JSONL `source_handle` is
+  `<encoded_file_path>:<encoded_local_id>:<record_hash>` as concretized by
+  [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md). The source
+  line's `updated_at` is the `valid_time`, with `valid_time_source` set to
+  `local_jsonl_updated_at`.
 - Project-graph records MAY express intent but MUST NOT impersonate code-graph
   or verification facts. Closing a `Task` does not produce a `Verification`.
   Merging a `PR` does not produce a `Change`. Future cross-walk slices may
@@ -49,10 +52,10 @@ reserved and has no producer yet.
 | `domain` | `"project"` | yes | Reject any project kind with a different domain. |
 | `schema_version` | `1` | yes | `PROJECT_SCHEMA_VERSION`. |
 | `valid_time` | RFC3339 | yes | Domain event time. |
-| `valid_time_source` | string | yes | For GitHub, `github_updated_at`; for local JSONL, file modification time source. |
+| `valid_time_source` | string | yes | For GitHub, `github_updated_at`; for local JSONL, `local_jsonl_updated_at`. |
 | `transaction_time` | RFC3339 | yes | Store write time for append-with-same-entity-id mutation rows. |
 | `confidence` | float string | guessed fields only | Omit for stable source fields. |
-| `source_handle` | string | local JSONL | File path + line/record ID + hash. |
+| `source_handle` | string | local JSONL | File path + line/record ID + hash. For local JSONL, `source_handle` is `<encoded_file_path>:<encoded_local_id>:<record_hash>` and is concretized by [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md). |
 | `summary` | string | yes | Human-readable one-line summary. |
 
 ## 3 - Task record shape
@@ -68,7 +71,7 @@ Task record shape.
 | `title` | string | yes | Redacted per #4. |
 | `body_handle` | `{ inline: Option<String>, hash: String, bytes: u64 }` | yes | Same shape and 16 KiB inline ceiling as `CommandRun.stdout_handle` from #11. |
 | `status` | enum | yes | `open`, `in_progress`, `blocked`, `closed_completed`, `closed_dropped`, `unknown`; additive. |
-| `source_kind` | enum | yes | `github_issue`, `github_pr`, `local_jsonl`, `harness_legacy`; additive. |
+| `source_kind` | enum | yes | `github_issue`, `github_pr`, `local_jsonl`, `harness_legacy`; additive. `source_kind: local_jsonl` consumes [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md). |
 | `source_external_link_id` | record ID | yes | `ExternalLink` carrying the source-system handle. |
 | `assignees` | string array | yes | Agent IDs or human identifiers; opaque strings, not resolved to `Agent` nodes in this slice. |
 | `labels` | string array | yes | Redacted per #4. |
@@ -112,7 +115,7 @@ local-JSONL-sourced tasks normalize into one `Task` shape.
 | shared fields | see section 2 | yes | `domain = "project"`, `schema_version = 1`. |
 | `system` | enum | yes | `github`, `gitlab`, `local_file`, `harness_legacy`, `other`; additive. |
 | `url` | string | yes | Canonical URL or `file://` path; redacted per #4. |
-| `system_native_id` | string | yes | GitHub issue number as a string, local JSONL record ID, etc. Not redacted by default. |
+| `system_native_id` | string | yes | GitHub issue number as a string, local JSONL source identity handle, etc. For local JSONL, use the hashless percent-encoded source identity handle from [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md), rendered as `<file_path>:<local_id>` when no escaping is needed. Not redacted by default. |
 | `repository_remote` | string | when applicable | VCS remote from #7. |
 | `discovered_at` | RFC3339 | yes | When the importer first saw this handle. |
 
@@ -178,13 +181,14 @@ The `entity_kind_identity` component is:
 
 | Kind | Entity identity input |
 |------|-----------------------|
-| `Task` | `source_external_link_id.system_native_id`, such as a GitHub issue number, or the local-JSONL record path. |
+| `Task` | `source_external_link_id.system_native_id`, such as a GitHub issue number, or the hashless local-JSONL percent-encoded source identity handle rendered as `<file_path>:<local_id>` when no escaping is needed. |
 | `AcceptanceCriterion` | `(parent_task_id, ordinal)`; reordering ACs changes the ID. |
 | `ExternalLink` | `(system, system_native_id)`. |
 
 The rule "IDs are unique within `(domain, schema_version)`" from #3 still
 holds. Re-importing the same GitHub issue produces the same `Task` ID because
-the source handle is stable.
+the source handle is stable. Local JSONL uses a percent-encoded source handle
+for deterministic lookup.
 
 ## 10 - Mutation Model
 
@@ -262,8 +266,17 @@ Requires `project:v2:` and `PROJECT_SCHEMA_VERSION = 2`:
 - **Issue #5 (daemon wire):** `acceptance_criterion_missing_verification` is
   added to the daemon error-code enum. HTTP 422, non-retryable.
 - **Issue #6 (agent memory):** `REFERENCES_TASK` is promoted from reserved to
-  defined with `project.Task` as TO, and the new project edge rows are added to
-  the registry table in `docs/schema/agent-memory.md`.
+  defined with `project.Task` as TO. A future `REFERENCES_TASK` edge whose
+  target is a local-JSONL-sourced `Task` MUST resolve through the file path +
+  local_id pair documented in [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md),
+  not by guessing the file format. The new project edge rows are added to the
+  registry table in `docs/schema/agent-memory.md`.
+- **Issue #17 (local JSONL):** The `local-JSONL record path` mention in
+  `system_native_id` is concretized as the hashless percent-encoded source
+  identity handle from [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md),
+  rendered as `<file_path>:<local_id>` when no escaping is needed, with
+  `file_path` repo-relative. The shared local JSONL `source_handle` remains the
+  hashed row handle `<encoded_file_path>:<encoded_local_id>:<record_hash>`.
 - **Issue #10 (query verbs):** Future query verb `criteria_for_task` is
   reserved against this schema and distinct from existing reserved verbs.
 - **Issue #11 (verification):** `CLOSES_ACCEPTANCE_CRITERION` targets
