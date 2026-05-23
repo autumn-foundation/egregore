@@ -127,7 +127,8 @@ Acceptance criteria attach falsifiable requirements to a task:
   "ordinal": 1,
   "text": "A new doc docs/schema/local-project-jsonl.md exists.",
   "status": "unverified",
-  "verification_handle": {"system": "manual", "id": "future-import-test"}
+  "verification_handle": {"system": "manual", "id": "future-import-test"},
+  "updated_at": "2026-05-18T08:41:56Z"
 }
 ```
 
@@ -142,6 +143,7 @@ Field set:
 | `text` | string | yes | Redacted per issue #4 at import time before persistence into the graph. |
 | `status` | enum | yes | `unverified`, `verified`, `failed`, `superseded`, `unknown`. Additive and aligned with `AcceptanceCriterion.status` in project-graph v1. |
 | `verification_handle` | object | no | `{"system": "<verifier>", "id": "<external-id>"}` for the verifier that closed the AC. |
+| `updated_at` | RFC3339 string | yes | Mutation timestamp for this AC line; this is `acceptance_criterion.updated_at`. |
 
 When `verification_handle` is present, the importer is responsible for resolving
 it to a verification record from issue #11 at import time. If it cannot resolve
@@ -165,7 +167,8 @@ External links attach source handles to a task or acceptance criterion:
   "system": "github",
   "url": "https://github.com/madmax983/egregore/issues/17",
   "system_native_id": "madmax983/egregore#17",
-  "discovered_at": "2026-05-18T08:41:56Z"
+  "discovered_at": "2026-05-18T08:41:56Z",
+  "updated_at": "2026-05-18T08:41:56Z"
 }
 ```
 
@@ -180,19 +183,22 @@ Field set:
 | `url` | string | yes | Canonical URL, `file://` URL, or local path string when no URL exists. |
 | `system_native_id` | string | yes | Source-system identifier. For the local-JSONL source handle, this is `<file_path>:<local_id>` with `file_path` repo-relative. |
 | `discovered_at` | RFC3339 string | yes | When the link was discovered or authored. |
+| `updated_at` | RFC3339 string | yes | Mutation timestamp for this link line; this is `external_link.updated_at`. |
 
 Rule: external_link lines are optional; their absence does not block import;
 their presence produces one `project.ExternalLink` row per line in the graph.
 
 ## Mutation Model
 
-Local JSONL files are append-oriented. Edits to an existing task or AC append a
-new line with the same `local_id` and a later `updated_at`. The latest line for
-a given `local_id` is the current state by file order, with ties broken by
-`updated_at`.
+Local JSONL files are append-oriented. Edits to an existing task,
+acceptance_criterion, or external_link append a new line with the same
+`local_id` and a later `updated_at`. In other words, edits to a task,
+acceptance_criterion, or external_link append a revision line.
 
-Rule: latest line for a given `local_id` wins by file order, with `updated_at`
-as the tie-breaker.
+Rule: task, acceptance_criterion, or external_link records all use the same
+append-revision mutation model.
+
+Rule: latest line for a given `local_id` wins by file order. file order is the only current-state winner rule; `updated_at` sets graph `valid_time` but does not choose the winner. An importer that sees `updated_at` move backward for the same `local_id` SHOULD emit a `non_monotonic_updated_at` diagnostic while still using file order for current state.
 
 Rule: this is the on-disk equivalent of issue #14's append-with-same-entity-id
 model; the importer produces one new project-graph row per appended line, with
@@ -297,9 +303,9 @@ Minimal fixture:
 ```jsonl
 {"kind": "header", "schema_version": 1, "project_slug": "sample", "created_at": "2026-05-18T00:00:00Z"}
 {"kind": "task", "local_id": "sample-task", "title": "Wire local JSONL import", "body": "Make project state editable offline.", "status": "open", "priority": "normal", "assignees": [], "labels": ["local-jsonl"], "created_at": "2026-05-18T00:00:00Z", "updated_at": "2026-05-18T00:00:00Z"}
-{"kind": "acceptance_criterion", "local_id": "sample-task-ac-1", "parent_task_local_id": "sample-task", "ordinal": 1, "text": "The importer reads the header.", "status": "unverified"}
-{"kind": "acceptance_criterion", "local_id": "sample-task-ac-2", "parent_task_local_id": "sample-task", "ordinal": 2, "text": "Re-import is idempotent.", "status": "unverified"}
-{"kind": "external_link", "local_id": "sample-task-source", "parent_local_id": "sample-task", "system": "local_file", "url": "file://.egregore/tasks/sample.jsonl", "system_native_id": ".egregore/tasks/sample.jsonl:sample-task", "discovered_at": "2026-05-18T00:00:00Z"}
+{"kind": "acceptance_criterion", "local_id": "sample-task-ac-1", "parent_task_local_id": "sample-task", "ordinal": 1, "text": "The importer reads the header.", "status": "unverified", "updated_at": "2026-05-18T00:00:00Z"}
+{"kind": "acceptance_criterion", "local_id": "sample-task-ac-2", "parent_task_local_id": "sample-task", "ordinal": 2, "text": "Re-import is idempotent.", "status": "unverified", "updated_at": "2026-05-18T00:00:00Z"}
+{"kind": "external_link", "local_id": "sample-task-source", "parent_local_id": "sample-task", "system": "local_file", "url": "file://.egregore/tasks/sample.jsonl", "system_native_id": ".egregore/tasks/sample.jsonl:sample-task", "discovered_at": "2026-05-18T00:00:00Z", "updated_at": "2026-05-18T00:00:00Z"}
 ```
 
 ## Inspect Surface Contract
