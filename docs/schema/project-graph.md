@@ -22,8 +22,11 @@ Rules:
 - GitHub-sourced records MUST carry an `ExternalLink` to the canonical GitHub
   URL and MUST use the GitHub-side `updated_at` as `valid_time_source`.
 - Local-JSONL-sourced records MUST carry a `source_handle` containing file
-  path, line or record ID, and hash; the source line's `updated_at` is the
-  `valid_time`, with `valid_time_source` set to `local_jsonl_updated_at`.
+  path, line or record ID, and hash. The local JSONL `source_handle` is
+  `<encoded_file_path>:<encoded_local_id>:<record_hash>` as concretized by
+  [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md). The source
+  line's `updated_at` is the `valid_time`, with `valid_time_source` set to
+  `local_jsonl_updated_at`.
 - Project-graph records MAY express intent but MUST NOT impersonate code-graph
   or verification facts. Closing a `Task` does not produce a `Verification`.
   Merging a `PR` does not produce a `Change`. Future cross-walk slices may
@@ -52,7 +55,7 @@ reserved and has no producer yet.
 | `valid_time_source` | string | yes | For GitHub, `github_updated_at`; for local JSONL, `local_jsonl_updated_at`. |
 | `transaction_time` | RFC3339 | yes | Store write time for append-with-same-entity-id mutation rows. |
 | `confidence` | float string | guessed fields only | Omit for stable source fields. |
-| `source_handle` | string | local JSONL | File path + line/record ID + hash. Local JSONL handles are concretized by [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md). |
+| `source_handle` | string | local JSONL | File path + line/record ID + hash. For local JSONL, `source_handle` is `<encoded_file_path>:<encoded_local_id>:<record_hash>` and is concretized by [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md). |
 | `summary` | string | yes | Human-readable one-line summary. |
 
 ## 3 - Task record shape
@@ -112,7 +115,7 @@ local-JSONL-sourced tasks normalize into one `Task` shape.
 | shared fields | see section 2 | yes | `domain = "project"`, `schema_version = 1`. |
 | `system` | enum | yes | `github`, `gitlab`, `local_file`, `harness_legacy`, `other`; additive. |
 | `url` | string | yes | Canonical URL or `file://` path; redacted per #4. |
-| `system_native_id` | string | yes | GitHub issue number as a string, local JSONL source handle, etc. For local JSONL, use the percent-encoded source handle from [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md), rendered as `<file_path>:<local_id>` when no escaping is needed. Not redacted by default. |
+| `system_native_id` | string | yes | GitHub issue number as a string, local JSONL source identity handle, etc. For local JSONL, use the hashless percent-encoded source identity handle from [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md), rendered as `<file_path>:<local_id>` when no escaping is needed. Not redacted by default. |
 | `repository_remote` | string | when applicable | VCS remote from #7. |
 | `discovered_at` | RFC3339 | yes | When the importer first saw this handle. |
 
@@ -178,13 +181,14 @@ The `entity_kind_identity` component is:
 
 | Kind | Entity identity input |
 |------|-----------------------|
-| `Task` | `source_external_link_id.system_native_id`, such as a GitHub issue number, or the local-JSONL percent-encoded source handle rendered as `<file_path>:<local_id>` when no escaping is needed. |
+| `Task` | `source_external_link_id.system_native_id`, such as a GitHub issue number, or the hashless local-JSONL percent-encoded source identity handle rendered as `<file_path>:<local_id>` when no escaping is needed. |
 | `AcceptanceCriterion` | `(parent_task_id, ordinal)`; reordering ACs changes the ID. |
 | `ExternalLink` | `(system, system_native_id)`. |
 
 The rule "IDs are unique within `(domain, schema_version)`" from #3 still
 holds. Re-importing the same GitHub issue produces the same `Task` ID because
-the source handle is stable.
+the source handle is stable. Local JSONL uses a percent-encoded source handle
+for deterministic lookup.
 
 ## 10 - Mutation Model
 
@@ -268,10 +272,11 @@ Requires `project:v2:` and `PROJECT_SCHEMA_VERSION = 2`:
   not by guessing the file format. The new project edge rows are added to the
   registry table in `docs/schema/agent-memory.md`.
 - **Issue #17 (local JSONL):** The `local-JSONL record path` mention in
-  `system_native_id` is concretized as the percent-encoded source handle from
-  [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md), rendered as
-  `<file_path>:<local_id>` when no escaping is needed, with `file_path`
-  repo-relative.
+  `system_native_id` is concretized as the hashless percent-encoded source
+  identity handle from [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md),
+  rendered as `<file_path>:<local_id>` when no escaping is needed, with
+  `file_path` repo-relative. The shared local JSONL `source_handle` remains the
+  hashed row handle `<encoded_file_path>:<encoded_local_id>:<record_hash>`.
 - **Issue #10 (query verbs):** Future query verb `criteria_for_task` is
   reserved against this schema and distinct from existing reserved verbs.
 - **Issue #11 (verification):** `CLOSES_ACCEPTANCE_CRITERION` targets
