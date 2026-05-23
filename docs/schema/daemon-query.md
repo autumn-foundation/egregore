@@ -122,6 +122,7 @@ Error responses follow the standard envelope in
 | `symbol_at_commit`      | implemented | `name: string`, `commit: string` | Prefix-safe commit lookup |
 | `file_defines`          | implemented | `repo_relative_path: string`  | Symbols defined in a file |
 | `drift_top_n`           | implemented | `limit?: u64` (default 10, max 100) | SemanticDrift records ranked by score |
+| `drift`                 | reserved    | same as `drift_top_n`         | Reserved for issue #10; returns `not_implemented` until wired. |
 | `observations_for_symbol` | reserved  | —                             | Returns `not_implemented` |
 | `agent_sessions_for_repo` | reserved  | —                             | Returns `not_implemented` |
 | `criteria_for_task`      | reserved  | `task_id: string`              | Future project-graph query over [`docs/schema/project-graph.md`](project-graph.md); returns `not_implemented` until wired. |
@@ -253,6 +254,9 @@ current-state results.
 ### `drift_top_n`
 
 Return the top-N `SemanticDrift` nodes ranked by `score` descending.
+`SemanticDrift` records are defined by
+[`docs/schema/semantic-drift.md`](semantic-drift.md); `score` and
+`selection_threshold` are JSON numbers.
 
 **Params:**
 ```json
@@ -264,19 +268,33 @@ Return the top-N `SemanticDrift` nodes ranked by `score` descending.
 **Record shape** (parity with `eg query drift`):
 ```json
 {
-  "record_id":          "codegraph:v3:...",
-  "before_commit":      "abc1234",
-  "after_commit":       "def5678",
-  "score":              "0.92",
-  "model_id":           "text-embedding-3-small",
-  "repo_relative_path": "src/lib.rs",
-  "name":               "nested::Widget"
+  "record_id":                    "semantic:v1:...",
+  "before_commit":                "abc1234",
+  "after_commit":                 "def5678",
+  "before_valid_time":            "2026-05-21T00:00:00Z",
+  "after_valid_time":             "2026-05-22T00:00:00Z",
+  "prior_record_id":              "codegraph:v4:...",
+  "target_record_id":             "codegraph:v4:...",
+  "metric_kind":                  "cosine_distance",
+  "score":                        0.92,
+  "selection_threshold":          0.7,
+  "selection_basis":              "threshold_only",
+  "embedding_model_provider":     "aletheiadb_re_export",
+  "embedding_model_name":         "sentence-transformers/all-MiniLM-L6-v2",
+  "embedding_model_version":      "0.1.0",
+  "embedding_model_dim":          384,
+  "embedding_model_content_hash": "unknown",
+  "repo_relative_path":           "src/lib.rs",
+  "name":                         "nested::Widget"
 }
 ```
 
 `repo_relative_path` and `name` are omitted when not resolved (present only
 when a `DriftsFrom` edge or `target_record_id` resolves to a Symbol or File
 node with those fields set).
+
+Coordination: issue #15 updates this response shape. Issue #10's future
+`drift` verb should return the same record shape.
 
 ---
 

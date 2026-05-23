@@ -76,8 +76,8 @@ fn semantic_drift(record: &GraphRecord) -> Option<&SemanticDriftMetadata> {
     }
 }
 
-fn drift_score(drift: &SemanticDriftMetadata) -> f32 {
-    drift.score.parse::<f32>().unwrap_or(0.0)
+const fn drift_score(drift: &SemanticDriftMetadata) -> f64 {
+    drift.score
 }
 
 /// Finds a symbol record by name at the most recent commit at or before `as_of`.

@@ -17,7 +17,7 @@ use aletheia_egregore::{
     import_traj,
     ir::{
         EdgeLabel, GraphRecord, IdentitySource, NodeKind, RepositoryIdentityPayload,
-        PROJECT_SCHEMA_VERSION, SCHEMA_VERSION, TemporalMetadata,
+        PROJECT_SCHEMA_VERSION, SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION, TemporalMetadata,
     },
     traj::ImportOptions,
 };
@@ -2871,8 +2871,11 @@ fn all_node_kinds_have_documented_schema() {
         | NodeKind::Import
         | NodeKind::Diagnostic
         | NodeKind::Commit
-        | NodeKind::Change
-        | NodeKind::SemanticDrift => "code-graph-documented",
+        | NodeKind::Change => "code-graph-documented",
+        // Documented in docs/schema/semantic-drift.md
+        NodeKind::SemanticDrift | NodeKind::EmbeddingModel | NodeKind::EmbeddingVector => {
+            "semantic-domain-documented"
+        }
         // Documented in docs/schema/agent-memory.md (full schema)
         NodeKind::Agent | NodeKind::AgentSession | NodeKind::Observation => {
             "agent-memory-documented"
@@ -2925,8 +2928,11 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::Implements
         | EdgeLabel::Mentions
         | EdgeLabel::ChangedIn
-        | EdgeLabel::ParentOf
-        | EdgeLabel::DriftsFrom => "code-graph-internal",
+        | EdgeLabel::ParentOf => "code-graph-internal",
+        // Semantic drift registry: documented in docs/schema/semantic-drift.md
+        EdgeLabel::DriftsFrom | EdgeLabel::DriftsPrior | EdgeLabel::MeasuredBy => {
+            "semantic-domain-registry"
+        }
         // Cross-domain registry: documented in docs/schema/agent-memory.md
         EdgeLabel::SessionOf
         | EdgeLabel::AuthoredBy
@@ -5795,6 +5801,202 @@ fn eg_query_daemon_smoke() {
         .stderr(predicate::str::contains("no match found"));
 
     daemon.stop();
+}
+
+#[test]
+fn semantic_drift_rejects_non_codegraph_prior_target() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    ingest_semantic_codegraph_targets(&metadata, "semantic-bad-prior-targets");
+
+    let drift_id = "semantic:v1:bad-prior-fixture";
+    let target_id = "codegraph:v4:semantic-target-file";
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "semantic-bad-prior",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "semantic-bad-prior-key",
+            "domain": "semantic",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    semantic_drift_json(drift_id, target_id, "agent_memory:v1:not-codegraph-prior", 0.75),
+                    semantic_edge_json("semantic:v1:bad-prior-from", "DRIFTS_FROM", drift_id, target_id),
+                    semantic_edge_json("semantic:v1:bad-prior-prior", "DRIFTS_PRIOR", drift_id, "agent_memory:v1:not-codegraph-prior")
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "non-codegraph semantic prior should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "drift_prior_target_mismatch",
+        "bad prior target must use drift_prior_target_mismatch, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn semantic_drift_records_are_immutable_at_stable_id() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    ingest_semantic_codegraph_targets(&metadata, "semantic-immutable-targets");
+
+    let drift_id = "semantic:v1:immutable-drift-fixture";
+    let target_id = "codegraph:v4:semantic-target-file";
+    let prior_id = "codegraph:v4:semantic-prior-file";
+    let valid_records = serde_json::json!([
+        semantic_drift_json(drift_id, target_id, prior_id, 0.75),
+        semantic_edge_json("semantic:v1:immutable-from", "DRIFTS_FROM", drift_id, target_id),
+        semantic_edge_json("semantic:v1:immutable-prior", "DRIFTS_PRIOR", drift_id, prior_id)
+    ]);
+    let first = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "semantic-immutable-first",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "semantic-immutable-first-key",
+            "domain": "semantic",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": { "records": valid_records }
+        }),
+    );
+    assert!(
+        first.starts_with("HTTP/1.1 200"),
+        "valid semantic drift ingest should succeed, got {first}"
+    );
+
+    let mutation = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "semantic-immutable-mutation",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "semantic-immutable-mutation-key",
+            "domain": "semantic",
+            "created_at": "2026-05-22T00:01:00Z",
+            "payload": {
+                "records": [
+                    semantic_drift_json(drift_id, target_id, prior_id, 0.9)
+                ]
+            }
+        }),
+    );
+    assert!(
+        !mutation.starts_with("HTTP/1.1 200"),
+        "mutating a same-ID semantic drift score should be rejected, got {mutation}"
+    );
+    let body = response_json(&mutation);
+    assert_eq!(
+        body["error"]["code"], "drift_record_immutable",
+        "same-ID score mutation must use drift_record_immutable, got {body}"
+    );
+
+    daemon.stop();
+}
+
+fn ingest_semantic_codegraph_targets(metadata: &DaemonMetadata, key_suffix: &str) {
+    let response = http_json(
+        metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": format!("{key_suffix}-codegraph"),
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": format!("{key_suffix}-codegraph-key"),
+            "domain": "codegraph",
+            "created_at": "2026-05-22T00:00:00Z",
+            "payload": {
+                "records": [
+                    codegraph_file_json("codegraph:v4:semantic-prior-file"),
+                    codegraph_file_json("codegraph:v4:semantic-target-file")
+                ]
+            }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "codegraph target fixture ingest should succeed, got {response}"
+    );
+}
+
+fn semantic_drift_json(
+    id: &str,
+    target_record_id: &str,
+    prior_record_id: &str,
+    score: f64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "SemanticDrift",
+        "schema_version": SEMANTIC_SCHEMA_VERSION,
+        "repo_relative_path": "src/lib.rs",
+        "name": "src/lib.rs",
+        "summary": "semantic drift fixture",
+        "domain": "semantic",
+        "valid_time": "2026-05-22T00:00:00Z",
+        "valid_time_source": "after_valid_time",
+        "ingested_at": "2026-05-22T00:00:01Z",
+        "semantic_drift": {
+            "embedding_model": {
+                "provider": "test",
+                "name": "fixture-model",
+                "version": "v1",
+                "dim": 384,
+                "content_hash": "fixture-hash"
+            },
+            "target_record_id": target_record_id,
+            "prior_record_id": prior_record_id,
+            "before_git_commit": "aaaaaaaa",
+            "after_git_commit": "bbbbbbbb",
+            "before_valid_time": "2026-05-21T00:00:00Z",
+            "after_valid_time": "2026-05-22T00:00:00Z",
+            "metric_kind": "cosine_distance",
+            "score": score,
+            "selection_threshold": 0.7,
+            "selection_basis": "threshold_only"
+        }
+    })
+}
+
+fn semantic_edge_json(
+    id: &str,
+    label: &str,
+    source: &str,
+    target: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "edge",
+        "id": id,
+        "schema_version": SEMANTIC_SCHEMA_VERSION,
+        "label": label,
+        "source": source,
+        "target": target,
+        "confidence": "1.0",
+        "summary": "semantic drift edge fixture"
+    })
 }
 
 // ── Schema conformance: issue #11 (verification domain) ──────────────────────

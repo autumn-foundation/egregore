@@ -16,8 +16,8 @@ use crate::{
     daemon::StoreLease,
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
-        EdgeLabel, EvidenceLink, GraphRecord, IdentitySource, NodeKind, SemanticDriftMetadata,
-        SourceSpan, TemporalMetadata,
+        EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, IdentitySource, MetricKind,
+        NodeKind, SelectionBasis, SemanticDriftMetadata, SourceSpan, TemporalMetadata,
     },
 };
 #[cfg(feature = "embeddings")]
@@ -2459,18 +2459,48 @@ fn semantic_drift_from_properties<'a>(
     record_id: &str,
     get: impl Fn(&str) -> Option<&'a ::aletheiadb::PropertyValue>,
 ) -> AdapterResult<Option<Box<SemanticDriftMetadata>>> {
-    let Some(model_id) =
-        optional_str_property(record_id, "semantic_model_id", get("semantic_model_id"))?
+    let Some(provider) = optional_str_property(
+        record_id,
+        "embedding_model_provider",
+        get("embedding_model_provider"),
+    )?
     else {
         return Ok(None);
     };
 
     Ok(Some(Box::new(SemanticDriftMetadata {
-        model_id,
+        embedding_model: EmbeddingModel {
+            provider,
+            name: required_str_property(
+                record_id,
+                "embedding_model_name",
+                get("embedding_model_name"),
+            )?,
+            version: required_str_property(
+                record_id,
+                "embedding_model_version",
+                get("embedding_model_version"),
+            )?,
+            dim: required_u32_property(
+                record_id,
+                "embedding_model_dim",
+                get("embedding_model_dim"),
+            )?,
+            content_hash: required_str_property(
+                record_id,
+                "embedding_model_content_hash",
+                get("embedding_model_content_hash"),
+            )?,
+        },
         target_record_id: required_str_property(
             record_id,
             "drift_target_record_id",
             get("drift_target_record_id"),
+        )?,
+        prior_record_id: required_str_property(
+            record_id,
+            "drift_prior_record_id",
+            get("drift_prior_record_id"),
         )?,
         before_git_commit: required_str_property(
             record_id,
@@ -2492,8 +2522,59 @@ fn semantic_drift_from_properties<'a>(
             "after_valid_time",
             get("after_valid_time"),
         )?,
-        score: required_str_property(record_id, "drift_score", get("drift_score"))?,
+        metric_kind: parse_metric_kind(
+            record_id,
+            &required_str_property(record_id, "drift_metric_kind", get("drift_metric_kind"))?,
+        )?,
+        score: required_f64_text_property(record_id, "drift_score", get("drift_score"))?,
+        selection_threshold: required_f64_text_property(
+            record_id,
+            "drift_selection_threshold",
+            get("drift_selection_threshold"),
+        )?,
+        selection_basis: parse_selection_basis(
+            record_id,
+            &required_str_property(
+                record_id,
+                "drift_selection_basis",
+                get("drift_selection_basis"),
+            )?,
+        )?,
     })))
+}
+
+fn required_f64_text_property(
+    record_id: &str,
+    key: &str,
+    value: Option<&::aletheiadb::PropertyValue>,
+) -> AdapterResult<f64> {
+    required_str_property(record_id, key, value)?
+        .parse::<f64>()
+        .map_err(|error| read_back_error(record_id, format!("{key} parse error: {error}")))
+}
+
+fn parse_metric_kind(record_id: &str, metric: &str) -> AdapterResult<MetricKind> {
+    match metric {
+        "cosine_distance" => Ok(MetricKind::CosineDistance),
+        "l2_distance" => Ok(MetricKind::L2Distance),
+        "learned_delta_v1" => Ok(MetricKind::LearnedDeltaV1),
+        _ => Err(read_back_error(
+            record_id,
+            format!("unknown semantic drift metric_kind {metric}"),
+        )),
+    }
+}
+
+fn parse_selection_basis(record_id: &str, basis: &str) -> AdapterResult<SelectionBasis> {
+    match basis {
+        "threshold_only" => Ok(SelectionBasis::ThresholdOnly),
+        "top_k_per_pair" => Ok(SelectionBasis::TopKPerPair),
+        "top_k_per_symbol" => Ok(SelectionBasis::TopKPerSymbol),
+        _ => Err(read_back_error(
+            record_id,
+            format!("unknown semantic drift selection_basis {basis}"),
+        )),
+    }
 }
 
 fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
@@ -2507,6 +2588,8 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "Commit" => Ok(NodeKind::Commit),
         "Change" => Ok(NodeKind::Change),
         "SemanticDrift" => Ok(NodeKind::SemanticDrift),
+        "EmbeddingModel" => Ok(NodeKind::EmbeddingModel),
+        "EmbeddingVector" => Ok(NodeKind::EmbeddingVector),
         "Agent" => Ok(NodeKind::Agent),
         "AgentSession" => Ok(NodeKind::AgentSession),
         "Observation" => Ok(NodeKind::Observation),
@@ -2555,6 +2638,8 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "CHANGED_IN" => Ok(EdgeLabel::ChangedIn),
         "PARENT_OF" => Ok(EdgeLabel::ParentOf),
         "DRIFTS_FROM" => Ok(EdgeLabel::DriftsFrom),
+        "DRIFTS_PRIOR" => Ok(EdgeLabel::DriftsPrior),
+        "MEASURED_BY" => Ok(EdgeLabel::MeasuredBy),
         "SESSION_OF" => Ok(EdgeLabel::SessionOf),
         "AUTHORED_BY" => Ok(EdgeLabel::AuthoredBy),
         "HAS_EVIDENCE" => Ok(EdgeLabel::HasEvidence),
@@ -2666,14 +2751,33 @@ fn insert_semantic_drift(
     drift: Option<&crate::ir::SemanticDriftMetadata>,
 ) -> ::aletheiadb::PropertyMapBuilder {
     if let Some(drift) = drift {
+        let score = drift.score.to_string();
+        let threshold = drift.selection_threshold.to_string();
         builder = builder
-            .insert("semantic_model_id", drift.model_id.as_str())
+            .insert(
+                "embedding_model_provider",
+                drift.embedding_model.provider.as_str(),
+            )
+            .insert("embedding_model_name", drift.embedding_model.name.as_str())
+            .insert(
+                "embedding_model_version",
+                drift.embedding_model.version.as_str(),
+            )
+            .insert("embedding_model_dim", i64::from(drift.embedding_model.dim))
+            .insert(
+                "embedding_model_content_hash",
+                drift.embedding_model.content_hash.as_str(),
+            )
             .insert("drift_target_record_id", drift.target_record_id.as_str())
+            .insert("drift_prior_record_id", drift.prior_record_id.as_str())
             .insert("before_git_commit", drift.before_git_commit.as_str())
             .insert("after_git_commit", drift.after_git_commit.as_str())
             .insert("before_valid_time", drift.before_valid_time.as_str())
             .insert("after_valid_time", drift.after_valid_time.as_str())
-            .insert("drift_score", drift.score.as_str());
+            .insert("drift_metric_kind", drift.metric_kind.as_str())
+            .insert("drift_score", score.as_str())
+            .insert("drift_selection_threshold", threshold.as_str())
+            .insert("drift_selection_basis", drift.selection_basis.as_str());
     }
     builder
 }
@@ -2689,6 +2793,8 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::Commit
         | NodeKind::Change
         | NodeKind::SemanticDrift
+        | NodeKind::EmbeddingModel
+        | NodeKind::EmbeddingVector
         | NodeKind::Agent
         | NodeKind::AgentSession
         | NodeKind::Observation

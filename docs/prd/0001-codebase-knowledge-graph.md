@@ -4,7 +4,7 @@ This PRD defines the first Egregore domain: deterministic source-derived code fa
 
 ## Summary
 
-Egregore's code graph domain turns a local source repository and its Git history into a durable, queryable, bi-temporal code graph for coding agents. It parses source files with Tree-sitter, replays repository history commit-by-commit, produces a stable intermediate representation of files, symbols, relationships, and changes, and writes that graph into an embedded AletheiaDB store so future agents can recall not only what the codebase looks like now, but how it became that way.
+Egregore's code graph domain turns a local source repository and its Git history into a durable, queryable, bi-temporal code graph for coding agents. It parses source files with Tree-sitter, replays repository history commit-by-commit, produces a stable intermediate representation of files, symbols, relationships, and changes, and writes that graph into an embedded AletheiaDB store so future agents can recall not only what the codebase looks like now, but how it became that way. Derived drift measurements live in the separate [`semantic` domain schema](../schema/semantic-drift.md).
 
 The project starts as a standalone repo. That keeps parser and ingestion experiments out of the AletheiaDB crate release path while preserving a clear integration contract with AletheiaDB.
 
@@ -92,7 +92,7 @@ Initial node kinds:
 | `Diagnostic` | Extractor warning or unsupported construct | file path plus message hash |
 | `Commit` | Git commit observed during history replay | repository identity plus commit SHA |
 | `Change` | File or symbol change between commits | commit SHA plus entity stable ID plus change kind |
-| `SemanticDrift` | Semantic movement for a file or symbol over time | source entity ID plus before/after commit SHAs plus model ID |
+| `SemanticDrift` | Semantic movement for a file or symbol over time | See [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md); this is a `semantic` domain record, not a code-graph record. |
 
 Initial edge labels:
 
@@ -107,7 +107,9 @@ Initial edge labels:
 | `MENTIONS` | Symbol -> Symbol | Weaker unresolved textual/syntactic mention |
 | `CHANGED_IN` | File/Symbol -> Commit/Change | Entity changed in a commit |
 | `PARENT_OF` | Commit -> Commit | Git commit ancestry |
-| `DRIFTS_FROM` | SemanticDrift -> File/Symbol | Drift measurement target |
+| `DRIFTS_FROM` | SemanticDrift -> File/Symbol | Semantic-domain edge; see [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md). |
+| `DRIFTS_PRIOR` | SemanticDrift -> File/Symbol | Semantic-domain prior edge; see [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md). |
+| `MEASURED_BY` | SemanticDrift -> EmbeddingModel | Reserved semantic-domain model edge; see [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md). |
 
 Every emitted node must include:
 
@@ -247,7 +249,7 @@ Acceptance criteria:
 
 - Embedding candidates are generated for file and symbol summaries through AletheiaDB's `embeddings` feature and its `embed_anything` re-export.
 - Drift records compare the same logical file or symbol across commits.
-- Drift records preserve before/after commit SHAs, valid-time range, model ID, score, and explanation summary.
+- Drift records preserve before/after commit SHAs, valid-time range, structured `embedding_model`, score, selection threshold, and explanation summary.
 - Semantic drift can be queried from graph output alone, and embedded AletheiaDB ingestion preserves the records for temporal traversal.
 
 ## Success Metrics
@@ -288,7 +290,7 @@ The parser should produce IR, not database writes. The adapter layer owns persis
 - AletheiaDB public embedded APIs may not expose every graph update primitive Egregore wants initially, so ingestion may need append-oriented behavior before true updates.
 - Git history replay can be expensive on large repos; MVP fixtures must prove deterministic ordering first, then optimization can follow.
 - Commit-time semantics are subtle: rebases, cherry-picks, and amended commits can change transaction-time observations without changing the valid-time story.
-- Semantic drift can look impressive while being noisy. The MVP must preserve model ID, target text, and score so agents can explain evidence instead of hallucinating insight.
+- Semantic drift can look impressive while being noisy. The MVP must preserve structured `embedding_model`, target text, threshold, metric, and score so agents can explain evidence instead of hallucinating insight.
 - Incremental indexing can create stale edges if file-level invalidation is too narrow.
 - Multi-language support can sprawl unless Rust reaches a clean MVP first.
 
@@ -357,7 +359,7 @@ The parser should produce IR, not database writes. The adapter layer owns persis
 Resolved for the MVP:
 
 - The first binary is `egregore`, with `eg` as a short alias.
-- The embedded AletheiaDB schema uses specific codegraph labels such as `Repository`, `File`, `Symbol`, `Commit`, `Change`, and `SemanticDrift`.
+- The embedded AletheiaDB schema uses specific codegraph labels such as `Repository`, `File`, `Symbol`, `Commit`, and `Change`; semantic labels such as `SemanticDrift` are owned by [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md).
 - Semantic embedding candidates attach to both files and symbols.
 - Committer time drives valid-time ordering; author time is preserved as temporal metadata.
 - `semantic-search`, `semantic-temporal`, and `semantic-diagnostics` are default-on with embedded AletheiaDB ingestion.

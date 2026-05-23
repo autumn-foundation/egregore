@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 
 use crate::ir::{
-    EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, TemporalMetadata, stable_id,
+    EdgeLabel, EmbeddingModel, GraphRecord, MetricKind, NodeKind, SEMANTIC_SCHEMA_VERSION,
+    SelectionBasis, SemanticDriftMetadata, TemporalMetadata, semantic_stable_id,
 };
 
 /// Re-export of `AletheiaDB`'s embedding boundary when semantic embedding
@@ -15,14 +16,22 @@ pub use aletheiadb::embeddings as aletheia_embeddings;
 #[cfg(feature = "embeddings")]
 pub use aletheiadb::embeddings::embed_anything;
 
-/// Default embedding model used by the CLI.
-pub const DEFAULT_EMBEDDING_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
+/// Default embedding model name used by the CLI.
+pub const DEFAULT_EMBEDDING_MODEL_NAME: &str = "sentence-transformers/all-MiniLM-L6-v2";
+
+/// Provider boundary used by the default embedding model identity.
+pub const DEFAULT_EMBEDDING_MODEL_PROVIDER: &str = "aletheiadb_re_export";
+
+/// Content hash for providers that do not expose model bytes to this crate.
+pub const DEFAULT_EMBEDDING_MODEL_CONTENT_HASH: &str = "unknown";
 
 /// Model architecture passed through to `AletheiaDB`'s embedding boundary.
 pub const DEFAULT_EMBEDDING_MODEL_ARCHITECTURE: &str = "bert";
 
-/// Dense vector dimensions for [`DEFAULT_EMBEDDING_MODEL_ID`].
+/// Dense vector dimensions for [`DEFAULT_EMBEDDING_MODEL_NAME`].
 pub const DEFAULT_EMBEDDING_MODEL_DIMENSIONS: usize = 384;
+
+const DEFAULT_EMBEDDING_MODEL_DIMENSIONS_U32: u32 = 384;
 
 /// Text unit selected for embedding.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -132,6 +141,8 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::Commit
         | NodeKind::Change
         | NodeKind::SemanticDrift
+        | NodeKind::EmbeddingModel
+        | NodeKind::EmbeddingVector
         | NodeKind::Agent
         | NodeKind::AgentSession
         | NodeKind::Observation
@@ -178,8 +189,8 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
 #[must_use]
 pub fn semantic_drift_records(
     vectors: &[CandidateVector],
-    model_id: &str,
-    threshold: f32,
+    model_name: &str,
+    threshold: f64,
 ) -> Vec<GraphRecord> {
     let mut groups = BTreeMap::<String, Vec<&CandidateVector>>::new();
     for vector in vectors {
@@ -208,10 +219,10 @@ pub fn semantic_drift_records(
             let Some(score) = cosine_distance(&before.vector, &after.vector) else {
                 continue;
             };
-            if score < threshold {
+            if f64::from(score) < threshold {
                 continue;
             }
-            records.extend(drift_pair_records(before, after, model_id, score));
+            records.extend(drift_pair_records(before, after, model_name, threshold, score));
         }
     }
 
@@ -233,7 +244,8 @@ fn candidate_text(summary: &str, repo_relative_path: Option<&str>, name: Option<
 fn drift_pair_records(
     before: &CandidateVector,
     after: &CandidateVector,
-    model_id: &str,
+    model_name: &str,
+    threshold: f64,
     score: f32,
 ) -> Vec<GraphRecord> {
     let Some(before_temporal) = before.candidate.temporal.as_ref() else {
@@ -243,23 +255,44 @@ fn drift_pair_records(
         return Vec::new();
     };
 
-    let score = format!("{score:.6}");
-    let drift_id = stable_id(&[
-        "node",
+    let embedding_model = EmbeddingModel {
+        provider: DEFAULT_EMBEDDING_MODEL_PROVIDER.to_owned(),
+        name: model_name.to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        dim: DEFAULT_EMBEDDING_MODEL_DIMENSIONS_U32,
+        content_hash: DEFAULT_EMBEDDING_MODEL_CONTENT_HASH.to_owned(),
+    };
+    let metric_kind = MetricKind::CosineDistance;
+    let selection_basis = SelectionBasis::ThresholdOnly;
+    let score = f64::from(score);
+    let selection_threshold = threshold;
+    let selection_threshold_id = selection_threshold.to_string();
+    let drift_id = semantic_stable_id(&[
+        "semantic",
         "semantic_drift",
-        model_id,
+        &embedding_model.provider,
+        &embedding_model.name,
+        &embedding_model.version,
+        &embedding_model.content_hash,
+        metric_kind.as_str(),
+        &selection_threshold_id,
+        &before.candidate.record_id,
         &after.candidate.record_id,
         &before_temporal.git_commit,
         &after_temporal.git_commit,
     ]);
     let drift = SemanticDriftMetadata {
-        model_id: model_id.to_owned(),
+        embedding_model,
         target_record_id: after.candidate.record_id.clone(),
+        prior_record_id: before.candidate.record_id.clone(),
         before_git_commit: before_temporal.git_commit.clone(),
         after_git_commit: after_temporal.git_commit.clone(),
         before_valid_time: before_temporal.valid_time.clone(),
         after_valid_time: after_temporal.valid_time.clone(),
-        score: score.clone(),
+        metric_kind,
+        score,
+        selection_threshold,
+        selection_basis,
     };
     let node = GraphRecord::node(
         drift_id.clone(),
@@ -277,17 +310,52 @@ fn drift_pair_records(
         ),
     )
     .with_temporal(after_temporal.clone())
+    .with_domain("semantic", SEMANTIC_SCHEMA_VERSION)
+    .with_node_time(
+        after_temporal.valid_time.clone(),
+        "after_valid_time",
+        after_temporal.observed_at.clone(),
+    )
     .with_semantic_drift(drift);
-    let edge = GraphRecord::edge(
+    let target_edge = semantic_edge(
         EdgeLabel::DriftsFrom,
-        drift_id,
+        drift_id.clone(),
         after.candidate.record_id.clone(),
         Some("1.0".to_owned()),
         "Semantic drift measurement target".to_owned(),
     )
     .with_temporal(after_temporal.clone());
 
-    vec![node, edge]
+    let prior_edge = semantic_edge(
+        EdgeLabel::DriftsPrior,
+        drift_id,
+        before.candidate.record_id.clone(),
+        Some("1.0".to_owned()),
+        "Semantic drift prior measurement target".to_owned(),
+    )
+    .with_temporal(before_temporal.clone());
+
+    vec![node, target_edge, prior_edge]
+}
+
+fn semantic_edge(
+    label: EdgeLabel,
+    source: String,
+    target: String,
+    confidence: Option<String>,
+    summary: String,
+) -> GraphRecord {
+    let id = semantic_stable_id(&["edge", label.as_str(), &source, &target]);
+    GraphRecord::Edge {
+        id,
+        schema_version: SEMANTIC_SCHEMA_VERSION,
+        label,
+        source,
+        target,
+        confidence,
+        temporal: None,
+        summary,
+    }
 }
 
 fn entity_key(candidate: &EmbeddingCandidate) -> String {

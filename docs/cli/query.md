@@ -124,8 +124,19 @@ eg query drift --graph <PATH> [--limit N] [--format json|text]
 | `record_id` | string | yes | Stable record ID for the `SemanticDrift` node. |
 | `before_commit` | string | yes | Commit SHA for the earlier embedding. |
 | `after_commit` | string | yes | Commit SHA for the later embedding. |
-| `score` | string | yes | Cosine distance with stable precision, e.g. `"0.900000"`. Higher = more drift. |
-| `model_id` | string | yes | Embedding model identifier. |
+| `before_valid_time` | string | yes | Valid time for the earlier embedding. |
+| `after_valid_time` | string | yes | Valid time for the later embedding. |
+| `prior_record_id` | string | yes | Prior codegraph File/Symbol record ID. |
+| `target_record_id` | string | yes | Later codegraph File/Symbol record ID. |
+| `metric_kind` | string | yes | Drift metric, e.g. `cosine_distance`. |
+| `score` | number | yes | Cosine distance as a JSON number. Higher = more drift. |
+| `selection_threshold` | number | yes | Threshold that selected this drift record. |
+| `selection_basis` | string | yes | Selection policy, e.g. `threshold_only`. |
+| `embedding_model_provider` | string | yes | Provider or boundary that supplied the model. |
+| `embedding_model_name` | string | yes | Embedding model name. |
+| `embedding_model_version` | string | yes | Pinned model version. |
+| `embedding_model_dim` | number | yes | Embedding dimension. |
+| `embedding_model_content_hash` | string | yes | Model content hash or `unknown`. |
 | `repo_relative_path` | string or null | when resolvable | Path of the drift target, resolved from `DRIFTS_FROM` edges. |
 | `name` | string or null | when resolvable | Name of the drift target. |
 

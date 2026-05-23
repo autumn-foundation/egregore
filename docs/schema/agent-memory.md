@@ -11,6 +11,7 @@ functions) and `src/daemon.rs` (write applier validation) must conform to it.
 **Related documents:**
 - Wire contract: [`docs/schema/daemon-api.md`](daemon-api.md)
 - Agent actions and patch artifacts: [`docs/schema/agent-actions.md`](agent-actions.md)
+- Semantic drift domain: [`docs/schema/semantic-drift.md`](semantic-drift.md)
 - Code-graph schema: [`docs/prd/0001-codebase-knowledge-graph.md`](../prd/0001-codebase-knowledge-graph.md)
 - Vision PRD: [`docs/prd/0000-egregore-vision.md`](../prd/0000-egregore-vision.md)
 - Daemon design: [`docs/plans/2026-05-17-egregore-daemon-design.md`](../plans/2026-05-17-egregore-daemon-design.md)
@@ -312,6 +313,9 @@ removing a label is a schema version bump.
 | `OWNED_BY_TASK` | `project` | `project` | `AcceptanceCriterion` | `Task` | many:1 | no |
 | `EXTERNAL_HANDLE` | `project` | `project` | `Task`, `AcceptanceCriterion` | `ExternalLink` | many:1 | no |
 | `TOUCHES_FILE` | `project` | `codegraph` | `Task` | `File` | many:many | no |
+| `DRIFTS_FROM` | `semantic` | `codegraph` | `SemanticDrift` | `File`, `Symbol` | many:1 | no |
+| `DRIFTS_PRIOR` | `semantic` | `codegraph` | `SemanticDrift` | `File`, `Symbol` | many:1 | no |
+| `MEASURED_BY` | `semantic` | `semantic` | `SemanticDrift` | `EmbeddingModel` | many:1 | no |
 | `CONTRADICTS` | `agent_memory`, `verification` | any | any | any | many:many | yes |
 | `SUPERSEDES` | `agent_memory`, `artifact` | `agent_memory`, `artifact` | any agent-memory, `PatchArtifact` | any agent-memory, `PatchArtifact` | many:1 | no |
 | `RELATES_TO` | any | any | any | any | many:many | no |
@@ -326,7 +330,11 @@ The following labels are used exclusively within the code-graph domain and are
 documented in `docs/prd/0001-codebase-knowledge-graph.md`:
 
 `CONTAINS`, `DEFINES`, `IMPORTS`, `REFERENCES`, `CALLS`, `IMPLEMENTS`,
-`MENTIONS`, `CHANGED_IN`, `PARENT_OF`, `DRIFTS_FROM`.
+`MENTIONS`, `CHANGED_IN`, `PARENT_OF`.
+
+Semantic drift edge labels are in the registry above and are specified in
+[`docs/schema/semantic-drift.md`](semantic-drift.md). This is the issue #15
+coordination point for #6's daemon edge validation.
 
 ---
 

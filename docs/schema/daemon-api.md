@@ -47,7 +47,7 @@ top-level fields:
 | `agent_id`       | string       | yes                 | yes                | Identifies the calling agent |
 | `session_id`     | string       | yes                 | yes                | Identifies the agent session |
 | `idempotency_key`| string       | yes                 | n/a                | Unique per `(agent_id, route)` for ≥ 24 hours |
-| `domain`         | string enum  | yes                 | optional           | `"codegraph"`, `"agent_memory"`, `"verification"`, `"artifact"`, or `"project"` |
+| `domain`         | string enum  | yes                 | optional           | `"codegraph"`, `"agent_memory"`, `"verification"`, `"artifact"`, `"project"`, or `"semantic"` |
 | `created_at`     | RFC 3339     | yes                 | n/a                | Wall-clock time of the write |
 | `payload`        | object       | yes                 | yes                | Route-specific content |
 
@@ -119,12 +119,18 @@ All error codes are snake\_case identifiers. String literals at call sites in
 | `patch_status_pinned` | 422 | no       | no               | ingest, jobs/ingest |
 | `inline_payload_exceeds_ceiling` | 400 | no | no             | ingest, jobs/ingest |
 | `acceptance_criterion_missing_verification` | 422 | no | no | ingest, jobs/ingest |
+| `drift_prior_target_mismatch` | 422 | no | no | ingest, jobs/ingest |
+| `drift_record_immutable` | 422 | no | no | ingest, jobs/ingest |
 
 Adding a new code is additive. Renaming or removing a code requires `/v2/`.
 
 Coordination: issue #14 adds `acceptance_criterion_missing_verification` for
 project-domain `AcceptanceCriterion` writes. See
 [`docs/schema/project-graph.md`](project-graph.md).
+
+Coordination: issue #15 adds `semantic` domain writes,
+`drift_prior_target_mismatch`, and `drift_record_immutable`. See
+[`docs/schema/semantic-drift.md`](semantic-drift.md).
 
 ---
 

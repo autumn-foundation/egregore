@@ -1,7 +1,8 @@
 #![allow(missing_docs)]
 
 use aletheia_egregore::{
-    GraphRecord, NodeKind, SemanticDriftMetadata, TemporalMetadata,
+    EmbeddingModel, GraphRecord, MetricKind, NodeKind, SelectionBasis, SemanticDriftMetadata,
+    TemporalMetadata,
     query::{largest_semantic_drifts, symbol_at_commit},
 };
 
@@ -35,8 +36,8 @@ fn symbol_at_commit_returns_the_temporal_symbol_record() {
 
 #[test]
 fn largest_semantic_drifts_rank_drift_nodes_by_score() {
-    let small = drift("drift:small", "answer", "aaaaaaaa", "bbbbbbbb", "0.250000");
-    let large = drift("drift:large", "answer", "bbbbbbbb", "cccccccc", "0.900000");
+    let small = drift("drift:small", "answer", "aaaaaaaa", "bbbbbbbb", 0.25);
+    let large = drift("drift:large", "answer", "bbbbbbbb", "cccccccc", 0.9);
     let edge = GraphRecord::edge(
         aletheia_egregore::EdgeLabel::DriftsFrom,
         "drift:large".to_owned(),
@@ -52,7 +53,7 @@ fn largest_semantic_drifts_rank_drift_nodes_by_score() {
     assert_eq!(ranked[0].id(), "drift:large");
 }
 
-fn drift(id: &str, name: &str, before: &str, after: &str, score: &str) -> GraphRecord {
+fn drift(id: &str, name: &str, before: &str, after: &str, score: f64) -> GraphRecord {
     GraphRecord::node(
         id.to_owned(),
         NodeKind::SemanticDrift,
@@ -63,13 +64,23 @@ fn drift(id: &str, name: &str, before: &str, after: &str, score: &str) -> GraphR
     )
     .with_temporal(temporal(after, "2026-01-02T00:00:00Z"))
     .with_semantic_drift(SemanticDriftMetadata {
-        model_id: "fake-code-model".to_owned(),
+        embedding_model: EmbeddingModel {
+            provider: "test".to_owned(),
+            name: "fake-code-model".to_owned(),
+            version: "v1".to_owned(),
+            dim: 384,
+            content_hash: "fixture".to_owned(),
+        },
         target_record_id: format!("symbol:{name}"),
+        prior_record_id: format!("symbol:{name}"),
         before_git_commit: before.to_owned(),
         after_git_commit: after.to_owned(),
         before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
         after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
-        score: score.to_owned(),
+        metric_kind: MetricKind::CosineDistance,
+        score,
+        selection_threshold: 0.2,
+        selection_basis: SelectionBasis::ThresholdOnly,
     })
 }
 

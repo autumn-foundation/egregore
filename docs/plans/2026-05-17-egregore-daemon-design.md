@@ -17,6 +17,11 @@ describes *how* the daemon is built; the schema doc owns *what* it exposes.
 rules, including artifact-domain placement and patch-status pinning, are
 specified in [docs/schema/agent-actions.md](../schema/agent-actions.md).
 
+**Semantic drift schema:** `SemanticDrift`, structured `embedding_model`,
+semantic stable IDs, `DRIFTS_FROM`, `DRIFTS_PRIOR`, `MEASURED_BY`, and the
+`drift_prior_target_mismatch` / `drift_record_immutable` daemon errors are
+specified in [docs/schema/semantic-drift.md](../schema/semantic-drift.md).
+
 **Redaction schema:** Agent-authored payload redaction markers and policy-version
 metadata are specified in [docs/schema/redaction.md](../schema/redaction.md).
 

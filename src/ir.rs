@@ -21,6 +21,15 @@ pub const ARTIFACT_SCHEMA_VERSION: u32 = 1;
 /// Documented in `docs/schema/project-graph.md`.
 pub const PROJECT_SCHEMA_VERSION: u32 = 1;
 
+/// Schema version for semantic-domain records (`SemanticDrift`, reserved
+/// `EmbeddingModel`, reserved `EmbeddingVector`).
+/// Documented in `docs/schema/semantic-drift.md`.
+pub const SEMANTIC_SCHEMA_VERSION: u32 = 1;
+
+/// Minimum replay tolerance for semantic drift scores.
+/// Documented in `docs/schema/semantic-drift.md`.
+pub const SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE: f64 = 1e-5;
+
 /// Complete in-memory graph emitted by a scan.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
@@ -886,6 +895,21 @@ impl GraphRecord {
         self
     }
 
+    /// Sets an explicit domain and schema version on a node record.
+    #[must_use]
+    pub fn with_domain(mut self, domain_name: &str, schema: u32) -> Self {
+        if let Self::Node {
+            domain,
+            schema_version,
+            ..
+        } = &mut self
+        {
+            *domain = Some(domain_name.to_owned());
+            *schema_version = schema;
+        }
+        self
+    }
+
     /// Attaches repository identity payload to a `Repository` node.
     #[must_use]
     pub fn with_repository_identity(mut self, payload: RepositoryIdentityPayload) -> Self {
@@ -918,6 +942,28 @@ impl GraphRecord {
         }
         self
     }
+
+    /// Stamps explicit base time fields on a node record.
+    #[must_use]
+    pub fn with_node_time(
+        mut self,
+        node_valid_time: impl Into<String>,
+        node_valid_time_source: impl Into<String>,
+        node_ingested_at: impl Into<String>,
+    ) -> Self {
+        if let Self::Node {
+            valid_time,
+            valid_time_source,
+            ingested_at,
+            ..
+        } = &mut self
+        {
+            *valid_time = Some(node_valid_time.into());
+            *valid_time_source = Some(node_valid_time_source.into());
+            *ingested_at = Some(node_ingested_at.into());
+        }
+        self
+    }
 }
 
 /// Git and bitemporal provenance attached to history-backed records.
@@ -939,13 +985,111 @@ pub struct TemporalMetadata {
     pub valid_time_source: Option<String>,
 }
 
-/// Structured metadata for a semantic drift measurement.
+/// Reserved graph domains.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Domain {
+    /// Source-derived code facts.
+    CodeGraph,
+    /// Agent-authored observations and session state.
+    AgentMemory,
+    /// Runtime, test, CI, benchmark, and proof evidence.
+    Verification,
+    /// Durable generated or external artifacts.
+    Artifact,
+    /// Product, project, task, and acceptance-criterion state.
+    Project,
+    /// Semantic measurements that require source bytes plus model bytes.
+    Semantic,
+}
+
+impl Domain {
+    /// Returns the serialized domain name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CodeGraph => "codegraph",
+            Self::AgentMemory => "agent_memory",
+            Self::Verification => "verification",
+            Self::Artifact => "artifact",
+            Self::Project => "project",
+            Self::Semantic => "semantic",
+        }
+    }
+}
+
+/// Structured identity for an embedding model.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingModel {
+    /// Provider boundary that supplied the model.
+    pub provider: String,
+    /// Model name from the provider registry.
+    pub name: String,
+    /// Provider or crate version pin.
+    pub version: String,
+    /// Dense vector dimensionality.
+    pub dim: u32,
+    /// BLAKE3 hash of model weights, or `unknown` when unavailable.
+    pub content_hash: String,
+}
+
+/// Semantic distance metric used by a drift measurement.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricKind {
+    /// One minus cosine similarity.
+    CosineDistance,
+    /// Reserved Euclidean distance metric.
+    L2Distance,
+    /// Reserved learned semantic delta scorer.
+    LearnedDeltaV1,
+}
+
+impl MetricKind {
+    /// Returns the serialized metric kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CosineDistance => "cosine_distance",
+            Self::L2Distance => "l2_distance",
+            Self::LearnedDeltaV1 => "learned_delta_v1",
+        }
+    }
+}
+
+/// Selection policy that caused a drift record to be emitted.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionBasis {
+    /// Emit every drift whose score is greater than or equal to the threshold.
+    ThresholdOnly,
+    /// Reserved policy: top K drifts per compared pair.
+    TopKPerPair,
+    /// Reserved policy: top K drifts per symbol.
+    TopKPerSymbol,
+}
+
+impl SelectionBasis {
+    /// Returns the serialized selection basis.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ThresholdOnly => "threshold_only",
+            Self::TopKPerPair => "top_k_per_pair",
+            Self::TopKPerSymbol => "top_k_per_symbol",
+        }
+    }
+}
+
+/// Structured metadata for a semantic drift measurement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticDriftMetadata {
-    /// Embedding model or semantic scorer identifier.
-    pub model_id: String,
-    /// Stable graph record ID for the drift target.
+    /// Structured embedding model identity.
+    pub embedding_model: EmbeddingModel,
+    /// Stable graph record ID for the later drift target.
     pub target_record_id: String,
+    /// Stable graph record ID for the prior drift target.
+    pub prior_record_id: String,
     /// Commit SHA for the earlier embedding.
     pub before_git_commit: String,
     /// Commit SHA for the later embedding.
@@ -954,9 +1098,17 @@ pub struct SemanticDriftMetadata {
     pub before_valid_time: String,
     /// Valid time for the later embedding.
     pub after_valid_time: String,
-    /// Cosine distance formatted with stable precision.
-    pub score: String,
+    /// Semantic distance metric.
+    pub metric_kind: MetricKind,
+    /// Drift score as a JSON number.
+    pub score: f64,
+    /// Producer threshold that selected this record.
+    pub selection_threshold: f64,
+    /// Producer selection policy.
+    pub selection_basis: SelectionBasis,
 }
+
+impl Eq for SemanticDriftMetadata {}
 
 /// Initial graph node kinds.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -980,6 +1132,10 @@ pub enum NodeKind {
     Change,
     /// Semantic movement for a file or symbol over time.
     SemanticDrift,
+    /// Reserved per-model registry record in the semantic domain.
+    EmbeddingModel,
+    /// Reserved persisted embedding vector record in the semantic domain.
+    EmbeddingVector,
     /// Agent process or human actor writing observations.
     Agent,
     /// One agent run or conversation session.
@@ -1056,6 +1212,8 @@ impl NodeKind {
             Self::Commit => "Commit",
             Self::Change => "Change",
             Self::SemanticDrift => "SemanticDrift",
+            Self::EmbeddingModel => "EmbeddingModel",
+            Self::EmbeddingVector => "EmbeddingVector",
             Self::Agent => "Agent",
             Self::AgentSession => "AgentSession",
             Self::Observation => "Observation",
@@ -1113,6 +1271,10 @@ pub enum EdgeLabel {
     ParentOf,
     /// Semantic drift measurement target.
     DriftsFrom,
+    /// Semantic drift prior-version target.
+    DriftsPrior,
+    /// Semantic drift measurement model edge.
+    MeasuredBy,
     /// Agent session belongs to an agent.
     SessionOf,
     /// Entity was authored by an agent session.
@@ -1169,6 +1331,8 @@ impl EdgeLabel {
             "CHANGED_IN" => Some(Self::ChangedIn),
             "PARENT_OF" => Some(Self::ParentOf),
             "DRIFTS_FROM" => Some(Self::DriftsFrom),
+            "DRIFTS_PRIOR" => Some(Self::DriftsPrior),
+            "MEASURED_BY" => Some(Self::MeasuredBy),
             "SESSION_OF" => Some(Self::SessionOf),
             "AUTHORED_BY" => Some(Self::AuthoredBy),
             "HAS_EVIDENCE" => Some(Self::HasEvidence),
@@ -1240,6 +1404,8 @@ impl EdgeLabel {
                 | Self::ChangedIn
                 | Self::ParentOf
                 | Self::DriftsFrom
+                | Self::DriftsPrior
+                | Self::MeasuredBy
         )
     }
 
@@ -1257,6 +1423,8 @@ impl EdgeLabel {
             Self::ChangedIn => "CHANGED_IN",
             Self::ParentOf => "PARENT_OF",
             Self::DriftsFrom => "DRIFTS_FROM",
+            Self::DriftsPrior => "DRIFTS_PRIOR",
+            Self::MeasuredBy => "MEASURED_BY",
             Self::SessionOf => "SESSION_OF",
             Self::AuthoredBy => "AUTHORED_BY",
             Self::HasEvidence => "HAS_EVIDENCE",
@@ -1367,6 +1535,23 @@ pub fn project_stable_id(parts: &[&str]) -> String {
     }
     format!(
         "project:v{PROJECT_SCHEMA_VERSION}:{}",
+        hasher.finalize().to_hex()
+    )
+}
+
+/// Builds a stable semantic-domain record ID.
+///
+/// Uses the `semantic:v1:` prefix so semantic records cannot collide with
+/// source-derived code-graph IDs. Documented in `docs/schema/semantic-drift.md`.
+#[must_use]
+pub fn semantic_stable_id(parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!(
+        "semantic:v{SEMANTIC_SCHEMA_VERSION}:{}",
         hasher.finalize().to_hex()
     )
 }

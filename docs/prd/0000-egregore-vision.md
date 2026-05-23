@@ -56,13 +56,16 @@ Egregore starts with typed graph domains. Domains share one AletheiaDB store and
 
 **Project-graph schema:** [`docs/schema/project-graph.md`](../schema/project-graph.md) is the single source of truth for project-domain `Task`, `AcceptanceCriterion`, and `ExternalLink` records, reserved project kinds, trust-class rules, and project cross-domain edges.
 
+**Semantic drift schema:** [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md) is the single source of truth for `SemanticDrift`, `EmbeddingModel`, `EmbeddingVector`, semantic stable IDs, and drift edge contracts.
+
 **Redaction schema:** [`docs/schema/redaction.md`](../schema/redaction.md) owns the redaction marker grammar and policy-version field for agent-authored records; producer schemas name the concrete fields that pass through it.
 
 **Bi-temporal selector grammar:** [`docs/schema/temporal-selectors.md`](../schema/temporal-selectors.md) is the single source of truth for `valid_time`/`transaction_time` axes, the `as_of`/`since` selector JSON shape, CLI flag surfaces, and per-domain mapping rules.
 
 | Domain | Owns | Examples |
 |--------|------|----------|
-| Code Graph | Source-derived facts | Repository, File, Symbol, Import, Call, Commit, Change, SemanticDrift |
+| Code Graph | Source-derived facts | Repository, File, Symbol, Import, Call, Commit, Change |
+| Semantic | Derived semantic measurements | SemanticDrift, EmbeddingModel, EmbeddingVector |
 | Agent Memory | Agent-authored observations | Session, Observation, Hypothesis, Decision, Lesson, Failure |
 | Project Graph | Work management state | Product, Project, Plan, Task, GitHubIssue, LocalTask, PR, Review, AcceptanceCriterion |
 | Artifact Graph | Durable generated or external artifacts | ADR, PRD, Plan, Transcript, Patch, BenchmarkReport, ReleaseNote |

@@ -30,7 +30,8 @@ use crate::{
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord,
-        IdentitySource, NodeKind, OutputHandle, PROJECT_SCHEMA_VERSION, TemporalMetadata,
+        IdentitySource, NodeKind, OutputHandle, PROJECT_SCHEMA_VERSION,
+        SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, TemporalMetadata,
         VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
     },
     query as graph_query,
@@ -381,9 +382,15 @@ enum ErrorCode {
     /// Added by #13 and reused for #11 handles: inline payload exceeded the
     /// 16 KiB ceiling and must be demoted to handle-only storage.
     InlinePayloadExceedsCeiling,
-    /// Added by #14 (project graph schema): a verified AcceptanceCriterion is
+    /// Added by #14 (project graph schema): a verified `AcceptanceCriterion` is
     /// missing the verification record that closed it.
     AcceptanceCriterionMissingVerification,
+    /// Added by #15 (semantic drift schema): `prior_record_id` and the
+    /// `DRIFTS_PRIOR` edge target disagree or do not target code graph.
+    DriftPriorTargetMismatch,
+    /// Added by #15 (semantic drift schema): an existing drift ID was
+    /// resubmitted with a different score.
+    DriftRecordImmutable,
 }
 
 impl ErrorCode {
@@ -411,6 +418,8 @@ impl ErrorCode {
             Self::AcceptanceCriterionMissingVerification => {
                 "acceptance_criterion_missing_verification"
             }
+            Self::DriftPriorTargetMismatch => "drift_prior_target_mismatch",
+            Self::DriftRecordImmutable => "drift_record_immutable",
         }
     }
 
@@ -435,7 +444,9 @@ impl ErrorCode {
             | Self::LocalPathIdentityUnsupported
             | Self::MissingEvidenceHandle
             | Self::PatchStatusPinned
-            | Self::AcceptanceCriterionMissingVerification => 422,
+            | Self::AcceptanceCriterionMissingVerification
+            | Self::DriftPriorTargetMismatch
+            | Self::DriftRecordImmutable => 422,
         }
     }
 }
@@ -496,7 +507,7 @@ impl ApiError {
     fn invalid_domain() -> Self {
         Self::new(
             ErrorCode::InvalidDomain,
-            r#"domain must be "codegraph", "agent_memory", "verification", "artifact", or "project""#,
+            r#"domain must be "codegraph", "agent_memory", "verification", "artifact", "project", or "semantic""#,
         )
     }
 
@@ -1249,6 +1260,7 @@ fn apply_write(
     validate_verification_domain_records(&command.records)?;
     validate_artifact_domain_records(&command.records, sink)?;
     let project_edges = validate_project_domain_records(&command.records, sink)?;
+    validate_semantic_domain_records(&command.records, sink)?;
 
     let (synthesized_edges, canonical_nodes) =
         validate_and_synthesize_evidence_edges(&command.records, sink)?;
@@ -2028,6 +2040,317 @@ fn validate_project_domain_records(
     Ok(synthesized_edges)
 }
 
+fn validate_semantic_domain_records(
+    records: &[GraphRecord],
+    sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
+) -> WriteResult<()> {
+    let store_records = {
+        let sink_guard = sink
+            .read()
+            .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
+        sink_guard
+            .read_all_records()
+            .map_err(|error| ApiError::internal(error.to_string()))?
+    };
+
+    for record in records {
+        match record {
+            GraphRecord::Node {
+                id,
+                domain,
+                ..
+            } if id.starts_with("semantic:v1:") || domain.as_deref() == Some("semantic") => {
+                validate_semantic_drift_node(record, records, &store_records, sink)?;
+            }
+            GraphRecord::Edge {
+                id,
+                schema_version,
+                label,
+                source,
+                target,
+                ..
+            } if id.starts_with("semantic:v1:") => {
+                if *schema_version != SEMANTIC_SCHEMA_VERSION {
+                    return Err(ApiError::bad_request(format!(
+                        "semantic edge '{id}' has schema_version {schema_version} but only version {SEMANTIC_SCHEMA_VERSION} is accepted"
+                    )));
+                }
+                let sink_guard = sink
+                    .read()
+                    .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
+                validate_semantic_edge(id, *label, source, target, records, &sink_guard)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_semantic_drift_node(
+    record: &GraphRecord,
+    records: &[GraphRecord],
+    store_records: &[GraphRecord],
+    sink: &Arc<RwLock<EmbeddedAletheiaSink>>,
+) -> WriteResult<()> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        schema_version,
+        semantic_drift,
+        valid_time,
+        valid_time_source,
+        ingested_at,
+        domain,
+        ..
+    } = record
+    else {
+        return Ok(());
+    };
+
+    if !id.starts_with("semantic:v1:") {
+        return Err(ApiError::bad_request(format!(
+            "semantic-domain record '{id}' must use semantic:v1: ID prefix"
+        )));
+    }
+    if *schema_version != SEMANTIC_SCHEMA_VERSION {
+        return Err(ApiError::bad_request(format!(
+            "semantic node '{id}' has schema_version {schema_version} but only version {SEMANTIC_SCHEMA_VERSION} is accepted"
+        )));
+    }
+    if domain.as_deref() != Some("semantic") {
+        return Err(ApiError::bad_request(format!(
+            "semantic node '{id}' must carry domain 'semantic'"
+        )));
+    }
+    if *kind != NodeKind::SemanticDrift {
+        return Err(ApiError::bad_request(format!(
+            "node kind '{}' is not permitted for semantic drift records",
+            kind.as_str()
+        )));
+    }
+
+    required_str(valid_time.as_deref(), "valid_time")?;
+    required_str(valid_time_source.as_deref(), "valid_time_source")?;
+    required_str(ingested_at.as_deref(), "ingested_at")?;
+
+    let drift = semantic_drift
+        .as_deref()
+        .ok_or_else(|| ApiError::missing_field("semantic_drift"))?;
+    validate_semantic_drift_payload(id, drift)?;
+    let sink_guard = sink
+        .read()
+        .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
+    validate_semantic_drift_endpoint(
+        "SemanticDrift.target_record_id",
+        &drift.target_record_id,
+        records,
+        &sink_guard,
+    )?;
+    validate_semantic_drift_endpoint(
+        "SemanticDrift.prior_record_id",
+        &drift.prior_record_id,
+        records,
+        &sink_guard,
+    )?;
+    validate_semantic_drift_edges(id, drift, records, store_records)?;
+    validate_semantic_drift_immutable(id, drift, &sink_guard)
+}
+
+fn validate_semantic_drift_edges(
+    id: &str,
+    drift: &crate::ir::SemanticDriftMetadata,
+    records: &[GraphRecord],
+    store_records: &[GraphRecord],
+) -> WriteResult<()> {
+    if !semantic_edge_present(
+        id,
+        EdgeLabel::DriftsFrom,
+        &drift.target_record_id,
+        records,
+        store_records,
+    ) {
+        return Err(ApiError::new(
+            ErrorCode::DriftPriorTargetMismatch,
+            format!("SemanticDrift '{id}' is missing DRIFTS_FROM edge to target_record_id"),
+        ));
+    }
+    if !semantic_edge_present(
+        id,
+        EdgeLabel::DriftsPrior,
+        &drift.prior_record_id,
+        records,
+        store_records,
+    ) {
+        return Err(ApiError::new(
+            ErrorCode::DriftPriorTargetMismatch,
+            format!("SemanticDrift '{id}' is missing DRIFTS_PRIOR edge to prior_record_id"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_semantic_drift_immutable(
+    id: &str,
+    drift: &crate::ir::SemanticDriftMetadata,
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    match sink.read_back(id) {
+        Ok(Some(GraphRecord::Node {
+            semantic_drift: Some(existing),
+            ..
+        })) if (existing.score - drift.score).abs() > SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE => {
+            Err(ApiError::new(
+                ErrorCode::DriftRecordImmutable,
+                format!(
+                    "SemanticDrift '{id}' is immutable; existing score {} cannot be rewritten to {}",
+                    existing.score, drift.score
+                ),
+            ))
+        }
+        Ok(_) => Ok(()),
+        Err(error) => Err(ApiError::internal(error.to_string())),
+    }
+}
+
+fn validate_semantic_drift_payload(
+    record_id: &str,
+    drift: &crate::ir::SemanticDriftMetadata,
+) -> WriteResult<()> {
+    required_str(Some(drift.embedding_model.provider.as_str()), "embedding_model.provider")?;
+    required_str(Some(drift.embedding_model.name.as_str()), "embedding_model.name")?;
+    required_str(Some(drift.embedding_model.version.as_str()), "embedding_model.version")?;
+    if drift.embedding_model.dim == 0 {
+        return Err(ApiError::bad_request(format!(
+            "SemanticDrift '{record_id}' embedding_model.dim must be greater than zero"
+        )));
+    }
+    required_str(
+        Some(drift.embedding_model.content_hash.as_str()),
+        "embedding_model.content_hash",
+    )?;
+    required_str(Some(drift.metric_kind.as_str()), "metric_kind")?;
+    if !drift.score.is_finite() {
+        return Err(ApiError::bad_request(format!(
+            "SemanticDrift '{record_id}' score must be a finite JSON number"
+        )));
+    }
+    if !drift.selection_threshold.is_finite() {
+        return Err(ApiError::bad_request(format!(
+            "SemanticDrift '{record_id}' selection_threshold must be finite"
+        )));
+    }
+    required_str(Some(drift.selection_basis.as_str()), "selection_basis")?;
+    Ok(())
+}
+
+fn validate_semantic_drift_endpoint(
+    field: &'static str,
+    value: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    if !value.starts_with("codegraph:") {
+        return Err(ApiError::new(
+            ErrorCode::DriftPriorTargetMismatch,
+            format!("{field} must reference a codegraph File or Symbol; got '{value}'"),
+        ));
+    }
+    match lookup_node_kind(value, records, sink)? {
+        Some(NodeKind::File | NodeKind::Symbol) => Ok(()),
+        Some(kind) => Err(ApiError::new(
+            ErrorCode::DriftPriorTargetMismatch,
+            format!(
+                "{field} must reference a codegraph File or Symbol; target '{value}' has kind {}",
+                kind.as_str()
+            ),
+        )),
+        None => Err(ApiError::new(
+            ErrorCode::UnresolvedEvidenceTarget,
+            format!("{field} target '{value}' not found in store or batch"),
+        )),
+    }
+}
+
+fn semantic_edge_present(
+    source: &str,
+    label: EdgeLabel,
+    target: &str,
+    batch: &[GraphRecord],
+    store_records: &[GraphRecord],
+) -> bool {
+    batch.iter().chain(store_records.iter()).any(|record| {
+        matches!(
+            record,
+            GraphRecord::Edge {
+                label: edge_label,
+                source: edge_source,
+                target: edge_target,
+                ..
+            } if *edge_label == label && edge_source == source && edge_target == target
+        )
+    })
+}
+
+fn validate_semantic_edge(
+    edge_id: &str,
+    label: EdgeLabel,
+    source: &str,
+    target: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    if !matches!(
+        label,
+        EdgeLabel::DriftsFrom | EdgeLabel::DriftsPrior | EdgeLabel::MeasuredBy
+    ) {
+        return Err(ApiError::bad_request(format!(
+            "semantic edge '{edge_id}' uses unsupported label '{}'",
+            label.as_str()
+        )));
+    }
+    if !source.starts_with("semantic:v1:") {
+        return Err(ApiError::bad_request(format!(
+            "semantic edge '{edge_id}' requires a semantic:v1: source; got '{source}'"
+        )));
+    }
+    let source_kind = lookup_node_kind(source, records, sink)?;
+    if !matches!(source_kind, Some(NodeKind::SemanticDrift)) {
+        return Err(ApiError::bad_request(format!(
+            "semantic edge '{edge_id}' requires a SemanticDrift source"
+        )));
+    }
+    match label {
+        EdgeLabel::DriftsFrom | EdgeLabel::DriftsPrior => {
+            validate_semantic_drift_endpoint("semantic edge target", target, records, sink)
+        }
+        EdgeLabel::MeasuredBy => {
+            if !target.starts_with("semantic:v1:") {
+                return Err(ApiError::new(
+                    ErrorCode::DriftPriorTargetMismatch,
+                    format!(
+                        "semantic MEASURED_BY edge '{edge_id}' requires a semantic:v1: EmbeddingModel target; got '{target}'"
+                    ),
+                ));
+            }
+            match lookup_node_kind(target, records, sink)? {
+                Some(NodeKind::EmbeddingModel) => Ok(()),
+                Some(kind) => Err(ApiError::new(
+                    ErrorCode::DriftPriorTargetMismatch,
+                    format!(
+                        "semantic MEASURED_BY edge '{edge_id}' target has kind {}; expected EmbeddingModel",
+                        kind.as_str()
+                    ),
+                )),
+                None => Err(ApiError::new(
+                    ErrorCode::UnresolvedEvidenceTarget,
+                    format!("semantic MEASURED_BY target '{target}' not found in store or batch"),
+                )),
+            }
+        }
+        _ => unreachable!("semantic edge labels were checked above"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_project_node_base(
     id: &str,
@@ -2218,6 +2541,7 @@ fn validate_project_verification_ref(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_project_edge(
     edge_id: &str,
     schema_version: u32,
@@ -2868,6 +3192,7 @@ fn record_id_matches_domain(id: &str, domain: &str) -> bool {
         "verification" => id.starts_with("verification:v1:"),
         "artifact" => id.starts_with("artifact:v1:"),
         "project" => id.starts_with("project:v1:"),
+        "semantic" => id.starts_with("semantic:v1:"),
         _ => true,
     }
 }
@@ -2901,6 +3226,11 @@ fn validate_evidence_target_domain(id: &str, target_domain: &str) -> WriteResult
         "project" if !id.starts_with("project:v1:") => {
             return Err(ApiError::bad_request(format!(
                 "evidence link declares target_domain 'project' but target '{id}' does not have the expected 'project:v1:' prefix",
+            )));
+        }
+        "semantic" if !id.starts_with("semantic:v1:") => {
+            return Err(ApiError::bad_request(format!(
+                "evidence link declares target_domain 'semantic' but target '{id}' does not have the expected 'semantic:v1:' prefix",
             )));
         }
         // Other declared domains: no universal prefix requirement.
@@ -3370,6 +3700,7 @@ const AGENT_MEMORY_NODE_KINDS: &[NodeKind] = &[
 
 // Validates that the source and target IDs of a directly submitted agent-memory edge
 // are in the domains required by the cross-domain registry (docs/schema/agent-memory.md §6).
+#[allow(clippy::too_many_lines)]
 fn validate_agent_memory_edge_endpoints(
     edge_id: &str,
     label: EdgeLabel,
@@ -4244,7 +4575,7 @@ fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         Some(d)
             if !matches!(
                 d,
-                "codegraph" | "agent_memory" | "verification" | "artifact" | "project"
+                "codegraph" | "agent_memory" | "verification" | "artifact" | "project" | "semantic"
             ) =>
         {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
@@ -4465,8 +4796,46 @@ fn drift_node_to_query_json(
     obj.insert("record_id".to_owned(), json!(id.as_str()));
     obj.insert("before_commit".to_owned(), json!(&drift.before_git_commit));
     obj.insert("after_commit".to_owned(), json!(&drift.after_git_commit));
-    obj.insert("score".to_owned(), json!(&drift.score));
-    obj.insert("model_id".to_owned(), json!(&drift.model_id));
+    obj.insert(
+        "before_valid_time".to_owned(),
+        json!(&drift.before_valid_time),
+    );
+    obj.insert(
+        "after_valid_time".to_owned(),
+        json!(&drift.after_valid_time),
+    );
+    obj.insert("prior_record_id".to_owned(), json!(&drift.prior_record_id));
+    obj.insert("target_record_id".to_owned(), json!(&drift.target_record_id));
+    obj.insert("score".to_owned(), json!(drift.score));
+    obj.insert(
+        "selection_threshold".to_owned(),
+        json!(drift.selection_threshold),
+    );
+    obj.insert(
+        "selection_basis".to_owned(),
+        json!(drift.selection_basis.as_str()),
+    );
+    obj.insert("metric_kind".to_owned(), json!(drift.metric_kind.as_str()));
+    obj.insert(
+        "embedding_model_provider".to_owned(),
+        json!(&drift.embedding_model.provider),
+    );
+    obj.insert(
+        "embedding_model_name".to_owned(),
+        json!(&drift.embedding_model.name),
+    );
+    obj.insert(
+        "embedding_model_version".to_owned(),
+        json!(&drift.embedding_model.version),
+    );
+    obj.insert(
+        "embedding_model_dim".to_owned(),
+        json!(drift.embedding_model.dim),
+    );
+    obj.insert(
+        "embedding_model_content_hash".to_owned(),
+        json!(&drift.embedding_model.content_hash),
+    );
     if let Some(p) = resolved_path {
         obj.insert("repo_relative_path".to_owned(), json!(p));
     }
@@ -5022,7 +5391,13 @@ fn handle_verb_drift_top_n(
     .min(DRIFT_TOP_N_MAX);
     let effective_limit = params_limit.min(budget_limit);
 
-    let (mut records, snapshot) = match load_all_records_for_verb(state, started, budget, domain) {
+    let drift_domain = if domain == "codegraph" {
+        "semantic"
+    } else {
+        domain
+    };
+    let (mut records, snapshot) =
+        match load_all_records_for_verb(state, started, budget, drift_domain) {
         Ok(r) => r,
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
@@ -5128,7 +5503,7 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
     if non_empty(query.domain.as_deref()).is_some_and(|d| {
         !matches!(
             d,
-            "codegraph" | "agent_memory" | "verification" | "artifact" | "project"
+            "codegraph" | "agent_memory" | "verification" | "artifact" | "project" | "semantic"
         )
     }) {
         return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());
@@ -5223,13 +5598,15 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             &domain,
             state,
         ),
-        "observations_for_symbol" | "agent_sessions_for_repo" | "criteria_for_task" => HttpResponse::error_with_id(
-            &request_id,
-            ApiError::new(
-                ErrorCode::NotImplemented,
-                format!("verb '{verb}' is reserved and not yet implemented"),
-            ),
-        ),
+        "drift" | "observations_for_symbol" | "agent_sessions_for_repo" | "criteria_for_task" => {
+            HttpResponse::error_with_id(
+                &request_id,
+                ApiError::new(
+                    ErrorCode::NotImplemented,
+                    format!("verb '{verb}' is reserved and not yet implemented"),
+                ),
+            )
+        },
         _ => HttpResponse::error_with_id(
             &request_id,
             ApiError::bad_request_field(format!("unknown verb '{verb}'"), "verb"),
@@ -5444,7 +5821,7 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         Some(d)
             if !matches!(
                 d,
-                "codegraph" | "agent_memory" | "verification" | "artifact" | "project"
+                "codegraph" | "agent_memory" | "verification" | "artifact" | "project" | "semantic"
             ) =>
         {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());

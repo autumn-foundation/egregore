@@ -236,7 +236,7 @@ Expected: PASS.
 
 **Step 1: Write failing tests**
 
-Create two versions of the same symbol across commits and assert drift candidates compare the same logical symbol across before/after commits. The test must not download models; it can use deterministic fake vectors to prove score, model ID, before commit, after commit, and summary are preserved.
+Create two versions of the same symbol across commits and assert drift candidates compare the same logical symbol across before/after commits. The test must not download models; it can use deterministic fake vectors to prove score, structured `embedding_model`, before commit, after commit, and summary are preserved.
 
 **Step 2: Verify red**
 
@@ -245,7 +245,7 @@ Expected: FAIL because drift records do not exist.
 
 **Step 3: Implement drift record generation**
 
-Enable AletheiaDB semantic features through Codegraph features. Generate `SemanticDrift` graph records from embedding candidate pairs and vector distance scores. Preserve model ID, target entity ID, before/after commit SHAs, valid-time range, score, and explanation summary.
+Enable AletheiaDB semantic features through Codegraph features. Generate `SemanticDrift` graph records from embedding candidate pairs and vector distance scores. Preserve structured `embedding_model`, target entity ID, prior entity ID, before/after commit SHAs, valid-time range, score, selection threshold, and explanation summary.
 
 **Step 4: Verify green**
 

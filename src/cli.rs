@@ -527,8 +527,19 @@ struct DriftResult<'a> {
     record_id: &'a str,
     before_commit: &'a str,
     after_commit: &'a str,
-    score: &'a str,
-    model_id: &'a str,
+    before_valid_time: &'a str,
+    after_valid_time: &'a str,
+    embedding_model_provider: &'a str,
+    embedding_model_name: &'a str,
+    embedding_model_version: &'a str,
+    embedding_model_dim: u32,
+    embedding_model_content_hash: &'a str,
+    metric_kind: &'static str,
+    prior_record_id: &'a str,
+    target_record_id: &'a str,
+    score: f64,
+    selection_threshold: f64,
+    selection_basis: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     repo_relative_path: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -838,7 +849,7 @@ fn generate_embeddings(
 ) -> Result<(crate::embeddings::EmbeddingVectorMap, usize)> {
     use crate::embeddings::{
         DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_DIMENSIONS,
-        DEFAULT_EMBEDDING_MODEL_ID, EmbeddingVectorKey, EmbeddingVectorMap, aletheia_embeddings,
+        DEFAULT_EMBEDDING_MODEL_NAME, EmbeddingVectorKey, EmbeddingVectorMap, aletheia_embeddings,
         embedding_candidates,
     };
 
@@ -857,7 +868,7 @@ fn generate_embeddings(
 
     let embedder = aletheia_embeddings::EmbedderBuilder::new()
         .model_architecture(DEFAULT_EMBEDDING_MODEL_ARCHITECTURE)
-        .model_id(Some(DEFAULT_EMBEDDING_MODEL_ID))
+        .model_id(Some(DEFAULT_EMBEDDING_MODEL_NAME))
         .from_pretrained_hf()
         .context("failed to load embedding model")?;
 
@@ -892,14 +903,14 @@ fn generate_embeddings(
 #[cfg(feature = "embeddings")]
 fn query_semantic(query: &str, data_dir: &Path, limit: usize, format: OutputFormat) -> Result<()> {
     use crate::embeddings::{
-        DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_ID, aletheia_embeddings,
+        DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_NAME, aletheia_embeddings,
     };
 
     validate_existing_embedded_store(data_dir)?;
 
     let embedder = aletheia_embeddings::EmbedderBuilder::new()
         .model_architecture(DEFAULT_EMBEDDING_MODEL_ARCHITECTURE)
-        .model_id(Some(DEFAULT_EMBEDDING_MODEL_ID))
+        .model_id(Some(DEFAULT_EMBEDDING_MODEL_NAME))
         .from_pretrained_hf()
         .context("failed to load embedding model")?;
 
@@ -1194,8 +1205,19 @@ fn query_drift(records: &[GraphRecord], limit: usize, format: OutputFormat) -> R
             record_id: id,
             before_commit: &drift.before_git_commit,
             after_commit: &drift.after_git_commit,
-            score: &drift.score,
-            model_id: &drift.model_id,
+            before_valid_time: &drift.before_valid_time,
+            after_valid_time: &drift.after_valid_time,
+            embedding_model_provider: &drift.embedding_model.provider,
+            embedding_model_name: &drift.embedding_model.name,
+            embedding_model_version: &drift.embedding_model.version,
+            embedding_model_dim: drift.embedding_model.dim,
+            embedding_model_content_hash: &drift.embedding_model.content_hash,
+            metric_kind: drift.metric_kind.as_str(),
+            prior_record_id: &drift.prior_record_id,
+            target_record_id: &drift.target_record_id,
+            score: drift.score,
+            selection_threshold: drift.selection_threshold,
+            selection_basis: drift.selection_basis.as_str(),
             repo_relative_path: resolved_path,
             name: resolved_name,
         };
@@ -1279,7 +1301,7 @@ impl PrintText for DriftResult<'_> {
         let name = self.name.unwrap_or("(unknown)");
         let path = self.repo_relative_path.unwrap_or("(unknown)");
         format!(
-            "{name} score={} {}..{} @ {path}",
+            "{name} score={:.6} {}..{} @ {path}",
             self.score, self.before_commit, self.after_commit
         )
     }

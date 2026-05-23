@@ -3,7 +3,8 @@
 use std::{fs, path::PathBuf};
 
 use aletheia_egregore::{
-    EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan, TemporalMetadata,
+    EdgeLabel, EmbeddingModel, GraphRecord, MetricKind, NodeKind, SelectionBasis,
+    SemanticDriftMetadata, SourceSpan, TemporalMetadata,
     ir::{Graph, stable_id},
 };
 use assert_cmd::Command;
@@ -243,6 +244,7 @@ fn fixture_graph_with_nested_symbol() -> (tempfile::TempDir, PathBuf) {
     (temp, path)
 }
 
+#[allow(clippy::too_many_lines)]
 fn fixture_graph_with_drift() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("temp dir");
     let path = temp.path().join("drift.jsonl");
@@ -269,13 +271,23 @@ fn fixture_graph_with_drift() -> (tempfile::TempDir, PathBuf) {
         valid_time_source: None,
     })
     .with_semantic_drift(SemanticDriftMetadata {
-        model_id: "test-model-v1".to_owned(),
+        embedding_model: EmbeddingModel {
+            provider: "test".to_owned(),
+            name: "test-model-v1".to_owned(),
+            version: "v1".to_owned(),
+            dim: 384,
+            content_hash: "fixture".to_owned(),
+        },
         target_record_id: target_id.clone(),
+        prior_record_id: target_id.clone(),
         before_git_commit: "aaaaaaaa".to_owned(),
         after_git_commit: "bbbbbbbb".to_owned(),
         before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
         after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
-        score: "0.250000".to_owned(),
+        metric_kind: MetricKind::CosineDistance,
+        score: 0.25,
+        selection_threshold: 0.2,
+        selection_basis: SelectionBasis::ThresholdOnly,
     });
 
     let drift_large = GraphRecord::node(
@@ -295,13 +307,23 @@ fn fixture_graph_with_drift() -> (tempfile::TempDir, PathBuf) {
         valid_time_source: None,
     })
     .with_semantic_drift(SemanticDriftMetadata {
-        model_id: "test-model-v1".to_owned(),
+        embedding_model: EmbeddingModel {
+            provider: "test".to_owned(),
+            name: "test-model-v1".to_owned(),
+            version: "v1".to_owned(),
+            dim: 384,
+            content_hash: "fixture".to_owned(),
+        },
         target_record_id: target_id.clone(),
+        prior_record_id: target_id.clone(),
         before_git_commit: "bbbbbbbb".to_owned(),
         after_git_commit: "cccccccc".to_owned(),
         before_valid_time: "2026-01-02T00:00:00Z".to_owned(),
         after_valid_time: "2026-01-03T00:00:00Z".to_owned(),
-        score: "0.900000".to_owned(),
+        metric_kind: MetricKind::CosineDistance,
+        score: 0.9,
+        selection_threshold: 0.2,
+        selection_basis: SelectionBasis::ThresholdOnly,
     });
 
     let target_sym = GraphRecord::symbol(
@@ -459,8 +481,8 @@ fn query_drift_data_dir_returns_drift_ranked_by_score() {
     let stdout = String::from_utf8(output).expect("utf8");
     let first: serde_json::Value =
         serde_json::from_str(stdout.lines().next().expect("first line")).expect("valid JSON");
-    assert_eq!(first["score"], "0.900000", "largest drift should be first");
-    assert_eq!(first["model_id"], "test-model-v1");
+    assert_eq!(first["score"], 0.9, "largest drift should be first");
+    assert_eq!(first["embedding_model_name"], "test-model-v1");
     assert!(first["record_id"].is_string());
 }
 
@@ -653,9 +675,9 @@ fn query_drift_prints_jsonl_ranked_by_score_descending() {
     assert!(!lines.is_empty(), "should have drift output");
     let first: serde_json::Value =
         serde_json::from_str(lines[0]).expect("valid JSON on first line");
-    assert_eq!(first["score"], "0.900000", "largest drift should be first");
+    assert_eq!(first["score"], 0.9, "largest drift should be first");
     assert!(first["record_id"].is_string(), "record_id should be string");
-    assert_eq!(first["model_id"], "test-model-v1");
+    assert_eq!(first["embedding_model_name"], "test-model-v1");
     assert_eq!(first["before_commit"], "bbbbbbbb");
     assert_eq!(first["after_commit"], "cccccccc");
     // target info resolved from DriftsFrom edge
@@ -909,13 +931,23 @@ fn fixture_graph_with_drift_stale_target_id() -> (tempfile::TempDir, PathBuf) {
         valid_time_source: None,
     })
     .with_semantic_drift(SemanticDriftMetadata {
-        model_id: "test-model-v1".to_owned(),
+        embedding_model: EmbeddingModel {
+            provider: "test".to_owned(),
+            name: "test-model-v1".to_owned(),
+            version: "v1".to_owned(),
+            dim: 384,
+            content_hash: "fixture".to_owned(),
+        },
         target_record_id: "stale-id-not-in-slice".to_owned(), // stale / missing
+        prior_record_id: "stale-id-not-in-slice".to_owned(),
         before_git_commit: "aaaaaaaa".to_owned(),
         after_git_commit: "bbbbbbbb".to_owned(),
         before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
         after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
-        score: "0.750000".to_owned(),
+        metric_kind: MetricKind::CosineDistance,
+        score: 0.75,
+        selection_threshold: 0.2,
+        selection_basis: SelectionBasis::ThresholdOnly,
     });
 
     let target_sym = GraphRecord::symbol(

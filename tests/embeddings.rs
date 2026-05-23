@@ -100,11 +100,17 @@ fn semantic_drift_records_capture_vector_movement_between_commits() {
         json.iter().any(|record| {
             record["record_type"] == "node"
                 && record["kind"] == "SemanticDrift"
-                && record["semantic_drift"]["model_id"] == "fake-code-model"
+                && record["domain"] == "semantic"
+                && record["semantic_drift"]["embedding_model"]["name"] == "fake-code-model"
+                && record["semantic_drift"]["embedding_model"]["dim"] == 384
                 && record["semantic_drift"]["target_record_id"] == "file:src/lib.rs"
+                && record["semantic_drift"]["prior_record_id"] == "file:src/lib.rs"
                 && record["semantic_drift"]["before_git_commit"] == "aaaaaaaa"
                 && record["semantic_drift"]["after_git_commit"] == "bbbbbbbb"
-                && record["semantic_drift"]["score"] == "1.000000"
+                && record["semantic_drift"]["metric_kind"] == "cosine_distance"
+                && record["semantic_drift"]["score"] == 1.0
+                && record["semantic_drift"]["selection_threshold"] == 0.5
+                && record["semantic_drift"]["selection_basis"] == "threshold_only"
         }),
         "missing semantic drift node"
     );
@@ -115,6 +121,14 @@ fn semantic_drift_records_capture_vector_movement_between_commits() {
                 && record["target"] == "file:src/lib.rs"
         }),
         "missing DRIFTS_FROM edge"
+    );
+    assert!(
+        json.iter().any(|record| {
+            record["record_type"] == "edge"
+                && record["label"] == "DRIFTS_PRIOR"
+                && record["target"] == "file:src/lib.rs"
+        }),
+        "missing DRIFTS_PRIOR edge"
     );
 }
 
