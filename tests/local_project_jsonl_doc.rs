@@ -17,6 +17,16 @@ fn assert_contains_all(path: &str, needles: &[&str]) {
     }
 }
 
+fn assert_contains_none(path: &str, needles: &[&str]) {
+    let text = read_repo_text(path);
+    for needle in needles {
+        assert!(
+            !text.contains(needle),
+            "{path} must not document stale contract `{needle}`"
+        );
+    }
+}
+
 #[test]
 fn local_project_jsonl_schema_doc_locks_file_contract() {
     assert_contains_all(
@@ -42,7 +52,8 @@ fn local_project_jsonl_schema_doc_locks_file_contract() {
             r#"{"kind": "header", "schema_version": 1, "project_slug": "<slug>", "created_at": "<rfc3339>"}"#,
             "missing_header",
             "`local_id` is the stable identifier",
-            "`updated_at` is the mutation timestamp used as `valid_time_source`",
+            "duplicate `local_id` lines are valid only as revisions of the same record kind",
+            "`valid_time_source` to `local_jsonl_updated_at`",
             "`open`",
             "`in_progress`",
             "`blocked`",
@@ -71,7 +82,10 @@ fn local_project_jsonl_schema_doc_locks_file_contract() {
             "task.labels",
             "task.assignees",
             "acceptance_criterion.text",
-            "project:v<schema_version>:<blake3(domain || kind || source_kind || file_path || local_id)>",
+            "external_link.url",
+            "project:v<schema_version>:<blake3(domain || kind || source_kind || source_native_id || entity_kind_identity)>",
+            "`AcceptanceCriterion` | `(parent_task_id, ordinal)`",
+            "`ExternalLink` | `(system, system_native_id)`",
             "renaming a local JSONL file produces new in-graph IDs",
             "idempotent re-import",
             ".egregore/tasks/sample.jsonl",
@@ -81,6 +95,15 @@ fn local_project_jsonl_schema_doc_locks_file_contract() {
             "Versioning rules",
             "schema_version` = `1`",
             "schema_version` = `2`",
+        ],
+    );
+
+    assert_contains_none(
+        "docs/schema/local-project-jsonl.md",
+        &[
+            "Required, unique within the file",
+            "file modification time source",
+            "project:v<schema_version>:<blake3(domain || kind || source_kind || file_path || local_id)>",
         ],
     );
 }
@@ -114,6 +137,7 @@ fn local_project_jsonl_schema_doc_is_linked_and_coordinated() {
             "task.labels",
             "task.assignees",
             "acceptance_criterion.text",
+            "external_link.url",
             "does not redact at rest",
         ],
     );
@@ -124,5 +148,14 @@ fn local_project_jsonl_schema_doc_is_linked_and_coordinated() {
             "file path + local_id",
             "not by guessing the file format",
         ],
+    );
+
+    assert_contains_all(
+        "docs/schema/project-graph.md",
+        &["local_jsonl_updated_at"],
+    );
+    assert_contains_none(
+        "docs/schema/project-graph.md",
+        &["file modification time source"],
     );
 }
