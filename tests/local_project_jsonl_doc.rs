@@ -1,4 +1,5 @@
 #![allow(missing_docs)]
+#![allow(clippy::too_many_lines)]
 
 use std::{fs, path::Path};
 
@@ -62,9 +63,13 @@ fn local_project_jsonl_schema_doc_locks_file_contract() {
             "`urgent`",
             "`bytes`",
             "missing_body_bytes",
+            "omitted `task.body` projects as the canonical empty body",
+            "BLAKE3 hash of the empty byte string",
+            "`bytes` = 0",
             "parent_task_local_id",
             "unresolved_parent_task",
             "verification_handle",
+            "verified `acceptance_criterion` lines without `verification_handle` are skipped",
             "verified `acceptance_criterion` lines with unresolved `verification_handle` are skipped",
             "acceptance_criterion_missing_verification",
             "unresolved_verification_handle",
@@ -76,7 +81,9 @@ fn local_project_jsonl_schema_doc_locks_file_contract() {
             "`other`",
             "external_link.updated_at",
             "unresolved_parent_local_id",
-            "external_link lines are optional",
+            "Explicit `external_link` rows are optional only for additional, non-source links",
+            "importer MUST materialize one source `ExternalLink` for every `task`",
+            "`source_external_link_id`",
             "latest line for a given `local_id`",
             "task, acceptance_criterion, or external_link",
             "identity fields MUST NOT change across revisions with the same `local_id`",
@@ -88,6 +95,7 @@ fn local_project_jsonl_schema_doc_locks_file_contract() {
             "`transaction_time` set to import time",
             "`valid_time` set to the line's `updated_at`",
             ".egregore/tasks/<project>.jsonl.tmp-<uuid>",
+            "fsync the containing directory",
             ".tmp-*",
             "NOT redacted at rest",
             "local file is the source of truth",
@@ -98,6 +106,9 @@ fn local_project_jsonl_schema_doc_locks_file_contract() {
             "acceptance_criterion.text",
             "external_link.url",
             "project:v<schema_version>:<blake3(domain || kind || source_kind || source_native_id || entity_kind_identity)>",
+            "`<encoded_file_path>:<encoded_local_id>`",
+            "literal `:` MUST be percent-encoded as `%3A`",
+            "source_handle_encoding_error",
             "`AcceptanceCriterion` | `(parent_task_id, ordinal)`",
             "`ExternalLink` | `(system, system_native_id)`",
             "renaming a local JSONL file produces new in-graph IDs",
@@ -118,6 +129,7 @@ fn local_project_jsonl_schema_doc_locks_file_contract() {
             "Required, unique within the file",
             "file modification time source",
             "leaves the in-graph `verification_link_id` null",
+            "Rule: external_link lines are optional; their absence does not block import",
             "ties broken by `updated_at`",
             "project:v<schema_version>:<blake3(domain || kind || source_kind || file_path || local_id)>",
         ],
@@ -143,6 +155,7 @@ fn local_project_jsonl_schema_doc_is_linked_and_coordinated() {
             "docs/schema/local-project-jsonl.md",
             "`source_kind: local_jsonl`",
             "<file_path>:<local_id>",
+            "percent-encoded source handle",
         ],
     );
     assert_contains_all(
