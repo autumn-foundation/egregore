@@ -103,7 +103,7 @@ Field set:
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
 | `kind` | string | yes | Always `task`. |
-| `local_id` | string | yes | Local-JSONL record identifier. Required, unique within the file, and used in the local source handle. |
+| `local_id` | string | yes | Local-JSONL record identifier. Required and used in the local source handle. The first occurrence defines the record; later lines with the same `local_id` are revisions of that record. |
 | `title` | string | yes | Redacted per issue #4 at import time before persistence into the graph. |
 | `body` | string or body handle | no | Inline string for bodies up to 16 KiB, or `{"handle": "<repo-relative-path>", "hash": "<blake3>"}` for larger bodies. |
 | `status` | enum | yes | `open`, `in_progress`, `blocked`, `closed_completed`, `closed_dropped`, `unknown`. Additive and aligned with `Task.status` in project-graph v1. |
@@ -113,9 +113,7 @@ Field set:
 | `created_at` | RFC3339 string | yes | Original creation timestamp for this task. |
 | `updated_at` | RFC3339 string | yes | Mutation timestamp for this line. |
 
-Rule: `local_id` is the stable identifier; `updated_at` is the mutation timestamp used as `valid_time_source` for the project-graph row. The importer
-sets project-graph `valid_time` to this line's `updated_at` and records the
-source of that value as the local JSONL line.
+Rule: `local_id` is the stable identifier; duplicate `local_id` lines are valid only as revisions of the same record kind. The importer sets project-graph `valid_time` to this line's `updated_at` and sets `valid_time_source` to `local_jsonl_updated_at`.
 
 ## Acceptance Criterion Record
 
@@ -138,7 +136,7 @@ Field set:
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
 | `kind` | string | yes | Always `acceptance_criterion`. |
-| `local_id` | string | yes | Local-JSONL record identifier. Required and unique within the file. |
+| `local_id` | string | yes | Local-JSONL record identifier. Required. Later lines with the same `local_id` are revisions of the same AC; reuse across record kinds is invalid. |
 | `parent_task_local_id` | string | yes | Must match a `task.local_id` earlier in the same file. |
 | `ordinal` | u32 | yes | Position within the parent's AC list. |
 | `text` | string | yes | Redacted per issue #4 at import time before persistence into the graph. |
@@ -176,7 +174,7 @@ Field set:
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
 | `kind` | string | yes | Always `external_link`. |
-| `local_id` | string | yes | Local-JSONL record identifier. Required and unique within the file. |
+| `local_id` | string | yes | Local-JSONL record identifier. Required. Later lines with the same `local_id` are revisions of the same external link; reuse across record kinds is invalid. |
 | `parent_local_id` | string | yes | The `task.local_id` or `acceptance_criterion.local_id` this link belongs to. |
 | `system` | enum | yes | `github`, `gitlab`, `local_file`, `harness_legacy`, `other`. Additive and aligned with `ExternalLink.system` in project-graph v1. |
 | `url` | string | yes | Canonical URL, `file://` URL, or local path string when no URL exists. |
@@ -237,21 +235,22 @@ through the redaction policy before becoming queryable graph fields:
 | `task.labels` | `Task.labels` |
 | `task.assignees` | `Task.assignees` |
 | `acceptance_criterion.text` | `AcceptanceCriterion.text` |
+| `external_link.url` | `ExternalLink.url` |
 
 Rule: the local file is the source of truth; Egregore's graph view is a
 redacted, indexed projection of it. The operator is responsible for not
 committing secrets to local task files, the same posture as `.env`.
 
-`external_link.url` remains governed by
-[`docs/schema/project-graph.md`](project-graph.md); the local-file source handle
-`<file_path>:<local_id>` is not redacted by default.
+The local-file source handle `<file_path>:<local_id>` is not redacted by
+default.
 
 ## Stable ID Composition
 
-Local-JSONL-sourced project-graph rows use this stable ID composition:
+Local-JSONL-sourced project-graph rows use the canonical project-graph stable ID
+composition from [`docs/schema/project-graph.md`](project-graph.md):
 
 ```text
-id = project:v<schema_version>:<blake3(domain || kind || source_kind || file_path || local_id)>
+id = project:v<schema_version>:<blake3(domain || kind || source_kind || source_native_id || entity_kind_identity)>
 ```
 
 Inputs:
@@ -261,8 +260,15 @@ Inputs:
 | `domain` | `project` |
 | `kind` | `Task`, `AcceptanceCriterion`, or `ExternalLink` |
 | `source_kind` | `local_jsonl` |
-| `file_path` | Repo-relative `.egregore/tasks/<project-slug>.jsonl` |
-| `local_id` | The line's `local_id` string |
+| `source_native_id` | Repo-relative `.egregore/tasks/<project-slug>.jsonl` |
+
+Kind-specific `entity_kind_identity` values:
+
+| Kind | `entity_kind_identity` |
+|------|------------------------|
+| `Task` | `<file_path>:<local_id>` |
+| `AcceptanceCriterion` | `(parent_task_id, ordinal)` |
+| `ExternalLink` | `(system, system_native_id)` |
 
 Rule: renaming a local JSONL file produces new in-graph IDs; moving a task to a
 new project is a deliberate identity break. The operator mechanism is a
