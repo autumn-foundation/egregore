@@ -22,8 +22,8 @@ Rules:
 - GitHub-sourced records MUST carry an `ExternalLink` to the canonical GitHub
   URL and MUST use the GitHub-side `updated_at` as `valid_time_source`.
 - Local-JSONL-sourced records MUST carry a `source_handle` containing file
-  path, line or record ID, and hash; the file modification time is the
-  `valid_time_source`.
+  path, line or record ID, and hash; the source line's `updated_at` is the
+  `valid_time`, with `valid_time_source` set to `local_jsonl_updated_at`.
 - Project-graph records MAY express intent but MUST NOT impersonate code-graph
   or verification facts. Closing a `Task` does not produce a `Verification`.
   Merging a `PR` does not produce a `Change`. Future cross-walk slices may
@@ -49,7 +49,7 @@ reserved and has no producer yet.
 | `domain` | `"project"` | yes | Reject any project kind with a different domain. |
 | `schema_version` | `1` | yes | `PROJECT_SCHEMA_VERSION`. |
 | `valid_time` | RFC3339 | yes | Domain event time. |
-| `valid_time_source` | string | yes | For GitHub, `github_updated_at`; for local JSONL, file modification time source. |
+| `valid_time_source` | string | yes | For GitHub, `github_updated_at`; for local JSONL, `local_jsonl_updated_at`. |
 | `transaction_time` | RFC3339 | yes | Store write time for append-with-same-entity-id mutation rows. |
 | `confidence` | float string | guessed fields only | Omit for stable source fields. |
 | `source_handle` | string | local JSONL | File path + line/record ID + hash. Local JSONL handles are concretized by [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md). |
