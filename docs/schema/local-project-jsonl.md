@@ -194,7 +194,7 @@ Field set:
 | `parent_local_id` | string | yes | The `task.local_id` or `acceptance_criterion.local_id` this link belongs to. |
 | `system` | enum | yes | `github`, `gitlab`, `local_file`, `harness_legacy`, `other`. Additive and aligned with `ExternalLink.system` in project-graph v1. |
 | `url` | string | yes | Canonical URL, `file://` URL, or local path string when no URL exists. |
-| `system_native_id` | string | yes | Source-system identifier. For the local-JSONL source handle, this is `<encoded_file_path>:<encoded_local_id>` with `file_path` repo-relative. |
+| `system_native_id` | string | yes | Source-system identifier. For the materialized local source link identity, this is `<encoded_file_path>:<encoded_local_id>` with `file_path` repo-relative. |
 | `discovered_at` | RFC3339 string | yes | When the link was discovered or authored. |
 | `updated_at` | RFC3339 string | yes | Mutation timestamp for this link line; this is `external_link.updated_at`. |
 
@@ -212,6 +212,13 @@ materialized deterministically. Their presence produces one
 `system` and `system_native_id` as the materialized source link, in which case
 it refines that source link rather than creating a duplicate identity.
 
+Rule: explicit source-link refinement field precedence is deterministic. When
+an explicit `external_link` row refines the materialized local source link, the
+explicit `external_link` row wins for `url`, `discovered_at`, and `updated_at`.
+The materialized source link retains identity and task parent wiring:
+`system`, `system_native_id`, and the owning task linkage remain the source link
+identity for `Task.source_external_link_id`.
+
 Rule: an `external_link` line whose `parent_local_id` does not refer to a
 `task` or `acceptance_criterion` line earlier in the same file is rejected by
 the importer with `unresolved_parent_local_id`. This is a `Diagnostic`, not a
@@ -219,8 +226,13 @@ hard error; the line is skipped and a `Diagnostic` record is emitted.
 
 ## Source Handle Encoding
 
-The canonical local-file source handle is
-`<encoded_file_path>:<encoded_local_id>`. The historical
+The project-graph `source_handle` uses `<encoded_file_path>:<encoded_local_id>:<record_hash>`.
+The `record_hash` is the BLAKE3 hash of the canonical source line bytes. The
+hash component is provenance for the concrete source row, not the stable task
+identity.
+
+The materialized local source link identity uses the hashless
+`<encoded_file_path>:<encoded_local_id>` form. The historical
 `<file_path>:<local_id>` spelling is display shorthand only when neither
 component needs escaping.
 
@@ -228,9 +240,11 @@ Encoding rules:
 
 1. Normalize `file_path` to the repo-relative path used for import.
 2. Percent-encode each UTF-8 component with uppercase hex escapes before
-   joining it with the single `:` separator.
-3. A literal `:` MUST be percent-encoded as `%3A`; a literal `%` MUST be
-   percent-encoded as `%25`.
+   joining encoded components with the single `:` separator.
+3. ASCII alphanumeric plus `-`, `.`, `_`, and `~` are the only unescaped bytes.
+   Every other UTF-8 byte MUST be percent-encoded.
+4. A literal `:` MUST be percent-encoded as `%3A`; a literal `%` MUST be
+   percent-encoded as `%25`; a literal `/` MUST be percent-encoded as `%2F`.
 
 Importers MUST reject malformed percent escapes or non-canonical lowercase
 escapes with `source_handle_encoding_error`. This keeps the mapping from
@@ -303,9 +317,11 @@ Rule: the local file is the source of truth; Egregore's graph view is a
 redacted, indexed projection of it. The operator is responsible for not
 committing secrets to local task files, the same posture as `.env`.
 
-The local-file source handle `<encoded_file_path>:<encoded_local_id>` is not
-redacted by default. In examples without escaped characters it is rendered as
-`<file_path>:<local_id>`.
+The local-file source identity handle `<encoded_file_path>:<encoded_local_id>`
+and project-graph `source_handle`
+`<encoded_file_path>:<encoded_local_id>:<record_hash>` are not redacted by
+default. In examples without escaped characters the identity handle is rendered
+as `<file_path>:<local_id>`.
 
 ## Stable ID Composition
 
@@ -338,7 +354,9 @@ new project is a deliberate identity break. The operator mechanism is a
 `closed_dropped` line in the old file plus a new `open` line in the new file.
 
 For `ExternalLink.system_native_id` that represents the local JSONL source
-itself, use `<encoded_file_path>:<encoded_local_id>`.
+itself, use `<encoded_file_path>:<encoded_local_id>`. For the shared
+project-graph `source_handle` field on local-JSONL rows, use
+`<encoded_file_path>:<encoded_local_id>:<record_hash>`.
 
 ## Idempotent Re-Import Contract
 
@@ -362,7 +380,7 @@ Minimal fixture:
 {"kind": "task", "local_id": "sample-task", "title": "Wire local JSONL import", "body": "Make project state editable offline.", "status": "open", "priority": "normal", "assignees": [], "labels": ["local-jsonl"], "created_at": "2026-05-18T00:00:00Z", "updated_at": "2026-05-18T00:00:00Z"}
 {"kind": "acceptance_criterion", "local_id": "sample-task-ac-1", "parent_task_local_id": "sample-task", "ordinal": 1, "text": "The importer reads the header.", "status": "unverified", "updated_at": "2026-05-18T00:00:00Z"}
 {"kind": "acceptance_criterion", "local_id": "sample-task-ac-2", "parent_task_local_id": "sample-task", "ordinal": 2, "text": "Re-import is idempotent.", "status": "unverified", "updated_at": "2026-05-18T00:00:00Z"}
-{"kind": "external_link", "local_id": "sample-task-source", "parent_local_id": "sample-task", "system": "local_file", "url": "file://.egregore/tasks/sample.jsonl", "system_native_id": ".egregore/tasks/sample.jsonl:sample-task", "discovered_at": "2026-05-18T00:00:00Z", "updated_at": "2026-05-18T00:00:00Z"}
+{"kind": "external_link", "local_id": "sample-task-source", "parent_local_id": "sample-task", "system": "local_file", "url": "file://.egregore/tasks/sample.jsonl", "system_native_id": ".egregore%2Ftasks%2Fsample.jsonl:sample-task", "discovered_at": "2026-05-18T00:00:00Z", "updated_at": "2026-05-18T00:00:00Z"}
 ```
 
 ## Inspect Surface Contract
