@@ -78,6 +78,13 @@ pub enum CodegraphError {
     #[error("failed to serialize graph record: {0}")]
     Serialize(#[from] serde_json::Error),
 
+    /// A cached or persisted graph record uses an unsupported schema version.
+    #[error("{message}")]
+    UnsupportedSchemaVersion {
+        /// Version compatibility failure detail.
+        message: String,
+    },
+
     /// Tree-sitter could not load a language grammar.
     #[error("failed to load parser language: {0}")]
     ParserLanguage(String),

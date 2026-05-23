@@ -15,6 +15,7 @@ use crate::{
     identity,
     ir::{Graph, GraphRecord, SCHEMA_VERSION, stable_id, versioned_stable_id},
     repository_record_from_identity, scan_source_file_records,
+    schema_version::validate_record_version,
 };
 
 /// Incremental cache schema for extractor output stored on disk.
@@ -65,8 +66,11 @@ pub fn scan_repository_incremental_at(
     let repo_identity = identity::compute_repository_identity(repo_root, None);
     let (repository_id, repository) = repository_record_from_identity(&repo_identity);
     let previous_cache = CacheFile::load(cache_path.as_ref())?;
-    let can_reuse_cache_records = previous_cache.schema_version == CACHE_SCHEMA_VERSION
+    let mut can_reuse_cache_records = previous_cache.schema_version == CACHE_SCHEMA_VERSION
         && previous_cache.repository_id == repository_id;
+    if can_reuse_cache_records && previous_cache.validate_record_versions().is_err() {
+        can_reuse_cache_records = false;
+    }
     let mut next_cache = CacheFile::default();
     let mut graph = Graph::new();
     let mut rebuilt_files = Vec::new();
@@ -226,6 +230,22 @@ impl CacheFile {
             path: path.to_path_buf(),
             source,
         })
+    }
+
+    fn validate_record_versions(&self) -> Result<()> {
+        for cached_file in self.files.values() {
+            for record in &cached_file.records {
+                validate_record_version(record).map_err(|unknown| {
+                    CodegraphError::UnsupportedSchemaVersion {
+                        message: format!(
+                            "incremental cache contains unsupported record schema version: {}",
+                            unknown.version
+                        ),
+                    }
+                })?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -21,6 +21,11 @@ All routes are prefixed `/v1/`. Within `v1`:
 The current API version is surfaced as `"api_version": "v1"` in every
 `GET /v1/health` and `GET /v1/status` response.
 
+Record-level `GraphRecord.schema_version` values are governed separately by
+[`schema-versioning.md`](schema-versioning.md). A v1 daemon can read and write
+multiple record schema versions in one store, and must reject unknown
+`(domain, kind, schema_version)` tuples with `unknown_schema_version`.
+
 ---
 
 ## 2 — Transport and auth
@@ -121,6 +126,7 @@ All error codes are snake\_case identifiers. String literals at call sites in
 | `acceptance_criterion_missing_verification` | 422 | no | no | ingest, jobs/ingest |
 | `drift_prior_target_mismatch` | 422 | no | no | ingest, jobs/ingest |
 | `drift_record_immutable` | 422 | no | no | ingest, jobs/ingest |
+| `unknown_schema_version` | 422 | no | no | ingest, jobs/ingest, query/read |
 
 Adding a new code is additive. Renaming or removing a code requires `/v2/`.
 
@@ -131,6 +137,9 @@ project-domain `AcceptanceCriterion` writes. See
 Coordination: issue #15 adds `semantic` domain writes,
 `drift_prior_target_mismatch`, and `drift_record_immutable`. See
 [`docs/schema/semantic-drift.md`](semantic-drift.md).
+
+Coordination: issue #16 reserves `unknown_schema_version` for record-level
+version compatibility. See [`docs/schema/schema-versioning.md`](schema-versioning.md).
 
 ---
 

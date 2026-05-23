@@ -31,6 +31,8 @@ pub mod languages;
 pub mod parser;
 /// Agent-facing graph query helpers.
 pub mod query;
+/// Record schema-version compatibility checks.
+pub mod schema_version;
 /// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
 pub mod traj;
 
@@ -45,6 +47,10 @@ pub use ir::{
     SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, SelectionBasis,
     SemanticDriftMetadata, SourceSpan, TemporalMetadata, agent_memory_stable_id,
     artifact_stable_id, semantic_stable_id, stable_id,
+};
+pub use schema_version::{
+    RecordLineRead, RecordReadError, RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE,
+    UnknownSchemaVersion, record_version, validate_record_version,
 };
 pub use traj::import_traj;
 

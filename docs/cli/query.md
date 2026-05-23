@@ -60,6 +60,7 @@ eg query symbol <NAME> --graph <PATH> [--at <COMMIT>] [--format json|text]
 | Field | Type | Always present | Description |
 |-------|------|----------------|-------------|
 | `record_id` | string | yes | Stable BLAKE3-based record ID (`codegraph:v1:…`). |
+| `schema_version` | number | yes | Record schema version for the returned `Symbol`; see [`docs/schema/schema-versioning.md`](../schema/schema-versioning.md). |
 | `name` | string | yes | Symbol name. |
 | `kind` | string | yes | Always `"Symbol"`. |
 | `repo_relative_path` | string or null | yes | Repository-relative file path, e.g. `"src/lib.rs"`. |
@@ -74,7 +75,7 @@ eg query symbol scan_repository --graph g.jsonl
 ```
 
 ```json
-{"record_id":"codegraph:v1:abc…","name":"scan_repository","kind":"Symbol","repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":500,"start_line":51,"end_line":71}}
+{"record_id":"codegraph:v1:abc...","schema_version":1,"name":"scan_repository","kind":"Symbol","repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":500,"start_line":51,"end_line":71}}
 ```
 
 ---
@@ -122,6 +123,7 @@ eg query drift --graph <PATH> [--limit N] [--format json|text]
 | Field | Type | Always present | Description |
 |-------|------|----------------|-------------|
 | `record_id` | string | yes | Stable record ID for the `SemanticDrift` node. |
+| `schema_version` | number | yes | Record schema version for the returned `SemanticDrift`; see [`docs/schema/schema-versioning.md`](../schema/schema-versioning.md). |
 | `before_commit` | string | yes | Commit SHA for the earlier embedding. |
 | `after_commit` | string | yes | Commit SHA for the later embedding. |
 | `before_valid_time` | string | yes | Valid time for the earlier embedding. |

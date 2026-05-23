@@ -18,6 +18,11 @@ the `get_records` verb.
 Full transport and authentication rules are in
 [`docs/schema/daemon-api.md`](daemon-api.md).
 
+Returned record-shaped rows include the record-level `schema_version` so mixed
+stores and bi-temporal reads do not hide version boundaries. Record compatibility
+is governed by [`schema-versioning.md`](schema-versioning.md), not by this query
+envelope `schema_version`.
+
 ---
 
 ## 2 — Request envelope
@@ -182,6 +187,7 @@ closest to and not after the instant.
 ```json
 {
   "record_id":          "codegraph:v3:...",
+  "schema_version":     3,
   "name":               "nested::Widget",
   "kind":               "Symbol",
   "repo_relative_path": "src/lib.rs",
@@ -242,8 +248,8 @@ current-state results.
   "verb": "file_defines",
   "snapshot": "2026-05-19T10:00:00Z",
   "records": [
-    { "record_id": "...", "name": "nested::Widget", "kind": "Symbol", ... },
-    { "record_id": "...", "name": "nested::Runner", "kind": "Symbol", ... }
+    { "record_id": "...", "schema_version": 3, "name": "nested::Widget", "kind": "Symbol", ... },
+    { "record_id": "...", "schema_version": 3, "name": "nested::Runner", "kind": "Symbol", ... }
   ],
   "page": { "cursor": null, "has_more": false, "returned": 2 }
 }
@@ -269,6 +275,7 @@ Return the top-N `SemanticDrift` nodes ranked by `score` descending.
 ```json
 {
   "record_id":                    "semantic:v1:...",
+  "schema_version":               1,
   "before_commit":                "abc1234",
   "after_commit":                 "def5678",
   "before_valid_time":            "2026-05-21T00:00:00Z",
