@@ -14,9 +14,8 @@ use std::{
 use aletheia_egregore::{
     adapters::{EmbeddedAletheiaSink, GraphSink},
     daemon::{
-        DaemonClient, DaemonMetadata as ClientDaemonMetadata, DaemonState,
-        StoreLease, discover_runtime_dir_for_working_dir, runtime_dir_for_data_dir,
-        runtime_metadata_is_stale,
+        DaemonClient, DaemonMetadata as ClientDaemonMetadata, DaemonState, StoreLease,
+        discover_runtime_dir_for_working_dir, runtime_dir_for_data_dir, runtime_metadata_is_stale,
     },
     import_traj,
     ir::{
@@ -212,10 +211,7 @@ fn daemon_runtime_dir_contract_conforms() {
     assert_ne!(metadata.pid, 0);
     assert!(!metadata.address.is_empty());
     assert!(!metadata.token.is_empty());
-    assert_eq!(
-        metadata.data_dir,
-        canonical_data_dir
-    );
+    assert_eq!(metadata.data_dir, canonical_data_dir);
     assert_eq!(metadata.version, env!("CARGO_PKG_VERSION"));
     assert!(metadata.started_at_unix_ms.is_u64() || metadata.started_at_unix_ms.is_string());
     assert_eq!(metadata.state, "running");
@@ -254,6 +250,120 @@ fn daemon_runtime_dir_contract_conforms() {
     );
 }
 
+#[test]
+fn daemon_client_rejects_future_runtime_metadata_schema() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+    let runtime_dir = runtime_dir_for_data_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    fs::write(
+        runtime_dir.join("egregored.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 2,
+            "pid": 1234,
+            "address": "127.0.0.1:9",
+            "token": "test-token",
+            "data_dir": data_dir.canonicalize().expect("data dir should canonicalize"),
+            "version": env!("CARGO_PKG_VERSION"),
+            "started_at_unix_ms": 1,
+            "state": "running"
+        }))
+        .expect("metadata should serialize"),
+    )
+    .expect("future metadata should be written");
+
+    let Err(error) = DaemonClient::from_data_dir(&data_dir) else {
+        panic!("future daemon runtime schema should be rejected");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported daemon runtime schema_version 2"),
+        "future runtime schema should fail explicitly, got {error:#}"
+    );
+}
+
+#[test]
+fn runtime_discovery_rejects_non_directory_runtime_candidates() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let working_dir = temp.path().join("repo").join("src");
+    fs::create_dir_all(&working_dir).expect("working dir should be created");
+
+    let env_data_dir = temp.path().join("env-store");
+    fs::create_dir_all(&env_data_dir).expect("env data dir should be created");
+    let env_runtime_dir = runtime_dir_for_data_dir(&env_data_dir);
+    fs::write(&env_runtime_dir, "not a directory")
+        .expect("runtime candidate file should be written");
+    let env_error =
+        discover_runtime_dir_for_working_dir(&working_dir, Some(env_data_dir.as_path()))
+            .expect_err("env runtime candidate file should not be accepted");
+    assert!(
+        env_error
+            .to_string()
+            .contains("no daemon for this directory"),
+        "non-directory env runtime should be rejected as undiscoverable, got {env_error:#}"
+    );
+
+    let default_data_dir = temp.path().join("repo").join(".egregore");
+    let default_runtime_dir = runtime_dir_for_data_dir(&default_data_dir);
+    fs::write(&default_runtime_dir, "not a directory")
+        .expect("default runtime candidate file should be written");
+    let default_error = discover_runtime_dir_for_working_dir(&working_dir, None)
+        .expect_err("walk-up runtime candidate file should not be accepted");
+    assert!(
+        default_error
+            .to_string()
+            .contains("no daemon for this directory"),
+        "non-directory walk-up runtime should be rejected as undiscoverable, got {default_error:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn store_lease_rejects_symlinked_runtime_dir() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+    let runtime_dir = runtime_dir_for_data_dir(&data_dir);
+    let symlink_target = temp.path().join("symlink-target-runtime");
+    fs::create_dir_all(&symlink_target).expect("symlink target should be created");
+    std::os::unix::fs::symlink(&symlink_target, &runtime_dir)
+        .expect("runtime dir symlink should be created");
+
+    let Err(error) = StoreLease::acquire(&data_dir) else {
+        panic!("symlinked runtime dir should be rejected");
+    };
+    assert!(
+        error.to_string().contains("runtime_permissions_unsafe")
+            && error.to_string().contains("symlink"),
+        "symlinked runtime dir should fail as unsafe, got {error:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn store_lease_rejects_symlinked_lock_file() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+    let runtime_dir = runtime_dir_for_data_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let symlink_target = temp.path().join("target-lock");
+    fs::write(&symlink_target, "target").expect("symlink target file should be written");
+    std::os::unix::fs::symlink(&symlink_target, runtime_dir.join("egregored.lock"))
+        .expect("lock file symlink should be created");
+
+    let Err(error) = StoreLease::acquire(&data_dir) else {
+        panic!("symlinked lock file should be rejected");
+    };
+    assert!(
+        error.to_string().contains("runtime_permissions_unsafe")
+            && error.to_string().contains("symlink"),
+        "symlinked lock file should fail as unsafe, got {error:#}"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn daemon_runtime_contract_windows_acl_gap_is_explicit() {
@@ -276,7 +386,10 @@ fn daemon_runtime_schema_doc_is_cross_linked_and_names_contract() {
         "EGREGORE_DATA_DIR",
         "no daemon for this directory",
     ] {
-        assert!(schema.contains(needle), "runtime schema must contain {needle}");
+        assert!(
+            schema.contains(needle),
+            "runtime schema must contain {needle}"
+        );
     }
 
     for (path, needle) in [
@@ -3547,11 +3660,7 @@ fn project_task_reimport_preserves_rows_by_transaction_time() {
     assert_eq!(
         task_rows,
         vec![
-            (
-                PROJECT_TASK_ID,
-                "closed_completed",
-                "2026-05-22T00:00:02Z"
-            ),
+            (PROJECT_TASK_ID, "closed_completed", "2026-05-22T00:00:02Z"),
             (PROJECT_TASK_ID, "open", "2026-05-22T00:00:01Z")
         ],
         "re-importing the same task should preserve both mutation rows with the same entity_id"
@@ -4438,8 +4547,10 @@ fn tool_call_produced_evidence_id_must_resolve_to_verification_record() {
     let mut daemon = start_daemon(&data_dir);
     let metadata = read_metadata(&data_dir);
     let turn_id = "agent_memory:v1:turn-for-produced-evidence-check";
-    let mut tool_call =
-        valid_tool_call_json("agent_memory:v1:tool-call-missing-produced-evidence", turn_id);
+    let mut tool_call = valid_tool_call_json(
+        "agent_memory:v1:tool-call-missing-produced-evidence",
+        turn_id,
+    );
     tool_call
         .as_object_mut()
         .expect("tool call fixture should be an object")
@@ -4717,7 +4828,10 @@ fn invalid_syntax_patch_artifact_requires_empty_target_files() {
     let data_dir = temp.path().join("store");
     let mut daemon = start_daemon(&data_dir);
     let metadata = read_metadata(&data_dir);
-    ingest_patch_producer_session(&metadata, "invalid-syntax-target-files-producer-session-key");
+    ingest_patch_producer_session(
+        &metadata,
+        "invalid-syntax-target-files-producer-session-key",
+    );
     let mut patch = patch_artifact_fixture(
         "artifact:v1:invalid-syntax-with-target-files",
         "invalid_syntax",
@@ -4962,8 +5076,10 @@ fn tool_call_completed_status_requires_finished_at() {
     let mut daemon = start_daemon(&data_dir);
     let metadata = read_metadata(&data_dir);
     let turn_id = "agent_memory:v1:turn-for-completed-finished-at-check";
-    let mut tool_call =
-        valid_tool_call_json("agent_memory:v1:tool-call-completed-without-finished-at", turn_id);
+    let mut tool_call = valid_tool_call_json(
+        "agent_memory:v1:tool-call-completed-without-finished-at",
+        turn_id,
+    );
     tool_call
         .as_object_mut()
         .expect("tool call fixture should be an object")
@@ -4999,8 +5115,10 @@ fn tool_call_interrupted_status_forbids_finished_at() {
     let mut daemon = start_daemon(&data_dir);
     let metadata = read_metadata(&data_dir);
     let turn_id = "agent_memory:v1:turn-for-interrupted-finished-at-check";
-    let mut tool_call =
-        valid_tool_call_json("agent_memory:v1:tool-call-interrupted-with-finished-at", turn_id);
+    let mut tool_call = valid_tool_call_json(
+        "agent_memory:v1:tool-call-interrupted-with-finished-at",
+        turn_id,
+    );
     tool_call
         .as_object_mut()
         .expect("tool call fixture should be an object")
@@ -5037,8 +5155,10 @@ fn file_edit_create_and_delete_forbid_opposite_side_hashes() {
     let metadata = read_metadata(&data_dir);
 
     let create_turn_id = "agent_memory:v1:turn-for-create-opposite-hash-check";
-    let mut create_edit =
-        valid_file_edit_json("agent_memory:v1:file-edit-create-with-before-hash", create_turn_id);
+    let mut create_edit = valid_file_edit_json(
+        "agent_memory:v1:file-edit-create-with-before-hash",
+        create_turn_id,
+    );
     create_edit
         .as_object_mut()
         .expect("file edit fixture should be an object")
@@ -5063,8 +5183,10 @@ fn file_edit_create_and_delete_forbid_opposite_side_hashes() {
     );
 
     let delete_turn_id = "agent_memory:v1:turn-for-delete-opposite-hash-check";
-    let mut delete_edit =
-        valid_file_edit_json("agent_memory:v1:file-edit-delete-with-after-hash", delete_turn_id);
+    let mut delete_edit = valid_file_edit_json(
+        "agent_memory:v1:file-edit-delete-with-after-hash",
+        delete_turn_id,
+    );
     delete_edit
         .as_object_mut()
         .expect("file edit fixture should be an object")
@@ -6057,8 +6179,18 @@ fn semantic_drift_records_are_immutable_at_stable_id() {
     let prior_id = "codegraph:v4:semantic-prior-file";
     let valid_records = serde_json::json!([
         semantic_drift_json(drift_id, target_id, prior_id, 0.75),
-        semantic_edge_json("semantic:v1:immutable-from", "DRIFTS_FROM", drift_id, target_id),
-        semantic_edge_json("semantic:v1:immutable-prior", "DRIFTS_PRIOR", drift_id, prior_id)
+        semantic_edge_json(
+            "semantic:v1:immutable-from",
+            "DRIFTS_FROM",
+            drift_id,
+            target_id
+        ),
+        semantic_edge_json(
+            "semantic:v1:immutable-prior",
+            "DRIFTS_PRIOR",
+            drift_id,
+            prior_id
+        )
     ]);
     let first = http_json(
         &metadata,
@@ -6176,12 +6308,7 @@ fn semantic_drift_json(
     })
 }
 
-fn semantic_edge_json(
-    id: &str,
-    label: &str,
-    source: &str,
-    target: &str,
-) -> serde_json::Value {
+fn semantic_edge_json(id: &str, label: &str, source: &str, target: &str) -> serde_json::Value {
     serde_json::json!({
         "record_type": "edge",
         "id": id,

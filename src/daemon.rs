@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError as FileTryLockError},
     io::{self, Read, Seek, SeekFrom, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -240,6 +240,7 @@ struct IdempotencyStore {
 
 impl IdempotencyStore {
     fn load(path: PathBuf) -> Result<Self> {
+        reject_runtime_symlink_components(&path, "runtime file")?;
         let mut created = false;
         let entries = match fs::read_to_string(&path) {
             Ok(contents) => {
@@ -313,13 +314,16 @@ impl StoreLease {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
+        reject_runtime_symlink(&path, "runtime file")?;
         let file = options
             .open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
         enforce_runtime_file_permissions(&path)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { file, path })),
-            Err(_) => Ok(None),
+            Err(error) if lock_error_is_contention(&error) => Ok(None),
+            Err(error) => Err(io::Error::from(error))
+                .with_context(|| format!("failed to lock {}", path.display())),
         }
     }
 
@@ -967,7 +971,12 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
     }
     let mut lease = StoreLease::acquire(&config.data_dir).map_err(|error| {
         read_metadata(&config.data_dir).map_or_else(
-            |_| anyhow!("daemon already running for {}: {error}", config.data_dir.display()),
+            |_| {
+                anyhow!(
+                    "daemon already running for {}: {error}",
+                    config.data_dir.display()
+                )
+            },
             |metadata| already_running_error(&config.data_dir, &metadata),
         )
     })?;
@@ -6606,9 +6615,25 @@ fn wait_until_stopped(data_dir: &Path) -> Result<()> {
 
 fn read_metadata(data_dir: &Path) -> Result<DaemonMetadata> {
     let path = metadata_path(data_dir);
+    reject_runtime_symlink_components(&path, "runtime file")?;
     let contents =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+    let metadata = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    validate_daemon_runtime_schema(&metadata, &path)?;
+    Ok(metadata)
+}
+
+fn validate_daemon_runtime_schema(metadata: &DaemonMetadata, path: &Path) -> Result<()> {
+    if metadata.schema_version != DAEMON_RUNTIME_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "unsupported daemon runtime schema_version {} in {}; only {} is supported",
+            metadata.schema_version,
+            path.display(),
+            DAEMON_RUNTIME_SCHEMA_VERSION
+        ));
+    }
+    Ok(())
 }
 
 fn write_metadata(data_dir: &Path, metadata: &DaemonMetadata) -> Result<()> {
@@ -6637,6 +6662,7 @@ pub fn runtime_dir_for_data_dir(data_dir: &Path) -> PathBuf {
 /// Returns an error if the runtime lock file cannot be opened or inspected.
 pub fn runtime_metadata_is_stale(data_dir: &Path) -> Result<bool> {
     let metadata_path = metadata_path(data_dir);
+    reject_runtime_symlink_components(&metadata_path, "runtime file")?;
     if !metadata_path.exists() {
         return Ok(false);
     }
@@ -6648,6 +6674,7 @@ pub fn runtime_metadata_is_stale(data_dir: &Path) -> Result<bool> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    reject_runtime_symlink(&path, "runtime file")?;
     let file = options
         .open(&path)
         .with_context(|| format!("failed to open {}", path.display()))?;
@@ -6657,8 +6684,14 @@ pub fn runtime_metadata_is_stale(data_dir: &Path) -> Result<bool> {
             let _ = file.unlock();
             Ok(true)
         }
-        Err(_) => Ok(false),
+        Err(error) if lock_error_is_contention(&error) => Ok(false),
+        Err(error) => Err(io::Error::from(error))
+            .with_context(|| format!("failed to inspect runtime lock {}", path.display())),
     }
+}
+
+const fn lock_error_is_contention(error: &FileTryLockError) -> bool {
+    matches!(error, FileTryLockError::WouldBlock)
 }
 
 /// Discovers the runtime dir for a client that starts with a working directory.
@@ -6678,7 +6711,7 @@ pub fn discover_runtime_dir_for_working_dir(
     if let Some(data_dir) = data_dir_env {
         let runtime = runtime_dir(data_dir);
         tried.push(runtime.clone());
-        if runtime.exists() {
+        if runtime_dir_is_plain_dir(&runtime) {
             return Ok(runtime);
         }
         return Err(no_runtime_dir_error(working_dir, &tried));
@@ -6695,14 +6728,14 @@ pub fn discover_runtime_dir_for_working_dir(
     loop {
         let direct_runtime = runtime_dir(&cursor);
         tried.push(direct_runtime.clone());
-        if direct_runtime.exists() {
+        if runtime_dir_is_plain_dir(&direct_runtime) {
             return Ok(direct_runtime);
         }
 
         let default_data_dir = cursor.join(".egregore");
         let default_runtime = runtime_dir(&default_data_dir);
         tried.push(default_runtime.clone());
-        if default_runtime.exists() {
+        if runtime_dir_is_plain_dir(&default_runtime) {
             return Ok(default_runtime);
         }
 
@@ -6769,8 +6802,52 @@ fn store_identity_text(data_dir: &Path) -> String {
     store_identity_dir(data_dir).to_string_lossy().into_owned()
 }
 
+fn runtime_dir_is_plain_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+fn reject_runtime_symlink_components(path: &Path, kind: &str) -> Result<()> {
+    let mut ancestors = path.ancestors().collect::<Vec<_>>();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(anyhow!(
+                        "runtime_permissions_unsafe: {kind} {} contains symlink component {}",
+                        path.display(),
+                        ancestor.display()
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", ancestor.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_runtime_symlink(path: &Path, kind: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "runtime_permissions_unsafe: {kind} {} is a symlink",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
 fn ensure_runtime_dir(data_dir: &Path) -> Result<PathBuf> {
     let runtime_dir = runtime_dir(data_dir);
+    reject_runtime_symlink_components(&runtime_dir, "runtime dir")?;
     fs::create_dir_all(&runtime_dir)
         .with_context(|| format!("failed to create {}", runtime_dir.display()))?;
     enforce_runtime_dir_permissions(&runtime_dir)?;
@@ -6781,6 +6858,7 @@ fn ensure_runtime_dir(data_dir: &Path) -> Result<PathBuf> {
 fn enforce_runtime_dir_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    reject_runtime_symlink(path, "runtime dir")?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
         format!(
             "runtime_permissions_unsafe: failed to restrict runtime dir {}",
@@ -6804,7 +6882,8 @@ fn enforce_runtime_dir_permissions(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 #[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
-fn enforce_runtime_dir_permissions(_path: &Path) -> Result<()> {
+fn enforce_runtime_dir_permissions(path: &Path) -> Result<()> {
+    reject_runtime_symlink(path, "runtime dir")?;
     // TODO(windows-acl-runtime-permissions): set the runtime directory ACL to
     // the current user only, then fail startup with runtime_permissions_unsafe
     // if the ACL cannot be enforced. The Windows conformance test asserts this
@@ -6816,6 +6895,7 @@ fn enforce_runtime_dir_permissions(_path: &Path) -> Result<()> {
 fn enforce_runtime_file_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    reject_runtime_symlink(path, "runtime file")?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
         format!(
             "runtime_permissions_unsafe: failed to restrict runtime file {}",
@@ -6839,7 +6919,8 @@ fn enforce_runtime_file_permissions(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 #[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
-fn enforce_runtime_file_permissions(_path: &Path) -> Result<()> {
+fn enforce_runtime_file_permissions(path: &Path) -> Result<()> {
+    reject_runtime_symlink(path, "runtime file")?;
     // TODO(windows-acl-runtime-permissions): set the lock, metadata, and
     // idempotency journal ACL to the current user only, then fail startup with
     // runtime_permissions_unsafe if the ACL cannot be enforced.
@@ -6872,11 +6953,14 @@ fn same_mount(_child: &Path, _parent: &Path) -> Result<bool> {
 
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
+        reject_runtime_symlink_components(parent, "runtime dir")?;
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
         enforce_runtime_dir_permissions(parent)?;
     }
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    reject_runtime_symlink(path, "runtime file")?;
+    reject_runtime_symlink(&tmp, "runtime file")?;
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -7164,6 +7248,17 @@ mod tests {
             UNKNOWN_SCHEMA_VERSION_CODE
         );
         Ok(())
+    }
+
+    #[test]
+    fn lock_contention_classifier_does_not_hide_other_io_errors() {
+        assert!(lock_error_is_contention(&FileTryLockError::WouldBlock));
+        assert!(!lock_error_is_contention(&FileTryLockError::Error(
+            io::Error::from(io::ErrorKind::PermissionDenied)
+        )));
+        assert!(!lock_error_is_contention(&FileTryLockError::Error(
+            io::Error::from(io::ErrorKind::Unsupported)
+        )));
     }
 
     #[test]

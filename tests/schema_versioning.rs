@@ -2,11 +2,11 @@
 
 use std::fs;
 
-use assert_cmd::Command;
 use aletheia_egregore::{
     GraphRecord, NodeKind, SCHEMA_VERSION, SourceSpan,
     adapters::{AdapterError, records_from_jsonl, records_from_jsonl_report},
 };
+use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::json;
 
@@ -38,7 +38,11 @@ fn future_schema_version_is_typed_and_inspect_reports_mixed_counts() {
     let jsonl = format!("{current}\n{future}\n");
 
     let report = records_from_jsonl_report(&jsonl).expect("mixed JSONL should be readable");
-    assert_eq!(report.records.len(), 1, "recognized record must still parse");
+    assert_eq!(
+        report.records.len(),
+        1,
+        "recognized record must still parse"
+    );
     assert!(matches!(
         &report.records[0],
         GraphRecord::Node {

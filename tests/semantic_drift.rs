@@ -3,8 +3,7 @@
 use std::collections::BTreeMap;
 
 use aletheia_egregore::{
-    EdgeLabel, EmbeddingModel, GraphRecord, MetricKind, NodeKind, SelectionBasis,
-    TemporalMetadata,
+    EdgeLabel, EmbeddingModel, GraphRecord, MetricKind, NodeKind, SelectionBasis, TemporalMetadata,
     embeddings::{CandidateVector, EmbeddingCandidate, semantic_drift_records},
     ir::{SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION},
 };
@@ -73,9 +72,7 @@ fn semantic_drift_records_emit_structured_contract_and_prior_edge() {
     assert_eq!(drift.prior_record_id, "codegraph:v4:prior-symbol");
     assert_eq!(drift.metric_kind, MetricKind::CosineDistance);
     assert!((drift.score - 1.0).abs() <= SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE);
-    assert!(
-        (drift.selection_threshold - 0.4).abs() <= SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE
-    );
+    assert!((drift.selection_threshold - 0.4).abs() <= SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE);
     assert_eq!(drift.selection_basis, SelectionBasis::ThresholdOnly);
 
     let edges = records
@@ -156,7 +153,10 @@ fn semantic_drift_replay_is_deterministic_within_tolerance() {
     let first = drift_scores_by_id(&first_records);
     let second = drift_scores_by_id(&second_records);
 
-    assert_eq!(first.keys().collect::<Vec<_>>(), second.keys().collect::<Vec<_>>());
+    assert_eq!(
+        first.keys().collect::<Vec<_>>(),
+        second.keys().collect::<Vec<_>>()
+    );
     for (id, first_score) in first {
         let second_score = second.get(id).expect("same drift ID should replay");
         assert!(
