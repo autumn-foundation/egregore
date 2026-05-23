@@ -13,13 +13,14 @@ use chrono::{DateTime, Utc};
 use crate::embeddings::{EmbeddingVectorKey, EmbeddingVectorMap};
 use crate::{
     adapters::{
-        AdapterError, AdapterResult, ExpectedRecordState, GraphSink, validate_adapter_record_version,
+        AdapterError, AdapterResult, ExpectedRecordState, GraphSink,
+        validate_adapter_record_version,
     },
     daemon::StoreLease,
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
-        EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, IdentitySource, MetricKind,
-        NodeKind, SelectionBasis, SemanticDriftMetadata, SourceSpan, TemporalMetadata,
+        EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, IdentitySource, MetricKind, NodeKind,
+        SelectionBasis, SemanticDriftMetadata, SourceSpan, TemporalMetadata,
     },
 };
 #[cfg(feature = "embeddings")]
@@ -605,6 +606,27 @@ impl EmbeddedAletheiaSink {
             }
         }
         count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_latest_node_schema_version_for_test(
+        &self,
+        record_id: &str,
+        schema_version: u32,
+    ) -> AdapterResult<()> {
+        let node_id = self
+            .node_lookup
+            .latest_node(record_id)
+            .ok_or_else(|| read_back_error(record_id, "test fixture node is not indexed"))?;
+        let properties = ::aletheiadb::PropertyMapBuilder::new()
+            .insert("schema_version", i64::from(schema_version))
+            .build();
+        self.db
+            .write(|tx| tx.update_node(node_id, properties))
+            .map_err(|error| AdapterError::Rejected {
+                record_id: record_id.to_owned(),
+                message: error.to_string(),
+            })
     }
 
     pub(crate) fn expected_record_state(
@@ -1833,7 +1855,11 @@ impl EmbeddedAletheiaSink {
                 "node_valid_time_source",
                 node.get_property("node_valid_time_source"),
             )?,
-            entity_id: optional_str_property(record_id, "entity_id", node.get_property("entity_id"))?,
+            entity_id: optional_str_property(
+                record_id,
+                "entity_id",
+                node.get_property("entity_id"),
+            )?,
             title: optional_str_property(record_id, "title", node.get_property("title"))?,
             body_handle: optional_str_property(
                 record_id,
@@ -1864,11 +1890,15 @@ impl EmbeddedAletheiaSink {
             .map(serde_json::from_str::<Vec<String>>)
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("assignees_json invalid: {e}")))?,
-            labels: optional_str_property(record_id, "labels_json", node.get_property("labels_json"))?
-                .as_deref()
-                .map(serde_json::from_str::<Vec<String>>)
-                .transpose()
-                .map_err(|e| read_back_error(record_id, format!("labels_json invalid: {e}")))?,
+            labels: optional_str_property(
+                record_id,
+                "labels_json",
+                node.get_property("labels_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<Vec<String>>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("labels_json invalid: {e}")))?,
             priority: optional_str_property(record_id, "priority", node.get_property("priority"))?,
             parent_task_id: optional_str_property(
                 record_id,

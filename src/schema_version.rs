@@ -114,15 +114,22 @@ pub enum RecordReadError {
 /// Returns an error when the line is not valid JSON or cannot expose a record
 /// type, kind, and `schema_version` tuple.
 pub fn read_record_line(line: &str) -> Result<RecordLineRead, RecordReadError> {
-    let value = serde_json::from_str::<Value>(line).map_err(|error| json_error(&error))?;
-    let version = record_version_from_value(&value)?;
-    if !is_known_record_version(&version) {
-        return Ok(RecordLineRead::UnknownSchemaVersion(
-            UnknownSchemaVersion::new(version),
-        ));
+    match serde_json::from_str::<GraphRecord>(line) {
+        Ok(record) => match validate_record_version(&record) {
+            Ok(()) => Ok(RecordLineRead::Record(Box::new(record))),
+            Err(unknown) => Ok(RecordLineRead::UnknownSchemaVersion(unknown)),
+        },
+        Err(record_error) => {
+            let value = serde_json::from_str::<Value>(line).map_err(|error| json_error(&error))?;
+            let version = record_version_from_value(&value)?;
+            if !is_known_record_version(&version) {
+                return Ok(RecordLineRead::UnknownSchemaVersion(
+                    UnknownSchemaVersion::new(version),
+                ));
+            }
+            Err(json_error(&record_error))
+        }
     }
-    let record = serde_json::from_value::<GraphRecord>(value).map_err(|error| json_error(&error))?;
-    Ok(RecordLineRead::Record(Box::new(record)))
 }
 
 /// Returns the reader-side version tuple for an already-deserialized record.
@@ -293,8 +300,16 @@ fn domain_from_record_id(id: &str) -> Option<String> {
 fn domain_for_node_kind(kind: &str) -> &'static str {
     match kind {
         "SemanticDrift" | "EmbeddingModel" | "EmbeddingVector" => Domain::Semantic.as_str(),
-        "Task" | "AcceptanceCriterion" | "ExternalLink" | "Product" | "Project" | "Plan"
-        | "GitHubIssue" | "PR" | "Review" | "LocalTask" => Domain::Project.as_str(),
+        "Task"
+        | "AcceptanceCriterion"
+        | "ExternalLink"
+        | "Product"
+        | "Project"
+        | "Plan"
+        | "GitHubIssue"
+        | "PR"
+        | "Review"
+        | "LocalTask" => Domain::Project.as_str(),
         "Artifact" | "PatchArtifact" => Domain::Artifact.as_str(),
         "Verification" | "CommandEvidence" | "CommandRun" | "TestRun" | "CIStatus"
         | "BenchmarkRun" | "CoverageReport" | "ProofResult" => Domain::Verification.as_str(),
@@ -306,9 +321,9 @@ fn domain_for_node_kind(kind: &str) -> &'static str {
 
 fn domain_for_edge_label(label: &str) -> &'static str {
     match EdgeLabel::from_relation(label) {
-        Some(
-            EdgeLabel::DriftsFrom | EdgeLabel::DriftsPrior | EdgeLabel::MeasuredBy,
-        ) => Domain::Semantic.as_str(),
+        Some(EdgeLabel::DriftsFrom | EdgeLabel::DriftsPrior | EdgeLabel::MeasuredBy) => {
+            Domain::Semantic.as_str()
+        }
         Some(label) if label.is_codegraph_topology_label() => Domain::CodeGraph.as_str(),
         Some(_) | None => Domain::AgentMemory.as_str(),
     }

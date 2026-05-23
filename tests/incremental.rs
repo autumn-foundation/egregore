@@ -3,7 +3,7 @@
 use std::fs;
 
 use aletheia_egregore::incremental::{scan_repository_incremental, scan_repository_incremental_at};
-use aletheia_egregore::{GraphRecord, NodeKind, SourceSpan, stable_id};
+use aletheia_egregore::{GraphRecord, NodeKind, SCHEMA_VERSION, SourceSpan, stable_id};
 
 #[test]
 fn incremental_reuses_unchanged_files_and_tombstones_removed_files() {
@@ -134,6 +134,35 @@ fn incremental_ignores_old_cache_when_extractor_output_schema_changes() {
         )),
         "invalidated cached symbol IDs must be tombstoned so persisted stores can retire stale records"
     );
+}
+
+#[test]
+fn incremental_rebuilds_when_cache_record_schema_version_is_unknown() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    let src = repo.join("src");
+    fs::create_dir_all(&src).expect("fixture src dir should be created");
+    fs::write(src.join("lib.rs"), "pub fn answer() -> usize { 42 }\n")
+        .expect("fixture should write");
+    let cache_path = temp.path().join("codegraph-cache.json");
+
+    scan_repository_incremental(&repo, &cache_path).expect("first scan should write cache");
+    let mut cache_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cache_path).expect("cache should be readable"))
+            .expect("cache should parse");
+    cache_json["files"]["src/lib.rs"]["records"][0]["schema_version"] =
+        serde_json::json!(SCHEMA_VERSION + 1);
+    fs::write(
+        &cache_path,
+        serde_json::to_string_pretty(&cache_json).expect("cache should serialize"),
+    )
+    .expect("fixture should write future-version cache");
+
+    let scan = scan_repository_incremental(&repo, &cache_path)
+        .expect("future cache record version should degrade to a rebuild");
+
+    assert_eq!(scan.rebuilt_files, ["src/lib.rs"]);
+    assert!(scan.reused_files.is_empty());
 }
 
 #[test]

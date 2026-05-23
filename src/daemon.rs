@@ -35,7 +35,9 @@ use crate::{
         VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
     },
     query as graph_query,
-    schema_version::{UNKNOWN_SCHEMA_VERSION_CODE, UnknownSchemaVersion, validate_record_version},
+    schema_version::{
+        RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE, UnknownSchemaVersion, validate_record_version,
+    },
 };
 
 const RUNTIME_DIR_SUFFIX: &str = ".egregore-runtime";
@@ -518,10 +520,14 @@ impl ApiError {
     }
 
     fn unknown_schema_version(unknown: &UnknownSchemaVersion) -> Self {
+        Self::unknown_record_schema_version(&unknown.version)
+    }
+
+    fn unknown_record_schema_version(version: &RecordVersion) -> Self {
         Self {
             status: ErrorCode::UnknownSchemaVersion.http_status(),
             code: ErrorCode::UnknownSchemaVersion,
-            message: format!("unsupported record schema version: {}", unknown.version),
+            message: format!("unsupported record schema version: {version}"),
             field: Some("schema_version".to_owned()),
             retry_after_ms: None,
             partial_result: None,
@@ -1235,9 +1241,8 @@ fn apply_write(
     idempotency: &Arc<Mutex<IdempotencyStore>>,
 ) -> WriteResult {
     validate_unique_recovery_keys(&command.records)?;
-    validate_record_schema_versions(&command.records)?;
 
-    // Consult the idempotency cache BEFORE running evidence-link validation so that
+    // Consult the idempotency cache BEFORE running schema/evidence-link validation so that
     // a committed replay returns the cached response immediately without re-executing
     // validation against the current store state (which can differ from the original
     // write, e.g. the target has since grown additional temporal observations).
@@ -1274,6 +1279,7 @@ fn apply_write(
         return Ok(response);
     }
 
+    validate_record_schema_versions(&command.records)?;
     validate_no_local_path_identity_in_shared_store(&command.records, sink)?;
     validate_verification_domain_records(&command.records)?;
     validate_artifact_domain_records(&command.records, sink)?;
@@ -1763,7 +1769,9 @@ fn validate_artifact_domain_records(
                 PATCH_STATUS_VALUES.join(", ")
             )));
         }
-        let has_base_commit = base_commit.as_deref().is_some_and(|commit| !commit.is_empty());
+        let has_base_commit = base_commit
+            .as_deref()
+            .is_some_and(|commit| !commit.is_empty());
         if status == "invalid_no_base" && has_base_commit {
             return Err(ApiError::bad_request(
                 "PatchArtifact.base_commit must be null when patch_status is invalid_no_base",
@@ -2005,8 +2013,10 @@ fn validate_project_domain_records(
                             records,
                             &sink_guard,
                         )?;
-                        let parent_id =
-                            required_str(parent_task_id.as_deref(), "AcceptanceCriterion.parent_task_id")?;
+                        let parent_id = required_str(
+                            parent_task_id.as_deref(),
+                            "AcceptanceCriterion.parent_task_id",
+                        )?;
                         synthesized_edges.push(project_edge(
                             EdgeLabel::OwnedByTask,
                             id,
@@ -2058,6 +2068,16 @@ fn validate_project_domain_records(
     Ok(synthesized_edges)
 }
 
+fn adapter_read_error_to_api(error: AdapterError) -> ApiError {
+    match error {
+        AdapterError::TimedOut { .. } => ApiError::query_timeout(),
+        AdapterError::UnknownSchemaVersion { version, .. } => {
+            ApiError::unknown_record_schema_version(&version)
+        }
+        other => ApiError::internal(other.to_string()),
+    }
+}
+
 fn validate_record_schema_versions(records: &[GraphRecord]) -> WriteResult<()> {
     for record in records {
         validate_record_version(record)
@@ -2081,11 +2101,9 @@ fn validate_semantic_domain_records(
 
     for record in records {
         match record {
-            GraphRecord::Node {
-                id,
-                domain,
-                ..
-            } if id.starts_with("semantic:v1:") || domain.as_deref() == Some("semantic") => {
+            GraphRecord::Node { id, domain, .. }
+                if id.starts_with("semantic:v1:") || domain.as_deref() == Some("semantic") =>
+            {
                 validate_semantic_drift_node(record, records, &store_records, sink)?;
             }
             GraphRecord::Edge {
@@ -2242,9 +2260,18 @@ fn validate_semantic_drift_payload(
     record_id: &str,
     drift: &crate::ir::SemanticDriftMetadata,
 ) -> WriteResult<()> {
-    required_str(Some(drift.embedding_model.provider.as_str()), "embedding_model.provider")?;
-    required_str(Some(drift.embedding_model.name.as_str()), "embedding_model.name")?;
-    required_str(Some(drift.embedding_model.version.as_str()), "embedding_model.version")?;
+    required_str(
+        Some(drift.embedding_model.provider.as_str()),
+        "embedding_model.provider",
+    )?;
+    required_str(
+        Some(drift.embedding_model.name.as_str()),
+        "embedding_model.name",
+    )?;
+    required_str(
+        Some(drift.embedding_model.version.as_str()),
+        "embedding_model.version",
+    )?;
     if drift.embedding_model.dim == 0 {
         return Err(ApiError::bad_request(format!(
             "SemanticDrift '{record_id}' embedding_model.dim must be greater than zero"
@@ -2619,7 +2646,11 @@ fn validate_project_edge(
                 source_kind,
                 &[NodeKind::AcceptanceCriterion],
                 target_kind,
-                &[NodeKind::Verification, NodeKind::CommandRun, NodeKind::TestRun],
+                &[
+                    NodeKind::Verification,
+                    NodeKind::CommandRun,
+                    NodeKind::TestRun,
+                ],
             )?;
         }
         EdgeLabel::TouchesFile => {
@@ -2688,7 +2719,9 @@ fn validate_project_edge_kinds(
 
 fn validate_project_output_handle(field: &'static str, handle: &OutputHandle) -> WriteResult<()> {
     if handle.hash.is_empty() {
-        return Err(ApiError::bad_request(format!("{field}.hash must not be empty")));
+        return Err(ApiError::bad_request(format!(
+            "{field}.hash must not be empty"
+        )));
     }
     let inline_len = handle.inline.as_deref().map_or(0, |s| s.len() as u64);
     if inline_len > handle.bytes {
@@ -2715,7 +2748,11 @@ fn validate_rfc3339_field(field: &'static str, value: &str) -> WriteResult<()> {
     Ok(())
 }
 
-fn validate_confidence(edge_id: &str, label: EdgeLabel, confidence: Option<&str>) -> WriteResult<()> {
+fn validate_confidence(
+    edge_id: &str,
+    label: EdgeLabel,
+    confidence: Option<&str>,
+) -> WriteResult<()> {
     let valid = confidence
         .and_then(|s| s.parse::<f64>().ok())
         .is_some_and(|v| (0.0..=1.0).contains(&v));
@@ -2920,8 +2957,10 @@ fn validate_tool_call_record(
             sink,
         )?;
     }
-    let linked_turn_id =
-        required_str(linked_turn_id, "linked_turn_id (required for ToolCall nodes)")?;
+    let linked_turn_id = required_str(
+        linked_turn_id,
+        "linked_turn_id (required for ToolCall nodes)",
+    )?;
     validate_agent_turn_ref("ToolCall.linked_turn_id", linked_turn_id, records, sink)?;
     let started_at = required_str(started_at, "started_at (required for ToolCall nodes)")?;
     if DateTime::parse_from_rfc3339(started_at).is_err() {
@@ -2985,10 +3024,16 @@ fn validate_file_edit_record(
                     "FileEdit.before_hash must be null or omitted when edit_kind is create",
                 ));
             }
-            required_str(after_hash, "after_hash (required for FileEdit create nodes)")?;
+            required_str(
+                after_hash,
+                "after_hash (required for FileEdit create nodes)",
+            )?;
         }
         "delete" => {
-            required_str(before_hash, "before_hash (required for FileEdit delete nodes)")?;
+            required_str(
+                before_hash,
+                "before_hash (required for FileEdit delete nodes)",
+            )?;
             if after_hash.is_some() {
                 return Err(ApiError::bad_request(
                     "FileEdit.after_hash must be null or omitted when edit_kind is delete",
@@ -2996,28 +3041,38 @@ fn validate_file_edit_record(
             }
         }
         "modify" => {
-            required_str(before_hash, "before_hash (required for FileEdit modify nodes)")?;
-            required_str(after_hash, "after_hash (required for FileEdit modify nodes)")?;
+            required_str(
+                before_hash,
+                "before_hash (required for FileEdit modify nodes)",
+            )?;
+            required_str(
+                after_hash,
+                "after_hash (required for FileEdit modify nodes)",
+            )?;
         }
         "rename" => {
-            required_str(before_hash, "before_hash (required for FileEdit rename nodes)")?;
-            required_str(after_hash, "after_hash (required for FileEdit rename nodes)")?;
+            required_str(
+                before_hash,
+                "before_hash (required for FileEdit rename nodes)",
+            )?;
+            required_str(
+                after_hash,
+                "after_hash (required for FileEdit rename nodes)",
+            )?;
             required_str(rename_to, "rename_to (required for FileEdit rename nodes)")?;
         }
         _ => {}
     }
-    hunk_count.ok_or_else(|| ApiError::missing_field("hunk_count (required for FileEdit nodes)"))?;
+    hunk_count
+        .ok_or_else(|| ApiError::missing_field("hunk_count (required for FileEdit nodes)"))?;
     if let Some(linked_patch_id) = linked_patch_id {
         let linked_patch_id = required_str(Some(linked_patch_id), "linked_patch_id")?;
-        validate_patch_artifact_ref(
-            "FileEdit.linked_patch_id",
-            linked_patch_id,
-            records,
-            sink,
-        )?;
+        validate_patch_artifact_ref("FileEdit.linked_patch_id", linked_patch_id, records, sink)?;
     }
-    let linked_turn_id =
-        required_str(linked_turn_id, "linked_turn_id (required for FileEdit nodes)")?;
+    let linked_turn_id = required_str(
+        linked_turn_id,
+        "linked_turn_id (required for FileEdit nodes)",
+    )?;
     validate_agent_turn_ref("FileEdit.linked_turn_id", linked_turn_id, records, sink)?;
     if id.is_empty() {
         return Err(ApiError::missing_field("id"));
@@ -3181,9 +3236,14 @@ fn validate_record_kind_ref(
     }
 }
 
-fn validate_agent_action_output_handle(field: &'static str, handle: &OutputHandle) -> WriteResult<()> {
+fn validate_agent_action_output_handle(
+    field: &'static str,
+    handle: &OutputHandle,
+) -> WriteResult<()> {
     if handle.hash.is_empty() {
-        return Err(ApiError::bad_request(format!("{field}.hash must not be empty")));
+        return Err(ApiError::bad_request(format!(
+            "{field}.hash must not be empty"
+        )));
     }
     let inline_len = handle.inline.as_deref().map_or(0, |s| s.len() as u64);
     if inline_len > handle.bytes {
@@ -3782,9 +3842,7 @@ fn validate_agent_memory_edge_endpoints(
     // Target-domain constraints per schema registry.
     match label {
         // Must target agent_memory exclusively.
-        EdgeLabel::SessionOf
-        | EdgeLabel::AuthoredBy
-        | EdgeLabel::Supersedes
+        EdgeLabel::SessionOf | EdgeLabel::AuthoredBy | EdgeLabel::Supersedes
             if !target.starts_with("agent_memory:v1:") =>
         {
             return Err(ApiError::bad_request(format!(
@@ -3971,8 +4029,10 @@ fn validate_and_synthesize_evidence_edges(
                         if valid_documented || valid_legacy_traj {
                             continue;
                         }
-                        if !matches!(source_kind, Some(NodeKind::AgentSession | NodeKind::AgentRun))
-                        {
+                        if !matches!(
+                            source_kind,
+                            Some(NodeKind::AgentSession | NodeKind::AgentRun)
+                        ) {
                             return Err(ApiError::bad_request(format!(
                                 "agent-memory edge '{id}' SESSION_OF requires an AgentSession source or legacy AgentRun source; got {}",
                                 source_kind.map_or_else(
@@ -3983,19 +4043,15 @@ fn validate_and_synthesize_evidence_edges(
                         }
                         return Err(ApiError::bad_request(format!(
                             "agent-memory edge '{id}' SESSION_OF requires an Agent target or legacy AgentSession target; got {}",
-                            target_kind.map_or_else(
-                                || "unknown".to_owned(),
-                                |k| k.as_str().to_owned()
-                            )
+                            target_kind
+                                .map_or_else(|| "unknown".to_owned(), |k| k.as_str().to_owned())
                         )));
                     }
                     EdgeLabel::AuthoredBy => {
                         let target_kind = lookup_node_kind(target, records, &sink_guard)?;
                         if !matches!(
                             target_kind,
-                            Some(
-                                NodeKind::AgentSession | NodeKind::AgentRun | NodeKind::AgentTurn
-                            )
+                            Some(NodeKind::AgentSession | NodeKind::AgentRun | NodeKind::AgentTurn)
                         ) {
                             return Err(ApiError::bad_request(format!(
                                 "agent-memory edge '{id}' AUTHORED_BY requires an AgentSession target or legacy AgentRun/AgentTurn target; got {}",
@@ -4220,7 +4276,10 @@ fn validate_and_synthesize_evidence_edges(
                             )));
                         }
                         EdgeLabel::FailedOn
-                            if !matches!(link.target_domain.as_str(), "codegraph" | "agent_memory") =>
+                            if !matches!(
+                                link.target_domain.as_str(),
+                                "codegraph" | "agent_memory"
+                            ) =>
                         {
                             return Err(ApiError::bad_request(format!(
                                 "evidence link relation '{}' requires target_domain 'codegraph' or legacy 'agent_memory'; got '{}'",
@@ -4250,8 +4309,7 @@ fn validate_and_synthesize_evidence_edges(
                             )));
                         }
                         // CONTRADICTS: TO any — no target_domain restriction.
-                        EdgeLabel::ReferencesTask if link.target_domain != "project" =>
-                        {
+                        EdgeLabel::ReferencesTask if link.target_domain != "project" => {
                             return Err(ApiError::bad_request(format!(
                                 "evidence link relation '{}' requires target_domain 'project'; got '{}'",
                                 edge_label.as_str(),
@@ -4662,7 +4720,7 @@ fn handle_get_record(record_id: &str, state: &ServerState) -> HttpResponse {
     };
     match sink.read_back(record_id) {
         Ok(record) => HttpResponse::success(None, 200, json!({ "record": record })),
-        Err(error) => HttpResponse::error(ApiError::internal(error.to_string())),
+        Err(error) => HttpResponse::error(adapter_read_error_to_api(error)),
     }
 }
 
@@ -4707,9 +4765,7 @@ fn load_all_records_for_verb(
     let sink = query_sink_read(state, started, budget)?;
     // Capture the snapshot while the read lock is held.
     let snapshot = rfc3339_now();
-    let records = sink
-        .read_all_records()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let records = sink.read_all_records().map_err(adapter_read_error_to_api)?;
     drop(sink);
     // Post-read check: the read itself may have overrun the deadline.
     check_query_budget(started, budget)?;
@@ -4835,7 +4891,10 @@ fn drift_node_to_query_json(
         json!(&drift.after_valid_time),
     );
     obj.insert("prior_record_id".to_owned(), json!(&drift.prior_record_id));
-    obj.insert("target_record_id".to_owned(), json!(&drift.target_record_id));
+    obj.insert(
+        "target_record_id".to_owned(),
+        json!(&drift.target_record_id),
+    );
     obj.insert("score".to_owned(), json!(drift.score));
     obj.insert(
         "selection_threshold".to_owned(),
@@ -4950,10 +5009,7 @@ fn handle_verb_get_records(
                 return HttpResponse::error_with_id(request_id, ApiError::query_timeout());
             }
             Err(error) => {
-                return HttpResponse::error_with_id(
-                    request_id,
-                    ApiError::internal(error.to_string()),
-                );
+                return HttpResponse::error_with_id(request_id, adapter_read_error_to_api(error));
             }
         }
         if let Err(error) = check_query_budget(started, budget) {
@@ -5428,9 +5484,9 @@ fn handle_verb_drift_top_n(
     };
     let (mut records, snapshot) =
         match load_all_records_for_verb(state, started, budget, drift_domain) {
-        Ok(r) => r,
-        Err(e) => return HttpResponse::error_with_id(request_id, e),
-    };
+            Ok(r) => r,
+            Err(e) => return HttpResponse::error_with_id(request_id, e),
+        };
 
     // When as_of_valid_time is set, exclude drift records whose valid_time
     // exceeds the given instant. Records without valid_time are current-state
@@ -5636,7 +5692,7 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
                     format!("verb '{verb}' is reserved and not yet implemented"),
                 ),
             )
-        },
+        }
         _ => HttpResponse::error_with_id(
             &request_id,
             ApiError::bad_request_field(format!("unknown verb '{verb}'"), "verb"),
@@ -6627,6 +6683,120 @@ mod tests {
             "query timeout should include waiting for the read lock"
         );
         drop(write_guard);
+        Ok(())
+    }
+
+    #[test]
+    fn committed_idempotency_replay_precedes_schema_version_validation() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let sink = Arc::new(RwLock::new(
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?,
+        ));
+        let record = GraphRecord::node(
+            "codegraph:v3:committed-schema-replay".to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("repo".to_owned()),
+            "committed replay from a future schema".to_owned(),
+        )
+        .with_domain("codegraph", crate::ir::SCHEMA_VERSION + 1);
+        let payload_hash = records_hash(std::slice::from_ref(&record))?;
+        let cached_response = DaemonIngestResponse {
+            attempted: 1,
+            succeeded: 1,
+            failed: 0,
+            failures: Vec::new(),
+            record_ids: vec![record.id().to_owned()],
+            idempotent: false,
+        };
+        let idempotency = Arc::new(Mutex::new(IdempotencyStore {
+            path: temp.path().join("idempotency.json"),
+            entries: BTreeMap::from([(
+                "committed-key".to_owned(),
+                IdempotencyEntry::Committed {
+                    payload_hash: payload_hash.clone(),
+                    response: cached_response,
+                },
+            )]),
+        }));
+        let (response_tx, response_rx) = mpsc::channel();
+        let command = WriteCommand {
+            idempotency_key: "committed-key".to_owned(),
+            payload_hash,
+            records: vec![record],
+            response_tx,
+        };
+
+        let response =
+            apply_write(&command, &sink, &idempotency).map_err(|error| anyhow!(error.message))?;
+
+        assert_eq!(response.succeeded, 1);
+        assert!(response.idempotent);
+        drop(response_rx);
+        Ok(())
+    }
+
+    #[test]
+    fn read_routes_preserve_unknown_schema_version_errors() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let record_id = "codegraph:v3:future-read-node".to_owned();
+        let record = GraphRecord::node(
+            record_id.clone(),
+            NodeKind::Symbol,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("future_read_node".to_owned()),
+            "read path future schema fixture".to_owned(),
+        );
+        let mut raw_sink =
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?;
+        let report = ingest_records(std::slice::from_ref(&record), &mut raw_sink);
+        assert!(report.is_success(), "{report:?}");
+        raw_sink
+            .force_latest_node_schema_version_for_test(&record_id, crate::ir::SCHEMA_VERSION + 1)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let sink = Arc::new(RwLock::new(raw_sink));
+        let (write_tx, _write_rx) = mpsc::sync_channel(1);
+        let idempotency = Arc::new(Mutex::new(IdempotencyStore {
+            path: temp.path().join("idempotency.json"),
+            entries: BTreeMap::new(),
+        }));
+        let state = ServerState {
+            token: "test-token".to_owned(),
+            store_identity: store_identity_text(temp.path()),
+            sink,
+            write_tx,
+            jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            agents: Arc::new(Mutex::new(BTreeMap::new())),
+            idempotency,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+
+        let read_response = handle_get_record(&record_id, &state);
+        assert_eq!(read_response.status, 422);
+        assert_eq!(
+            read_response.body["error"]["code"],
+            UNKNOWN_SCHEMA_VERSION_CODE
+        );
+
+        let query_request = HttpRequest {
+            method: "POST".to_owned(),
+            path: "/v1/query".to_owned(),
+            headers: HashMap::new(),
+            body: serde_json::to_vec(&json!({
+                "request_id": "future-read-query",
+                "agent_id": "test-agent",
+                "verb": "get_records",
+                "params": { "record_ids": [record_id] }
+            }))?,
+        };
+        let query_response = handle_query(&query_request, &state);
+        assert_eq!(query_response.status, 422);
+        assert_eq!(
+            query_response.body["error"]["code"],
+            UNKNOWN_SCHEMA_VERSION_CODE
+        );
         Ok(())
     }
 
