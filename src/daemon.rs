@@ -374,6 +374,9 @@ fn mark_metadata_crashed_if_store_unleased(data_dir: &Path) -> Result<bool> {
     let Ok(metadata) = read_metadata(data_dir) else {
         return Ok(true);
     };
+    if metadata.state == DaemonState::Stopped {
+        return Ok(true);
+    }
     let crashed = DaemonMetadata {
         state: DaemonState::Crashed,
         ..metadata
@@ -969,17 +972,23 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
     if let Some(metadata) = active_metadata(&config.data_dir) {
         return Err(already_running_error(&config.data_dir, &metadata));
     }
-    let mut lease = StoreLease::acquire(&config.data_dir).map_err(|error| {
-        read_metadata(&config.data_dir).map_or_else(
+    let Some(mut lease) = StoreLease::try_acquire(&config.data_dir).with_context(|| {
+        format!(
+            "failed to acquire embedded store lease for {}",
+            config.data_dir.display()
+        )
+    })?
+    else {
+        return Err(read_metadata(&config.data_dir).map_or_else(
             |_| {
                 anyhow!(
-                    "daemon already running for {}: {error}",
+                    "embedded store lease is still held for {}",
                     config.data_dir.display()
                 )
             },
             |metadata| already_running_error(&config.data_dir, &metadata),
-        )
-    })?;
+        ));
+    };
     let sink = EmbeddedAletheiaSink::open_unleased(&config.data_dir).with_context(|| {
         format!(
             "failed to open embedded store {}",
@@ -1057,6 +1066,9 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
 /// Returns active daemon metadata for a data directory if the daemon responds.
 #[must_use]
 pub fn active_metadata(data_dir: &Path) -> Option<DaemonMetadata> {
+    if runtime_metadata_is_stale(data_dir).ok()? {
+        return None;
+    }
     let metadata = read_metadata(data_dir).ok()?;
     let client = DaemonClient::for_data_dir(metadata.clone(), data_dir);
     client.health().ok()?;
@@ -1069,6 +1081,15 @@ pub fn active_metadata(data_dir: &Path) -> Option<DaemonMetadata> {
 ///
 /// Returns an error if metadata is missing or the shutdown request fails.
 pub fn stop(data_dir: &Path) -> Result<()> {
+    if runtime_metadata_is_stale(data_dir)? {
+        if remove_metadata_if_store_unleased(data_dir)? {
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "daemon metadata is stale but store lease is still held for {}",
+            data_dir.display()
+        ));
+    }
     let metadata = read_metadata(data_dir)
         .with_context(|| format!("no daemon metadata found for {}", data_dir.display()))?;
     let client = DaemonClient::for_data_dir(metadata, data_dir);
@@ -1118,7 +1139,11 @@ impl DaemonClient {
     ///
     /// Returns an error if the daemon metadata cannot be read.
     pub fn from_data_dir(data_dir: &Path) -> Result<Self> {
-        Ok(Self::for_data_dir(read_metadata(data_dir)?, data_dir))
+        let metadata = read_metadata(data_dir)?;
+        if runtime_metadata_is_stale(data_dir)? {
+            return Err(stale_metadata_error(data_dir));
+        }
+        Ok(Self::for_data_dir(metadata, data_dir))
     }
 
     /// Sends graph records to the daemon.
@@ -6774,6 +6799,13 @@ fn no_runtime_dir_error(working_dir: &Path, tried: &[PathBuf]) -> anyhow::Error 
     )
 }
 
+fn stale_metadata_error(data_dir: &Path) -> anyhow::Error {
+    anyhow!(
+        "daemon metadata is stale for {}; runtime lock is not held",
+        data_dir.display()
+    )
+}
+
 fn runtime_dir(data_dir: &Path) -> PathBuf {
     let data_dir = store_identity_dir(data_dir);
     data_dir.file_name().map_or_else(
@@ -6945,7 +6977,26 @@ fn same_mount(child: &Path, parent: &Path) -> Result<bool> {
     Ok(child_dev == parent_dev)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn same_mount(child: &Path, parent: &Path) -> Result<bool> {
+    let child_canonical = child
+        .canonicalize()
+        .with_context(|| format!("failed to inspect {}", child.display()))?;
+    let parent_canonical = parent
+        .canonicalize()
+        .with_context(|| format!("failed to inspect {}", parent.display()))?;
+    Ok(same_mount_canonical_paths(
+        &child_canonical,
+        &parent_canonical,
+    ))
+}
+
+#[cfg(windows)]
+fn same_mount_canonical_paths(child: &Path, parent: &Path) -> bool {
+    child.starts_with(parent)
+}
+
+#[cfg(not(any(unix, windows)))]
 #[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 fn same_mount(_child: &Path, _parent: &Path) -> Result<bool> {
     Ok(true)
@@ -7259,6 +7310,92 @@ mod tests {
         assert!(!lock_error_is_contention(&FileTryLockError::Error(
             io::Error::from(io::ErrorKind::Unsupported)
         )));
+    }
+
+    #[test]
+    fn stopped_metadata_is_not_rewritten_as_crashed_during_start_preflight() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let data_dir = temp.path().join("store");
+        let metadata = DaemonMetadata {
+            schema_version: DAEMON_RUNTIME_SCHEMA_VERSION,
+            pid: 999_990,
+            address: "127.0.0.1:9".to_owned(),
+            token: "stopped-token".to_owned(),
+            data_dir: store_identity_dir(&data_dir),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            started_at_unix_ms: 0,
+            state: DaemonState::Stopped,
+            api_version: None,
+            transports: None,
+            token_expires_at_unix_ms: None,
+            daemons_index_url: None,
+        };
+        write_metadata(&data_dir, &metadata)?;
+
+        assert!(mark_metadata_crashed_if_store_unleased(&data_dir)?);
+
+        let metadata = read_metadata(&data_dir)?;
+        assert_eq!(
+            metadata.state,
+            DaemonState::Stopped,
+            "gracefully stopped metadata must remain stopped during preflight"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_daemon_preserves_non_contention_lease_errors() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let data_dir = temp.path().join("store");
+        let metadata = DaemonMetadata {
+            schema_version: DAEMON_RUNTIME_SCHEMA_VERSION,
+            pid: 999_989,
+            address: "127.0.0.1:9".to_owned(),
+            token: "unsafe-lock-token".to_owned(),
+            data_dir: store_identity_dir(&data_dir),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            started_at_unix_ms: 0,
+            state: DaemonState::Running,
+            api_version: None,
+            transports: None,
+            token_expires_at_unix_ms: None,
+            daemons_index_url: None,
+        };
+        write_metadata(&data_dir, &metadata)?;
+        let runtime_dir = runtime_dir(&data_dir);
+        let target = temp.path().join("target-lock");
+        fs::write(&target, "target").context("lock target should write")?;
+        std::os::unix::fs::symlink(&target, runtime_dir.join(LOCK_FILE))
+            .context("lock symlink should be created")?;
+
+        let error = run_foreground(&DaemonConfig::new(data_dir))
+            .expect_err("unsafe runtime lock error should abort foreground startup");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to acquire embedded store lease")
+                && error.to_string().contains("runtime_permissions_unsafe"),
+            "foreground startup should preserve the lock acquisition error, got {error:#}"
+        );
+        assert!(
+            !error.to_string().contains("daemon already running for"),
+            "non-contention lock errors must not be rewritten as already-running: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_mount_identity_detects_canonical_parent_boundary() {
+        assert!(same_mount_canonical_paths(
+            Path::new(r"C:\repo\mounted\work"),
+            Path::new(r"C:\repo\mounted")
+        ));
+        assert!(!same_mount_canonical_paths(
+            Path::new(r"D:\mounted-target\work"),
+            Path::new(r"C:\repo")
+        ));
     }
 
     #[test]

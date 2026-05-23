@@ -497,6 +497,7 @@ fn daemon_status_times_out_stalled_stale_metadata() {
     let data_dir = temp.path().join("store");
     let runtime_dir = runtime_dir(&data_dir);
     fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let _lease = StoreLease::acquire(&data_dir).expect("test should hold store lease");
     let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral port should bind");
     let address = listener
         .local_addr()
@@ -547,6 +548,7 @@ fn daemon_status_rejects_wrong_service_health_response() {
     let data_dir = temp.path().join("store");
     let runtime_dir = runtime_dir(&data_dir);
     fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let _lease = StoreLease::acquire(&data_dir).expect("test should hold store lease");
     let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral port should bind");
     let address = listener
         .local_addr()
@@ -596,6 +598,7 @@ fn daemon_status_rejects_same_version_wrong_store_health_response() {
     let data_dir = temp.path().join("store");
     let runtime_dir = runtime_dir(&data_dir);
     fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let _lease = StoreLease::acquire(&data_dir).expect("test should hold store lease");
     let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral port should bind");
     let address = listener
         .local_addr()
@@ -650,12 +653,116 @@ fn daemon_status_rejects_same_version_wrong_store_health_response() {
 }
 
 #[test]
+fn daemon_ingest_rejects_stopped_stale_metadata_before_connecting() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("graph.jsonl");
+    let runtime_dir = runtime_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    write_graph(
+        &graph_path,
+        &[GraphRecord::node(
+            "codegraph:v3:stopped-stale-ingest-node".to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("repo".to_owned()),
+            "stopped stale ingest".to_owned(),
+        )],
+    );
+    let (address, listener_thread) = spawn_request_capture_listener(Duration::from_millis(750));
+    fs::write(
+        runtime_dir.join("egregored.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "pid": 999_992,
+            "address": address,
+            "token": "stopped-stale-token",
+            "data_dir": data_dir,
+            "version": env!("CARGO_PKG_VERSION"),
+            "started_at_unix_ms": 0_u64,
+            "state": "stopped"
+        }))
+        .expect("metadata should serialize"),
+    )
+    .expect("stopped metadata should write");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(temp.path().join("store"))
+        .arg("--idempotency-key")
+        .arg("stopped-stale-ingest")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("daemon metadata is stale"));
+
+    let request = listener_thread
+        .join()
+        .expect("listener thread should finish");
+    assert!(
+        request.is_none(),
+        "stopped stale metadata should be rejected before connecting, got {request:?}"
+    );
+}
+
+#[test]
+fn daemon_stop_removes_stopped_stale_metadata_without_contacting_address() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let runtime_dir = runtime_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let metadata_path = runtime_dir.join("egregored.json");
+    let (address, listener_thread) = spawn_request_capture_listener(Duration::from_millis(750));
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "pid": 999_991,
+            "address": address,
+            "token": "stopped-stop-token",
+            "data_dir": data_dir,
+            "version": env!("CARGO_PKG_VERSION"),
+            "started_at_unix_ms": 0_u64,
+            "state": "stopped"
+        }))
+        .expect("metadata should serialize"),
+    )
+    .expect("stopped metadata should write");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("daemon")
+        .arg("stop")
+        .arg("--data-dir")
+        .arg(temp.path().join("store"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("daemon stopped"));
+
+    assert!(
+        !metadata_path.exists(),
+        "stopped stale metadata should be removed without contacting its address"
+    );
+    let request = listener_thread
+        .join()
+        .expect("listener thread should finish");
+    assert!(
+        request.is_none(),
+        "daemon stop should not contact stopped stale metadata address, got {request:?}"
+    );
+}
+
+#[test]
 fn daemon_ingest_preflights_wrong_service_before_sending_records() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
     let graph_path = temp.path().join("graph.jsonl");
     let runtime_dir = runtime_dir(&data_dir);
     fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let _lease = StoreLease::acquire(&data_dir).expect("test should hold store lease");
     write_graph(
         &graph_path,
         &[GraphRecord::node(
@@ -2173,6 +2280,39 @@ fn http_request(address: &str, request: &str) -> String {
         .read_to_string(&mut response)
         .expect("response should read");
     response
+}
+
+fn spawn_request_capture_listener(
+    timeout: Duration,
+) -> (String, thread::JoinHandle<Option<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("capture listener should bind");
+    listener
+        .set_nonblocking(true)
+        .expect("capture listener should be nonblocking");
+    let address = listener
+        .local_addr()
+        .expect("capture listener address should exist")
+        .to_string();
+    let handle = thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = String::new();
+                    let _ = stream.read_to_string(&mut request);
+                    return Some(request);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if started.elapsed() >= timeout {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(_) => return None,
+            }
+        }
+    });
+    (address, handle)
 }
 
 fn graph_records_json(graph_path: &Path) -> Vec<serde_json::Value> {
