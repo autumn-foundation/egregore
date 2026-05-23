@@ -112,7 +112,7 @@ local-JSONL-sourced tasks normalize into one `Task` shape.
 | shared fields | see section 2 | yes | `domain = "project"`, `schema_version = 1`. |
 | `system` | enum | yes | `github`, `gitlab`, `local_file`, `harness_legacy`, `other`; additive. |
 | `url` | string | yes | Canonical URL or `file://` path; redacted per #4. |
-| `system_native_id` | string | yes | GitHub issue number as a string, local JSONL source handle, etc. For local JSONL, use `<file_path>:<local_id>` with `file_path` repo-relative per [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md). Not redacted by default. |
+| `system_native_id` | string | yes | GitHub issue number as a string, local JSONL source handle, etc. For local JSONL, use the percent-encoded source handle from [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md), rendered as `<file_path>:<local_id>` when no escaping is needed. Not redacted by default. |
 | `repository_remote` | string | when applicable | VCS remote from #7. |
 | `discovered_at` | RFC3339 | yes | When the importer first saw this handle. |
 
@@ -178,7 +178,7 @@ The `entity_kind_identity` component is:
 
 | Kind | Entity identity input |
 |------|-----------------------|
-| `Task` | `source_external_link_id.system_native_id`, such as a GitHub issue number, or the local-JSONL `<file_path>:<local_id>` handle. |
+| `Task` | `source_external_link_id.system_native_id`, such as a GitHub issue number, or the local-JSONL percent-encoded source handle rendered as `<file_path>:<local_id>` when no escaping is needed. |
 | `AcceptanceCriterion` | `(parent_task_id, ordinal)`; reordering ACs changes the ID. |
 | `ExternalLink` | `(system, system_native_id)`. |
 
@@ -268,9 +268,10 @@ Requires `project:v2:` and `PROJECT_SCHEMA_VERSION = 2`:
   not by guessing the file format. The new project edge rows are added to the
   registry table in `docs/schema/agent-memory.md`.
 - **Issue #17 (local JSONL):** The `local-JSONL record path` mention in
-  `system_native_id` is concretized as `<file_path>:<local_id>` per
-  [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md), with
-  `file_path` repo-relative.
+  `system_native_id` is concretized as the percent-encoded source handle from
+  [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md), rendered as
+  `<file_path>:<local_id>` when no escaping is needed, with `file_path`
+  repo-relative.
 - **Issue #10 (query verbs):** Future query verb `criteria_for_task` is
   reserved against this schema and distinct from existing reserved verbs.
 - **Issue #11 (verification):** `CLOSES_ACCEPTANCE_CRITERION` targets
