@@ -403,3 +403,7 @@ Both functions null-terminate each input part before hashing, so
   `MENTIONS_SYMBOL` row are contributed by
   [`docs/schema/project-graph.md`](project-graph.md); this table remains the
   canonical cross-domain edge registry.
+- **Issue #17 (local JSONL):** A future `REFERENCES_TASK` edge whose target is
+  a local-JSONL-sourced `Task` MUST resolve through the file path + local_id
+  pair documented in [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md),
+  not by guessing the file format.

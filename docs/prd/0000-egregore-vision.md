@@ -56,6 +56,8 @@ Egregore starts with typed graph domains. Domains share one AletheiaDB store and
 
 **Project-graph schema:** [`docs/schema/project-graph.md`](../schema/project-graph.md) is the single source of truth for project-domain `Task`, `AcceptanceCriterion`, and `ExternalLink` records, reserved project kinds, trust-class rules, and project cross-domain edges.
 
+**Local project/task JSONL format:** [`docs/schema/local-project-jsonl.md`](../schema/local-project-jsonl.md) is the canonical offline interchange format for local `source_kind: local_jsonl` task state.
+
 **Semantic drift schema:** [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md) is the single source of truth for `SemanticDrift`, `EmbeddingModel`, `EmbeddingVector`, semantic stable IDs, and drift edge contracts.
 
 **Redaction schema:** [`docs/schema/redaction.md`](../schema/redaction.md) owns the redaction marker grammar and policy-version field for agent-authored records; producer schemas name the concrete fields that pass through it.
@@ -169,7 +171,7 @@ Project/task imports should normalize into shared records:
 | `Review` | Review comment, finding, approval, requested change, or blocker |
 | `ExternalLink` | Source-system handle such as GitHub URL, issue number, PR number, or local JSONL record ID |
 
-The local JSONL format should be treated as the canonical offline interchange format for project/task state. GitHub import should preserve GitHub-specific handles while mapping into the same graph records so queries do not care whether a task came from GitHub or a local file.
+The local JSONL format should be treated as the canonical offline interchange format for project/task state. GitHub import should preserve GitHub-specific handles while mapping into the same graph records so queries do not care whether a task came from GitHub or a local file. The on-disk shape for day-one local project/task files is specified in [`docs/schema/local-project-jsonl.md`](../schema/local-project-jsonl.md).
 
 ## Redaction And Storage Protection
 
@@ -287,7 +289,7 @@ Acceptance criteria:
 
 Egregore must import GitHub Issues/PRs and local project/task JSONL into one normalized project graph without depending on Harness.
 
-Project-domain record shapes are versioned in [`docs/schema/project-graph.md`](../schema/project-graph.md); importers must target that schema instead of defining task, acceptance-criterion, or external-link fields inline.
+Project-domain record shapes are versioned in [`docs/schema/project-graph.md`](../schema/project-graph.md); importers must target that schema instead of defining task, acceptance-criterion, or external-link fields inline. Local project/task JSONL format details are versioned separately in [`docs/schema/local-project-jsonl.md`](../schema/local-project-jsonl.md).
 
 Acceptance criteria:
 

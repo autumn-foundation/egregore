@@ -10,9 +10,13 @@ facts such as repository paths, symbol names, spans, commits, and topology edges
 remain plaintext by construction.
 
 Coordination: [`docs/schema/project-graph.md`](project-graph.md) reserves the
-six project fields that must pass through this policy:
+project fields that must pass through this policy:
 `Task.title`, `Task.body_handle.inline`, `Task.labels`, `Task.assignees`,
 `AcceptanceCriterion.text`, and `ExternalLink.url`.
+[`docs/schema/local-project-jsonl.md`](local-project-jsonl.md) narrows the
+local-file import-time targets to `task.title`, `task.body` inline form,
+`task.labels`, `task.assignees`, and `acceptance_criterion.text`; the on-disk
+local JSONL file does not redact at rest.
 
 ## Secret Classes
 

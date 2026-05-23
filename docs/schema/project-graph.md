@@ -52,7 +52,7 @@ reserved and has no producer yet.
 | `valid_time_source` | string | yes | For GitHub, `github_updated_at`; for local JSONL, file modification time source. |
 | `transaction_time` | RFC3339 | yes | Store write time for append-with-same-entity-id mutation rows. |
 | `confidence` | float string | guessed fields only | Omit for stable source fields. |
-| `source_handle` | string | local JSONL | File path + line/record ID + hash. |
+| `source_handle` | string | local JSONL | File path + line/record ID + hash. Local JSONL handles are concretized by [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md). |
 | `summary` | string | yes | Human-readable one-line summary. |
 
 ## 3 - Task record shape
@@ -68,7 +68,7 @@ Task record shape.
 | `title` | string | yes | Redacted per #4. |
 | `body_handle` | `{ inline: Option<String>, hash: String, bytes: u64 }` | yes | Same shape and 16 KiB inline ceiling as `CommandRun.stdout_handle` from #11. |
 | `status` | enum | yes | `open`, `in_progress`, `blocked`, `closed_completed`, `closed_dropped`, `unknown`; additive. |
-| `source_kind` | enum | yes | `github_issue`, `github_pr`, `local_jsonl`, `harness_legacy`; additive. |
+| `source_kind` | enum | yes | `github_issue`, `github_pr`, `local_jsonl`, `harness_legacy`; additive. `source_kind: local_jsonl` consumes [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md). |
 | `source_external_link_id` | record ID | yes | `ExternalLink` carrying the source-system handle. |
 | `assignees` | string array | yes | Agent IDs or human identifiers; opaque strings, not resolved to `Agent` nodes in this slice. |
 | `labels` | string array | yes | Redacted per #4. |
@@ -112,7 +112,7 @@ local-JSONL-sourced tasks normalize into one `Task` shape.
 | shared fields | see section 2 | yes | `domain = "project"`, `schema_version = 1`. |
 | `system` | enum | yes | `github`, `gitlab`, `local_file`, `harness_legacy`, `other`; additive. |
 | `url` | string | yes | Canonical URL or `file://` path; redacted per #4. |
-| `system_native_id` | string | yes | GitHub issue number as a string, local JSONL record ID, etc. Not redacted by default. |
+| `system_native_id` | string | yes | GitHub issue number as a string, local JSONL source handle, etc. For local JSONL, use `<file_path>:<local_id>` with `file_path` repo-relative per [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md). Not redacted by default. |
 | `repository_remote` | string | when applicable | VCS remote from #7. |
 | `discovered_at` | RFC3339 | yes | When the importer first saw this handle. |
 
@@ -178,7 +178,7 @@ The `entity_kind_identity` component is:
 
 | Kind | Entity identity input |
 |------|-----------------------|
-| `Task` | `source_external_link_id.system_native_id`, such as a GitHub issue number, or the local-JSONL record path. |
+| `Task` | `source_external_link_id.system_native_id`, such as a GitHub issue number, or the local-JSONL `<file_path>:<local_id>` handle. |
 | `AcceptanceCriterion` | `(parent_task_id, ordinal)`; reordering ACs changes the ID. |
 | `ExternalLink` | `(system, system_native_id)`. |
 
@@ -262,8 +262,15 @@ Requires `project:v2:` and `PROJECT_SCHEMA_VERSION = 2`:
 - **Issue #5 (daemon wire):** `acceptance_criterion_missing_verification` is
   added to the daemon error-code enum. HTTP 422, non-retryable.
 - **Issue #6 (agent memory):** `REFERENCES_TASK` is promoted from reserved to
-  defined with `project.Task` as TO, and the new project edge rows are added to
-  the registry table in `docs/schema/agent-memory.md`.
+  defined with `project.Task` as TO. A future `REFERENCES_TASK` edge whose
+  target is a local-JSONL-sourced `Task` MUST resolve through the file path +
+  local_id pair documented in [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md),
+  not by guessing the file format. The new project edge rows are added to the
+  registry table in `docs/schema/agent-memory.md`.
+- **Issue #17 (local JSONL):** The `local-JSONL record path` mention in
+  `system_native_id` is concretized as `<file_path>:<local_id>` per
+  [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md), with
+  `file_path` repo-relative.
 - **Issue #10 (query verbs):** Future query verb `criteria_for_task` is
   reserved against this schema and distinct from existing reserved verbs.
 - **Issue #11 (verification):** `CLOSES_ACCEPTANCE_CRITERION` targets
