@@ -1,6 +1,7 @@
 //! Command-line interface for Egregore.
 
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -13,6 +14,7 @@ use crate::{
     adapters::{DryRunSink, ingest_records, records_from_jsonl},
     ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan},
     query, scan_repository_history_with_override, scan_repository_with_override,
+    schema_version::{RecordVersion, record_version},
     traj::{self, ImportOptions},
 };
 
@@ -367,6 +369,12 @@ fn inspect(graph: &Path) -> Result<()> {
     println!("edges: {}", counts.edges);
     println!("tombstones: {}", counts.tombstones);
     println!("diagnostics: {}", counts.diagnostics);
+    for (version, count) in &counts.schema_versions {
+        println!("schema_version {version}: {count}");
+    }
+    for (version, count) in &counts.unknown_schema_versions {
+        println!("unknown_schema_version {version}: {count}");
+    }
     for repo in &counts.repositories {
         println!("repository: {} ({})", repo.id, repo.identity_summary);
     }
@@ -514,6 +522,7 @@ fn daemon(action: DaemonAction) -> Result<()> {
 #[derive(Serialize)]
 struct SymbolResult<'a> {
     record_id: &'a str,
+    schema_version: u32,
     name: &'a str,
     kind: &'static str,
     repo_relative_path: Option<&'a str>,
@@ -525,6 +534,7 @@ struct SymbolResult<'a> {
 #[derive(Serialize)]
 struct DriftResult<'a> {
     record_id: &'a str,
+    schema_version: u32,
     before_commit: &'a str,
     after_commit: &'a str,
     before_valid_time: &'a str,
@@ -996,6 +1006,7 @@ fn symbol_result<'a>(record: &'a GraphRecord, name: &str) -> Option<SymbolResult
     let GraphRecord::Node {
         id,
         kind: NodeKind::Symbol,
+        schema_version,
         name: node_name,
         repo_relative_path,
         span,
@@ -1010,6 +1021,7 @@ fn symbol_result<'a>(record: &'a GraphRecord, name: &str) -> Option<SymbolResult
     }
     Some(SymbolResult {
         record_id: id,
+        schema_version: *schema_version,
         name: node_name.as_deref().unwrap_or(""),
         kind: "Symbol",
         repo_relative_path: repo_relative_path.as_deref(),
@@ -1131,6 +1143,7 @@ fn query_file(records: &[GraphRecord], path: &str, format: OutputFormat) -> Resu
             let GraphRecord::Node {
                 id,
                 kind: NodeKind::Symbol,
+                schema_version,
                 name,
                 repo_relative_path,
                 span,
@@ -1148,6 +1161,7 @@ fn query_file(records: &[GraphRecord], path: &str, format: OutputFormat) -> Resu
             }
             Some(SymbolResult {
                 record_id: id,
+                schema_version: *schema_version,
                 name: name.as_deref().unwrap_or(""),
                 kind: "Symbol",
                 repo_relative_path: repo_relative_path.as_deref(),
@@ -1184,6 +1198,7 @@ fn query_drift(records: &[GraphRecord], limit: usize, format: OutputFormat) -> R
     for record in drifts {
         let GraphRecord::Node {
             id,
+            schema_version,
             semantic_drift: Some(drift),
             repo_relative_path: drift_path,
             name: drift_name,
@@ -1203,6 +1218,7 @@ fn query_drift(records: &[GraphRecord], limit: usize, format: OutputFormat) -> R
 
         let result = DriftResult {
             record_id: id,
+            schema_version: *schema_version,
             before_commit: &drift.before_git_commit,
             after_commit: &drift.after_git_commit,
             before_valid_time: &drift.before_valid_time,
@@ -1332,20 +1348,28 @@ struct InspectCounts {
     edges: usize,
     tombstones: usize,
     diagnostics: usize,
+    schema_versions: BTreeMap<RecordVersion, usize>,
+    unknown_schema_versions: BTreeMap<RecordVersion, usize>,
     repositories: Vec<RepositorySummary>,
 }
 
 impl InspectCounts {
     fn from_jsonl(jsonl: &str) -> Result<Self> {
         let mut counts = Self::default();
-        for (index, line) in jsonl
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .enumerate()
-        {
-            let record = serde_json::from_str::<GraphRecord>(line)
-                .with_context(|| format!("failed to parse graph record on line {}", index + 1))?;
+        let report = crate::adapters::records_from_jsonl_report(jsonl)?;
+        for unknown in report.unknown_schema_versions {
             counts.records += 1;
+            *counts
+                .unknown_schema_versions
+                .entry(unknown.version)
+                .or_default() += 1;
+        }
+        for record in report.records {
+            counts.records += 1;
+            *counts
+                .schema_versions
+                .entry(record_version(&record))
+                .or_default() += 1;
             match &record {
                 GraphRecord::Node {
                     id,

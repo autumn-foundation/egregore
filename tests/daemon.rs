@@ -16,8 +16,9 @@ use aletheia_egregore::{
     daemon::{DaemonClient, DaemonMetadata as ClientDaemonMetadata, StoreLease},
     import_traj,
     ir::{
-        EdgeLabel, GraphRecord, IdentitySource, NodeKind, RepositoryIdentityPayload,
-        PROJECT_SCHEMA_VERSION, SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION, TemporalMetadata,
+        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, GraphRecord, IdentitySource, NodeKind,
+        PROJECT_SCHEMA_VERSION, RepositoryIdentityPayload, SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION,
+        TemporalMetadata,
     },
     traj::ImportOptions,
 };
@@ -3758,7 +3759,8 @@ fn produced_patch_evidence_link_requires_artifact_id_target() {
             None,
             None,
             "legacy agent-memory PatchArtifact target".to_owned(),
-        );
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
         sink.write_record(&legacy_patch)
             .expect("legacy patch target should pre-seed");
         sink.persist_indexes()
@@ -3834,7 +3836,8 @@ fn failed_on_evidence_link_accepts_legacy_agent_memory_patch_target() {
             None,
             None,
             "legacy agent-memory PatchArtifact failure target".to_owned(),
-        );
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
         sink.write_record(&legacy_patch)
             .expect("legacy patch target should pre-seed");
         sink.persist_indexes()
@@ -6229,8 +6232,14 @@ fn verification_wrong_schema_version_rejected() {
     );
     let body = response_json(&response);
     assert_eq!(
-        body["error"]["code"], "bad_request",
-        "wrong schema_version must produce bad_request, got {body}"
+        body["error"]["code"], "unknown_schema_version",
+        "wrong schema_version must produce unknown_schema_version, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("verification TestRun v2")),
+        "unknown schema-version error must surface the tuple, got {body}"
     );
 
     daemon.stop();

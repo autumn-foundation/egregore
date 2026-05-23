@@ -48,6 +48,11 @@ Mark needs local-first, inspectable tooling that can feed AletheiaDB memory with
 ### Secondary User: Future Maintainer
 
 The maintainer needs deterministic output, focused tests, and clear schema versioning so graph changes do not silently corrupt memory.
+Record-level compatibility is governed by
+[`docs/schema/schema-versioning.md`](../schema/schema-versioning.md): codegraph
+uses `SCHEMA_VERSION` as its domain default, while readers check
+`(domain, kind, schema_version)` before accepting records from JSONL, embedded
+storage, daemon reads, or incremental cache reuse.
 
 ## MVP Scope
 

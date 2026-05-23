@@ -15,6 +15,11 @@ The `POST /v1/query` verb set and payload contract are specified in
 [docs/schema/daemon-query.md](../schema/daemon-query.md). That document is the
 read-side complement to the write-side wire contract above.
 
+Persisted graph records use their own record-level `schema_version` policy in
+[docs/schema/schema-versioning.md](../schema/schema-versioning.md). That policy
+is separate from daemon `api_version` and query-envelope `schema_version`; the
+daemon rejects unknown record tuples with `unknown_schema_version`.
+
 ## Context
 
 Egregore stores code facts, agent memory, project/task state, artifacts, and

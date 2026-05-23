@@ -35,6 +35,7 @@ use crate::{
         VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
     },
     query as graph_query,
+    schema_version::{UNKNOWN_SCHEMA_VERSION_CODE, UnknownSchemaVersion, validate_record_version},
 };
 
 const RUNTIME_DIR_SUFFIX: &str = ".egregore-runtime";
@@ -391,6 +392,9 @@ enum ErrorCode {
     /// Added by #15 (semantic drift schema): an existing drift ID was
     /// resubmitted with a different score.
     DriftRecordImmutable,
+    /// Reserved by the record schema-version policy: a record's
+    /// `(domain, kind, schema_version)` tuple is unknown to this reader.
+    UnknownSchemaVersion,
 }
 
 impl ErrorCode {
@@ -420,6 +424,7 @@ impl ErrorCode {
             }
             Self::DriftPriorTargetMismatch => "drift_prior_target_mismatch",
             Self::DriftRecordImmutable => "drift_record_immutable",
+            Self::UnknownSchemaVersion => UNKNOWN_SCHEMA_VERSION_CODE,
         }
     }
 
@@ -446,7 +451,8 @@ impl ErrorCode {
             | Self::PatchStatusPinned
             | Self::AcceptanceCriterionMissingVerification
             | Self::DriftPriorTargetMismatch
-            | Self::DriftRecordImmutable => 422,
+            | Self::DriftRecordImmutable
+            | Self::UnknownSchemaVersion => 422,
         }
     }
 }
@@ -509,6 +515,17 @@ impl ApiError {
             ErrorCode::InvalidDomain,
             r#"domain must be "codegraph", "agent_memory", "verification", "artifact", "project", or "semantic""#,
         )
+    }
+
+    fn unknown_schema_version(unknown: &UnknownSchemaVersion) -> Self {
+        Self {
+            status: ErrorCode::UnknownSchemaVersion.http_status(),
+            code: ErrorCode::UnknownSchemaVersion,
+            message: format!("unsupported record schema version: {}", unknown.version),
+            field: Some("schema_version".to_owned()),
+            retry_after_ms: None,
+            partial_result: None,
+        }
     }
 
     fn not_found(message: impl Into<String>) -> Self {
@@ -1218,6 +1235,7 @@ fn apply_write(
     idempotency: &Arc<Mutex<IdempotencyStore>>,
 ) -> WriteResult {
     validate_unique_recovery_keys(&command.records)?;
+    validate_record_schema_versions(&command.records)?;
 
     // Consult the idempotency cache BEFORE running evidence-link validation so that
     // a committed replay returns the cached response immediately without re-executing
@@ -2038,6 +2056,14 @@ fn validate_project_domain_records(
         }
     }
     Ok(synthesized_edges)
+}
+
+fn validate_record_schema_versions(records: &[GraphRecord]) -> WriteResult<()> {
+    for record in records {
+        validate_record_version(record)
+            .map_err(|unknown| ApiError::unknown_schema_version(&unknown))?;
+    }
+    Ok(())
 }
 
 fn validate_semantic_domain_records(
@@ -4715,6 +4741,7 @@ fn symbol_node_to_query_json(record: &GraphRecord) -> Option<serde_json::Value> 
     let GraphRecord::Node {
         id,
         kind: NodeKind::Symbol,
+        schema_version,
         name,
         repo_relative_path,
         span,
@@ -4728,6 +4755,7 @@ fn symbol_node_to_query_json(record: &GraphRecord) -> Option<serde_json::Value> 
     let name_str = name.as_deref().unwrap_or("");
     let mut obj = serde_json::Map::new();
     obj.insert("record_id".to_owned(), json!(id.as_str()));
+    obj.insert("schema_version".to_owned(), json!(*schema_version));
     obj.insert("name".to_owned(), json!(name_str));
     obj.insert("kind".to_owned(), json!("Symbol"));
     obj.insert(
@@ -4751,6 +4779,7 @@ fn drift_node_to_query_json(
     let GraphRecord::Node {
         id,
         kind: NodeKind::SemanticDrift,
+        schema_version,
         semantic_drift: Some(drift),
         repo_relative_path: drift_path,
         name: drift_name,
@@ -4794,6 +4823,7 @@ fn drift_node_to_query_json(
 
     let mut obj = serde_json::Map::new();
     obj.insert("record_id".to_owned(), json!(id.as_str()));
+    obj.insert("schema_version".to_owned(), json!(*schema_version));
     obj.insert("before_commit".to_owned(), json!(&drift.before_git_commit));
     obj.insert("after_commit".to_owned(), json!(&drift.after_git_commit));
     obj.insert(

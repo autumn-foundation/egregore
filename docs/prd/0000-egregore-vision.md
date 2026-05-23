@@ -62,6 +62,8 @@ Egregore starts with typed graph domains. Domains share one AletheiaDB store and
 
 **Bi-temporal selector grammar:** [`docs/schema/temporal-selectors.md`](../schema/temporal-selectors.md) is the single source of truth for `valid_time`/`transaction_time` axes, the `as_of`/`since` selector JSON shape, CLI flag surfaces, and per-domain mapping rules.
 
+**Record schema-version policy:** [`docs/schema/schema-versioning.md`](../schema/schema-versioning.md) is the single source of truth for `(domain, kind, schema_version)` compatibility classes, unknown-version rejection, mixed-store inspect output, and migration manifests. It is distinct from daemon HTTP `api_version`.
+
 | Domain | Owns | Examples |
 |--------|------|----------|
 | Code Graph | Source-derived facts | Repository, File, Symbol, Import, Call, Commit, Change |

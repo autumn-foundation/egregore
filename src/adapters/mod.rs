@@ -2,7 +2,13 @@
 
 use std::collections::BTreeMap;
 
-use crate::ir::GraphRecord;
+use crate::{
+    ir::GraphRecord,
+    schema_version::{
+        RecordLineRead, RecordVersion, UnknownSchemaVersion, read_record_line,
+        validate_record_version,
+    },
+};
 
 #[cfg(feature = "embedded-aletheiadb")]
 mod aletheiadb;
@@ -58,6 +64,15 @@ pub enum AdapterError {
     TimedOut {
         /// Graph record ID.
         record_id: String,
+    },
+
+    /// A record carried a schema-version tuple unknown to this reader.
+    #[error("unknown_schema_version: {version}")]
+    UnknownSchemaVersion {
+        /// One-based JSONL line number, when available.
+        line: Option<usize>,
+        /// Unknown schema-version tuple.
+        version: RecordVersion,
     },
 }
 
@@ -127,6 +142,15 @@ pub struct IngestFailure {
     pub message: String,
 }
 
+/// Version-aware JSONL read report used by inspect-style commands.
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub struct JsonlRecordReport {
+    /// Records whose `(domain, kind, schema_version)` tuple is known.
+    pub records: Vec<GraphRecord>,
+    /// Unknown-version records that were rejected before concrete deserialization.
+    pub unknown_schema_versions: Vec<UnknownSchemaVersion>,
+}
+
 /// Ingests graph records into a sink with read-back verification.
 #[must_use]
 pub fn ingest_records<S: GraphSink>(records: &[GraphRecord], sink: &mut S) -> IngestReport {
@@ -153,17 +177,52 @@ pub fn ingest_records<S: GraphSink>(records: &[GraphRecord], sink: &mut S) -> In
 ///
 /// Returns an error when any non-empty line is not a graph record.
 pub fn records_from_jsonl(jsonl: &str) -> AdapterResult<Vec<GraphRecord>> {
-    jsonl
+    let mut records = Vec::new();
+    for (index, line) in jsonl
         .lines()
         .enumerate()
         .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, line)| {
-            serde_json::from_str::<GraphRecord>(line).map_err(|error| AdapterError::Parse {
-                line: index + 1,
-                message: error.to_string(),
-            })
-        })
-        .collect()
+    {
+        match read_record_line(line).map_err(|error| AdapterError::Parse {
+            line: index + 1,
+            message: error.to_string(),
+        })? {
+            RecordLineRead::Record(record) => records.push(*record),
+            RecordLineRead::UnknownSchemaVersion(unknown) => {
+                return Err(AdapterError::UnknownSchemaVersion {
+                    line: Some(index + 1),
+                    version: unknown.version,
+                });
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// Parses graph records from JSON Lines while preserving unknown-version counts.
+///
+/// # Errors
+///
+/// Returns an error when a non-empty line is not valid graph-record JSON. Lines
+/// with unknown future schema versions are reported in the returned summary.
+pub fn records_from_jsonl_report(jsonl: &str) -> AdapterResult<JsonlRecordReport> {
+    let mut report = JsonlRecordReport::default();
+    for (index, line) in jsonl
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+    {
+        match read_record_line(line).map_err(|error| AdapterError::Parse {
+            line: index + 1,
+            message: error.to_string(),
+        })? {
+            RecordLineRead::Record(record) => report.records.push(*record),
+            RecordLineRead::UnknownSchemaVersion(unknown) => {
+                report.unknown_schema_versions.push(unknown);
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// Sink that records successful writes without touching external storage.
@@ -223,8 +282,16 @@ impl GraphSink for FakeSink {
 }
 
 fn write_and_verify<S: GraphSink>(record: &GraphRecord, sink: &mut S) -> AdapterResult<()> {
+    validate_adapter_record_version(record)?;
     sink.write_record(record)?;
     sink.verify_record(record)
+}
+
+pub(crate) fn validate_adapter_record_version(record: &GraphRecord) -> AdapterResult<()> {
+    validate_record_version(record).map_err(|unknown| AdapterError::UnknownSchemaVersion {
+        line: None,
+        version: unknown.version,
+    })
 }
 
 fn ordered_records(records: &[GraphRecord]) -> Vec<&GraphRecord> {
