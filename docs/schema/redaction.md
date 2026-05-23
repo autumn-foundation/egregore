@@ -15,8 +15,8 @@ project fields that must pass through this policy:
 `AcceptanceCriterion.text`, and `ExternalLink.url`.
 [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md) narrows the
 local-file import-time targets to `task.title`, `task.body` inline form,
-`task.labels`, `task.assignees`, and `acceptance_criterion.text`; the on-disk
-local JSONL file does not redact at rest.
+`task.labels`, `task.assignees`, `acceptance_criterion.text`, and
+`external_link.url`; the on-disk local JSONL file does not redact at rest.
 
 ## Secret Classes
 
