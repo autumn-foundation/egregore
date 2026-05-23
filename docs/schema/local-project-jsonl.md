@@ -115,6 +115,9 @@ Field set:
 
 Rule: `local_id` is the stable identifier; duplicate `local_id` lines are valid only as revisions of the same record kind. The importer sets project-graph `valid_time` to this line's `updated_at` and sets `valid_time_source` to `local_jsonl_updated_at`.
 
+Rule: omitted `task.body` projects as the canonical empty body: `inline = ""`,
+hash = the BLAKE3 hash of the empty byte string, and `bytes` = 0.
+
 ## Acceptance Criterion Record
 
 Acceptance criteria attach falsifiable requirements to a task:
@@ -142,11 +145,15 @@ Field set:
 | `ordinal` | u32 | yes | Position within the parent's AC list. |
 | `text` | string | yes | Redacted per issue #4 at import time before persistence into the graph. |
 | `status` | enum | yes | `unverified`, `verified`, `failed`, `superseded`, `unknown`. Additive and aligned with `AcceptanceCriterion.status` in project-graph v1. |
-| `verification_handle` | object | no | `{"system": "<verifier>", "id": "<external-id>"}` for the verifier that closed the AC. |
+| `verification_handle` | object | no | `{"system": "<verifier>", "id": "<external-id>"}` for the verifier that closed the AC. Required when `status` is `verified`; optional otherwise. |
 | `updated_at` | RFC3339 string | yes | Mutation timestamp for this AC line; this is `acceptance_criterion.updated_at`. |
 
 When `verification_handle` is present, the importer is responsible for resolving
 it to a verification record from issue #11 at import time.
+
+Rule: verified `acceptance_criterion` lines without `verification_handle` are skipped with an
+`acceptance_criterion_missing_verification` diagnostic. The importer MUST NOT
+write a `verified` acceptance criterion without a non-null `verification_link_id`.
 
 Rule: verified `acceptance_criterion` lines with unresolved `verification_handle` are skipped with an
 `acceptance_criterion_missing_verification` diagnostic. The importer MUST NOT
@@ -187,17 +194,47 @@ Field set:
 | `parent_local_id` | string | yes | The `task.local_id` or `acceptance_criterion.local_id` this link belongs to. |
 | `system` | enum | yes | `github`, `gitlab`, `local_file`, `harness_legacy`, `other`. Additive and aligned with `ExternalLink.system` in project-graph v1. |
 | `url` | string | yes | Canonical URL, `file://` URL, or local path string when no URL exists. |
-| `system_native_id` | string | yes | Source-system identifier. For the local-JSONL source handle, this is `<file_path>:<local_id>` with `file_path` repo-relative. |
+| `system_native_id` | string | yes | Source-system identifier. For the local-JSONL source handle, this is `<encoded_file_path>:<encoded_local_id>` with `file_path` repo-relative. |
 | `discovered_at` | RFC3339 string | yes | When the link was discovered or authored. |
 | `updated_at` | RFC3339 string | yes | Mutation timestamp for this link line; this is `external_link.updated_at`. |
 
-Rule: external_link lines are optional; their absence does not block import;
-their presence produces one `project.ExternalLink` row per line in the graph.
+Rule: the importer MUST materialize one source `ExternalLink` for every `task`.
+The materialized source link uses `system = "local_file"`, `parent_local_id`
+equal to the task's `local_id`, `url = "file://<file_path>"`, and
+`system_native_id = "<encoded_file_path>:<encoded_local_id>"`. This link is the
+mandatory `Task.source_external_link_id` / `source_external_link_id` target in
+the project graph.
+
+Rule: Explicit `external_link` rows are optional only for additional, non-source links;
+their absence does not block import because the source `ExternalLink` is
+materialized deterministically. Their presence produces one
+`project.ExternalLink` row per line in the graph unless the line has the same
+`system` and `system_native_id` as the materialized source link, in which case
+it refines that source link rather than creating a duplicate identity.
 
 Rule: an `external_link` line whose `parent_local_id` does not refer to a
 `task` or `acceptance_criterion` line earlier in the same file is rejected by
 the importer with `unresolved_parent_local_id`. This is a `Diagnostic`, not a
 hard error; the line is skipped and a `Diagnostic` record is emitted.
+
+## Source Handle Encoding
+
+The canonical local-file source handle is
+`<encoded_file_path>:<encoded_local_id>`. The historical
+`<file_path>:<local_id>` spelling is display shorthand only when neither
+component needs escaping.
+
+Encoding rules:
+
+1. Normalize `file_path` to the repo-relative path used for import.
+2. Percent-encode each UTF-8 component with uppercase hex escapes before
+   joining it with the single `:` separator.
+3. A literal `:` MUST be percent-encoded as `%3A`; a literal `%` MUST be
+   percent-encoded as `%25`.
+
+Importers MUST reject malformed percent escapes or non-canonical lowercase
+escapes with `source_handle_encoding_error`. This keeps the mapping from
+`(file_path, local_id)` to source handle injective.
 
 ## Mutation Model
 
@@ -228,8 +265,8 @@ identity changes, the in-graph ID changes by design.
 
 ## Atomic Write Protocol
 
-Writers MUST write a tempfile sibling of the target, fsync it, then rename it
-over the target:
+Writers MUST write a tempfile sibling of the target, fsync it, rename it over
+the target, then fsync the containing directory:
 
 ```text
 .egregore/tasks/<project>.jsonl.tmp-<uuid>
@@ -240,6 +277,7 @@ Required sequence:
 1. Write the complete candidate file to the sibling tempfile.
 2. `fsync` the tempfile.
 3. Rename the tempfile over `.egregore/tasks/<project>.jsonl`.
+4. `fsync` the containing directory so the rename's directory entry is durable.
 
 Rule: an importer encountering a `.tmp-*` leftover from a crashed writer SHOULD
 ignore it and import the canonical file. A future operator-tooling slice may
@@ -265,8 +303,9 @@ Rule: the local file is the source of truth; Egregore's graph view is a
 redacted, indexed projection of it. The operator is responsible for not
 committing secrets to local task files, the same posture as `.env`.
 
-The local-file source handle `<file_path>:<local_id>` is not redacted by
-default.
+The local-file source handle `<encoded_file_path>:<encoded_local_id>` is not
+redacted by default. In examples without escaped characters it is rendered as
+`<file_path>:<local_id>`.
 
 ## Stable ID Composition
 
@@ -290,7 +329,7 @@ Kind-specific `entity_kind_identity` values:
 
 | Kind | `entity_kind_identity` |
 |------|------------------------|
-| `Task` | `<file_path>:<local_id>` |
+| `Task` | `<encoded_file_path>:<encoded_local_id>` |
 | `AcceptanceCriterion` | `(parent_task_id, ordinal)` |
 | `ExternalLink` | `(system, system_native_id)` |
 
@@ -299,7 +338,7 @@ new project is a deliberate identity break. The operator mechanism is a
 `closed_dropped` line in the old file plus a new `open` line in the new file.
 
 For `ExternalLink.system_native_id` that represents the local JSONL source
-itself, use `<file_path>:<local_id>`.
+itself, use `<encoded_file_path>:<encoded_local_id>`.
 
 ## Idempotent Re-Import Contract
 
