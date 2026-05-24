@@ -21,7 +21,7 @@ use aletheia_egregore::{
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, GraphRecord, IdentitySource, NodeKind,
         PROJECT_SCHEMA_VERSION, RepositoryIdentityPayload, SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION,
-        TemporalMetadata,
+        TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, user_context_stable_id,
     },
     traj::ImportOptions,
 };
@@ -2550,6 +2550,231 @@ fn project_acceptance_criterion_json(
     })
 }
 
+fn seed_observations(data_dir: &Path, observations: &[(&str, &str, &str)]) {
+    let mut sink = EmbeddedAletheiaSink::open(data_dir).expect("embedded store should open");
+    for (id, session_id, text_value) in observations {
+        let mut record = GraphRecord::node(
+            (*id).to_owned(),
+            NodeKind::Observation,
+            None,
+            None,
+            None,
+            format!("Seeded observation {id}"),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
+        if let GraphRecord::Node {
+            text,
+            agent_id,
+            agent_kind,
+            session_id: node_session_id,
+            observed_at,
+            ingested_at,
+            confidence,
+            valid_time,
+            valid_time_source,
+            ..
+        } = &mut record
+        {
+            *text = Some((*text_value).to_owned());
+            *agent_id = Some("test-agent".to_owned());
+            *agent_kind = Some("codex".to_owned());
+            *node_session_id = Some((*session_id).to_owned());
+            *observed_at = Some("2026-05-24T00:00:00Z".to_owned());
+            *ingested_at = Some("2026-05-24T00:00:00Z".to_owned());
+            *confidence = Some("1.0".to_owned());
+            *valid_time = Some("2026-05-24T00:00:00Z".to_owned());
+            *valid_time_source = Some("observation_observed_at".to_owned());
+        }
+        sink.write_record(&record)
+            .expect("seeded observation should write");
+    }
+    sink.persist_indexes()
+        .expect("seeded observations should persist");
+}
+
+fn seed_agent_memory_nodes(data_dir: &Path, nodes: &[(&str, NodeKind, &str, &str)]) {
+    let mut sink = EmbeddedAletheiaSink::open(data_dir).expect("embedded store should open");
+    for (id, kind, session_id, summary) in nodes {
+        let mut record = GraphRecord::node(
+            (*id).to_owned(),
+            *kind,
+            None,
+            None,
+            None,
+            (*summary).to_owned(),
+        )
+        .with_domain("agent_memory", AGENT_MEMORY_SCHEMA_VERSION);
+        if let GraphRecord::Node {
+            text,
+            agent_id,
+            agent_kind,
+            session_id: node_session_id,
+            observed_at,
+            ingested_at,
+            confidence,
+            valid_time,
+            valid_time_source,
+            ..
+        } = &mut record
+        {
+            *text = matches!(*kind, NodeKind::Observation).then(|| (*summary).to_owned());
+            *agent_id = Some("test-agent".to_owned());
+            *agent_kind = Some("codex".to_owned());
+            *node_session_id = Some((*session_id).to_owned());
+            *observed_at = Some("2026-05-24T00:00:00Z".to_owned());
+            *ingested_at = Some("2026-05-24T00:00:00Z".to_owned());
+            *confidence = Some("1.0".to_owned());
+            *valid_time = Some("2026-05-24T00:00:00Z".to_owned());
+            *valid_time_source = Some("observation_observed_at".to_owned());
+        }
+        sink.write_record(&record)
+            .expect("seeded agent-memory node should write");
+    }
+    sink.persist_indexes()
+        .expect("seeded agent-memory nodes should persist");
+}
+
+fn seed_promotion_evidence(data_dir: &Path) {
+    seed_observations(
+        data_dir,
+        &[
+            (
+                "agent_memory:v1:obs-1",
+                "session-a",
+                "Prefer thiserror for library errors.",
+            ),
+            (
+                "agent_memory:v1:obs-2",
+                "session-b",
+                "Use thiserror in library crates.",
+            ),
+            (
+                "agent_memory:v1:obs-3",
+                "session-b",
+                "Library errors should use thiserror.",
+            ),
+            (
+                "agent_memory:v1:obs-4",
+                "session-c",
+                "Prefer thiserror for library errors.",
+            ),
+            (
+                "agent_memory:v1:obs-5",
+                "session-d",
+                "Use thiserror for library errors.",
+            ),
+            (
+                "agent_memory:v1:obs-6",
+                "session-d",
+                "Library errors should use thiserror.",
+            ),
+        ],
+    );
+}
+
+fn promote_candidate_json(
+    id: &str,
+    proposed_rule_text: &str,
+    evidence_ids: &[&str],
+    superseded_by: Option<&str>,
+) -> serde_json::Value {
+    let supporting_evidence = evidence_ids
+        .iter()
+        .map(|target_record_id| {
+            serde_json::json!({
+                "target_record_id": target_record_id,
+                "target_domain": "agent_memory",
+                "relation": "PROPOSED_BY",
+                "confidence": "1.0"
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "PromoteCandidate",
+        "schema_version": USER_CONTEXT_SCHEMA_VERSION,
+        "domain": "user_context",
+        "proposed_rule_text": proposed_rule_text,
+        "proposed_rule_kind": "preference",
+        "scope": {
+            "language": "rust"
+        },
+        "confidence": "0.75",
+        "supporting_evidence": supporting_evidence,
+        "contradicting_evidence": [],
+        "superseded_by": superseded_by,
+        "evidence_quality": "verbatim",
+        "agent_id": "test-agent",
+        "agent_kind": "codex",
+        "session_id": "test-session",
+        "observed_at": "2026-05-24T00:00:00Z",
+        "ingested_at": "2026-05-24T00:00:00Z",
+        "valid_time": "2026-05-24T00:00:00Z",
+        "valid_time_source": "observation_observed_at",
+        "summary": format!("PromoteCandidate {id}")
+    })
+}
+
+fn promotion_prompt_json(id: &str, candidate_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "PromotionPrompt",
+        "schema_version": USER_CONTEXT_SCHEMA_VERSION,
+        "domain": "user_context",
+        "candidate_id": candidate_id,
+        "prompt_surface": "cli",
+        "prompt_text": "Save this preference?",
+        "prompted_at": "2026-05-24T00:00:10Z",
+        "prompted_to": "operator",
+        "summary": format!("PromotionPrompt {id}")
+    })
+}
+
+fn promotion_decision_json(
+    id: &str,
+    candidate_id: &str,
+    prompt_id: &str,
+    outcome: &str,
+    materialized_record_id: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "PromotionDecision",
+        "schema_version": USER_CONTEXT_SCHEMA_VERSION,
+        "domain": "user_context",
+        "candidate_id": candidate_id,
+        "prompt_id": prompt_id,
+        "outcome": outcome,
+        "decided_at": "2026-05-24T00:00:30Z",
+        "decided_by": "operator",
+        "decision_rationale": "Fixture decision",
+        "materialized_record_id": materialized_record_id,
+        "summary": format!("PromotionDecision {id}")
+    })
+}
+
+fn preference_json(id: &str, approval_decision_id: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "Preference",
+        "schema_version": USER_CONTEXT_SCHEMA_VERSION,
+        "domain": "user_context",
+        "rule_text": "Use thiserror for library errors.",
+        "proposed_rule_kind": "preference",
+        "scope": {
+            "language": "rust"
+        },
+        "approval_decision_id": approval_decision_id,
+        "active_from": "2026-05-24T00:00:30Z",
+        "summary": format!("Preference {id}")
+    })
+}
+
 fn verification_record_json(id: &str) -> serde_json::Value {
     serde_json::json!({
         "record_type": "node",
@@ -3394,6 +3619,13 @@ fn all_node_kinds_have_documented_schema() {
         | NodeKind::BenchmarkRun
         | NodeKind::CoverageReport
         | NodeKind::ProofResult => "verification-domain-documented",
+        NodeKind::PromoteCandidate
+        | NodeKind::PromotionPrompt
+        | NodeKind::PromotionDecision
+        | NodeKind::Preference
+        | NodeKind::WorkflowRule
+        | NodeKind::NamingDecision
+        | NodeKind::Constraint => "user-context-documented",
     };
 }
 
@@ -3437,7 +3669,321 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::Contradicts
         | EdgeLabel::Supersedes
         | EdgeLabel::RelatesTo => "cross-domain-registry",
+        EdgeLabel::ProposedBy
+        | EdgeLabel::PromptedFor
+        | EdgeLabel::DecidedOn
+        | EdgeLabel::MaterializedAs
+        | EdgeLabel::RevokedBy
+        | EdgeLabel::ScopedToRepo => "user-context-registry",
     };
+}
+
+// -- Schema conformance: issue #19 ------------------------------------------------
+
+#[test]
+fn user_context_schema_doc_is_cross_linked_and_names_contract() {
+    let schema = read_repo_text("docs/schema/user-context.md");
+    for needle in [
+        "# User-Context Domain Schema - v1",
+        "schema_version` = `1`",
+        "authorization-derived",
+        "`PromoteCandidate` records MAY be created from agent observations",
+        "`Preference`, `WorkflowRule`, `NamingDecision`, and `Constraint` records MAY exist only when an approved `PromotionDecision` references them",
+        "`PromotionPrompt` and `PromotionDecision` are append-only audit records",
+        "rejection-debounce window",
+        "PromoteCandidate record shape",
+        "PromotionPrompt record shape",
+        "PromotionDecision record shape",
+        "Evidence threshold",
+        "Jaccard token similarity >= 0.6",
+        "agent_policy_for(scope)",
+        "pending_candidates(scope)",
+        "audit_trail_for(durable_record_id)",
+        "user_context:v<schema_version>:candidate:<blake3(normalized_proposed_rule_text || canonical_scope || earliest_supporting_observation_id)>",
+    ] {
+        assert!(
+            schema.contains(needle),
+            "user-context schema must document `{needle}`"
+        );
+    }
+
+    for path in [
+        "README.md",
+        "docs/prd/0000-egregore-vision.md",
+        "docs/schema/agent-memory.md",
+        "docs/plans/2026-05-17-egregore-daemon-design.md",
+    ] {
+        let text = read_repo_text(path);
+        assert!(
+            text.contains("docs/schema/user-context.md") || text.contains("user-context.md"),
+            "{path} must link to docs/schema/user-context.md"
+        );
+    }
+}
+
+#[test]
+fn user_context_edge_registry_rows_are_documented() {
+    let registry = read_repo_text("docs/schema/agent-memory.md");
+    for needle in [
+        "| `PROPOSED_BY` | `user_context` | `agent_memory` | `PromoteCandidate` | `Observation` | many:many | yes |",
+        "| `PROMPTED_FOR` | `user_context` | `user_context` | `PromotionPrompt` | `PromoteCandidate` | many:1 | no |",
+        "| `DECIDED_ON` | `user_context` | `user_context` | `PromotionDecision` | `PromoteCandidate` | many:1 | no |",
+        "| `MATERIALIZED_AS` | `user_context` | `user_context` | `PromotionDecision` | `Preference`, `WorkflowRule`, `NamingDecision`, `Constraint` | many:1 | no |",
+        "| `REVOKED_BY` | `user_context` | `user_context` | `Preference`, `WorkflowRule`, `NamingDecision`, `Constraint` | `PromotionDecision` | many:1 | no |",
+        "| `CONTRADICTS` | `user_context` | `user_context` | `PromoteCandidate` | `Preference`, `WorkflowRule` | many:many | yes |",
+        "| `SCOPED_TO_REPO` | `user_context` | `codegraph` | `Preference`, `WorkflowRule`, `NamingDecision`, `Constraint` | `Repository` | many:1 | no |",
+    ] {
+        assert!(
+            registry.contains(needle),
+            "agent-memory edge registry must contain exact user-context row: {needle}"
+        );
+    }
+}
+
+#[test]
+fn user_context_stable_ids_are_idempotent_for_same_candidate_inputs() {
+    let first = user_context_stable_id(&[
+        "candidate",
+        "use thiserror for library errors",
+        "{\"repo\":null,\"path_glob\":null,\"language\":\"rust\",\"lifecycle_phase\":null}",
+        "agent_memory:v1:obs-1",
+    ]);
+    let second = user_context_stable_id(&[
+        "candidate",
+        "use thiserror for library errors",
+        "{\"repo\":null,\"path_glob\":null,\"language\":\"rust\",\"lifecycle_phase\":null}",
+        "agent_memory:v1:obs-1",
+    ]);
+
+    assert_eq!(first, second);
+    assert!(
+        first.starts_with("user_context:v1:"),
+        "candidate IDs must use the user_context:v1: prefix, got {first}"
+    );
+}
+
+#[test]
+fn promote_candidate_with_insufficient_evidence_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_observations(
+        &data_dir,
+        &[(
+            "agent_memory:v1:obs-1",
+            "session-a",
+            "Prefer thiserror for library errors.",
+        )],
+    );
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "issue-19-insufficient-evidence",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "issue-19-insufficient-evidence",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": {
+                "records": [promote_candidate_json(
+                    "user_context:v1:candidate-insufficient",
+                    "Use thiserror for library errors.",
+                    &["agent_memory:v1:obs-1"],
+                    None
+                )]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "candidate below the evidence threshold should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "insufficient_promotion_evidence",
+        "thin candidates must use the documented daemon code, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn promote_candidate_supporting_evidence_accepts_agent_turn_and_decision_targets() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_memory_nodes(
+        &data_dir,
+        &[
+            (
+                "agent_memory:v1:obs-support",
+                NodeKind::Observation,
+                "session-a",
+                "Use thiserror for library errors.",
+            ),
+            (
+                "agent_memory:v1:turn-support",
+                NodeKind::AgentTurn,
+                "session-b",
+                "AgentTurn with preference-shaped correction.",
+            ),
+            (
+                "agent_memory:v1:decision-support",
+                NodeKind::Decision,
+                "session-c",
+                "Decision with preference-shaped correction.",
+            ),
+        ],
+    );
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "issue-19-rich-evidence-targets",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "issue-19-rich-evidence-targets",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": {
+                "records": [promote_candidate_json(
+                    "user_context:v1:candidate-rich-evidence",
+                    "Use thiserror for library errors.",
+                    &[
+                        "agent_memory:v1:obs-support",
+                        "agent_memory:v1:turn-support",
+                        "agent_memory:v1:decision-support",
+                    ],
+                    None
+                )]
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "supporting evidence may cite Observation, AgentTurn, or Decision nodes, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn durable_user_context_without_approval_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "issue-19-unapproved-durable",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "issue-19-unapproved-durable",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": { "records": [preference_json("user_context:v1:preference-unapproved", None)] }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "durable preference without approval should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "unapproved_durable_user_context",
+        "unapproved durable records must use the documented daemon code, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn compatible_candidate_after_recent_rejection_is_superseded_but_written() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_promotion_evidence(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let rejected_candidate_id = "user_context:v1:candidate-rejected";
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "issue-19-rejected-seed",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "issue-19-rejected-seed",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": {
+                "records": [
+                    promote_candidate_json(rejected_candidate_id, "Use thiserror for library errors.", &[
+                        "agent_memory:v1:obs-1",
+                        "agent_memory:v1:obs-2",
+                        "agent_memory:v1:obs-3",
+                    ], None),
+                    promotion_prompt_json("user_context:v1:prompt-rejected", rejected_candidate_id),
+                    promotion_decision_json("user_context:v1:decision-rejected", rejected_candidate_id, "user_context:v1:prompt-rejected", "rejected", None)
+                ]
+            }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "seed rejected candidate should be accepted, got {response}"
+    );
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "issue-19-debounced-candidate",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "issue-19-debounced-candidate",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:01:00Z",
+            "payload": {
+                "records": [
+                    promote_candidate_json("user_context:v1:candidate-debounced", "Use thiserror for library errors.", &[
+                        "agent_memory:v1:obs-4",
+                        "agent_memory:v1:obs-5",
+                        "agent_memory:v1:obs-6",
+                    ], Some(rejected_candidate_id))
+                ]
+            }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "debounced compatible candidate should still be written, got {response}"
+    );
+
+    let read = http_get_authed(&metadata, "/v1/records/user_context:v1:candidate-debounced");
+    let body = response_json(&read);
+    assert_eq!(
+        body["result"]["record"]["superseded_by"], rejected_candidate_id,
+        "debounced candidate must point at the rejected candidate, got {body}"
+    );
+
+    daemon.stop();
 }
 
 #[test]

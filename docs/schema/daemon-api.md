@@ -132,6 +132,8 @@ All error codes are snake\_case identifiers. String literals at call sites in
 | `drift_prior_target_mismatch` | 422 | no | no | ingest, jobs/ingest |
 | `drift_record_immutable` | 422 | no | no | ingest, jobs/ingest |
 | `unknown_schema_version` | 422 | no | no | ingest, jobs/ingest, query/read |
+| `insufficient_promotion_evidence` | 422 | no | no | ingest, jobs/ingest |
+| `unapproved_durable_user_context` | 422 | no | no | ingest, jobs/ingest |
 
 Adding a new code is additive. Renaming or removing a code requires `/v2/`.
 
@@ -149,6 +151,10 @@ version compatibility. See [`docs/schema/schema-versioning.md`](schema-versionin
 Coordination: issue #18 reserves `runtime_permissions_unsafe` and
 `token_rotated`. Runtime-dir discovery, stale-file detection, and the
 `egregored.json` schema live in [`daemon-runtime.md`](daemon-runtime.md).
+
+Coordination: issue #19 reserves `insufficient_promotion_evidence` and
+`unapproved_durable_user_context` for authorization-derived user-context writes.
+See [`docs/schema/user-context.md`](user-context.md).
 
 ---
 

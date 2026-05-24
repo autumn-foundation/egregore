@@ -17,6 +17,11 @@ project fields that must pass through this policy:
 local-file import-time targets to `task.title`, `task.body` inline form,
 `task.labels`, `task.assignees`, `acceptance_criterion.text`, and
 `external_link.url`; the on-disk local JSONL file does not redact at rest.
+Coordination: [`docs/schema/user-context.md`](user-context.md) reserves
+`PromoteCandidate.proposed_rule_text`, `PromotionPrompt.prompt_text`,
+`PromotionDecision.decision_rationale`, `PromotionDecision.edited_rule_text`,
+`Preference.rule_text`, `WorkflowRule.rule_text`, `WorkflowRule.action_summary`,
+and `Constraint.constraint_text` as user-context redaction fields.
 
 ## Secret Classes
 

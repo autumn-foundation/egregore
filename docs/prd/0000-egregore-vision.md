@@ -60,6 +60,8 @@ Egregore starts with typed graph domains. Domains share one AletheiaDB store and
 
 **Semantic drift schema:** [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md) is the single source of truth for `SemanticDrift`, `EmbeddingModel`, `EmbeddingVector`, semantic stable IDs, and drift edge contracts.
 
+**User-context schema:** [`docs/schema/user-context.md`](../schema/user-context.md) is the single source of truth for authorization-derived preference-promotion records, durable user policy records, approval-gated trust rules, and user-context edge contracts.
+
 **Redaction schema:** [`docs/schema/redaction.md`](../schema/redaction.md) owns the redaction marker grammar and policy-version field for agent-authored records; producer schemas name the concrete fields that pass through it.
 
 **Bi-temporal selector grammar:** [`docs/schema/temporal-selectors.md`](../schema/temporal-selectors.md) is the single source of truth for `valid_time`/`transaction_time` axes, the `as_of`/`since` selector JSON shape, CLI flag surfaces, and per-domain mapping rules.
@@ -126,6 +128,7 @@ Egregore must preserve trust separation even while using one graph.
 - Agent memory is subjective unless linked to evidence.
 - Project/task state reflects intent and workflow, not proof that code exists.
 - User context reflects operator preference and must not be inferred silently from one-off or repeated behavior. Repeated evidence may create a promotion candidate, not a durable rule.
+- The authorization-derived user-context contract is specified in [`docs/schema/user-context.md`](../schema/user-context.md); durable `Preference`, `WorkflowRule`, `NamingDecision`, and `Constraint` records require approved `PromotionDecision` evidence.
 - Sensitive records require classification and redaction before persistence. Encryption at rest is defense in depth, not a substitute for redaction.
 
 No subjective observation may overwrite or impersonate deterministic source facts. Instead, observations attach to facts through edges such as `OBSERVES`, `EXPLAINS`, `VALIDATED_BY`, `CONTRADICTS`, `SUPERSEDES`, and `RELATES_TO`.
@@ -133,6 +136,8 @@ No subjective observation may overwrite or impersonate deterministic source fact
 ## Preference Promotion
 
 Egregore should make preference learning explicit. Agent observations can suggest that a durable user preference exists, but they must not silently become policy that future agents obey.
+
+Record shapes, stable IDs, candidate aggregation, rejection debounce, and query semantics for this flow are specified in [`docs/schema/user-context.md`](../schema/user-context.md).
 
 Promotion flow:
 
@@ -275,6 +280,8 @@ Acceptance criteria:
 ### PR-8: Explicit Preference Promotion
 
 Egregore must support promotion from repeated observations to durable user preferences without silent inference.
+
+Schema source of truth: [`docs/schema/user-context.md`](../schema/user-context.md).
 
 Acceptance criteria:
 
@@ -421,6 +428,8 @@ Exit criteria:
 ### M7: Explicit Preference Promotion
 
 Promote repeated preference-shaped observations through an auditable approval flow instead of silently creating durable rules.
+
+The v1 record contract for this milestone is [`docs/schema/user-context.md`](../schema/user-context.md).
 
 Exit criteria:
 

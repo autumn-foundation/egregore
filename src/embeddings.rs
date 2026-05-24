@@ -171,7 +171,14 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::CIStatus
         | NodeKind::BenchmarkRun
         | NodeKind::CoverageReport
-        | NodeKind::ProofResult => return None,
+        | NodeKind::ProofResult
+        | NodeKind::PromoteCandidate
+        | NodeKind::PromotionPrompt
+        | NodeKind::PromotionDecision
+        | NodeKind::Preference
+        | NodeKind::WorkflowRule
+        | NodeKind::NamingDecision
+        | NodeKind::Constraint => return None,
     };
 
     Some(EmbeddingCandidate {
