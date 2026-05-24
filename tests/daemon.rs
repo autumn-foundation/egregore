@@ -113,6 +113,44 @@ fn daemon_status_rejects_copied_metadata_for_another_data_dir() {
 }
 
 #[test]
+fn daemon_status_propagates_runtime_lock_inspection_errors() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let runtime_dir = runtime_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    fs::write(
+        runtime_dir.join("egregored.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "pid": 999_994,
+            "address": "127.0.0.1:9",
+            "token": "bad-lock-token",
+            "data_dir": data_dir,
+            "version": env!("CARGO_PKG_VERSION"),
+            "started_at_unix_ms": 1_u64,
+            "state": "running"
+        }))
+        .expect("metadata should serialize"),
+    )
+    .expect("metadata should write");
+    fs::create_dir(runtime_dir.join("egregored.lock"))
+        .expect("bad lock path should be created as a directory");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("daemon")
+        .arg("status")
+        .arg("--data-dir")
+        .arg(temp.path().join("store"))
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("failed to open")
+                .and(predicate::str::contains("egregored.lock")),
+        );
+}
+
+#[test]
 fn daemon_stop_does_not_wait_for_slow_request_headers() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");

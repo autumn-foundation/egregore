@@ -500,7 +500,7 @@ fn daemon(action: DaemonAction) -> Result<()> {
             crate::daemon::run_foreground(&config)
         }
         DaemonAction::Status { data_dir } => {
-            if let Some(metadata) = crate::daemon::active_metadata(&data_dir) {
+            if let Some(metadata) = crate::daemon::active_metadata(&data_dir)? {
                 println!("daemon running at {}", metadata.address);
                 Ok(())
             } else {

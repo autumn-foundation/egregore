@@ -916,7 +916,7 @@ struct AgentRegisterFull {
 /// Returns an error if another daemon is running, the child cannot be spawned,
 /// or the daemon does not become healthy before the startup timeout.
 pub fn start_background(config: &DaemonConfig) -> Result<DaemonMetadata> {
-    if let Some(metadata) = active_metadata(&config.data_dir) {
+    if let Some(metadata) = active_metadata(&config.data_dir)? {
         return Err(already_running_error(&config.data_dir, &metadata));
     }
     let metadata_path = metadata_path(&config.data_dir);
@@ -969,7 +969,7 @@ pub fn start_background(config: &DaemonConfig) -> Result<DaemonMetadata> {
 pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
     fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("failed to create {}", config.data_dir.display()))?;
-    if let Some(metadata) = active_metadata(&config.data_dir) {
+    if let Some(metadata) = active_metadata(&config.data_dir)? {
         return Err(already_running_error(&config.data_dir, &metadata));
     }
     let Some(mut lease) = StoreLease::try_acquire(&config.data_dir).with_context(|| {
@@ -1064,15 +1064,23 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
 }
 
 /// Returns active daemon metadata for a data directory if the daemon responds.
-#[must_use]
-pub fn active_metadata(data_dir: &Path) -> Option<DaemonMetadata> {
-    if runtime_metadata_is_stale(data_dir).ok()? {
-        return None;
+///
+/// # Errors
+///
+/// Returns an error if runtime metadata or lock inspection fails.
+pub fn active_metadata(data_dir: &Path) -> Result<Option<DaemonMetadata>> {
+    if runtime_metadata_is_stale(data_dir)? {
+        return Ok(None);
     }
-    let metadata = read_metadata(data_dir).ok()?;
+    if !metadata_path(data_dir).exists() {
+        return Ok(None);
+    }
+    let metadata = read_metadata(data_dir)?;
     let client = DaemonClient::for_data_dir(metadata.clone(), data_dir);
-    client.health().ok()?;
-    Some(metadata)
+    if client.health().is_err() {
+        return Ok(None);
+    }
+    Ok(Some(metadata))
 }
 
 /// Stops the running daemon for a data directory.
@@ -1094,7 +1102,7 @@ pub fn stop(data_dir: &Path) -> Result<()> {
         .with_context(|| format!("no daemon metadata found for {}", data_dir.display()))?;
     let client = DaemonClient::for_data_dir(metadata, data_dir);
     if let Err(error) = client.shutdown() {
-        if active_metadata(data_dir).is_none() {
+        if active_metadata(data_dir)?.is_none() {
             if remove_metadata_if_store_unleased(data_dir)? {
                 return Ok(());
             }
@@ -6615,7 +6623,7 @@ fn parse_http_response(response: &str) -> Result<(u16, String)> {
 fn wait_until_running(data_dir: &Path) -> Result<DaemonMetadata> {
     let start = Instant::now();
     loop {
-        if let Some(metadata) = active_metadata(data_dir) {
+        if let Some(metadata) = active_metadata(data_dir)? {
             return Ok(metadata);
         }
         if start.elapsed() > START_TIMEOUT {
@@ -6628,7 +6636,7 @@ fn wait_until_running(data_dir: &Path) -> Result<DaemonMetadata> {
 fn wait_until_stopped(data_dir: &Path) -> Result<()> {
     let start = Instant::now();
     loop {
-        if active_metadata(data_dir).is_none() && store_is_unleased(data_dir)? {
+        if active_metadata(data_dir)?.is_none() && store_is_unleased(data_dir)? {
             return Ok(());
         }
         if start.elapsed() > START_TIMEOUT {
