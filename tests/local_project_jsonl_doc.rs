@@ -147,10 +147,7 @@ fn local_project_jsonl_schema_doc_locks_file_contract() {
 
 #[test]
 fn local_project_jsonl_schema_doc_is_linked_and_coordinated() {
-    assert_contains_all(
-        "README.md",
-        &["docs/schema/local-project-jsonl.md"],
-    );
+    assert_contains_all("README.md", &["docs/schema/local-project-jsonl.md"]);
     assert_contains_all(
         "docs/prd/0000-egregore-vision.md",
         &[
@@ -189,10 +186,7 @@ fn local_project_jsonl_schema_doc_is_linked_and_coordinated() {
         ],
     );
 
-    assert_contains_all(
-        "docs/schema/project-graph.md",
-        &["local_jsonl_updated_at"],
-    );
+    assert_contains_all("docs/schema/project-graph.md", &["local_jsonl_updated_at"]);
     assert_contains_none(
         "docs/schema/project-graph.md",
         &["file modification time source"],

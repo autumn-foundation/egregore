@@ -222,7 +222,9 @@ pub fn semantic_drift_records(
             if f64::from(score) < threshold {
                 continue;
             }
-            records.extend(drift_pair_records(before, after, model_name, threshold, score));
+            records.extend(drift_pair_records(
+                before, after, model_name, threshold, score,
+            ));
         }
     }
 

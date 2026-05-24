@@ -194,6 +194,7 @@ Query output is newline-delimited JSON by default (`--format json`). Pass `--for
 - **Bi-temporal selector grammar (v2):** [docs/schema/temporal-selectors.md](docs/schema/temporal-selectors.md)
 - **Symbol identity ADR:** [docs/adr/0004-symbol-identity.md](docs/adr/0004-symbol-identity.md)
 - Architecture decisions: [docs/adr/README.md](docs/adr/README.md)
+- **Daemon runtime discovery contract (v1):** [docs/schema/daemon-runtime.md](docs/schema/daemon-runtime.md)
 - **Daemon HTTP wire contract (v1):** [docs/schema/daemon-api.md](docs/schema/daemon-api.md)
 - **Daemon query verb set (v1):** [docs/schema/daemon-query.md](docs/schema/daemon-query.md)
 - **Repository node identity (v2):** [docs/schema/repository-identity.md](docs/schema/repository-identity.md)
