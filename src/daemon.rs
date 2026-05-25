@@ -32,7 +32,7 @@ use crate::{
         AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord,
         IdentitySource, NodeKind, OutputHandle, PROJECT_SCHEMA_VERSION,
         SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, TemporalMetadata,
-        USER_CONTEXT_SCHEMA_VERSION, UserContextFields, VERIFICATION_SCHEMA_VERSION,
+        USER_CONTEXT_SCHEMA_VERSION, UserContextFields, UserContextScope, VERIFICATION_SCHEMA_VERSION,
         agent_memory_stable_id, user_context_stable_id,
     },
     query as graph_query,
@@ -2930,6 +2930,15 @@ fn validate_rfc3339_field(field: &'static str, value: &str) -> WriteResult<()> {
     Ok(())
 }
 
+fn parse_rfc3339_field(
+    field: &'static str,
+    value: &str,
+) -> WriteResult<DateTime<chrono::FixedOffset>> {
+    DateTime::parse_from_rfc3339(value).map_err(|_| {
+        ApiError::bad_request(format!("{field} '{value}' is not a valid RFC 3339 timestamp"))
+    })
+}
+
 fn validate_confidence(
     edge_id: &str,
     label: EdgeLabel,
@@ -3013,6 +3022,9 @@ const USER_CONTEXT_WORKFLOW_TRIGGERS: &[&str] = &[
     "pre_command",
     "post_command",
 ];
+
+const USER_CONTEXT_LIFECYCLE_PHASES: &[&str] =
+    &["pre_commit", "pre_pr", "pre_merge", "runtime", "any"];
 
 const USER_CONTEXT_EDGE_LABELS: &[EdgeLabel] = &[
     EdgeLabel::ProposedBy,
@@ -3324,9 +3336,16 @@ fn validate_promote_candidate(
     Ok(edges)
 }
 
-fn require_scope<T>(scope: Option<&T>, field: &'static str) -> WriteResult<()> {
-    scope
-        .map_or_else(|| Err(ApiError::missing_field(field)), |_| Ok(()))
+fn require_scope(scope: Option<&UserContextScope>, field: &'static str) -> WriteResult<()> {
+    let scope = scope.ok_or_else(|| ApiError::missing_field(field))?;
+    if let Some(lifecycle_phase) = scope.lifecycle_phase.as_deref() {
+        validate_enum(
+            "scope.lifecycle_phase",
+            lifecycle_phase,
+            USER_CONTEXT_LIFECYCLE_PHASES,
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_supporting_evidence_link(
@@ -3480,6 +3499,14 @@ fn validate_promotion_decision(
             "edited_then_approved",
         ],
     )?;
+    if outcome == "edited_then_approved"
+        && promotion_decision_uses_revocation_candidate(user_context, records, sink)?
+    {
+        return Err(ApiError::bad_request(
+            "PromotionDecision.outcome edited_then_approved is not valid for revocation \
+             candidates; use approved",
+        ));
+    }
     validate_rfc3339_field(
         "PromotionDecision.decided_at",
         required_str(
@@ -3789,11 +3816,12 @@ fn validate_durable_active_from(
     decision_fields: &UserContextFields,
 ) -> WriteResult<()> {
     let active_from = required_str(user_context.active_from.as_deref(), "durable.active_from")?;
-    validate_rfc3339_field("durable.active_from", active_from)?;
+    let active_from = parse_rfc3339_field("durable.active_from", active_from)?;
     let decided_at = required_str(
         decision_fields.decided_at.as_deref(),
         "PromotionDecision.decided_at",
     )?;
+    let decided_at = parse_rfc3339_field("PromotionDecision.decided_at", decided_at)?;
     if active_from != decided_at {
         return Err(ApiError::bad_request(format!(
             "durable.active_from must equal PromotionDecision.decided_at from approval decision \
@@ -3914,14 +3942,17 @@ fn validate_user_context_edge(
             &[NodeKind::PromoteCandidate],
             USER_CONTEXT_PROPOSED_BY_TARGET_KINDS,
         ),
-        EdgeLabel::PromptedFor => require_edge_kinds(
-            edge_id,
-            label,
-            source_kind,
-            target_kind,
-            &[NodeKind::PromotionPrompt],
-            &[NodeKind::PromoteCandidate],
-        ),
+        EdgeLabel::PromptedFor => {
+            require_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                target_kind,
+                &[NodeKind::PromotionPrompt],
+                &[NodeKind::PromoteCandidate],
+            )?;
+            validate_prompted_for_edge_payload(edge_id, source, target, records, sink)
+        }
         EdgeLabel::DecidedOn => {
             require_edge_kinds(
                 edge_id,
@@ -3963,16 +3994,46 @@ fn validate_user_context_edge(
             &[NodeKind::PromoteCandidate],
             USER_CONTEXT_CONTRADICTS_TARGET_KINDS,
         ),
-        EdgeLabel::ScopedToRepo => require_edge_kinds(
-            edge_id,
-            label,
-            source_kind,
-            target_kind,
-            USER_CONTEXT_DURABLE_NODE_KINDS,
-            &[NodeKind::Repository],
-        ),
+        EdgeLabel::ScopedToRepo => {
+            require_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                target_kind,
+                USER_CONTEXT_DURABLE_NODE_KINDS,
+                &[NodeKind::Repository],
+            )?;
+            validate_scoped_to_repo_edge_payload(edge_id, source, target, records, sink)
+        }
         _ => Ok(()),
     }
+}
+
+fn validate_prompted_for_edge_payload(
+    edge_id: &str,
+    source_prompt_id: &str,
+    target_candidate_id: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    let prompt_fields = lookup_user_context_fields_for_kind(
+        source_prompt_id,
+        NodeKind::PromotionPrompt,
+        records,
+        sink,
+        "PROMPTED_FOR source",
+    )?;
+    let candidate_id = required_str(
+        prompt_fields.candidate_id.as_deref(),
+        "PromotionPrompt.candidate_id",
+    )?;
+    if candidate_id != target_candidate_id {
+        return Err(ApiError::bad_request(format!(
+            "PROMPTED_FOR edge '{edge_id}' target '{target_candidate_id}' must equal \
+             PromotionPrompt.candidate_id '{candidate_id}'"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_decided_on_edge_payload(
@@ -4068,6 +4129,33 @@ fn validate_revoked_by_edge_payload(
     )?;
     let active_to = required_str(durable_fields.active_to.as_deref(), "durable.active_to")?;
     validate_rfc3339_field("durable.active_to", active_to)
+}
+
+fn validate_scoped_to_repo_edge_payload(
+    edge_id: &str,
+    source_durable_id: &str,
+    target_repo_id: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    let (_, durable_fields) = lookup_user_context_node_fields(
+        source_durable_id,
+        records,
+        sink,
+        "SCOPED_TO_REPO source",
+    )?;
+    let scope = durable_fields
+        .scope
+        .as_ref()
+        .ok_or_else(|| ApiError::missing_field("durable.scope"))?;
+    let scoped_repo = required_str(scope.repo.as_deref(), "durable.scope.repo")?;
+    if scoped_repo != target_repo_id {
+        return Err(ApiError::bad_request(format!(
+            "SCOPED_TO_REPO edge '{edge_id}' target '{target_repo_id}' must equal \
+             durable scope.repo '{scoped_repo}'"
+        )));
+    }
+    Ok(())
 }
 
 fn require_approved_decision_outcome(

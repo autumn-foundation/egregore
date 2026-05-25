@@ -21,7 +21,7 @@ use aletheia_egregore::{
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, GraphRecord, IdentitySource, NodeKind,
         PROJECT_SCHEMA_VERSION, RepositoryIdentityPayload, SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION,
-        TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, user_context_stable_id,
+        TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, stable_id, user_context_stable_id,
     },
     traj::ImportOptions,
 };
@@ -2683,6 +2683,32 @@ fn seed_agent_memory_nodes(data_dir: &Path, nodes: &[(&str, NodeKind, &str, &str
         .expect("seeded agent-memory nodes should persist");
 }
 
+fn seed_repository_nodes(data_dir: &Path, repositories: &[(&str, &str)]) {
+    let mut sink = EmbeddedAletheiaSink::open(data_dir).expect("embedded store should open");
+    for (id, basename) in repositories {
+        let record = GraphRecord::node(
+            (*id).to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some((*basename).to_owned()),
+            format!("Repository {id}"),
+        )
+        .with_domain("codegraph", SCHEMA_VERSION)
+        .with_repository_identity(RepositoryIdentityPayload {
+            identity_source: IdentitySource::OperatorOverride,
+            remote_url: None,
+            root_commit_sha: None,
+            canonical_path: None,
+            basename: (*basename).to_owned(),
+        });
+        sink.write_record(&record)
+            .expect("seeded repository node should write");
+    }
+    sink.persist_indexes()
+        .expect("seeded repository nodes should persist");
+}
+
 fn seed_promotion_evidence(data_dir: &Path) {
     seed_observations(
         data_dir,
@@ -4194,6 +4220,63 @@ fn promote_candidate_requires_scope() {
 }
 
 #[test]
+fn user_context_scope_validates_lifecycle_phase_enum() {
+    let mut candidate = promote_candidate_json(
+        "user_context:v1:candidate-invalid-lifecycle-phase",
+        "Use thiserror for library errors.",
+        &[
+            "agent_memory:v1:obs-1",
+            "agent_memory:v1:obs-2",
+            "agent_memory:v1:obs-3",
+        ],
+        None,
+    );
+    candidate["scope"]["lifecycle_phase"] = serde_json::json!("pre_release");
+    let candidate_response =
+        ingest_user_context_records("candidate-invalid-lifecycle-phase", &[candidate]);
+    assert!(
+        !candidate_response.starts_with("HTTP/1.1 200"),
+        "candidate scope.lifecycle_phase enum violation should be rejected, got {candidate_response}"
+    );
+    let candidate_body = response_json(&candidate_response);
+    assert_eq!(
+        candidate_body["error"]["code"], "bad_request",
+        "candidate invalid lifecycle_phase should be a bad_request, got {candidate_body}"
+    );
+    assert!(
+        candidate_body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("scope.lifecycle_phase")),
+        "candidate invalid lifecycle_phase should name scope.lifecycle_phase, got {candidate_body}"
+    );
+
+    let mut records = approved_preference_records(
+        "user_context:v1:candidate-durable-invalid-lifecycle",
+        "user_context:v1:prompt-durable-invalid-lifecycle",
+        "user_context:v1:decision-durable-invalid-lifecycle",
+        "user_context:v1:preference-durable-invalid-lifecycle",
+    );
+    records[3]["scope"]["lifecycle_phase"] = serde_json::json!("pre_release");
+    let durable_response =
+        ingest_user_context_records("durable-invalid-lifecycle-phase", &records);
+    assert!(
+        !durable_response.starts_with("HTTP/1.1 200"),
+        "durable scope.lifecycle_phase enum violation should be rejected, got {durable_response}"
+    );
+    let durable_body = response_json(&durable_response);
+    assert_eq!(
+        durable_body["error"]["code"], "bad_request",
+        "durable invalid lifecycle_phase should be a bad_request, got {durable_body}"
+    );
+    assert!(
+        durable_body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("scope.lifecycle_phase")),
+        "durable invalid lifecycle_phase should name scope.lifecycle_phase, got {durable_body}"
+    );
+}
+
+#[test]
 fn promote_candidate_requires_contradicting_evidence_field() {
     let mut candidate = promote_candidate_json(
         "user_context:v1:candidate-missing-contradictions",
@@ -4808,6 +4891,38 @@ fn promotion_decision_prompt_must_match_decided_candidate() {
 }
 
 #[test]
+fn revocation_decision_rejects_edited_approval_outcome() {
+    let mut records = approved_revocation_records(
+        "user_context:v1:candidate-edited-revocation",
+        "user_context:v1:prompt-edited-revocation",
+        "user_context:v1:decision-edited-revocation",
+        "user_context:v1:preference-edited-revocation",
+    );
+    records[2]["outcome"] = serde_json::json!("edited_then_approved");
+    records[2]["edited_rule_text"] = serde_json::json!("Revoke after operator edit.");
+
+    let response = ingest_user_context_records("edited-revocation-rejected", &records);
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "revocation decisions must not use edited_then_approved, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "edited revocation should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| {
+                message.contains("PromotionDecision.outcome") && message.contains("revocation")
+            }),
+        "edited revocation rejection should name outcome and revocation semantics, got {body}"
+    );
+}
+
+#[test]
 fn approved_promotion_decision_requires_materialized_target() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -4886,6 +5001,72 @@ fn approved_promotion_decision_requires_materialized_target() {
         }),
         "pre-validation failure must not leave a partial approval audit chain"
     );
+}
+
+#[test]
+fn direct_prompted_for_edge_must_match_prompt_candidate() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_promotion_evidence(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let candidate_a = "user_context:v1:candidate-prompted-edge-a";
+    let candidate_b = "user_context:v1:candidate-prompted-edge-b";
+    let prompt_a = "user_context:v1:prompt-prompted-edge-a";
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "direct-prompted-for-target-mismatch",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "direct-prompted-for-target-mismatch",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": {
+                "records": [
+                    promote_candidate_json(candidate_a, "Use thiserror for library errors.", &[
+                        "agent_memory:v1:obs-1",
+                        "agent_memory:v1:obs-2",
+                        "agent_memory:v1:obs-3",
+                    ], None),
+                    promote_candidate_json(candidate_b, "Prefer thiserror in library crates.", &[
+                        "agent_memory:v1:obs-4",
+                        "agent_memory:v1:obs-5",
+                        "agent_memory:v1:obs-6",
+                    ], None),
+                    promotion_prompt_json(prompt_a, candidate_a),
+                    user_context_edge_json(
+                        "user_context:v1:explicit-prompted-for-wrong-candidate",
+                        "PROMPTED_FOR",
+                        prompt_a,
+                        candidate_b,
+                        None,
+                    )
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "PROMPTED_FOR edge target must match PromotionPrompt.candidate_id, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "PROMPTED_FOR payload mismatch should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("PromotionPrompt.candidate_id")),
+        "PROMPTED_FOR mismatch should name PromotionPrompt.candidate_id, got {body}"
+    );
+
+    daemon.stop();
 }
 
 #[test]
@@ -5175,6 +5356,24 @@ fn durable_active_from_must_equal_approval_decided_at() {
             .as_str()
             .is_some_and(|message| message.contains("durable.active_from")),
         "active_from mismatch should name durable.active_from, got {body}"
+    );
+}
+
+#[test]
+fn durable_active_from_accepts_equivalent_rfc3339_instant() {
+    let mut records = approved_preference_records(
+        "user_context:v1:candidate-active-from-equivalent",
+        "user_context:v1:prompt-active-from-equivalent",
+        "user_context:v1:decision-active-from-equivalent",
+        "user_context:v1:preference-active-from-equivalent",
+    );
+    records[3]["active_from"] = serde_json::json!("2026-05-24T00:00:30+00:00");
+
+    let response = ingest_user_context_records("durable-active-from-equivalent", &records);
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "durable active_from should compare by RFC3339 instant, got {response}"
     );
 }
 
@@ -5519,6 +5718,73 @@ fn direct_revoked_by_edge_requires_approved_revocation_decision() {
             .is_some_and(|message| message.contains("PromotionDecision.outcome")),
         "rejected REVOKED_BY edge should name PromotionDecision.outcome, got {body}"
     );
+}
+
+#[test]
+fn direct_scoped_to_repo_edge_must_match_durable_scope_repo() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_promotion_evidence(&data_dir);
+    let expected_repo = stable_id(&["repository", "operator-override", "repo-scope-expected"]);
+    let wrong_repo = stable_id(&["repository", "operator-override", "repo-scope-wrong"]);
+    seed_repository_nodes(
+        &data_dir,
+        &[
+            (&expected_repo, "repo-scope-expected"),
+            (&wrong_repo, "repo-scope-wrong"),
+        ],
+    );
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let durable_id = "user_context:v1:preference-scoped-repo-edge";
+    let mut records = approved_preference_records(
+        "user_context:v1:candidate-scoped-repo-edge",
+        "user_context:v1:prompt-scoped-repo-edge",
+        "user_context:v1:decision-scoped-repo-edge",
+        durable_id,
+    );
+    records[3]["scope"]["repo"] = serde_json::json!(expected_repo);
+    records.push(user_context_edge_json(
+        "user_context:v1:explicit-scoped-to-wrong-repo",
+        "SCOPED_TO_REPO",
+        durable_id,
+        &wrong_repo,
+        None,
+    ));
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "direct-scoped-to-repo-target-mismatch",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "direct-scoped-to-repo-target-mismatch",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": { "records": records }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "SCOPED_TO_REPO target must match durable scope.repo, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "SCOPED_TO_REPO payload mismatch should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("scope.repo")),
+        "SCOPED_TO_REPO mismatch should name scope.repo, got {body}"
+    );
+
+    daemon.stop();
 }
 
 #[test]
