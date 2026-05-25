@@ -988,6 +988,7 @@ fn make_node(
         executed_at: None,
         verification_kind: None,
         status: extra.status,
+        user_context: crate::ir::UserContextFields::empty(),
     }
 }
 

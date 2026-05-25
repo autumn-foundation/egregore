@@ -187,6 +187,7 @@ Query output is newline-delimited JSON by default (`--format json`). Pass `--for
 - **Agent-actions and PatchArtifact schema (v1):** [docs/schema/agent-actions.md](docs/schema/agent-actions.md)
 - **Verification-evidence domain schema (v1):** [docs/schema/verification.md](docs/schema/verification.md)
 - **Project-graph domain schema (v1):** [docs/schema/project-graph.md](docs/schema/project-graph.md)
+- **User-context domain schema (v1):** [docs/schema/user-context.md](docs/schema/user-context.md)
 - **Local project/task JSONL file format (v1):** [docs/schema/local-project-jsonl.md](docs/schema/local-project-jsonl.md)
 - **Semantic drift domain schema (v1):** [docs/schema/semantic-drift.md](docs/schema/semantic-drift.md)
 - **Record schema-version policy:** [docs/schema/schema-versioning.md](docs/schema/schema-versioning.md)

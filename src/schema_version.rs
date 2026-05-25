@@ -11,7 +11,8 @@ use serde_json::Value;
 
 use crate::ir::{
     AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, Domain, EdgeLabel, GraphRecord,
-    PROJECT_SCHEMA_VERSION, SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION, VERIFICATION_SCHEMA_VERSION,
+    PROJECT_SCHEMA_VERSION, SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION, USER_CONTEXT_SCHEMA_VERSION,
+    VERIFICATION_SCHEMA_VERSION,
 };
 
 /// Stable error code for default reader rejection of an unknown record version.
@@ -199,6 +200,7 @@ pub fn is_known_record_version(version: &RecordVersion) -> bool {
         "artifact" => version.version == ARTIFACT_SCHEMA_VERSION,
         "project" => version.version == PROJECT_SCHEMA_VERSION,
         "semantic" => version.version == SEMANTIC_SCHEMA_VERSION,
+        "user_context" => version.version == USER_CONTEXT_SCHEMA_VERSION,
         _ => false,
     }
 }
@@ -293,6 +295,7 @@ fn domain_from_record_id(id: &str) -> Option<String> {
         "artifact" => Some(Domain::Artifact.as_str().to_owned()),
         "project" => Some(Domain::Project.as_str().to_owned()),
         "semantic" => Some(Domain::Semantic.as_str().to_owned()),
+        "user_context" => Some(Domain::UserContext.as_str().to_owned()),
         _ => None,
     }
 }
@@ -300,6 +303,8 @@ fn domain_from_record_id(id: &str) -> Option<String> {
 fn domain_for_node_kind(kind: &str) -> &'static str {
     match kind {
         "SemanticDrift" | "EmbeddingModel" | "EmbeddingVector" => Domain::Semantic.as_str(),
+        "PromoteCandidate" | "PromotionPrompt" | "PromotionDecision" | "Preference"
+        | "WorkflowRule" | "NamingDecision" | "Constraint" => Domain::UserContext.as_str(),
         "Task"
         | "AcceptanceCriterion"
         | "ExternalLink"
@@ -324,6 +329,14 @@ fn domain_for_edge_label(label: &str) -> &'static str {
         Some(EdgeLabel::DriftsFrom | EdgeLabel::DriftsPrior | EdgeLabel::MeasuredBy) => {
             Domain::Semantic.as_str()
         }
+        Some(
+            EdgeLabel::ProposedBy
+            | EdgeLabel::PromptedFor
+            | EdgeLabel::DecidedOn
+            | EdgeLabel::MaterializedAs
+            | EdgeLabel::RevokedBy
+            | EdgeLabel::ScopedToRepo,
+        ) => Domain::UserContext.as_str(),
         Some(label) if label.is_codegraph_topology_label() => Domain::CodeGraph.as_str(),
         Some(_) | None => Domain::AgentMemory.as_str(),
     }

@@ -20,7 +20,7 @@ use crate::{
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
         EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, IdentitySource, MetricKind, NodeKind,
-        SelectionBasis, SemanticDriftMetadata, SourceSpan, TemporalMetadata,
+        SelectionBasis, SemanticDriftMetadata, SourceSpan, TemporalMetadata, UserContextFields,
     },
 };
 #[cfg(feature = "embeddings")]
@@ -1167,6 +1167,7 @@ impl EmbeddedAletheiaSink {
             executed_at,
             verification_kind,
             status,
+            user_context,
         } = record
         else {
             unreachable!("write_node called with non-node record");
@@ -1346,6 +1347,11 @@ impl EmbeddedAletheiaSink {
         builder = insert_optional(builder, "executed_at", executed_at.as_deref());
         builder = insert_optional(builder, "verification_kind", verification_kind.as_deref());
         builder = insert_optional(builder, "status", status.as_deref());
+        if !user_context.is_empty()
+            && let Ok(json) = serde_json::to_string(user_context)
+        {
+            builder = builder.insert("user_context_json", json.as_str());
+        }
         #[cfg(feature = "embeddings")]
         if let Some(vector) = self.embedding_for_node_write(record) {
             builder = builder.insert_vector("embedding", &vector);
@@ -2167,6 +2173,16 @@ impl EmbeddedAletheiaSink {
                 node.get_property("verification_kind"),
             )?,
             status: optional_str_property(record_id, "status", node.get_property("status"))?,
+            user_context: optional_str_property(
+                record_id,
+                "user_context_json",
+                node.get_property("user_context_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<UserContextFields>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("user_context_json invalid: {e}")))?
+            .unwrap_or_else(UserContextFields::empty),
         };
         validate_adapter_record_version(&record)?;
         Ok(record)
@@ -2658,6 +2674,13 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "BenchmarkRun" => Ok(NodeKind::BenchmarkRun),
         "CoverageReport" => Ok(NodeKind::CoverageReport),
         "ProofResult" => Ok(NodeKind::ProofResult),
+        "PromoteCandidate" => Ok(NodeKind::PromoteCandidate),
+        "PromotionPrompt" => Ok(NodeKind::PromotionPrompt),
+        "PromotionDecision" => Ok(NodeKind::PromotionDecision),
+        "Preference" => Ok(NodeKind::Preference),
+        "WorkflowRule" => Ok(NodeKind::WorkflowRule),
+        "NamingDecision" => Ok(NodeKind::NamingDecision),
+        "Constraint" => Ok(NodeKind::Constraint),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded node kind {kind}"),
@@ -2697,6 +2720,12 @@ fn parse_edge_label(record_id: &str, label: &str) -> AdapterResult<EdgeLabel> {
         "REFERENCES_TASK" => Ok(EdgeLabel::ReferencesTask),
         "CONTRADICTS" => Ok(EdgeLabel::Contradicts),
         "SUPERSEDES" => Ok(EdgeLabel::Supersedes),
+        "PROPOSED_BY" => Ok(EdgeLabel::ProposedBy),
+        "PROMPTED_FOR" => Ok(EdgeLabel::PromptedFor),
+        "DECIDED_ON" => Ok(EdgeLabel::DecidedOn),
+        "MATERIALIZED_AS" => Ok(EdgeLabel::MaterializedAs),
+        "REVOKED_BY" => Ok(EdgeLabel::RevokedBy),
+        "SCOPED_TO_REPO" => Ok(EdgeLabel::ScopedToRepo),
         "RELATES_TO" => Ok(EdgeLabel::RelatesTo),
         _ => Err(read_back_error(
             record_id,
@@ -2862,7 +2891,14 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::CIStatus
         | NodeKind::BenchmarkRun
         | NodeKind::CoverageReport
-        | NodeKind::ProofResult => kind.as_str(),
+        | NodeKind::ProofResult
+        | NodeKind::PromoteCandidate
+        | NodeKind::PromotionPrompt
+        | NodeKind::PromotionDecision
+        | NodeKind::Preference
+        | NodeKind::WorkflowRule
+        | NodeKind::NamingDecision
+        | NodeKind::Constraint => kind.as_str(),
     }
 }
 

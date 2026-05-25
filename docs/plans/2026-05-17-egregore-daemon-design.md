@@ -27,6 +27,10 @@ semantic stable IDs, `DRIFTS_FROM`, `DRIFTS_PRIOR`, `MEASURED_BY`, and the
 `drift_prior_target_mismatch` / `drift_record_immutable` daemon errors are
 specified in [docs/schema/semantic-drift.md](../schema/semantic-drift.md).
 
+**User-context schema:** preference-promotion candidates, prompts, decisions,
+durable user policy records, and the approval-gates-policy invariant are
+specified in [docs/schema/user-context.md](../schema/user-context.md).
+
 **Redaction schema:** Agent-authored payload redaction markers and policy-version
 metadata are specified in [docs/schema/redaction.md](../schema/redaction.md).
 
@@ -160,7 +164,7 @@ Small writes can remain synchronous:
 
 ```text
 POST /v1/records/ingest
-POST /v1/observations
+POST /v1/observations       # candidate creation follows docs/schema/user-context.md
 POST /v1/artifacts
 POST /v1/verifications    # schema: docs/schema/verification.md
 ```
@@ -357,7 +361,8 @@ Still planned:
 
 1. Full redaction policy enforcement for agent-authored non-codegraph payloads.
 2. Dedicated observation, artifact, verification, and command-evidence write
-   endpoints.
+   endpoints. `POST /v1/observations` owns user-context candidate creation per
+   [docs/schema/user-context.md](../schema/user-context.md).
 3. Structured logs, metrics, and retry-after fields on queue overload.
 4. Explicit offline-exclusive repair mode that acquires the same lease.
 

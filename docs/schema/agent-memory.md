@@ -32,6 +32,11 @@ code-graph `codegraph:v1:` IDs even when the Blake3 content hashes are
 identical. The rule "IDs are unique within `(domain, schema_version)`" from
 issue #3 holds for both domains.
 
+Preference-promotion records live in the authorization-derived
+[`user_context`](user-context.md) domain. Agent-memory observations may supply
+evidence for `PromoteCandidate` records, but they do not become durable policy
+without an approved user-context decision.
+
 Existing in-store `Agent` and `AgentSession` records emitted by the daemon
 before this schema was published are declared `schema_version: 1`
 retroactively — the field set the daemon was already writing is the field set
@@ -317,6 +322,13 @@ removing a label is a schema version bump.
 | `DRIFTS_PRIOR` | `semantic` | `codegraph` | `SemanticDrift` | `File`, `Symbol` | many:1 | no |
 | `MEASURED_BY` | `semantic` | `semantic` | `SemanticDrift` | `EmbeddingModel` | many:1 | no |
 | `CONTRADICTS` | `agent_memory`, `verification` | any | any | any | many:many | yes |
+| `PROPOSED_BY` | `user_context` | `agent_memory` | `PromoteCandidate` | `Observation`, `AgentTurn`, `Decision` | many:many | yes |
+| `PROMPTED_FOR` | `user_context` | `user_context` | `PromotionPrompt` | `PromoteCandidate` | many:1 | no |
+| `DECIDED_ON` | `user_context` | `user_context` | `PromotionDecision` | `PromoteCandidate` | many:1 | no |
+| `MATERIALIZED_AS` | `user_context` | `user_context` | `PromotionDecision` | `Preference`, `WorkflowRule`, `NamingDecision`, `Constraint` | many:1 | no |
+| `REVOKED_BY` | `user_context` | `user_context` | `Preference`, `WorkflowRule`, `NamingDecision`, `Constraint` | `PromotionDecision` | many:1 | no |
+| `CONTRADICTS` | `user_context` | `user_context` | `PromoteCandidate` | `Preference`, `WorkflowRule` | many:many | yes |
+| `SCOPED_TO_REPO` | `user_context` | `codegraph` | `Preference`, `WorkflowRule`, `NamingDecision`, `Constraint` | `Repository` | many:1 | no |
 | `SUPERSEDES` | `agent_memory`, `artifact` | `agent_memory`, `artifact` | any agent-memory, `PatchArtifact` | any agent-memory, `PatchArtifact` | many:1 | no |
 | `RELATES_TO` | any | any | any | any | many:many | no |
 
@@ -407,3 +419,8 @@ Both functions null-terminate each input part before hashing, so
   a local-JSONL-sourced `Task` MUST resolve through the file path + local_id
   pair documented in [`docs/schema/local-project-jsonl.md`](local-project-jsonl.md),
   not by guessing the file format.
+- **Issue #19 (user context):** `PROPOSED_BY`, `PROMPTED_FOR`, `DECIDED_ON`,
+  `MATERIALIZED_AS`, `REVOKED_BY`, the user-context `CONTRADICTS` extension,
+  and `SCOPED_TO_REPO` are contributed by
+  [`docs/schema/user-context.md`](user-context.md); the `user_context` domain
+  enum value is load-bearing.

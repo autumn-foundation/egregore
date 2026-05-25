@@ -26,6 +26,11 @@ pub const PROJECT_SCHEMA_VERSION: u32 = 1;
 /// Documented in `docs/schema/semantic-drift.md`.
 pub const SEMANTIC_SCHEMA_VERSION: u32 = 1;
 
+/// Schema version for authorization-derived user-context records
+/// (`PromoteCandidate`, `PromotionDecision`, durable preferences, etc.).
+/// Documented in `docs/schema/user-context.md`.
+pub const USER_CONTEXT_SCHEMA_VERSION: u32 = 1;
+
 /// Minimum replay tolerance for semantic drift scores.
 /// Documented in `docs/schema/semantic-drift.md`.
 pub const SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE: f64 = 1e-5;
@@ -226,6 +231,193 @@ pub struct EvidenceLink {
     /// Git commit SHA anchoring the target node lookup (triple fallback).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_git_commit: Option<String>,
+}
+
+/// User-context scope shared by promotion candidates and durable rules.
+///
+/// All fields omitted means "global to this operator"; see
+/// `docs/schema/user-context.md`.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct UserContextScope {
+    /// Optional repository identity from the repository-identity domain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Optional repository-relative glob.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_glob: Option<String>,
+    /// Optional language tag such as `rust`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Optional lifecycle phase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_phase: Option<String>,
+}
+
+/// Flat user-context fields carried by `GraphRecord::Node`.
+///
+/// The fields are flattened into node JSON so the schema remains a normal
+/// record shape instead of a nested metadata blob.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct UserContextFields {
+    /// Candidate durable rule body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed_rule_text: Option<String>,
+    /// Durable kind the candidate would materialize.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed_rule_kind: Option<String>,
+    /// Scope for candidates and durable user-context records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<UserContextScope>,
+    /// Evidence supporting a promotion candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supporting_evidence: Option<Vec<EvidenceLink>>,
+    /// Evidence contradicting a promotion candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contradicting_evidence: Option<Vec<EvidenceLink>>,
+    /// Promotion candidate ID for prompts and decisions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_id: Option<String>,
+    /// Surface where a prompt was presented.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_surface: Option<String>,
+    /// Exact redacted prompt text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_text: Option<String>,
+    /// Prompt timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompted_at: Option<String>,
+    /// Operator handle the prompt was shown to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompted_to: Option<String>,
+    /// Prompt expiry timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// Prompt ID a decision responds to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
+    /// Promotion decision outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// Decision timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<String>,
+    /// Operator handle that made a decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
+    /// Optional redacted rationale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_rationale: Option<String>,
+    /// Durable record ID created or revoked by a decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub materialized_record_id: Option<String>,
+    /// Edited rule body for edited approvals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edited_rule_text: Option<String>,
+    /// Durable preference/workflow rule body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_text: Option<String>,
+    /// Approval decision that authorized a durable record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_decision_id: Option<String>,
+    /// RFC3339 activation timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_from: Option<String>,
+    /// RFC3339 deactivation timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_to: Option<String>,
+    /// Workflow trigger enums.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggers: Option<Vec<String>>,
+    /// Workflow action summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_summary: Option<String>,
+    /// Naming-decision entity kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_kind: Option<String>,
+    /// Canonical approved name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_name: Option<String>,
+    /// Rejected naming alternatives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alternatives_rejected: Option<Vec<String>>,
+    /// Constraint body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constraint_text: Option<String>,
+    /// Constraint enforcement level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enforcement_level: Option<String>,
+}
+
+impl UserContextFields {
+    /// Empty user-context field set.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            proposed_rule_text: None,
+            proposed_rule_kind: None,
+            scope: None,
+            supporting_evidence: None,
+            contradicting_evidence: None,
+            candidate_id: None,
+            prompt_surface: None,
+            prompt_text: None,
+            prompted_at: None,
+            prompted_to: None,
+            expires_at: None,
+            prompt_id: None,
+            outcome: None,
+            decided_at: None,
+            decided_by: None,
+            decision_rationale: None,
+            materialized_record_id: None,
+            edited_rule_text: None,
+            rule_text: None,
+            approval_decision_id: None,
+            active_from: None,
+            active_to: None,
+            triggers: None,
+            action_summary: None,
+            entity_kind: None,
+            canonical_name: None,
+            alternatives_rejected: None,
+            constraint_text: None,
+            enforcement_level: None,
+        }
+    }
+
+    /// Returns true when no user-context field is populated.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.proposed_rule_text.is_none()
+            && self.proposed_rule_kind.is_none()
+            && self.scope.is_none()
+            && self.supporting_evidence.is_none()
+            && self.contradicting_evidence.is_none()
+            && self.candidate_id.is_none()
+            && self.prompt_surface.is_none()
+            && self.prompt_text.is_none()
+            && self.prompted_at.is_none()
+            && self.prompted_to.is_none()
+            && self.expires_at.is_none()
+            && self.prompt_id.is_none()
+            && self.outcome.is_none()
+            && self.decided_at.is_none()
+            && self.decided_by.is_none()
+            && self.decision_rationale.is_none()
+            && self.materialized_record_id.is_none()
+            && self.edited_rule_text.is_none()
+            && self.rule_text.is_none()
+            && self.approval_decision_id.is_none()
+            && self.active_from.is_none()
+            && self.active_to.is_none()
+            && self.triggers.is_none()
+            && self.action_summary.is_none()
+            && self.entity_kind.is_none()
+            && self.canonical_name.is_none()
+            && self.alternatives_rejected.is_none()
+            && self.constraint_text.is_none()
+            && self.enforcement_level.is_none()
+    }
 }
 
 /// One JSONL graph record.
@@ -490,6 +682,9 @@ pub enum GraphRecord {
         /// `passed`, `failed`, `errored`, `skipped`, or `inconclusive`.
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        /// User-context domain fields, flattened into node JSON.
+        #[serde(flatten)]
+        user_context: UserContextFields,
     },
     /// A graph edge.
     Edge {
@@ -635,6 +830,7 @@ impl GraphRecord {
             executed_at: None,
             verification_kind: None,
             status: None,
+            user_context: UserContextFields::empty(),
         }
     }
 
@@ -731,6 +927,7 @@ impl GraphRecord {
             executed_at: None,
             verification_kind: None,
             status: None,
+            user_context: UserContextFields::empty(),
         }
     }
 
@@ -826,6 +1023,7 @@ impl GraphRecord {
             executed_at: None,
             verification_kind: None,
             status: None,
+            user_context: UserContextFields::empty(),
         }
     }
 
@@ -1001,6 +1199,8 @@ pub enum Domain {
     Project,
     /// Semantic measurements that require source bytes plus model bytes.
     Semantic,
+    /// Authorization-derived operator preference and workflow-policy records.
+    UserContext,
 }
 
 impl Domain {
@@ -1014,6 +1214,7 @@ impl Domain {
             Self::Artifact => "artifact",
             Self::Project => "project",
             Self::Semantic => "semantic",
+            Self::UserContext => "user_context",
         }
     }
 }
@@ -1196,6 +1397,21 @@ pub enum NodeKind {
     CoverageReport,
     /// Verus/Kani/CBMC/Lean/Coq proof outcome — reserved.
     ProofResult,
+    // ── User-context node kinds (docs/schema/user-context.md) ────────────────
+    /// Proposal to promote repeated evidence into a durable user-context rule.
+    PromoteCandidate,
+    /// Append-only prompt shown to an operator for a promotion candidate.
+    PromotionPrompt,
+    /// Append-only operator decision on a promotion prompt.
+    PromotionDecision,
+    /// Approved durable preference.
+    Preference,
+    /// Approved durable workflow rule.
+    WorkflowRule,
+    /// Approved durable naming convention.
+    NamingDecision,
+    /// Approved durable constraint.
+    Constraint,
 }
 
 impl NodeKind {
@@ -1243,6 +1459,13 @@ impl NodeKind {
             Self::BenchmarkRun => "BenchmarkRun",
             Self::CoverageReport => "CoverageReport",
             Self::ProofResult => "ProofResult",
+            Self::PromoteCandidate => "PromoteCandidate",
+            Self::PromotionPrompt => "PromotionPrompt",
+            Self::PromotionDecision => "PromotionDecision",
+            Self::Preference => "Preference",
+            Self::WorkflowRule => "WorkflowRule",
+            Self::NamingDecision => "NamingDecision",
+            Self::Constraint => "Constraint",
         }
     }
 }
@@ -1312,6 +1535,18 @@ pub enum EdgeLabel {
     Contradicts,
     /// Agent-memory node supersedes another record.
     Supersedes,
+    /// User-context candidate was proposed by an agent-memory observation.
+    ProposedBy,
+    /// Prompt was issued for a promotion candidate.
+    PromptedFor,
+    /// Decision was made on a promotion candidate.
+    DecidedOn,
+    /// Approval materialized a durable user-context record.
+    MaterializedAs,
+    /// Durable user-context record was revoked by a decision.
+    RevokedBy,
+    /// Durable user-context record is scoped to a repository.
+    ScopedToRepo,
     /// Generic weak relationship between any two records.
     RelatesTo,
 }
@@ -1351,6 +1586,12 @@ impl EdgeLabel {
             "REFERENCES_TASK" => Some(Self::ReferencesTask),
             "CONTRADICTS" => Some(Self::Contradicts),
             "SUPERSEDES" => Some(Self::Supersedes),
+            "PROPOSED_BY" => Some(Self::ProposedBy),
+            "PROMPTED_FOR" => Some(Self::PromptedFor),
+            "DECIDED_ON" => Some(Self::DecidedOn),
+            "MATERIALIZED_AS" => Some(Self::MaterializedAs),
+            "REVOKED_BY" => Some(Self::RevokedBy),
+            "SCOPED_TO_REPO" => Some(Self::ScopedToRepo),
             "RELATES_TO" => Some(Self::RelatesTo),
             _ => None,
         }
@@ -1443,6 +1684,12 @@ impl EdgeLabel {
             Self::ReferencesTask => "REFERENCES_TASK",
             Self::Contradicts => "CONTRADICTS",
             Self::Supersedes => "SUPERSEDES",
+            Self::ProposedBy => "PROPOSED_BY",
+            Self::PromptedFor => "PROMPTED_FOR",
+            Self::DecidedOn => "DECIDED_ON",
+            Self::MaterializedAs => "MATERIALIZED_AS",
+            Self::RevokedBy => "REVOKED_BY",
+            Self::ScopedToRepo => "SCOPED_TO_REPO",
             Self::RelatesTo => "RELATES_TO",
         }
     }
@@ -1552,6 +1799,24 @@ pub fn semantic_stable_id(parts: &[&str]) -> String {
     }
     format!(
         "semantic:v{SEMANTIC_SCHEMA_VERSION}:{}",
+        hasher.finalize().to_hex()
+    )
+}
+
+/// Builds a stable user-context record ID.
+///
+/// Uses the `user_context:v1:` prefix so authorization-derived records cannot
+/// collide with code, memory, verification, artifact, project, or semantic IDs.
+/// Documented in `docs/schema/user-context.md`.
+#[must_use]
+pub fn user_context_stable_id(parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!(
+        "user_context:v{USER_CONTEXT_SCHEMA_VERSION}:{}",
         hasher.finalize().to_hex()
     )
 }

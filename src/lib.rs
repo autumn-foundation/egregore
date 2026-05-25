@@ -45,8 +45,9 @@ pub use ir::{
     EvidenceLink, Graph, GraphRecord, IdentitySource, MetricKind, NodeKind, NodeProvenance,
     PROJECT_SCHEMA_VERSION, PatchHandle, RepositoryIdentityPayload, SCHEMA_VERSION,
     SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, SelectionBasis,
-    SemanticDriftMetadata, SourceSpan, TemporalMetadata, agent_memory_stable_id,
-    artifact_stable_id, semantic_stable_id, stable_id,
+    SemanticDriftMetadata, SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION,
+    UserContextFields, UserContextScope, agent_memory_stable_id, artifact_stable_id,
+    semantic_stable_id, stable_id, user_context_stable_id,
 };
 pub use schema_version::{
     RecordLineRead, RecordReadError, RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE,
