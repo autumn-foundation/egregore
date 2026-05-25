@@ -322,7 +322,7 @@ removing a label is a schema version bump.
 | `DRIFTS_PRIOR` | `semantic` | `codegraph` | `SemanticDrift` | `File`, `Symbol` | many:1 | no |
 | `MEASURED_BY` | `semantic` | `semantic` | `SemanticDrift` | `EmbeddingModel` | many:1 | no |
 | `CONTRADICTS` | `agent_memory`, `verification` | any | any | any | many:many | yes |
-| `PROPOSED_BY` | `user_context` | `agent_memory` | `PromoteCandidate` | `Observation` | many:many | yes |
+| `PROPOSED_BY` | `user_context` | `agent_memory` | `PromoteCandidate` | `Observation`, `AgentTurn`, `Decision` | many:many | yes |
 | `PROMPTED_FOR` | `user_context` | `user_context` | `PromotionPrompt` | `PromoteCandidate` | many:1 | no |
 | `DECIDED_ON` | `user_context` | `user_context` | `PromotionDecision` | `PromoteCandidate` | many:1 | no |
 | `MATERIALIZED_AS` | `user_context` | `user_context` | `PromotionDecision` | `Preference`, `WorkflowRule`, `NamingDecision`, `Constraint` | many:1 | no |

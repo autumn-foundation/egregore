@@ -2993,6 +2993,12 @@ const USER_CONTEXT_DURABLE_NODE_KINDS: &[NodeKind] = &[
     NodeKind::Constraint,
 ];
 
+const USER_CONTEXT_PROPOSED_BY_TARGET_KINDS: &[NodeKind] = &[
+    NodeKind::Observation,
+    NodeKind::AgentTurn,
+    NodeKind::Decision,
+];
+
 const USER_CONTEXT_EDGE_LABELS: &[EdgeLabel] = &[
     EdgeLabel::ProposedBy,
     EdgeLabel::PromptedFor,
@@ -3000,6 +3006,15 @@ const USER_CONTEXT_EDGE_LABELS: &[EdgeLabel] = &[
     EdgeLabel::MaterializedAs,
     EdgeLabel::RevokedBy,
     EdgeLabel::Contradicts,
+    EdgeLabel::ScopedToRepo,
+];
+
+const USER_CONTEXT_ONLY_EDGE_LABELS: &[EdgeLabel] = &[
+    EdgeLabel::ProposedBy,
+    EdgeLabel::PromptedFor,
+    EdgeLabel::DecidedOn,
+    EdgeLabel::MaterializedAs,
+    EdgeLabel::RevokedBy,
     EdgeLabel::ScopedToRepo,
 ];
 
@@ -3196,17 +3211,8 @@ fn validate_promote_candidate(
         .supporting_evidence
         .as_deref()
         .ok_or_else(|| ApiError::missing_field("PromoteCandidate.supporting_evidence"))?;
-    if supporting.len() < USER_CONTEXT_PROMOTION_EVIDENCE_THRESHOLD_N {
-        return Err(ApiError::new(
-            ErrorCode::InsufficientPromotionEvidence,
-            format!(
-                "PromoteCandidate '{id}' has {} supporting observations; at least {} are required",
-                supporting.len(),
-                USER_CONTEXT_PROMOTION_EVIDENCE_THRESHOLD_N
-            ),
-        ));
-    }
     let mut sessions = BTreeSet::new();
+    let mut unique_supporting_targets = BTreeSet::new();
     let mut edges = Vec::new();
     for link in supporting {
         validate_supporting_evidence_link(id, link, records, sink, &mut sessions)?;
@@ -3214,12 +3220,24 @@ fn validate_promote_candidate(
             .target_record_id
             .as_deref()
             .expect("validated support link should have target");
-        edges.push(user_context_edge(
-            EdgeLabel::ProposedBy,
-            id,
-            target,
-            Some(link.confidence.clone()),
-            "PromoteCandidate proposed by Observation",
+        if unique_supporting_targets.insert(target) {
+            edges.push(user_context_edge(
+                EdgeLabel::ProposedBy,
+                id,
+                target,
+                Some(link.confidence.clone()),
+                "PromoteCandidate proposed by Observation",
+            ));
+        }
+    }
+    if unique_supporting_targets.len() < USER_CONTEXT_PROMOTION_EVIDENCE_THRESHOLD_N {
+        return Err(ApiError::new(
+            ErrorCode::InsufficientPromotionEvidence,
+            format!(
+                "PromoteCandidate '{id}' has {} unique supporting observations; at least {} are required",
+                unique_supporting_targets.len(),
+                USER_CONTEXT_PROMOTION_EVIDENCE_THRESHOLD_N
+            ),
         ));
     }
     if sessions.len() < USER_CONTEXT_PROMOTION_EVIDENCE_THRESHOLD_K {
@@ -3366,7 +3384,7 @@ fn validate_promotion_decision(
         user_context.prompt_id.as_deref(),
         "PromotionDecision.prompt_id",
     )?;
-    require_kind(prompt_id, NodeKind::PromotionPrompt, records, sink)?;
+    require_prompt_for_candidate(prompt_id, candidate_id, records, sink)?;
     let outcome = required_str(user_context.outcome.as_deref(), "PromotionDecision.outcome")?;
     validate_enum(
         "PromotionDecision.outcome",
@@ -3422,6 +3440,48 @@ fn validate_promotion_decision(
     Ok(())
 }
 
+fn require_prompt_for_candidate(
+    prompt_id: &str,
+    candidate_id: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    let prompt = lookup_record(prompt_id, records, sink)?.ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::UnresolvedEvidenceTarget,
+            format!("record '{prompt_id}' not found"),
+        )
+    })?;
+    match prompt {
+        GraphRecord::Node {
+            kind: NodeKind::PromotionPrompt,
+            user_context,
+            ..
+        } => {
+            let prompt_candidate_id = required_str(
+                user_context.candidate_id.as_deref(),
+                "PromotionPrompt.candidate_id",
+            )?;
+            if prompt_candidate_id != candidate_id {
+                return Err(ApiError::bad_request(format!(
+                    "PromotionDecision.prompt_id '{prompt_id}' was issued for candidate \
+                     '{prompt_candidate_id}', not decided candidate '{candidate_id}'"
+                )));
+            }
+            Ok(())
+        }
+        GraphRecord::Node { kind, .. } => Err(ApiError::bad_request(format!(
+            "record '{prompt_id}' must be {}, got {}",
+            NodeKind::PromotionPrompt.as_str(),
+            kind.as_str()
+        ))),
+        _ => Err(ApiError::new(
+            ErrorCode::UnresolvedEvidenceTarget,
+            format!("record '{prompt_id}' not found"),
+        )),
+    }
+}
+
 fn validate_durable_user_context(
     id: &str,
     kind: NodeKind,
@@ -3469,7 +3529,11 @@ fn validate_durable_user_context(
     }
     match kind {
         NodeKind::Preference | NodeKind::WorkflowRule => {
+            require_durable_rule_kind(kind, user_context)?;
             required_str(user_context.rule_text.as_deref(), "durable.rule_text")?;
+            if kind == NodeKind::WorkflowRule {
+                require_workflow_rule_fields(user_context)?;
+            }
         }
         NodeKind::NamingDecision => {
             required_str(
@@ -3497,12 +3561,100 @@ fn validate_durable_user_context(
         }
         _ => {}
     }
+    validate_edited_approval_body(id, kind, user_context, approval_id, &decision_fields)?;
     validate_rfc3339_field(
         "durable.active_from",
         required_str(user_context.active_from.as_deref(), "durable.active_from")?,
     )?;
     if let Some(active_to) = user_context.active_to.as_deref() {
         validate_rfc3339_field("durable.active_to", active_to)?;
+    }
+    Ok(())
+}
+
+fn validate_edited_approval_body(
+    id: &str,
+    kind: NodeKind,
+    user_context: &UserContextFields,
+    approval_id: &str,
+    decision_fields: &UserContextFields,
+) -> WriteResult<()> {
+    if decision_fields.outcome.as_deref() != Some("edited_then_approved") {
+        return Ok(());
+    }
+
+    let edited_rule_text = required_str(
+        decision_fields.edited_rule_text.as_deref(),
+        "PromotionDecision.edited_rule_text",
+    )?;
+    let (field, durable_body) = match kind {
+        NodeKind::Preference | NodeKind::WorkflowRule => (
+            "durable.rule_text",
+            required_str(user_context.rule_text.as_deref(), "durable.rule_text")?,
+        ),
+        NodeKind::NamingDecision => (
+            "NamingDecision.canonical_name",
+            required_str(
+                user_context.canonical_name.as_deref(),
+                "NamingDecision.canonical_name",
+            )?,
+        ),
+        NodeKind::Constraint => (
+            "Constraint.constraint_text",
+            required_str(
+                user_context.constraint_text.as_deref(),
+                "Constraint.constraint_text",
+            )?,
+        ),
+        _ => return Ok(()),
+    };
+
+    if durable_body != edited_rule_text {
+        return Err(ApiError::bad_request(format!(
+            "{field} for durable record '{id}' must match PromotionDecision.edited_rule_text \
+             from '{approval_id}'"
+        )));
+    }
+
+    Ok(())
+}
+
+fn require_workflow_rule_fields(user_context: &UserContextFields) -> WriteResult<()> {
+    let triggers = user_context
+        .triggers
+        .as_ref()
+        .filter(|triggers| !triggers.is_empty())
+        .ok_or_else(|| ApiError::missing_field("WorkflowRule.triggers"))?;
+    if triggers.iter().any(String::is_empty) {
+        return Err(ApiError::bad_request(
+            "WorkflowRule.triggers entries must not be empty",
+        ));
+    }
+    required_str(
+        user_context.action_summary.as_deref(),
+        "WorkflowRule.action_summary",
+    )?;
+    Ok(())
+}
+
+fn require_durable_rule_kind(
+    kind: NodeKind,
+    user_context: &UserContextFields,
+) -> WriteResult<()> {
+    let expected = match kind {
+        NodeKind::Preference => "preference",
+        NodeKind::WorkflowRule => "workflow_rule",
+        _ => return Ok(()),
+    };
+    let actual = required_str(
+        user_context.proposed_rule_kind.as_deref(),
+        "durable.proposed_rule_kind",
+    )?;
+    if actual != expected {
+        return Err(ApiError::bad_request(format!(
+            "durable.proposed_rule_kind must be '{expected}' for {}, got '{actual}'",
+            kind.as_str()
+        )));
     }
     Ok(())
 }
@@ -3541,7 +3693,7 @@ fn validate_user_context_edge(
             source_kind,
             target_kind,
             &[NodeKind::PromoteCandidate],
-            &[NodeKind::Observation],
+            USER_CONTEXT_PROPOSED_BY_TARGET_KINDS,
         ),
         EdgeLabel::PromptedFor => require_edge_kinds(
             edge_id,
@@ -4864,6 +5016,15 @@ fn validate_and_synthesize_evidence_edges(
             .map_err(|_| ApiError::internal("embedded sink lock poisoned"))?;
         let mut resolved = Vec::new();
         for record in records {
+            if let GraphRecord::Edge { id, label, .. } = record
+                && !id.starts_with("user_context:v1:")
+                && USER_CONTEXT_ONLY_EDGE_LABELS.contains(label)
+            {
+                return Err(ApiError::bad_request(format!(
+                    "edge '{id}' uses user-context-only label '{}'; use a user_context:v1: edge",
+                    label.as_str()
+                )));
+            }
             // Reject evidence-link labels on codegraph edges — they must go through the
             // agent-memory envelope and its cross-domain checks, not the codegraph path.
             if let GraphRecord::Edge { id, label, .. } = record

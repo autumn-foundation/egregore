@@ -2775,6 +2775,62 @@ fn preference_json(id: &str, approval_decision_id: Option<&str>) -> serde_json::
     })
 }
 
+fn durable_rule_json(
+    kind: &str,
+    id: &str,
+    approval_decision_id: &str,
+    proposed_rule_kind: &str,
+) -> serde_json::Value {
+    let mut record = serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": kind,
+        "schema_version": USER_CONTEXT_SCHEMA_VERSION,
+        "domain": "user_context",
+        "rule_text": "Use thiserror for library errors.",
+        "proposed_rule_kind": proposed_rule_kind,
+        "scope": {
+            "language": "rust"
+        },
+        "approval_decision_id": approval_decision_id,
+        "active_from": "2026-05-24T00:00:30Z",
+        "summary": format!("{kind} {id}")
+    });
+    if kind == "WorkflowRule" {
+        let object = record
+            .as_object_mut()
+            .expect("durable rule fixture should be a JSON object");
+        object.insert(
+            "triggers".to_owned(),
+            serde_json::json!(["pre_commit", "pre_pr"]),
+        );
+        object.insert(
+            "action_summary".to_owned(),
+            serde_json::json!("Prefer thiserror for library error types."),
+        );
+    }
+    record
+}
+
+fn user_context_edge_json(
+    id: &str,
+    label: &str,
+    source: &str,
+    target: &str,
+    confidence: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "edge",
+        "id": id,
+        "schema_version": USER_CONTEXT_SCHEMA_VERSION,
+        "label": label,
+        "source": source,
+        "target": target,
+        "confidence": confidence,
+        "summary": format!("{label} {source} -> {target}")
+    })
+}
+
 fn verification_record_json(id: &str) -> serde_json::Value {
     serde_json::json!({
         "record_type": "node",
@@ -3678,6 +3734,24 @@ fn all_edge_labels_have_documented_schema() {
     };
 }
 
+#[test]
+fn user_context_only_labels_are_not_generic_evidence_links() {
+    for label in [
+        EdgeLabel::ProposedBy,
+        EdgeLabel::PromptedFor,
+        EdgeLabel::DecidedOn,
+        EdgeLabel::MaterializedAs,
+        EdgeLabel::RevokedBy,
+        EdgeLabel::ScopedToRepo,
+    ] {
+        assert!(
+            !label.is_evidence_link_label(),
+            "{} is user-context-only and must not be accepted as a generic evidence link",
+            label.as_str()
+        );
+    }
+}
+
 // -- Schema conformance: issue #19 ------------------------------------------------
 
 #[test]
@@ -3725,7 +3799,7 @@ fn user_context_schema_doc_is_cross_linked_and_names_contract() {
 fn user_context_edge_registry_rows_are_documented() {
     let registry = read_repo_text("docs/schema/agent-memory.md");
     for needle in [
-        "| `PROPOSED_BY` | `user_context` | `agent_memory` | `PromoteCandidate` | `Observation` | many:many | yes |",
+        "| `PROPOSED_BY` | `user_context` | `agent_memory` | `PromoteCandidate` | `Observation`, `AgentTurn`, `Decision` | many:many | yes |",
         "| `PROMPTED_FOR` | `user_context` | `user_context` | `PromotionPrompt` | `PromoteCandidate` | many:1 | no |",
         "| `DECIDED_ON` | `user_context` | `user_context` | `PromotionDecision` | `PromoteCandidate` | many:1 | no |",
         "| `MATERIALIZED_AS` | `user_context` | `user_context` | `PromotionDecision` | `Preference`, `WorkflowRule`, `NamingDecision`, `Constraint` | many:1 | no |",
@@ -3813,6 +3887,59 @@ fn promote_candidate_with_insufficient_evidence_is_rejected() {
 }
 
 #[test]
+fn promote_candidate_counts_unique_supporting_evidence_for_threshold() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_promotion_evidence(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "promotion-duplicate-supporting-evidence",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "promotion-duplicate-supporting-evidence",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": {
+                "records": [promote_candidate_json(
+                    "user_context:v1:candidate-duplicate-supporting-evidence",
+                    "Use thiserror for library errors.",
+                    &[
+                        "agent_memory:v1:obs-1",
+                        "agent_memory:v1:obs-2",
+                        "agent_memory:v1:obs-2",
+                    ],
+                    None
+                )]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "duplicated supporting evidence must not satisfy the evidence threshold, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "insufficient_promotion_evidence",
+        "duplicate evidence threshold failure should use documented code, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unique supporting observations")),
+        "duplicate evidence rejection should explain unique evidence count, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
 fn promote_candidate_supporting_evidence_accepts_agent_turn_and_decision_targets() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -3877,6 +4004,182 @@ fn promote_candidate_supporting_evidence_accepts_agent_turn_and_decision_targets
 }
 
 #[test]
+fn direct_proposed_by_edges_accept_all_supported_evidence_target_kinds() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_memory_nodes(
+        &data_dir,
+        &[
+            (
+                "agent_memory:v1:obs-direct-support",
+                NodeKind::Observation,
+                "session-a",
+                "Use thiserror for library errors.",
+            ),
+            (
+                "agent_memory:v1:turn-direct-support",
+                NodeKind::AgentTurn,
+                "session-b",
+                "AgentTurn with preference-shaped correction.",
+            ),
+            (
+                "agent_memory:v1:decision-direct-support",
+                NodeKind::Decision,
+                "session-c",
+                "Decision with preference-shaped correction.",
+            ),
+        ],
+    );
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let candidate_id = "user_context:v1:candidate-direct-evidence-edge";
+
+    let candidate_response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "seed-direct-proposed-by-candidate",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "seed-direct-proposed-by-candidate",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": {
+                "records": [promote_candidate_json(
+                    candidate_id,
+                    "Use thiserror for library errors.",
+                    &[
+                        "agent_memory:v1:obs-direct-support",
+                        "agent_memory:v1:turn-direct-support",
+                        "agent_memory:v1:decision-direct-support",
+                    ],
+                    None
+                )]
+            }
+        }),
+    );
+    assert!(
+        candidate_response.starts_with("HTTP/1.1 200"),
+        "seed candidate with supported evidence targets should be accepted, got {candidate_response}"
+    );
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "direct-proposed-by-supported-targets",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "direct-proposed-by-supported-targets",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:01Z",
+            "payload": {
+                "records": [
+                    user_context_edge_json(
+                        "user_context:v1:explicit-proposed-by-observation",
+                        "PROPOSED_BY",
+                        candidate_id,
+                        "agent_memory:v1:obs-direct-support",
+                        Some("1.0"),
+                    ),
+                    user_context_edge_json(
+                        "user_context:v1:explicit-proposed-by-agent-turn",
+                        "PROPOSED_BY",
+                        candidate_id,
+                        "agent_memory:v1:turn-direct-support",
+                        Some("1.0"),
+                    ),
+                    user_context_edge_json(
+                        "user_context:v1:explicit-proposed-by-decision",
+                        "PROPOSED_BY",
+                        candidate_id,
+                        "agent_memory:v1:decision-direct-support",
+                        Some("1.0"),
+                    )
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "direct PROPOSED_BY edges should accept Observation, AgentTurn, and Decision targets, got {response}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn agent_memory_edges_reject_user_context_only_labels() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_agent_memory_nodes(
+        &data_dir,
+        &[
+            (
+                "agent_memory:v1:user-context-label-source",
+                NodeKind::AgentSession,
+                "session-a",
+                "AgentSession used as malformed edge source.",
+            ),
+            (
+                "agent_memory:v1:user-context-label-target",
+                NodeKind::AgentTurn,
+                "session-a",
+                "AgentTurn used as malformed edge target.",
+            ),
+        ],
+    );
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "agent-memory-user-context-label-edge",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "agent-memory-user-context-label-edge",
+            "domain": "agent_memory",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "edge",
+                    "id": "agent_memory:v1:malformed-prompted-for-edge",
+                    "schema_version": AGENT_MEMORY_SCHEMA_VERSION,
+                    "label": "PROMPTED_FOR",
+                    "source": "agent_memory:v1:user-context-label-source",
+                    "target": "agent_memory:v1:user-context-label-target",
+                    "summary": "Malformed user-context relation in agent-memory edge envelope"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "agent-memory edge should reject user-context-only label, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "user-context-only agent-memory edge should fail with bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("user-context-only")),
+        "error should explain that the label is user-context-only, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
 fn durable_user_context_without_approval_is_rejected() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -3909,6 +4212,298 @@ fn durable_user_context_without_approval_is_rejected() {
     );
 
     daemon.stop();
+}
+
+#[test]
+fn promotion_decision_prompt_must_match_decided_candidate() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_promotion_evidence(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let candidate_a = "user_context:v1:candidate-decision-a";
+    let candidate_b = "user_context:v1:candidate-prompt-b";
+    let prompt_for_b = "user_context:v1:prompt-for-b";
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "decision-prompt-candidate-mismatch",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "decision-prompt-candidate-mismatch",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": {
+                "records": [
+                    promote_candidate_json(candidate_a, "Use thiserror for library errors.", &[
+                        "agent_memory:v1:obs-1",
+                        "agent_memory:v1:obs-2",
+                        "agent_memory:v1:obs-3",
+                    ], None),
+                    promote_candidate_json(candidate_b, "Prefer thiserror in library crates.", &[
+                        "agent_memory:v1:obs-4",
+                        "agent_memory:v1:obs-5",
+                        "agent_memory:v1:obs-6",
+                    ], None),
+                    promotion_prompt_json(prompt_for_b, candidate_b),
+                    promotion_decision_json(
+                        "user_context:v1:decision-for-a-with-prompt-b",
+                        candidate_a,
+                        prompt_for_b,
+                        "rejected",
+                        None,
+                    )
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "decision must not reference a prompt issued for another candidate, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "candidate/prompt mismatch should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("PromotionDecision.prompt_id")),
+        "candidate/prompt mismatch should name PromotionDecision.prompt_id, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn edited_approval_durable_rule_body_must_match_decision() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_promotion_evidence(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let candidate_id = "user_context:v1:candidate-edited-body";
+    let prompt_id = "user_context:v1:prompt-edited-body";
+    let decision_id = "user_context:v1:decision-edited-body";
+    let durable_id = "user_context:v1:preference-edited-body";
+    let mut decision = promotion_decision_json(
+        decision_id,
+        candidate_id,
+        prompt_id,
+        "edited_then_approved",
+        Some(durable_id),
+    );
+    decision["edited_rule_text"] = serde_json::json!("Use anyhow for application errors.");
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "edited-approval-body-mismatch",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "edited-approval-body-mismatch",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": {
+                "records": [
+                    promote_candidate_json(candidate_id, "Prefer thiserror for library errors.", &[
+                        "agent_memory:v1:obs-1",
+                        "agent_memory:v1:obs-2",
+                        "agent_memory:v1:obs-3",
+                    ], None),
+                    promotion_prompt_json(prompt_id, candidate_id),
+                    decision,
+                    preference_json(durable_id, Some(decision_id))
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "durable rule body must match edited approval text, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "edited approval body mismatch should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("PromotionDecision.edited_rule_text")),
+        "edited approval body mismatch should name PromotionDecision.edited_rule_text, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn durable_rule_rejects_mismatched_proposed_rule_kind() {
+    for (kind, expected_rule_kind, mismatched_rule_kind, suffix) in [
+        ("Preference", "preference", "workflow_rule", "preference"),
+        ("WorkflowRule", "workflow_rule", "preference", "workflow"),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("store");
+        seed_promotion_evidence(&data_dir);
+        let mut daemon = start_daemon(&data_dir);
+        let metadata = read_metadata(&data_dir);
+        let candidate_id = format!("user_context:v1:candidate-kind-{suffix}");
+        let prompt_id = format!("user_context:v1:prompt-kind-{suffix}");
+        let decision_id = format!("user_context:v1:decision-kind-{suffix}");
+        let durable_id = format!("user_context:v1:durable-kind-{suffix}");
+        let mut candidate = promote_candidate_json(
+            &candidate_id,
+            "Use thiserror for library errors.",
+            &[
+                "agent_memory:v1:obs-1",
+                "agent_memory:v1:obs-2",
+                "agent_memory:v1:obs-3",
+            ],
+            None,
+        );
+        candidate["proposed_rule_kind"] = serde_json::json!(expected_rule_kind);
+
+        let response = http_json(
+            &metadata,
+            "POST",
+            "/v1/records/ingest",
+            &serde_json::json!({
+                "request_id": format!("durable-kind-mismatch-{suffix}"),
+                "agent_id": "test-agent",
+                "session_id": "test-session",
+                "idempotency_key": format!("durable-kind-mismatch-{suffix}"),
+                "domain": "user_context",
+                "created_at": "2026-05-24T00:00:00Z",
+                "payload": {
+                    "records": [
+                        candidate,
+                        promotion_prompt_json(&prompt_id, &candidate_id),
+                        promotion_decision_json(
+                            &decision_id,
+                            &candidate_id,
+                            &prompt_id,
+                            "approved",
+                            Some(&durable_id),
+                        ),
+                        durable_rule_json(
+                            kind,
+                            &durable_id,
+                            &decision_id,
+                            mismatched_rule_kind,
+                        )
+                    ]
+                }
+            }),
+        );
+
+        assert!(
+            !response.starts_with("HTTP/1.1 200"),
+            "{kind} must reject proposed_rule_kind={mismatched_rule_kind}, got {response}"
+        );
+        let body = response_json(&response);
+        assert_eq!(
+            body["error"]["code"], "bad_request",
+            "{kind} proposed_rule_kind mismatch should be a bad_request, got {body}"
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("durable.proposed_rule_kind")),
+            "{kind} proposed_rule_kind mismatch should name durable.proposed_rule_kind, got {body}"
+        );
+
+        daemon.stop();
+    }
+}
+
+#[test]
+fn workflow_rule_requires_triggers_and_action_summary() {
+    for (missing_field, suffix) in [
+        ("triggers", "missing-triggers"),
+        ("action_summary", "missing-action-summary"),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("store");
+        seed_promotion_evidence(&data_dir);
+        let mut daemon = start_daemon(&data_dir);
+        let metadata = read_metadata(&data_dir);
+        let candidate_id = format!("user_context:v1:candidate-workflow-{suffix}");
+        let prompt_id = format!("user_context:v1:prompt-workflow-{suffix}");
+        let decision_id = format!("user_context:v1:decision-workflow-{suffix}");
+        let durable_id = format!("user_context:v1:workflow-rule-{suffix}");
+        let mut candidate = promote_candidate_json(
+            &candidate_id,
+            "Run cargo test before opening a PR.",
+            &[
+                "agent_memory:v1:obs-1",
+                "agent_memory:v1:obs-2",
+                "agent_memory:v1:obs-3",
+            ],
+            None,
+        );
+        candidate["proposed_rule_kind"] = serde_json::json!("workflow_rule");
+        let mut workflow_rule =
+            durable_rule_json("WorkflowRule", &durable_id, &decision_id, "workflow_rule");
+        workflow_rule
+            .as_object_mut()
+            .expect("WorkflowRule fixture should be an object")
+            .remove(missing_field);
+
+        let response = http_json(
+            &metadata,
+            "POST",
+            "/v1/records/ingest",
+            &serde_json::json!({
+                "request_id": format!("workflow-rule-required-{suffix}"),
+                "agent_id": "test-agent",
+                "session_id": "test-session",
+                "idempotency_key": format!("workflow-rule-required-{suffix}"),
+                "domain": "user_context",
+                "created_at": "2026-05-24T00:00:00Z",
+                "payload": {
+                    "records": [
+                        candidate,
+                        promotion_prompt_json(&prompt_id, &candidate_id),
+                        promotion_decision_json(
+                            &decision_id,
+                            &candidate_id,
+                            &prompt_id,
+                            "approved",
+                            Some(&durable_id),
+                        ),
+                        workflow_rule
+                    ]
+                }
+            }),
+        );
+
+        assert!(
+            !response.starts_with("HTTP/1.1 200"),
+            "WorkflowRule missing {missing_field} should be rejected, got {response}"
+        );
+        let body = response_json(&response);
+        assert_eq!(
+            body["error"]["code"], "missing_field",
+            "WorkflowRule missing {missing_field} should use missing_field, got {body}"
+        );
+        assert_eq!(
+            body["error"]["field"],
+            format!("WorkflowRule.{missing_field}"),
+            "WorkflowRule missing {missing_field} should name the missing field, got {body}"
+        );
+
+        daemon.stop();
+    }
 }
 
 #[test]

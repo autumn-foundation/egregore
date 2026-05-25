@@ -1621,12 +1621,6 @@ impl EdgeLabel {
                 | Self::ReferencesTask
                 | Self::Contradicts
                 | Self::Supersedes
-                | Self::ProposedBy
-                | Self::PromptedFor
-                | Self::DecidedOn
-                | Self::MaterializedAs
-                | Self::RevokedBy
-                | Self::ScopedToRepo
                 | Self::RelatesTo
         )
     }

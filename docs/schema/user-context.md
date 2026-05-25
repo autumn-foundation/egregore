@@ -91,7 +91,7 @@ PromoteCandidate record shape
 | `proposed_rule_kind` | enum | yes | `preference`, `workflow_rule`, `naming_decision`, `constraint`; additive. `revocation` is reserved for approved revocation flows. |
 | `scope` | object | yes | See §2. |
 | `confidence` | float `[0.0, 1.0]` | yes | Derived from evidence aggregation. |
-| `supporting_evidence` | `EvidenceLink[]` | yes | Links to `Observation`/`AgentTurn`/`Decision` records that triggered the proposal. Minimum length is the configured threshold. |
+| `supporting_evidence` | `EvidenceLink[]` | yes | Links to `Observation`/`AgentTurn`/`Decision` records that triggered the proposal. Minimum unique target count is the configured threshold. |
 | `contradicting_evidence` | `EvidenceLink[]` | yes | Conflicting observations or prior `PromotionDecision` records; MAY be empty. |
 | `superseded_by` | record ID | no | Later candidate or rejected candidate this candidate refines/replaces. |
 | `evidence_quality` | enum | yes | `verbatim`, `summarized`, `referenced_only` from issue #11. |
@@ -204,7 +204,7 @@ audit trail is the product.
 
 ## 7 - Candidate-Aggregation Rule
 
-Evidence threshold: a `PromoteCandidate` requires at least `N` supporting
+Evidence threshold: a `PromoteCandidate` requires at least `N` unique supporting
 observations from at least `K` distinct sessions. Defaults: `N = 3`, `K = 2`.
 These thresholds are configuration knobs, not schema contracts. Changing them
 does not bump `schema_version`.
@@ -298,7 +298,7 @@ schema contributes these rows:
 
 | Label | FROM domain(s) | TO domain(s) | FROM kind(s) | TO kind(s) | Cardinality | `confidence` required |
 |-------|---------------|-------------|-------------|-----------|-------------|----------------------|
-| `PROPOSED_BY` | `user_context` | `agent_memory` | `PromoteCandidate` | `Observation` | many:many | yes |
+| `PROPOSED_BY` | `user_context` | `agent_memory` | `PromoteCandidate` | `Observation`, `AgentTurn`, `Decision` | many:many | yes |
 | `PROMPTED_FOR` | `user_context` | `user_context` | `PromotionPrompt` | `PromoteCandidate` | many:1 | no |
 | `DECIDED_ON` | `user_context` | `user_context` | `PromotionDecision` | `PromoteCandidate` | many:1 | no |
 | `MATERIALIZED_AS` | `user_context` | `user_context` | `PromotionDecision` | `Preference`, `WorkflowRule`, `NamingDecision`, `Constraint` | many:1 | no |
