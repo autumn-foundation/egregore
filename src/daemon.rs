@@ -3052,6 +3052,8 @@ fn validate_user_context_domain_records(
                 confidence,
                 superseded_by,
                 evidence_quality,
+                valid_time,
+                valid_time_source,
                 user_context,
                 ..
             } => {
@@ -3061,7 +3063,14 @@ fn validate_user_context_domain_records(
                 if !is_user_context {
                     continue;
                 }
-                validate_user_context_node_base(id, *kind, *schema_version, domain.as_deref())?;
+                validate_user_context_node_base(
+                    id,
+                    *kind,
+                    *schema_version,
+                    domain.as_deref(),
+                    valid_time.as_deref(),
+                    valid_time_source.as_deref(),
+                )?;
                 match kind {
                     NodeKind::PromoteCandidate => {
                         synthesized_edges.extend(validate_promote_candidate(
@@ -3162,18 +3171,22 @@ fn validate_user_context_node_base(
     kind: NodeKind,
     schema_version: u32,
     domain: Option<&str>,
+    valid_time: Option<&str>,
+    valid_time_source: Option<&str>,
 ) -> WriteResult<()> {
     if !id.starts_with("user_context:v1:") {
         return Err(ApiError::bad_request(format!(
             "user-context node '{id}' must use a user_context:v1: ID"
         )));
     }
-    if let Some(domain) = domain
-        && domain != "user_context"
-    {
-        return Err(ApiError::bad_request(format!(
-            "user-context node '{id}' must carry domain 'user_context', got '{domain}'"
-        )));
+    match domain {
+        Some("user_context") => {}
+        Some(domain) => {
+            return Err(ApiError::bad_request(format!(
+                "user-context node '{id}' must carry domain 'user_context', got '{domain}'"
+            )));
+        }
+        None => return Err(ApiError::missing_field("domain")),
     }
     if schema_version != USER_CONTEXT_SCHEMA_VERSION {
         return Err(ApiError::bad_request(format!(
@@ -3186,6 +3199,8 @@ fn validate_user_context_node_base(
             kind.as_str()
         )));
     }
+    validate_rfc3339_field("valid_time", required_str(valid_time, "valid_time")?)?;
+    required_str(valid_time_source, "valid_time_source")?;
     Ok(())
 }
 
@@ -3271,7 +3286,14 @@ fn validate_promote_candidate(
         .as_deref()
         .ok_or_else(|| ApiError::missing_field("PromoteCandidate.contradicting_evidence"))?;
     for link in contradicting {
-        validate_contradicting_evidence_link(id, link, records, sink)?;
+        let target_id = validate_contradicting_evidence_link(id, link, records, sink)?;
+        edges.push(user_context_edge(
+            EdgeLabel::Contradicts,
+            id,
+            &target_id,
+            Some(link.confidence.clone()),
+            "PromoteCandidate contradicts durable user-context record",
+        ));
     }
     if let Some(rejected_id) = superseded_by {
         validate_superseded_rejection(id, rejected_id, records, sink)?;
@@ -3332,7 +3354,7 @@ fn validate_contradicting_evidence_link(
     link: &EvidenceLink,
     records: &[GraphRecord],
     sink: &EmbeddedAletheiaSink,
-) -> WriteResult<()> {
+) -> WriteResult<String> {
     if link.target_domain != "user_context" || link.relation != EdgeLabel::Contradicts.as_str() {
         return Err(ApiError::bad_request(format!(
             "PromoteCandidate.contradicting_evidence for '{candidate_id}' must use \
@@ -3350,7 +3372,9 @@ fn validate_contradicting_evidence_link(
             ApiError::missing_field("PromoteCandidate.contradicting_evidence[].target_record_id")
         })?;
     match lookup_node_kind(target_id, records, sink)? {
-        Some(kind) if USER_CONTEXT_CONTRADICTS_TARGET_KINDS.contains(&kind) => Ok(()),
+        Some(kind) if USER_CONTEXT_CONTRADICTS_TARGET_KINDS.contains(&kind) => {
+            Ok(target_id.to_owned())
+        }
         Some(kind) => Err(ApiError::bad_request(format!(
             "PromoteCandidate.contradicting_evidence target '{target_id}' must be a Preference \
              or WorkflowRule, got {}",
@@ -3447,15 +3471,13 @@ fn validate_promotion_decision(
         user_context.decided_by.as_deref(),
         "PromotionDecision.decided_by",
     )?;
-    match outcome {
-        "approved" => {
-            required_str(
+    let materialized_record_id = match outcome {
+        "approved" => Some(required_str(
                 user_context.materialized_record_id.as_deref(),
                 "PromotionDecision.materialized_record_id",
-            )?;
-        }
+            )?),
         "edited_then_approved" => {
-            required_str(
+            let materialized_record_id = required_str(
                 user_context.materialized_record_id.as_deref(),
                 "PromotionDecision.materialized_record_id",
             )?;
@@ -3463,13 +3485,23 @@ fn validate_promotion_decision(
                 user_context.edited_rule_text.as_deref(),
                 "PromotionDecision.edited_rule_text",
             )?;
+            Some(materialized_record_id)
         }
         _ if user_context.materialized_record_id.is_some() => {
             return Err(ApiError::bad_request(format!(
                 "PromotionDecision.materialized_record_id must be null when outcome is {outcome}"
             )));
         }
-        _ => {}
+        _ => None,
+    };
+    if let Some(materialized_record_id) = materialized_record_id {
+        require_kind_in(
+            "PromotionDecision.materialized_record_id",
+            materialized_record_id,
+            USER_CONTEXT_DURABLE_NODE_KINDS,
+            records,
+            sink,
+        )?;
     }
     if id == candidate_id || id == prompt_id {
         return Err(ApiError::bad_request(
@@ -3634,28 +3666,46 @@ fn validate_durable_approval_body(
     records: &[GraphRecord],
     sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<()> {
-    let (expected_field, expected_body) = match decision_fields.outcome.as_deref() {
+    let outcome = decision_fields.outcome.as_deref();
+    let approval_candidate = if matches!(outcome, Some("approved" | "edited_then_approved")) {
+        let candidate_id = required_str(
+            decision_fields.candidate_id.as_deref(),
+            "PromotionDecision.candidate_id",
+        )?;
+        let candidate = lookup_record(candidate_id, records, sink)?.ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::UnresolvedEvidenceTarget,
+                format!("approval candidate '{candidate_id}' not found"),
+            )
+        })?;
+        let GraphRecord::Node {
+            kind: NodeKind::PromoteCandidate,
+            user_context: candidate_fields,
+            ..
+        } = &candidate
+        else {
+            return Err(ApiError::bad_request(format!(
+                "PromotionDecision.candidate_id '{candidate_id}' does not reference a \
+                 PromoteCandidate"
+            )));
+        };
+        require_candidate_rule_kind_matches_durable(kind, candidate_fields)?;
+        Some(candidate)
+    } else {
+        None
+    };
+
+    let (expected_field, expected_body) = match outcome {
         Some("approved") => {
-            let candidate_id = required_str(
-                decision_fields.candidate_id.as_deref(),
-                "PromotionDecision.candidate_id",
-            )?;
-            let candidate = lookup_record(candidate_id, records, sink)?.ok_or_else(|| {
-                ApiError::new(
-                    ErrorCode::UnresolvedEvidenceTarget,
-                    format!("approval candidate '{candidate_id}' not found"),
-                )
-            })?;
             let GraphRecord::Node {
                 kind: NodeKind::PromoteCandidate,
                 user_context: candidate_fields,
                 ..
-            } = candidate
+            } = approval_candidate
+                .as_ref()
+                .expect("approved outcome should load candidate above")
             else {
-                return Err(ApiError::bad_request(format!(
-                    "PromotionDecision.candidate_id '{candidate_id}' does not reference a \
-                     PromoteCandidate"
-                )));
+                unreachable!("approved outcome candidate kind was checked above");
             };
             (
                 "PromoteCandidate.proposed_rule_text",
@@ -3757,10 +3807,8 @@ fn require_durable_rule_kind(
     kind: NodeKind,
     user_context: &UserContextFields,
 ) -> WriteResult<()> {
-    let expected = match kind {
-        NodeKind::Preference => "preference",
-        NodeKind::WorkflowRule => "workflow_rule",
-        _ => return Ok(()),
+    let Some(expected) = proposed_rule_kind_for_durable(kind) else {
+        return Ok(());
     };
     let actual = required_str(
         user_context.proposed_rule_kind.as_deref(),
@@ -3773,6 +3821,36 @@ fn require_durable_rule_kind(
         )));
     }
     Ok(())
+}
+
+fn require_candidate_rule_kind_matches_durable(
+    durable_kind: NodeKind,
+    candidate_fields: &UserContextFields,
+) -> WriteResult<()> {
+    let Some(expected) = proposed_rule_kind_for_durable(durable_kind) else {
+        return Ok(());
+    };
+    let actual = required_str(
+        candidate_fields.proposed_rule_kind.as_deref(),
+        "PromoteCandidate.proposed_rule_kind",
+    )?;
+    if actual != expected {
+        return Err(ApiError::bad_request(format!(
+            "PromoteCandidate.proposed_rule_kind must be '{expected}' when materializing {}, got '{actual}'",
+            durable_kind.as_str()
+        )));
+    }
+    Ok(())
+}
+
+const fn proposed_rule_kind_for_durable(kind: NodeKind) -> Option<&'static str> {
+    match kind {
+        NodeKind::Preference => Some("preference"),
+        NodeKind::WorkflowRule => Some("workflow_rule"),
+        NodeKind::NamingDecision => Some("naming_decision"),
+        NodeKind::Constraint => Some("constraint"),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3932,6 +4010,33 @@ fn require_kind(
         None => Err(ApiError::new(
             ErrorCode::UnresolvedEvidenceTarget,
             format!("record '{id}' not found"),
+        )),
+    }
+}
+
+fn require_kind_in(
+    field: &'static str,
+    id: &str,
+    expected: &[NodeKind],
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    match lookup_node_kind(id, records, sink)? {
+        Some(actual) if expected.contains(&actual) => Ok(()),
+        Some(actual) => {
+            let expected_kinds = expected
+                .iter()
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(ApiError::bad_request(format!(
+                "{field} '{id}' must reference one of [{expected_kinds}], got {}",
+                actual.as_str()
+            )))
+        }
+        None => Err(ApiError::new(
+            ErrorCode::UnresolvedEvidenceTarget,
+            format!("{field} target '{id}' not found"),
         )),
     }
 }
@@ -7134,7 +7239,13 @@ fn handle_job_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse
         Some(d)
             if !matches!(
                 d,
-                "codegraph" | "agent_memory" | "verification" | "artifact" | "project" | "semantic"
+                "codegraph"
+                    | "agent_memory"
+                    | "verification"
+                    | "artifact"
+                    | "project"
+                    | "semantic"
+                    | "user_context"
             ) =>
         {
             return HttpResponse::error_with_id(&request_id, ApiError::invalid_domain());

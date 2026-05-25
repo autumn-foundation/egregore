@@ -2008,6 +2008,55 @@ fn daemon_job_ingest_rejects_same_key_with_different_payload() {
 }
 
 #[test]
+fn daemon_job_ingest_accepts_user_context_domain() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_promotion_evidence(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/jobs/ingest",
+        &serde_json::json!({
+            "request_id": "job-user-context",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "job-user-context-key",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": {
+                "records": [promote_candidate_json(
+                    "user_context:v1:candidate-job-ingest",
+                    "Use thiserror for library errors.",
+                    &[
+                        "agent_memory:v1:obs-1",
+                        "agent_memory:v1:obs-2",
+                        "agent_memory:v1:obs-3",
+                    ],
+                    None
+                )]
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 202"),
+        "async user_context ingest should be accepted like sync ingest, got {response}"
+    );
+    let job_id = response_json(&response)["result"]["job_id"]
+        .as_str()
+        .expect("job response should include id")
+        .to_owned();
+    let job_status = wait_for_job(&metadata, &job_id);
+    assert_eq!(job_status["status"], "completed");
+    assert_eq!(job_status["report"]["failed"], 0);
+
+    daemon.stop();
+}
+
+#[test]
 fn daemon_ingest_idempotency_keys_are_scoped_by_agent_session() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -2729,6 +2778,8 @@ fn promotion_prompt_json(id: &str, candidate_id: &str) -> serde_json::Value {
         "prompt_text": "Save this preference?",
         "prompted_at": "2026-05-24T00:00:10Z",
         "prompted_to": "operator",
+        "valid_time": "2026-05-24T00:00:10Z",
+        "valid_time_source": "prompted_at",
         "summary": format!("PromotionPrompt {id}")
     })
 }
@@ -2753,6 +2804,8 @@ fn promotion_decision_json(
         "decided_by": "operator",
         "decision_rationale": "Fixture decision",
         "materialized_record_id": materialized_record_id,
+        "valid_time": "2026-05-24T00:00:30Z",
+        "valid_time_source": "decided_at",
         "summary": format!("PromotionDecision {id}")
     })
 }
@@ -2771,6 +2824,8 @@ fn preference_json(id: &str, approval_decision_id: Option<&str>) -> serde_json::
         },
         "approval_decision_id": approval_decision_id,
         "active_from": "2026-05-24T00:00:30Z",
+        "valid_time": "2026-05-24T00:00:30Z",
+        "valid_time_source": "active_from",
         "summary": format!("Preference {id}")
     })
 }
@@ -2794,6 +2849,8 @@ fn durable_rule_json(
         },
         "approval_decision_id": approval_decision_id,
         "active_from": "2026-05-24T00:00:30Z",
+        "valid_time": "2026-05-24T00:00:30Z",
+        "valid_time_source": "active_from",
         "summary": format!("{kind} {id}")
     });
     if kind == "WorkflowRule" {
@@ -2827,6 +2884,8 @@ fn naming_decision_json(id: &str, approval_decision_id: &str) -> serde_json::Val
         },
         "approval_decision_id": approval_decision_id,
         "active_from": "2026-05-24T00:00:30Z",
+        "valid_time": "2026-05-24T00:00:30Z",
+        "valid_time_source": "active_from",
         "summary": format!("NamingDecision {id}")
     })
 }
@@ -4141,6 +4200,79 @@ fn promote_candidate_requires_contradicting_evidence_field() {
 }
 
 #[test]
+fn user_context_nodes_require_domain() {
+    let mut candidate = promote_candidate_json(
+        "user_context:v1:candidate-missing-domain",
+        "Use thiserror for library errors.",
+        &[
+            "agent_memory:v1:obs-1",
+            "agent_memory:v1:obs-2",
+            "agent_memory:v1:obs-3",
+        ],
+        None,
+    );
+    candidate
+        .as_object_mut()
+        .expect("candidate fixture should be an object")
+        .remove("domain");
+
+    let response = ingest_user_context_records("candidate-missing-domain", &[candidate]);
+
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "user-context node without domain should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "missing user-context domain should use missing_field, got {body}"
+    );
+    assert_eq!(
+        body["error"]["field"], "domain",
+        "missing user-context domain should name domain, got {body}"
+    );
+}
+
+#[test]
+fn user_context_nodes_require_valid_time_fields() {
+    for (field, request_id) in [
+        ("valid_time", "candidate-missing-valid-time"),
+        ("valid_time_source", "candidate-missing-valid-time-source"),
+    ] {
+        let mut candidate = promote_candidate_json(
+            &format!("user_context:v1:{request_id}"),
+            "Use thiserror for library errors.",
+            &[
+                "agent_memory:v1:obs-1",
+                "agent_memory:v1:obs-2",
+                "agent_memory:v1:obs-3",
+            ],
+            None,
+        );
+        candidate
+            .as_object_mut()
+            .expect("candidate fixture should be an object")
+            .remove(field);
+
+        let response = ingest_user_context_records(request_id, &[candidate]);
+
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "user-context node without {field} should be rejected, got {response}"
+        );
+        let body = response_json(&response);
+        assert_eq!(
+            body["error"]["code"], "missing_field",
+            "missing {field} should use missing_field, got {body}"
+        );
+        assert_eq!(
+            body["error"]["field"], field,
+            "missing {field} should name {field}, got {body}"
+        );
+    }
+}
+
+#[test]
 fn promote_candidate_contradicting_evidence_validates_link_semantics() {
     let cases = [
         (
@@ -4233,6 +4365,81 @@ fn promote_candidate_contradicting_evidence_validates_link_semantics() {
     assert!(
         accepted.is_empty(),
         "invalid contradicting_evidence cases were accepted: {accepted:?}"
+    );
+}
+
+#[test]
+fn promote_candidate_contradicting_evidence_synthesizes_edges() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_promotion_evidence(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let durable_id = "user_context:v1:preference-contradicts-edge-target";
+    let mut records = approved_preference_records(
+        "user_context:v1:candidate-contradicts-edge-target",
+        "user_context:v1:prompt-contradicts-edge-target",
+        "user_context:v1:decision-contradicts-edge-target",
+        durable_id,
+    );
+    let contradicting_candidate_id = "user_context:v1:candidate-contradicts-edge-source";
+    let mut contradicting_candidate = promote_candidate_json(
+        contradicting_candidate_id,
+        "Stop using thiserror for library errors.",
+        &[
+            "agent_memory:v1:obs-4",
+            "agent_memory:v1:obs-5",
+            "agent_memory:v1:obs-6",
+        ],
+        None,
+    );
+    contradicting_candidate["proposed_rule_kind"] = serde_json::json!("revocation");
+    contradicting_candidate["contradicting_evidence"] = serde_json::json!([{
+        "target_record_id": durable_id,
+        "target_domain": "user_context",
+        "relation": "CONTRADICTS",
+        "confidence": "0.9"
+    }]);
+    records.push(contradicting_candidate);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "contradicting-evidence-synth-edge",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "contradicting-evidence-synth-edge",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": { "records": records }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "candidate with valid contradicting evidence should ingest, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let stored = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        stored.iter().any(|record| {
+            matches!(
+                record,
+                GraphRecord::Edge {
+                    label: EdgeLabel::Contradicts,
+                    source,
+                    target,
+                    ..
+                } if source == contradicting_candidate_id && target == durable_id
+            )
+        }),
+        "contradicting_evidence should synthesize a traversable CONTRADICTS edge"
     );
 }
 
@@ -4514,6 +4721,87 @@ fn promotion_decision_prompt_must_match_decided_candidate() {
 }
 
 #[test]
+fn approved_promotion_decision_requires_materialized_target() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_promotion_evidence(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+    let candidate_id = "user_context:v1:candidate-missing-materialized-target";
+    let prompt_id = "user_context:v1:prompt-missing-materialized-target";
+    let decision_id = "user_context:v1:decision-missing-materialized-target";
+    let missing_durable_id = "user_context:v1:preference-missing-materialized-target";
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "decision-missing-materialized-target",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "decision-missing-materialized-target",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": {
+                "records": [
+                    promote_candidate_json(
+                        candidate_id,
+                        "Use thiserror for library errors.",
+                        &[
+                            "agent_memory:v1:obs-1",
+                            "agent_memory:v1:obs-2",
+                            "agent_memory:v1:obs-3",
+                        ],
+                        None
+                    ),
+                    promotion_prompt_json(prompt_id, candidate_id),
+                    promotion_decision_json(
+                        decision_id,
+                        candidate_id,
+                        prompt_id,
+                        "approved",
+                        Some(missing_durable_id)
+                    )
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 422"),
+        "approved decision with missing materialized target should be rejected before write, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "unresolved_evidence_target",
+        "missing materialized target should use unresolved_evidence_target, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("PromotionDecision.materialized_record_id")),
+        "missing materialized target should name PromotionDecision.materialized_record_id, got {body}"
+    );
+
+    daemon.stop();
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let stored = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        stored.iter().all(|record| {
+            !matches!(
+                record,
+                GraphRecord::Node { id, .. }
+                    if id == candidate_id || id == prompt_id || id == decision_id
+            )
+        }),
+        "pre-validation failure must not leave a partial approval audit chain"
+    );
+}
+
+#[test]
 fn edited_approval_durable_rule_body_must_match_decision() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -4746,6 +5034,35 @@ fn durable_rule_rejects_mismatched_proposed_rule_kind() {
 
         daemon.stop();
     }
+}
+
+#[test]
+fn approved_durable_rejects_mismatched_candidate_rule_kind() {
+    let mut records = approved_preference_records(
+        "user_context:v1:candidate-approved-kind-mismatch",
+        "user_context:v1:prompt-approved-kind-mismatch",
+        "user_context:v1:decision-approved-kind-mismatch",
+        "user_context:v1:preference-approved-kind-mismatch",
+    );
+    records[0]["proposed_rule_kind"] = serde_json::json!("revocation");
+
+    let response = ingest_user_context_records("approved-candidate-kind-mismatch", &records);
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "approved Preference must reject a candidate proposed_rule_kind=revocation, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "candidate/durable kind mismatch should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("PromoteCandidate.proposed_rule_kind")),
+        "candidate/durable kind mismatch should name PromoteCandidate.proposed_rule_kind, got {body}"
+    );
 }
 
 #[test]
