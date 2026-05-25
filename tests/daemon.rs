@@ -2913,6 +2913,35 @@ fn approved_preference_records(
     ]
 }
 
+fn approved_revocation_records(
+    candidate_id: &str,
+    prompt_id: &str,
+    decision_id: &str,
+    durable_id: &str,
+) -> Vec<serde_json::Value> {
+    let mut candidate = promote_candidate_json(
+        candidate_id,
+        "Revoke the preference to use thiserror for library errors.",
+        &[
+            "agent_memory:v1:obs-1",
+            "agent_memory:v1:obs-2",
+            "agent_memory:v1:obs-3",
+        ],
+        None,
+    );
+    candidate["proposed_rule_kind"] = serde_json::json!("revocation");
+
+    let mut durable = preference_json(durable_id, Some(decision_id));
+    durable["active_to"] = serde_json::json!("2026-05-24T00:00:30Z");
+
+    vec![
+        candidate,
+        promotion_prompt_json(prompt_id, candidate_id),
+        promotion_decision_json(decision_id, candidate_id, prompt_id, "approved", Some(durable_id)),
+        durable,
+    ]
+}
+
 fn ingest_user_context_records(request_id: &str, records: &[serde_json::Value]) -> String {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -4620,6 +4649,64 @@ fn agent_memory_edges_reject_user_context_only_labels() {
 }
 
 #[test]
+fn non_user_context_nodes_reject_user_context_fields() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "agent-memory-user-context-field-leak",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "agent-memory-user-context-field-leak",
+            "domain": "agent_memory",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "agent_memory:v1:turn-with-user-context-fields",
+                    "kind": "AgentTurn",
+                    "schema_version": AGENT_MEMORY_SCHEMA_VERSION,
+                    "domain": "agent_memory",
+                    "agent_id": "test-agent",
+                    "agent_kind": "codex",
+                    "session_id": "session-a",
+                    "observed_at": "2026-05-24T00:00:00Z",
+                    "ingested_at": "2026-05-24T00:00:00Z",
+                    "valid_time": "2026-05-24T00:00:00Z",
+                    "valid_time_source": "observation_observed_at",
+                    "proposed_rule_kind": "preference",
+                    "summary": "Agent-memory node with leaked user-context fields"
+                }]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "non-user-context node must reject flattened user-context fields, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "leaked user-context fields should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("user-context fields")),
+        "error should explain that user-context fields are domain-local, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
 fn durable_user_context_without_approval_is_rejected() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -4798,6 +4885,171 @@ fn approved_promotion_decision_requires_materialized_target() {
             )
         }),
         "pre-validation failure must not leave a partial approval audit chain"
+    );
+}
+
+#[test]
+fn direct_decided_on_edge_must_match_decision_candidate() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_promotion_evidence(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let candidate_a = "user_context:v1:candidate-decided-edge-a";
+    let candidate_b = "user_context:v1:candidate-decided-edge-b";
+    let prompt_a = "user_context:v1:prompt-decided-edge-a";
+    let decision_id = "user_context:v1:decision-decided-edge-a";
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "direct-decided-on-target-mismatch",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "direct-decided-on-target-mismatch",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": {
+                "records": [
+                    promote_candidate_json(candidate_a, "Use thiserror for library errors.", &[
+                        "agent_memory:v1:obs-1",
+                        "agent_memory:v1:obs-2",
+                        "agent_memory:v1:obs-3",
+                    ], None),
+                    promote_candidate_json(candidate_b, "Prefer thiserror in library crates.", &[
+                        "agent_memory:v1:obs-4",
+                        "agent_memory:v1:obs-5",
+                        "agent_memory:v1:obs-6",
+                    ], None),
+                    promotion_prompt_json(prompt_a, candidate_a),
+                    promotion_decision_json(decision_id, candidate_a, prompt_a, "rejected", None),
+                    user_context_edge_json(
+                        "user_context:v1:explicit-decided-on-wrong-candidate",
+                        "DECIDED_ON",
+                        decision_id,
+                        candidate_b,
+                        None,
+                    )
+                ]
+            }
+        }),
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "DECIDED_ON edge target must match PromotionDecision.candidate_id, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "DECIDED_ON payload mismatch should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("PromotionDecision.candidate_id")),
+        "DECIDED_ON mismatch should name PromotionDecision.candidate_id, got {body}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn direct_materialized_as_edge_must_match_decision_payload() {
+    let mut records = approved_preference_records(
+        "user_context:v1:candidate-materialized-edge-a",
+        "user_context:v1:prompt-materialized-edge-a",
+        "user_context:v1:decision-materialized-edge-a",
+        "user_context:v1:preference-materialized-edge-a",
+    );
+    records.extend(approved_preference_records(
+        "user_context:v1:candidate-materialized-edge-b",
+        "user_context:v1:prompt-materialized-edge-b",
+        "user_context:v1:decision-materialized-edge-b",
+        "user_context:v1:preference-materialized-edge-b",
+    ));
+    records.push(user_context_edge_json(
+        "user_context:v1:explicit-materialized-as-wrong-target",
+        "MATERIALIZED_AS",
+        "user_context:v1:decision-materialized-edge-a",
+        "user_context:v1:preference-materialized-edge-b",
+        None,
+    ));
+
+    let response = ingest_user_context_records("direct-materialized-as-target-mismatch", &records);
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "MATERIALIZED_AS target must match PromotionDecision.materialized_record_id, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "MATERIALIZED_AS payload mismatch should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("PromotionDecision.materialized_record_id")),
+        "MATERIALIZED_AS mismatch should name PromotionDecision.materialized_record_id, got {body}"
+    );
+}
+
+#[test]
+fn direct_materialized_as_edge_requires_approval_outcome() {
+    let mut records = approved_preference_records(
+        "user_context:v1:candidate-materialized-edge-target",
+        "user_context:v1:prompt-materialized-edge-target",
+        "user_context:v1:decision-materialized-edge-target",
+        "user_context:v1:preference-materialized-edge-target",
+    );
+    let rejected_candidate_id = "user_context:v1:candidate-materialized-rejected-source";
+    let rejected_prompt_id = "user_context:v1:prompt-materialized-rejected-source";
+    let rejected_decision_id = "user_context:v1:decision-materialized-rejected-source";
+    records.push(promote_candidate_json(
+        rejected_candidate_id,
+        "Use thiserror for library errors.",
+        &[
+            "agent_memory:v1:obs-4",
+            "agent_memory:v1:obs-5",
+            "agent_memory:v1:obs-6",
+        ],
+        None,
+    ));
+    records.push(promotion_prompt_json(rejected_prompt_id, rejected_candidate_id));
+    records.push(promotion_decision_json(
+        rejected_decision_id,
+        rejected_candidate_id,
+        rejected_prompt_id,
+        "rejected",
+        None,
+    ));
+    records.push(user_context_edge_json(
+        "user_context:v1:explicit-materialized-as-rejected-source",
+        "MATERIALIZED_AS",
+        rejected_decision_id,
+        "user_context:v1:preference-materialized-edge-target",
+        None,
+    ));
+
+    let response = ingest_user_context_records("direct-materialized-as-rejected-source", &records);
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "MATERIALIZED_AS edge must require an approved decision, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "MATERIALIZED_AS non-approval should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("PromotionDecision.outcome")),
+        "MATERIALIZED_AS non-approval should name PromotionDecision.outcome, got {body}"
     );
 }
 
@@ -5044,13 +5296,13 @@ fn approved_durable_rejects_mismatched_candidate_rule_kind() {
         "user_context:v1:decision-approved-kind-mismatch",
         "user_context:v1:preference-approved-kind-mismatch",
     );
-    records[0]["proposed_rule_kind"] = serde_json::json!("revocation");
+    records[0]["proposed_rule_kind"] = serde_json::json!("workflow_rule");
 
     let response = ingest_user_context_records("approved-candidate-kind-mismatch", &records);
 
     assert!(
         !response.starts_with("HTTP/1.1 200"),
-        "approved Preference must reject a candidate proposed_rule_kind=revocation, got {response}"
+        "approved Preference must reject a non-revocation kind mismatch, got {response}"
     );
     let body = response_json(&response);
     assert_eq!(
@@ -5062,6 +5314,210 @@ fn approved_durable_rejects_mismatched_candidate_rule_kind() {
             .as_str()
             .is_some_and(|message| message.contains("PromoteCandidate.proposed_rule_kind")),
         "candidate/durable kind mismatch should name PromoteCandidate.proposed_rule_kind, got {body}"
+    );
+}
+
+#[test]
+fn approved_revocation_deactivates_durable_and_synthesizes_revoked_by() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_promotion_evidence(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let decision_id = "user_context:v1:decision-approved-revocation";
+    let durable_id = "user_context:v1:preference-approved-revocation";
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "approved-revocation-synthesizes-revoked-by",
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": "approved-revocation-synthesizes-revoked-by",
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": {
+                "records": approved_revocation_records(
+                    "user_context:v1:candidate-approved-revocation",
+                    "user_context:v1:prompt-approved-revocation",
+                    decision_id,
+                    durable_id,
+                )
+            }
+        }),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "approved revocation should deactivate the durable record, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let stored = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        stored.iter().any(|record| {
+            matches!(
+                record,
+                GraphRecord::Edge {
+                    label: EdgeLabel::RevokedBy,
+                    source,
+                    target,
+                    ..
+                } if source == durable_id && target == decision_id
+            )
+        }),
+        "approved revocation should synthesize durable -> decision REVOKED_BY"
+    );
+    assert!(
+        stored.iter().all(|record| {
+            !matches!(
+                record,
+                GraphRecord::Edge {
+                    label: EdgeLabel::MaterializedAs,
+                    source,
+                    target,
+                    ..
+                } if source == decision_id && target == durable_id
+            )
+        }),
+        "approved revocation must not synthesize decision -> durable MATERIALIZED_AS"
+    );
+}
+
+#[test]
+fn direct_materialized_as_edge_rejects_revocation_decisions() {
+    let mut records = approved_revocation_records(
+        "user_context:v1:candidate-explicit-revocation-materialized",
+        "user_context:v1:prompt-explicit-revocation-materialized",
+        "user_context:v1:decision-explicit-revocation-materialized",
+        "user_context:v1:preference-explicit-revocation-materialized",
+    );
+    records.push(user_context_edge_json(
+        "user_context:v1:explicit-materialized-as-revocation",
+        "MATERIALIZED_AS",
+        "user_context:v1:decision-explicit-revocation-materialized",
+        "user_context:v1:preference-explicit-revocation-materialized",
+        None,
+    ));
+
+    let response =
+        ingest_user_context_records("direct-materialized-as-revocation-decision", &records);
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "revocation decisions must use REVOKED_BY rather than MATERIALIZED_AS, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "MATERIALIZED_AS revocation edge should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("revocation")),
+        "MATERIALIZED_AS revocation edge should explain revocation semantics, got {body}"
+    );
+}
+
+#[test]
+fn direct_revoked_by_edge_requires_revocation_decision_for_source() {
+    let mut records = approved_preference_records(
+        "user_context:v1:candidate-explicit-false-revocation",
+        "user_context:v1:prompt-explicit-false-revocation",
+        "user_context:v1:decision-explicit-false-revocation",
+        "user_context:v1:preference-explicit-false-revocation",
+    );
+    records.push(user_context_edge_json(
+        "user_context:v1:explicit-revoked-by-non-revocation",
+        "REVOKED_BY",
+        "user_context:v1:preference-explicit-false-revocation",
+        "user_context:v1:decision-explicit-false-revocation",
+        None,
+    ));
+
+    let response = ingest_user_context_records("direct-revoked-by-non-revocation", &records);
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "REVOKED_BY edge must reference an approved revocation decision for the source, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "false REVOKED_BY edge should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("revocation")),
+        "false REVOKED_BY edge should explain revocation semantics, got {body}"
+    );
+}
+
+#[test]
+fn direct_revoked_by_edge_requires_approved_revocation_decision() {
+    let mut records = approved_preference_records(
+        "user_context:v1:candidate-explicit-revoked-target",
+        "user_context:v1:prompt-explicit-revoked-target",
+        "user_context:v1:decision-explicit-revoked-target",
+        "user_context:v1:preference-explicit-revoked-target",
+    );
+    let revocation_candidate_id = "user_context:v1:candidate-rejected-revocation-edge";
+    let revocation_prompt_id = "user_context:v1:prompt-rejected-revocation-edge";
+    let revocation_decision_id = "user_context:v1:decision-rejected-revocation-edge";
+    let mut revocation_candidate = promote_candidate_json(
+        revocation_candidate_id,
+        "Revoke the preference to use thiserror for library errors.",
+        &[
+            "agent_memory:v1:obs-4",
+            "agent_memory:v1:obs-5",
+            "agent_memory:v1:obs-6",
+        ],
+        None,
+    );
+    revocation_candidate["proposed_rule_kind"] = serde_json::json!("revocation");
+    records.push(revocation_candidate);
+    records.push(promotion_prompt_json(
+        revocation_prompt_id,
+        revocation_candidate_id,
+    ));
+    records.push(promotion_decision_json(
+        revocation_decision_id,
+        revocation_candidate_id,
+        revocation_prompt_id,
+        "rejected",
+        None,
+    ));
+    records.push(user_context_edge_json(
+        "user_context:v1:explicit-revoked-by-rejected-decision",
+        "REVOKED_BY",
+        "user_context:v1:preference-explicit-revoked-target",
+        revocation_decision_id,
+        None,
+    ));
+
+    let response = ingest_user_context_records("direct-revoked-by-rejected-decision", &records);
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "REVOKED_BY edge must require an approved revocation decision, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "rejected REVOKED_BY edge should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("PromotionDecision.outcome")),
+        "rejected REVOKED_BY edge should name PromotionDecision.outcome, got {body}"
     );
 }
 

@@ -3061,6 +3061,11 @@ fn validate_user_context_domain_records(
                     || domain.as_deref() == Some("user_context")
                     || USER_CONTEXT_NODE_KINDS.contains(kind);
                 if !is_user_context {
+                    if !user_context.is_empty() {
+                        return Err(ApiError::bad_request(format!(
+                            "non-user-context node '{id}' must not carry user-context fields"
+                        )));
+                    }
                     continue;
                 }
                 validate_user_context_node_base(
@@ -3113,16 +3118,31 @@ fn validate_user_context_domain_records(
                             user_context.outcome.as_deref(),
                             Some("approved" | "edited_then_approved")
                         ) {
-                            synthesized_edges.push(user_context_edge(
-                                EdgeLabel::MaterializedAs,
-                                id,
-                                required_str(
-                                    user_context.materialized_record_id.as_deref(),
-                                    "PromotionDecision.materialized_record_id",
-                                )?,
-                                None,
-                                "PromotionDecision materialized durable user-context record",
-                            ));
+                            let materialized_id = required_str(
+                                user_context.materialized_record_id.as_deref(),
+                                "PromotionDecision.materialized_record_id",
+                            )?;
+                            if promotion_decision_uses_revocation_candidate(
+                                user_context,
+                                records,
+                                &sink_guard,
+                            )? {
+                                synthesized_edges.push(user_context_edge(
+                                    EdgeLabel::RevokedBy,
+                                    materialized_id,
+                                    id,
+                                    None,
+                                    "PromotionDecision revoked durable user-context record",
+                                ));
+                            } else {
+                                synthesized_edges.push(user_context_edge(
+                                    EdgeLabel::MaterializedAs,
+                                    id,
+                                    materialized_id,
+                                    None,
+                                    "PromotionDecision materialized durable user-context record",
+                                ));
+                            }
                         }
                     }
                     NodeKind::Preference
@@ -3689,6 +3709,11 @@ fn validate_durable_approval_body(
                  PromoteCandidate"
             )));
         };
+        if candidate_fields.proposed_rule_kind.as_deref() == Some("revocation") {
+            let active_to = required_str(user_context.active_to.as_deref(), "durable.active_to")?;
+            validate_rfc3339_field("durable.active_to", active_to)?;
+            return Ok(());
+        }
         require_candidate_rule_kind_matches_durable(kind, candidate_fields)?;
         Some(candidate)
     } else {
@@ -3897,30 +3922,39 @@ fn validate_user_context_edge(
             &[NodeKind::PromotionPrompt],
             &[NodeKind::PromoteCandidate],
         ),
-        EdgeLabel::DecidedOn => require_edge_kinds(
-            edge_id,
-            label,
-            source_kind,
-            target_kind,
-            &[NodeKind::PromotionDecision],
-            &[NodeKind::PromoteCandidate],
-        ),
-        EdgeLabel::MaterializedAs => require_edge_kinds(
-            edge_id,
-            label,
-            source_kind,
-            target_kind,
-            &[NodeKind::PromotionDecision],
-            USER_CONTEXT_DURABLE_NODE_KINDS,
-        ),
-        EdgeLabel::RevokedBy => require_edge_kinds(
-            edge_id,
-            label,
-            source_kind,
-            target_kind,
-            USER_CONTEXT_DURABLE_NODE_KINDS,
-            &[NodeKind::PromotionDecision],
-        ),
+        EdgeLabel::DecidedOn => {
+            require_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                target_kind,
+                &[NodeKind::PromotionDecision],
+                &[NodeKind::PromoteCandidate],
+            )?;
+            validate_decided_on_edge_payload(edge_id, source, target, records, sink)
+        }
+        EdgeLabel::MaterializedAs => {
+            require_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                target_kind,
+                &[NodeKind::PromotionDecision],
+                USER_CONTEXT_DURABLE_NODE_KINDS,
+            )?;
+            validate_materialized_as_edge_payload(edge_id, source, target, records, sink)
+        }
+        EdgeLabel::RevokedBy => {
+            require_edge_kinds(
+                edge_id,
+                label,
+                source_kind,
+                target_kind,
+                USER_CONTEXT_DURABLE_NODE_KINDS,
+                &[NodeKind::PromotionDecision],
+            )?;
+            validate_revoked_by_edge_payload(edge_id, source, target, records, sink)
+        }
         EdgeLabel::Contradicts => require_edge_kinds(
             edge_id,
             label,
@@ -3939,6 +3973,211 @@ fn validate_user_context_edge(
         ),
         _ => Ok(()),
     }
+}
+
+fn validate_decided_on_edge_payload(
+    edge_id: &str,
+    source_decision_id: &str,
+    target_candidate_id: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    let decision_fields = lookup_user_context_fields_for_kind(
+        source_decision_id,
+        NodeKind::PromotionDecision,
+        records,
+        sink,
+        "DECIDED_ON source",
+    )?;
+    let candidate_id = required_str(
+        decision_fields.candidate_id.as_deref(),
+        "PromotionDecision.candidate_id",
+    )?;
+    if candidate_id != target_candidate_id {
+        return Err(ApiError::bad_request(format!(
+            "DECIDED_ON edge '{edge_id}' target '{target_candidate_id}' must equal \
+             PromotionDecision.candidate_id '{candidate_id}'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_materialized_as_edge_payload(
+    edge_id: &str,
+    source_decision_id: &str,
+    target_durable_id: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    let decision_fields = lookup_user_context_fields_for_kind(
+        source_decision_id,
+        NodeKind::PromotionDecision,
+        records,
+        sink,
+        "MATERIALIZED_AS source",
+    )?;
+    require_approved_decision_outcome(edge_id, EdgeLabel::MaterializedAs, &decision_fields)?;
+    require_decision_materialized_target(
+        edge_id,
+        EdgeLabel::MaterializedAs,
+        &decision_fields,
+        target_durable_id,
+    )?;
+    if promotion_decision_uses_revocation_candidate(&decision_fields, records, sink)? {
+        return Err(ApiError::bad_request(format!(
+            "MATERIALIZED_AS edge '{edge_id}' cannot represent a revocation decision; use \
+             REVOKED_BY from the durable record to the decision"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_revoked_by_edge_payload(
+    edge_id: &str,
+    source_durable_id: &str,
+    target_decision_id: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<()> {
+    let decision_fields = lookup_user_context_fields_for_kind(
+        target_decision_id,
+        NodeKind::PromotionDecision,
+        records,
+        sink,
+        "REVOKED_BY target",
+    )?;
+    require_approved_decision_outcome(edge_id, EdgeLabel::RevokedBy, &decision_fields)?;
+    require_decision_materialized_target(
+        edge_id,
+        EdgeLabel::RevokedBy,
+        &decision_fields,
+        source_durable_id,
+    )?;
+    if !promotion_decision_uses_revocation_candidate(&decision_fields, records, sink)? {
+        return Err(ApiError::bad_request(format!(
+            "REVOKED_BY edge '{edge_id}' requires PromotionDecision.candidate_id to reference a \
+             revocation PromoteCandidate"
+        )));
+    }
+
+    let (_, durable_fields) = lookup_user_context_node_fields(
+        source_durable_id,
+        records,
+        sink,
+        "REVOKED_BY source",
+    )?;
+    let active_to = required_str(durable_fields.active_to.as_deref(), "durable.active_to")?;
+    validate_rfc3339_field("durable.active_to", active_to)
+}
+
+fn require_approved_decision_outcome(
+    edge_id: &str,
+    label: EdgeLabel,
+    decision_fields: &UserContextFields,
+) -> WriteResult<()> {
+    if matches!(
+        decision_fields.outcome.as_deref(),
+        Some("approved" | "edited_then_approved")
+    ) {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(format!(
+        "{} edge '{edge_id}' requires PromotionDecision.outcome to be approved or \
+         edited_then_approved",
+        label.as_str()
+    )))
+}
+
+fn require_decision_materialized_target(
+    edge_id: &str,
+    label: EdgeLabel,
+    decision_fields: &UserContextFields,
+    expected_target_id: &str,
+) -> WriteResult<()> {
+    let materialized_id = required_str(
+        decision_fields.materialized_record_id.as_deref(),
+        "PromotionDecision.materialized_record_id",
+    )?;
+    if materialized_id != expected_target_id {
+        return Err(ApiError::bad_request(format!(
+            "{} edge '{edge_id}' endpoint '{expected_target_id}' must equal \
+             PromotionDecision.materialized_record_id '{materialized_id}'",
+            label.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn promotion_decision_uses_revocation_candidate(
+    decision_fields: &UserContextFields,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<bool> {
+    let candidate_fields = promotion_decision_candidate_fields(decision_fields, records, sink)?;
+    let proposed_rule_kind = required_str(
+        candidate_fields.proposed_rule_kind.as_deref(),
+        "PromoteCandidate.proposed_rule_kind",
+    )?;
+    Ok(proposed_rule_kind == "revocation")
+}
+
+fn promotion_decision_candidate_fields(
+    decision_fields: &UserContextFields,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<UserContextFields> {
+    let candidate_id = required_str(
+        decision_fields.candidate_id.as_deref(),
+        "PromotionDecision.candidate_id",
+    )?;
+    lookup_user_context_fields_for_kind(
+        candidate_id,
+        NodeKind::PromoteCandidate,
+        records,
+        sink,
+        "PromotionDecision.candidate_id",
+    )
+}
+
+fn lookup_user_context_fields_for_kind(
+    id: &str,
+    expected_kind: NodeKind,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+    context: &str,
+) -> WriteResult<UserContextFields> {
+    let (actual_kind, fields) = lookup_user_context_node_fields(id, records, sink, context)?;
+    if actual_kind != expected_kind {
+        return Err(ApiError::bad_request(format!(
+            "{context} '{id}' must reference a {}, got {}",
+            expected_kind.as_str(),
+            actual_kind.as_str()
+        )));
+    }
+    Ok(fields)
+}
+
+fn lookup_user_context_node_fields(
+    id: &str,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+    context: &str,
+) -> WriteResult<(NodeKind, UserContextFields)> {
+    let record = lookup_record(id, records, sink)?.ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::UnresolvedEvidenceTarget,
+            format!("{context} '{id}' does not resolve to a graph record"),
+        )
+    })?;
+    let GraphRecord::Node {
+        kind, user_context, ..
+    } = record
+    else {
+        return Err(ApiError::bad_request(format!(
+            "{context} '{id}' must reference a node record"
+        )));
+    };
+    Ok((kind, user_context))
 }
 
 fn require_edge_kinds(
