@@ -2812,6 +2812,74 @@ fn durable_rule_json(
     record
 }
 
+fn naming_decision_json(id: &str, approval_decision_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "NamingDecision",
+        "schema_version": USER_CONTEXT_SCHEMA_VERSION,
+        "domain": "user_context",
+        "entity_kind": "type",
+        "canonical_name": "ResultAlias",
+        "alternatives_rejected": [],
+        "scope": {
+            "language": "rust"
+        },
+        "approval_decision_id": approval_decision_id,
+        "active_from": "2026-05-24T00:00:30Z",
+        "summary": format!("NamingDecision {id}")
+    })
+}
+
+fn approved_preference_records(
+    candidate_id: &str,
+    prompt_id: &str,
+    decision_id: &str,
+    durable_id: &str,
+) -> Vec<serde_json::Value> {
+    vec![
+        promote_candidate_json(
+            candidate_id,
+            "Use thiserror for library errors.",
+            &[
+                "agent_memory:v1:obs-1",
+                "agent_memory:v1:obs-2",
+                "agent_memory:v1:obs-3",
+            ],
+            None,
+        ),
+        promotion_prompt_json(prompt_id, candidate_id),
+        promotion_decision_json(decision_id, candidate_id, prompt_id, "approved", Some(durable_id)),
+        preference_json(durable_id, Some(decision_id)),
+    ]
+}
+
+fn ingest_user_context_records(request_id: &str, records: &[serde_json::Value]) -> String {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    seed_promotion_evidence(&data_dir);
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": request_id,
+            "agent_id": "test-agent",
+            "session_id": "test-session",
+            "idempotency_key": request_id,
+            "domain": "user_context",
+            "created_at": "2026-05-24T00:00:00Z",
+            "payload": { "records": records }
+        }),
+    );
+
+    daemon.stop();
+    response
+}
+
 fn user_context_edge_json(
     id: &str,
     label: &str,
@@ -4004,6 +4072,171 @@ fn promote_candidate_supporting_evidence_accepts_agent_turn_and_decision_targets
 }
 
 #[test]
+fn promote_candidate_requires_scope() {
+    let mut candidate = promote_candidate_json(
+        "user_context:v1:candidate-missing-scope",
+        "Use thiserror for library errors.",
+        &[
+            "agent_memory:v1:obs-1",
+            "agent_memory:v1:obs-2",
+            "agent_memory:v1:obs-3",
+        ],
+        None,
+    );
+    candidate
+        .as_object_mut()
+        .expect("candidate fixture should be an object")
+        .remove("scope");
+
+    let response = ingest_user_context_records("candidate-missing-scope", &[candidate]);
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "PromoteCandidate without scope should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "missing candidate scope should use missing_field, got {body}"
+    );
+    assert_eq!(
+        body["error"]["field"], "PromoteCandidate.scope",
+        "missing candidate scope should name PromoteCandidate.scope, got {body}"
+    );
+}
+
+#[test]
+fn promote_candidate_requires_contradicting_evidence_field() {
+    let mut candidate = promote_candidate_json(
+        "user_context:v1:candidate-missing-contradictions",
+        "Use thiserror for library errors.",
+        &[
+            "agent_memory:v1:obs-1",
+            "agent_memory:v1:obs-2",
+            "agent_memory:v1:obs-3",
+        ],
+        None,
+    );
+    candidate
+        .as_object_mut()
+        .expect("candidate fixture should be an object")
+        .remove("contradicting_evidence");
+
+    let response =
+        ingest_user_context_records("candidate-missing-contradictions", &[candidate]);
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "PromoteCandidate without contradicting_evidence should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "missing contradicting_evidence should use missing_field, got {body}"
+    );
+    assert_eq!(
+        body["error"]["field"], "PromoteCandidate.contradicting_evidence",
+        "missing field should name PromoteCandidate.contradicting_evidence, got {body}"
+    );
+}
+
+#[test]
+fn promote_candidate_contradicting_evidence_validates_link_semantics() {
+    let cases = [
+        (
+            "wrong-relation",
+            "user_context:v1:preference-contradiction-target-wrong-relation",
+            "user_context",
+            "PROPOSED_BY",
+            "1.0",
+        ),
+        (
+            "wrong-domain",
+            "agent_memory:v1:obs-1",
+            "agent_memory",
+            "CONTRADICTS",
+            "1.0",
+        ),
+        (
+            "bad-confidence",
+            "user_context:v1:preference-contradiction-target-bad-confidence",
+            "user_context",
+            "CONTRADICTS",
+            "certain",
+        ),
+        (
+            "wrong-target-kind",
+            "user_context:v1:candidate-contradiction-wrong-target-kind",
+            "user_context",
+            "CONTRADICTS",
+            "1.0",
+        ),
+    ];
+    let mut accepted = Vec::new();
+
+    for (suffix, target_id, target_domain, relation, confidence) in cases {
+        let target_candidate_id = format!("user_context:v1:candidate-target-{suffix}");
+        let target_prompt_id = format!("user_context:v1:prompt-target-{suffix}");
+        let target_decision_id = format!("user_context:v1:decision-target-{suffix}");
+        let target_preference_id =
+            format!("user_context:v1:preference-contradiction-target-{suffix}");
+        let candidate_id = format!("user_context:v1:candidate-contradiction-{suffix}");
+        let mut candidate = promote_candidate_json(
+            &candidate_id,
+            "Stop applying the conflicting preference.",
+            &[
+                "agent_memory:v1:obs-4",
+                "agent_memory:v1:obs-5",
+                "agent_memory:v1:obs-6",
+            ],
+            None,
+        );
+        candidate["proposed_rule_kind"] = serde_json::json!("revocation");
+        candidate["contradicting_evidence"] = serde_json::json!([{
+            "target_record_id": if suffix == "wrong-target-kind" {
+                candidate_id.as_str()
+            } else {
+                target_id
+            },
+            "target_domain": target_domain,
+            "relation": relation,
+            "confidence": confidence
+        }]);
+
+        let mut records = approved_preference_records(
+            &target_candidate_id,
+            &target_prompt_id,
+            &target_decision_id,
+            &target_preference_id,
+        );
+        records.push(candidate);
+        let response =
+            ingest_user_context_records(&format!("contradicting-evidence-{suffix}"), &records);
+
+        if response.starts_with("HTTP/1.1 200") {
+            accepted.push(suffix);
+            continue;
+        }
+        let body = response_json(&response);
+        assert_eq!(
+            body["error"]["code"], "bad_request",
+            "invalid contradicting evidence should be a bad_request, got {body}"
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("PromoteCandidate.contradicting_evidence")),
+            "invalid contradicting evidence should name the field, got {body}"
+        );
+    }
+
+    assert!(
+        accepted.is_empty(),
+        "invalid contradicting_evidence cases were accepted: {accepted:?}"
+    );
+}
+
+#[test]
 fn direct_proposed_by_edges_accept_all_supported_evidence_target_kinds() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");
@@ -4347,6 +4580,95 @@ fn edited_approval_durable_rule_body_must_match_decision() {
 }
 
 #[test]
+fn approved_durable_rule_body_must_match_candidate_proposal() {
+    let mut records = approved_preference_records(
+        "user_context:v1:candidate-approved-body",
+        "user_context:v1:prompt-approved-body",
+        "user_context:v1:decision-approved-body",
+        "user_context:v1:preference-approved-body",
+    );
+    records[0]["proposed_rule_text"] =
+        serde_json::json!("Use anyhow for application errors.");
+
+    let response = ingest_user_context_records("approved-body-mismatch", &records);
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "durable rule body must match approved candidate proposal, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "approved body mismatch should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("PromoteCandidate.proposed_rule_text")),
+        "approved body mismatch should name PromoteCandidate.proposed_rule_text, got {body}"
+    );
+}
+
+#[test]
+fn durable_active_from_must_equal_approval_decided_at() {
+    let mut records = approved_preference_records(
+        "user_context:v1:candidate-active-from",
+        "user_context:v1:prompt-active-from",
+        "user_context:v1:decision-active-from",
+        "user_context:v1:preference-active-from",
+    );
+    records[3]["active_from"] = serde_json::json!("2026-05-24T00:01:30Z");
+
+    let response = ingest_user_context_records("durable-active-from-mismatch", &records);
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "durable active_from must equal approval decision time, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "active_from mismatch should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("durable.active_from")),
+        "active_from mismatch should name durable.active_from, got {body}"
+    );
+}
+
+#[test]
+fn durable_user_context_requires_scope() {
+    let mut records = approved_preference_records(
+        "user_context:v1:candidate-durable-scope",
+        "user_context:v1:prompt-durable-scope",
+        "user_context:v1:decision-durable-scope",
+        "user_context:v1:preference-durable-scope",
+    );
+    records[3]
+        .as_object_mut()
+        .expect("durable preference fixture should be an object")
+        .remove("scope");
+
+    let response = ingest_user_context_records("durable-missing-scope", &records);
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "durable user-context record without scope should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "missing durable scope should use missing_field, got {body}"
+    );
+    assert_eq!(
+        body["error"]["field"], "durable.scope",
+        "missing durable scope should name durable.scope, got {body}"
+    );
+}
+
+#[test]
 fn durable_rule_rejects_mismatched_proposed_rule_kind() {
     for (kind, expected_rule_kind, mismatched_rule_kind, suffix) in [
         ("Preference", "preference", "workflow_rule", "preference"),
@@ -4504,6 +4826,167 @@ fn workflow_rule_requires_triggers_and_action_summary() {
 
         daemon.stop();
     }
+}
+
+#[test]
+fn workflow_rule_rejects_unknown_trigger_values() {
+    let candidate_id = "user_context:v1:candidate-workflow-trigger";
+    let prompt_id = "user_context:v1:prompt-workflow-trigger";
+    let decision_id = "user_context:v1:decision-workflow-trigger";
+    let durable_id = "user_context:v1:workflow-trigger";
+    let mut candidate = promote_candidate_json(
+        candidate_id,
+        "Use thiserror for library errors.",
+        &[
+            "agent_memory:v1:obs-1",
+            "agent_memory:v1:obs-2",
+            "agent_memory:v1:obs-3",
+        ],
+        None,
+    );
+    candidate["proposed_rule_kind"] = serde_json::json!("workflow_rule");
+    let mut workflow_rule =
+        durable_rule_json("WorkflowRule", durable_id, decision_id, "workflow_rule");
+    workflow_rule["triggers"] = serde_json::json!(["pre_push"]);
+
+    let response = ingest_user_context_records(
+        "workflow-rule-invalid-trigger",
+        &[
+            candidate,
+            promotion_prompt_json(prompt_id, candidate_id),
+            promotion_decision_json(
+                decision_id,
+                candidate_id,
+                prompt_id,
+                "approved",
+                Some(durable_id),
+            ),
+            workflow_rule,
+        ],
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "WorkflowRule with an unknown trigger should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "unknown trigger should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("WorkflowRule.triggers")),
+        "unknown trigger rejection should name WorkflowRule.triggers, got {body}"
+    );
+}
+
+#[test]
+fn naming_decision_requires_alternatives_rejected() {
+    let candidate_id = "user_context:v1:candidate-naming-alternatives";
+    let prompt_id = "user_context:v1:prompt-naming-alternatives";
+    let decision_id = "user_context:v1:decision-naming-alternatives";
+    let durable_id = "user_context:v1:naming-alternatives";
+    let mut candidate = promote_candidate_json(
+        candidate_id,
+        "ResultAlias",
+        &[
+            "agent_memory:v1:obs-1",
+            "agent_memory:v1:obs-2",
+            "agent_memory:v1:obs-3",
+        ],
+        None,
+    );
+    candidate["proposed_rule_kind"] = serde_json::json!("naming_decision");
+    let mut naming_decision = naming_decision_json(durable_id, decision_id);
+    naming_decision
+        .as_object_mut()
+        .expect("NamingDecision fixture should be an object")
+        .remove("alternatives_rejected");
+
+    let response = ingest_user_context_records(
+        "naming-decision-missing-alternatives",
+        &[
+            candidate,
+            promotion_prompt_json(prompt_id, candidate_id),
+            promotion_decision_json(
+                decision_id,
+                candidate_id,
+                prompt_id,
+                "approved",
+                Some(durable_id),
+            ),
+            naming_decision,
+        ],
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "NamingDecision without alternatives_rejected should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "missing alternatives_rejected should use missing_field, got {body}"
+    );
+    assert_eq!(
+        body["error"]["field"], "NamingDecision.alternatives_rejected",
+        "missing alternatives should name NamingDecision.alternatives_rejected, got {body}"
+    );
+}
+
+#[test]
+fn naming_decision_validates_entity_kind_enum() {
+    let candidate_id = "user_context:v1:candidate-naming-entity-kind";
+    let prompt_id = "user_context:v1:prompt-naming-entity-kind";
+    let decision_id = "user_context:v1:decision-naming-entity-kind";
+    let durable_id = "user_context:v1:naming-entity-kind";
+    let mut candidate = promote_candidate_json(
+        candidate_id,
+        "ResultAlias",
+        &[
+            "agent_memory:v1:obs-1",
+            "agent_memory:v1:obs-2",
+            "agent_memory:v1:obs-3",
+        ],
+        None,
+    );
+    candidate["proposed_rule_kind"] = serde_json::json!("naming_decision");
+    let mut naming_decision = naming_decision_json(durable_id, decision_id);
+    naming_decision["entity_kind"] = serde_json::json!("namespace");
+
+    let response = ingest_user_context_records(
+        "naming-decision-invalid-entity-kind",
+        &[
+            candidate,
+            promotion_prompt_json(prompt_id, candidate_id),
+            promotion_decision_json(
+                decision_id,
+                candidate_id,
+                prompt_id,
+                "approved",
+                Some(durable_id),
+            ),
+            naming_decision,
+        ],
+    );
+
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "NamingDecision with an unknown entity_kind should be rejected, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "unknown entity_kind should be a bad_request, got {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("NamingDecision.entity_kind")),
+        "unknown entity_kind rejection should name NamingDecision.entity_kind, got {body}"
+    );
 }
 
 #[test]

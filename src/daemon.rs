@@ -2999,6 +2999,21 @@ const USER_CONTEXT_PROPOSED_BY_TARGET_KINDS: &[NodeKind] = &[
     NodeKind::Decision,
 ];
 
+const USER_CONTEXT_CONTRADICTS_TARGET_KINDS: &[NodeKind] =
+    &[NodeKind::Preference, NodeKind::WorkflowRule];
+
+const USER_CONTEXT_NAMING_ENTITY_KINDS: &[&str] = &[
+    "crate", "module", "type", "function", "field", "feature", "other",
+];
+
+const USER_CONTEXT_WORKFLOW_TRIGGERS: &[&str] = &[
+    "pre_commit",
+    "pre_pr",
+    "pre_merge",
+    "pre_command",
+    "post_command",
+];
+
 const USER_CONTEXT_EDGE_LABELS: &[EdgeLabel] = &[
     EdgeLabel::ProposedBy,
     EdgeLabel::PromptedFor,
@@ -3207,6 +3222,7 @@ fn validate_promote_candidate(
         required_str(evidence_quality, "PromoteCandidate.evidence_quality")?,
         &["verbatim", "summarized", "referenced_only"],
     )?;
+    require_scope(user_context.scope.as_ref(), "PromoteCandidate.scope")?;
     let supporting = user_context
         .supporting_evidence
         .as_deref()
@@ -3250,12 +3266,12 @@ fn validate_promote_candidate(
             ),
         ));
     }
-    for link in user_context
+    let contradicting = user_context
         .contradicting_evidence
         .as_deref()
-        .unwrap_or(&[])
-    {
-        validate_evidence_target(link, records, sink)?;
+        .ok_or_else(|| ApiError::missing_field("PromoteCandidate.contradicting_evidence"))?;
+    for link in contradicting {
+        validate_contradicting_evidence_link(id, link, records, sink)?;
     }
     if let Some(rejected_id) = superseded_by {
         validate_superseded_rejection(id, rejected_id, records, sink)?;
@@ -3264,6 +3280,11 @@ fn validate_promote_candidate(
         );
     }
     Ok(edges)
+}
+
+fn require_scope<T>(scope: Option<&T>, field: &'static str) -> WriteResult<()> {
+    scope
+        .map_or_else(|| Err(ApiError::missing_field(field)), |_| Ok(()))
 }
 
 fn validate_supporting_evidence_link(
@@ -3306,22 +3327,40 @@ fn validate_supporting_evidence_link(
     Ok(())
 }
 
-fn validate_evidence_target(
+fn validate_contradicting_evidence_link(
+    candidate_id: &str,
     link: &EvidenceLink,
     records: &[GraphRecord],
     sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<()> {
+    if link.target_domain != "user_context" || link.relation != EdgeLabel::Contradicts.as_str() {
+        return Err(ApiError::bad_request(format!(
+            "PromoteCandidate.contradicting_evidence for '{candidate_id}' must use \
+             target_domain 'user_context' and relation CONTRADICTS"
+        )));
+    }
+    validate_numeric_confidence(
+        "PromoteCandidate.contradicting_evidence[].confidence",
+        Some(&link.confidence),
+    )?;
     let target_id = link
         .target_record_id
         .as_deref()
-        .ok_or_else(|| ApiError::missing_field("EvidenceLink.target_record_id"))?;
-    if lookup_record(target_id, records, sink)?.is_none() {
-        return Err(ApiError::new(
+        .ok_or_else(|| {
+            ApiError::missing_field("PromoteCandidate.contradicting_evidence[].target_record_id")
+        })?;
+    match lookup_node_kind(target_id, records, sink)? {
+        Some(kind) if USER_CONTEXT_CONTRADICTS_TARGET_KINDS.contains(&kind) => Ok(()),
+        Some(kind) => Err(ApiError::bad_request(format!(
+            "PromoteCandidate.contradicting_evidence target '{target_id}' must be a Preference \
+             or WorkflowRule, got {}",
+            kind.as_str()
+        ))),
+        None => Err(ApiError::new(
             ErrorCode::UnresolvedEvidenceTarget,
             format!("evidence target '{target_id}' not found"),
-        ));
+        )),
     }
-    Ok(())
 }
 
 fn validate_promotion_prompt(
@@ -3527,6 +3566,7 @@ fn validate_durable_user_context(
             format!("PromotionDecision '{approval_id}' does not approve durable record '{id}'"),
         ));
     }
+    require_scope(user_context.scope.as_ref(), "durable.scope")?;
     match kind {
         NodeKind::Preference | NodeKind::WorkflowRule => {
             require_durable_rule_kind(kind, user_context)?;
@@ -3536,14 +3576,22 @@ fn validate_durable_user_context(
             }
         }
         NodeKind::NamingDecision => {
-            required_str(
-                user_context.entity_kind.as_deref(),
+            validate_enum(
                 "NamingDecision.entity_kind",
+                required_str(
+                    user_context.entity_kind.as_deref(),
+                    "NamingDecision.entity_kind",
+                )?,
+                USER_CONTEXT_NAMING_ENTITY_KINDS,
             )?;
             required_str(
                 user_context.canonical_name.as_deref(),
                 "NamingDecision.canonical_name",
             )?;
+            user_context
+                .alternatives_rejected
+                .as_ref()
+                .ok_or_else(|| ApiError::missing_field("NamingDecision.alternatives_rejected"))?;
         }
         NodeKind::Constraint => {
             required_str(
@@ -3561,32 +3609,73 @@ fn validate_durable_user_context(
         }
         _ => {}
     }
-    validate_edited_approval_body(id, kind, user_context, approval_id, &decision_fields)?;
-    validate_rfc3339_field(
-        "durable.active_from",
-        required_str(user_context.active_from.as_deref(), "durable.active_from")?,
+    validate_durable_approval_body(
+        id,
+        kind,
+        user_context,
+        approval_id,
+        &decision_fields,
+        records,
+        sink,
     )?;
+    validate_durable_active_from(user_context, approval_id, &decision_fields)?;
     if let Some(active_to) = user_context.active_to.as_deref() {
         validate_rfc3339_field("durable.active_to", active_to)?;
     }
     Ok(())
 }
 
-fn validate_edited_approval_body(
+fn validate_durable_approval_body(
     id: &str,
     kind: NodeKind,
     user_context: &UserContextFields,
     approval_id: &str,
     decision_fields: &UserContextFields,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<()> {
-    if decision_fields.outcome.as_deref() != Some("edited_then_approved") {
-        return Ok(());
-    }
-
-    let edited_rule_text = required_str(
-        decision_fields.edited_rule_text.as_deref(),
-        "PromotionDecision.edited_rule_text",
-    )?;
+    let (expected_field, expected_body) = match decision_fields.outcome.as_deref() {
+        Some("approved") => {
+            let candidate_id = required_str(
+                decision_fields.candidate_id.as_deref(),
+                "PromotionDecision.candidate_id",
+            )?;
+            let candidate = lookup_record(candidate_id, records, sink)?.ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::UnresolvedEvidenceTarget,
+                    format!("approval candidate '{candidate_id}' not found"),
+                )
+            })?;
+            let GraphRecord::Node {
+                kind: NodeKind::PromoteCandidate,
+                user_context: candidate_fields,
+                ..
+            } = candidate
+            else {
+                return Err(ApiError::bad_request(format!(
+                    "PromotionDecision.candidate_id '{candidate_id}' does not reference a \
+                     PromoteCandidate"
+                )));
+            };
+            (
+                "PromoteCandidate.proposed_rule_text",
+                required_str(
+                    candidate_fields.proposed_rule_text.as_deref(),
+                    "PromoteCandidate.proposed_rule_text",
+                )?
+                .to_owned(),
+            )
+        }
+        Some("edited_then_approved") => (
+            "PromotionDecision.edited_rule_text",
+            required_str(
+                decision_fields.edited_rule_text.as_deref(),
+                "PromotionDecision.edited_rule_text",
+            )?
+            .to_owned(),
+        ),
+        _ => return Ok(()),
+    };
     let (field, durable_body) = match kind {
         NodeKind::Preference | NodeKind::WorkflowRule => (
             "durable.rule_text",
@@ -3609,13 +3698,33 @@ fn validate_edited_approval_body(
         _ => return Ok(()),
     };
 
-    if durable_body != edited_rule_text {
+    if durable_body != expected_body.as_str() {
         return Err(ApiError::bad_request(format!(
-            "{field} for durable record '{id}' must match PromotionDecision.edited_rule_text \
-             from '{approval_id}'"
+            "{field} for durable record '{id}' must match {expected_field} from approval \
+             decision '{approval_id}'"
         )));
     }
 
+    Ok(())
+}
+
+fn validate_durable_active_from(
+    user_context: &UserContextFields,
+    approval_id: &str,
+    decision_fields: &UserContextFields,
+) -> WriteResult<()> {
+    let active_from = required_str(user_context.active_from.as_deref(), "durable.active_from")?;
+    validate_rfc3339_field("durable.active_from", active_from)?;
+    let decided_at = required_str(
+        decision_fields.decided_at.as_deref(),
+        "PromotionDecision.decided_at",
+    )?;
+    if active_from != decided_at {
+        return Err(ApiError::bad_request(format!(
+            "durable.active_from must equal PromotionDecision.decided_at from approval decision \
+             '{approval_id}'"
+        )));
+    }
     Ok(())
 }
 
@@ -3629,6 +3738,13 @@ fn require_workflow_rule_fields(user_context: &UserContextFields) -> WriteResult
         return Err(ApiError::bad_request(
             "WorkflowRule.triggers entries must not be empty",
         ));
+    }
+    for trigger in triggers {
+        validate_enum(
+            "WorkflowRule.triggers",
+            trigger,
+            USER_CONTEXT_WORKFLOW_TRIGGERS,
+        )?;
     }
     required_str(
         user_context.action_summary.as_deref(),
@@ -3733,7 +3849,7 @@ fn validate_user_context_edge(
             source_kind,
             target_kind,
             &[NodeKind::PromoteCandidate],
-            &[NodeKind::Preference, NodeKind::WorkflowRule],
+            USER_CONTEXT_CONTRADICTS_TARGET_KINDS,
         ),
         EdgeLabel::ScopedToRepo => require_edge_kinds(
             edge_id,
