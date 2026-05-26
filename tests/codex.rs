@@ -726,3 +726,115 @@ fn import_does_not_panic_on_rollout_fixture() {
     let result = import_codex(Path::new(ROLLOUT_FIXTURE), &ImportOptions::default());
     assert!(result.is_ok(), "import_codex panicked: {:?}", result.err());
 }
+
+// ── Multi-call correlation: two function_calls before their outputs ───────────
+
+fn multi_call_jsonl() -> Vec<GraphRecord> {
+    // Two function_calls arrive before either output; outputs arrive out-of-order
+    // (call-2 output comes before call-1 output).
+    let jsonl = r#"{"type":"session","model":"test-model","created_at":"2025-01-01T00:00:00Z"}
+{"type":"message","role":"user","content":[{"type":"input_text","text":"run two things"}]}
+{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Running both in parallel"}]}
+{"type":"function_call","call_id":"call-1","name":"shell","arguments":"{\"cmd\":[\"echo\",\"one\"]}"}
+{"type":"function_call","call_id":"call-2","name":"shell","arguments":"{\"cmd\":[\"echo\",\"two\"]}"}
+{"type":"function_call_output","call_id":"call-2","output":"{\"exit_code\":0,\"stdout\":\"two\",\"stderr\":\"\"}"}
+{"type":"function_call_output","call_id":"call-1","output":"{\"exit_code\":0,\"stdout\":\"one\",\"stderr\":\"\"}"}"#;
+
+    let tmp = tempfile::NamedTempFile::new().expect("tmp file");
+    std::fs::write(tmp.path(), jsonl).expect("write fixture");
+    import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec()
+}
+
+#[test]
+fn multi_call_both_tool_calls_emitted() {
+    let records = multi_call_jsonl();
+    let tool_call_count = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                GraphRecord::Node {
+                    kind: NodeKind::ToolCall,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        tool_call_count, 2,
+        "expected 2 ToolCall nodes, got {tool_call_count}"
+    );
+}
+
+#[test]
+fn multi_call_both_command_runs_emitted() {
+    let records = multi_call_jsonl();
+    let cmd_run_count = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                GraphRecord::Node {
+                    kind: NodeKind::CommandRun,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        cmd_run_count, 2,
+        "expected 2 CommandRun nodes, got {cmd_run_count}"
+    );
+}
+
+#[test]
+fn multi_call_no_spurious_diagnostics() {
+    // Neither call should produce an "unrecognized event" Diagnostic, which would
+    // indicate a mismatched call_id (the old single-slot regression).
+    let records = multi_call_jsonl();
+    let diagnostic_count = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                GraphRecord::Node {
+                    kind: NodeKind::Diagnostic,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        diagnostic_count, 0,
+        "spurious Diagnostic nodes indicate call_id mismatch: {diagnostic_count} found"
+    );
+}
+
+#[test]
+fn multi_call_both_exit_codes_present() {
+    // Both CommandRun nodes should have exit_code=0 from their respective outputs.
+    let records = multi_call_jsonl();
+    let exit_codes: Vec<i64> = records
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Node {
+                kind: NodeKind::CommandRun,
+                exit_code,
+                ..
+            } = r
+            {
+                *exit_code
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(exit_codes.len(), 2, "expected 2 exit codes");
+    assert!(
+        exit_codes.iter().all(|&c| c == 0),
+        "expected all exit_code=0, got {exit_codes:?}"
+    );
+}

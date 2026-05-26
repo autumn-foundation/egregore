@@ -56,6 +56,7 @@
 //! importer version and a JSONL `schema_version` bump on all emitted records.
 //! See `docs/adr/codex-field-stability-tiers.md §Upgrade Contract`.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -411,7 +412,9 @@ fn group_events(events: Vec<(usize, CodexEvent)>) -> GroupedEvents {
     let mut flavor = SessionFlavor::None;
     let mut turns: Vec<TurnData> = Vec::new();
     let mut current_turn: Option<TurnData> = None;
-    let mut pending_call: Option<CodexFunctionCall> = None;
+    // Maps call_id → index in the target turn's tool_calls for output correlation.
+    // Multiple calls can be in flight simultaneously; cleared on each new assistant turn.
+    let mut pending_call_ids: HashMap<String, usize> = HashMap::new();
     let mut unknown_indices: Vec<usize> = Vec::new();
     let mut interruptions: Vec<CodexInterrupted> = Vec::new();
 
@@ -427,12 +430,7 @@ fn group_events(events: Vec<(usize, CodexEvent)>) -> GroupedEvents {
                 if let Some(turn) = current_turn.take() {
                     turns.push(turn);
                 }
-                // Flush any pending unmatched call
-                if let Some(orphan) = pending_call.take()
-                    && let Some(turn) = turns.last_mut()
-                {
-                    turn.tool_calls.push((orphan, None));
-                }
+                pending_call_ids.clear();
                 current_turn = Some(TurnData {
                     turn_index: turns.len() as u64,
                     message: m,
@@ -443,30 +441,32 @@ fn group_events(events: Vec<(usize, CodexEvent)>) -> GroupedEvents {
                 // User message or other role — skip (context only)
             }
             CodexEvent::FunctionCall(fc) => {
-                // Flush previous pending call without output
-                if let Some(orphan) = pending_call.take()
-                    && let Some(turn) = current_turn.as_mut()
-                {
-                    turn.tool_calls.push((orphan, None));
+                // Pre-allocate a slot in the turn with no output yet.
+                // When the matching output arrives it fills in the slot by index.
+                let call_id = fc.call_id.clone();
+                if let Some(turn) = current_turn.as_mut() {
+                    let idx = turn.tool_calls.len();
+                    pending_call_ids.insert(call_id, idx);
+                    turn.tool_calls.push((fc, None));
+                } else if let Some(turn) = turns.last_mut() {
+                    let idx = turn.tool_calls.len();
+                    pending_call_ids.insert(call_id, idx);
+                    turn.tool_calls.push((fc, None));
+                } else {
+                    // No turn context at all — treat as unrecognized
+                    unknown_indices.push(line_idx);
                 }
-                pending_call = Some(fc);
             }
             CodexEvent::FunctionCallOutput(fco) => {
-                if let Some(pending) = pending_call.take() {
-                    let output = if pending.call_id == fco.call_id {
-                        Some(fco)
-                    } else {
-                        // Mismatched call_id — emit output as unmatched
-                        unknown_indices.push(line_idx);
-                        None
-                    };
+                if let Some(&idx) = pending_call_ids.get(&fco.call_id) {
+                    // Fill the pre-allocated slot for this call_id.
                     if let Some(turn) = current_turn.as_mut() {
-                        turn.tool_calls.push((pending, output));
+                        turn.tool_calls[idx].1 = Some(fco);
                     } else if let Some(turn) = turns.last_mut() {
-                        turn.tool_calls.push((pending, output));
+                        turn.tool_calls[idx].1 = Some(fco);
                     }
                 } else {
-                    // Orphaned output
+                    // No matching function_call for this output — orphaned
                     unknown_indices.push(line_idx);
                 }
             }
@@ -477,13 +477,6 @@ fn group_events(events: Vec<(usize, CodexEvent)>) -> GroupedEvents {
                 unknown_indices.push(line_idx);
             }
         }
-    }
-
-    // Flush final pending call
-    if let Some(orphan) = pending_call.take()
-        && let Some(turn) = current_turn.as_mut()
-    {
-        turn.tool_calls.push((orphan, None));
     }
 
     if let Some(turn) = current_turn {
