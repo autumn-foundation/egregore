@@ -104,4 +104,11 @@ pub enum CodegraphError {
         /// Failure detail.
         message: String,
     },
+
+    /// An importer received a file with no parseable events.
+    #[error("no parseable events in {path}: file is empty or entirely malformed")]
+    EmptyImport {
+        /// Path of the file that produced no events.
+        path: PathBuf,
+    },
 }

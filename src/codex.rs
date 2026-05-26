@@ -293,18 +293,34 @@ fn parse_output_field(raw: &str) -> ParsedOutput {
                 stdout: Some(raw.to_owned()),
                 stderr: None,
             },
-            |val| ParsedOutput {
-                exit_code: val.get("exit_code").and_then(serde_json::Value::as_i64),
-                stdout: val
+            |val| {
+                let exit_code = val.get("exit_code").and_then(serde_json::Value::as_i64);
+                let stdout = val
                     .get("stdout")
                     .and_then(serde_json::Value::as_str)
                     .filter(|s| !s.is_empty())
-                    .map(str::to_owned),
-                stderr: val
+                    .map(str::to_owned);
+                let stderr = val
                     .get("stderr")
                     .and_then(serde_json::Value::as_str)
                     .filter(|s| !s.is_empty())
-                    .map(str::to_owned),
+                    .map(str::to_owned);
+                // If none of the expected shell-output keys are present, the object
+                // is a non-shell tool payload: preserve the raw text so downstream
+                // records (CommandRun, Failure) still have meaningful content.
+                if exit_code.is_none() && stdout.is_none() && stderr.is_none() {
+                    ParsedOutput {
+                        exit_code: None,
+                        stdout: Some(raw.to_owned()),
+                        stderr: None,
+                    }
+                } else {
+                    ParsedOutput {
+                        exit_code,
+                        stdout,
+                        stderr,
+                    }
+                }
             },
         )
 }
@@ -538,6 +554,14 @@ pub fn import_codex(path: &Path, opts: &ImportOptions) -> Result<Graph> {
     ]);
 
     let grouped = group_events(parsed);
+
+    // Reject files that produced no actionable events — empty files or files where
+    // every non-empty line failed to parse as a known Codex event.
+    if grouped.turns.is_empty() && grouped.interruptions.is_empty() {
+        return Err(crate::CodegraphError::EmptyImport {
+            path: path.to_path_buf(),
+        });
+    }
 
     // Determine metadata from flavor header.
     let (header_model, header_timestamp) = match &grouped.flavor {
@@ -1142,15 +1166,13 @@ fn tool_kind_for(tool_name: &str, cmd_parts: &[String]) -> String {
 }
 
 fn extract_target_file_from_parts(parts: &[String]) -> Option<String> {
-    // For sed/tee, find the last argument that looks like a file path.
-    // A sed expression starts with 's' followed by a non-alphanumeric delimiter (e.g. s/…/…/).
-    // Genuine paths like src/lib.rs start with 's' but are followed by alphanumeric chars.
+    // For sed/tee, find the last non-flag, non-sed-expression argument.
+    // We intentionally omit any '/' or '.' requirement so extension-less
+    // targets like Makefile, Dockerfile, and LICENSE are captured.
     parts
         .iter()
         .rev()
-        .find(|p| {
-            !p.starts_with('-') && (p.contains('/') || p.contains('.')) && !is_sed_expression(p)
-        })
+        .find(|p| !p.starts_with('-') && !is_sed_expression(p))
         .cloned()
 }
 

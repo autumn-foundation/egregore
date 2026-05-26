@@ -727,6 +727,81 @@ fn import_does_not_panic_on_rollout_fixture() {
     assert!(result.is_ok(), "import_codex panicked: {:?}", result.err());
 }
 
+// ── Empty / malformed file validation ────────────────────────────────────────
+
+#[test]
+fn empty_file_returns_error() {
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    let result = import_codex(tmp.path(), &ImportOptions::default());
+    assert!(result.is_err(), "expected error for empty file, got Ok");
+}
+
+#[test]
+fn header_only_file_returns_error() {
+    // A file with only a session header and no turns should also fail.
+    let jsonl = r#"{"type":"session","model":"test","created_at":"2025-01-01T00:00:00Z"}"#;
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let result = import_codex(tmp.path(), &ImportOptions::default());
+    assert!(
+        result.is_err(),
+        "expected error for header-only file, got Ok"
+    );
+}
+
+#[test]
+fn fully_malformed_file_returns_error() {
+    // Every line is unparseable JSON — should fail rather than emit phantom records.
+    let jsonl = "not json at all\nalso not json\n{broken";
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let result = import_codex(tmp.path(), &ImportOptions::default());
+    assert!(
+        result.is_err(),
+        "expected error for fully malformed file, got Ok"
+    );
+}
+
+// ── Extension-less file targets (Makefile, Dockerfile, etc.) ─────────────────
+
+#[test]
+fn sed_edit_on_makefile_captures_path() {
+    let jsonl = r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}
+{"type":"message","role":"user","content":[{"type":"input_text","text":"fix it"}]}
+{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}
+{"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"cmd\":[\"sed\",\"-i\",\"s/foo/bar/\",\"Makefile\"]}"}
+{"type":"function_call_output","call_id":"c1","output":"{\"exit_code\":0,\"stdout\":\"\",\"stderr\":\"\"}"}"#;
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    let file_edit = records.iter().find(|r| {
+        matches!(
+            r,
+            GraphRecord::Node {
+                kind: NodeKind::FileEdit,
+                ..
+            }
+        )
+    });
+    assert!(
+        file_edit.is_some(),
+        "expected FileEdit node for Makefile edit"
+    );
+    if let Some(GraphRecord::Node {
+        repo_relative_path, ..
+    }) = file_edit
+    {
+        assert_eq!(
+            repo_relative_path.as_deref(),
+            Some("Makefile"),
+            "repo_relative_path should be 'Makefile'"
+        );
+    }
+}
+
 // ── Multi-call correlation: two function_calls before their outputs ───────────
 
 fn multi_call_jsonl() -> Vec<GraphRecord> {
