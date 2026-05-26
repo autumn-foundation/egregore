@@ -3876,6 +3876,8 @@ fn all_node_kinds_have_documented_schema() {
         | NodeKind::WorkflowRule
         | NodeKind::NamingDecision
         | NodeKind::Constraint => "user-context-documented",
+        // M3 Codex importer node kinds (issue #21)
+        NodeKind::CostUsage => "agent-memory-m3-codex-importer",
     };
 }
 

@@ -393,15 +393,21 @@ Exit criteria:
 - ✅ Re-importing the same `.traj` 5× produces byte-identical JSONL (canonical sort + BLAKE3 idempotency).
 - ✅ Redaction hook wired with pass-through default; single call site marked `TODO: replace with #4 policy`.
 
-### M3: Codex Session Import
+### M3: Codex Session Import ✓
 
 Import Codex session or rollout JSONL into the same normalized event model. This is the current local workflow source, so it should preserve interruptions, tool outputs, verification claims, and file-edit provenance.
 
 Exit criteria:
 
-- A local Codex JSONL fixture imports without losing user/assistant/tool turn ordering.
-- Tool calls and command outputs have stable artifact handles.
-- Verification claims can be compared with actual command results when present.
+- A local Codex JSONL fixture imports without losing user/assistant/tool turn ordering. ✓
+- Tool calls and command outputs have stable artifact handles. ✓
+- Verification claims can be compared with actual command results when present. ✓
+- Session and rollout flavors auto-detected from first event. ✓
+- Unrecognized event kinds degrade to Diagnostic nodes without panics. ✓
+- Field-stability tiers documented in `docs/adr/0005-codex-field-stability-tiers.md`. ✓
+- Redaction hook available for all free-text fields. ✓
+- Import is deterministic (byte-identical across runs). ✓
+- AgentSession ID is idempotent across re-imports of the same file. ✓
 
 ### M4: Claude Code Transcript Import
 

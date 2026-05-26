@@ -127,6 +127,7 @@ egregore query symbol <name>  --data-dir .egregore
 egregore query file   <path>  --data-dir .egregore
 egregore query drift          --data-dir .egregore
 egregore query semantic <text> --data-dir .egregore-semantic
+egregore import-codex session.jsonl --out agent.graph.jsonl  # Codex session/rollout import
 ```
 
 ---
@@ -139,6 +140,7 @@ Implemented surfaces:
 - `scan-history` — commit-by-commit temporal extraction
 - `inspect` — graph summary
 - `ingest` — dry-run, embedded AletheiaDB, and daemon adapters
+- `import-codex` — Codex session/rollout JSONL → agent-memory graph records (M3)
 - `query symbol / file / drift / semantic` — structural and semantic agent queries
 - Incremental file-cache planning with tombstones
 - AletheiaDB embedding re-export through the optional `embeddings` feature

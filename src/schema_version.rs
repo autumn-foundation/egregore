@@ -319,7 +319,7 @@ fn domain_for_node_kind(kind: &str) -> &'static str {
         "Verification" | "CommandEvidence" | "CommandRun" | "TestRun" | "CIStatus"
         | "BenchmarkRun" | "CoverageReport" | "ProofResult" => Domain::Verification.as_str(),
         "Agent" | "AgentSession" | "Observation" | "AgentRun" | "AgentTurn" | "ToolCall"
-        | "FileEdit" | "Failure" | "Decision" => Domain::AgentMemory.as_str(),
+        | "FileEdit" | "Failure" | "Decision" | "CostUsage" => Domain::AgentMemory.as_str(),
         _ => Domain::CodeGraph.as_str(),
     }
 }
