@@ -170,6 +170,22 @@ impl Graph {
         &self.records
     }
 
+    /// Stamps every record in the graph with the given producer envelope.
+    ///
+    /// When a single producer emits a batch of records, every record in that
+    /// batch carries the same `Producer` value per the non-identity rule in
+    /// `docs/schema/producer-version.md`.
+    #[must_use]
+    pub fn stamp_producer(self, producer: &Producer) -> Self {
+        Self {
+            records: self
+                .records
+                .into_iter()
+                .map(|r| r.with_producer(producer.clone()))
+                .collect(),
+        }
+    }
+
     /// Serializes the graph to canonically ordered JSON Lines.
     ///
     /// Ordering is based on the final serialized lines. This keeps output

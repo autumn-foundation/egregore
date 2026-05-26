@@ -36,7 +36,7 @@ pub mod schema_version;
 /// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
 pub mod traj;
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 pub use error::{CodegraphError, Result};
 pub use history::{scan_repository_history, scan_repository_history_with_override};
@@ -128,7 +128,26 @@ pub fn scan_repository_at_with_override(
         }
     }
 
-    Ok(graph)
+    Ok(graph.stamp_producer(&code_graph_producer(transaction_time)))
+}
+
+pub(crate) fn code_graph_producer(started_at: &str) -> Producer {
+    Producer {
+        egregore_version: env!("CARGO_PKG_VERSION").to_owned(),
+        egregore_git: None,
+        producer_kind: ProducerKind::CodeGraphExtractor,
+        producer_components: BTreeMap::from([
+            (
+                "tree_sitter".to_owned(),
+                env!("TREE_SITTER_VERSION").to_owned(),
+            ),
+            (
+                "tree_sitter_rust".to_owned(),
+                env!("TREE_SITTER_RUST_VERSION").to_owned(),
+            ),
+        ]),
+        producer_started_at: started_at.to_owned(),
+    }
 }
 
 pub(crate) fn repository_record_from_identity(
