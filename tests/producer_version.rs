@@ -14,8 +14,9 @@ use aletheia_egregore::ir::{
 /// Documented as the non-identity rule in docs/schema/producer-version.md.
 #[test]
 fn producer_non_identity_rule() {
-    let id = stable_id(&["test-repo", "src/lib.rs", "fn", "run"]);
-
+    // IDs are computed independently from identical inputs so that if stable_id
+    // composition ever accidentally started including producer metadata, the two
+    // computed IDs would diverge and the assert_eq below would catch it.
     let producer_a = Producer {
         egregore_version: "0.1.0".to_owned(),
         egregore_git: None,
@@ -42,7 +43,7 @@ fn producer_non_identity_rule() {
     };
 
     let record_a = GraphRecord::node(
-        id.clone(),
+        stable_id(&["test-repo", "src/lib.rs", "fn", "run"]),
         NodeKind::Symbol,
         Some("src/lib.rs".to_owned()),
         None,
@@ -52,7 +53,7 @@ fn producer_non_identity_rule() {
     .with_producer(producer_a);
 
     let record_b = GraphRecord::node(
-        id,
+        stable_id(&["test-repo", "src/lib.rs", "fn", "run"]),
         NodeKind::Symbol,
         Some("src/lib.rs".to_owned()),
         None,

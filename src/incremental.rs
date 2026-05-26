@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 use chrono::Utc;
 
 use crate::{
+    PROCESS_STARTED_AT, code_graph_producer,
     error::{CodegraphError, Result},
     identity,
-    ir::{Graph, GraphRecord, SCHEMA_VERSION, stable_id, versioned_stable_id},
+    ir::{Graph, GraphRecord, ProducerKind, SCHEMA_VERSION, stable_id, versioned_stable_id},
     repository_record_from_identity, scan_source_file_records,
     schema_version::validate_record_version,
 };
@@ -60,6 +61,7 @@ pub fn scan_repository_incremental_at(
     cache_path: impl AsRef<Path>,
     transaction_time: &str,
 ) -> Result<IncrementalScan> {
+    std::sync::LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
     crate::validate_repository(repo_root)?;
 
@@ -182,8 +184,14 @@ pub fn scan_repository_incremental_at(
 
     next_cache.repository_id.clone_from(&repository_id);
     next_cache.save(cache_path.as_ref())?;
+    let mut producer = code_graph_producer();
+    producer.producer_kind = ProducerKind::IncrementalCache;
+    producer.producer_components.insert(
+        "cache_format_version".to_owned(),
+        CACHE_SCHEMA_VERSION.to_string(),
+    );
     Ok(IncrementalScan {
-        graph,
+        graph: graph.stamp_producer(&producer),
         rebuilt_files,
         reused_files,
         tombstoned_files,

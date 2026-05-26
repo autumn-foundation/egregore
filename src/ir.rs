@@ -82,7 +82,9 @@ pub enum ProducerKind {
     TaskWriter,
     /// Semantic drift engine.
     DriftEngine,
-    /// Any other producer not enumerated above.
+    /// Any other producer not enumerated above, including future additive variants
+    /// from newer binary versions read by an older binary.
+    #[serde(other)]
     Other,
 }
 
@@ -166,6 +168,22 @@ impl Graph {
     #[must_use]
     pub fn records(&self) -> &[GraphRecord] {
         &self.records
+    }
+
+    /// Stamps every record in the graph with the given producer envelope.
+    ///
+    /// When a single producer emits a batch of records, every record in that
+    /// batch carries the same `Producer` value per the non-identity rule in
+    /// `docs/schema/producer-version.md`.
+    #[must_use]
+    pub fn stamp_producer(self, producer: &Producer) -> Self {
+        Self {
+            records: self
+                .records
+                .into_iter()
+                .map(|r| r.with_producer(producer.clone()))
+                .collect(),
+        }
     }
 
     /// Serializes the graph to canonically ordered JSON Lines.
@@ -1301,6 +1319,27 @@ impl GraphRecord {
             }
         }
         self
+    }
+
+    /// Returns a clone with `producer.producer_started_at` set to an empty string.
+    ///
+    /// Use for store idempotency comparisons: version fields (`egregore_version`,
+    /// `producer_components`) are still compared so an extractor upgrade triggers
+    /// a rewrite of `producer_json`, while the per-run wall-clock timestamp is
+    /// excluded to avoid rewriting unchanged facts on every invocation.
+    #[must_use]
+    pub fn with_cleared_producer_started_at(&self) -> Self {
+        let mut cloned = self.clone();
+        match &mut cloned {
+            Self::Node { producer: p, .. }
+            | Self::Edge { producer: p, .. }
+            | Self::Tombstone { producer: p, .. } => {
+                if let Some(prod) = p {
+                    prod.producer_started_at = String::new();
+                }
+            }
+        }
+        cloned
     }
 
     /// Returns the producer identity envelope if present.

@@ -7,10 +7,11 @@ use std::{
 };
 
 use crate::{
+    PROCESS_STARTED_AT, code_graph_producer,
     error::{CodegraphError, Result},
     fs::SourceFile,
     identity,
-    ir::{EdgeLabel, Graph, GraphRecord, NodeKind, TemporalMetadata, stable_id},
+    ir::{EdgeLabel, Graph, GraphRecord, NodeKind, ProducerKind, TemporalMetadata, stable_id},
     repository_record_from_identity, scan_source_text_records, validate_repository,
 };
 
@@ -40,6 +41,7 @@ pub fn scan_repository_history_with_override(
     repo_path: impl AsRef<Path>,
     repo_id_override: Option<&str>,
 ) -> Result<Graph> {
+    std::sync::LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
     validate_repository(repo_root)?;
 
@@ -142,7 +144,9 @@ pub fn scan_repository_history_with_override(
         }
     }
 
-    Ok(graph)
+    let mut producer = code_graph_producer();
+    producer.producer_kind = ProducerKind::HistoryReplay;
+    Ok(graph.stamp_producer(&producer))
 }
 
 #[derive(Debug, Clone)]
