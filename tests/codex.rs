@@ -949,6 +949,114 @@ fn future_event_types_produce_diagnostics_not_error() {
     );
 }
 
+// ── Flavor is pinned to the first header event ───────────────────────────────
+
+#[test]
+fn first_header_flavor_wins_on_duplicate_headers() {
+    // Session header first, rollout header second: import must treat this as a session.
+    let jsonl = concat!(
+        r#"{"type":"session","model":"first-model","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"rollout","model":"second-model","started_at":"2025-01-02T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[]}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    let session_node = records
+        .iter()
+        .find(|r| r.node_kind_name() == Some("AgentSession"));
+    assert!(session_node.is_some(), "no AgentSession node emitted");
+    // The AgentRun summary should reflect "session" flavor, not "rollout".
+    let run_node = records
+        .iter()
+        .find(|r| r.node_kind_name() == Some("AgentRun"));
+    assert!(run_node.is_some(), "no AgentRun node");
+    if let Some(GraphRecord::Node { summary, .. }) = run_node {
+        assert!(
+            summary.contains("session"),
+            "AgentRun summary should reflect first-header session flavor, got: {summary}"
+        );
+    }
+}
+
+// ── CostUsage is only emitted when token counts are present and non-zero ─────
+
+#[test]
+fn empty_usage_object_does_not_produce_cost_usage() {
+    // usage: {} — all fields absent → no CostUsage
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[],"usage":{}}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    assert_eq!(
+        count_kind(&records, "CostUsage"),
+        0,
+        "empty usage object must not produce CostUsage"
+    );
+}
+
+#[test]
+fn all_zero_usage_does_not_produce_cost_usage() {
+    // usage: {input:0, output:0, total:0} — all zero → no CostUsage
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    assert_eq!(
+        count_kind(&records, "CostUsage"),
+        0,
+        "all-zero usage must not produce CostUsage"
+    );
+}
+
+#[test]
+fn nonzero_usage_does_produce_cost_usage() {
+    // usage with real token counts → CostUsage must be emitted
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[],"usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    assert_eq!(
+        count_kind(&records, "CostUsage"),
+        1,
+        "non-zero usage must produce exactly one CostUsage"
+    );
+}
+
 // ── ToolCall.tool_kind values must be accepted by daemon ────────────────────
 
 #[test]

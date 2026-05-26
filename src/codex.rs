@@ -281,6 +281,16 @@ struct ParsedOutput {
     stderr: Option<String>,
 }
 
+/// Coerce a JSON value to text, falling back to JSON serialization for non-strings.
+/// Returns `None` only for JSON `null`.
+fn json_value_to_text(v: &serde_json::Value) -> Option<String> {
+    if v.is_null() {
+        None
+    } else {
+        Some(v.as_str().map_or_else(|| v.to_string(), str::to_owned))
+    }
+}
+
 fn parse_output_field(raw: &str) -> ParsedOutput {
     // Only treat as structured output when valid JSON *and* an object.
     // Arrays, strings, and other JSON scalars are stored as raw stdout text.
@@ -297,14 +307,12 @@ fn parse_output_field(raw: &str) -> ParsedOutput {
                 let exit_code = val.get("exit_code").and_then(serde_json::Value::as_i64);
                 let stdout = val
                     .get("stdout")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned);
+                    .and_then(json_value_to_text)
+                    .filter(|s| !s.is_empty());
                 let stderr = val
                     .get("stderr")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned);
+                    .and_then(json_value_to_text)
+                    .filter(|s| !s.is_empty());
                 // If none of the expected shell-output keys are present, the object
                 // is a non-shell tool payload: preserve the raw text so downstream
                 // records (CommandRun, Failure) still have meaningful content.
@@ -439,10 +447,16 @@ fn group_events(events: Vec<(usize, CodexEvent)>) -> GroupedEvents {
     for (line_idx, event) in events {
         match event {
             CodexEvent::Session(h) => {
-                flavor = SessionFlavor::Session(h);
+                // Pin to the first header encountered; ignore duplicates.
+                if matches!(flavor, SessionFlavor::None) {
+                    flavor = SessionFlavor::Session(h);
+                }
             }
             CodexEvent::Rollout(h) => {
-                flavor = SessionFlavor::Rollout(h);
+                // Pin to the first header encountered; ignore duplicates.
+                if matches!(flavor, SessionFlavor::None) {
+                    flavor = SessionFlavor::Rollout(h);
+                }
             }
             CodexEvent::Message(m) if m.role == "assistant" => {
                 if let Some(turn) = current_turn.take() {
@@ -712,8 +726,10 @@ fn emit_turn(
         ctx,
     ));
 
-    // ── CostUsage (best-effort: emitted only when usage is present) ───────────
-    if let Some(usage) = &msg.usage {
+    // ── CostUsage (best-effort: emit only when at least one non-zero token count) ──
+    if let Some(usage) = &msg.usage
+        && (usage.input() > 0 || usage.output() > 0 || usage.total() > 0)
+    {
         emit_cost_usage(graph, turn_index, &turn_id, usage, &turn_timestamp, ctx);
     }
 
@@ -1573,5 +1589,79 @@ mod unit_tests {
         assert_eq!(grouped.turns.len(), 1);
         assert_eq!(grouped.turns[0].tool_calls.len(), 1);
         assert!(grouped.turns[0].tool_calls[0].1.is_some());
+    }
+
+    #[test]
+    fn flavor_pinned_to_first_header_event() {
+        // A session header followed by a rollout header: flavor must stay Session.
+        let events = vec![
+            (
+                0,
+                CodexEvent::Session(CodexSessionHeader {
+                    id: Some("sess_1".to_owned()),
+                    model: Some("model-1".to_owned()),
+                    created_at: Some("2025-01-01T00:00:00Z".to_owned()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                1,
+                CodexEvent::Rollout(CodexRolloutHeader {
+                    run_id: Some("run_2".to_owned()),
+                    model: Some("model-2".to_owned()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                2,
+                CodexEvent::Message(CodexMessage {
+                    role: "assistant".to_owned(),
+                    content: vec![],
+                    id: None,
+                    status: None,
+                    usage: None,
+                }),
+            ),
+        ];
+        let grouped = group_events(events);
+        assert!(
+            matches!(grouped.flavor, SessionFlavor::Session(ref h) if h.model.as_deref() == Some("model-1")),
+            "later Rollout header must not overwrite first Session header"
+        );
+    }
+
+    #[test]
+    fn parse_output_field_non_string_stdout_preserved() {
+        // When stdout is a JSON object, it must be serialized to a string rather than dropped.
+        let raw = r#"{"exit_code":0,"stdout":{"nested":"data"},"stderr":""}"#;
+        let p = parse_output_field(raw);
+        assert_eq!(p.exit_code, Some(0));
+        assert!(
+            p.stdout.is_some(),
+            "non-string stdout value was dropped instead of serialized"
+        );
+        let out = p.stdout.unwrap();
+        assert!(
+            out.contains("nested") && out.contains("data"),
+            "serialized stdout should contain original content; got: {out}"
+        );
+    }
+
+    #[test]
+    fn json_value_to_text_null_returns_none() {
+        assert!(json_value_to_text(&serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn json_value_to_text_string_returns_string() {
+        let v = serde_json::Value::String("hello".to_owned());
+        assert_eq!(json_value_to_text(&v).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn json_value_to_text_object_returns_json() {
+        let v = serde_json::json!({"k":"v"});
+        let result = json_value_to_text(&v).expect("should be Some");
+        assert!(result.contains('k') && result.contains('v'));
     }
 }
