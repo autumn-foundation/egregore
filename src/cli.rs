@@ -378,6 +378,12 @@ fn inspect(graph: &Path) -> Result<()> {
     for repo in &counts.repositories {
         println!("repository: {} ({})", repo.id, repo.identity_summary);
     }
+    for (kind, count) in &counts.producer_kinds {
+        println!("producer_kind {kind}: {count}");
+    }
+    for (version, count) in &counts.egregore_versions {
+        println!("egregore_version {version}: {count}");
+    }
     Ok(())
 }
 
@@ -1351,6 +1357,10 @@ struct InspectCounts {
     schema_versions: BTreeMap<RecordVersion, usize>,
     unknown_schema_versions: BTreeMap<RecordVersion, usize>,
     repositories: Vec<RepositorySummary>,
+    /// Per-`producer_kind` breakdown; legacy records use key `"legacy_pre_v1"`.
+    producer_kinds: BTreeMap<String, usize>,
+    /// Per-`egregore_version` breakdown; legacy records use key `"legacy_pre_v1"`.
+    egregore_versions: BTreeMap<String, usize>,
 }
 
 impl InspectCounts {
@@ -1410,6 +1420,18 @@ impl InspectCounts {
                 GraphRecord::Edge { .. } => counts.edges += 1,
                 GraphRecord::Tombstone { .. } => counts.tombstones += 1,
             }
+            // Producer breakdown — legacy records (no `producer` field) go under "legacy_pre_v1".
+            let (kind_key, version_key) = record.producer().map_or_else(
+                || ("legacy_pre_v1".to_owned(), "legacy_pre_v1".to_owned()),
+                |p| {
+                    (
+                        p.producer_kind.as_str().to_owned(),
+                        p.egregore_version.clone(),
+                    )
+                },
+            );
+            *counts.producer_kinds.entry(kind_key).or_default() += 1;
+            *counts.egregore_versions.entry(version_key).or_default() += 1;
         }
         Ok(counts)
     }

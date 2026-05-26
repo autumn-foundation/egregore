@@ -989,6 +989,7 @@ fn make_node(
         verification_kind: None,
         status: extra.status,
         user_context: crate::ir::UserContextFields::empty(),
+        producer: None,
     }
 }
 
@@ -1043,6 +1044,7 @@ fn make_edge(
         confidence: None,
         temporal: None,
         summary: summary.to_owned(),
+        producer: None,
     }
 }
 

@@ -364,6 +364,7 @@ fn semantic_edge(
         confidence,
         temporal: None,
         summary,
+        producer: None,
     }
 }
 

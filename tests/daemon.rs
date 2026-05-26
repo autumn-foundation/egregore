@@ -2934,7 +2934,13 @@ fn approved_preference_records(
             None,
         ),
         promotion_prompt_json(prompt_id, candidate_id),
-        promotion_decision_json(decision_id, candidate_id, prompt_id, "approved", Some(durable_id)),
+        promotion_decision_json(
+            decision_id,
+            candidate_id,
+            prompt_id,
+            "approved",
+            Some(durable_id),
+        ),
         preference_json(durable_id, Some(decision_id)),
     ]
 }
@@ -2963,7 +2969,13 @@ fn approved_revocation_records(
     vec![
         candidate,
         promotion_prompt_json(prompt_id, candidate_id),
-        promotion_decision_json(decision_id, candidate_id, prompt_id, "approved", Some(durable_id)),
+        promotion_decision_json(
+            decision_id,
+            candidate_id,
+            prompt_id,
+            "approved",
+            Some(durable_id),
+        ),
         durable,
     ]
 }
@@ -4257,8 +4269,7 @@ fn user_context_scope_validates_lifecycle_phase_enum() {
         "user_context:v1:preference-durable-invalid-lifecycle",
     );
     records[3]["scope"]["lifecycle_phase"] = serde_json::json!("pre_release");
-    let durable_response =
-        ingest_user_context_records("durable-invalid-lifecycle-phase", &records);
+    let durable_response = ingest_user_context_records("durable-invalid-lifecycle-phase", &records);
     assert!(
         !durable_response.starts_with("HTTP/1.1 200"),
         "durable scope.lifecycle_phase enum violation should be rejected, got {durable_response}"
@@ -4293,8 +4304,7 @@ fn promote_candidate_requires_contradicting_evidence_field() {
         .expect("candidate fixture should be an object")
         .remove("contradicting_evidence");
 
-    let response =
-        ingest_user_context_records("candidate-missing-contradictions", &[candidate]);
+    let response = ingest_user_context_records("candidate-missing-contradictions", &[candidate]);
 
     assert!(
         !response.starts_with("HTTP/1.1 200"),
@@ -4913,11 +4923,9 @@ fn revocation_decision_rejects_edited_approval_outcome() {
         "edited revocation should be a bad_request, got {body}"
     );
     assert!(
-        body["error"]["message"]
-            .as_str()
-            .is_some_and(|message| {
-                message.contains("PromotionDecision.outcome") && message.contains("revocation")
-            }),
+        body["error"]["message"].as_str().is_some_and(|message| {
+            message.contains("PromotionDecision.outcome") && message.contains("revocation")
+        }),
         "edited revocation rejection should name outcome and revocation semantics, got {body}"
     );
 }
@@ -5199,7 +5207,10 @@ fn direct_materialized_as_edge_requires_approval_outcome() {
         ],
         None,
     ));
-    records.push(promotion_prompt_json(rejected_prompt_id, rejected_candidate_id));
+    records.push(promotion_prompt_json(
+        rejected_prompt_id,
+        rejected_candidate_id,
+    ));
     records.push(promotion_decision_json(
         rejected_decision_id,
         rejected_candidate_id,
@@ -5308,8 +5319,7 @@ fn approved_durable_rule_body_must_match_candidate_proposal() {
         "user_context:v1:decision-approved-body",
         "user_context:v1:preference-approved-body",
     );
-    records[0]["proposed_rule_text"] =
-        serde_json::json!("Use anyhow for application errors.");
+    records[0]["proposed_rule_text"] = serde_json::json!("Use anyhow for application errors.");
 
     let response = ingest_user_context_records("approved-body-mismatch", &records);
 

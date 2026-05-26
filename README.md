@@ -191,6 +191,7 @@ Query output is newline-delimited JSON by default (`--format json`). Pass `--for
 - **Local project/task JSONL file format (v1):** [docs/schema/local-project-jsonl.md](docs/schema/local-project-jsonl.md)
 - **Semantic drift domain schema (v1):** [docs/schema/semantic-drift.md](docs/schema/semantic-drift.md)
 - **Record schema-version policy:** [docs/schema/schema-versioning.md](docs/schema/schema-versioning.md)
+- **Producer identity envelope (v1):** [docs/schema/producer-version.md](docs/schema/producer-version.md)
 - **Redaction schema (v1):** [docs/schema/redaction.md](docs/schema/redaction.md)
 - **Bi-temporal selector grammar (v2):** [docs/schema/temporal-selectors.md](docs/schema/temporal-selectors.md)
 - **Symbol identity ADR:** [docs/adr/0004-symbol-identity.md](docs/adr/0004-symbol-identity.md)

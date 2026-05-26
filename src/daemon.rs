@@ -32,8 +32,8 @@ use crate::{
         AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord,
         IdentitySource, NodeKind, OutputHandle, PROJECT_SCHEMA_VERSION,
         SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, TemporalMetadata,
-        USER_CONTEXT_SCHEMA_VERSION, UserContextFields, UserContextScope, VERIFICATION_SCHEMA_VERSION,
-        agent_memory_stable_id, user_context_stable_id,
+        USER_CONTEXT_SCHEMA_VERSION, UserContextFields, UserContextScope,
+        VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id, user_context_stable_id,
     },
     query as graph_query,
     schema_version::{
@@ -2935,7 +2935,9 @@ fn parse_rfc3339_field(
     value: &str,
 ) -> WriteResult<DateTime<chrono::FixedOffset>> {
     DateTime::parse_from_rfc3339(value).map_err(|_| {
-        ApiError::bad_request(format!("{field} '{value}' is not a valid RFC 3339 timestamp"))
+        ApiError::bad_request(format!(
+            "{field} '{value}' is not a valid RFC 3339 timestamp"
+        ))
     })
 }
 
@@ -2967,6 +2969,7 @@ fn project_edge(label: EdgeLabel, source: &str, target: &str, summary: &str) -> 
         confidence: None,
         temporal: None,
         summary: summary.to_owned(),
+        producer: None,
     }
 }
 
@@ -3404,12 +3407,9 @@ fn validate_contradicting_evidence_link(
         "PromoteCandidate.contradicting_evidence[].confidence",
         Some(&link.confidence),
     )?;
-    let target_id = link
-        .target_record_id
-        .as_deref()
-        .ok_or_else(|| {
-            ApiError::missing_field("PromoteCandidate.contradicting_evidence[].target_record_id")
-        })?;
+    let target_id = link.target_record_id.as_deref().ok_or_else(|| {
+        ApiError::missing_field("PromoteCandidate.contradicting_evidence[].target_record_id")
+    })?;
     match lookup_node_kind(target_id, records, sink)? {
         Some(kind) if USER_CONTEXT_CONTRADICTS_TARGET_KINDS.contains(&kind) => {
             Ok(target_id.to_owned())
@@ -3520,9 +3520,9 @@ fn validate_promotion_decision(
     )?;
     let materialized_record_id = match outcome {
         "approved" => Some(required_str(
-                user_context.materialized_record_id.as_deref(),
-                "PromotionDecision.materialized_record_id",
-            )?),
+            user_context.materialized_record_id.as_deref(),
+            "PromotionDecision.materialized_record_id",
+        )?),
         "edited_then_approved" => {
             let materialized_record_id = required_str(
                 user_context.materialized_record_id.as_deref(),
@@ -3856,10 +3856,7 @@ fn require_workflow_rule_fields(user_context: &UserContextFields) -> WriteResult
     Ok(())
 }
 
-fn require_durable_rule_kind(
-    kind: NodeKind,
-    user_context: &UserContextFields,
-) -> WriteResult<()> {
+fn require_durable_rule_kind(kind: NodeKind, user_context: &UserContextFields) -> WriteResult<()> {
     let Some(expected) = proposed_rule_kind_for_durable(kind) else {
         return Ok(());
     };
@@ -4121,12 +4118,8 @@ fn validate_revoked_by_edge_payload(
         )));
     }
 
-    let (_, durable_fields) = lookup_user_context_node_fields(
-        source_durable_id,
-        records,
-        sink,
-        "REVOKED_BY source",
-    )?;
+    let (_, durable_fields) =
+        lookup_user_context_node_fields(source_durable_id, records, sink, "REVOKED_BY source")?;
     let active_to = required_str(durable_fields.active_to.as_deref(), "durable.active_to")?;
     validate_rfc3339_field("durable.active_to", active_to)
 }
@@ -4138,12 +4131,8 @@ fn validate_scoped_to_repo_edge_payload(
     records: &[GraphRecord],
     sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<()> {
-    let (_, durable_fields) = lookup_user_context_node_fields(
-        source_durable_id,
-        records,
-        sink,
-        "SCOPED_TO_REPO source",
-    )?;
+    let (_, durable_fields) =
+        lookup_user_context_node_fields(source_durable_id, records, sink, "SCOPED_TO_REPO source")?;
     let scope = durable_fields
         .scope
         .as_ref()
@@ -4430,6 +4419,7 @@ fn user_context_edge(
         confidence,
         temporal: None,
         summary: summary.to_owned(),
+        producer: None,
     }
 }
 

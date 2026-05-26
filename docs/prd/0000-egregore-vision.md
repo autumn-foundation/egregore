@@ -68,6 +68,8 @@ Egregore starts with typed graph domains. Domains share one AletheiaDB store and
 
 **Record schema-version policy:** [`docs/schema/schema-versioning.md`](../schema/schema-versioning.md) is the single source of truth for `(domain, kind, schema_version)` compatibility classes, unknown-version rejection, mixed-store inspect output, and migration manifests. It is distinct from daemon HTTP `api_version`.
 
+**Producer identity envelope:** [`docs/schema/producer-version.md`](../schema/producer-version.md) is the single source of truth for the `producer` field on every persisted record — which binary version, grammar set, and process produced each observation. Producer identity is a trust boundary: the extractor's version is separate from the record's stable ID and from the agent-authored observation axis.
+
 | Domain | Owns | Examples |
 |--------|------|----------|
 | Code Graph | Source-derived facts | Repository, File, Symbol, Import, Call, Commit, Change |
@@ -123,7 +125,7 @@ Importers should connect normalized records to code and project graph records th
 
 Egregore must preserve trust separation even while using one graph.
 
-- Code graph facts are source-derived and should be reproducible from a repository state.
+- Code graph facts are source-derived and should be reproducible from a repository state — but only *relative to a fixed producer*. A grammar or extractor version bump can change which spans and edges are emitted for the same source without any source change. The `producer` field on every record captures the exact binary and grammar versions that produced it; see [`docs/schema/producer-version.md`](../schema/producer-version.md).
 - Verification facts are evidence-derived and should point to command output, CI result, benchmark artifact, or proof result.
 - Agent memory is subjective unless linked to evidence.
 - Project/task state reflects intent and workflow, not proof that code exists.

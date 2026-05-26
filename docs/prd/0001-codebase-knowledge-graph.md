@@ -190,6 +190,8 @@ Acceptance criteria:
 - Output ordering is deterministic.
 - Absolute machine-local paths do not leak into stable IDs.
 
+**Producer identity note:** The `producer` envelope (which binary version and grammar set wrote a record) MUST NOT contribute to any stable ID. Two records produced by different binary versions over identical input must have identical stable IDs. See [`docs/schema/producer-version.md`](../schema/producer-version.md) §5 (Non-Identity Rule) and `tests/producer_version.rs::producer_non_identity_rule`.
+
 ### PR-2: Rust Symbol Coverage
 
 The Rust extractor must identify top-level and nested definitions for common Rust constructs.
