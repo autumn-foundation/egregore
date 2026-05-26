@@ -7,7 +7,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use aletheia_egregore::{scan_repository_history, stable_id};
+use aletheia_egregore::{scan_repository_history, scan_repository_history_at, stable_id};
 use assert_cmd::Command as CargoCommand;
 use predicates::prelude::*;
 use serde_json::Value;
@@ -21,11 +21,11 @@ fn git_history_replay_emits_bitemporal_records_without_mutating_checkout() {
     let head_before = git_output(repo, ["rev-parse", "HEAD"]);
     let lib_before = fs::read_to_string(repo.join("src/lib.rs")).expect("fixture file");
 
-    let first_jsonl = scan_repository_history(repo)
+    let first_jsonl = scan_repository_history_at(repo, "2026-01-01T00:00:00Z")
         .expect("history should scan")
         .to_jsonl()
         .expect("history graph should serialize");
-    let second_jsonl = scan_repository_history(repo)
+    let second_jsonl = scan_repository_history_at(repo, "2026-01-01T00:00:00Z")
         .expect("history should scan twice")
         .to_jsonl()
         .expect("history graph should serialize twice");

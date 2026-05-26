@@ -29,6 +29,20 @@ pub fn scan_repository_history(repo_path: impl AsRef<Path>) -> Result<Graph> {
     scan_repository_history_with_override(repo_path, None)
 }
 
+/// Like [`scan_repository_history`] but accepts an explicit `started_at` timestamp (RFC 3339).
+///
+/// Both the `producer_started_at` and `valid_time` on the repository record are
+/// pinned to `started_at`, making two calls with identical inputs produce
+/// byte-identical JSONL. Use this in tests to eliminate wall-clock non-determinism.
+///
+/// # Errors
+///
+/// Returns an error when the repository path is invalid, Git is unavailable, or
+/// a reachable Rust source blob cannot be parsed.
+pub fn scan_repository_history_at(repo_path: impl AsRef<Path>, started_at: &str) -> Result<Graph> {
+    scan_repository_history_at_with_override(repo_path, None, started_at)
+}
+
 /// Scans Git history with an optional identity override.
 ///
 /// See `scan_repository_history` for full documentation.
@@ -42,6 +56,14 @@ pub fn scan_repository_history_with_override(
     repo_id_override: Option<&str>,
 ) -> Result<Graph> {
     let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    scan_repository_history_at_with_override(repo_path, repo_id_override, &started_at)
+}
+
+pub(crate) fn scan_repository_history_at_with_override(
+    repo_path: impl AsRef<Path>,
+    repo_id_override: Option<&str>,
+    started_at: &str,
+) -> Result<Graph> {
     let repo_root = repo_path.as_ref();
     validate_repository(repo_root)?;
 
@@ -144,7 +166,7 @@ pub fn scan_repository_history_with_override(
         }
     }
 
-    let mut producer = code_graph_producer(&started_at);
+    let mut producer = code_graph_producer(started_at);
     producer.producer_kind = ProducerKind::HistoryReplay;
     Ok(graph.stamp_producer(&producer))
 }

@@ -39,7 +39,9 @@ pub mod traj;
 use std::{collections::BTreeMap, path::Path};
 
 pub use error::{CodegraphError, Result};
-pub use history::{scan_repository_history, scan_repository_history_with_override};
+pub use history::{
+    scan_repository_history, scan_repository_history_at, scan_repository_history_with_override,
+};
 pub use ir::{
     AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, Domain, EdgeLabel, EgregoreGit,
     EmbeddingModel, EvidenceLink, Graph, GraphRecord, IdentitySource, MetricKind, NodeKind,
