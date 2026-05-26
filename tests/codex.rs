@@ -1500,20 +1500,20 @@ fn malformed_interruption_timestamp_falls_back_to_epoch() {
             observed_at,
             ..
         } = r
+        && summary.to_lowercase().contains("interrupt")
         {
-            if summary.to_lowercase().contains("interrupt") {
-                // The malformed 'at' value must not be stored; the fallback is either
-                // the header timestamp or DEFAULT_TIMESTAMP (epoch), both are valid RFC3339.
-                let ts = observed_at.as_deref().unwrap_or("");
-                assert_ne!(
-                    ts, "not-a-timestamp",
-                    "Interrupted Diagnostic must not store the raw malformed 'at' value"
-                );
-                assert!(
-                    ts.len() >= 20 && ts.contains('T'),
-                    "Interrupted Diagnostic observed_at should be a valid RFC3339 fallback, got: {ts}"
-                );
-            }
+            // The malformed 'at' value must not be stored; the fallback is either
+            // the header timestamp or DEFAULT_TIMESTAMP (epoch), both are valid RFC3339.
+            let ts = observed_at.as_deref().unwrap_or("");
+            assert_ne!(
+                ts,
+                "not-a-timestamp",
+                "Interrupted Diagnostic must not store the raw malformed 'at' value"
+            );
+            assert!(
+                ts.len() >= 20 && ts.contains('T'),
+                "Interrupted Diagnostic observed_at should be a valid RFC3339 fallback, got: {ts}"
+            );
         }
     }
 }

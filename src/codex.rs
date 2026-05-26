@@ -453,9 +453,6 @@ fn group_events(events: Vec<(usize, CodexEvent)>) -> GroupedEvents {
             CodexEvent::Rollout(h) if evt_idx == 0 => {
                 flavor = SessionFlavor::Rollout(h);
             }
-            CodexEvent::Session(_) | CodexEvent::Rollout(_) => {
-                // late or duplicate header — ignored
-            }
             CodexEvent::Message(m) if m.role == "assistant" => {
                 if let Some(turn) = current_turn.take() {
                     turns.push(turn);
@@ -467,9 +464,8 @@ fn group_events(events: Vec<(usize, CodexEvent)>) -> GroupedEvents {
                     tool_calls: Vec::new(),
                 });
             }
-            CodexEvent::Message(_) => {
-                // User message or other role — skip (context only)
-            }
+            // Late/duplicate headers and non-assistant messages are context-only; skip.
+            CodexEvent::Session(_) | CodexEvent::Rollout(_) | CodexEvent::Message(_) => {}
             CodexEvent::FunctionCall(fc) => {
                 // Pre-allocate a slot in the turn with no output yet.
                 // When the matching output arrives it fills in the slot by index.
@@ -1263,8 +1259,11 @@ fn is_sed_expression(s: &str) -> bool {
         return false;
     }
     // A valid sed substitution is s<d>pattern<d>replacement[<d>flags].
-    // Require at least 2 more occurrences of the delimiter after position 1.
-    b[2..].iter().filter(|&&c| c == delim).count() >= 2
+    // Find the first occurrence of delim in b[2..]; there must be a second one after it.
+    let rest = &b[2..];
+    rest.iter()
+        .position(|&c| c == delim)
+        .is_some_and(|pos| rest[pos + 1..].contains(&delim))
 }
 
 fn build_output_summary(stdout: Option<&str>, stderr: Option<&str>) -> String {
@@ -1293,16 +1292,8 @@ fn safe_truncate(s: &str, max_bytes: usize) -> &str {
     &s[..boundary]
 }
 
-const fn tool_status(exit_code: Option<i64>) -> &'static str {
-    match exit_code {
-        Some(0) => "succeeded",
-        Some(_) => "failed",
-        None => "unknown",
-    }
-}
-
-/// Derive ToolCall status from exit code and the function_call event's own status field.
-/// When no output arrived (exit_code is None), the call's status field reveals whether
+/// Derive `ToolCall` status from `exit_code` and the `function_call` event's own `status` field.
+/// When no output arrived (`exit_code` is `None`), the call's status field reveals whether
 /// it was interrupted/cancelled rather than simply missing its output.
 fn derive_tool_status(exit_code: Option<i64>, fc_status: Option<&str>) -> &'static str {
     match exit_code {
@@ -1311,7 +1302,7 @@ fn derive_tool_status(exit_code: Option<i64>, fc_status: Option<&str>) -> &'stat
         // When no output payload arrived we cannot confirm success — "completed"
         // only signals lifecycle end, not command success, so it stays "unknown".
         None => match fc_status {
-            Some("incomplete") | Some("cancelled") | Some("interrupted") => "interrupted",
+            Some("incomplete" | "cancelled" | "interrupted") => "interrupted",
             _ => "unknown",
         },
     }
@@ -1319,10 +1310,10 @@ fn derive_tool_status(exit_code: Option<i64>, fc_status: Option<&str>) -> &'stat
 
 /// Validate a timestamp string as plausible RFC3339.
 ///
-/// Checks structural positions (dashes, colon separators, 'T') and numeric ranges
-/// (month 1–12, day 1–31, hour 0–23, minute 0–59, second 0–60) so values like
-/// `2025-99-99T99:99:99Z` are rejected. Returns `None` for any malformed input so
-/// callers fall back to `DEFAULT_TIMESTAMP` rather than propagating an invalid date.
+/// Checks structural positions, numeric ranges, timezone designator, and calendar
+/// validity (including leap years) so values like `2025-99-99T99:99:99Z`,
+/// `2025-02-31T12:00:00Z`, and `2025-01-01T00:00:00BAD` are all rejected.
+/// Returns `None` for any malformed input so callers fall back to `DEFAULT_TIMESTAMP`.
 fn sanitize_rfc3339(ts: &str) -> Option<String> {
     let b = ts.as_bytes();
     if b.len() < 20 {
@@ -1338,17 +1329,35 @@ fn sanitize_rfc3339(ts: &str) -> Option<String> {
             return None;
         }
     }
+    // Position 19 must start a valid timezone designator or fractional-seconds '.'.
+    // Anything else (e.g. 'B' from "BAD") is not RFC3339 and must be rejected.
+    if !matches!(b[19], b'Z' | b'+' | b'-' | b'.') {
+        return None;
+    }
     let month = (b[5] - b'0') * 10 + (b[6] - b'0');
     let day = (b[8] - b'0') * 10 + (b[9] - b'0');
     let hour = (b[11] - b'0') * 10 + (b[12] - b'0');
     let minute = (b[14] - b'0') * 10 + (b[15] - b'0');
     let second = (b[17] - b'0') * 10 + (b[18] - b'0');
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
+    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // Validate day against actual days-in-month including leap-year February.
+    let year = u16::from(b[0] - b'0') * 1000
+        + u16::from(b[1] - b'0') * 100
+        + u16::from(b[2] - b'0') * 10
+        + u16::from(b[3] - b'0');
+    let days_in_month: u8 = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let is_leap =
+                (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+            if is_leap { 29 } else { 28 }
+        }
+        _ => return None,
+    };
+    if day < 1 || day > days_in_month {
         return None;
     }
     Some(ts.to_owned())
@@ -1781,6 +1790,8 @@ mod unit_tests {
         assert!(sanitize_rfc3339("2025-01-01T00:00:00Z").is_some());
         assert!(sanitize_rfc3339("2025-05-26T12:34:56+00:00").is_some());
         assert!(sanitize_rfc3339("1970-01-01T00:00:00Z").is_some());
+        assert!(sanitize_rfc3339("2024-02-29T00:00:00Z").is_some()); // leap year Feb 29
+        assert!(sanitize_rfc3339("2025-01-01T00:00:00.123Z").is_some()); // fractional seconds
     }
 
     #[test]
@@ -1788,11 +1799,17 @@ mod unit_tests {
         assert!(sanitize_rfc3339("not-a-timestamp").is_none());
         assert!(sanitize_rfc3339("2025-01-01").is_none()); // no time part
         assert!(sanitize_rfc3339("").is_none());
-        // Out-of-range values must be rejected.
+        // Out-of-range calendar/time values must be rejected.
         assert!(sanitize_rfc3339("2025-99-99T99:99:99Z").is_none()); // month 99
         assert!(sanitize_rfc3339("2025-13-01T00:00:00Z").is_none()); // month 13
         assert!(sanitize_rfc3339("2025-01-01T24:00:00Z").is_none()); // hour 24
         assert!(sanitize_rfc3339("2025-01-01T00:60:00Z").is_none()); // minute 60
+        // Invalid timezone tail.
+        assert!(sanitize_rfc3339("2025-01-01T00:00:00BAD").is_none()); // non-tz tail
+        // Impossible calendar dates (days exceeding month maximum).
+        assert!(sanitize_rfc3339("2025-02-31T12:00:00Z").is_none()); // Feb 31 impossible
+        assert!(sanitize_rfc3339("2025-04-31T12:00:00Z").is_none()); // April 31 impossible
+        assert!(sanitize_rfc3339("2025-02-29T12:00:00Z").is_none()); // Feb 29 in non-leap year
     }
 
     #[test]
