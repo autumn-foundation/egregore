@@ -20,7 +20,8 @@ use crate::{
     identity::{is_local_remote_url, repository_id_matches_payload},
     ir::{
         EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, IdentitySource, MetricKind, NodeKind,
-        SelectionBasis, SemanticDriftMetadata, SourceSpan, TemporalMetadata, UserContextFields,
+        Producer, SelectionBasis, SemanticDriftMetadata, SourceSpan, TemporalMetadata,
+        UserContextFields,
     },
 };
 #[cfg(feature = "embeddings")]
@@ -1168,7 +1169,7 @@ impl EmbeddedAletheiaSink {
             verification_kind,
             status,
             user_context,
-            producer: _,
+            producer,
         } = record
         else {
             unreachable!("write_node called with non-node record");
@@ -1353,6 +1354,11 @@ impl EmbeddedAletheiaSink {
         {
             builder = builder.insert("user_context_json", json.as_str());
         }
+        if let Some(p) = producer
+            && let Ok(json) = serde_json::to_string(p)
+        {
+            builder = builder.insert("producer_json", json.as_str());
+        }
         #[cfg(feature = "embeddings")]
         if let Some(vector) = self.embedding_for_node_write(record) {
             builder = builder.insert_vector("embedding", &vector);
@@ -1496,7 +1502,7 @@ impl EmbeddedAletheiaSink {
             schema_version,
             deleted_id,
             summary,
-            producer: _,
+            producer,
         } = record
         else {
             unreachable!("write_tombstone called with non-tombstone record");
@@ -1504,10 +1510,15 @@ impl EmbeddedAletheiaSink {
         self.write_seq += 1;
         let seq = self.write_seq;
         let seq_str = seq.to_string();
-        let properties = base_properties(id, "tombstone", *schema_version, summary)
+        let mut builder = base_properties(id, "tombstone", *schema_version, summary)
             .insert("deleted_id", deleted_id.as_str())
-            .insert("egregore_seq", seq_str.as_str())
-            .build();
+            .insert("egregore_seq", seq_str.as_str());
+        if let Some(p) = producer
+            && let Ok(json) = serde_json::to_string(p)
+        {
+            builder = builder.insert("producer_json", json.as_str());
+        }
+        let properties = builder.build();
         let node_id = self
             .db
             .create_node("Tombstone", properties)
@@ -1554,7 +1565,7 @@ impl EmbeddedAletheiaSink {
             confidence,
             temporal,
             summary,
-            producer: _,
+            producer,
         } = record
         else {
             unreachable!("write_edge called with non-edge record");
@@ -1571,6 +1582,11 @@ impl EmbeddedAletheiaSink {
             .insert("egregore_seq", seq_str.as_str());
         builder = insert_optional(builder, "confidence", confidence.as_deref());
         builder = insert_temporal(builder, temporal.as_ref());
+        if let Some(p) = producer
+            && let Ok(json) = serde_json::to_string(p)
+        {
+            builder = builder.insert("producer_json", json.as_str());
+        }
 
         let edge_id = self
             .db
@@ -2186,7 +2202,15 @@ impl EmbeddedAletheiaSink {
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("user_context_json invalid: {e}")))?
             .unwrap_or_else(UserContextFields::empty),
-            producer: None,
+            producer: optional_str_property(
+                record_id,
+                "producer_json",
+                node.get_property("producer_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<Producer>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("producer_json invalid: {e}")))?,
         };
         validate_adapter_record_version(&record)?;
         Ok(record)
@@ -2231,7 +2255,15 @@ impl EmbeddedAletheiaSink {
                 node.get_property("deleted_id"),
             )?,
             summary: required_str_property(record_id, "summary", node.get_property("summary"))?,
-            producer: None,
+            producer: optional_str_property(
+                record_id,
+                "producer_json",
+                node.get_property("producer_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<Producer>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("producer_json invalid: {e}")))?,
         };
         validate_adapter_record_version(&record)?;
         Ok(record)
@@ -2283,7 +2315,15 @@ impl EmbeddedAletheiaSink {
             )?,
             temporal: temporal_from_properties(record_id, |key| edge.get_property(key))?,
             summary: required_str_property(record_id, "summary", edge.get_property("summary"))?,
-            producer: None,
+            producer: optional_str_property(
+                record_id,
+                "producer_json",
+                edge.get_property("producer_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<Producer>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("producer_json invalid: {e}")))?,
         };
         validate_adapter_record_version(&record)?;
         Ok(record)

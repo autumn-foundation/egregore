@@ -82,7 +82,9 @@ pub enum ProducerKind {
     TaskWriter,
     /// Semantic drift engine.
     DriftEngine,
-    /// Any other producer not enumerated above.
+    /// Any other producer not enumerated above, including future additive variants
+    /// from newer binary versions read by an older binary.
+    #[serde(other)]
     Other,
 }
 
