@@ -246,9 +246,8 @@ struct CodexFunctionCall {
     #[serde(default)]
     #[allow(dead_code)]
     id: Option<String>,
-    /// Completion status (retained for format documentation).
+    /// Completion status — used to derive tool status when output is absent (expected tier).
     #[serde(default)]
-    #[allow(dead_code)]
     status: Option<String>,
 }
 
@@ -444,19 +443,18 @@ fn group_events(events: Vec<(usize, CodexEvent)>) -> GroupedEvents {
     let mut unknown_indices: Vec<usize> = Vec::new();
     let mut interruptions: Vec<CodexInterrupted> = Vec::new();
 
-    for (line_idx, event) in events {
+    for (evt_idx, (line_idx, event)) in events.into_iter().enumerate() {
         match event {
-            CodexEvent::Session(h) => {
-                // Pin to the first header encountered; ignore duplicates.
-                if matches!(flavor, SessionFlavor::None) {
-                    flavor = SessionFlavor::Session(h);
-                }
+            // Flavor is determined exclusively from the first parsed event (index 0).
+            // A header at any later position is silently ignored per the ADR contract.
+            CodexEvent::Session(h) if evt_idx == 0 => {
+                flavor = SessionFlavor::Session(h);
             }
-            CodexEvent::Rollout(h) => {
-                // Pin to the first header encountered; ignore duplicates.
-                if matches!(flavor, SessionFlavor::None) {
-                    flavor = SessionFlavor::Rollout(h);
-                }
+            CodexEvent::Rollout(h) if evt_idx == 0 => {
+                flavor = SessionFlavor::Rollout(h);
+            }
+            CodexEvent::Session(_) | CodexEvent::Rollout(_) => {
+                // late or duplicate header — ignored
             }
             CodexEvent::Message(m) if m.role == "assistant" => {
                 if let Some(turn) = current_turn.take() {
@@ -591,9 +589,17 @@ pub fn import_codex(path: &Path, opts: &ImportOptions) -> Result<Graph> {
     }
 
     // Determine metadata from flavor header.
+    // Timestamps are validated before use; malformed values fall back to DEFAULT_TIMESTAMP
+    // so that a bad header field never propagates invalid dates into daemon-visible records.
     let (header_model, header_timestamp) = match &grouped.flavor {
-        SessionFlavor::Session(h) => (h.model.clone(), h.created_at.clone()),
-        SessionFlavor::Rollout(h) => (h.model.clone(), h.started_at.clone()),
+        SessionFlavor::Session(h) => (
+            h.model.clone(),
+            h.created_at.as_deref().and_then(sanitize_rfc3339),
+        ),
+        SessionFlavor::Rollout(h) => (
+            h.model.clone(),
+            h.started_at.as_deref().and_then(sanitize_rfc3339),
+        ),
         SessionFlavor::None => (None, None),
     };
 
@@ -857,7 +863,7 @@ fn emit_tool_action(
     let cmd_run_id =
         agent_memory_stable_id(&["node", "command_run", turn_id, &action_idx.to_string()]);
 
-    let status_str = tool_status(exit_code);
+    let status_str = derive_tool_status(exit_code, fc.status.as_deref());
 
     // ── ToolCall ──────────────────────────────────────────────────────────────
     graph.push(make_node(
@@ -1269,6 +1275,33 @@ const fn tool_status(exit_code: Option<i64>) -> &'static str {
     }
 }
 
+/// Derive ToolCall status from exit code and the function_call event's own status field.
+/// When no output arrived (exit_code is None), the call's status field reveals whether
+/// it was interrupted/cancelled rather than simply missing its output.
+fn derive_tool_status(exit_code: Option<i64>, fc_status: Option<&str>) -> &'static str {
+    match exit_code {
+        Some(0) => "succeeded",
+        Some(_) => "failed",
+        None => match fc_status {
+            Some("incomplete") | Some("cancelled") | Some("interrupted") => "interrupted",
+            Some("completed") => "succeeded",
+            _ => "unknown",
+        },
+    }
+}
+
+/// Validate a timestamp string as plausible RFC3339.
+/// Returns `None` for strings that are clearly malformed (too short or missing 'T' separator)
+/// so callers can fall back to `DEFAULT_TIMESTAMP` without emitting invalid dates.
+fn sanitize_rfc3339(ts: &str) -> Option<String> {
+    let b = ts.as_bytes();
+    if b.len() >= 20 && b.get(10) == Some(&b'T') {
+        Some(ts.to_owned())
+    } else {
+        None
+    }
+}
+
 fn surrogate_hash(ctx: &ImportCtx, target: &str, phase: &str, cmd: &str) -> String {
     blake3_hex(
         format!(
@@ -1628,6 +1661,73 @@ mod unit_tests {
             matches!(grouped.flavor, SessionFlavor::Session(ref h) if h.model.as_deref() == Some("model-1")),
             "later Rollout header must not overwrite first Session header"
         );
+    }
+
+    #[test]
+    fn late_header_leaves_flavor_none() {
+        // First event is a user message (not a header); session header comes later.
+        // Per ADR contract, flavor must remain None.
+        let events = vec![
+            (
+                0,
+                CodexEvent::Message(CodexMessage {
+                    role: "user".to_owned(),
+                    content: vec![],
+                    id: None,
+                    status: None,
+                    usage: None,
+                }),
+            ),
+            (
+                1,
+                CodexEvent::Session(CodexSessionHeader {
+                    id: Some("late_sess".to_owned()),
+                    model: Some("late-model".to_owned()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                2,
+                CodexEvent::Message(CodexMessage {
+                    role: "assistant".to_owned(),
+                    content: vec![],
+                    id: None,
+                    status: None,
+                    usage: None,
+                }),
+            ),
+        ];
+        let grouped = group_events(events);
+        assert!(
+            matches!(grouped.flavor, SessionFlavor::None),
+            "session header after a non-header first event must not set flavor"
+        );
+    }
+
+    #[test]
+    fn derive_tool_status_incomplete_fc_is_interrupted() {
+        assert_eq!(derive_tool_status(None, Some("incomplete")), "interrupted");
+        assert_eq!(derive_tool_status(None, Some("cancelled")), "interrupted");
+        assert_eq!(derive_tool_status(None, Some("interrupted")), "interrupted");
+    }
+
+    #[test]
+    fn derive_tool_status_exit_code_overrides_fc_status() {
+        assert_eq!(derive_tool_status(Some(0), Some("incomplete")), "succeeded");
+        assert_eq!(derive_tool_status(Some(1), Some("completed")), "failed");
+    }
+
+    #[test]
+    fn sanitize_rfc3339_accepts_valid() {
+        assert!(sanitize_rfc3339("2025-01-01T00:00:00Z").is_some());
+        assert!(sanitize_rfc3339("2025-05-26T12:34:56+00:00").is_some());
+    }
+
+    #[test]
+    fn sanitize_rfc3339_rejects_malformed() {
+        assert!(sanitize_rfc3339("not-a-timestamp").is_none());
+        assert!(sanitize_rfc3339("2025-01-01").is_none()); // no time part
+        assert!(sanitize_rfc3339("").is_none());
     }
 
     #[test]

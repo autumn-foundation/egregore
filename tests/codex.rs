@@ -1087,6 +1087,110 @@ fn tool_call_kind_values_are_daemon_valid() {
     }
 }
 
+// ── Interrupted tool calls carry status="interrupted" ───────────────────────
+
+#[test]
+fn interrupted_tool_call_has_interrupted_status() {
+    // function_call with status="incomplete" and no output → ToolCall.status must be "interrupted"
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[]}"#,
+        "\n",
+        r#"{"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"cmd\":[\"sleep\",\"100\"]}","status":"incomplete"}"#,
+        // deliberately no function_call_output — call was interrupted
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    let tool_call_status: Option<&str> = records.iter().find_map(|r| {
+        if let GraphRecord::Node {
+            kind: NodeKind::ToolCall,
+            status,
+            ..
+        } = r
+        {
+            status.as_deref()
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        tool_call_status,
+        Some("interrupted"),
+        "ToolCall with status=incomplete and no output should have status=interrupted"
+    );
+}
+
+// ── Late header does not set flavor ───────────────────────────────────────────
+
+#[test]
+fn non_header_first_event_leaves_flavor_unknown() {
+    // First event is a user message, not a header.
+    // The session header arriving later must not change the flavor, per ADR contract.
+    let jsonl = concat!(
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"session","model":"late-model","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[]}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    let run_node = records
+        .iter()
+        .find(|r| r.node_kind_name() == Some("AgentRun"));
+    assert!(run_node.is_some(), "no AgentRun emitted");
+    if let Some(GraphRecord::Node { summary, .. }) = run_node {
+        assert!(
+            summary.contains("unknown"),
+            "AgentRun flavor should be 'unknown' when header is not the first event, got: {summary}"
+        );
+    }
+}
+
+// ── Malformed header timestamp falls back to epoch ────────────────────────────
+
+#[test]
+fn malformed_header_timestamp_falls_back_to_epoch() {
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"not-a-timestamp"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[]}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    for r in &records {
+        if let GraphRecord::Node {
+            kind: NodeKind::AgentSession,
+            observed_at,
+            ..
+        } = r
+        {
+            assert_eq!(
+                observed_at.as_deref(),
+                Some("1970-01-01T00:00:00Z"),
+                "AgentSession with malformed created_at must use epoch fallback for observed_at"
+            );
+        }
+    }
+}
+
 // ── Malformed JSON lines produce a Diagnostic record ─────────────────────────
 
 #[test]
