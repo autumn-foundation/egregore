@@ -3,4 +3,5 @@
 
 # Generated egregore stores and graph snapshots
 *.jsonl
+!tests/fixtures/**/*.jsonl
 .egregore*/
