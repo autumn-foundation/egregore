@@ -398,10 +398,11 @@ fn is_patch_command_parts(parts: &[String]) -> bool {
 fn is_file_edit_command_parts(parts: &[String]) -> bool {
     let first = parts.first().map_or("", String::as_str);
     match first {
-        "sed" => parts
-            .iter()
-            .any(|p| p == "-i" || p.starts_with("-i") || p == "--in-place"),
-        "tee" => true,
+        "sed" => parts.iter().any(|p| {
+            p == "-i" || p.starts_with("-i") || p == "--in-place" || p.starts_with("--in-place=")
+        }),
+        // tee is a file edit only when it has a real file operand (not just piping to stdout).
+        "tee" => extract_target_file_from_parts(parts).is_some(),
         "cat" => {
             // cat > file or cat >> file (redirect)
             parts.windows(2).any(|w| w[0] == ">" || w[0] == ">>")
@@ -588,9 +589,13 @@ pub fn import_codex(path: &Path, opts: &ImportOptions) -> Result<Graph> {
     // valid-JSON lines with unrecognised event types is NOT rejected here — those
     // events produce Diagnostic records, preserving forward-compat with future
     // Codex CLI versions that add new event types.
+    // A file with a recognised session/rollout header but no assistant turns is also
+    // NOT rejected: the session identity is known, so at minimum an AgentSession node
+    // can be emitted (common for truncated captures or header-only recordings).
     if grouped.turns.is_empty()
         && grouped.interruptions.is_empty()
         && grouped.unknown_indices.is_empty()
+        && matches!(grouped.flavor, SessionFlavor::None)
     {
         return Err(crate::CodegraphError::EmptyImport {
             path: path.to_path_buf(),
@@ -1310,9 +1315,10 @@ fn derive_tool_status(exit_code: Option<i64>, fc_status: Option<&str>) -> &'stat
 
 /// Validate a timestamp string as plausible RFC3339.
 ///
-/// Checks structural positions, numeric ranges, timezone designator, and calendar
-/// validity (including leap years) so values like `2025-99-99T99:99:99Z`,
-/// `2025-02-31T12:00:00Z`, and `2025-01-01T00:00:00BAD` are all rejected.
+/// Checks structural positions, numeric ranges, timezone designator (including the
+/// full offset for `+`/`-` forms), and calendar validity (including leap years).
+/// Values like `2025-99-99T99:99:99Z`, `2025-02-31T12:00:00Z`,
+/// `2025-01-01T00:00:00BAD`, and `2025-01-01T00:00:00+24:99` are all rejected.
 /// Returns `None` for any malformed input so callers fall back to `DEFAULT_TIMESTAMP`.
 fn sanitize_rfc3339(ts: &str) -> Option<String> {
     let b = ts.as_bytes();
@@ -1328,11 +1334,6 @@ fn sanitize_rfc3339(ts: &str) -> Option<String> {
         if !b[pos].is_ascii_digit() {
             return None;
         }
-    }
-    // Position 19 must start a valid timezone designator or fractional-seconds '.'.
-    // Anything else (e.g. 'B' from "BAD") is not RFC3339 and must be rejected.
-    if !matches!(b[19], b'Z' | b'+' | b'-' | b'.') {
-        return None;
     }
     let month = (b[5] - b'0') * 10 + (b[6] - b'0');
     let day = (b[8] - b'0') * 10 + (b[9] - b'0');
@@ -1359,6 +1360,71 @@ fn sanitize_rfc3339(ts: &str) -> Option<String> {
     };
     if day < 1 || day > days_in_month {
         return None;
+    }
+    // Validate the complete timezone tail starting at byte 19.
+    // Each branch validates both structure and value ranges for the respective form.
+    match b[19] {
+        b'Z' => {
+            // Z must be the final character; trailing garbage (e.g. "ZZZZ") is not RFC3339.
+            if b.len() != 20 {
+                return None;
+            }
+        }
+        b'+' | b'-' => {
+            // Numeric offset: sign + HH:MM = exactly 6 bytes → total length 25.
+            if b.len() != 25
+                || !b[20].is_ascii_digit()
+                || !b[21].is_ascii_digit()
+                || b[22] != b':'
+                || !b[23].is_ascii_digit()
+                || !b[24].is_ascii_digit()
+            {
+                return None;
+            }
+            let off_h = (b[20] - b'0') * 10 + (b[21] - b'0');
+            let off_m = (b[23] - b'0') * 10 + (b[24] - b'0');
+            if off_h > 23 || off_m > 59 {
+                return None;
+            }
+        }
+        b'.' => {
+            // Fractional seconds: one or more ASCII digits, then Z or a numeric offset.
+            let mut i = 20usize;
+            if i >= b.len() || !b[i].is_ascii_digit() {
+                return None;
+            }
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            match b.get(i) {
+                Some(&b'Z') => {
+                    if i + 1 != b.len() {
+                        return None;
+                    }
+                }
+                Some(&(b'+' | b'-')) => {
+                    let rem = &b[i..];
+                    // sign + HH:MM = exactly 6 bytes
+                    if rem.len() != 6
+                        || !rem[1].is_ascii_digit()
+                        || !rem[2].is_ascii_digit()
+                        || rem[3] != b':'
+                        || !rem[4].is_ascii_digit()
+                        || !rem[5].is_ascii_digit()
+                    {
+                        return None;
+                    }
+                    let off_h = (rem[1] - b'0') * 10 + (rem[2] - b'0');
+                    let off_m = (rem[4] - b'0') * 10 + (rem[5] - b'0');
+                    if off_h > 23 || off_m > 59 {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        // Not a valid RFC3339 timezone designator (e.g. 'B' from "BAD").
+        _ => return None,
     }
     Some(ts.to_owned())
 }
@@ -1866,5 +1932,65 @@ mod unit_tests {
         let v = serde_json::json!({"k":"v"});
         let result = json_value_to_text(&v).expect("should be Some");
         assert!(result.contains('k') && result.contains('v'));
+    }
+
+    // ── sanitize_rfc3339: full timezone-suffix validation ──────────────────────
+
+    #[test]
+    fn sanitize_rfc3339_rejects_invalid_offset() {
+        // Offset hours must be 00-23, minutes 00-59.
+        assert!(sanitize_rfc3339("2025-01-01T00:00:00+24:99").is_none()); // hours > 23
+        assert!(sanitize_rfc3339("2025-01-01T00:00:00-00:60").is_none()); // minutes > 59
+        assert!(sanitize_rfc3339("2025-01-01T00:00:00+").is_none()); // incomplete offset
+        assert!(sanitize_rfc3339("2025-01-01T00:00:00+5:30").is_none()); // not zero-padded → wrong len
+        assert!(sanitize_rfc3339("2025-01-01T00:00:00+05:3").is_none()); // truncated
+    }
+
+    #[test]
+    fn sanitize_rfc3339_accepts_valid_offsets() {
+        assert!(sanitize_rfc3339("2025-01-01T00:00:00+05:30").is_some());
+        assert!(sanitize_rfc3339("2025-01-01T00:00:00-07:00").is_some());
+        assert!(sanitize_rfc3339("2025-01-01T00:00:00+23:59").is_some()); // boundary values
+        assert!(sanitize_rfc3339("2025-01-01T00:00:00.456+05:30").is_some()); // fractional + offset
+    }
+
+    // ── is_file_edit_command_parts: sed --in-place=<suffix> ────────────────────
+
+    #[test]
+    fn sed_in_place_equals_suffix_is_file_edit() {
+        // GNU sed --in-place=<suffix> must be detected as a file-edit command.
+        let parts: Vec<String> = vec![
+            "sed".to_owned(),
+            "--in-place=.bak".to_owned(),
+            "s/foo/bar/g".to_owned(),
+            "file.py".to_owned(),
+        ];
+        assert!(
+            is_file_edit_command_parts(&parts),
+            "sed --in-place=.bak must be classified as a file-edit command"
+        );
+    }
+
+    // ── is_file_edit_command_parts: tee without file arg ───────────────────────
+
+    #[test]
+    fn tee_without_file_arg_is_not_file_edit() {
+        // tee with no operand (piping to stdout only) must not be classified
+        // as a file-edit command — there is no file to record.
+        let parts: Vec<String> = vec!["tee".to_owned()];
+        assert!(
+            !is_file_edit_command_parts(&parts),
+            "tee with no file arg must not be a file-edit command"
+        );
+    }
+
+    #[test]
+    fn tee_with_file_arg_is_file_edit() {
+        // tee file.log IS a file-edit; must still classify correctly.
+        let parts: Vec<String> = vec!["tee".to_owned(), "file.log".to_owned()];
+        assert!(
+            is_file_edit_command_parts(&parts),
+            "tee with a file arg must be a file-edit command"
+        );
     }
 }

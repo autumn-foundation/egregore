@@ -737,15 +737,27 @@ fn empty_file_returns_error() {
 }
 
 #[test]
-fn header_only_file_returns_error() {
-    // A file with only a session header and no turns should also fail.
+fn header_only_file_emits_session_node() {
+    // A file with only a session header (no assistant turns) is a valid truncated
+    // recording: the session identity is known, so at minimum an AgentSession node
+    // must be emitted. Previously this returned EmptyImport; that was incorrect.
     let jsonl = r#"{"type":"session","model":"test","created_at":"2025-01-01T00:00:00Z"}"#;
     let tmp = tempfile::NamedTempFile::new().expect("tmp");
     std::fs::write(tmp.path(), jsonl).expect("write");
     let result = import_codex(tmp.path(), &ImportOptions::default());
     assert!(
-        result.is_err(),
-        "expected error for header-only file, got Ok"
+        result.is_ok(),
+        "session-header-only file must not be rejected as EmptyImport; got: {result:?}"
+    );
+    assert!(
+        result.unwrap().records().iter().any(|r| matches!(
+            r,
+            GraphRecord::Node {
+                kind: NodeKind::AgentSession,
+                ..
+            }
+        )),
+        "session-header-only file must emit an AgentSession node"
     );
 }
 
@@ -1500,14 +1512,13 @@ fn malformed_interruption_timestamp_falls_back_to_epoch() {
             observed_at,
             ..
         } = r
-        && summary.to_lowercase().contains("interrupt")
+            && summary.to_lowercase().contains("interrupt")
         {
             // The malformed 'at' value must not be stored; the fallback is either
             // the header timestamp or DEFAULT_TIMESTAMP (epoch), both are valid RFC3339.
             let ts = observed_at.as_deref().unwrap_or("");
             assert_ne!(
-                ts,
-                "not-a-timestamp",
+                ts, "not-a-timestamp",
                 "Interrupted Diagnostic must not store the raw malformed 'at' value"
             );
             assert!(
@@ -1516,4 +1527,176 @@ fn malformed_interruption_timestamp_falls_back_to_epoch() {
             );
         }
     }
+}
+
+// ── sanitize_rfc3339 rejects invalid timezone offsets ─────────────────────────
+
+#[test]
+fn invalid_timezone_offset_in_header_falls_back_to_epoch() {
+    // "+24:99" has hours > 23 and minutes > 59 — not valid RFC3339.
+    // sanitize_rfc3339 must reject it, causing the AgentSession to use DEFAULT_TIMESTAMP.
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00+24:99"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[]}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    let ts = records
+        .iter()
+        .find_map(|r| {
+            if let GraphRecord::Node {
+                kind: NodeKind::AgentSession,
+                observed_at,
+                ..
+            } = r
+            {
+                Some(observed_at.as_deref().unwrap_or(""))
+            } else {
+                None
+            }
+        })
+        .unwrap_or("");
+    assert_ne!(
+        ts, "2025-01-01T00:00:00+24:99",
+        "AgentSession must not store a timestamp with out-of-range offset"
+    );
+}
+
+// ── sed --in-place=<suffix> produces FileEdit ─────────────────────────────────
+
+#[test]
+fn sed_in_place_equals_suffix_emits_file_edit() {
+    // GNU sed --in-place=.bak is equivalent to -i.bak; must produce a FileEdit.
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[]}"#,
+        "\n",
+        r#"{"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"cmd\":[\"sed\",\"--in-place=.bak\",\"s/foo/bar/g\",\"file.py\"]}"}"#,
+        "\n",
+        r#"{"type":"function_call_output","call_id":"c1","output":"{\"exit_code\":0,\"stdout\":\"\",\"stderr\":\"\"}"}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    let has_file_edit = records.iter().any(|r| {
+        if let GraphRecord::Node {
+            kind: NodeKind::FileEdit,
+            repo_relative_path,
+            ..
+        } = r
+        {
+            repo_relative_path.as_deref() == Some("file.py")
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_file_edit,
+        "sed --in-place=.bak must produce a FileEdit node for file.py"
+    );
+    // The ToolCall kind must also be file_edit.
+    let tool_kind: Option<&str> = records.iter().find_map(|r| {
+        if let GraphRecord::Node {
+            kind: NodeKind::ToolCall,
+            tool_kind,
+            ..
+        } = r
+        {
+            tool_kind.as_deref()
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        tool_kind,
+        Some("file_edit"),
+        "sed --in-place=.bak ToolCall must have tool_kind=file_edit"
+    );
+}
+
+// ── header-only session is not EmptyImport ────────────────────────────────────
+
+#[test]
+fn header_only_session_not_empty_import() {
+    // A capture with only a session header and user messages (no assistant turn) is
+    // a valid truncated recording: the AgentSession identity is known, so it must
+    // not be rejected as EmptyImport.
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let result = import_codex(tmp.path(), &ImportOptions::default());
+    assert!(
+        result.is_ok(),
+        "header-only session capture must not be rejected as EmptyImport; got: {result:?}"
+    );
+    let records = result.unwrap().records().to_vec();
+    assert!(
+        records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Node {
+                kind: NodeKind::AgentSession,
+                ..
+            }
+        )),
+        "header-only session must still emit AgentSession node"
+    );
+}
+
+// ── tee without file arg has tool_kind=bash ───────────────────────────────────
+
+#[test]
+fn tee_without_file_arg_tool_kind_is_bash() {
+    // tee with no file operand is piping to stdout — the ToolCall must be tagged
+    // as "bash", not "file_edit", to avoid polluting file-edit analytics.
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[]}"#,
+        "\n",
+        r#"{"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"cmd\":[\"tee\"]}"}"#,
+        "\n",
+        r#"{"type":"function_call_output","call_id":"c1","output":"{\"exit_code\":0,\"stdout\":\"data\",\"stderr\":\"\"}"}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    let tool_kind: Option<&str> = records.iter().find_map(|r| {
+        if let GraphRecord::Node {
+            kind: NodeKind::ToolCall,
+            tool_kind,
+            ..
+        } = r
+        {
+            tool_kind.as_deref()
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        tool_kind,
+        Some("bash"),
+        "tee with no file arg must have tool_kind=bash, not file_edit"
+    );
 }
