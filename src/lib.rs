@@ -41,9 +41,10 @@ use std::path::Path;
 pub use error::{CodegraphError, Result};
 pub use history::{scan_repository_history, scan_repository_history_with_override};
 pub use ir::{
-    AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, Domain, EdgeLabel, EmbeddingModel,
-    EvidenceLink, Graph, GraphRecord, IdentitySource, MetricKind, NodeKind, NodeProvenance,
-    PROJECT_SCHEMA_VERSION, PatchHandle, RepositoryIdentityPayload, SCHEMA_VERSION,
+    AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, Domain, EdgeLabel, EgregoreGit,
+    EmbeddingModel, EvidenceLink, Graph, GraphRecord, IdentitySource, MetricKind, NodeKind,
+    NodeProvenance, PRODUCER_ENVELOPE_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION, PatchHandle,
+    Producer, ProducerKind, RepositoryIdentityPayload, SCHEMA_VERSION,
     SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, SelectionBasis,
     SemanticDriftMetadata, SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION,
     UserContextFields, UserContextScope, agent_memory_stable_id, artifact_stable_id,

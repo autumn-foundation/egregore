@@ -91,6 +91,7 @@ pub fn scan_repository_incremental_at(
             schema_version: SCHEMA_VERSION,
             deleted_id: old_repo_id.clone(),
             summary: format!("Repository identity changed; stale Repository {old_repo_id} removed"),
+            producer: None,
         });
     } else if previous_cache.repository_id.is_empty() && !previous_cache.files.is_empty() {
         // Legacy cache written before the repository_id field existed: infer the old
@@ -114,6 +115,7 @@ pub fn scan_repository_incremental_at(
                 summary: format!(
                     "Repository identity changed; stale Repository {legacy_repo_id} removed"
                 ),
+                producer: None,
             });
         }
     }
@@ -276,6 +278,7 @@ fn file_tombstone(repo_relative_path: &str, repository_id: &str) -> GraphRecord 
         schema_version: SCHEMA_VERSION,
         deleted_id,
         summary: format!("Removed source file {repo_relative_path}"),
+        producer: None,
     }
 }
 
@@ -301,5 +304,6 @@ fn invalidated_record_tombstone(repo_relative_path: &str, deleted_id: &str) -> G
         schema_version: SCHEMA_VERSION,
         deleted_id: deleted_id.to_owned(),
         summary: format!("Invalidated stale cached record {deleted_id} from {repo_relative_path}"),
+        producer: None,
     }
 }

@@ -277,6 +277,7 @@ fn semantic_search_returns_latest_live_records_only() {
         schema_version: SCHEMA_VERSION,
         deleted_id: deleted_symbol_id.clone(),
         summary: "deleted symbol tombstone".to_owned(),
+        producer: None,
     };
     let superseded_symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "superseded"]);
     let superseding_symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "superseding"]);
@@ -918,6 +919,7 @@ fn embedded_tombstone_read_back_survives_persist_and_reopen() {
         schema_version: SCHEMA_VERSION,
         deleted_id,
         summary: "Removed source file src/deleted.rs".to_owned(),
+        producer: None,
     };
     let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
 

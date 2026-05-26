@@ -1168,6 +1168,7 @@ impl EmbeddedAletheiaSink {
             verification_kind,
             status,
             user_context,
+            producer: _,
         } = record
         else {
             unreachable!("write_node called with non-node record");
@@ -1495,6 +1496,7 @@ impl EmbeddedAletheiaSink {
             schema_version,
             deleted_id,
             summary,
+            producer: _,
         } = record
         else {
             unreachable!("write_tombstone called with non-tombstone record");
@@ -1552,6 +1554,7 @@ impl EmbeddedAletheiaSink {
             confidence,
             temporal,
             summary,
+            producer: _,
         } = record
         else {
             unreachable!("write_edge called with non-edge record");
@@ -2183,6 +2186,7 @@ impl EmbeddedAletheiaSink {
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("user_context_json invalid: {e}")))?
             .unwrap_or_else(UserContextFields::empty),
+            producer: None,
         };
         validate_adapter_record_version(&record)?;
         Ok(record)
@@ -2227,6 +2231,7 @@ impl EmbeddedAletheiaSink {
                 node.get_property("deleted_id"),
             )?,
             summary: required_str_property(record_id, "summary", node.get_property("summary"))?,
+            producer: None,
         };
         validate_adapter_record_version(&record)?;
         Ok(record)
@@ -2278,6 +2283,7 @@ impl EmbeddedAletheiaSink {
             )?,
             temporal: temporal_from_properties(record_id, |key| edge.get_property(key))?,
             summary: required_str_property(record_id, "summary", edge.get_property("summary"))?,
+            producer: None,
         };
         validate_adapter_record_version(&record)?;
         Ok(record)
@@ -3385,6 +3391,7 @@ mod tests {
             schema_version: crate::ir::SCHEMA_VERSION,
             deleted_id: symbol_id.clone(),
             summary: "deleted".to_owned(),
+            producer: None,
         };
 
         let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
@@ -3437,6 +3444,7 @@ mod tests {
             schema_version: crate::ir::SCHEMA_VERSION,
             deleted_id: symbol_id.clone(),
             summary: "deleted".to_owned(),
+            producer: None,
         })
         .expect("tombstone should write");
         // 3. Re-ingest the same record (restoration) — new AletheiaDB node, higher NodeId
@@ -3500,6 +3508,7 @@ mod tests {
             schema_version: crate::ir::SCHEMA_VERSION,
             deleted_id: edge_id.clone(),
             summary: "edge deleted".to_owned(),
+            producer: None,
         })
         .expect("tombstone should write");
         sink.write_record(&reingested_edge)
@@ -3545,6 +3554,7 @@ mod tests {
             schema_version: crate::ir::SCHEMA_VERSION,
             deleted_id: edge_id.clone(),
             summary: "edge deleted".to_owned(),
+            producer: None,
         })
         .expect("tombstone should write");
 

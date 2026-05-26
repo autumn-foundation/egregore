@@ -1076,6 +1076,7 @@ fn fixture_graph_with_tombstoned_symbol() -> (tempfile::TempDir, PathBuf) {
         schema_version: SCHEMA_VERSION,
         deleted_id: sym_id,
         summary: "deleted_fn removed".to_owned(),
+        producer: None,
     };
 
     let mut graph = Graph::new();
@@ -1141,6 +1142,7 @@ fn fixture_graph_with_tombstoned_temporal_symbol() -> (tempfile::TempDir, PathBu
         schema_version: SCHEMA_VERSION,
         deleted_id: sym_id,
         summary: "removed_fn deleted after aaaa".to_owned(),
+        producer: None,
     };
 
     let mut graph = Graph::new();

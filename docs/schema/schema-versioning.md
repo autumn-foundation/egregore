@@ -177,7 +177,13 @@ state and producer version. Agent-memory, project, artifact, verification, and
 semantic records do not have that escape hatch by default; their migrations must
 treat the persisted record as source data.
 
-## 7 - Coordination Notes
+## 7 - Producer Envelope
+
+The `producer` field is a **non-versioned envelope field** on every `GraphRecord`. It does not participate in the per-`(domain, kind)` `schema_version` bump cycle. Adding a new `producer_kind` is additive; changing a `producer_components` key shape is breaking and requires a `PRODUCER_ENVELOPE_SCHEMA_VERSION` bump (separate constant in `src/ir.rs`).
+
+See [`docs/schema/producer-version.md`](producer-version.md) for the full `Producer` shape, the non-identity rule, the legacy-record policy, and per-kind `producer_components` requirements.
+
+## 8 - Coordination Notes
 
 - #3: the `domain` field bump from `SCHEMA_VERSION` 1 to 2 must classify itself
   under `additive`, `breaking`, or `migrating` and update this document.

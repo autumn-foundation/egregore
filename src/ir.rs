@@ -35,6 +35,113 @@ pub const USER_CONTEXT_SCHEMA_VERSION: u32 = 1;
 /// Documented in `docs/schema/semantic-drift.md`.
 pub const SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE: f64 = 1e-5;
 
+/// Schema version for the producer envelope.
+///
+/// Adding a new `producer_kind` or a well-known `producer_components` key is
+/// additive; removing or renaming an existing key is a `/v2/` bump.
+/// Documented in `docs/schema/producer-version.md`.
+pub const PRODUCER_ENVELOPE_SCHEMA_VERSION: u32 = 1;
+
+// ── Producer identity types (docs/schema/producer-version.md) ─────────────────
+
+/// Optional Git-tree provenance for a producer build.
+///
+/// Present when the binary was built from a git checkout; absent when built from
+/// a clean release tarball. Documented in `docs/schema/producer-version.md`.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EgregoreGit {
+    /// Short or full git commit SHA of the build tree.
+    pub commit: String,
+    /// `true` when the working tree had uncommitted changes at build time.
+    pub dirty: bool,
+}
+
+/// Which subsystem wrote a batch of graph records.
+///
+/// Adding a new variant is **additive** per `docs/schema/schema-versioning.md`.
+/// Removing or renaming a variant requires a producer-envelope `/v2/` bump.
+/// Documented in `docs/schema/producer-version.md`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerKind {
+    /// Tree-sitter-based code graph extractor (`scan` command).
+    CodeGraphExtractor,
+    /// Git history replay producer (`scan-history` command).
+    HistoryReplay,
+    /// Incremental cache update producer.
+    IncrementalCache,
+    /// `.traj` file importer.
+    TrajImporter,
+    /// Codex-format importer.
+    CodexImporter,
+    /// Claude Code session importer.
+    ClaudeCodeImporter,
+    /// Agent-memory observation writer.
+    ObservationWriter,
+    /// Project / task writer.
+    TaskWriter,
+    /// Semantic drift engine.
+    DriftEngine,
+    /// Any other producer not enumerated above.
+    Other,
+}
+
+impl ProducerKind {
+    /// Returns the serialized producer kind string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CodeGraphExtractor => "code_graph_extractor",
+            Self::HistoryReplay => "history_replay",
+            Self::IncrementalCache => "incremental_cache",
+            Self::TrajImporter => "traj_importer",
+            Self::CodexImporter => "codex_importer",
+            Self::ClaudeCodeImporter => "claude_code_importer",
+            Self::ObservationWriter => "observation_writer",
+            Self::TaskWriter => "task_writer",
+            Self::DriftEngine => "drift_engine",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Producer identity envelope stamped on every persisted graph record.
+///
+/// **Non-identity rule:** `producer` MUST NOT contribute to any stable ID
+/// composition. Two records produced by different binary versions over identical
+/// input MUST have identical stable IDs. See `docs/schema/producer-version.md`.
+///
+/// **Legacy-record policy:** records persisted before this field was introduced
+/// have no `producer` field. Readers MUST treat them as `legacy_pre_v1` rather
+/// than synthesizing a producer identity.
+///
+/// **Placement:** this is a single embedded field on `GraphRecord`, not per
+/// node/edge/tombstone duplication. When a producer emits a batch of records,
+/// every record in that batch carries the same `Producer` value.
+///
+/// Documented in `docs/schema/producer-version.md`.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Producer {
+    /// Semver string from `CARGO_PKG_VERSION`.
+    pub egregore_version: String,
+    /// Git build provenance; absent for clean release tarballs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egregore_git: Option<EgregoreGit>,
+    /// Which subsystem produced these records.
+    pub producer_kind: ProducerKind,
+    /// Named version strings for the producer's components.
+    ///
+    /// `code_graph_extractor` MUST populate `tree_sitter` and `tree_sitter_rust`.
+    /// `history_replay` MUST also populate `tree_sitter` and `tree_sitter_rust`.
+    /// `incremental_cache` MUST populate `cache_format_version`.
+    /// `drift_engine` MUST populate `embedding_model_id`.
+    /// `traj_importer`, `codex_importer`, `claude_code_importer` MUST populate
+    /// `importer_schema_version` and `source_format_version`.
+    pub producer_components: std::collections::BTreeMap<String, String>,
+    /// RFC 3339 wall-clock time the producer process started.
+    pub producer_started_at: String,
+}
+
 /// Complete in-memory graph emitted by a scan.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
@@ -685,6 +792,10 @@ pub enum GraphRecord {
         /// User-context domain fields, flattened into node JSON.
         #[serde(flatten)]
         user_context: UserContextFields,
+        /// Producer identity envelope. `None` for legacy records written before
+        /// this field was introduced; see `docs/schema/producer-version.md`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        producer: Option<Producer>,
     },
     /// A graph edge.
     Edge {
@@ -706,6 +817,10 @@ pub enum GraphRecord {
         temporal: Option<TemporalMetadata>,
         /// Agent-facing summary.
         summary: String,
+        /// Producer identity envelope. `None` for legacy records written before
+        /// this field was introduced; see `docs/schema/producer-version.md`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        producer: Option<Producer>,
     },
     /// A deleted graph entity marker emitted by incremental scans.
     Tombstone {
@@ -717,6 +832,10 @@ pub enum GraphRecord {
         deleted_id: String,
         /// Agent-facing summary.
         summary: String,
+        /// Producer identity envelope. `None` for legacy records written before
+        /// this field was introduced; see `docs/schema/producer-version.md`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        producer: Option<Producer>,
     },
 }
 
@@ -831,6 +950,7 @@ impl GraphRecord {
             verification_kind: None,
             status: None,
             user_context: UserContextFields::empty(),
+            producer: None,
         }
     }
 
@@ -928,6 +1048,7 @@ impl GraphRecord {
             verification_kind: None,
             status: None,
             user_context: UserContextFields::empty(),
+            producer: None,
         }
     }
 
@@ -1024,6 +1145,7 @@ impl GraphRecord {
             verification_kind: None,
             status: None,
             user_context: UserContextFields::empty(),
+            producer: None,
         }
     }
 
@@ -1046,6 +1168,7 @@ impl GraphRecord {
             confidence,
             temporal: None,
             summary,
+            producer: None,
         }
     }
 
@@ -1069,6 +1192,7 @@ impl GraphRecord {
             confidence,
             temporal: None,
             summary,
+            producer: None,
         }
     }
 
@@ -1161,6 +1285,35 @@ impl GraphRecord {
             *ingested_at = Some(node_ingested_at.into());
         }
         self
+    }
+
+    /// Stamps the producer identity envelope on this record.
+    ///
+    /// The `producer` field is a non-identity envelope: it MUST NOT contribute
+    /// to any stable ID composition. See `docs/schema/producer-version.md`.
+    #[must_use]
+    pub fn with_producer(mut self, producer: Producer) -> Self {
+        match &mut self {
+            Self::Node { producer: p, .. }
+            | Self::Edge { producer: p, .. }
+            | Self::Tombstone { producer: p, .. } => {
+                *p = Some(producer);
+            }
+        }
+        self
+    }
+
+    /// Returns the producer identity envelope if present.
+    ///
+    /// `None` indicates a legacy record written before the producer envelope was
+    /// introduced; see `docs/schema/producer-version.md §Legacy-Record Policy`.
+    #[must_use]
+    pub const fn producer(&self) -> Option<&Producer> {
+        match self {
+            Self::Node { producer, .. }
+            | Self::Edge { producer, .. }
+            | Self::Tombstone { producer, .. } => producer.as_ref(),
+        }
     }
 }
 

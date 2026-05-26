@@ -68,6 +68,8 @@ Egregore starts with typed graph domains. Domains share one AletheiaDB store and
 
 **Record schema-version policy:** [`docs/schema/schema-versioning.md`](../schema/schema-versioning.md) is the single source of truth for `(domain, kind, schema_version)` compatibility classes, unknown-version rejection, mixed-store inspect output, and migration manifests. It is distinct from daemon HTTP `api_version`.
 
+**Producer identity envelope:** [`docs/schema/producer-version.md`](../schema/producer-version.md) is the single source of truth for the `producer` field on every persisted record — which binary version, grammar set, and process produced each observation. Producer identity is a trust boundary: the extractor's version is separate from the record's stable ID and from the agent-authored observation axis.
+
 | Domain | Owns | Examples |
 |--------|------|----------|
 | Code Graph | Source-derived facts | Repository, File, Symbol, Import, Call, Commit, Change |
