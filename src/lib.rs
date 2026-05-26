@@ -114,6 +114,7 @@ pub fn scan_repository_at_with_override(
     transaction_time: &str,
     repo_id_override: Option<&str>,
 ) -> Result<Graph> {
+    LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
     validate_repository(repo_root)?;
 
@@ -131,13 +132,12 @@ pub fn scan_repository_at_with_override(
     Ok(graph.stamp_producer(&code_graph_producer()))
 }
 
-/// Wall-clock time at which the current egregore process started.
+/// Wall-clock time captured at the start of the first scan in this process.
 ///
-/// Initialized once on first access; all extraction paths use this value as
-/// `producer_started_at` so the field accurately reflects the process runtime
-/// window regardless of what `transaction_time` is passed to deterministic
-/// `_at` scan variants.
-static PROCESS_STARTED_AT: LazyLock<String> =
+/// Forced before any graph construction in every public scan entry point so that
+/// `producer_started_at` reflects scan-start wall-clock rather than the instant
+/// `code_graph_producer()` is called at the end of a potentially long run.
+pub(crate) static PROCESS_STARTED_AT: LazyLock<String> =
     LazyLock::new(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
 
 pub(crate) fn code_graph_producer() -> Producer {

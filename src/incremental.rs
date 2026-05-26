@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use chrono::Utc;
 
 use crate::{
-    code_graph_producer,
+    PROCESS_STARTED_AT, code_graph_producer,
     error::{CodegraphError, Result},
     identity,
     ir::{Graph, GraphRecord, ProducerKind, SCHEMA_VERSION, stable_id, versioned_stable_id},
@@ -61,6 +61,7 @@ pub fn scan_repository_incremental_at(
     cache_path: impl AsRef<Path>,
     transaction_time: &str,
 ) -> Result<IncrementalScan> {
+    std::sync::LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
     crate::validate_repository(repo_root)?;
 

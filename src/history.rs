@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    code_graph_producer,
+    PROCESS_STARTED_AT, code_graph_producer,
     error::{CodegraphError, Result},
     fs::SourceFile,
     identity,
@@ -41,6 +41,7 @@ pub fn scan_repository_history_with_override(
     repo_path: impl AsRef<Path>,
     repo_id_override: Option<&str>,
 ) -> Result<Graph> {
+    std::sync::LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
     validate_repository(repo_root)?;
 

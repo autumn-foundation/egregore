@@ -41,6 +41,8 @@ fn version_from_root_deps(lock: &str, root_pkg: &str, dep_name: &str) -> Option<
 
     for line in lock.lines() {
         let trimmed = line.trim();
+        // Cargo.lock v4 appends a trailing comma to every dep entry; strip it for comparisons.
+        let trimmed = trimmed.trim_end_matches(',');
 
         if trimmed == root_header.as_str() {
             in_root = true;
@@ -62,7 +64,10 @@ fn version_from_root_deps(lock: &str, root_pkg: &str, dep_name: &str) -> Option<
                 }
                 // versioned entry: `"tree-sitter 0.26.8 (registry+...)"` or `"tree-sitter 0.26.8"`
                 if let Some(rest) = trimmed.strip_prefix(dep_prefix.as_str()) {
-                    let version = rest.split_whitespace().next()?.trim_end_matches('"');
+                    let version = rest
+                        .split_whitespace()
+                        .next()?
+                        .trim_matches(|c| c == '"' || c == ',');
                     return Some(version.to_owned());
                 }
             }
