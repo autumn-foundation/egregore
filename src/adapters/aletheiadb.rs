@@ -1698,7 +1698,9 @@ impl EmbeddedAletheiaSink {
 
     fn compare_latest_record(&self, record: &GraphRecord) -> AdapterResult<ExpectedRecordState> {
         match self.read_back(record.id())? {
-            Some(read_back) if read_back == *record => Ok(ExpectedRecordState::Matched),
+            Some(read_back) if read_back.without_producer() == record.without_producer() => {
+                Ok(ExpectedRecordState::Matched)
+            }
             Some(_) => Ok(ExpectedRecordState::Mismatched),
             None => Ok(ExpectedRecordState::Missing),
         }
@@ -1710,9 +1712,11 @@ impl EmbeddedAletheiaSink {
         node_id: ::aletheiadb::NodeId,
         expected: &GraphRecord,
     ) -> AdapterResult<ExpectedRecordState> {
-        match self.read_node_record(record_id, node_id)? {
-            read_back if read_back == *expected => Ok(ExpectedRecordState::Matched),
-            _ => Ok(ExpectedRecordState::Mismatched),
+        let read_back = self.read_node_record(record_id, node_id)?;
+        if read_back.without_producer() == expected.without_producer() {
+            Ok(ExpectedRecordState::Matched)
+        } else {
+            Ok(ExpectedRecordState::Mismatched)
         }
     }
 
@@ -1737,7 +1741,11 @@ impl EmbeddedAletheiaSink {
                     == Some(record_id)
                 {
                     saw_same_id = true;
-                    if self.read_edge_record(record_id, edge_id)? == *expected {
+                    if self
+                        .read_edge_record(record_id, edge_id)?
+                        .without_producer()
+                        == expected.without_producer()
+                    {
                         return Ok(ExpectedRecordState::Matched);
                     }
                 }

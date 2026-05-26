@@ -1321,6 +1321,23 @@ impl GraphRecord {
         self
     }
 
+    /// Returns a clone of this record with `producer` set to `None`.
+    ///
+    /// Use when comparing records for content equality where the producer
+    /// envelope (e.g. `producer_started_at`) must not trigger a mismatch.
+    #[must_use]
+    pub fn without_producer(&self) -> Self {
+        let mut cloned = self.clone();
+        match &mut cloned {
+            Self::Node { producer: p, .. }
+            | Self::Edge { producer: p, .. }
+            | Self::Tombstone { producer: p, .. } => {
+                *p = None;
+            }
+        }
+        cloned
+    }
+
     /// Returns the producer identity envelope if present.
     ///
     /// `None` indicates a legacy record written before the producer envelope was
