@@ -1321,18 +1321,22 @@ impl GraphRecord {
         self
     }
 
-    /// Returns a clone of this record with `producer` set to `None`.
+    /// Returns a clone with `producer.producer_started_at` set to an empty string.
     ///
-    /// Use when comparing records for content equality where the producer
-    /// envelope (e.g. `producer_started_at`) must not trigger a mismatch.
+    /// Use for store idempotency comparisons: version fields (`egregore_version`,
+    /// `producer_components`) are still compared so an extractor upgrade triggers
+    /// a rewrite of `producer_json`, while the per-run wall-clock timestamp is
+    /// excluded to avoid rewriting unchanged facts on every invocation.
     #[must_use]
-    pub fn without_producer(&self) -> Self {
+    pub fn with_cleared_producer_started_at(&self) -> Self {
         let mut cloned = self.clone();
         match &mut cloned {
             Self::Node { producer: p, .. }
             | Self::Edge { producer: p, .. }
             | Self::Tombstone { producer: p, .. } => {
-                *p = None;
+                if let Some(prod) = p {
+                    prod.producer_started_at = String::new();
+                }
             }
         }
         cloned
