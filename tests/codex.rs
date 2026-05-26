@@ -1329,3 +1329,191 @@ fn tee_without_file_arg_does_not_emit_file_edit() {
         }
     }
 }
+
+// ── sed with s.conf-style filename captures path correctly ───────────────────
+
+#[test]
+fn sed_with_dot_filename_captures_file_not_expression() {
+    // `sed -i s/foo/bar/ s.conf` — s.conf is the target file, not a sed expression.
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[]}"#,
+        "\n",
+        r#"{"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"cmd\":[\"sed\",\"-i\",\"s/foo/bar/\",\"s.conf\"]}"}"#,
+        "\n",
+        r#"{"type":"function_call_output","call_id":"c1","output":"{\"exit_code\":0,\"stdout\":\"\",\"stderr\":\"\"}"}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    let file_edit = records.iter().find(|r| {
+        matches!(
+            r,
+            GraphRecord::Node {
+                kind: NodeKind::FileEdit,
+                ..
+            }
+        )
+    });
+    assert!(file_edit.is_some(), "expected a FileEdit node");
+    if let Some(GraphRecord::Node {
+        repo_relative_path, ..
+    }) = file_edit
+    {
+        assert_eq!(
+            repo_relative_path.as_deref(),
+            Some("s.conf"),
+            "repo_relative_path should be 's.conf', not the sed expression"
+        );
+    }
+}
+
+// ── Valid-JSON events missing required fields degrade to Diagnostics ──────────
+
+#[test]
+fn function_call_missing_required_field_produces_diagnostic_not_malformed_count() {
+    // A function_call without call_id is valid JSON but can't be deserialized as
+    // CodexFunctionCall. It should degrade to Unknown → Diagnostic rather than
+    // being silently counted as a malformed (unparseable) line.
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[]}"#,
+        "\n",
+        // function_call missing required call_id field
+        r#"{"type":"function_call","name":"shell","arguments":"{\"cmd\":[\"echo\",\"hi\"]}"}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok — valid JSON should not fail import")
+        .records()
+        .to_vec();
+    let has_unrecognized_diag = records.iter().any(|r| {
+        if let GraphRecord::Node {
+            kind: NodeKind::Diagnostic,
+            summary,
+            ..
+        } = r
+        {
+            summary.to_lowercase().contains("unrecognized")
+                || summary.to_lowercase().contains("malformed event")
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_unrecognized_diag,
+        "function_call missing call_id should produce a Diagnostic, not be silently dropped"
+    );
+    // It must NOT produce a "malformed line(s) skipped" Diagnostic (the JSON is valid).
+    let has_malformed_lines_diag = records.iter().any(|r| {
+        if let GraphRecord::Node {
+            kind: NodeKind::Diagnostic,
+            summary,
+            ..
+        } = r
+        {
+            summary.contains("malformed line")
+        } else {
+            false
+        }
+    });
+    assert!(
+        !has_malformed_lines_diag,
+        "valid JSON event should not count as a malformed line"
+    );
+}
+
+// ── completed-but-no-output ToolCall stays unknown ───────────────────────────
+
+#[test]
+fn completed_function_call_without_output_has_unknown_status() {
+    // function_call with status="completed" but no output → status must be "unknown",
+    // not "succeeded", since "completed" only means lifecycle end, not command success.
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[]}"#,
+        "\n",
+        r#"{"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"cmd\":[\"echo\",\"hi\"]}","status":"completed"}"#,
+        // No function_call_output — output is missing/malformed
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    let tool_call_status: Option<&str> = records.iter().find_map(|r| {
+        if let GraphRecord::Node {
+            kind: NodeKind::ToolCall,
+            status,
+            ..
+        } = r
+        {
+            status.as_deref()
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        tool_call_status,
+        Some("unknown"),
+        "completed-but-no-output ToolCall must have status=unknown, not succeeded"
+    );
+}
+
+// ── Interruption with malformed timestamp falls back to epoch ─────────────────
+
+#[test]
+fn malformed_interruption_timestamp_falls_back_to_epoch() {
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[]}"#,
+        "\n",
+        r#"{"type":"interrupted","reason":"user","at":"not-a-timestamp"}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    for r in &records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Diagnostic,
+            summary,
+            observed_at,
+            ..
+        } = r
+        {
+            if summary.to_lowercase().contains("interrupt") {
+                // The malformed 'at' value must not be stored; the fallback is either
+                // the header timestamp or DEFAULT_TIMESTAMP (epoch), both are valid RFC3339.
+                let ts = observed_at.as_deref().unwrap_or("");
+                assert_ne!(
+                    ts, "not-a-timestamp",
+                    "Interrupted Diagnostic must not store the raw malformed 'at' value"
+                );
+                assert!(
+                    ts.len() >= 20 && ts.contains('T'),
+                    "Interrupted Diagnostic observed_at should be a valid RFC3339 fallback, got: {ts}"
+                );
+            }
+        }
+    }
+}

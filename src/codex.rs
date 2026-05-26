@@ -560,7 +560,20 @@ pub fn import_codex(path: &Path, opts: &ImportOptions) -> Result<Graph> {
         }
         match serde_json::from_str::<CodexEvent>(line) {
             Ok(event) => parsed.push((i, event)),
-            Err(_) => malformed_count += 1,
+            Err(_) => {
+                // Distinguish between structurally invalid JSON (truly malformed) and
+                // valid JSON that simply doesn't match the CodexEvent schema (e.g. a
+                // recognized event type missing a required field). The latter is valid
+                // JSON and should degrade to CodexEvent::Unknown → Diagnostic, not be
+                // silently dropped into malformed_count.
+                if let Ok(serde_json::Value::Object(_)) =
+                    serde_json::from_str::<serde_json::Value>(line)
+                {
+                    parsed.push((i, CodexEvent::Unknown));
+                } else {
+                    malformed_count += 1;
+                }
+            }
         }
     }
 
@@ -1120,7 +1133,8 @@ fn emit_interruption_diagnostic(
     let reason = interrupted.reason.as_deref().unwrap_or("unknown");
     let timestamp = interrupted
         .at
-        .clone()
+        .as_deref()
+        .and_then(sanitize_rfc3339)
         .unwrap_or_else(|| ctx.default_timestamp.clone());
 
     let diag_id = agent_memory_stable_id(&[
@@ -1238,7 +1252,19 @@ fn extract_target_file_from_parts(parts: &[String]) -> Option<String> {
 }
 
 fn is_sed_expression(s: &str) -> bool {
-    matches!(s.as_bytes(), [b's', delim, ..] if !delim.is_ascii_alphanumeric() && *delim != b'_')
+    let b = s.as_bytes();
+    if b.len() < 4 || b[0] != b's' {
+        return false;
+    }
+    let delim = b[1];
+    // Exclude alphanumeric, underscore, and '.' delimiters.
+    // '.' is used in filenames (s.conf, s.yaml) but is never a practical sed delimiter.
+    if delim.is_ascii_alphanumeric() || delim == b'_' || delim == b'.' {
+        return false;
+    }
+    // A valid sed substitution is s<d>pattern<d>replacement[<d>flags].
+    // Require at least 2 more occurrences of the delimiter after position 1.
+    b[2..].iter().filter(|&&c| c == delim).count() >= 2
 }
 
 fn build_output_summary(stdout: Option<&str>, stderr: Option<&str>) -> String {
@@ -1282,24 +1308,50 @@ fn derive_tool_status(exit_code: Option<i64>, fc_status: Option<&str>) -> &'stat
     match exit_code {
         Some(0) => "succeeded",
         Some(_) => "failed",
+        // When no output payload arrived we cannot confirm success — "completed"
+        // only signals lifecycle end, not command success, so it stays "unknown".
         None => match fc_status {
             Some("incomplete") | Some("cancelled") | Some("interrupted") => "interrupted",
-            Some("completed") => "succeeded",
             _ => "unknown",
         },
     }
 }
 
 /// Validate a timestamp string as plausible RFC3339.
-/// Returns `None` for strings that are clearly malformed (too short or missing 'T' separator)
-/// so callers can fall back to `DEFAULT_TIMESTAMP` without emitting invalid dates.
+///
+/// Checks structural positions (dashes, colon separators, 'T') and numeric ranges
+/// (month 1–12, day 1–31, hour 0–23, minute 0–59, second 0–60) so values like
+/// `2025-99-99T99:99:99Z` are rejected. Returns `None` for any malformed input so
+/// callers fall back to `DEFAULT_TIMESTAMP` rather than propagating an invalid date.
 fn sanitize_rfc3339(ts: &str) -> Option<String> {
     let b = ts.as_bytes();
-    if b.len() >= 20 && b.get(10) == Some(&b'T') {
-        Some(ts.to_owned())
-    } else {
-        None
+    if b.len() < 20 {
+        return None;
     }
+    // Structural separators: YYYY-MM-DDTHH:MM:SS
+    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    // All digit positions must be ASCII digits.
+    for &pos in &[0usize, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+        if !b[pos].is_ascii_digit() {
+            return None;
+        }
+    }
+    let month = (b[5] - b'0') * 10 + (b[6] - b'0');
+    let day = (b[8] - b'0') * 10 + (b[9] - b'0');
+    let hour = (b[11] - b'0') * 10 + (b[12] - b'0');
+    let minute = (b[14] - b'0') * 10 + (b[15] - b'0');
+    let second = (b[17] - b'0') * 10 + (b[18] - b'0');
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    Some(ts.to_owned())
 }
 
 fn surrogate_hash(ctx: &ImportCtx, target: &str, phase: &str, cmd: &str) -> String {
@@ -1712,6 +1764,13 @@ mod unit_tests {
     }
 
     #[test]
+    fn derive_tool_status_completed_without_output_is_unknown() {
+        // completed only signals lifecycle end; without exit_code we cannot confirm success.
+        assert_eq!(derive_tool_status(None, Some("completed")), "unknown");
+        assert_eq!(derive_tool_status(None, None), "unknown");
+    }
+
+    #[test]
     fn derive_tool_status_exit_code_overrides_fc_status() {
         assert_eq!(derive_tool_status(Some(0), Some("incomplete")), "succeeded");
         assert_eq!(derive_tool_status(Some(1), Some("completed")), "failed");
@@ -1721,6 +1780,7 @@ mod unit_tests {
     fn sanitize_rfc3339_accepts_valid() {
         assert!(sanitize_rfc3339("2025-01-01T00:00:00Z").is_some());
         assert!(sanitize_rfc3339("2025-05-26T12:34:56+00:00").is_some());
+        assert!(sanitize_rfc3339("1970-01-01T00:00:00Z").is_some());
     }
 
     #[test]
@@ -1728,6 +1788,32 @@ mod unit_tests {
         assert!(sanitize_rfc3339("not-a-timestamp").is_none());
         assert!(sanitize_rfc3339("2025-01-01").is_none()); // no time part
         assert!(sanitize_rfc3339("").is_none());
+        // Out-of-range values must be rejected.
+        assert!(sanitize_rfc3339("2025-99-99T99:99:99Z").is_none()); // month 99
+        assert!(sanitize_rfc3339("2025-13-01T00:00:00Z").is_none()); // month 13
+        assert!(sanitize_rfc3339("2025-01-01T24:00:00Z").is_none()); // hour 24
+        assert!(sanitize_rfc3339("2025-01-01T00:60:00Z").is_none()); // minute 60
+    }
+
+    #[test]
+    fn is_sed_expression_accepts_real_sed_scripts() {
+        assert!(is_sed_expression("s/foo/bar/"));
+        assert!(is_sed_expression("s|foo|bar|g"));
+        assert!(is_sed_expression("s@old@new@"));
+    }
+
+    #[test]
+    fn is_sed_expression_rejects_filenames() {
+        assert!(!is_sed_expression("s.conf")); // dot delimiter excluded
+        assert!(!is_sed_expression("s.yaml"));
+        assert!(!is_sed_expression("setup.py")); // starts with 's', but 'e' is alphanumeric
+        assert!(!is_sed_expression("src/main.rs")); // path, not a sed script
+    }
+
+    #[test]
+    fn is_sed_expression_requires_min_length() {
+        assert!(!is_sed_expression("s/a")); // fewer than 4 chars (s + d + 1 more d = needs 4)
+        assert!(!is_sed_expression("s//"));
     }
 
     #[test]
