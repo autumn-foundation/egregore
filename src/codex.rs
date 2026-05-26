@@ -391,7 +391,9 @@ fn is_patch_command_parts(parts: &[String]) -> bool {
 fn is_file_edit_command_parts(parts: &[String]) -> bool {
     let first = parts.first().map_or("", String::as_str);
     match first {
-        "sed" => parts.contains(&"-i".to_owned()),
+        "sed" => parts
+            .iter()
+            .any(|p| p == "-i" || p.starts_with("-i") || p == "--in-place"),
         "tee" => true,
         "cat" => {
             // cat > file or cat >> file (redirect)
@@ -573,7 +575,6 @@ pub fn import_codex(path: &Path, opts: &ImportOptions) -> Result<Graph> {
             path: path.to_path_buf(),
         });
     }
-    let _ = malformed_count; // available for future telemetry
 
     // Determine metadata from flavor header.
     let (header_model, header_timestamp) = match &grouped.flavor {
@@ -645,6 +646,11 @@ pub fn import_codex(path: &Path, opts: &ImportOptions) -> Result<Graph> {
         "AgentRun belongs to AgentSession",
         &ctx,
     ));
+
+    // ── Malformed-lines Diagnostic (if any lines failed JSON parsing) ─────────
+    if malformed_count > 0 {
+        emit_malformed_lines_diagnostic(&mut graph, malformed_count, &run_id, &ctx);
+    }
 
     // ── Turns ─────────────────────────────────────────────────────────────────
     for turn in &grouped.turns {
@@ -896,35 +902,28 @@ fn emit_tool_action(
     ));
 
     // ── FileEdit ──────────────────────────────────────────────────────────────
-    if fc.name == "shell" && is_file_edit_command_parts(&cmd_parts) {
+    // Only emit when provenance (a target file path) can be inferred.
+    // Commands like `tee` with no file argument are skipped entirely.
+    if fc.name == "shell"
+        && is_file_edit_command_parts(&cmd_parts)
+        && let Some(target) = extract_target_file_from_parts(&cmd_parts)
+    {
         let file_edit_id =
             agent_memory_stable_id(&["node", "file_edit", turn_id, &action_idx.to_string()]);
-        let target = extract_target_file_from_parts(&cmd_parts);
+        let before_hash = surrogate_hash(ctx, &target, "before", &redacted_cmd);
+        let after_hash = surrogate_hash(ctx, &target, "after", &redacted_cmd);
         graph.push(make_node(
             file_edit_id.clone(),
             NodeKind::FileEdit,
-            format!(
-                "FileEdit {} turn={turn_index}",
-                target.as_deref().unwrap_or("unknown")
-            ),
+            format!("FileEdit {target} turn={turn_index}"),
             ctx,
             NodeExtra {
                 observed_at: Some(action_timestamp.clone()),
                 text: Some(redacted_cmd.clone()),
-                repo_relative_path: target.clone(),
+                repo_relative_path: Some(target),
                 edit_kind: Some("modify".to_owned()),
-                before_hash: Some(surrogate_hash(
-                    ctx,
-                    target.as_deref().unwrap_or(""),
-                    "before",
-                    &redacted_cmd,
-                )),
-                after_hash: Some(surrogate_hash(
-                    ctx,
-                    target.as_deref().unwrap_or(""),
-                    "after",
-                    &redacted_cmd,
-                )),
+                before_hash: Some(before_hash),
+                after_hash: Some(after_hash),
                 hunk_count: Some(1),
                 linked_turn_id: Some(turn_id.to_owned()),
                 agent_kind: Some("codex".to_owned()),
@@ -1158,22 +1157,46 @@ fn emit_unknown_event_diagnostic(
     ));
 }
 
+fn emit_malformed_lines_diagnostic(graph: &mut Graph, count: usize, run_id: &str, ctx: &ImportCtx) {
+    let diag_id = agent_memory_stable_id(&[
+        "node",
+        "diagnostic",
+        "malformed_lines",
+        &count.to_string(),
+        run_id,
+    ]);
+    graph.push(make_node(
+        diag_id.clone(),
+        NodeKind::Diagnostic,
+        format!("{count} malformed line(s) skipped during import"),
+        ctx,
+        NodeExtra::default(),
+    ));
+    graph.push(make_edge(
+        EdgeLabel::AuthoredBy,
+        diag_id,
+        run_id.to_owned(),
+        "Malformed-lines Diagnostic belongs to AgentRun",
+        ctx,
+    ));
+}
+
 // ── Command helpers ───────────────────────────────────────────────────────────
 
 fn tool_kind_for(tool_name: &str, cmd_parts: &[String]) -> String {
+    // Values must be in daemon's TOOL_KIND_VALUES:
+    // bash | file_edit | file_read | search | network_request | code_execution | other
     match tool_name {
         "shell" => {
             if is_patch_command_parts(cmd_parts) {
-                "patch".to_owned()
+                "other".to_owned()
             } else if is_file_edit_command_parts(cmd_parts) {
                 "file_edit".to_owned()
-            } else if is_test_command(&cmd_parts.join(" ")) {
-                "test".to_owned()
             } else {
-                "shell".to_owned()
+                "bash".to_owned()
             }
         }
-        other => other.to_owned(),
+        _ => "other".to_owned(),
     }
 }
 

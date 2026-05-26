@@ -949,6 +949,141 @@ fn future_event_types_produce_diagnostics_not_error() {
     );
 }
 
+// ── ToolCall.tool_kind values must be accepted by daemon ────────────────────
+
+#[test]
+fn tool_call_kind_values_are_daemon_valid() {
+    // Must match daemon's TOOL_KIND_VALUES exactly.
+    const VALID: &[&str] = &[
+        "bash",
+        "file_edit",
+        "file_read",
+        "search",
+        "network_request",
+        "code_execution",
+        "other",
+    ];
+    for r in &import_session() {
+        if let GraphRecord::Node {
+            kind: NodeKind::ToolCall,
+            tool_kind: Some(k),
+            id,
+            ..
+        } = r
+        {
+            assert!(
+                VALID.contains(&k.as_str()),
+                "ToolCall {id} has tool_kind={k:?} which is not in daemon TOOL_KIND_VALUES"
+            );
+        }
+    }
+}
+
+// ── Malformed JSON lines produce a Diagnostic record ─────────────────────────
+
+#[test]
+fn malformed_lines_produce_diagnostic() {
+    // Mix of valid events with two unparseable lines.
+    let jsonl = concat!(
+        "{not valid json}\n",
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[]}"#,
+        "\nalso not json",
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import should succeed despite malformed lines")
+        .records()
+        .to_vec();
+    let has_malformed_diag = records.iter().any(|r| {
+        if let GraphRecord::Node {
+            kind: NodeKind::Diagnostic,
+            summary,
+            ..
+        } = r
+        {
+            summary.contains("malformed")
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_malformed_diag,
+        "expected a Diagnostic node for malformed lines"
+    );
+}
+
+// ── sed -i<ext> variant is still classified as a file edit ───────────────────
+
+#[test]
+fn sed_with_backup_suffix_is_file_edit() {
+    // `sed -i.bak 's/a/b/'` should still be classified as a file edit.
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[]}"#,
+        "\n",
+        r#"{"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"cmd\":[\"sed\",\"-i.bak\",\"s/a/b/\",\"file.py\"]}"}"#,
+        "\n",
+        r#"{"type":"function_call_output","call_id":"c1","output":"{\"exit_code\":0,\"stdout\":\"\",\"stderr\":\"\"}"}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    assert!(
+        records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Node {
+                kind: NodeKind::FileEdit,
+                ..
+            }
+        )),
+        "sed -i.bak should produce a FileEdit node"
+    );
+}
+
+// ── sed --in-place variant is still classified as a file edit ────────────────
+
+#[test]
+fn sed_with_in_place_flag_is_file_edit() {
+    let jsonl = concat!(
+        r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"type":"message","role":"user","content":[]}"#,
+        "\n",
+        r#"{"type":"message","role":"assistant","content":[]}"#,
+        "\n",
+        r#"{"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"cmd\":[\"sed\",\"--in-place\",\"s/a/b/\",\"file.py\"]}"}"#,
+        "\n",
+        r#"{"type":"function_call_output","call_id":"c1","output":"{\"exit_code\":0,\"stdout\":\"\",\"stderr\":\"\"}"}"#,
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    assert!(
+        records.iter().any(|r| matches!(
+            r,
+            GraphRecord::Node {
+                kind: NodeKind::FileEdit,
+                ..
+            }
+        )),
+        "sed --in-place should produce a FileEdit node"
+    );
+}
+
 // ── Command token excluded from file-edit path heuristic ─────────────────────
 
 #[test]
