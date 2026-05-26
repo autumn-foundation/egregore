@@ -183,7 +183,7 @@ pub fn scan_repository_incremental_at(
 
     next_cache.repository_id.clone_from(&repository_id);
     next_cache.save(cache_path.as_ref())?;
-    let mut producer = code_graph_producer(transaction_time);
+    let mut producer = code_graph_producer();
     producer.producer_kind = ProducerKind::IncrementalCache;
     producer.producer_components.insert(
         "cache_format_version".to_owned(),

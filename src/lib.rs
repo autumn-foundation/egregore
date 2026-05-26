@@ -36,12 +36,10 @@ pub mod schema_version;
 /// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
 pub mod traj;
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, sync::LazyLock};
 
 pub use error::{CodegraphError, Result};
-pub use history::{
-    scan_repository_history, scan_repository_history_at, scan_repository_history_with_override,
-};
+pub use history::{scan_repository_history, scan_repository_history_with_override};
 pub use ir::{
     AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, Domain, EdgeLabel, EgregoreGit,
     EmbeddingModel, EvidenceLink, Graph, GraphRecord, IdentitySource, MetricKind, NodeKind,
@@ -130,10 +128,19 @@ pub fn scan_repository_at_with_override(
         }
     }
 
-    Ok(graph.stamp_producer(&code_graph_producer(transaction_time)))
+    Ok(graph.stamp_producer(&code_graph_producer()))
 }
 
-pub(crate) fn code_graph_producer(started_at: &str) -> Producer {
+/// Wall-clock time at which the current egregore process started.
+///
+/// Initialized once on first access; all extraction paths use this value as
+/// `producer_started_at` so the field accurately reflects the process runtime
+/// window regardless of what `transaction_time` is passed to deterministic
+/// `_at` scan variants.
+static PROCESS_STARTED_AT: LazyLock<String> =
+    LazyLock::new(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+
+pub(crate) fn code_graph_producer() -> Producer {
     Producer {
         egregore_version: env!("CARGO_PKG_VERSION").to_owned(),
         egregore_git: None,
@@ -148,7 +155,7 @@ pub(crate) fn code_graph_producer(started_at: &str) -> Producer {
                 env!("TREE_SITTER_RUST_VERSION").to_owned(),
             ),
         ]),
-        producer_started_at: started_at.to_owned(),
+        producer_started_at: PROCESS_STARTED_AT.clone(),
     }
 }
 
