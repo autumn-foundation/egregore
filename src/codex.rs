@@ -281,26 +281,31 @@ struct ParsedOutput {
 }
 
 fn parse_output_field(raw: &str) -> ParsedOutput {
-    serde_json::from_str::<serde_json::Value>(raw).map_or_else(
-        |_| ParsedOutput {
-            exit_code: None,
-            stdout: Some(raw.to_owned()),
-            stderr: None,
-        },
-        |val| ParsedOutput {
-            exit_code: val.get("exit_code").and_then(serde_json::Value::as_i64),
-            stdout: val
-                .get("stdout")
-                .and_then(serde_json::Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned),
-            stderr: val
-                .get("stderr")
-                .and_then(serde_json::Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned),
-        },
-    )
+    // Only treat as structured output when valid JSON *and* an object.
+    // Arrays, strings, and other JSON scalars are stored as raw stdout text.
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .map_or_else(
+            || ParsedOutput {
+                exit_code: None,
+                stdout: Some(raw.to_owned()),
+                stderr: None,
+            },
+            |val| ParsedOutput {
+                exit_code: val.get("exit_code").and_then(serde_json::Value::as_i64),
+                stdout: val
+                    .get("stdout")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned),
+                stderr: val
+                    .get("stderr")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned),
+            },
+        )
 }
 
 // ── Argument parsing ──────────────────────────────────────────────────────────
@@ -784,8 +789,15 @@ fn emit_tool_action(
         .map(parse_output_field);
 
     let exit_code = parsed_output.as_ref().and_then(|p| p.exit_code);
-    let stdout = parsed_output.as_ref().and_then(|p| p.stdout.clone());
-    let stderr = parsed_output.as_ref().and_then(|p| p.stderr.clone());
+    // Redact before computing handles so secrets never appear in inline payloads or hashes.
+    let stdout = parsed_output
+        .as_ref()
+        .and_then(|p| p.stdout.as_deref())
+        .map(|s| redact(s, opts));
+    let stderr = parsed_output
+        .as_ref()
+        .and_then(|p| p.stderr.as_deref())
+        .map(|s| redact(s, opts));
 
     let action_timestamp = ctx.default_timestamp.clone();
 
@@ -827,7 +839,7 @@ fn emit_tool_action(
     ));
 
     // ── CommandRun ────────────────────────────────────────────────────────────
-    let output_summary = build_output_summary(stdout.as_deref(), stderr.as_deref(), opts);
+    let output_summary = build_output_summary(stdout.as_deref(), stderr.as_deref());
     graph.push(make_node(
         cmd_run_id.clone(),
         NodeKind::CommandRun,
@@ -1023,10 +1035,7 @@ fn emit_tool_action(
             ctx,
             NodeExtra {
                 observed_at: Some(action_timestamp),
-                text: Some(redact(
-                    &build_output_summary(stdout.as_deref(), stderr.as_deref(), opts),
-                    opts,
-                )),
+                text: Some(build_output_summary(stdout.as_deref(), stderr.as_deref())),
                 exit_code,
                 agent_kind: Some("codex".to_owned()),
                 ..Default::default()
@@ -1125,15 +1134,11 @@ fn emit_unknown_event_diagnostic(
 fn tool_kind_for(tool_name: &str, cmd_parts: &[String]) -> String {
     match tool_name {
         "shell" => {
-            let first = cmd_parts.first().map_or("", String::as_str);
             if is_patch_command_parts(cmd_parts) {
                 "patch".to_owned()
             } else if is_file_edit_command_parts(cmd_parts) {
                 "file_edit".to_owned()
-            } else if TEST_COMMAND_PATTERNS
-                .iter()
-                .any(|p| first == p.split_whitespace().next().unwrap_or(""))
-            {
+            } else if is_test_command(&cmd_parts.join(" ")) {
                 "test".to_owned()
             } else {
                 "shell".to_owned()
@@ -1145,20 +1150,22 @@ fn tool_kind_for(tool_name: &str, cmd_parts: &[String]) -> String {
 
 fn extract_target_file_from_parts(parts: &[String]) -> Option<String> {
     // For sed/tee, find the last argument that looks like a file path.
+    // A sed expression starts with 's' followed by a non-alphanumeric delimiter (e.g. s/…/…/).
+    // Genuine paths like src/lib.rs start with 's' but are followed by alphanumeric chars.
     parts
         .iter()
         .rev()
         .find(|p| {
-            !p.starts_with('-') && (p.contains('/') || p.contains('.')) && !p.starts_with('s') // skip sed expression
+            !p.starts_with('-') && (p.contains('/') || p.contains('.')) && !is_sed_expression(p)
         })
         .cloned()
 }
 
-fn build_output_summary(
-    stdout: Option<&str>,
-    stderr: Option<&str>,
-    opts: &ImportOptions,
-) -> String {
+fn is_sed_expression(s: &str) -> bool {
+    matches!(s.as_bytes(), [b's', delim, ..] if !delim.is_ascii_alphanumeric() && *delim != b'_')
+}
+
+fn build_output_summary(stdout: Option<&str>, stderr: Option<&str>) -> String {
     const MAX_LEN: usize = 500;
     let combined = match (stdout, stderr) {
         (Some(o), Some(e)) if !e.is_empty() => format!("{o}\n{e}"),
@@ -1166,12 +1173,11 @@ fn build_output_summary(
         (_, Some(e)) => e.to_owned(),
         (None, None) => String::new(),
     };
-    let truncated = if combined.len() > MAX_LEN {
+    if combined.len() > MAX_LEN {
         format!("{}…", safe_truncate(&combined, MAX_LEN))
     } else {
         combined
-    };
-    redact(&truncated, opts)
+    }
 }
 
 fn safe_truncate(s: &str, max_bytes: usize) -> &str {

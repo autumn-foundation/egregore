@@ -5415,6 +5415,7 @@ const AGENT_MEMORY_NODE_KINDS: &[NodeKind] = &[
     NodeKind::PatchArtifact,
     NodeKind::Failure,
     NodeKind::Decision,
+    NodeKind::CostUsage,
 ];
 
 // Validates that the source and target IDs of a directly submitted agent-memory edge
