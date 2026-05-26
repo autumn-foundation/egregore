@@ -520,6 +520,7 @@ fn group_events(events: Vec<(usize, CodexEvent)>) -> GroupedEvents {
 /// # Errors
 ///
 /// Returns an error when the file cannot be read or contains no parseable events.
+#[allow(clippy::too_many_lines)]
 pub fn import_codex(path: &Path, opts: &ImportOptions) -> Result<Graph> {
     let raw_bytes = std::fs::read(path).map_err(|e| crate::CodegraphError::ReadFile {
         path: path.to_path_buf(),
@@ -529,20 +530,25 @@ pub fn import_codex(path: &Path, opts: &ImportOptions) -> Result<Graph> {
     let source_artifact_hash = blake3_hex(&raw_bytes);
     let source_artifact_path = path.to_string_lossy().into_owned();
 
-    // Parse all lines. Lines that fail to parse as CodexEvent are treated as Unknown.
-    // Use lossy UTF-8 conversion — Codex files should be UTF-8; mojibake is treated
-    // as a best-effort parse rather than a hard failure.
+    // Parse all lines. Lines that fail JSON parsing are counted as malformed and
+    // excluded from grouping. Lines with valid JSON but an unrecognized `type`
+    // become CodexEvent::Unknown (via #[serde(other)]) and are grouped as future-
+    // format events, producing Diagnostic records instead of a hard failure.
+    // Use lossy UTF-8 — Codex files should be UTF-8; mojibake is best-effort.
     let raw_str = String::from_utf8_lossy(&raw_bytes);
 
-    let parsed: Vec<(usize, CodexEvent)> = raw_str
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(i, line)| {
-            let event = serde_json::from_str::<CodexEvent>(line).unwrap_or(CodexEvent::Unknown);
-            (i, event)
-        })
-        .collect();
+    let mut malformed_count = 0usize;
+    let mut parsed: Vec<(usize, CodexEvent)> = Vec::new();
+    for (i, line) in raw_str.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<CodexEvent>(line) {
+            Ok(event) => parsed.push((i, event)),
+            Err(_) => malformed_count += 1,
+        }
+    }
 
     // Derive stable session ID from artifact hash + importer identity.
     let session_id = agent_memory_stable_id(&[
@@ -555,13 +561,19 @@ pub fn import_codex(path: &Path, opts: &ImportOptions) -> Result<Graph> {
 
     let grouped = group_events(parsed);
 
-    // Reject files that produced no actionable events — empty files or files where
-    // every non-empty line failed to parse as a known Codex event.
-    if grouped.turns.is_empty() && grouped.interruptions.is_empty() {
+    // Reject truly empty or fully malformed files. A file containing only
+    // valid-JSON lines with unrecognised event types is NOT rejected here — those
+    // events produce Diagnostic records, preserving forward-compat with future
+    // Codex CLI versions that add new event types.
+    if grouped.turns.is_empty()
+        && grouped.interruptions.is_empty()
+        && grouped.unknown_indices.is_empty()
+    {
         return Err(crate::CodegraphError::EmptyImport {
             path: path.to_path_buf(),
         });
     }
+    let _ = malformed_count; // available for future telemetry
 
     // Determine metadata from flavor header.
     let (header_model, header_timestamp) = match &grouped.flavor {
@@ -1166,10 +1178,14 @@ fn tool_kind_for(tool_name: &str, cmd_parts: &[String]) -> String {
 }
 
 fn extract_target_file_from_parts(parts: &[String]) -> Option<String> {
-    // For sed/tee, find the last non-flag, non-sed-expression argument.
+    // Skip parts[0] (the command token itself) — we want an operand, not the
+    // command name. Without this guard, `tee` with no file argument would
+    // return "tee" as the repo_relative_path.
     // We intentionally omit any '/' or '.' requirement so extension-less
     // targets like Makefile, Dockerfile, and LICENSE are captured.
     parts
+        .get(1..)
+        .unwrap_or(&[])
         .iter()
         .rev()
         .find(|p| !p.starts_with('-') && !is_sed_expression(p))

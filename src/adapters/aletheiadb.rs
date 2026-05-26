@@ -2740,6 +2740,7 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "WorkflowRule" => Ok(NodeKind::WorkflowRule),
         "NamingDecision" => Ok(NodeKind::NamingDecision),
         "Constraint" => Ok(NodeKind::Constraint),
+        "CostUsage" => Ok(NodeKind::CostUsage),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded node kind {kind}"),

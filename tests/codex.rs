@@ -913,3 +913,72 @@ fn multi_call_both_exit_codes_present() {
         "expected all exit_code=0, got {exit_codes:?}"
     );
 }
+
+// ── Forward-compat: valid-JSON unknown event types degrade to Diagnostics ────
+
+#[test]
+fn future_event_types_produce_diagnostics_not_error() {
+    // A file with a valid header plus future/unknown event types should succeed
+    // and degrade each unknown event to a Diagnostic record, not return EmptyImport.
+    let jsonl = r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}
+{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}
+{"type":"future_event_v3","payload":{"some":"data"}}
+{"type":"another_unknown_event","payload":{"more":"data"}}"#;
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("future-format file should import successfully, not return EmptyImport")
+        .records()
+        .to_vec();
+    let diag_count = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                GraphRecord::Node {
+                    kind: NodeKind::Diagnostic,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert!(
+        diag_count >= 2,
+        "expected ≥2 Diagnostic nodes for unknown event types, got {diag_count}"
+    );
+}
+
+// ── Command token excluded from file-edit path heuristic ─────────────────────
+
+#[test]
+fn tee_without_file_arg_does_not_emit_file_edit() {
+    // `tee` to stdout (no file argument) should not produce a FileEdit node
+    // with repo_relative_path="tee" — the command token must be excluded.
+    let jsonl = r#"{"type":"session","model":"t","created_at":"2025-01-01T00:00:00Z"}
+{"type":"message","role":"user","content":[{"type":"input_text","text":"dump it"}]}
+{"type":"message","role":"assistant","content":[{"type":"output_text","text":"piping"}]}
+{"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"cmd\":[\"tee\"]}"}
+{"type":"function_call_output","call_id":"c1","output":"{\"exit_code\":0,\"stdout\":\"data\",\"stderr\":\"\"}"}"#;
+    let tmp = tempfile::NamedTempFile::new().expect("tmp");
+    std::fs::write(tmp.path(), jsonl).expect("write");
+    let records = import_codex(tmp.path(), &ImportOptions::default())
+        .expect("import ok")
+        .records()
+        .to_vec();
+    // No FileEdit at all is acceptable; if there is one, it must not claim path="tee"
+    for r in &records {
+        if let GraphRecord::Node {
+            kind: NodeKind::FileEdit,
+            repo_relative_path,
+            ..
+        } = r
+        {
+            assert_ne!(
+                repo_relative_path.as_deref(),
+                Some("tee"),
+                "repo_relative_path must not be the command name 'tee'"
+            );
+        }
+    }
+}
