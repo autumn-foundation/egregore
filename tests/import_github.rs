@@ -75,7 +75,9 @@ fn import_github_schema_doc_locks_policy_contract() {
             "gh auth token",
             "--token-file <path>",
             "github_auth_missing",
+            "github_repo_not_found",
             r"gh[pousr]_[A-Za-z0-9]{36,}",
+            r"github_pat_[A-Za-z0-9_]{36,}",
             "[REDACTED_GH_TOKEN]",
             "NO config file storage",
         ],
@@ -104,6 +106,7 @@ fn import_github_schema_doc_locks_policy_contract() {
             "X-RateLimit-Remaining",
             "X-RateLimit-Reset",
             "remaining < 100",
+            "remaining < 5",
             "Retry-After",
             "github_auth_rejected",
             "exponential backoff",
@@ -251,14 +254,18 @@ fn fresh_import_produces_documented_record_shapes() {
 #[test]
 #[ignore = "requires eg import github implementation (follow-up slice)"]
 fn reimport_unchanged_issues_sends_at_most_six_conditional_requests() {
-    // 1. Run a fresh import against a wiremock server (all six endpoints respond
-    //    with 200 + ETag headers).
-    // 2. Reset the mock server to respond 304 Not Modified on all six endpoints.
+    // 1. Run a fresh import against a wiremock server (repo probe + five repo-wide
+    //    endpoints respond with 200 + ETag headers; no per-PR review fetches needed
+    //    when pulls returns 304).
+    // 2. Reset the mock server: repo probe returns 200; five repo-wide endpoints
+    //    return 304 Not Modified (no per-PR review fetches triggered).
     // 3. Run a second import with the same --state-file.
     // Assert:
-    //   - Exactly six HTTP requests on the second run (one If-None-Match probe per endpoint)
+    //   - Exactly 6 HTTP requests on the second run:
+    //     1 repo probe + 5 conditional If-None-Match probes (all 304)
     //   - The handoff JSONL contains only the top-level record (zero per-issue records)
     //   - The .github-import-state.json is updated with the new last_run_at_unix_ms
+    //   - No /pulls/{n}/reviews requests are issued (pulls list unchanged → skip)
     todo!("implement after eg import github CLI ships")
 }
 
@@ -276,11 +283,25 @@ fn reimport_with_one_changed_issue_produces_exactly_that_issues_records() {
 #[test]
 #[ignore = "requires eg import github implementation (follow-up slice)"]
 fn auth_missing_exits_with_github_auth_missing_error_code() {
-    // Configure wiremock to respond 404 (private-repo gate).
+    // Configure wiremock: anonymous repo probe (GET /repos/owner/private-repo)
+    // returns 404 (private or non-existent; no token to distinguish).
     // Run `eg import github owner/private-repo --out <tmp>` with no token env vars.
     // Assert:
     //   - Process exits non-zero
-    //   - stderr contains `github_auth_missing`
+    //   - stderr contains `github_auth_missing` (not `github_repo_not_found`)
+    //   - stderr explains that a token is required to determine whether the repo exists
+    //   - No partial .github-import-state.json is written
+    todo!("implement after eg import github CLI ships")
+}
+
+#[test]
+#[ignore = "requires eg import github implementation (follow-up slice)"]
+fn nonexistent_repo_with_token_exits_with_github_repo_not_found() {
+    // Configure wiremock: anonymous probe returns 404, authenticated probe also 404.
+    // Run `eg import github owner/gone-repo --out <tmp>` with GH_TOKEN set.
+    // Assert:
+    //   - Process exits non-zero
+    //   - stderr contains `github_repo_not_found` (not `github_auth_missing`)
     //   - No partial .github-import-state.json is written
     todo!("implement after eg import github CLI ships")
 }

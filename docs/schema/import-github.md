@@ -61,11 +61,25 @@ permitted without a policy update.
 Rules:
 
 - NO config file storage of the token. NO daemon-runtime file storage.
-- If no token is available **and** the target repository is private (HTTP 404
-  on the anonymous probe): exit non-zero with error code `github_auth_missing`.
+
+- **Repository probe and auth-missing rule:** Before fetching issue or PR data
+  the importer MUST probe `GET /repos/{owner}/{repo}` unauthenticated.
+  - `200 OK` → public repository; proceed (with token if available, without if absent).
+  - `404 Not Found` without token → repository is private or does not exist;
+    cannot distinguish without a credential. Exit non-zero with
+    `github_auth_missing`; stderr MUST explain that a token is required to
+    determine whether the repository exists.
+  - `404 Not Found` with token → repository does not exist or token lacks access.
+    Exit non-zero with `github_repo_not_found`; do NOT use `github_auth_missing`
+    (the user supplied a credential and the repo is genuinely absent).
+  - `401` / `403` → token is invalid or revoked. Exit non-zero with
+    `github_auth_rejected`. No retry.
+
 - Every stdout/stderr/log line MUST pass through a token-scrubber that replaces
-  any string matching `gh[pousr]_[A-Za-z0-9]{36,}` with `[REDACTED_GH_TOKEN]`
-  before the bytes leave the process.
+  any substring matching the patterns below with `[REDACTED_GH_TOKEN]` before
+  the bytes leave the process:
+  - Classic and OAuth PATs: `gh[pousr]_[A-Za-z0-9]{36,}`
+  - Fine-grained PATs: `github_pat_[A-Za-z0-9_]{36,}`
 
 ---
 
@@ -83,7 +97,7 @@ implement the unchanged-re-import budget guarantee in section 5.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /repos/{owner}/{repo}/issues?state=all` | All issues (excludes PRs unless state filters differ) |
+| `GET /repos/{owner}/{repo}/issues?state=all` | All issues. **Note:** GitHub's issues API includes pull-request objects; the importer MUST discard any response item where `pull_request` key is present, to avoid double-ingesting PRs that are also returned by the `/pulls` endpoint. |
 | `GET /repos/{owner}/{repo}/pulls?state=all` | All pull requests |
 | `GET /repos/{owner}/{repo}/issues/comments` | All issue comments |
 | `GET /repos/{owner}/{repo}/pulls/comments` | All PR review comments |
@@ -108,8 +122,12 @@ Rules (normative behaviour for every HTTP response):
 
 - MUST read `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers on every
   response.
-- MUST pause until the `X-RateLimit-Reset` UNIX timestamp when
-  `remaining < 100`.
+- When **authenticated** (token present): MUST pause until the
+  `X-RateLimit-Reset` UNIX timestamp when `remaining < 100`. The 5,000/hour
+  authenticated limit makes this threshold meaningful.
+- When **unauthenticated** (public-repo import, no token): the limit is 60/hour.
+  Apply a proportional threshold of `remaining < 5` instead, to avoid an
+  immediate forced sleep after the very first response.
 - HTTP 403 with a secondary-rate-limit body: honour the `Retry-After` header;
   if absent, use exponential backoff starting at 60 s, capped at 600 s, with a
   maximum of 5 retries before exiting non-zero.
@@ -163,11 +181,18 @@ Schema (one JSON object per `<owner>/<repo>`, abbreviated type notation):
 
 **Normative budget:**
 
-- An unchanged re-import MUST issue ≤6 HTTP requests (one conditional probe
-  per v1 endpoint) and produce a handoff with only the top-level
-  idempotency record (zero per-issue records).
+- An unchanged re-import MUST issue ≤6 HTTP requests and produce a handoff
+  with only the top-level idempotency record (zero per-issue records). The 6
+  requests are: one repo-probe (`GET /repos/{owner}/{repo}`) plus one
+  conditional `If-None-Match` probe for each of the 5 repository-wide endpoints
+  (issues, pulls, issue_comments, pull_comments, labels) — all returning `304`.
+  Because `/pulls?state=all` returns `304`, no per-PR `/pulls/{n}/reviews`
+  requests are issued; those requests are triggered only when the pulls list
+  itself changes.
 - A changed-issue re-import MUST produce exactly that issue's records plus
-  the top-level handoff metadata record.
+  the top-level handoff metadata record. Per-PR review fetches
+  (`/pulls/{n}/reviews`) count against the run total but are NOT part of the
+  ≤6 unchanged-re-import budget.
 
 **Failure rule:** if the importer exits non-zero due to auth failure
 (`github_auth_missing` or `github_auth_rejected`), MUST NOT write or update
@@ -239,8 +264,8 @@ names, milestone title.
 **diff_hunk sub-policy:** Preserve file path, line numbers, and structural
 diff markers (`+`, `-`, `@@`). Redact only value-bearing content lines whose
 content matches a known secret pattern from the redaction policy (e.g., lines
-containing `TOKEN=`, `SECRET=`, or matching the GitHub token regex
-`gh[pousr]_[A-Za-z0-9]{36,}`).
+containing `TOKEN=`, `SECRET=`, or matching the token scrubber patterns
+`gh[pousr]_[A-Za-z0-9]{36,}` or `github_pat_[A-Za-z0-9_]{36,}`).
 
 ---
 
