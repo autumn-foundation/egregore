@@ -8,6 +8,8 @@
 pub mod adapters;
 /// Command-line interface.
 pub mod cli;
+/// Codex session/rollout JSONL importer (M3 agent-memory source).
+pub mod codex;
 /// Local daemon for shared multi-agent store access.
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod daemon;
@@ -38,6 +40,7 @@ pub mod traj;
 
 use std::{collections::BTreeMap, path::Path, sync::LazyLock};
 
+pub use codex::import_codex;
 pub use error::{CodegraphError, Result};
 pub use history::{scan_repository_history, scan_repository_history_with_override};
 pub use ir::{

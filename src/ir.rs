@@ -1604,6 +1604,9 @@ pub enum NodeKind {
     NamingDecision,
     /// Approved durable constraint.
     Constraint,
+    // ── M3 Codex importer node kinds (docs/schema/agent-memory.md) ────────────
+    /// Token and cost accounting record for an agent turn (M3 Codex import).
+    CostUsage,
 }
 
 impl NodeKind {
@@ -1658,6 +1661,7 @@ impl NodeKind {
             Self::WorkflowRule => "WorkflowRule",
             Self::NamingDecision => "NamingDecision",
             Self::Constraint => "Constraint",
+            Self::CostUsage => "CostUsage",
         }
     }
 }

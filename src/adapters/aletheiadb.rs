@@ -1698,7 +1698,10 @@ impl EmbeddedAletheiaSink {
 
     fn compare_latest_record(&self, record: &GraphRecord) -> AdapterResult<ExpectedRecordState> {
         match self.read_back(record.id())? {
-            Some(read_back) if read_back.with_cleared_producer_started_at() == record.with_cleared_producer_started_at() => {
+            Some(read_back)
+                if read_back.with_cleared_producer_started_at()
+                    == record.with_cleared_producer_started_at() =>
+            {
                 Ok(ExpectedRecordState::Matched)
             }
             Some(_) => Ok(ExpectedRecordState::Mismatched),
@@ -1713,7 +1716,9 @@ impl EmbeddedAletheiaSink {
         expected: &GraphRecord,
     ) -> AdapterResult<ExpectedRecordState> {
         let read_back = self.read_node_record(record_id, node_id)?;
-        if read_back.with_cleared_producer_started_at() == expected.with_cleared_producer_started_at() {
+        if read_back.with_cleared_producer_started_at()
+            == expected.with_cleared_producer_started_at()
+        {
             Ok(ExpectedRecordState::Matched)
         } else {
             Ok(ExpectedRecordState::Mismatched)
@@ -2735,6 +2740,7 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "WorkflowRule" => Ok(NodeKind::WorkflowRule),
         "NamingDecision" => Ok(NodeKind::NamingDecision),
         "Constraint" => Ok(NodeKind::Constraint),
+        "CostUsage" => Ok(NodeKind::CostUsage),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded node kind {kind}"),
@@ -2952,7 +2958,8 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::Preference
         | NodeKind::WorkflowRule
         | NodeKind::NamingDecision
-        | NodeKind::Constraint => kind.as_str(),
+        | NodeKind::Constraint
+        | NodeKind::CostUsage => kind.as_str(),
     }
 }
 

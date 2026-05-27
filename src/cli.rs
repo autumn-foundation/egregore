@@ -102,6 +102,14 @@ enum Commands {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Import a Codex session or rollout JSONL into agent-memory JSONL.
+    ImportCodex {
+        /// Path to the Codex session or rollout JSONL file.
+        codex_path: PathBuf,
+        /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Query an existing graph JSONL for symbols, files, or drift records.
     Query {
         /// Query subcommand.
@@ -316,10 +324,27 @@ fn run_cli(cli: Cli) -> Result<()> {
             embed,
         ),
         Commands::ImportTraj { traj_path, out } => import_traj_cmd(&traj_path, &out),
+        Commands::ImportCodex { codex_path, out } => import_codex_cmd(&codex_path, &out),
         Commands::Query { subcommand } => query_cmd(subcommand),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Daemon { action } => daemon(action),
     }
+}
+
+fn import_codex_cmd(codex_path: &Path, out: &Path) -> Result<()> {
+    let opts = crate::codex::ImportOptions::default();
+    let graph = crate::codex::import_codex(codex_path, &opts)
+        .with_context(|| format!("failed to import Codex JSONL from {}", codex_path.display()))?;
+    let jsonl = graph
+        .to_jsonl()
+        .context("failed to serialize agent-memory JSONL")?;
+    fs::write(out, jsonl).with_context(|| format!("failed to write JSONL to {}", out.display()))?;
+    println!(
+        "imported {} records from {}",
+        graph.records().len(),
+        codex_path.display()
+    );
+    Ok(())
 }
 
 fn import_traj_cmd(traj_path: &Path, out: &Path) -> Result<()> {
