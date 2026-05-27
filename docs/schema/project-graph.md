@@ -13,6 +13,12 @@ does not replace code-graph facts, verification evidence, or agent-memory
 claims. It gives future GitHub issue and local JSONL importers a contract so
 they do not invent inline task fields.
 
+GitHub import policy: [`docs/schema/import-github.md`](import-github.md) is
+the single source of truth for auth, network-access boundaries, redaction field
+map, GitHub-to-record-shape mapping, idempotency state, rate-limit handling,
+and PR-review-thread normalization. That document's mapping table in section 6
+is normative for any GitHub importer that writes records into this domain.
+
 ## 1 - Trust Class
 
 Project-graph records are **intent-shaped, externally-anchored when possible**.
@@ -142,11 +148,11 @@ project-domain side of the contract, but the registry remains the one from #6.
 
 | Label | FROM domain(s) | TO domain(s) | FROM kind(s) | TO kind(s) | Cardinality | `confidence` required |
 |-------|---------------|-------------|-------------|-----------|-------------|----------------------|
-| `REFERENCES_TASK` | `agent_memory` | `project` | `Observation`, `Decision`, `Failure`, `Lesson` | `Task` | many:many | no |
+| `REFERENCES_TASK` | `agent_memory`, `project` *(Review, reserved)* | `project` | `Observation`, `Decision`, `Failure`, `Lesson`; `Review` *(reserved — ships when Review is promoted)* | `Task` | many:many | no |
 | `CLOSES_ACCEPTANCE_CRITERION` | `project` | `verification` | `AcceptanceCriterion` | `Verification`, `CommandRun`, `TestRun` | many:1 | no |
 | `OWNED_BY_TASK` | `project` | `project` | `AcceptanceCriterion` | `Task` | many:1 | no |
 | `EXTERNAL_HANDLE` | `project` | `project` | `Task`, `AcceptanceCriterion` | `ExternalLink` | many:1 | no |
-| `TOUCHES_FILE` | `project` | `codegraph` | `Task` | `File` | many:many | no |
+| `TOUCHES_FILE` | `project` | `codegraph` | `Task`; `Review` *(reserved — ships when Review is promoted)* | `File` | many:many | no |
 | `MENTIONS_SYMBOL` | `project` | `codegraph` | `Task` | `Symbol` | many:many | yes |
 
 `REFERENCES_TASK` is promoted from reserved to defined: #6 already reserved the

@@ -13,6 +13,11 @@ This document intentionally ships before any writer or importer. The first
 writer that appends to `.egregore/tasks/*.jsonl` must follow this file shape;
 the M9 importer consumes it but is not implemented here.
 
+Coordination: [`docs/schema/import-github.md`](import-github.md) owns the
+GitHub-side fetch policy. The two importers share the same target record shapes
+defined in [`docs/schema/project-graph.md`](project-graph.md); this document
+owns only the local-JSONL file format.
+
 ## File Path Convention
 
 Project/task JSONL files live under `.egregore/tasks/` relative to the
