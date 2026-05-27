@@ -148,11 +148,11 @@ project-domain side of the contract, but the registry remains the one from #6.
 
 | Label | FROM domain(s) | TO domain(s) | FROM kind(s) | TO kind(s) | Cardinality | `confidence` required |
 |-------|---------------|-------------|-------------|-----------|-------------|----------------------|
-| `REFERENCES_TASK` | `agent_memory` | `project` | `Observation`, `Decision`, `Failure`, `Lesson` | `Task` | many:many | no |
+| `REFERENCES_TASK` | `agent_memory`, `project` *(Review, reserved)* | `project` | `Observation`, `Decision`, `Failure`, `Lesson`; `Review` *(reserved — ships when Review is promoted)* | `Task` | many:many | no |
 | `CLOSES_ACCEPTANCE_CRITERION` | `project` | `verification` | `AcceptanceCriterion` | `Verification`, `CommandRun`, `TestRun` | many:1 | no |
 | `OWNED_BY_TASK` | `project` | `project` | `AcceptanceCriterion` | `Task` | many:1 | no |
 | `EXTERNAL_HANDLE` | `project` | `project` | `Task`, `AcceptanceCriterion` | `ExternalLink` | many:1 | no |
-| `TOUCHES_FILE` | `project` | `codegraph` | `Task` | `File` | many:many | no |
+| `TOUCHES_FILE` | `project` | `codegraph` | `Task`; `Review` *(reserved — ships when Review is promoted)* | `File` | many:many | no |
 | `MENTIONS_SYMBOL` | `project` | `codegraph` | `Task` | `Symbol` | many:many | yes |
 
 `REFERENCES_TASK` is promoted from reserved to defined: #6 already reserved the

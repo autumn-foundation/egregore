@@ -104,6 +104,12 @@ implement the unchanged-re-import budget guarantee in section 5.
 | `GET /repos/{owner}/{repo}/pulls/{n}/reviews` | Reviews per PR |
 | `GET /repos/{owner}/{repo}/labels` | Label list (flattened into Task records) |
 
+**Pagination rule (normative):** GitHub list endpoints return at most 100 items
+per page. The importer MUST follow the `Link: <url>; rel="next"` header on
+every paginated response until no `next` relation is present.
+Stopping at page 1 is a conformance violation that silently truncates imports
+on any repository with more than 100 issues, PRs, comments, reviews, or labels.
+
 **Reserved for future slices (not implemented in v1):**
 
 | Endpoint | Definition |
@@ -207,8 +213,10 @@ as a missing state file.
 Single normative reference. The target record kinds are defined in
 [`docs/schema/project-graph.md`](project-graph.md).
 
-| GitHub Resource | Target Record(s) | Key Fields |
-|-----------------|------------------|-----------|
+**Full intended mapping (normative target shape for final implementation):**
+
+| GitHub Resource | Intended Target Record(s) | Key Fields |
+|-----------------|--------------------------|-----------|
 | Issue | `Task` + `GitHubIssue` + `ExternalLink` | `status` (from `state` + `state_reason`), `number`, `url`, `labels`, `milestone`, `assignees`, `author`, `created_at`, `updated_at`, `closed_at` |
 | Pull Request | `Task` + `PR` + `ExternalLink` | `status` (from `state` + `merged` + `draft`), `number`, `url`, head/base refs, merge commit SHA, `mergeable_state`, requested reviewers |
 | Issue Comment | `Review` (`review_kind: "issue_comment"`) → `REFERENCES_TASK` | Attached to parent `Task`; `body` passes through redaction |
@@ -216,6 +224,27 @@ Single normative reference. The target record kinds are defined in
 | PR Review Comment | `Review` (`review_kind: "pr_review_comment"`, `file_path`, `line`, `start_line`, `side`, `diff_hunk` summary, `in_reply_to_id`) → `REFERENCES_TASK` + `TOUCHED_FILE` | Attached to parent PR `Task` and `File` node when file exists at PR head SHA |
 | Label | Flattened into `Task.labels` array | No separate record kind in v1 |
 | Milestone | Flattened into `Task.milestone` (`id`, `title`, `due_on`) | No separate record kind in v1 |
+
+**v1 emission scope (what the first implementation actually emits):**
+
+`GitHubIssue`, `PR`, and `Review` are marked **reserved** in
+[`docs/schema/project-graph.md`](project-graph.md) with no defined payload.
+v1 MUST NOT emit records whose shape is undefined; those three kinds ship in a
+follow-up slice that promotes them from reserved.
+
+| GitHub Resource | v1 Emission |
+|-----------------|------------|
+| Issue | `Task + ExternalLink` only (`source_kind: github_issue`). GitHub-only metadata (`state_reason`, `milestone`, etc.) stored in `Task.body_handle` for round-trip fidelity; `GitHubIssue` deferred. |
+| Pull Request | `Task + ExternalLink` only (`source_kind: github_pr`). PR-specific fields deferred to `PR` record promotion. |
+| Issue Comment | **Deferred.** Comment endpoints are still fetched and ETag-cached; records emitted when `Review` is promoted. |
+| PR Review | **Deferred.** Same rationale as issue comments. |
+| PR Review Comment | **Deferred.** Same rationale. `REFERENCES_TASK` from `project.Review` and `TOUCHED_FILE` from `project.Review` must also be registered in `project-graph.md` before emission. |
+
+**Edge pre-registration note:** When the `Review` kind is promoted, two new
+edge registrations must be added to the cross-domain edge table in
+[`docs/schema/project-graph.md`](project-graph.md):
+- `REFERENCES_TASK` from `project.Review` TO `project.Task` (extends the existing registration to add `project.Review` alongside the `agent_memory` FROM kinds)
+- `TOUCHES_FILE` from `project.Review` TO `codegraph.File` (extends the existing registration to add `project.Review` alongside the `project.Task` FROM kind)
 
 **`valid_time_source`:** All GitHub-sourced records use `github_updated_at`.
 **`source_kind`:** Issues use `github_issue`; PRs use `github_pr`.
@@ -232,12 +261,16 @@ A "thread" is the transitive closure of `Review` records connected by
 - A `ReviewThread` is NOT a separate record kind in v1. Threads are
   reconstructible via traversal and are reserved for a future `ReviewThread`
   aggregation record.
-- Rule: an unresolved review thread on merged PR is a real, queryable state —
-  "merged with unresolved feedback" — and MUST be surfaceable via graph query.
-- Traversal: from a PR `Task`, follow `REFERENCES_TASK` edges to `Review`
-  records with `review_kind: "pr_review_comment"`, group by the `in_reply_to_id`
-  chain, and surface unresolved thread roots (comments whose `in_reply_to_id`
-  is null and whose thread has at least one unresolved descendant).
+- **REST limitation on thread resolution state:** GitHub's REST review-comment
+  API exposes `in_reply_to_id` (reply structure) but does NOT expose whether a
+  thread is resolved (`isResolved`). That field is only available through the
+  GraphQL API, which is reserved for v2. Therefore, v1 stores all review-comment
+  threads without a resolved/unresolved distinction; the "merged with unresolved
+  feedback" query state is deferred to the GraphQL slice.
+- Traversal (once `Review` is promoted from reserved): from a PR `Task`, follow
+  `REFERENCES_TASK` edges to `Review` records with
+  `review_kind: "pr_review_comment"`, group by the `in_reply_to_id` chain to
+  reconstruct threads. Resolution state is not stored in v1.
 
 ---
 

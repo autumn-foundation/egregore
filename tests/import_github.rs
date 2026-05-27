@@ -96,6 +96,9 @@ fn import_github_schema_doc_locks_policy_contract() {
             "/pulls/{n}/reviews",
             "/labels",
             "ETag",
+            // Pagination rule
+            r#"Link: <url>; rel="next""#,
+            "Stopping at page 1 is a conformance violation",
         ],
     );
 
@@ -151,6 +154,12 @@ fn import_github_schema_doc_locks_policy_contract() {
             "in_reply_to_id",
             "REFERENCES_TASK",
             "TOUCHED_FILE",
+            // v1 emission scope
+            "v1 emission scope",
+            "GitHubIssue` deferred",
+            "Review` is promoted",
+            "REFERENCES_TASK` from `project.Review",
+            "TOUCHES_FILE` from `project.Review",
         ],
     );
 
@@ -160,7 +169,10 @@ fn import_github_schema_doc_locks_policy_contract() {
         &[
             "transitive closure",
             "ReviewThread",
-            "unresolved review thread on merged PR",
+            // Resolution state not available over REST; no longer a v1 guarantee
+            "REST limitation on thread resolution state",
+            "isResolved",
+            "deferred to the GraphQL slice",
         ],
     );
 
