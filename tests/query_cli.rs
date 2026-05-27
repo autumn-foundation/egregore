@@ -3,9 +3,12 @@
 use std::{fs, path::PathBuf};
 
 use aletheia_egregore::{
-    EdgeLabel, EmbeddingModel, GraphRecord, MetricKind, NodeKind, SelectionBasis,
+    EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, MetricKind, NodeKind, SelectionBasis,
     SemanticDriftMetadata, SourceSpan, TemporalMetadata,
-    ir::{Graph, stable_id},
+    ir::{
+        AGENT_MEMORY_SCHEMA_VERSION, Graph, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
+        stable_id, verification_stable_id,
+    },
 };
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -1243,4 +1246,386 @@ fn query_file_finds_temporal_file_node_from_scan_history_graph() {
         serde_json::from_str(stdout.lines().next().expect("line")).expect("json");
     assert_eq!(parsed["name"], "temporal_fn");
     assert_eq!(parsed["git_commit"], "aaaaaaaaaaaaaaaa");
+}
+
+// ---------------------------------------------------------------------------
+// query context — fixture helpers
+// ---------------------------------------------------------------------------
+
+/// Creates a seeded fixture: one Symbol, one Observation linked via `evidence_link`,
+/// one Task linked via `evidence_link`, and one Verification linked via `evidence_link`.
+#[allow(clippy::too_many_lines)]
+fn fixture_context_seeded() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("context_seeded.jsonl");
+
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "my_function"]);
+    let sym = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 0,
+            end_byte: 80,
+            start_line: 10,
+            end_line: 20,
+        },
+        "my_function".to_owned(),
+        "Rust fn my_function at src/lib.rs:10".to_owned(),
+    );
+
+    // Observation node linked to the symbol via evidence_links
+    let obs_id = agent_memory_stable_id(&["obs", "ctx_obs1"]);
+    let mut obs = GraphRecord::node(
+        obs_id,
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation about my_function".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut text,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ref mut evidence_links,
+        ref mut schema_version,
+        ..
+    } = obs
+    {
+        *text = Some("my_function needs error handling".to_owned());
+        *agent_id = Some("agent:ctx_test".to_owned());
+        *session_id = Some("session:ctx_test".to_owned());
+        *observed_at = Some("2026-03-01T12:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(sym_id.clone()),
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "0.9".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    // Task node linked to the symbol
+    let task_id = aletheia_egregore::ir::project_stable_id(&["task", "ctx_task1"]);
+    let mut task = GraphRecord::node(
+        task_id,
+        NodeKind::Task,
+        None,
+        None,
+        Some("Add error handling to my_function".to_owned()),
+        "Task: add error handling".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut title,
+        ref mut evidence_links,
+        ref mut schema_version,
+        ..
+    } = task
+    {
+        *title = Some("Add error handling to my_function".to_owned());
+        *schema_version = aletheia_egregore::ir::PROJECT_SCHEMA_VERSION;
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(sym_id.clone()),
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    // Verification record linked to the symbol
+    let ver_id = verification_stable_id(&["verification", "ctx_ver1"]);
+    let mut ver = GraphRecord::node(
+        ver_id,
+        NodeKind::Verification,
+        None,
+        None,
+        None,
+        "Verification of my_function".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ref mut status,
+        ref mut verification_kind,
+        ..
+    } = ver
+    {
+        *schema_version = VERIFICATION_SCHEMA_VERSION;
+        *status = Some("passed".to_owned());
+        *verification_kind = Some("test_run".to_owned());
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(sym_id),
+            target_domain: "codegraph".to_owned(),
+            relation: "VALIDATED_BY".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let mut graph = Graph::new();
+    graph.push(sym);
+    graph.push(obs);
+    graph.push(task);
+    graph.push(ver);
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    (temp, path)
+}
+
+// ---------------------------------------------------------------------------
+// query context — happy path: structured JSON with all sections
+// ---------------------------------------------------------------------------
+
+/// AC1 + AC2: a single `eg query context` returns all linked context sections.
+#[test]
+fn query_context_returns_structured_json_with_all_sections() {
+    let (_temp, graph) = fixture_context_seeded();
+
+    let output = egregore()
+        .args(["query", "context", "my_function", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    assert_eq!(parsed["ok"], true, "ok must be true on success");
+    assert_eq!(parsed["symbol_name"], "my_function");
+
+    // source_facts section must contain the symbol node
+    let facts = parsed["source_facts"]
+        .as_array()
+        .expect("source_facts array");
+    assert!(!facts.is_empty(), "source_facts must not be empty");
+    assert!(
+        facts.iter().any(|f| f["kind"] == "Symbol"),
+        "source_facts must contain the Symbol node"
+    );
+
+    // observations section must exist
+    let obs_arr = parsed["observations"]
+        .as_array()
+        .expect("observations array");
+    assert!(!obs_arr.is_empty(), "observations must not be empty");
+
+    // project_state section must exist
+    let proj = parsed["project_state"]
+        .as_array()
+        .expect("project_state array");
+    assert!(!proj.is_empty(), "project_state must not be empty");
+
+    // verification_evidence section must exist
+    let ver = parsed["verification_evidence"]
+        .as_array()
+        .expect("verification_evidence array");
+    assert!(!ver.is_empty(), "verification_evidence must not be empty");
+}
+
+// ---------------------------------------------------------------------------
+// query context — AC2: every source fact carries record_id + path/span
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_context_source_facts_carry_record_id_and_path() {
+    let (_temp, graph) = fixture_context_seeded();
+
+    let output = egregore()
+        .args(["query", "context", "my_function", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let facts = parsed["source_facts"].as_array().expect("source_facts");
+
+    for fact in facts {
+        assert!(
+            fact["record_id"].is_string() && !fact["record_id"].as_str().unwrap().is_empty(),
+            "every source_fact must have a non-empty record_id"
+        );
+        let has_path = fact["repo_relative_path"].is_string();
+        let has_commit = fact.get("git_commit").is_some_and(serde_json::Value::is_string);
+        let has_valid_time = fact.get("valid_time").is_some_and(serde_json::Value::is_string);
+        assert!(
+            has_path || has_commit || has_valid_time,
+            "source_fact {} must carry repo_relative_path, git_commit, or valid_time",
+            fact["record_id"]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// query context — AC3: every observation carries provenance fields
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_context_observations_carry_provenance_fields() {
+    let (_temp, graph) = fixture_context_seeded();
+
+    let output = egregore()
+        .args(["query", "context", "my_function", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let obs_arr = parsed["observations"].as_array().expect("observations");
+
+    for obs in obs_arr {
+        assert!(
+            obs["record_id"].is_string(),
+            "every observation must have a record_id"
+        );
+        assert!(
+            obs.get("provenance_handle")
+                .is_some_and(serde_json::Value::is_string)
+                || obs.get("agent_id").is_some_and(serde_json::Value::is_string),
+            "every observation must carry a provenance_handle or agent_id"
+        );
+        assert!(
+            obs.get("observed_at").is_some_and(serde_json::Value::is_string),
+            "every observation must carry observed_at"
+        );
+        assert!(
+            obs.get("confidence").is_some_and(serde_json::Value::is_string),
+            "every observation must carry confidence"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// query context — AC4: observation is never presented as source truth
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_context_observation_not_in_source_facts() {
+    let (_temp, graph) = fixture_context_seeded();
+
+    let output = egregore()
+        .args(["query", "context", "my_function", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let facts = parsed["source_facts"].as_array().expect("source_facts");
+
+    for fact in facts {
+        assert_ne!(
+            fact["kind"], "Observation",
+            "Observation nodes must never appear in source_facts"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// query context — AC6: no-match is explicit and machine-readable
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_context_no_match_returns_machine_readable_error_and_exits_2() {
+    let (_temp, graph) = fixture_context_seeded();
+
+    let output = egregore()
+        .args(["query", "context", "nonexistent_fn_xyz", "--graph"])
+        .arg(&graph)
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("must be valid JSON");
+    assert_eq!(parsed["ok"], false, "ok must be false for no-match");
+    assert_eq!(
+        parsed["error"]["code"], "no_match",
+        "error.code must be 'no_match'"
+    );
+    assert_eq!(
+        parsed["error"]["symbol_name"], "nonexistent_fn_xyz",
+        "error.symbol_name must echo the queried symbol"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// query context — AC7: stable output ordering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_context_stable_ordering_across_repeated_calls() {
+    let (_temp, graph) = fixture_context_seeded();
+
+    let run = || {
+        let output = egregore()
+            .args(["query", "context", "my_function", "--graph"])
+            .arg(&graph)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(output).expect("utf8")
+    };
+
+    let first = run();
+    let second = run();
+    assert_eq!(
+        first, second,
+        "context query output must be identical for repeated calls on the same fixture"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// query context — missing graph file exits non-zero
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_context_missing_graph_file_exits_nonzero() {
+    egregore()
+        .args([
+            "query",
+            "context",
+            "my_function",
+            "--graph",
+            "/nonexistent/path/context.jsonl",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_match("error|failed").unwrap());
 }

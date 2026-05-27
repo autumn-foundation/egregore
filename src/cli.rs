@@ -220,6 +220,26 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Retrieve evidence-backed context for a named symbol.
+    ///
+    /// Returns a structured JSON object with five trust-separated sections:
+    /// `source_facts` (code-graph), `observations` (agent-authored),
+    /// `project_state` (tasks/ACs), `artifacts`, and `verification_evidence`.
+    /// Missing evidence links are surfaced as `unresolved` items.
+    ///
+    /// On no-match: emits `{"ok":false,"error":{"code":"no_match",...}}` to
+    /// stdout and exits with code 2. No synthesized prose; no hallucinated
+    /// fallback records.
+    Context {
+        /// Symbol name to look up.
+        name: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -615,6 +635,103 @@ impl<'a> From<&'a SemanticMatch> for SemanticResult<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Context query output types (issue #38)
+// ---------------------------------------------------------------------------
+
+/// One item in the `source_facts` section of a context query result.
+///
+/// Every field that was present on the source record is forwarded directly so
+/// the output is fully citable. Per AC2 from issue #38, every item must
+/// include `record_id` plus at least one of `repo_relative_path`,
+/// `git_commit`, or `valid_time`.
+#[derive(Serialize)]
+struct ContextSourceFact<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_commit: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid_time: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_kind: Option<&'a str>,
+}
+
+/// One item in the `observations` section.
+///
+/// Per AC3 from issue #38, every observation must include `record_id`,
+/// `provenance_handle` (or `agent_id`/`session_id`), `observed_at`,
+/// `confidence`, and the evidence links.
+#[derive(Serialize)]
+struct ContextObservation<'a> {
+    record_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+    /// Provenance handle composed from `agent_id:session_id` when both are present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance_handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<&'a str>,
+    /// Supporting evidence links from the observation.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    evidence_links: Vec<&'a crate::ir::EvidenceLink>,
+}
+
+/// One item in the `project_state`, `artifacts`, or `verification_evidence` sections.
+#[derive(Serialize)]
+struct ContextLinkedItem<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_kind: Option<&'a str>,
+    /// Evidence links that connect this item to the queried symbol.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    evidence_links: Vec<&'a crate::ir::EvidenceLink>,
+}
+
+/// One unresolved evidence link target, surfaced per AC5.
+#[derive(Serialize)]
+struct ContextUnresolved<'a> {
+    source_record_id: &'a str,
+    target_handle: &'a str,
+    relation: &'a str,
+    target_domain: &'a str,
+    verification_status: &'static str,
+}
+
+/// Full context query response envelope.
+#[derive(Serialize)]
+struct ContextResponse<'a> {
+    ok: bool,
+    symbol_name: &'a str,
+    source_facts: Vec<ContextSourceFact<'a>>,
+    observations: Vec<ContextObservation<'a>>,
+    project_state: Vec<ContextLinkedItem<'a>>,
+    artifacts: Vec<ContextLinkedItem<'a>>,
+    verification_evidence: Vec<ContextLinkedItem<'a>>,
+    unresolved: Vec<ContextUnresolved<'a>>,
+}
+
+// ---------------------------------------------------------------------------
 // query_cmd — dispatch
 // ---------------------------------------------------------------------------
 
@@ -710,6 +827,14 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             limit,
             format,
         } => query_semantic(&query, &data_dir, limit, format),
+        QuerySubcommand::Context {
+            name,
+            graph,
+            data_dir,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_context_cmd(&records, &name)
+        }
     }
 }
 
@@ -1311,6 +1436,168 @@ fn resolve_drift_target<'a>(
         return (repo_relative_path.as_deref(), name.as_deref());
     }
     (drift_path, drift_name)
+}
+
+// ---------------------------------------------------------------------------
+// query context (issue #38)
+// ---------------------------------------------------------------------------
+
+fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
+    let ctx = query::symbol_context(records, symbol_name);
+
+    if ctx.is_no_match() {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "no_match",
+                "symbol_name": symbol_name
+            }
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(2);
+    }
+
+    let source_facts: Vec<ContextSourceFact<'_>> = ctx
+        .source_facts
+        .iter()
+        .filter_map(|r| context_source_fact(r))
+        .collect();
+
+    let observations: Vec<ContextObservation<'_>> = ctx
+        .observations
+        .iter()
+        .filter_map(|r| context_observation(r))
+        .collect();
+
+    let project_state: Vec<ContextLinkedItem<'_>> = ctx
+        .project_state
+        .iter()
+        .filter_map(|r| context_linked_item(r))
+        .collect();
+
+    let artifacts: Vec<ContextLinkedItem<'_>> = ctx
+        .artifacts
+        .iter()
+        .filter_map(|r| context_linked_item(r))
+        .collect();
+
+    let verification_evidence: Vec<ContextLinkedItem<'_>> = ctx
+        .verification_evidence
+        .iter()
+        .filter_map(|r| context_linked_item(r))
+        .collect();
+
+    let unresolved: Vec<ContextUnresolved<'_>> = ctx
+        .unresolved
+        .iter()
+        .map(|u| ContextUnresolved {
+            source_record_id: &u.source_record_id,
+            target_handle: &u.target_handle,
+            relation: &u.relation,
+            target_domain: &u.target_domain,
+            verification_status: "unresolved",
+        })
+        .collect();
+
+    let response = ContextResponse {
+        ok: true,
+        symbol_name,
+        source_facts,
+        observations,
+        project_state,
+        artifacts,
+        verification_evidence,
+        unresolved,
+    };
+
+    let output = serde_json::to_string_pretty(&response).context("failed to serialize context")?;
+    println!("{output}");
+    Ok(())
+}
+
+fn context_source_fact(record: &GraphRecord) -> Option<ContextSourceFact<'_>> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        name,
+        repo_relative_path,
+        span,
+        temporal,
+        valid_time,
+        language,
+        symbol_kind,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    Some(ContextSourceFact {
+        record_id: id,
+        kind: kind.as_str(),
+        name: name.as_deref(),
+        repo_relative_path: repo_relative_path.as_deref(),
+        span: *span,
+        git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+        valid_time: valid_time.as_deref(),
+        language: language.as_deref(),
+        symbol_kind: symbol_kind.as_deref(),
+    })
+}
+
+fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_>> {
+    let GraphRecord::Node {
+        id,
+        text,
+        agent_id,
+        session_id,
+        observed_at,
+        confidence,
+        evidence_links,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    let provenance_handle = match (agent_id.as_deref(), session_id.as_deref()) {
+        (Some(a), Some(s)) => Some(format!("{a}:{s}")),
+        (Some(a), None) => Some(a.to_owned()),
+        _ => None,
+    };
+    Some(ContextObservation {
+        record_id: id,
+        text: text.as_deref(),
+        provenance_handle,
+        agent_id: agent_id.as_deref(),
+        session_id: session_id.as_deref(),
+        observed_at: observed_at.as_deref(),
+        confidence: confidence.as_deref(),
+        evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
+    })
+}
+
+fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        name,
+        title,
+        status,
+        verification_kind,
+        evidence_links,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    Some(ContextLinkedItem {
+        record_id: id,
+        kind: kind.as_str(),
+        title: title.as_deref(),
+        name: name.as_deref(),
+        status: status.as_deref(),
+        verification_kind: verification_kind.as_deref(),
+        evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
+    })
 }
 
 // ---------------------------------------------------------------------------

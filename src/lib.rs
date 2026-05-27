@@ -53,6 +53,7 @@ pub use ir::{
     UserContextFields, UserContextScope, agent_memory_stable_id, artifact_stable_id,
     semantic_stable_id, stable_id, user_context_stable_id,
 };
+pub use query::{SymbolContext, UnresolvedRef, symbol_context};
 pub use schema_version::{
     RecordLineRead, RecordReadError, RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE,
     UnknownSchemaVersion, record_version, validate_record_version,
