@@ -13,6 +13,12 @@ does not replace code-graph facts, verification evidence, or agent-memory
 claims. It gives future GitHub issue and local JSONL importers a contract so
 they do not invent inline task fields.
 
+GitHub import policy: [`docs/schema/import-github.md`](import-github.md) is
+the single source of truth for auth, network-access boundaries, redaction field
+map, GitHub-to-record-shape mapping, idempotency state, rate-limit handling,
+and PR-review-thread normalization. That document's mapping table in section 6
+is normative for any GitHub importer that writes records into this domain.
+
 ## 1 - Trust Class
 
 Project-graph records are **intent-shaped, externally-anchored when possible**.

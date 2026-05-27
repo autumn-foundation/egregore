@@ -58,6 +58,8 @@ Egregore starts with typed graph domains. Domains share one AletheiaDB store and
 
 **Local project/task JSONL format:** [`docs/schema/local-project-jsonl.md`](../schema/local-project-jsonl.md) is the canonical offline interchange format for local `source_kind: local_jsonl` task state.
 
+**GitHub Issues/PRs import policy:** [`docs/schema/import-github.md`](../schema/import-github.md) is the single source of truth for GitHub import auth, network-access boundaries, redaction field map, GitHub-to-record-shape mapping, idempotency state, rate-limit handling, and PR-review-thread normalization. Invoked via `eg import github <owner>/<repo>`.
+
 **Semantic drift schema:** [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md) is the single source of truth for `SemanticDrift`, `EmbeddingModel`, `EmbeddingVector`, semantic stable IDs, and drift edge contracts.
 
 **User-context schema:** [`docs/schema/user-context.md`](../schema/user-context.md) is the single source of truth for authorization-derived preference-promotion records, durable user policy records, approval-gated trust rules, and user-context edge contracts.

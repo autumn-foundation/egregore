@@ -128,6 +128,7 @@ egregore query file   <path>  --data-dir .egregore
 egregore query drift          --data-dir .egregore
 egregore query semantic <text> --data-dir .egregore-semantic
 egregore import-codex session.jsonl --out agent.graph.jsonl  # Codex session/rollout import
+eg import github <owner>/<repo> --out github.jsonl            # GitHub Issues/PRs import (policy: docs/schema/import-github.md)
 ```
 
 ---
