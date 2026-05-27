@@ -275,8 +275,9 @@ fn import_github_schema_doc_is_linked_and_coordinated() {
 #[test]
 #[ignore = "requires eg import github implementation (follow-up slice)"]
 fn fresh_import_produces_documented_record_shapes() {
-    // Set up a wiremock server, configure fixture responses for all six v1
-    // endpoints, run `eg import github owner/repo --out <tmp>`, and assert:
+    // Set up a wiremock server, configure fixture responses for the 3 active v1
+    // endpoints (issues, pulls, labels — comment/review endpoints are deferred
+    // and MUST NOT be configured here), run `eg import github owner/repo --out <tmp>`, and assert:
     //
     // v1 emission scope (Task + ExternalLink only — GitHubIssue, PR, Review are reserved):
     //   - one Task (source_kind: github_issue) per issue

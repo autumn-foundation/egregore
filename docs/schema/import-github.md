@@ -71,9 +71,14 @@ Rules:
     Exit non-zero with `github_auth_missing`; stderr MUST explain that a token is
     required to determine whether the repository exists.
   - `404 Not Found` with token available → proceed to Step 2.
-  - `403` with `X-RateLimit-Remaining: 0` → anonymous quota exhausted; apply the
-    section 4 rate-limit backoff (wait until `X-RateLimit-Reset`, then retry Step 1).
+  - `403` with `X-RateLimit-Remaining: 0` and **token available** → anonymous IP
+    quota exhausted, but authenticated quota is a separate 5,000/hour bucket.
+    Skip Step 1 backoff entirely and proceed immediately to Step 2 with the token.
     Do NOT exit with `github_auth_rejected` for this case.
+  - `403` with `X-RateLimit-Remaining: 0` and **no token** → anonymous quota
+    exhausted with no fallback; apply the section 4 rate-limit backoff (wait
+    until `X-RateLimit-Reset`, then retry Step 1). Exit non-zero with a
+    `github_rate_limit_anon` diagnostic if the wait would exceed 5 minutes.
   - `401` / `403` without rate-limit indicator → exit with `github_auth_rejected`.
 
   **Step 2 — Authenticated re-probe** (only when Step 1 returned 404 and a token
@@ -190,12 +195,23 @@ Schema (one JSON object per `<owner>/<repo>`, abbreviated type notation):
   last_seen_updated_at: {
     issues: RFC3339,
     pulls: RFC3339
-  }
+  },
+  label_list_hash: String | null
 }
 ```
 
 ETag keys include the page number (`?page=<n>`) so each page of a paginated
 endpoint has its own stored ETag and can be individually probed on re-import.
+
+**Label change tracking:** GitHub's `/labels` list endpoint does not provide
+per-label `updated_at` timestamps (see GitHub REST docs: List labels for a
+repository). The `last_seen_updated_at` watermarks cannot be used for label
+change detection. Instead, the importer hashes the full sorted label list
+(name + color + description) from the most recent 200 response and stores it
+in `label_list_hash`. On re-import, if the endpoint returns 200 AND the new
+hash differs from the stored hash, all Task records whose `labels` array changed
+MUST be re-emitted. If the hash is unchanged but the ETag changed (can happen
+if GitHub re-signs the response), no label records are re-emitted.
 
 **Deferred endpoint ETag rule:** The v1 importer MUST NOT store ETags for
 deferred comment/review endpoints (`/issues/comments`, `/pulls/comments`,
@@ -252,7 +268,7 @@ Single normative reference. The target record kinds are defined in
 | GitHub Resource | Intended Target Record(s) | Key Fields |
 |-----------------|--------------------------|-----------|
 | Issue | `Task` + `GitHubIssue` + `ExternalLink` | `status` (from `state` + `state_reason`), `number`, `url`, `labels`, `milestone`, `assignees`, `author`, `created_at`, `updated_at`, `closed_at` |
-| Pull Request | `Task` + `PR` + `ExternalLink` | `status` (from `state` + `merged` + `draft`), `number`, `url`, head/base refs, merge commit SHA, `mergeable_state`, requested reviewers |
+| Pull Request | `Task` + `PR` + `ExternalLink` | `status` (from `state` + `merged` + `draft`), `number`, `url`, head/base refs, merge commit SHA, requested reviewers. **Note:** `mergeable_state` is NOT available from the `/pulls?state=all` list endpoint; GitHub computes mergeability lazily for individual PR GETs only. v1 omits `mergeable_state` unless a per-PR GET is explicitly added to the active endpoint set. |
 | Issue Comment | `Review` (`review_kind: "issue_comment"`) → `REFERENCES_TASK` | Attached to parent `Task`; `body` passes through redaction |
 | PR Review | `Review` (`review_kind: "pr_review"`, `state` preserved) → `REFERENCES_TASK` | Attached to parent PR `Task` |
 | PR Review Comment | `Review` (`review_kind: "pr_review_comment"`, `file_path`, `line`, `start_line`, `side`, `diff_hunk` summary, `in_reply_to_id`) → `REFERENCES_TASK` + `TOUCHES_FILE` | Attached to parent PR `Task` and `File` node when file exists at PR head SHA |
@@ -329,7 +345,13 @@ These GitHub fields pass through the redaction pipeline defined in
 **Plaintext fields (queryable, never redacted):**
 
 Repo name, issue/PR number, state, author login, `created_at`, `updated_at`,
-`closed_at`, merge commit SHA, head/base branch names, milestone title.
+`closed_at`, merge commit SHA, head/base branch names.
+
+**Redacted body-stored metadata:** Milestone title (`Task.body_handle` field) is
+NOT in the plaintext carve-out. `Task.body_handle.inline` is a redactable field
+per [`docs/schema/project-graph.md`](project-graph.md) section 8; milestone
+titles MAY contain operator-entered text with secret-like values and MUST pass
+through the redaction pipeline before persistence.
 
 **Redaction note:** `Task.labels`, `Task.assignees`, and `ExternalLink.url` are
 NOT plaintext — they MUST pass through the redaction policy before persistence,
