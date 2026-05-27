@@ -71,7 +71,10 @@ Rules:
     Exit non-zero with `github_auth_missing`; stderr MUST explain that a token is
     required to determine whether the repository exists.
   - `404 Not Found` with token available → proceed to Step 2.
-  - `401` / `403` → (rare on unauthenticated probes) exit with `github_auth_rejected`.
+  - `403` with `X-RateLimit-Remaining: 0` → anonymous quota exhausted; apply the
+    section 4 rate-limit backoff (wait until `X-RateLimit-Reset`, then retry Step 1).
+    Do NOT exit with `github_auth_rejected` for this case.
+  - `401` / `403` without rate-limit indicator → exit with `github_auth_rejected`.
 
   **Step 2 — Authenticated re-probe** (only when Step 1 returned 404 and a token
   is available): `GET /repos/{owner}/{repo}` with `Authorization: Bearer <token>`.
@@ -206,6 +209,14 @@ Those endpoints start being fetched and ETag-cached only after Review promotion.
   cached ETag.
 - On `304 Not Modified`: skip that page; the stored records are unchanged.
 - On `200 OK`: update the stored ETag and continue processing.
+
+**Watermark tie-breaking rule:** When a changed endpoint returns 200, the
+importer uses `>= last_seen_updated_at` (inclusive) to select candidates.
+Using strict `>` would silently drop resources updated at the exact watermark
+timestamp during a concurrent write tick. After selecting candidates, the
+importer MUST compare the full resource state (by hashing key fields) against
+the previously stored state before emitting a new record, so resources that
+match the watermark but are genuinely unchanged do not produce duplicate records.
 
 **Normative budget:**
 

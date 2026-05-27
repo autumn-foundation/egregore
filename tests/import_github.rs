@@ -292,20 +292,22 @@ fn fresh_import_produces_documented_record_shapes() {
 #[test]
 #[ignore = "requires eg import github implementation (follow-up slice)"]
 fn reimport_unchanged_issues_sends_only_conditional_probes() {
-    // Uses a single-page fixture (≤100 items per endpoint) so each endpoint
-    // has exactly one stored ETag.
+    // Uses a single-page fixture (≤100 items per active endpoint) so each endpoint
+    // has exactly one stored ETag. Active v1 endpoints are: issues, pulls, labels.
+    // Comment/review endpoints are deferred and NOT fetched or ETag-cached.
     //
-    // 1. Fresh import: repo probe + five repo-wide endpoints respond 200 + ETag.
-    //    No per-PR review fetches (deferred to Review-promotion slice).
-    // 2. Re-import: repo probe returns 200; all five endpoint probes return 304.
-    //    No per-PR review fetches triggered (pulls list unchanged).
+    // 1. Fresh import: repo probe + 3 active endpoints respond 200 + ETag.
+    //    No comment/review fetches (those endpoints are deferred to Review-promotion).
+    // 2. Re-import: repo probe returns 200; all 3 active endpoint probes return 304.
+    //    No per-PR review fetches triggered (deferred).
     // Assert on the second run:
-    //   - Exactly 6 HTTP requests (1 repo-probe + 5 If-None-Match all-304)
+    //   - Exactly 4 HTTP requests (1 repo-probe + 3 If-None-Match all-304)
     //   - Handoff JSONL contains only the top-level idempotency record (zero per-issue records)
     //   - .github-import-state.json updated with new last_run_at_unix_ms
+    //   - NO requests to /issues/comments, /pulls/comments, or /pulls/{n}/reviews
     //
     // Note: for paginated fixtures (>100 items), the count would be
-    //   1 repo-probe + N_pages probes per endpoint. The single-page case is
+    //   1 repo-probe + N_pages probes per active endpoint. The single-page case is
     //   the canonical budget fixture; multi-page tests are separate.
     todo!("implement after eg import github CLI ships")
 }
