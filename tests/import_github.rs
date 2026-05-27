@@ -89,13 +89,18 @@ fn import_github_schema_doc_locks_policy_contract() {
         &[
             "REST",
             "api.github.com",
-            "/issues?state=all",
-            "/pulls?state=all",
+            // Active v1 endpoints (with required per_page=100)
+            "/issues?state=all&per_page=100",
+            "/pulls?state=all&per_page=100",
+            "/labels?per_page=100",
+            // Deferred endpoints (documented but not fetched in v1)
             "/issues/comments",
             "/pulls/comments",
             "/pulls/{n}/reviews",
-            "/labels",
             "ETag",
+            // per_page rule
+            "per_page=100",
+            "GitHub's default is 30 items",
             // Pagination rule
             r#"Link: <url>; rel="next""#,
             "Stopping at page 1 is a conformance violation",
@@ -130,14 +135,17 @@ fn import_github_schema_doc_locks_policy_contract() {
             "source_repo",
             "api_base_url",
             "last_run_at_unix_ms",
-            "etags",
+            // ETag keys include page number
+            r#"etags: { "<endpoint>?page=<n>": "<etag>" }"#,
             "cursors",
             "last_seen_updated_at",
             "If-None-Match",
             "304 Not Modified",
-            // Budget is now expressed per-ETag (not a fixed ≤6 number)
+            // Budget is now expressed per-ETag
             "one conditional `If-None-Match` probe per stored ETag",
             "last_seen_updated_at` values",
+            // Deferred endpoint ETag rule
+            "MUST NOT store ETags for",
         ],
     );
 
@@ -155,13 +163,16 @@ fn import_github_schema_doc_locks_policy_contract() {
             "diff_hunk",
             "in_reply_to_id",
             "REFERENCES_TASK",
-            "TOUCHED_FILE",
+            // Registered edge label is TOUCHES_FILE (not TOUCHED_FILE)
+            "TOUCHES_FILE",
             // v1 emission scope
             "v1 emission scope",
             "GitHubIssue` deferred",
             "Review` is promoted",
             "REFERENCES_TASK` from `project.Review",
             "TOUCHES_FILE` from `project.Review",
+            // Deferred endpoint ETag rule
+            "MUST NOT store ETags for",
         ],
     );
 
@@ -182,6 +193,9 @@ fn import_github_schema_doc_locks_policy_contract() {
     assert_contains_all(
         "docs/schema/import-github.md",
         &[
+            // Title fields (Task.title is required to be redacted per project-graph.md)
+            "Issue.title",
+            "PullRequest.title",
             "Issue.body",
             "PullRequest.body",
             "Review.body",
@@ -201,6 +215,9 @@ fn import_github_schema_doc_locks_policy_contract() {
             "blake3(domain || kind || source_repo || github_number || subkind_identity)",
             "issue:<n>",
             "pr:<n>",
+            // ExternalLink IDs (v1 emits ExternalLink for every issue/PR)
+            r#"system_native_id="issue:<n>""#,
+            r#"system_native_id="pr:<n>""#,
             "issue_comment:<n>:<comment_id>",
             "pr_review:<n>:<review_id>",
             "pr_review_comment:<n>:<comment_id>",

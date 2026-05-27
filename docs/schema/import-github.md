@@ -63,17 +63,23 @@ Rules:
 - NO config file storage of the token. NO daemon-runtime file storage.
 
 - **Repository probe and auth-missing rule:** Before fetching issue or PR data
-  the importer MUST probe `GET /repos/{owner}/{repo}` unauthenticated.
+  the importer uses a two-step probe:
+
+  **Step 1 — Unauthenticated probe:** `GET /repos/{owner}/{repo}` without token.
   - `200 OK` → public repository; proceed (with token if available, without if absent).
-  - `404 Not Found` without token → repository is private or does not exist;
-    cannot distinguish without a credential. Exit non-zero with
-    `github_auth_missing`; stderr MUST explain that a token is required to
-    determine whether the repository exists.
-  - `404 Not Found` with token → repository does not exist or token lacks access.
-    Exit non-zero with `github_repo_not_found`; do NOT use `github_auth_missing`
-    (the user supplied a credential and the repo is genuinely absent).
-  - `401` / `403` → token is invalid or revoked. Exit non-zero with
-    `github_auth_rejected`. No retry.
+  - `404 Not Found` without token → cannot determine if private or non-existent.
+    Exit non-zero with `github_auth_missing`; stderr MUST explain that a token is
+    required to determine whether the repository exists.
+  - `404 Not Found` with token available → proceed to Step 2.
+  - `401` / `403` → (rare on unauthenticated probes) exit with `github_auth_rejected`.
+
+  **Step 2 — Authenticated re-probe** (only when Step 1 returned 404 and a token
+  is available): `GET /repos/{owner}/{repo}` with `Authorization: Bearer <token>`.
+  - `200 OK` → private repository with valid credentials; proceed.
+  - `404 Not Found` → repository does not exist or token lacks sufficient access.
+    Exit non-zero with `github_repo_not_found`; do NOT use `github_auth_missing`.
+  - `401` / `403` → token is invalid or revoked.
+    Exit non-zero with `github_auth_rejected`. No retry.
 
 - Every stdout/stderr/log line MUST pass through a token-scrubber that replaces
   any substring matching the patterns below with `[REDACTED_GH_TOKEN]` before
@@ -93,22 +99,31 @@ Modified`) is the load-bearing idempotency primitive for this policy. GraphQL's
 cursor-based pagination and lack of per-resource ETags make it harder to
 implement the unchanged-re-import budget guarantee in section 5.
 
-**Exact v1 endpoints:**
+**v1 active endpoints (fetched and ETag-cached):**
+
+All list requests MUST include `per_page=100` to maximise page size before pagination.
+GitHub's default is 30 items; omitting `per_page=100` breaks the single-page budget fixture.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /repos/{owner}/{repo}/issues?state=all` | All issues. **Note:** GitHub's issues API includes pull-request objects; the importer MUST discard any response item where `pull_request` key is present, to avoid double-ingesting PRs that are also returned by the `/pulls` endpoint. |
-| `GET /repos/{owner}/{repo}/pulls?state=all` | All pull requests |
-| `GET /repos/{owner}/{repo}/issues/comments` | All issue comments |
-| `GET /repos/{owner}/{repo}/pulls/comments` | All PR review comments |
-| `GET /repos/{owner}/{repo}/pulls/{n}/reviews` | Reviews per PR |
-| `GET /repos/{owner}/{repo}/labels` | Label list (flattened into Task records) |
+| `GET /repos/{owner}/{repo}/issues?state=all&per_page=100` | All issues. **Note:** GitHub's issues API includes pull-request objects; the importer MUST discard any response item where `pull_request` key is present. |
+| `GET /repos/{owner}/{repo}/pulls?state=all&per_page=100` | All pull requests |
+| `GET /repos/{owner}/{repo}/labels?per_page=100` | Label list (flattened into Task records) |
 
-**Pagination rule (normative):** GitHub list endpoints return at most 100 items
-per page. The importer MUST follow the `Link: <url>; rel="next"` header on
+**Endpoints deferred with `Review` kind promotion:**
+These are the intended full v1 surface once `Review` is promoted from reserved.
+They are NOT fetched or ETag-cached by the v1 implementation (see section 6).
+
+| Deferred Endpoint | Future Purpose |
+|-------------------|---------------|
+| `GET /repos/{owner}/{repo}/issues/comments?per_page=100` | All issue comments → `Review` records |
+| `GET /repos/{owner}/{repo}/pulls/comments?per_page=100` | All PR review comments → `Review` records |
+| `GET /repos/{owner}/{repo}/pulls/{n}/reviews` | Per-PR reviews → `Review` records |
+
+**Pagination rule (normative):** The importer MUST follow the `Link: <url>; rel="next"` header on
 every paginated response until no `next` relation is present.
 Stopping at page 1 is a conformance violation that silently truncates imports
-on any repository with more than 100 issues, PRs, comments, reviews, or labels.
+on any repository with more than 100 issues, PRs, or labels.
 
 **Reserved for future slices (not implemented in v1):**
 
@@ -167,16 +182,23 @@ Schema (one JSON object per `<owner>/<repo>`, abbreviated type notation):
   source_repo: "<owner>/<repo>",
   api_base_url: String,
   last_run_at_unix_ms: u128,
-  etags: { "<endpoint>": "<etag>" },
+  etags: { "<endpoint>?page=<n>": "<etag>" },
   cursors: { "<endpoint>": String | null },
   last_seen_updated_at: {
     issues: RFC3339,
-    pulls: RFC3339,
-    issue_comments: RFC3339,
-    pull_comments: RFC3339
+    pulls: RFC3339
   }
 }
 ```
+
+ETag keys include the page number (`?page=<n>`) so each page of a paginated
+endpoint has its own stored ETag and can be individually probed on re-import.
+
+**Deferred endpoint ETag rule:** The v1 importer MUST NOT store ETags for
+deferred comment/review endpoints (`/issues/comments`, `/pulls/comments`,
+`/pulls/{n}/reviews`). Caching ETags before records are emitted would cause
+304 responses to silently skip the backfill when `Review` is later promoted.
+Those endpoints start being fetched and ETag-cached only after Review promotion.
 
 **Re-run behaviour:**
 
@@ -190,12 +212,12 @@ Schema (one JSON object per `<owner>/<repo>`, abbreviated type notation):
 - An unchanged re-import MUST issue exactly one conditional `If-None-Match` probe per stored ETag
   (one per page per endpoint) plus one repo-probe, and produce a
   handoff with only the top-level idempotency record (zero per-issue records).
-  For repositories whose content fits on a single page per endpoint this totals
-  6 requests (1 repo-probe + 5 endpoint probes); paginated repositories require
+  For repositories whose content fits on a single page per each of the 3 active
+  v1 endpoints (issues, pulls, labels) this totals 4 requests
+  (1 repo-probe + 3 endpoint probes); paginated repositories require
   one additional probe per extra stored page.
-- Because `/pulls?state=all` returns `304` on an unchanged re-import, no per-PR
-  `/pulls/{n}/reviews` requests are issued; those fire only when the pulls list
-  changes.
+- Per-PR `/pulls/{n}/reviews` requests fire only when Review is promoted and
+  the pulls list changes on re-import.
 - A changed endpoint re-import MUST produce only the records for resources that
   changed since the last run (identified by comparing stored `last_seen_updated_at` values
   against the re-fetched resource list) plus the top-level handoff metadata record. Per-PR review fetches (`/pulls/{n}/reviews`) count against the run total
@@ -222,7 +244,7 @@ Single normative reference. The target record kinds are defined in
 | Pull Request | `Task` + `PR` + `ExternalLink` | `status` (from `state` + `merged` + `draft`), `number`, `url`, head/base refs, merge commit SHA, `mergeable_state`, requested reviewers |
 | Issue Comment | `Review` (`review_kind: "issue_comment"`) → `REFERENCES_TASK` | Attached to parent `Task`; `body` passes through redaction |
 | PR Review | `Review` (`review_kind: "pr_review"`, `state` preserved) → `REFERENCES_TASK` | Attached to parent PR `Task` |
-| PR Review Comment | `Review` (`review_kind: "pr_review_comment"`, `file_path`, `line`, `start_line`, `side`, `diff_hunk` summary, `in_reply_to_id`) → `REFERENCES_TASK` + `TOUCHED_FILE` | Attached to parent PR `Task` and `File` node when file exists at PR head SHA |
+| PR Review Comment | `Review` (`review_kind: "pr_review_comment"`, `file_path`, `line`, `start_line`, `side`, `diff_hunk` summary, `in_reply_to_id`) → `REFERENCES_TASK` + `TOUCHES_FILE` | Attached to parent PR `Task` and `File` node when file exists at PR head SHA |
 | Label | Flattened into `Task.labels` array | No separate record kind in v1 |
 | Milestone | Flattened into `Task.milestone` (`id`, `title`, `due_on`) | No separate record kind in v1 |
 
@@ -284,8 +306,10 @@ These GitHub fields pass through the redaction pipeline defined in
 
 | GitHub field | Redacted | Notes |
 |-------------|---------|-------|
+| `Issue.title` | yes | Maps to `Task.title`; `project-graph.md` requires `Task.title` to be redacted |
 | `Issue.body` | yes | Full body |
 | `Issue.comments[].body` | yes | All comment bodies |
+| `PullRequest.title` | yes | Maps to `Task.title`; same rule as `Issue.title` |
 | `PullRequest.body` | yes | PR description body |
 | `Review.body` | yes | PR review summary body |
 | `ReviewComment.body` | yes | Inline review comment body |
@@ -325,6 +349,8 @@ Subkind identities:
 |--------|-------------------|
 | Issue `Task` | `"issue:<n>"` |
 | PR `Task` | `"pr:<n>"` |
+| Issue `ExternalLink` | `(system="github", system_native_id="issue:<n>")` following the `(system, system_native_id)` shape from `project-graph.md` section 9 |
+| PR `ExternalLink` | `(system="github", system_native_id="pr:<n>")` — distinct from the issue ExternalLink even for the same numeric n, because GitHub PRs and issues share a number space but differ in kind |
 | Issue Comment `Review` | `"issue_comment:<n>:<comment_id>"` |
 | PR Review `Review` | `"pr_review:<n>:<review_id>"` |
 | PR Review Comment `Review` | `"pr_review_comment:<n>:<comment_id>"` |
