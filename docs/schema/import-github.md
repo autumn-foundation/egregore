@@ -160,6 +160,10 @@ Rules (normative behaviour for every HTTP response):
 - HTTP 403 with a secondary-rate-limit body: honour the `Retry-After` header;
   if absent, use exponential backoff starting at 60 s, capped at 600 s, with a
   maximum of 5 retries before exiting non-zero.
+- HTTP 429 (primary or secondary rate limit — GitHub may return either 403 or
+  429 for rate-limit events): treat identically to the 403 secondary-rate-limit
+  case above. Honour `Retry-After` or `X-RateLimit-Reset`; exponential backoff
+  if neither header is present; maximum 5 retries before exiting non-zero.
 - HTTP 502 / 503 / 504: exponential backoff starting at 5 s, capped at 60 s,
   maximum 5 retries.
 - HTTP 401 or HTTP 403 (authentication rejection, not secondary rate): exit
@@ -196,7 +200,8 @@ Schema (one JSON object per `<owner>/<repo>`, abbreviated type notation):
     issues: RFC3339,
     pulls: RFC3339
   },
-  label_list_hash: String | null
+  label_list_hash: String | null,
+  resource_hashes: { "<issue|pr>:<n>": "<hash>" }
 }
 ```
 
@@ -212,6 +217,17 @@ in `label_list_hash`. On re-import, if the endpoint returns 200 AND the new
 hash differs from the stored hash, all Task records whose `labels` array changed
 MUST be re-emitted. If the hash is unchanged but the ETag changed (can happen
 if GitHub re-signs the response), no label records are re-emitted.
+
+**Per-resource hash store (`resource_hashes`):** The watermark tie-breaking
+rule requires comparing each candidate resource against the previously stored
+state. `resource_hashes` provides that storage: it maps `"issue:<n>"` or
+`"pr:<n>"` to the BLAKE3 hex hash of the canonical JSON of the key fields
+(`number`, `state`, `title`, `body`, `labels`, `assignees`, `updated_at`,
+`closed_at`, and PR-specific fields `merged`, `draft`, `head.sha`, `base.ref`).
+On re-import, a resource selected by the `>= last_seen_updated_at` watermark is
+compared against its stored hash; if identical, no new record is emitted and the
+hash entry is left unchanged. If different, a new record is emitted and the hash
+entry is updated. An absent entry is treated as "never imported" — always emit.
 
 **Deferred endpoint ETag rule:** The v1 importer MUST NOT store ETags for
 deferred comment/review endpoints (`/issues/comments`, `/pulls/comments`,
