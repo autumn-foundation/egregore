@@ -187,18 +187,19 @@ Schema (one JSON object per `<owner>/<repo>`, abbreviated type notation):
 
 **Normative budget:**
 
-- An unchanged re-import MUST issue ≤6 HTTP requests and produce a handoff
-  with only the top-level idempotency record (zero per-issue records). The 6
-  requests are: one repo-probe (`GET /repos/{owner}/{repo}`) plus one
-  conditional `If-None-Match` probe for each of the 5 repository-wide endpoints
-  (issues, pulls, issue_comments, pull_comments, labels) — all returning `304`.
-  Because `/pulls?state=all` returns `304`, no per-PR `/pulls/{n}/reviews`
-  requests are issued; those requests are triggered only when the pulls list
-  itself changes.
-- A changed-issue re-import MUST produce exactly that issue's records plus
-  the top-level handoff metadata record. Per-PR review fetches
-  (`/pulls/{n}/reviews`) count against the run total but are NOT part of the
-  ≤6 unchanged-re-import budget.
+- An unchanged re-import MUST issue exactly one conditional `If-None-Match` probe per stored ETag
+  (one per page per endpoint) plus one repo-probe, and produce a
+  handoff with only the top-level idempotency record (zero per-issue records).
+  For repositories whose content fits on a single page per endpoint this totals
+  6 requests (1 repo-probe + 5 endpoint probes); paginated repositories require
+  one additional probe per extra stored page.
+- Because `/pulls?state=all` returns `304` on an unchanged re-import, no per-PR
+  `/pulls/{n}/reviews` requests are issued; those fire only when the pulls list
+  changes.
+- A changed endpoint re-import MUST produce only the records for resources that
+  changed since the last run (identified by comparing stored `last_seen_updated_at` values
+  against the re-fetched resource list) plus the top-level handoff metadata record. Per-PR review fetches (`/pulls/{n}/reviews`) count against the run total
+  but are NOT part of the unchanged-re-import conditional budget.
 
 **Failure rule:** if the importer exits non-zero due to auth failure
 (`github_auth_missing` or `github_auth_rejected`), MUST NOT write or update
@@ -267,10 +268,12 @@ A "thread" is the transitive closure of `Review` records connected by
   GraphQL API, which is reserved for v2. Therefore, v1 stores all review-comment
   threads without a resolved/unresolved distinction; the "merged with unresolved
   feedback" query state is deferred to the GraphQL slice.
-- Traversal (once `Review` is promoted from reserved): from a PR `Task`, follow
-  `REFERENCES_TASK` edges to `Review` records with
-  `review_kind: "pr_review_comment"`, group by the `in_reply_to_id` chain to
-  reconstruct threads. Resolution state is not stored in v1.
+- Traversal (once `Review` is promoted from reserved): `REFERENCES_TASK` is
+  registered FROM `project.Review` TO `project.Task`, so traversal from a PR
+  `Task` follows **incoming** `REFERENCES_TASK` edges (i.e., find all `Review`
+  records that point TO this `Task`). Group the resulting `Review` records with
+  `review_kind: "pr_review_comment"` by the `in_reply_to_id` chain to reconstruct
+  threads. Resolution state is not stored in v1.
 
 ---
 
@@ -290,9 +293,14 @@ These GitHub fields pass through the redaction pipeline defined in
 
 **Plaintext fields (queryable, never redacted):**
 
-Repo name, issue/PR number, URL, state, labels, assignees, author login,
-`created_at`, `updated_at`, `closed_at`, merge commit SHA, head/base branch
-names, milestone title.
+Repo name, issue/PR number, state, author login, `created_at`, `updated_at`,
+`closed_at`, merge commit SHA, head/base branch names, milestone title.
+
+**Redaction note:** `Task.labels`, `Task.assignees`, and `ExternalLink.url` are
+NOT plaintext — they MUST pass through the redaction policy before persistence,
+per [`docs/schema/project-graph.md`](project-graph.md) and
+[`docs/schema/redaction.md`](redaction.md). This aligns with how the local-JSONL
+importer handles the same fields.
 
 **diff_hunk sub-policy:** Preserve file path, line numbers, and structural
 diff markers (`+`, `-`, `@@`). Redact only value-bearing content lines whose
@@ -349,12 +357,13 @@ The test suite covers:
 
 | Test | Assertion |
 |------|-----------|
-| Fresh import | Produces documented record shapes and edge counts |
-| Unchanged re-import | ≤6 HTTP requests; handoff contains zero per-issue records |
-| Changed-issue re-import | Produces exactly that issue's records |
-| Auth-missing run | Exits with `github_auth_missing`; no partial state file |
-| Token in body | `ghp_` / `ghs_` strings → `[REDACTED_GH_TOKEN]` in Task.summary and Review.body |
-| PR review thread | Three comments via `in_reply_to_id`; thread reconstructed |
+| Fresh import | v1 scope: one `Task + ExternalLink` per issue/PR; zero `GitHubIssue`/`PR`/`Review` (reserved) |
+| Unchanged re-import (single-page) | One `If-None-Match` probe per stored ETag + repo-probe; handoff contains zero per-issue records |
+| Changed-issue re-import | Endpoint returns 200; importer uses `last_seen_updated_at` to emit only changed issue's records |
+| Auth-missing run (no token) | Exits with `github_auth_missing`; no partial state file |
+| Auth-missing run (token + 404) | Exits with `github_repo_not_found`; no partial state file |
+| Token in body | `ghp_`/`github_pat_` strings absent from `Task.body_handle.inline`; `<REDACTED:api_token:hash>` present |
+| PR review thread | Three `Review` records; incoming `REFERENCES_TASK` traversal from Task; `in_reply_to_id` chain |
 | Stderr summary | Documented fields present on every run |
 
 Implementation of behaviour tests is deferred to the `eg import github` CLI

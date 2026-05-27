@@ -135,7 +135,9 @@ fn import_github_schema_doc_locks_policy_contract() {
             "last_seen_updated_at",
             "If-None-Match",
             "304 Not Modified",
-            "unchanged re-import MUST issue",
+            // Budget is now expressed per-ETag (not a fixed ≤6 number)
+            "one conditional `If-None-Match` probe per stored ETag",
+            "last_seen_updated_at` values",
         ],
     );
 
@@ -186,6 +188,9 @@ fn import_github_schema_doc_locks_policy_contract() {
             "ReviewComment.body",
             "ReviewComment.diff_hunk",
             "diff_hunk sub-policy",
+            // Labels/assignees/URL must NOT be in plaintext carve-out
+            "`Task.labels`, `Task.assignees`, and `ExternalLink.url` are",
+            "NOT plaintext",
         ],
     );
 
@@ -255,40 +260,54 @@ fn import_github_schema_doc_is_linked_and_coordinated() {
 fn fresh_import_produces_documented_record_shapes() {
     // Set up a wiremock server, configure fixture responses for all six v1
     // endpoints, run `eg import github owner/repo --out <tmp>`, and assert:
-    //   - one Task per issue, one Task per PR
-    //   - one GitHubIssue per issue, one PR record per pull-request
-    //   - ExternalLink with system = "github" for every Task
-    //   - Review records for issue comments, PR reviews, and PR review comments
-    //   - Edge counts match fixture cardinality
+    //
+    // v1 emission scope (Task + ExternalLink only — GitHubIssue, PR, Review are reserved):
+    //   - one Task (source_kind: github_issue) per issue
+    //   - one Task (source_kind: github_pr) per pull request
+    //   - one ExternalLink (system = "github") per Task
+    //   - zero GitHubIssue, zero PR, zero Review records (those kinds are reserved;
+    //     deferred to the slice that promotes them from project-graph.md reserved status)
+    //   - one EXTERNAL_HANDLE edge per Task → ExternalLink
+    //   - handoff metadata record present
     todo!("implement after eg import github CLI ships")
 }
 
 #[test]
 #[ignore = "requires eg import github implementation (follow-up slice)"]
-fn reimport_unchanged_issues_sends_at_most_six_conditional_requests() {
-    // 1. Run a fresh import against a wiremock server (repo probe + five repo-wide
-    //    endpoints respond with 200 + ETag headers; no per-PR review fetches needed
-    //    when pulls returns 304).
-    // 2. Reset the mock server: repo probe returns 200; five repo-wide endpoints
-    //    return 304 Not Modified (no per-PR review fetches triggered).
-    // 3. Run a second import with the same --state-file.
-    // Assert:
-    //   - Exactly 6 HTTP requests on the second run:
-    //     1 repo probe + 5 conditional If-None-Match probes (all 304)
-    //   - The handoff JSONL contains only the top-level record (zero per-issue records)
-    //   - The .github-import-state.json is updated with the new last_run_at_unix_ms
-    //   - No /pulls/{n}/reviews requests are issued (pulls list unchanged → skip)
+fn reimport_unchanged_issues_sends_only_conditional_probes() {
+    // Uses a single-page fixture (≤100 items per endpoint) so each endpoint
+    // has exactly one stored ETag.
+    //
+    // 1. Fresh import: repo probe + five repo-wide endpoints respond 200 + ETag.
+    //    No per-PR review fetches (deferred to Review-promotion slice).
+    // 2. Re-import: repo probe returns 200; all five endpoint probes return 304.
+    //    No per-PR review fetches triggered (pulls list unchanged).
+    // Assert on the second run:
+    //   - Exactly 6 HTTP requests (1 repo-probe + 5 If-None-Match all-304)
+    //   - Handoff JSONL contains only the top-level idempotency record (zero per-issue records)
+    //   - .github-import-state.json updated with new last_run_at_unix_ms
+    //
+    // Note: for paginated fixtures (>100 items), the count would be
+    //   1 repo-probe + N_pages probes per endpoint. The single-page case is
+    //   the canonical budget fixture; multi-page tests are separate.
     todo!("implement after eg import github CLI ships")
 }
 
 #[test]
 #[ignore = "requires eg import github implementation (follow-up slice)"]
-fn reimport_with_one_changed_issue_produces_exactly_that_issues_records() {
-    // 1. Fresh import: two issues, all unchanged.
-    // 2. Re-import: issue #1 returns 304, issue #2 returns 200 with updated body.
+fn reimport_with_one_changed_issue_produces_only_that_issues_records() {
+    // ETag caching is at the repository-wide endpoint level, not per-issue.
+    // Change detection within a changed endpoint uses last_seen_updated_at.
+    //
+    // 1. Fresh import: two issues. /issues?state=all returns 200 + ETag.
+    //    Importer stores ETag and last_seen_updated_at for both issues.
+    // 2. Re-import: /issues?state=all returns 200 (ETag changed — the list changed).
+    //    The new response contains both issues, but only issue #2 has an updated_at
+    //    later than the stored last_seen_updated_at. Issue #1 is unchanged.
     // Assert:
-    //   - Only issue #2's Task and GitHubIssue records appear in the delta handoff
-    //   - Issue #1 produces no records on the second run
+    //   - Only issue #2's Task + ExternalLink appear in the delta handoff
+    //   - Issue #1 produces no new records (updated_at matches stored value)
+    //   - GitHubIssue records are NOT produced (kind is deferred/reserved)
     todo!("implement after eg import github CLI ships")
 }
 
@@ -324,22 +343,33 @@ fn token_strings_in_body_are_redacted_before_persistence() {
     // Configure fixture issue body:
     //   "Fix the config. Token: ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA and done."
     // Run import.
-    // Assert:
-    //   - The resulting Task.summary (and Review.body for comments) does NOT contain
-    //     the literal `ghp_AAAA...` string
-    //   - The string `[REDACTED_GH_TOKEN]` appears in its place
+    // Assert (two distinct redaction surfaces):
+    //
+    // 1. Stdout/stderr scrubber (in-flight): no `ghp_AAAA...` string appears in
+    //    any stdout/stderr/log byte before the process exits. The scrubber marker
+    //    `[REDACTED_GH_TOKEN]` MAY appear in stderr diagnostics.
+    //
+    // 2. Persisted graph record (Task.body_handle.inline): the raw token string
+    //    MUST NOT appear. The persisted value MUST use the redaction marker grammar
+    //    from docs/schema/redaction.md: `<REDACTED:api_token:<hash_prefix>>`.
+    //    Checking for `[REDACTED_GH_TOKEN]` in the persisted record is NOT
+    //    sufficient — a conforming importer uses the schema marker, not the
+    //    scrubber placeholder.
     todo!("implement after eg import github CLI ships")
 }
 
 #[test]
 #[ignore = "requires eg import github implementation (follow-up slice)"]
 fn pr_review_thread_reconstructs_via_in_reply_to_id() {
+    // Requires Review kind to be promoted from reserved.
     // Configure a PR fixture with three review comments in one thread:
     //   comment A (root), comment B (in_reply_to_id = A), comment C (in_reply_to_id = B)
     // Run import. Query the graph.
     // Assert:
     //   - Three Review records with review_kind = "pr_review_comment"
-    //   - Traversal from PR Task → REFERENCES_TASK → Review records
+    //   - REFERENCES_TASK is registered Review → Task (Review is FROM, Task is TO);
+    //     traversal from PR Task follows INCOMING REFERENCES_TASK edges to find Review records
+    //     (i.e., find all Reviews whose REFERENCES_TASK edge points TO this Task)
     //   - Grouping by in_reply_to_id chain yields {A, B, C} as one thread
     //   - Thread root A has no in_reply_to_id
     todo!("implement after eg import github CLI ships")
