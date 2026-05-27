@@ -222,8 +222,11 @@ if GitHub re-signs the response), no label records are re-emitted.
 rule requires comparing each candidate resource against the previously stored
 state. `resource_hashes` provides that storage: it maps `"issue:<n>"` or
 `"pr:<n>"` to the BLAKE3 hex hash of the canonical JSON of the key fields
-(`number`, `state`, `title`, `body`, `labels`, `assignees`, `updated_at`,
-`closed_at`, and PR-specific fields `merged`, `draft`, `head.sha`, `base.ref`).
+(**all fields that can affect the emitted `Task` or `ExternalLink`:**
+`number`, `state`, `state_reason`, `title`, `body`, `labels`, `assignees`,
+`milestone` (full object), `updated_at`, `closed_at`, and PR-specific fields
+`merged_at`, `draft`, `head.sha`, `base.ref`; omitting any of these fields
+from the hash means a change to that field is permanently missed on re-import).
 On re-import, a resource selected by the `>= last_seen_updated_at` watermark is
 compared against its stored hash; if identical, no new record is emitted and the
 hash entry is left unchanged. If different, a new record is emitted and the hash
@@ -284,12 +287,12 @@ Single normative reference. The target record kinds are defined in
 | GitHub Resource | Intended Target Record(s) | Key Fields |
 |-----------------|--------------------------|-----------|
 | Issue | `Task` + `GitHubIssue` + `ExternalLink` | `status` (from `state` + `state_reason`), `number`, `url`, `labels`, `milestone`, `assignees`, `author`, `created_at`, `updated_at`, `closed_at` |
-| Pull Request | `Task` + `PR` + `ExternalLink` | `status` (from `state` + `merged` + `draft`), `number`, `url`, head/base refs, merge commit SHA, requested reviewers. **Note:** `mergeable_state` is NOT available from the `/pulls?state=all` list endpoint; GitHub computes mergeability lazily for individual PR GETs only. v1 omits `mergeable_state` unless a per-PR GET is explicitly added to the active endpoint set. |
+| Pull Request | `Task` + `PR` + `ExternalLink` | `status` (from `state` + `merged_at` + `draft`; use `merged_at != null` to distinguish merged vs closed-unmerged — the `/pulls?state=all` list endpoint returns `merged_at` as RFC3339-or-null, NOT the `merged` boolean which is only on per-PR GET responses), `number`, `url`, head/base refs, merge commit SHA, requested reviewers. **Note:** `mergeable_state` is NOT available from the `/pulls?state=all` list endpoint; GitHub computes mergeability lazily for individual PR GETs only. v1 omits `mergeable_state` unless a per-PR GET is explicitly added to the active endpoint set. |
 | Issue Comment | `Review` (`review_kind: "issue_comment"`) → `REFERENCES_TASK` | Attached to parent `Task`; `body` passes through redaction |
 | PR Review | `Review` (`review_kind: "pr_review"`, `state` preserved) → `REFERENCES_TASK` | Attached to parent PR `Task` |
 | PR Review Comment | `Review` (`review_kind: "pr_review_comment"`, `file_path`, `line`, `start_line`, `side`, `diff_hunk` summary, `in_reply_to_id`) → `REFERENCES_TASK` + `TOUCHES_FILE` | Attached to parent PR `Task` and `File` node when file exists at PR head SHA |
 | Label | Flattened into `Task.labels` array | No separate record kind in v1 |
-| Milestone | Flattened into `Task.milestone` (`id`, `title`, `due_on`) | No separate record kind in v1 |
+| Milestone | Stored in `Task.body_handle` as part of the GitHub-only metadata blob (no `Task.milestone` field exists in the v1 `Task` schema — see [`docs/schema/project-graph.md`](project-graph.md) section 3; `Task.milestone` is undefined in v1 and emitting it would be rejected) | No separate record kind in v1 |
 
 **v1 emission scope (what the first implementation actually emits):**
 
@@ -300,8 +303,8 @@ follow-up slice that promotes them from reserved.
 
 | GitHub Resource | v1 Emission |
 |-----------------|------------|
-| Issue | `Task + ExternalLink` only (`source_kind: github_issue`). GitHub-only metadata (`state_reason`, `milestone`, etc.) stored in `Task.body_handle` for round-trip fidelity; `GitHubIssue` deferred. |
-| Pull Request | `Task + ExternalLink` only (`source_kind: github_pr`). PR-specific fields deferred to `PR` record promotion. |
+| Issue | `Task + ExternalLink` only (`source_kind: github_issue`). GitHub-only metadata (`state_reason`, `milestone`, etc.) stored in `Task.body_handle` for round-trip fidelity; `GitHubIssue` deferred. `Task.priority` defaults to `unknown` (GitHub issues have no native priority field; a future label-mapping rule may override this). |
+| Pull Request | `Task + ExternalLink` only (`source_kind: github_pr`). PR-specific fields deferred to `PR` record promotion. `Task.priority` defaults to `unknown`. |
 | Issue Comment | **Deferred.** Comment endpoints are still fetched and ETag-cached; records emitted when `Review` is promoted. |
 | PR Review | **Deferred.** Same rationale as issue comments. |
 | PR Review Comment | **Deferred.** Same rationale. `REFERENCES_TASK` from `project.Review` and `TOUCHED_FILE` from `project.Review` must also be registered in `project-graph.md` before emission. |
