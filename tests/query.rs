@@ -2172,6 +2172,284 @@ fn symbol_context_triple_evidence_link_surfaced_as_unresolved() {
     );
 }
 
+// ── Finding: path fallback must skip tombstoned file nodes ───────────────────
+//
+// When no DEFINES edge exists for a symbol, the path-based fallback adds every
+// File node whose `repo_relative_path` matches the symbol's path. A tombstoned
+// file record must not be seeded because it would pollute seed_ids and could
+// cause deleted file context to leak into an otherwise live symbol query.
+
+#[test]
+fn symbol_context_path_fallback_excludes_tombstoned_file() {
+    // Symbol S at "src/foo.rs" — no DEFINES edge
+    // File F1 (live) at "src/foo.rs"  — must be in source_facts
+    // File F2 (tombstoned) at "src/foo.rs" — must NOT be in source_facts
+    let sym_id = "codegraph:v4:pathfb_tomb_sym001";
+    let sym = ctx_symbol(sym_id, "pathfb_tomb_fn", "src/foo.rs", 1);
+
+    let live_file_id = aletheia_egregore::ir::stable_id(&["file", "pathfb_tomb_live"]);
+    let live_file = GraphRecord::node(
+        live_file_id.clone(),
+        NodeKind::File,
+        Some("src/foo.rs".to_owned()),
+        None,
+        None,
+        "src/foo.rs live".to_owned(),
+    );
+
+    let dead_file_id = aletheia_egregore::ir::stable_id(&["file", "pathfb_tomb_dead"]);
+    let dead_file = GraphRecord::node(
+        dead_file_id.clone(),
+        NodeKind::File,
+        Some("src/foo.rs".to_owned()),
+        None,
+        None,
+        "src/foo.rs dead".to_owned(),
+    );
+    let tombstone = GraphRecord::Tombstone {
+        id: "tombstone:pathfb_tomb_dead".to_owned(),
+        schema_version: 0,
+        deleted_id: dead_file_id.clone(),
+        summary: "file removed".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![sym, live_file, dead_file, tombstone];
+    let ctx = symbol_context(&records, "pathfb_tomb_fn");
+
+    assert!(!ctx.is_no_match(), "symbol must be found");
+    assert!(
+        ctx.source_facts
+            .iter()
+            .any(|r| r.id() == live_file_id.as_str()),
+        "live file must be in source_facts via path fallback"
+    );
+    assert!(
+        ctx.source_facts
+            .iter()
+            .all(|r| r.id() != dead_file_id.as_str()),
+        "tombstoned file must NOT appear in source_facts"
+    );
+}
+
+// ── Finding: partial DEFINES coverage must fall back per-symbol ───────────────
+//
+// When multiple live symbols share the queried name and only one of them has a
+// DEFINES edge, the global `files_added_via_defines` flag would disable the
+// path fallback for all matches. The symbol whose file was not resolved via
+// DEFINES would then be missing its co-located file from source_facts. Track
+// per-symbol DEFINES coverage instead.
+
+#[test]
+fn symbol_context_partial_defines_per_symbol_path_fallback() {
+    // Two symbols named "partial_defines_fn": sym_with_defines at "src/a.rs" (has DEFINES),
+    // sym_no_defines at "src/b.rs" (no DEFINES edge, but a live file exists at that path).
+    // Both files must appear in source_facts.
+    let sym_with_defines_id = "codegraph:v4:partial_defines_sym_a";
+    let sym_with_defines = ctx_symbol(sym_with_defines_id, "partial_defines_fn", "src/a.rs", 1);
+
+    let sym_no_defines_id = "codegraph:v4:partial_defines_sym_b";
+    let sym_no_defines = ctx_symbol(sym_no_defines_id, "partial_defines_fn", "src/b.rs", 10);
+
+    let file_defines_id = aletheia_egregore::ir::stable_id(&["file", "partial_defines_a"]);
+    let file_defines = GraphRecord::node(
+        file_defines_id.clone(),
+        NodeKind::File,
+        Some("src/a.rs".to_owned()),
+        None,
+        None,
+        "src/a.rs".to_owned(),
+    );
+
+    let file_fallback_id = aletheia_egregore::ir::stable_id(&["file", "partial_defines_b"]);
+    let file_fallback = GraphRecord::node(
+        file_fallback_id.clone(),
+        NodeKind::File,
+        Some("src/b.rs".to_owned()),
+        None,
+        None,
+        "src/b.rs".to_owned(),
+    );
+
+    // DEFINES edge only for sym_with_defines; sym_no_defines has none
+    let defines_edge = GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_defines_id.clone(),
+        sym_with_defines_id.to_owned(),
+        None,
+        "file_defines defines sym_with_defines".to_owned(),
+    );
+
+    let records = vec![
+        sym_with_defines,
+        sym_no_defines,
+        file_defines,
+        file_fallback,
+        defines_edge,
+    ];
+    let ctx = symbol_context(&records, "partial_defines_fn");
+
+    assert!(
+        ctx.source_facts
+            .iter()
+            .any(|r| r.id() == file_defines_id.as_str()),
+        "file resolved via DEFINES must be in source_facts"
+    );
+    assert!(
+        ctx.source_facts
+            .iter()
+            .any(|r| r.id() == file_fallback_id.as_str()),
+        "file for sym_no_defines must be in source_facts via path fallback"
+    );
+}
+
+// ── Finding: backfill expansion must loop until convergence ───────────────────
+//
+// When a node is classified only by the post-BFS evidence-link backfill (e.g.
+// Task discovered via Obs evidence_links), the extra edge pass must continue
+// traversing from newly discovered nodes until no new nodes are classified.
+// A single pass finds Task → AC but misses AC → CommandRun.
+
+#[allow(clippy::too_many_lines)]
+#[test]
+fn symbol_context_backfill_ac_closes_verification_via_extra_hop() {
+    // Symbol S
+    // Obs --MENTIONS_SYMBOL edge--> S              (Obs: edge arm, hop 1)
+    // Obs.evidence_links = [task_id]               (Task: backfill classification)
+    // Task --OWNED_BY_TASK edge--> AC              (AC: backfill edge pass 1)
+    // AC --CLOSES_ACCEPTANCE_CRITERION--> Run      (Run: needs backfill edge pass 2)
+    let sym_id = "codegraph:v4:backfill_close_sym001";
+    let sym = ctx_symbol(sym_id, "backfill_close_fn", "src/lib.rs", 1);
+
+    let task_id = aletheia_egregore::ir::project_stable_id(&["task", "backfill_close_task"]);
+    let mut task = GraphRecord::node(
+        task_id.clone(),
+        NodeKind::Task,
+        None,
+        None,
+        Some("Backfill close task".to_owned()),
+        "Task: Backfill close task".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut title,
+        ref mut schema_version,
+        ..
+    } = task
+    {
+        *title = Some("Backfill close task".to_owned());
+        *schema_version = aletheia_egregore::ir::PROJECT_SCHEMA_VERSION;
+    }
+
+    let ac_id = aletheia_egregore::ir::project_stable_id(&["ac", "backfill_close_ac"]);
+    let ac = GraphRecord::node(
+        ac_id.clone(),
+        NodeKind::AcceptanceCriterion,
+        None,
+        None,
+        Some("AC for backfill close".to_owned()),
+        "AC for backfill close".to_owned(),
+    );
+
+    let run_id = aletheia_egregore::ir::verification_stable_id(&["run", "backfill_close_run"]);
+    let run = GraphRecord::node(
+        run_id.clone(),
+        NodeKind::CommandRun,
+        None,
+        None,
+        None,
+        "command run closing the AC".to_owned(),
+    );
+
+    // Obs: classified via edge arm; has evidence_link to Task
+    let obs_id = agent_memory_stable_id(&["obs", "backfill_close_obs"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "observation about backfill_close_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ref mut evidence_links,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(task_id.clone()),
+            target_domain: "project".to_owned(),
+            relation: "REFERENCES_TASK".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    // Obs --MENTIONS_SYMBOL edge--> S
+    let obs_sym_edge = GraphRecord::agent_memory_edge(
+        EdgeLabel::MentionsSymbol,
+        obs_id,
+        sym_id.to_owned(),
+        Some("1.0".to_owned()),
+        "obs mentions backfill_close_fn".to_owned(),
+    );
+    // Task --OWNED_BY_TASK--> AC
+    let owned_edge = GraphRecord::edge(
+        EdgeLabel::OwnedByTask,
+        task_id.clone(),
+        ac_id.clone(),
+        None,
+        "task owns AC".to_owned(),
+    );
+    // AC --CLOSES_ACCEPTANCE_CRITERION--> Run
+    let closes_edge = GraphRecord::edge(
+        EdgeLabel::ClosesAcceptanceCriterion,
+        ac_id.clone(),
+        run_id.clone(),
+        None,
+        "AC closed by run".to_owned(),
+    );
+
+    let records = vec![
+        sym,
+        obs,
+        task,
+        ac,
+        run,
+        obs_sym_edge,
+        owned_edge,
+        closes_edge,
+    ];
+    let ctx = symbol_context(&records, "backfill_close_fn");
+
+    assert!(
+        ctx.project_state.iter().any(|r| r.id() == task_id.as_str()),
+        "task must be in project_state (backfill from obs evidence_link)"
+    );
+    assert!(
+        ctx.project_state.iter().any(|r| r.id() == ac_id.as_str()),
+        "AC must be in project_state (backfill edge pass 1 from task)"
+    );
+    assert!(
+        ctx.verification_evidence
+            .iter()
+            .any(|r| r.id() == run_id.as_str()),
+        "run must be in verification_evidence (backfill edge pass 2 from AC via CLOSES_ACCEPTANCE_CRITERION)"
+    );
+}
+
 // ── Finding: DEFINES edge with absent file source must not seed source_facts ───
 //
 // When a DEFINES edge references a file node that is absent from the current

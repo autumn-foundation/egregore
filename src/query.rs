@@ -270,7 +270,11 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     // Guard: only seed a file if its node is present AND not tombstoned.
     // Absent or tombstoned file sources from stale DEFINES edges would pollute
     // seed_ids and could pull in unrelated cross-domain context.
-    let mut files_added_via_defines = false;
+    // Track which symbol IDs were resolved via DEFINES (per-symbol, not a global flag).
+    // A global flag would suppress the path fallback for ALL matched symbols when even
+    // one has a DEFINES edge, silently omitting files for same-named symbols that lack
+    // a DEFINES edge in a partial slice.
+    let mut symbols_resolved_by_defines: BTreeSet<&str> = BTreeSet::new();
     for record in records {
         if let GraphRecord::Edge {
             label: EdgeLabel::Defines,
@@ -291,45 +295,49 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             })
         {
             source_facts.insert(source.as_str());
-            files_added_via_defines = true;
+            symbols_resolved_by_defines.insert(target.as_str());
         }
     }
 
-    // Path-based fallback: only used when no DEFINES edges link a file to this
-    // symbol. Path-matching may produce false positives in multi-repo stores
-    // (different repos sharing identical relative paths), so it is skipped
-    // whenever the topology edges already identified the correct file(s).
-    if !files_added_via_defines {
-        for record in records {
+    // Path-based fallback: only used per-symbol when no DEFINES edge resolved that
+    // symbol's file. Path-matching may produce false positives in multi-repo stores
+    // (different repos sharing identical relative paths), so it is skipped per-symbol
+    // whenever a DEFINES edge already identified the correct file.
+    // Tombstoned file nodes are excluded: a deleted file record must not seed
+    // source_facts or its tombstoned ID would pollute seed_ids and could draw in
+    // deleted file context via TOUCHED_FILE/TOUCHES_FILE edges.
+    for record in records {
+        let GraphRecord::Node {
+            id: sym_id,
+            kind: NodeKind::Symbol,
+            name,
+            repo_relative_path: Some(path),
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if name.as_deref() != Some(symbol_name) {
+            continue;
+        }
+        if !symbol_ids.contains(sym_id.as_str()) {
+            continue;
+        }
+        if symbols_resolved_by_defines.contains(sym_id.as_str()) {
+            continue;
+        }
+        for candidate in records {
             let GraphRecord::Node {
-                id: sym_id,
-                kind: NodeKind::Symbol,
-                name,
-                repo_relative_path: Some(path),
+                id: file_id,
+                kind: NodeKind::File,
+                repo_relative_path: Some(file_path),
                 ..
-            } = record
+            } = candidate
             else {
                 continue;
             };
-            if name.as_deref() != Some(symbol_name) {
-                continue;
-            }
-            if !symbol_ids.contains(sym_id.as_str()) {
-                continue;
-            }
-            for candidate in records {
-                let GraphRecord::Node {
-                    id: file_id,
-                    kind: NodeKind::File,
-                    repo_relative_path: Some(file_path),
-                    ..
-                } = candidate
-                else {
-                    continue;
-                };
-                if file_path == path {
-                    source_facts.insert(file_id.as_str());
-                }
+            if file_path == path && !tombstoned_ids.contains(file_id.as_str()) {
+                source_facts.insert(file_id.as_str());
             }
         }
     }
@@ -632,10 +640,9 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     // Frontier expansion for backfill discoveries: nodes newly classified by the
     // backfill (e.g. a Task found via an Observation's evidence_links) were never
     // in the BFS frontier, so their outgoing cross-domain edges were never scanned.
-    // Run one extra edge pass treating the backfill delta as a frontier so that,
-    // for example, OwnedByTask edges from a backfill-discovered Task can pull in
-    // AcceptanceCriteria that should appear in project_state.
-    let backfill_frontier: BTreeSet<&str> = source_facts
+    // Loop until convergence so that multi-hop chains discovered through backfill
+    // are fully traversed — e.g. backfill → Task → AC → CommandRun all appear.
+    let mut extra_frontier: BTreeSet<&str> = source_facts
         .iter()
         .chain(observations.iter())
         .chain(project_state.iter())
@@ -645,7 +652,8 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
         .filter(|id| !visited.contains(*id))
         .collect();
 
-    if !backfill_frontier.is_empty() {
+    while !extra_frontier.is_empty() {
+        let mut next_extra: Vec<&'a str> = Vec::new();
         for record in records {
             if let GraphRecord::Edge {
                 label,
@@ -657,10 +665,9 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                 if !is_cross_domain_label(*label) {
                     continue;
                 }
-                let candidate = if backfill_frontier.contains(source.as_str()) {
+                let candidate = if extra_frontier.contains(source.as_str()) {
                     Some(target.as_str())
-                } else if backfill_frontier.contains(target.as_str())
-                    && !is_forward_only_label(*label)
+                } else if extra_frontier.contains(target.as_str()) && !is_forward_only_label(*label)
                 {
                     Some(source.as_str())
                 } else {
@@ -669,7 +676,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                 if let Some(id) = candidate
                     && visited.insert(id)
                 {
-                    classify_and_insert(
+                    let was_classified = classify_and_insert(
                         id,
                         &mut source_facts,
                         &mut observations,
@@ -677,9 +684,13 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                         &mut artifacts,
                         &mut verification_evidence,
                     );
+                    if was_classified {
+                        next_extra.push(id);
+                    }
                 }
             }
         }
+        extra_frontier = next_extra.into_iter().collect();
     }
 
     // Remove symbol records from non-source-fact sections to avoid overlap
