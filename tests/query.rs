@@ -737,6 +737,89 @@ fn symbol_context_observation_node_kind_is_never_in_source_facts() {
     }
 }
 
+// ── 2-hop BFS: AcceptanceCriterion discovered via Task → AC edge ─────────────
+
+#[test]
+fn symbol_context_two_hop_bfs_discovers_acceptance_criteria_via_task() {
+    // Hop 0 (seed): Symbol S
+    // Hop 1: Task T  — evidence_link MENTIONS_SYMBOL → S
+    // Hop 2: AC      — OWNED_BY_TASK edge: T → AC
+    //
+    // Without 2-hop BFS the AC would be invisible because it has no direct link to S.
+    let sym_id = "codegraph:v4:bfs_two_hop_sym01";
+    let sym = ctx_symbol(sym_id, "bfs_two_hop_fn", "src/bfs.rs", 1);
+
+    // Build a Task with evidence_link pointing at the symbol (discovered in hop 1).
+    let task_id = aletheia_egregore::ir::project_stable_id(&["task", "bfs_two_hop_task"]);
+    let mut task = GraphRecord::node(
+        task_id.clone(),
+        NodeKind::Task,
+        None,
+        None,
+        Some("Two-hop BFS task".to_owned()),
+        "Task: Two-hop BFS task".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ref mut title,
+        ..
+    } = task
+    {
+        *title = Some("Two-hop BFS task".to_owned());
+        *schema_version = aletheia_egregore::ir::PROJECT_SCHEMA_VERSION;
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(sym_id.to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    // Build an AcceptanceCriterion with no direct link to the symbol.
+    let ac_id = aletheia_egregore::ir::project_stable_id(&["ac", "bfs_two_hop_ac"]);
+    let ac = GraphRecord::node(
+        ac_id.clone(),
+        NodeKind::AcceptanceCriterion,
+        None,
+        None,
+        Some("AC: bfs_two_hop_fn must be documented".to_owned()),
+        "AC: bfs_two_hop_fn must be documented".to_owned(),
+    );
+
+    // OWNED_BY_TASK edge: Task → AcceptanceCriterion (discovered in hop 2).
+    let edge = GraphRecord::edge(
+        EdgeLabel::OwnedByTask,
+        task_id.clone(),
+        ac_id.clone(),
+        None,
+        "task owns AC".to_owned(),
+    );
+
+    let records = vec![sym, task, ac, edge];
+    let ctx = symbol_context(&records, "bfs_two_hop_fn");
+
+    // The symbol must be in source_facts.
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == sym_id),
+        "symbol must be in source_facts"
+    );
+    // The task must be in project_state (hop 1).
+    assert!(
+        ctx.project_state.iter().any(|r| r.id() == task_id),
+        "task must be in project_state (hop 1)"
+    );
+    // The AC must be in project_state (hop 2).
+    assert!(
+        ctx.project_state.iter().any(|r| r.id() == ac_id),
+        "acceptance criterion must be in project_state via 2-hop BFS (hop 2)"
+    );
+}
+
 // ── Edges-based linking (MENTIONS_SYMBOL/OBSERVES edge, not just evidence_links) ─
 
 #[test]

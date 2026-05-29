@@ -333,97 +333,116 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             }
         };
 
-    for record in records {
-        match record {
-            GraphRecord::Edge {
-                label,
-                source,
-                target,
-                ..
-            } => {
-                if !is_cross_domain_label(*label) {
-                    // Code-graph topology edges (CONTAINS, DEFINES, …) don't
-                    // cross trust boundaries, so skip them.
-                } else if seed_ids.contains(source.as_str()) {
-                    // Edge outgoing from a seed (symbol or co-located file) → classify target.
-                    classify_and_insert(
-                        target.as_str(),
-                        &mut source_facts,
-                        &mut observations,
-                        &mut project_state,
-                        &mut artifacts,
-                        &mut verification_evidence,
-                    );
-                } else if seed_ids.contains(target.as_str()) {
-                    // Edge incoming to a seed → classify the source.
-                    classify_and_insert(
-                        source.as_str(),
-                        &mut source_facts,
-                        &mut observations,
-                        &mut project_state,
-                        &mut artifacts,
-                        &mut verification_evidence,
-                    );
+    // Step 3: bounded BFS traversal — 2 hops beyond seeds.
+    //
+    // Hop 1 discovers nodes directly linked to the symbol/file seeds.
+    // Hop 2 discovers nodes linked to hop-1 results, e.g. AcceptanceCriterion
+    // nodes owned by a Task that was found in hop 1 via OWNED_BY_TASK edges.
+    //
+    // `visited` prevents re-classifying the same node in a later hop.
+    // `frontier` is the set of IDs whose outgoing/incoming edges are scanned
+    // in the current hop.
+    let mut visited: BTreeSet<&str> = seed_ids.clone();
+    let mut frontier: BTreeSet<&str> = seed_ids.clone();
+
+    for _hop in 0..2_usize {
+        let mut next_frontier: Vec<&'a str> = Vec::new();
+
+        for record in records {
+            match record {
+                GraphRecord::Edge {
+                    label,
+                    source,
+                    target,
+                    ..
+                } => {
+                    if !is_cross_domain_label(*label) {
+                        continue;
+                    }
+                    let candidate = if frontier.contains(source.as_str()) {
+                        Some(target.as_str())
+                    } else if frontier.contains(target.as_str()) {
+                        Some(source.as_str())
+                    } else {
+                        None
+                    };
+                    if let Some(id) = candidate
+                        && visited.insert(id)
+                    {
+                        classify_and_insert(
+                            id,
+                            &mut source_facts,
+                            &mut observations,
+                            &mut project_state,
+                            &mut artifacts,
+                            &mut verification_evidence,
+                        );
+                        next_frontier.push(id);
+                    }
                 }
-            }
-            GraphRecord::Node {
-                id: node_id,
-                evidence_links: Some(links),
-                ..
-            } => {
-                // Check whether any evidence link targets a seed ID (symbol or
-                // co-located file). This handles file-scoped evidence such as
-                // CommandRun --TOUCHED_FILE--> File(src/lib.rs).
-                let links_to_symbol = links.iter().any(|link| {
-                    link.target_record_id
-                        .as_deref()
-                        .is_some_and(|tid| seed_ids.contains(tid))
-                });
+                GraphRecord::Node {
+                    id: node_id,
+                    evidence_links: Some(links),
+                    ..
+                } => {
+                    if visited.contains(node_id.as_str()) {
+                        continue;
+                    }
+                    // Classify if any evidence link targets the current frontier.
+                    let links_to_frontier = links.iter().any(|link| {
+                        link.target_record_id
+                            .as_deref()
+                            .is_some_and(|tid| frontier.contains(tid))
+                    });
+                    if links_to_frontier {
+                        classify_and_insert(
+                            node_id.as_str(),
+                            &mut source_facts,
+                            &mut observations,
+                            &mut project_state,
+                            &mut artifacts,
+                            &mut verification_evidence,
+                        );
+                        next_frontier.push(node_id.as_str());
+                        visited.insert(node_id.as_str());
 
-                if links_to_symbol {
-                    classify_and_insert(
-                        node_id.as_str(),
-                        &mut source_facts,
-                        &mut observations,
-                        &mut project_state,
-                        &mut artifacts,
-                        &mut verification_evidence,
-                    );
-
-                    // Step 4: scan evidence links on nodes that ARE linked to the
-                    // symbol. Present non-symbol targets are backing evidence and get
-                    // classified into their own section. Missing targets go to
-                    // unresolved (AC5).
-                    for link in links {
-                        if let Some(target_id) = &link.target_record_id {
-                            if present_ids.contains(target_id.as_str())
-                                && !symbol_ids.contains(target_id.as_str())
-                            {
-                                // Backing record exists: classify it (e.g. a
-                                // Verification that validates an Observation that
-                                // mentions the symbol).
-                                classify_and_insert(
-                                    target_id.as_str(),
-                                    &mut source_facts,
-                                    &mut observations,
-                                    &mut project_state,
-                                    &mut artifacts,
-                                    &mut verification_evidence,
-                                );
-                            } else if !present_ids.contains(target_id.as_str()) {
-                                unresolved.push(UnresolvedRef {
-                                    source_record_id: node_id.clone(),
-                                    target_handle: target_id.clone(),
-                                    relation: link.relation.clone(),
-                                    target_domain: link.target_domain.clone(),
-                                });
+                        // Scan backing evidence_links: present unvisited targets are
+                        // backing evidence; missing targets go to unresolved (AC5).
+                        for link in links {
+                            if let Some(target_id) = &link.target_record_id {
+                                if present_ids.contains(target_id.as_str())
+                                    && !visited.contains(target_id.as_str())
+                                {
+                                    classify_and_insert(
+                                        target_id.as_str(),
+                                        &mut source_facts,
+                                        &mut observations,
+                                        &mut project_state,
+                                        &mut artifacts,
+                                        &mut verification_evidence,
+                                    );
+                                    next_frontier.push(target_id.as_str());
+                                    visited.insert(target_id.as_str());
+                                } else if !present_ids.contains(target_id.as_str()) {
+                                    unresolved.push(UnresolvedRef {
+                                        source_record_id: node_id.clone(),
+                                        target_handle: target_id.clone(),
+                                        relation: link.relation.clone(),
+                                        target_domain: link.target_domain.clone(),
+                                    });
+                                }
                             }
                         }
                     }
                 }
+                GraphRecord::Node { .. } | GraphRecord::Tombstone { .. } => {}
             }
-            GraphRecord::Node { .. } | GraphRecord::Tombstone { .. } => {}
         }
+
+        if next_frontier.is_empty() {
+            break; // convergence: no new nodes in this hop
+        }
+        frontier = next_frontier.into_iter().collect();
     }
 
     // Post-processing: scan evidence_links of nodes classified via the edge arm.
@@ -550,6 +569,7 @@ const fn is_cross_domain_label(label: EdgeLabel) -> bool {
             | EdgeLabel::RelatesTo
             | EdgeLabel::Contradicts
             | EdgeLabel::Supersedes
+            | EdgeLabel::OwnedByTask
     )
 }
 
