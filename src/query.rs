@@ -139,8 +139,10 @@ const fn classify_node(kind: NodeKind) -> Option<ContextSection> {
         NodeKind::Symbol | NodeKind::File | NodeKind::Module | NodeKind::Import => {
             Some(ContextSection::SourceFact)
         }
-        // agent-authored observations
-        NodeKind::Observation | NodeKind::Decision => Some(ContextSection::Observation),
+        // agent-authored observations and failure records
+        NodeKind::Observation | NodeKind::Decision | NodeKind::Failure => {
+            Some(ContextSection::Observation)
+        }
         // project / task domain
         NodeKind::Task
         | NodeKind::AcceptanceCriterion
@@ -155,7 +157,11 @@ const fn classify_node(kind: NodeKind) -> Option<ContextSection> {
         NodeKind::Verification
         | NodeKind::CommandEvidence
         | NodeKind::TestRun
-        | NodeKind::CommandRun => Some(ContextSection::VerificationEvidence),
+        | NodeKind::CommandRun
+        | NodeKind::CIStatus
+        | NodeKind::BenchmarkRun
+        | NodeKind::CoverageReport
+        | NodeKind::ProofResult => Some(ContextSection::VerificationEvidence),
         // everything else (infrastructure, semantic, user-context, etc.) is excluded
         _ => None,
     }
@@ -404,6 +410,61 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                 }
             }
             GraphRecord::Node { .. } | GraphRecord::Tombstone { .. } => {}
+        }
+    }
+
+    // Post-processing: scan evidence_links of nodes classified via the edge arm.
+    // Those nodes are in the response but their evidence_links were never scanned
+    // (the evidence_links arm only runs when a node's OWN links target the symbol).
+    // This covers cases like Obs --edge--> Symbol where Obs also has a VALIDATED_BY
+    // link to a Verification that needs to appear in verification_evidence.
+    //
+    // Collect IDs as owned Strings to release borrows on the BTreeSets before
+    // calling classify_and_insert with mutable references to them.
+    let classified_for_backfill: Vec<String> = source_facts
+        .iter()
+        .chain(observations.iter())
+        .chain(project_state.iter())
+        .chain(artifacts.iter())
+        .chain(verification_evidence.iter())
+        .filter(|id| !symbol_ids.contains(**id))
+        .map(|id| (*id).to_owned())
+        .collect();
+
+    for node_id in &classified_for_backfill {
+        // .copied() converts Option<&&'a GraphRecord> → Option<&'a GraphRecord>
+        // so that sub-borrows (nid, links) carry lifetime 'a and satisfy
+        // the classify_and_insert closure's &'a str constraint.
+        let Some(GraphRecord::Node {
+            id: nid,
+            evidence_links: Some(links),
+            ..
+        }) = by_id.get(node_id.as_str()).copied()
+        else {
+            continue;
+        };
+        for link in links {
+            if let Some(target_id) = &link.target_record_id {
+                if present_ids.contains(target_id.as_str())
+                    && !symbol_ids.contains(target_id.as_str())
+                {
+                    classify_and_insert(
+                        target_id.as_str(),
+                        &mut source_facts,
+                        &mut observations,
+                        &mut project_state,
+                        &mut artifacts,
+                        &mut verification_evidence,
+                    );
+                } else if !present_ids.contains(target_id.as_str()) {
+                    unresolved.push(UnresolvedRef {
+                        source_record_id: nid.clone(),
+                        target_handle: target_id.clone(),
+                        relation: link.relation.clone(),
+                        target_domain: link.target_domain.clone(),
+                    });
+                }
+            }
         }
     }
 

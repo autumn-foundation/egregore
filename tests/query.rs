@@ -413,6 +413,94 @@ fn symbol_context_no_match_returns_empty_context_with_is_no_match() {
     assert!(ctx.unresolved.is_empty());
 }
 
+// ── edge-linked node evidence scan ───────────────────────────────────────────
+
+#[test]
+fn symbol_context_edge_linked_node_backing_evidence_is_classified() {
+    // Obs --edge(MENTIONS_SYMBOL)--> Symbol
+    // Obs --evidence_link(VALIDATED_BY)--> Ver
+    // Symbol has no direct link to Ver.
+    // Ver must still appear in verification_evidence via the post-processing pass.
+    let sym_id = "codegraph:v4:edge_ev_sym001";
+    let sym = GraphRecord::node(
+        sym_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("edge_backed_fn".to_owned()),
+        "fn edge_backed_fn".to_owned(),
+    );
+
+    let ver_id = verification_stable_id(&["ver", "edge_backed_ver1"]);
+    let ver = GraphRecord::node(
+        ver_id.clone(),
+        NodeKind::Verification,
+        None,
+        None,
+        None,
+        "Verification backing edge_backed_fn obs".to_owned(),
+    );
+
+    let obs_id = agent_memory_stable_id(&["obs", "edge_backed_obs1"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation about edge_backed_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(ver_id.clone()),
+            target_domain: "verification".to_owned(),
+            relation: "VALIDATED_BY".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    // The link from Obs to Symbol is an EDGE record, not an evidence_link.
+    let edge = GraphRecord::Edge {
+        id: "edge:mentions_symbol:edge_backed".to_owned(),
+        label: EdgeLabel::MentionsSymbol,
+        source: obs_id,
+        target: sym_id.to_owned(),
+        schema_version: 0,
+        confidence: None,
+        temporal: None,
+        summary: "obs mentions edge_backed_fn".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![sym, ver, obs, edge];
+    let ctx = symbol_context(&records, "edge_backed_fn");
+
+    assert!(
+        !ctx.observations.is_empty(),
+        "observation must be in observations (connected via edge)"
+    );
+    assert!(
+        !ctx.verification_evidence.is_empty(),
+        "backing verification must appear via post-processing of edge-classified obs"
+    );
+    let ver_in_evidence = ctx
+        .verification_evidence
+        .iter()
+        .any(|r| r.id() == ver_id.as_str());
+    assert!(ver_in_evidence, "the specific verification record must be in verification_evidence");
+    assert!(ctx.unresolved.is_empty(), "no unresolved — all targets are present");
+}
+
 // ── tombstone: deleted symbols yield no-match, not stale context ─────────────
 
 #[test]
