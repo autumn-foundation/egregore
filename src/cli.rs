@@ -733,12 +733,25 @@ struct ContextUnresolved<'a> {
     verification_status: &'static str,
 }
 
+/// One codegraph topology edge in the context response.
+#[derive(Serialize)]
+struct ContextTopologyEdge<'a> {
+    record_id: &'a str,
+    label: &'static str,
+    source_id: &'a str,
+    target_id: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    summary: &'a str,
+}
+
 /// Full context query response envelope.
 #[derive(Serialize)]
 struct ContextResponse<'a> {
     ok: bool,
     symbol_name: &'a str,
     source_facts: Vec<ContextSourceFact<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    topology_edges: Vec<ContextTopologyEdge<'a>>,
     observations: Vec<ContextObservation<'a>>,
     project_state: Vec<ContextLinkedItem<'a>>,
     artifacts: Vec<ContextLinkedItem<'a>>,
@@ -1514,10 +1527,37 @@ fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
         })
         .collect();
 
+    let topology_edges: Vec<ContextTopologyEdge<'_>> = ctx
+        .topology_edges
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Edge {
+                id,
+                label,
+                source,
+                target,
+                summary,
+                ..
+            } = r
+            {
+                Some(ContextTopologyEdge {
+                    record_id: id,
+                    label: label.as_str(),
+                    source_id: source,
+                    target_id: target,
+                    summary,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
     let response = ContextResponse {
         ok: true,
         symbol_name,
         source_facts,
+        topology_edges,
         observations,
         project_state,
         artifacts,

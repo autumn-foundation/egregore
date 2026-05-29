@@ -91,11 +91,15 @@ pub struct UnresolvedRef {
 pub struct SymbolContext<'a> {
     /// The queried symbol name.
     pub symbol_name: String,
-    /// Code-graph records: `Symbol`, `File`, and topology edges linking them.
+    /// Code-graph records: `Symbol` and `File` nodes that are the source of truth.
     ///
     /// Every record has a stable record ID and at least one of:
     /// `repo_relative_path`, `temporal.git_commit`, or `valid_time`.
     pub source_facts: Vec<&'a GraphRecord>,
+    /// Codegraph topology edges (DEFINES, CALLS, IMPORTS, etc.) whose source
+    /// and target are both in `source_facts`. Allows consumers to cite the
+    /// file→symbol definition relationship without re-reading the raw graph.
+    pub topology_edges: Vec<&'a GraphRecord>,
     /// Agent-authored `Observation` nodes that mention or observe the symbol.
     ///
     /// Every record carries `agent_id`, `observed_at`, and `confidence`.
@@ -297,6 +301,26 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     // file-scoped relations such as CommandRun --TOUCHED_FILE--> File.
     let seed_ids: BTreeSet<&str> = source_facts.iter().copied().collect();
 
+    // Step 2b: collect topology edges where BOTH endpoints are in seed_ids.
+    // These provide citable provenance for the file→symbol definition
+    // relationship (and other structural topology) without BFS traversal.
+    let mut topology_edge_ids: BTreeSet<&str> = BTreeSet::new();
+    for record in records {
+        if let GraphRecord::Edge {
+            id,
+            label,
+            source,
+            target,
+            ..
+        } = record
+            && label.is_codegraph_topology_label()
+            && seed_ids.contains(source.as_str())
+            && seed_ids.contains(target.as_str())
+        {
+            topology_edge_ids.insert(id.as_str());
+        }
+    }
+
     // Step 3a + 3b: classify linked records.
     let mut observations: BTreeSet<&str> = BTreeSet::new();
     let mut project_state: BTreeSet<&str> = BTreeSet::new();
@@ -400,7 +424,12 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                             &mut artifacts,
                             &mut verification_evidence,
                         );
-                        next_frontier.push(id);
+                        // Tombstoned nodes must not expand the frontier — their
+                        // backing evidence would be reachable only through a
+                        // deleted record and must not appear in context.
+                        if !tombstoned_ids.contains(id) {
+                            next_frontier.push(id);
+                        }
                     }
                 }
                 GraphRecord::Node {
@@ -426,8 +455,11 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                             &mut artifacts,
                             &mut verification_evidence,
                         );
-                        next_frontier.push(node_id.as_str());
                         visited.insert(node_id.as_str());
+                        // Tombstoned nodes must not expand the frontier.
+                        if !tombstoned_ids.contains(node_id.as_str()) {
+                            next_frontier.push(node_id.as_str());
+                        }
 
                         // Scan backing evidence_links: present unvisited targets are
                         // backing evidence; missing targets go to unresolved (AC5).
@@ -444,8 +476,11 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                                         &mut artifacts,
                                         &mut verification_evidence,
                                     );
-                                    next_frontier.push(target_id.as_str());
                                     visited.insert(target_id.as_str());
+                                    // Don't expand tombstoned evidence targets.
+                                    if !tombstoned_ids.contains(target_id.as_str()) {
+                                        next_frontier.push(target_id.as_str());
+                                    }
                                 } else if !present_ids.contains(target_id.as_str()) {
                                     unresolved.push(UnresolvedRef {
                                         source_record_id: node_id.clone(),
@@ -543,6 +578,14 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     SymbolContext {
         symbol_name: symbol_name.to_owned(),
         source_facts: resolve(&source_facts),
+        topology_edges: {
+            let mut out: Vec<&'a GraphRecord> = topology_edge_ids
+                .iter()
+                .filter_map(|id| by_id.get(id).copied())
+                .collect();
+            out.sort_by_key(|r| r.id());
+            out
+        },
         observations: resolve(&observations),
         project_state: resolve(&project_state),
         artifacts: resolve(&artifacts),
@@ -615,7 +658,6 @@ const fn is_forward_only_label(label: EdgeLabel) -> bool {
             | EdgeLabel::ProducedPatch
             | EdgeLabel::ExplainsChange
             | EdgeLabel::ReferencesTask
-            | EdgeLabel::FailedOn
     )
 }
 

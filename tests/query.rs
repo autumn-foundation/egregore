@@ -1226,3 +1226,190 @@ fn symbol_context_shared_validation_run_does_not_pull_sibling_observations() {
         "sibling_obs must NOT appear — it only shares the run, not the symbol link"
     );
 }
+
+// ── Finding: FAILED_ON traversal must work from Symbol seed ──────────────────
+
+#[test]
+fn symbol_context_failed_on_edge_traverses_from_symbol_seed() {
+    // Failure --FAILED_ON--> Symbol is the documented edge direction.
+    // The symbol is the target; querying it must discover the Failure node
+    // via backward traversal (frontier contains target → classify source).
+    let sym_id = "codegraph:v4:failed_on_sym001";
+    let sym = ctx_symbol(sym_id, "failing_fn", "src/lib.rs", 1);
+
+    let fail_id = agent_memory_stable_id(&["fail", "failed_on_fail1"]);
+    let mut fail = GraphRecord::node(
+        fail_id.clone(),
+        NodeKind::Failure,
+        None,
+        None,
+        None,
+        "failure on failing_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ..
+    } = fail
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+    }
+
+    // Failure --FAILED_ON--> Symbol (failure is the SOURCE, symbol is the TARGET)
+    let edge = GraphRecord::edge(
+        EdgeLabel::FailedOn,
+        fail_id.clone(),
+        sym_id.to_owned(),
+        None,
+        "failure failed_on sym".to_owned(),
+    );
+
+    let records = vec![sym, fail, edge];
+    let ctx = symbol_context(&records, "failing_fn");
+
+    assert!(
+        ctx.observations.iter().any(|r| r.id() == fail_id.as_str()),
+        "Failure node must be discovered via backward FAILED_ON traversal from symbol seed"
+    );
+}
+
+// ── Finding: tombstoned nodes must not expand the BFS frontier ────────────────
+
+#[test]
+fn symbol_context_tombstoned_context_node_does_not_expand_frontier() {
+    // Observation O is tombstoned. It has a VALIDATED_BY edge to Verification V.
+    // O is linked to Symbol S via edge.
+    // V must NOT appear in context because O is tombstoned and must not expand
+    // the frontier to expose its backing verification.
+    let sym_id = "codegraph:v4:tomb_expand_sym001";
+    let sym = ctx_symbol(sym_id, "tomb_expand_fn", "src/lib.rs", 1);
+
+    let obs_id = agent_memory_stable_id(&["obs", "tomb_expand_obs"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "tombstoned observation".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+    }
+
+    let ver_id = verification_stable_id(&["ver", "tomb_expand_ver"]);
+    let ver = GraphRecord::node(
+        ver_id.clone(),
+        NodeKind::Verification,
+        None,
+        None,
+        None,
+        "verification behind tombstoned obs".to_owned(),
+    );
+
+    // O --MENTIONS_SYMBOL--> S (edge connecting obs to symbol)
+    let obs_sym_edge = GraphRecord::agent_memory_edge(
+        EdgeLabel::MentionsSymbol,
+        obs_id.clone(),
+        sym_id.to_owned(),
+        None,
+        "obs mentions sym".to_owned(),
+    );
+    // O --VALIDATED_BY--> V (edge: obs is backed by verification)
+    let obs_ver_edge = GraphRecord::edge(
+        EdgeLabel::ValidatedBy,
+        obs_id.clone(),
+        ver_id.clone(),
+        None,
+        "obs validated by ver".to_owned(),
+    );
+    // Tombstone for O
+    let obs_tombstone = GraphRecord::Tombstone {
+        id: "tombstone:tomb_expand_obs".to_owned(),
+        schema_version: 0,
+        deleted_id: obs_id.clone(),
+        summary: "obs removed".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![sym, obs, ver, obs_sym_edge, obs_ver_edge, obs_tombstone];
+    let ctx = symbol_context(&records, "tomb_expand_fn");
+
+    assert!(
+        !ctx.is_no_match(),
+        "symbol is present; must not be no_match"
+    );
+    assert!(
+        ctx.observations.iter().all(|r| r.id() != obs_id.as_str()),
+        "tombstoned observation must not appear in context"
+    );
+    assert!(
+        ctx.verification_evidence.iter().all(|r| r.id() != ver_id.as_str()),
+        "verification reachable only through tombstoned obs must not appear in context"
+    );
+}
+
+// ── Finding: topology edges between seed nodes appear in topology_edges ───────
+
+#[test]
+fn symbol_context_topology_edges_include_defines_edge() {
+    // A DEFINES edge from a co-located File to the Symbol must appear in
+    // topology_edges so consumers can cite the file→symbol relationship.
+    let sym_id = "codegraph:v4:topo_sym001";
+    let sym = ctx_symbol(sym_id, "topo_fn", "src/topo.rs", 1);
+
+    let file_id = aletheia_egregore::ir::stable_id(&["file", "src/topo.rs"]);
+    let file = GraphRecord::node(
+        file_id.clone(),
+        NodeKind::File,
+        Some("src/topo.rs".to_owned()),
+        None,
+        None,
+        "src/topo.rs".to_owned(),
+    );
+
+    // DEFINES edge: File → Symbol
+    let defines_edge = GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id,
+        sym_id.to_owned(),
+        None,
+        "file defines symbol".to_owned(),
+    );
+    let defines_edge_id = defines_edge.id().to_owned();
+
+    let records = vec![sym, file, defines_edge];
+    let ctx = symbol_context(&records, "topo_fn");
+
+    assert!(
+        !ctx.source_facts.is_empty(),
+        "symbol and file must be in source_facts"
+    );
+    assert!(
+        !ctx.topology_edges.is_empty(),
+        "DEFINES edge must appear in topology_edges"
+    );
+    assert!(
+        ctx.topology_edges.iter().any(|r| r.id() == defines_edge_id.as_str()),
+        "the specific DEFINES edge must be in topology_edges"
+    );
+}
