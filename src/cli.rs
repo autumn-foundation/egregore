@@ -780,6 +780,12 @@ struct ContextTopologyEdge<'a> {
     target_id: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     summary: &'a str,
+    /// Git commit SHA for scan-history edges (None for current-tree edges).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_commit: Option<&'a str>,
+    /// Bitemporal `valid_time` for scan-history edges.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid_time: Option<&'a str>,
 }
 
 /// Full context query response envelope.
@@ -1575,6 +1581,7 @@ fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
                 source,
                 target,
                 summary,
+                temporal,
                 ..
             } = r
             {
@@ -1584,6 +1591,8 @@ fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
                     source_id: source,
                     target_id: target,
                     summary,
+                    git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+                    valid_time: temporal.as_ref().map(|t| t.valid_time.as_str()),
                 })
             } else {
                 None

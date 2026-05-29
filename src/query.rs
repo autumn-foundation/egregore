@@ -277,12 +277,17 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     let mut symbols_resolved_by_defines: BTreeSet<&str> = BTreeSet::new();
     for record in records {
         if let GraphRecord::Edge {
+            id: edge_id,
             label: EdgeLabel::Defines,
             source,
             target,
             ..
         } = record
             && symbol_ids.contains(target.as_str())
+            // Guard: skip tombstoned DEFINES edges (incremental invalidation emits a
+            // tombstone for stale edge IDs). Without this, a moved symbol keeps its
+            // old file in seed_ids, leaking stale file-scoped context.
+            && !tombstoned_ids.contains(edge_id.as_str())
             && !tombstoned_ids.contains(source.as_str())
             && by_id.get(source.as_str()).is_some_and(|r| {
                 matches!(
@@ -360,6 +365,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             ..
         } = record
             && label.is_codegraph_topology_label()
+            && !tombstoned_ids.contains(id.as_str())
             && seed_ids.contains(source.as_str())
             && seed_ids.contains(target.as_str())
         {
@@ -478,11 +484,11 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                             &mut artifacts,
                             &mut verification_evidence,
                         );
-                        // Only expand nodes that were actually classified: tombstoned,
-                        // missing (by_id miss), and skipped codegraph (non-seed) nodes
-                        // must not enter the frontier or their neighbors will be
-                        // traversed and pulled into unrelated context.
-                        if was_classified {
+                        // Expand nodes that were classified OR that are valid relay
+                        // kinds (e.g. ToolCall) which bridge classifiable sections but
+                        // have no output section of their own. Tombstoned and missing
+                        // (by_id miss) nodes still must not enter the frontier.
+                        if was_classified || is_bfs_relay_node(id, &by_id, &tombstoned_ids) {
                             next_frontier.push(id);
                         }
                     }
@@ -684,7 +690,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                         &mut artifacts,
                         &mut verification_evidence,
                     );
-                    if was_classified {
+                    if was_classified || is_bfs_relay_node(id, &by_id, &tombstoned_ids) {
                         next_extra.push(id);
                     }
                 }
@@ -826,6 +832,35 @@ const fn is_forward_only_label(label: EdgeLabel) -> bool {
             | EdgeLabel::ProducedPatch
             | EdgeLabel::ReferencesTask
             | EdgeLabel::ClosesAcceptanceCriterion
+    )
+}
+
+/// Returns `true` when `record_id` identifies a node that should expand the BFS
+/// frontier even though it has no output context section.
+///
+/// "Relay" nodes are infrastructure connectors that bridge classifiable sections:
+/// - [`NodeKind::ToolCall`]: `TOUCHED_FILE → File` backward traversal discovers the
+///   `ToolCall`; its `PRODUCED_EVIDENCE` forward edges then reach `CommandRun`/`TestRun`.
+///
+/// Relay expansion is only allowed for nodes that are present in `by_id` and
+/// not tombstoned — the same guards applied before `classify_and_insert`.
+fn is_bfs_relay_node(
+    record_id: &str,
+    by_id: &std::collections::BTreeMap<&str, &GraphRecord>,
+    tombstoned_ids: &BTreeSet<&str>,
+) -> bool {
+    if tombstoned_ids.contains(record_id) {
+        return false;
+    }
+    let Some(rec) = by_id.get(record_id) else {
+        return false;
+    };
+    matches!(
+        rec,
+        GraphRecord::Node {
+            kind: NodeKind::ToolCall,
+            ..
+        }
     )
 }
 

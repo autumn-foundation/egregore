@@ -2559,3 +2559,188 @@ fn symbol_context_defines_edge_absent_file_source_not_in_source_facts() {
         ctx.source_facts.iter().map(|r| r.id()).collect::<Vec<_>>()
     );
 }
+
+// ── Finding: tombstoned DEFINES edge must not seed the file source ─────────────
+//
+// An incremental scan that tombstones a stale DEFINES edge (e.g. after a symbol
+// move) may still have the old File node present. The current code checks the
+// FILE's tombstone but not the EDGE's own tombstone, so the old file is wrongly
+// seeded. Check the edge record's own ID against tombstoned_ids.
+
+#[test]
+fn symbol_context_tombstoned_defines_edge_does_not_seed_stale_file() {
+    // Symbol S at "src/new.rs"
+    // old_file at "src/old.rs" — DEFINES edge to S is tombstoned (symbol moved)
+    // new_file at "src/new.rs" — live DEFINES edge to S
+    // Expected: only new_file in source_facts (old DEFINES edge tombstoned)
+    let sym_id = "codegraph:v4:tomb_defines_sym001";
+    let sym = ctx_symbol(sym_id, "tomb_defines_fn", "src/new.rs", 1);
+
+    let old_file_id = aletheia_egregore::ir::stable_id(&["file", "tomb_defines_old"]);
+    let old_file = GraphRecord::node(
+        old_file_id.clone(),
+        NodeKind::File,
+        Some("src/old.rs".to_owned()),
+        None,
+        None,
+        "src/old.rs".to_owned(),
+    );
+
+    let new_file_id = aletheia_egregore::ir::stable_id(&["file", "tomb_defines_new"]);
+    let new_file = GraphRecord::node(
+        new_file_id.clone(),
+        NodeKind::File,
+        Some("src/new.rs".to_owned()),
+        None,
+        None,
+        "src/new.rs".to_owned(),
+    );
+
+    // Old DEFINES edge: old_file → S — this edge is tombstoned
+    let old_edge_id = aletheia_egregore::ir::stable_id(&["edge", "DEFINES", &old_file_id, sym_id]);
+    let old_defines = GraphRecord::edge(
+        EdgeLabel::Defines,
+        old_file_id.clone(),
+        sym_id.to_owned(),
+        None,
+        "old file defines symbol (stale)".to_owned(),
+    );
+    // Tombstone for the old DEFINES edge
+    let edge_tombstone = GraphRecord::Tombstone {
+        id: "tombstone:tomb_defines_edge".to_owned(),
+        schema_version: 0,
+        deleted_id: old_edge_id,
+        summary: "DEFINES edge removed after symbol moved to src/new.rs".to_owned(),
+        producer: None,
+    };
+
+    // Live DEFINES edge: new_file → S
+    let new_defines = GraphRecord::edge(
+        EdgeLabel::Defines,
+        new_file_id.clone(),
+        sym_id.to_owned(),
+        None,
+        "new file defines symbol".to_owned(),
+    );
+
+    let records = vec![
+        sym,
+        old_file,
+        new_file,
+        old_defines,
+        edge_tombstone,
+        new_defines,
+    ];
+    let ctx = symbol_context(&records, "tomb_defines_fn");
+
+    assert!(!ctx.is_no_match(), "symbol must be found");
+    assert!(
+        ctx.source_facts
+            .iter()
+            .any(|r| r.id() == new_file_id.as_str()),
+        "new_file must be in source_facts via live DEFINES edge"
+    );
+    assert!(
+        ctx.source_facts
+            .iter()
+            .all(|r| r.id() != old_file_id.as_str()),
+        "old_file must NOT be in source_facts — its DEFINES edge was tombstoned"
+    );
+}
+
+// ── Finding: ToolCall relay must expand BFS frontier despite no context section ─
+//
+// ToolCall is not classified into any context section (it is infrastructure), but
+// it bridges TOUCHED_FILE → file seeds to PRODUCED_EVIDENCE → verification nodes.
+// When ToolCall is reached via backward TOUCHED_FILE traversal from a File seed,
+// `was_classified` is false and the current code stops traversal before the
+// PRODUCED_EVIDENCE edge, silently omitting the CommandRun/TestRun from
+// verification_evidence. Allow relay node kinds to continue the BFS frontier.
+
+#[test]
+fn symbol_context_tool_call_relay_discovers_produced_evidence() {
+    // Symbol S, File F (DEFINES edge F → S so F is a seed)
+    // ToolCall TC: TOUCHED_FILE edge → F (backward from F discovers TC)
+    // ToolCall TC: PRODUCED_EVIDENCE edge → CommandRun CR
+    // Expected: CR appears in verification_evidence
+    let sym_id = "codegraph:v4:toolcall_relay_sym001";
+    let sym = ctx_symbol(sym_id, "toolcall_relay_fn", "src/lib.rs", 1);
+
+    let file_id = aletheia_egregore::ir::stable_id(&["file", "toolcall_relay_file"]);
+    let file = GraphRecord::node(
+        file_id.clone(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        None,
+        "src/lib.rs".to_owned(),
+    );
+
+    // DEFINES edge: File → Symbol (seeds the file)
+    let defines_edge = GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id.clone(),
+        sym_id.to_owned(),
+        None,
+        "file defines symbol".to_owned(),
+    );
+
+    let tc_id = aletheia_egregore::ir::stable_id(&["toolcall", "toolcall_relay_tc"]);
+    let tc = GraphRecord::node(
+        tc_id.clone(),
+        NodeKind::ToolCall,
+        None,
+        None,
+        None,
+        "tool call that touched lib.rs".to_owned(),
+    );
+
+    let run_id = aletheia_egregore::ir::verification_stable_id(&["run", "toolcall_relay_run"]);
+    let run = GraphRecord::node(
+        run_id.clone(),
+        NodeKind::CommandRun,
+        None,
+        None,
+        None,
+        "command run produced by tool call".to_owned(),
+    );
+
+    // ToolCall --TOUCHED_FILE--> File (backward traversal from File seed discovers TC)
+    let touched_edge = GraphRecord::edge(
+        EdgeLabel::TouchedFile,
+        tc_id.clone(),
+        file_id.clone(),
+        None,
+        "tool call touched lib.rs".to_owned(),
+    );
+    // ToolCall --PRODUCED_EVIDENCE--> CommandRun (should be traversed from TC relay)
+    let produced_edge = GraphRecord::edge(
+        EdgeLabel::ProducedEvidence,
+        tc_id,
+        run_id.clone(),
+        None,
+        "tool call produced command run".to_owned(),
+    );
+
+    let records = vec![
+        sym,
+        file,
+        defines_edge,
+        tc,
+        run,
+        touched_edge,
+        produced_edge,
+    ];
+    let ctx = symbol_context(&records, "toolcall_relay_fn");
+
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == file_id.as_str()),
+        "file must be in source_facts"
+    );
+    assert!(
+        ctx.verification_evidence
+            .iter()
+            .any(|r| r.id() == run_id.as_str()),
+        "CommandRun must be in verification_evidence via ToolCall relay (TOUCHED_FILE → ToolCall → PRODUCED_EVIDENCE → CommandRun)"
+    );
+}

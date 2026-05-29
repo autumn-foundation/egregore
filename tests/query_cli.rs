@@ -1722,6 +1722,96 @@ fn query_context_task_body_handle_in_project_state() {
 }
 
 // ---------------------------------------------------------------------------
+// query context — topology edge temporal metadata appears in JSON output
+// ---------------------------------------------------------------------------
+//
+// When a scan-history graph contains a DEFINES edge with temporal metadata,
+// the JSON output for topology_edges must include git_commit and valid_time
+// so consumers can cite which commit the file→symbol edge came from.
+
+#[test]
+fn query_context_topology_edge_carries_temporal_metadata() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("temporal_topo.jsonl");
+
+    let file_id = stable_id(&["file", "temporal_topo_file"]);
+    let sym_id = stable_id(&["node", "Symbol", "src/topo.rs", "temporal_topo_fn"]);
+
+    let file = GraphRecord::node(
+        file_id.clone(),
+        NodeKind::File,
+        Some("src/topo.rs".to_owned()),
+        None,
+        None,
+        "src/topo.rs".to_owned(),
+    );
+    let sym = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/topo.rs".to_owned(),
+        span(1, 10),
+        "temporal_topo_fn".to_owned(),
+        "fn temporal_topo_fn".to_owned(),
+    );
+    // DEFINES edge with temporal metadata (as produced by scan-history)
+    let defines_edge = GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id,
+        sym_id,
+        None,
+        "file defines symbol".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "deadbeefcafe1234".to_owned(),
+        git_parent_commits: vec![],
+        valid_time: "2026-03-01T00:00:00Z".to_owned(),
+        author_time: None,
+        observed_at: "2026-03-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
+    });
+
+    let mut graph = aletheia_egregore::ir::Graph::new();
+    graph.push(file);
+    graph.push(sym);
+    graph.push(defines_edge);
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+
+    let output = egregore()
+        .args(["query", "context", "temporal_topo_fn", "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    let topo = parsed["topology_edges"]
+        .as_array()
+        .expect("topology_edges array");
+    assert!(
+        !topo.is_empty(),
+        "DEFINES edge must appear in topology_edges"
+    );
+
+    let defines = &topo[0];
+    assert_eq!(defines["label"], "DEFINES");
+    assert_eq!(
+        defines.get("git_commit").and_then(|v| v.as_str()),
+        Some("deadbeefcafe1234"),
+        "topology_edge must carry git_commit from temporal metadata; got: {defines}"
+    );
+    assert_eq!(
+        defines.get("valid_time").and_then(|v| v.as_str()),
+        Some("2026-03-01T00:00:00Z"),
+        "topology_edge must carry valid_time from temporal metadata; got: {defines}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // query context — missing graph file exits non-zero
 // ---------------------------------------------------------------------------
 
