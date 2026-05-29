@@ -2744,3 +2744,325 @@ fn symbol_context_tool_call_relay_discovers_produced_evidence() {
         "CommandRun must be in verification_evidence via ToolCall relay (TOUCHED_FILE → ToolCall → PRODUCED_EVIDENCE → CommandRun)"
     );
 }
+
+// ── Finding: temporal DEFINES edge and file source must survive tombstone ─────
+//
+// When scan-history records carry temporal metadata, the file and DEFINES edge
+// may share their stable IDs with current-state records that are tombstoned.
+// The tombstone exclusion must not suppress temporal (historical) file seeds or
+// their DEFINES edges — only current-state (non-temporal) records should be
+// excluded by tombstones.
+
+#[test]
+fn symbol_context_temporal_defines_edge_and_file_survive_tombstone() {
+    // Symbol S (temporal: historical snapshot at commit A)
+    // File F (temporal: same ID, tombstoned in current state)
+    // DEFINES edge (temporal: same ID, tombstoned in current state) F → S
+    // Tombstones for both file ID and edge ID (current-state deletions)
+    // Expected: temporal F appears in source_facts — historical context preserved.
+    let sym_id = "codegraph:v4:temporal_defines_sym001";
+    let sym = ctx_symbol(sym_id, "temporal_defines_fn", "src/lib.rs", 1)
+        .with_temporal(temporal("aaaaaaaa", "2026-01-01T00:00:00Z"));
+
+    let file_id = aletheia_egregore::ir::stable_id(&["file", "temporal_defines_file"]);
+    let file = GraphRecord::node(
+        file_id.clone(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        None,
+        "src/lib.rs (temporal)".to_owned(),
+    )
+    .with_temporal(temporal("aaaaaaaa", "2026-01-01T00:00:00Z"));
+
+    // DEFINES edge (temporal): file → symbol
+    let defines_edge = GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id.clone(),
+        sym_id.to_owned(),
+        None,
+        "temporal defines edge".to_owned(),
+    )
+    .with_temporal(temporal("aaaaaaaa", "2026-01-01T00:00:00Z"));
+    let defines_edge_id = defines_edge.id().to_owned();
+
+    // Tombstones simulating current-state deletion of both file and edge
+    let edge_tombstone = GraphRecord::Tombstone {
+        id: "tombstone:temporal_defines_edge".to_owned(),
+        schema_version: 0,
+        deleted_id: defines_edge_id,
+        summary: "DEFINES edge deleted in current state".to_owned(),
+        producer: None,
+    };
+    let file_tombstone = GraphRecord::Tombstone {
+        id: "tombstone:temporal_defines_file".to_owned(),
+        schema_version: 0,
+        deleted_id: file_id.clone(),
+        summary: "file deleted in current state".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![sym, file, defines_edge, edge_tombstone, file_tombstone];
+    let ctx = symbol_context(&records, "temporal_defines_fn");
+
+    assert!(!ctx.is_no_match(), "temporal symbol must be found");
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == file_id.as_str()),
+        "temporal file must appear in source_facts despite its ID being tombstoned in current state"
+    );
+}
+
+// ── Finding: AgentTurn relay must expand BFS frontier ────────────────────────
+//
+// AgentTurn has no context section (classified as None), but it bridges
+// TOUCHES_FILE edges to file seeds and PRODUCED_PATCH edges to Artifact nodes.
+// Without AgentTurn in is_bfs_relay_node(), BFS stops at the AgentTurn and the
+// PatchArtifact is silently omitted from artifacts.
+
+#[test]
+fn symbol_context_agent_turn_relay_discovers_produced_patch() {
+    // Symbol S, File F (DEFINES edge F → S so F is a seed)
+    // AgentTurn AT: TOUCHES_FILE edge AT → F (backward from F discovers AT)
+    // AgentTurn AT: PRODUCED_PATCH edge AT → PatchArtifact P
+    // Expected: P appears in artifacts
+    let sym_id = "codegraph:v4:agent_turn_relay_sym001";
+    let sym = ctx_symbol(sym_id, "agent_turn_relay_fn", "src/lib.rs", 1);
+
+    let file_id = aletheia_egregore::ir::stable_id(&["file", "agent_turn_relay_file"]);
+    let file = GraphRecord::node(
+        file_id.clone(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        None,
+        "src/lib.rs".to_owned(),
+    );
+
+    let defines_edge = GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id.clone(),
+        sym_id.to_owned(),
+        None,
+        "file defines symbol".to_owned(),
+    );
+
+    let at_id =
+        aletheia_egregore::ir::agent_memory_stable_id(&["agentturn", "agent_turn_relay_at"]);
+    let at = GraphRecord::node(
+        at_id.clone(),
+        NodeKind::AgentTurn,
+        None,
+        None,
+        None,
+        "agent turn that touched lib.rs".to_owned(),
+    );
+
+    let patch_id =
+        aletheia_egregore::ir::agent_memory_stable_id(&["patch", "agent_turn_relay_patch"]);
+    let patch = GraphRecord::node(
+        patch_id.clone(),
+        NodeKind::PatchArtifact,
+        None,
+        None,
+        None,
+        "patch produced by agent turn".to_owned(),
+    );
+
+    // AgentTurn --TOUCHES_FILE--> File (backward from File seed discovers AT)
+    let touches_edge = GraphRecord::edge(
+        EdgeLabel::TouchesFile,
+        at_id.clone(),
+        file_id.clone(),
+        None,
+        "agent turn touched lib.rs".to_owned(),
+    );
+    // AgentTurn --PRODUCED_PATCH--> PatchArtifact (forward from AT relay)
+    let produced_edge = GraphRecord::edge(
+        EdgeLabel::ProducedPatch,
+        at_id,
+        patch_id.clone(),
+        None,
+        "agent turn produced patch".to_owned(),
+    );
+
+    let records = vec![
+        sym,
+        file,
+        defines_edge,
+        at,
+        patch,
+        touches_edge,
+        produced_edge,
+    ];
+    let ctx = symbol_context(&records, "agent_turn_relay_fn");
+
+    assert!(!ctx.is_no_match(), "symbol must be found");
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == file_id.as_str()),
+        "file must be in source_facts"
+    );
+    assert!(
+        ctx.artifacts.iter().any(|r| r.id() == patch_id.as_str()),
+        "PatchArtifact must be in artifacts via AgentTurn relay (TOUCHES_FILE → AgentTurn → PRODUCED_PATCH → PatchArtifact)"
+    );
+}
+
+// ── Finding: tombstoned cross-domain edge must not be traversed ───────────────
+//
+// During BFS edge traversal the edge record's own ID is not checked against
+// tombstoned_ids. A tombstoned edge (e.g. a stale MENTIONS_SYMBOL edge after an
+// observation was retracted) would still carry the BFS to the linked node,
+// silently including retracted context. Check the edge ID before traversal.
+
+#[test]
+fn symbol_context_tombstoned_cross_domain_edge_not_traversed() {
+    // Symbol S
+    // Observation O — connected via MENTIONS_SYMBOL edge that is tombstoned
+    // Expected: O does NOT appear in observations (edge tombstoned → traversal skipped)
+    let sym_id = "codegraph:v4:tomb_edge_sym001";
+    let sym = ctx_symbol(sym_id, "tomb_edge_fn", "src/lib.rs", 1);
+
+    let obs_id = aletheia_egregore::ir::agent_memory_stable_id(&["obs", "tomb_edge_obs"]);
+    let obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "observation that mentions tomb_edge_fn".to_owned(),
+    );
+
+    // MENTIONS_SYMBOL edge O → S (will be tombstoned)
+    let edge = GraphRecord::edge(
+        EdgeLabel::MentionsSymbol,
+        obs_id.clone(),
+        sym_id.to_owned(),
+        None,
+        "observation mentions symbol".to_owned(),
+    );
+    let edge_id = edge.id().to_owned();
+
+    // Tombstone for the edge (observation retracted or edge invalidated)
+    let edge_tombstone = GraphRecord::Tombstone {
+        id: "tombstone:tomb_edge_edge".to_owned(),
+        schema_version: 0,
+        deleted_id: edge_id,
+        summary: "MENTIONS_SYMBOL edge tombstoned".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![sym, obs, edge, edge_tombstone];
+    let ctx = symbol_context(&records, "tomb_edge_fn");
+
+    assert!(!ctx.is_no_match(), "symbol must still be found");
+    assert!(
+        ctx.observations.iter().all(|r| r.id() != obs_id.as_str()),
+        "observation must NOT appear in observations — its edge to the symbol was tombstoned"
+    );
+}
+
+// ── Finding: resolve must exclude tombstoned non-temporal record versions ─────
+//
+// When a record ID has both a temporal (historical) version and a non-temporal
+// (current-state) version that is tombstoned, `resolve` iterates all records
+// matching the ID and currently returns both. The tombstoned current-state
+// version must be filtered out so only the temporal snapshot appears in output.
+
+#[test]
+fn symbol_context_resolve_excludes_tombstoned_current_version() {
+    // Symbol S shares an ID with a temporal (historical) and a current-state version.
+    // The current-state version is tombstoned.
+    // Expected: source_facts contains only the temporal version, not the tombstoned one.
+    let sym_id = "codegraph:v4:resolve_tomb_sym001";
+    // Temporal (historical) version — survives tombstone
+    let sym_temporal = ctx_symbol(sym_id, "resolve_tomb_fn", "src/lib.rs", 1)
+        .with_temporal(temporal("aaaaaaaa", "2026-01-01T00:00:00Z"));
+    // Current-state (non-temporal) version — tombstoned
+    let sym_current = ctx_symbol(sym_id, "resolve_tomb_fn", "src/lib.rs", 1);
+    let tombstone = GraphRecord::Tombstone {
+        id: "tombstone:resolve_tomb_sym".to_owned(),
+        schema_version: 0,
+        deleted_id: sym_id.to_owned(),
+        summary: "symbol deleted in current state".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![sym_temporal, sym_current, tombstone];
+    let ctx = symbol_context(&records, "resolve_tomb_fn");
+
+    assert!(!ctx.is_no_match(), "temporal symbol must be found");
+    let temporal_count = ctx.source_facts.iter().filter(|r| r.id() == sym_id).count();
+    assert_eq!(
+        temporal_count, 1,
+        "only the temporal version should appear in source_facts; tombstoned current-state version must be excluded"
+    );
+    assert!(
+        ctx.source_facts.iter().any(|r| {
+            r.id() == sym_id
+                && matches!(
+                    r,
+                    GraphRecord::Node {
+                        temporal: Some(_),
+                        ..
+                    }
+                )
+        }),
+        "the surviving source_facts entry for sym_id must be the temporal version"
+    );
+}
+
+// ── Finding: temporal context node must survive tombstone in classify_and_insert
+//
+// classify_and_insert gates on tombstoned_ids without checking whether the
+// candidate record has temporal metadata. A historical Observation with the same
+// stable ID as a current-state tombstone would be silently dropped, losing
+// historical context. Mirror the symbol handling: allow temporal records through
+// even when their ID appears in tombstoned_ids.
+
+#[test]
+fn symbol_context_temporal_context_node_survives_tombstone() {
+    // Symbol S
+    // Observation O (temporal, commit A): MENTIONS_SYMBOL edge to S
+    // Tombstone for O's ID (current-state O was deleted)
+    // Expected: temporal O appears in observations
+    let sym_id = "codegraph:v4:temporal_ctx_node_sym001";
+    let sym = ctx_symbol(sym_id, "temporal_ctx_node_fn", "src/lib.rs", 1);
+
+    let obs_id = aletheia_egregore::ir::agent_memory_stable_id(&["obs", "temporal_ctx_node_obs"]);
+    let obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "historical observation about temporal_ctx_node_fn".to_owned(),
+    )
+    .with_temporal(temporal("aaaaaaaa", "2026-01-01T00:00:00Z"));
+
+    // MENTIONS_SYMBOL edge: O → S (live edge, symbol seed triggers backward traversal to O)
+    let edge = GraphRecord::edge(
+        EdgeLabel::MentionsSymbol,
+        obs_id.clone(),
+        sym_id.to_owned(),
+        None,
+        "historical observation mentions symbol".to_owned(),
+    );
+
+    // Tombstone for O's ID (current-state deletion)
+    let tombstone = GraphRecord::Tombstone {
+        id: "tombstone:temporal_ctx_node_obs".to_owned(),
+        schema_version: 0,
+        deleted_id: obs_id.clone(),
+        summary: "observation deleted in current state".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![sym, obs, edge, tombstone];
+    let ctx = symbol_context(&records, "temporal_ctx_node_fn");
+
+    assert!(!ctx.is_no_match(), "symbol must be found");
+    assert!(
+        ctx.observations.iter().any(|r| r.id() == obs_id.as_str()),
+        "temporal observation must appear in observations despite its ID being tombstoned in current state"
+    );
+}

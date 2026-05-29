@@ -261,6 +261,25 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     let by_id: std::collections::BTreeMap<&str, &GraphRecord> =
         records.iter().map(|r| (r.id(), r)).collect();
 
+    // IDs that have at least one temporal version in the slice.  Used to
+    // exempt historical records from current-state tombstone suppression.
+    let has_any_temporal_version: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                temporal: Some(_),
+                ..
+            }
+            | GraphRecord::Edge {
+                id,
+                temporal: Some(_),
+                ..
+            } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+
     // Step 2: the symbol nodes themselves are source_facts.
     let mut source_facts: BTreeSet<&str> = symbol_ids.clone();
 
@@ -281,14 +300,18 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             label: EdgeLabel::Defines,
             source,
             target,
+            temporal: edge_temporal,
             ..
         } = record
             && symbol_ids.contains(target.as_str())
-            // Guard: skip tombstoned DEFINES edges (incremental invalidation emits a
-            // tombstone for stale edge IDs). Without this, a moved symbol keeps its
-            // old file in seed_ids, leaking stale file-scoped context.
-            && !tombstoned_ids.contains(edge_id.as_str())
-            && !tombstoned_ids.contains(source.as_str())
+            // Guard: skip tombstoned DEFINES edges — but only for non-temporal (current-state)
+            // records. Temporal (historical) edges carry scan-history provenance and must
+            // not be suppressed by a tombstone reflecting only the current state.
+            && (edge_temporal.is_some() || !tombstoned_ids.contains(edge_id.as_str()))
+            // Same temporal guard for the file source: a historical file node must not be
+            // excluded by a current-state tombstone on its stable ID.
+            && (has_any_temporal_version.contains(source.as_str())
+                || !tombstoned_ids.contains(source.as_str()))
             && by_id.get(source.as_str()).is_some_and(|r| {
                 matches!(
                     *r,
@@ -341,7 +364,10 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             else {
                 continue;
             };
-            if file_path == path && !tombstoned_ids.contains(file_id.as_str()) {
+            if file_path == path
+                && (has_any_temporal_version.contains(file_id.as_str())
+                    || !tombstoned_ids.contains(file_id.as_str()))
+            {
                 source_facts.insert(file_id.as_str());
             }
         }
@@ -400,7 +426,10 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                                artifacts: &mut BTreeSet<&'a str>,
                                verification_evidence: &mut BTreeSet<&'a str>|
      -> bool {
-        if tombstoned_ids.contains(record_id) {
+        // Suppress tombstoned records, but allow temporal (historical) records
+        // through even when their stable ID is tombstoned: the tombstone reflects
+        // current-state deletion and must not erase historical context.
+        if tombstoned_ids.contains(record_id) && !has_any_temporal_version.contains(record_id) {
             return false;
         }
         let Some(rec) = by_id.get(record_id) else {
@@ -458,12 +487,18 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
         for record in records {
             match record {
                 GraphRecord::Edge {
+                    id: edge_id,
                     label,
                     source,
                     target,
                     ..
                 } => {
                     if !is_cross_domain_label(*label) {
+                        continue;
+                    }
+                    // Skip tombstoned edges — a retracted relationship must not
+                    // carry the BFS to its formerly-linked node.
+                    if tombstoned_ids.contains(edge_id.as_str()) {
                         continue;
                     }
                     let candidate = if frontier.contains(source.as_str()) {
@@ -662,6 +697,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
         let mut next_extra: Vec<&'a str> = Vec::new();
         for record in records {
             if let GraphRecord::Edge {
+                id: edge_id,
                 label,
                 source,
                 target,
@@ -669,6 +705,9 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             } = record
             {
                 if !is_cross_domain_label(*label) {
+                    continue;
+                }
+                if tombstoned_ids.contains(edge_id.as_str()) {
                     continue;
                 }
                 let candidate = if extra_frontier.contains(source.as_str()) {
@@ -714,8 +753,23 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     // including multiple temporal versions of the same symbol that share a
     // stable ID. by_id last-write-wins would silently drop all but one version.
     let resolve = |ids: &BTreeSet<&str>| -> Vec<&'a GraphRecord> {
-        let mut out: Vec<&'a GraphRecord> =
-            records.iter().filter(|r| ids.contains(r.id())).collect();
+        let mut out: Vec<&'a GraphRecord> = records
+            .iter()
+            .filter(|r| {
+                ids.contains(r.id())
+                    // Exclude non-temporal records whose IDs are tombstoned.
+                    // Temporal (historical) versions of the same ID must be kept.
+                    && match r {
+                        GraphRecord::Node {
+                            temporal: Some(_), ..
+                        }
+                        | GraphRecord::Edge {
+                            temporal: Some(_), ..
+                        } => true,
+                        _ => !tombstoned_ids.contains(r.id()),
+                    }
+            })
+            .collect();
         out.sort_by(|a, b| {
             a.id().cmp(b.id()).then_with(|| {
                 let a_commit = if let GraphRecord::Node {
@@ -858,7 +912,7 @@ fn is_bfs_relay_node(
     matches!(
         rec,
         GraphRecord::Node {
-            kind: NodeKind::ToolCall,
+            kind: NodeKind::ToolCall | NodeKind::AgentTurn | NodeKind::AgentRun,
             ..
         }
     )
