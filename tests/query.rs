@@ -1111,3 +1111,118 @@ fn symbol_context_three_hop_bfs_discovers_verification_via_ac() {
         "verification must be in verification_evidence via 3-hop BFS (hop 3)"
     );
 }
+
+// ── Finding: shared evidence sink must not fan out to sibling observations ────
+
+#[test]
+fn symbol_context_shared_validation_run_does_not_pull_sibling_observations() {
+    // ObsA --MENTIONS_SYMBOL(edge)--> SymA  (hop 1: ObsA discovered)
+    // ObsA --VALIDATED_BY(edge)----> Run    (hop 2: Run discovered)
+    // ObsB --VALIDATED_BY(edge)----> Run    (ObsB shares the run but has no link to SymA)
+    //
+    // Without directional guard, hop 3 would traverse Run backward via
+    // VALIDATED_BY and classify ObsB — even though ObsB has no connection to SymA.
+    let sym_id = "codegraph:v4:sharedrun_sym001";
+    let sym = ctx_symbol(sym_id, "sharedrun_fn", "src/lib.rs", 1);
+
+    let linked_obs_id = agent_memory_stable_id(&["obs", "sharedrun_obs_a"]);
+    let mut linked_obs = GraphRecord::node(
+        linked_obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "observation linked to sharedrun_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ..
+    } = linked_obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+    }
+
+    let sibling_obs_id = agent_memory_stable_id(&["obs", "sharedrun_obs_b"]);
+    let mut sibling_obs = GraphRecord::node(
+        sibling_obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "sibling observation — unrelated to sharedrun_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ..
+    } = sibling_obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.8".to_owned());
+    }
+
+    let run_id = verification_stable_id(&["run", "sharedrun_run"]);
+    let run = GraphRecord::node(
+        run_id.clone(),
+        NodeKind::CommandRun,
+        None,
+        None,
+        None,
+        "command run shared by two observations".to_owned(),
+    );
+
+    // linked_obs --MENTIONS_SYMBOL--> SymA (edge connecting the observation to the symbol)
+    let sym_edge = GraphRecord::agent_memory_edge(
+        EdgeLabel::MentionsSymbol,
+        linked_obs_id.clone(),
+        sym_id.to_owned(),
+        Some("1.0".to_owned()),
+        "linked_obs mentions sharedrun_fn".to_owned(),
+    );
+    // linked_obs --VALIDATED_BY--> Run (edge: linked_obs is validated by the shared run)
+    let linked_run_edge = GraphRecord::edge(
+        EdgeLabel::ValidatedBy,
+        linked_obs_id.clone(),
+        run_id.clone(),
+        None,
+        "linked_obs validated by run".to_owned(),
+    );
+    // sibling_obs --VALIDATED_BY--> Run (edge: sibling_obs also uses the same run, unrelated to SymA)
+    let sibling_run_edge = GraphRecord::edge(
+        EdgeLabel::ValidatedBy,
+        sibling_obs_id.clone(),
+        run_id.clone(),
+        None,
+        "sibling_obs validated by same run".to_owned(),
+    );
+
+    let records = vec![sym, linked_obs, sibling_obs, run, sym_edge, linked_run_edge, sibling_run_edge];
+    let ctx = symbol_context(&records, "sharedrun_fn");
+
+    assert!(
+        ctx.observations.iter().any(|r| r.id() == linked_obs_id.as_str()),
+        "linked_obs must be in observations (linked to symbol)"
+    );
+    assert!(
+        ctx.verification_evidence.iter().any(|r| r.id() == run_id.as_str()),
+        "run must be in verification_evidence (backs linked_obs)"
+    );
+    assert!(
+        ctx.observations.iter().all(|r| r.id() != sibling_obs_id.as_str()),
+        "sibling_obs must NOT appear — it only shares the run, not the symbol link"
+    );
+}

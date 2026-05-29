@@ -382,7 +382,9 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                     }
                     let candidate = if frontier.contains(source.as_str()) {
                         Some(target.as_str())
-                    } else if frontier.contains(target.as_str()) {
+                    } else if frontier.contains(target.as_str())
+                        && !is_forward_only_label(*label)
+                    {
                         Some(source.as_str())
                     } else {
                         None
@@ -591,6 +593,29 @@ const fn is_cross_domain_label(label: EdgeLabel) -> bool {
             | EdgeLabel::Contradicts
             | EdgeLabel::Supersedes
             | EdgeLabel::OwnedByTask
+    )
+}
+
+/// Returns `true` for edge labels that should only be traversed in the
+/// forward direction (source → target) during BFS.
+///
+/// These labels all point FROM agent-memory/project nodes TOWARD shared sinks
+/// (verification runs, artifacts, tasks). Traversing backward from the sink
+/// would pull in unrelated sibling nodes that happen to reference the same
+/// sink but have no connection to the queried symbol. For example, if two
+/// observations are both validated by the same `CommandRun`, following
+/// `VALIDATED_BY` backward from the run would classify the unrelated
+/// observation as context.
+const fn is_forward_only_label(label: EdgeLabel) -> bool {
+    matches!(
+        label,
+        EdgeLabel::ValidatedBy
+            | EdgeLabel::HasEvidence
+            | EdgeLabel::ProducedEvidence
+            | EdgeLabel::ProducedPatch
+            | EdgeLabel::ExplainsChange
+            | EdgeLabel::ReferencesTask
+            | EdgeLabel::FailedOn
     )
 }
 
