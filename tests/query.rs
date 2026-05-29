@@ -2450,6 +2450,65 @@ fn symbol_context_backfill_ac_closes_verification_via_extra_hop() {
     );
 }
 
+// ── Finding: EXPLAINS_CHANGE must not be forward-only — backward traversal needed ─
+//
+// Schema direction: Observation --EXPLAINS_CHANGE--> Symbol/File.
+// The symbol/file is the target; querying it must discover the explaining
+// Observation via backward traversal (frontier contains target → classify source).
+// Making EXPLAINS_CHANGE forward-only blocks this discovery. The fix mirrors
+// the MentionsSymbol pattern, which already uses backward traversal correctly.
+
+#[test]
+fn symbol_context_explains_change_edge_traverses_backward_from_symbol() {
+    // Observation O has an EXPLAINS_CHANGE edge to Symbol S.
+    // Querying S must discover O in observations via backward edge traversal.
+    let sym_id = "codegraph:v4:explains_change_sym001";
+    let sym = ctx_symbol(sym_id, "explains_change_fn", "src/lib.rs", 1);
+
+    let obs_id = agent_memory_stable_id(&["obs", "explains_change_obs"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "observation explaining the change to explains_change_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+    }
+
+    // Obs --EXPLAINS_CHANGE--> Symbol (Obs is source, Symbol is target)
+    let explains_edge = GraphRecord::agent_memory_edge(
+        EdgeLabel::ExplainsChange,
+        obs_id.clone(),
+        sym_id.to_owned(),
+        Some("1.0".to_owned()),
+        "obs explains change to explains_change_fn".to_owned(),
+    );
+
+    let records = vec![sym, obs, explains_edge];
+    let ctx = symbol_context(&records, "explains_change_fn");
+
+    assert!(!ctx.is_no_match(), "symbol must be found");
+    assert!(
+        ctx.observations.iter().any(|r| r.id() == obs_id.as_str()),
+        "observation must appear in observations via backward EXPLAINS_CHANGE traversal from symbol seed"
+    );
+}
+
 // ── Finding: DEFINES edge with absent file source must not seed source_facts ───
 //
 // When a DEFINES edge references a file node that is absent from the current

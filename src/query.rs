@@ -812,6 +812,11 @@ const fn is_cross_domain_label(label: EdgeLabel) -> bool {
 /// `ClosesAcceptanceCriterion` has schema direction AC → Verification. Making
 /// it forward-only prevents backward traversal from a Verification sink to
 /// unrelated `AcceptanceCriteria` that happen to share the same run.
+///
+/// `ExplainsChange` is intentionally NOT forward-only: its schema direction
+/// is Observation → Symbol/File (the same as `MentionsSymbol`). Backward
+/// traversal from the Symbol/File seed is required to discover the explaining
+/// Observation.
 const fn is_forward_only_label(label: EdgeLabel) -> bool {
     matches!(
         label,
@@ -819,7 +824,6 @@ const fn is_forward_only_label(label: EdgeLabel) -> bool {
             | EdgeLabel::HasEvidence
             | EdgeLabel::ProducedEvidence
             | EdgeLabel::ProducedPatch
-            | EdgeLabel::ExplainsChange
             | EdgeLabel::ReferencesTask
             | EdgeLabel::ClosesAcceptanceCriterion
     )
