@@ -1538,7 +1538,12 @@ fn context_source_fact(record: &GraphRecord) -> Option<ContextSourceFact<'_>> {
         repo_relative_path: repo_relative_path.as_deref(),
         span: *span,
         git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
-        valid_time: valid_time.as_deref(),
+        // For current-tree records valid_time is at the node level; for
+        // scan-history records it is in temporal.valid_time. Prefer the
+        // node-level field and fall back to the temporal block.
+        valid_time: valid_time
+            .as_deref()
+            .or_else(|| temporal.as_ref().map(|t| t.valid_time.as_str())),
         language: language.as_deref(),
         symbol_kind: symbol_kind.as_deref(),
     })

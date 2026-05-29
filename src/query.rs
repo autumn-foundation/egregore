@@ -247,9 +247,11 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
 
     // Step 2: the symbol nodes themselves are source_facts.
     let mut source_facts: BTreeSet<&str> = symbol_ids.clone();
-    // Also include File nodes at the same repo_relative_path as any symbol.
+    // Also include File nodes at the same repo_relative_path as any LIVE symbol
+    // (tombstoned symbols are excluded via symbol_ids).
     for record in records {
         let GraphRecord::Node {
+            id: sym_id,
             kind: NodeKind::Symbol,
             name,
             repo_relative_path: Some(path),
@@ -259,6 +261,10 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             continue;
         };
         if name.as_deref() != Some(symbol_name) {
+            continue;
+        }
+        if !symbol_ids.contains(sym_id.as_str()) {
+            // Tombstoned or non-matching symbol — skip its file co-location.
             continue;
         }
         // Find File nodes at this path.
@@ -277,6 +283,11 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             }
         }
     }
+
+    // Snapshot seed IDs (symbol IDs + co-located file IDs) before the main
+    // loop. Used to detect links that target the symbol's context, including
+    // file-scoped relations such as CommandRun --TOUCHED_FILE--> File.
+    let seed_ids: BTreeSet<&str> = source_facts.iter().copied().collect();
 
     // Step 3a + 3b: classify linked records.
     let mut observations: BTreeSet<&str> = BTreeSet::new();
@@ -333,8 +344,8 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                 if !is_cross_domain_label(*label) {
                     // Code-graph topology edges (CONTAINS, DEFINES, …) don't
                     // cross trust boundaries, so skip them.
-                } else if symbol_ids.contains(source.as_str()) {
-                    // Edge outgoing from the symbol → classify the target.
+                } else if seed_ids.contains(source.as_str()) {
+                    // Edge outgoing from a seed (symbol or co-located file) → classify target.
                     classify_and_insert(
                         target.as_str(),
                         &mut source_facts,
@@ -343,8 +354,8 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                         &mut artifacts,
                         &mut verification_evidence,
                     );
-                } else if symbol_ids.contains(target.as_str()) {
-                    // Edge incoming to the symbol → classify the source.
+                } else if seed_ids.contains(target.as_str()) {
+                    // Edge incoming to a seed → classify the source.
                     classify_and_insert(
                         source.as_str(),
                         &mut source_facts,
@@ -360,11 +371,13 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                 evidence_links: Some(links),
                 ..
             } => {
-                // Check whether any evidence link targets one of the symbol IDs.
+                // Check whether any evidence link targets a seed ID (symbol or
+                // co-located file). This handles file-scoped evidence such as
+                // CommandRun --TOUCHED_FILE--> File(src/lib.rs).
                 let links_to_symbol = links.iter().any(|link| {
                     link.target_record_id
                         .as_deref()
-                        .is_some_and(|tid| symbol_ids.contains(tid))
+                        .is_some_and(|tid| seed_ids.contains(tid))
                 });
 
                 if links_to_symbol {
@@ -498,9 +511,14 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                 a.source_record_id
                     .cmp(&b.source_record_id)
                     .then_with(|| a.target_handle.cmp(&b.target_handle))
+                    .then_with(|| a.relation.cmp(&b.relation))
+                    .then_with(|| a.target_domain.cmp(&b.target_domain))
             });
             u.dedup_by(|a, b| {
-                a.source_record_id == b.source_record_id && a.target_handle == b.target_handle
+                a.source_record_id == b.source_record_id
+                    && a.target_handle == b.target_handle
+                    && a.relation == b.relation
+                    && a.target_domain == b.target_domain
             });
             u
         },
