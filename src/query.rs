@@ -543,6 +543,7 @@ const fn is_cross_domain_label(label: EdgeLabel) -> bool {
             | EdgeLabel::FailedOn
             | EdgeLabel::ExplainsChange
             | EdgeLabel::TouchedFile
+            | EdgeLabel::TouchesFile
             | EdgeLabel::ProducedPatch
             | EdgeLabel::ProducedEvidence
             | EdgeLabel::ClosesAcceptanceCriterion

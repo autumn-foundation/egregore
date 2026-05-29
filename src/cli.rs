@@ -703,6 +703,18 @@ struct ContextLinkedItem<'a> {
     status: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verification_kind: Option<&'a str>,
+    /// Captured stdout from a `CommandRun` / `TestRun` (hash + optional inline).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stdout_handle: Option<&'a crate::ir::OutputHandle>,
+    /// Captured stderr from a `CommandRun` / `TestRun`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stderr_handle: Option<&'a crate::ir::OutputHandle>,
+    /// Repo-relative path to the script, config, or CI definition that was run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_artifact_path: Option<&'a str>,
+    /// BLAKE3 hex of the artefact at `source_artifact_path` at run time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_artifact_hash: Option<&'a str>,
     /// Evidence links that connect this item to the queried symbol.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     evidence_links: Vec<&'a crate::ir::EvidenceLink>,
@@ -1588,6 +1600,10 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         title,
         status,
         verification_kind,
+        stdout_handle,
+        stderr_handle,
+        source_artifact_path,
+        source_artifact_hash,
         evidence_links,
         ..
     } = record
@@ -1601,6 +1617,10 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         name: name.as_deref(),
         status: status.as_deref(),
         verification_kind: verification_kind.as_deref(),
+        stdout_handle: stdout_handle.as_deref(),
+        stderr_handle: stderr_handle.as_deref(),
+        source_artifact_path: source_artifact_path.as_deref(),
+        source_artifact_hash: source_artifact_hash.as_deref(),
         evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
     })
 }
