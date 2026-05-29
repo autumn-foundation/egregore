@@ -689,6 +689,12 @@ struct ContextObservation<'a> {
     observed_at: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     confidence: Option<&'a str>,
+    /// Failure classification for `Failure` records (e.g. `"command_failure"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_kind: Option<&'a str>,
+    /// Shell exit code for `Failure` or `CommandRun` records that represent a failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i64>,
     /// Supporting evidence links from the observation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     evidence_links: Vec<&'a crate::ir::EvidenceLink>,
@@ -699,6 +705,10 @@ struct ContextObservation<'a> {
 struct ContextLinkedItem<'a> {
     record_id: &'a str,
     kind: &'static str,
+    /// Agent-facing summary from the raw `GraphRecord`. Populated for all records
+    /// so consumers can understand the item without reloading the graph — especially
+    /// for `Artifact` records where `title`/`name`/`text`/`status` may all be absent.
+    summary: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -710,6 +720,15 @@ struct ContextLinkedItem<'a> {
     status: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verification_kind: Option<&'a str>,
+    /// Shell exit code for `CommandRun` verification records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i64>,
+    /// RFC 3339 timestamp when the command was executed (`CommandRun`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executed_at: Option<&'a str>,
+    /// Evidence capture quality: `"verbatim"`, `"summarized"`, or `"referenced_only"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence_quality: Option<&'a str>,
     /// Captured stdout from a `CommandRun` / `TestRun` (hash + optional inline).
     #[serde(skip_serializing_if = "Option::is_none")]
     stdout_handle: Option<&'a crate::ir::OutputHandle>,
@@ -753,6 +772,18 @@ struct ContextLinkedItem<'a> {
     /// Human-readable validation summary, redacted by policy (`PatchArtifact`).
     #[serde(skip_serializing_if = "Option::is_none")]
     validation_summary: Option<&'a str>,
+    /// Git SHA the patch was authored against (`PatchArtifact`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_commit: Option<&'a str>,
+    /// Reason `base_commit` is absent (`PatchArtifact`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unknown_base_reason: Option<&'a str>,
+    /// Raw patch byte length (`PatchArtifact`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    patch_bytes_size: Option<u64>,
+    /// `AgentSession` record ID that produced this patch (`PatchArtifact`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    producer_session_id: Option<&'a str>,
     /// Redacted body handle for `Task` nodes (required field per project schema).
     #[serde(skip_serializing_if = "Option::is_none")]
     body_handle: Option<&'a crate::ir::OutputHandle>,
@@ -1660,6 +1691,8 @@ fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_>> {
         session_id,
         observed_at,
         confidence,
+        failure_kind,
+        exit_code,
         evidence_links,
         ..
     } = record
@@ -1680,6 +1713,8 @@ fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_>> {
         session_id: session_id.as_deref(),
         observed_at: observed_at.as_deref(),
         confidence: confidence.as_deref(),
+        failure_kind: failure_kind.as_deref(),
+        exit_code: *exit_code,
         evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
     })
 }
@@ -1691,8 +1726,12 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         name,
         title,
         text,
+        summary,
         status,
         verification_kind,
+        exit_code,
+        executed_at,
+        evidence_quality,
         stdout_handle,
         stderr_handle,
         source_artifact_path,
@@ -1705,8 +1744,12 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         patch_status,
         patch_handle,
         patch_bytes_hash,
+        patch_bytes_size,
         target_files,
         validation_summary,
+        base_commit,
+        unknown_base_reason,
+        producer_session_id,
         body_handle,
         evidence_links,
         ..
@@ -1717,11 +1760,15 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
     Some(ContextLinkedItem {
         record_id: id,
         kind: kind.as_str(),
+        summary,
         title: title.as_deref(),
         name: name.as_deref(),
         text: text.as_deref(),
         status: status.as_deref(),
         verification_kind: verification_kind.as_deref(),
+        exit_code: *exit_code,
+        executed_at: executed_at.as_deref(),
+        evidence_quality: evidence_quality.as_deref(),
         stdout_handle: stdout_handle.as_deref(),
         stderr_handle: stderr_handle.as_deref(),
         source_artifact_path: source_artifact_path.as_deref(),
@@ -1734,8 +1781,12 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         patch_status: patch_status.as_deref(),
         patch_handle: patch_handle.as_deref(),
         patch_bytes_hash: patch_bytes_hash.as_deref(),
+        patch_bytes_size: *patch_bytes_size,
         target_files: target_files.as_deref(),
         validation_summary: validation_summary.as_deref(),
+        base_commit: base_commit.as_deref(),
+        unknown_base_reason: unknown_base_reason.as_deref(),
+        producer_session_id: producer_session_id.as_deref(),
         body_handle: body_handle.as_deref(),
         evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
     })

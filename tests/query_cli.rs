@@ -1830,3 +1830,404 @@ fn query_context_missing_graph_file_exits_nonzero() {
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::is_match("error|failed").unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// query context — Failure node carries failure_kind and exit_code
+// ---------------------------------------------------------------------------
+//
+// Finding (line 677): ContextObservation only serializes generic observation
+// fields, dropping Failure-specific `failure_kind` (required by schema) and
+// `exit_code`. Consumers cannot determine what kind of failure occurred from
+// `eg query context` alone without reloading the raw record.
+
+#[test]
+fn query_context_failure_record_carries_failure_kind_and_exit_code() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("failure_fields.jsonl");
+
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "failing_ctx_fn"]);
+    let sym = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 0,
+            end_byte: 80,
+            start_line: 1,
+            end_line: 5,
+        },
+        "failing_ctx_fn".to_owned(),
+        "fn failing_ctx_fn".to_owned(),
+    );
+
+    let fail_id = agent_memory_stable_id(&["fail", "cli_failure_test"]);
+    let mut fail = GraphRecord::node(
+        fail_id.clone(),
+        NodeKind::Failure,
+        None,
+        None,
+        None,
+        "command failure for failing_ctx_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ref mut failure_kind,
+        ref mut exit_code,
+        ref mut evidence_links,
+        ..
+    } = fail
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-04-01T10:00:00Z".to_owned());
+        *confidence = Some("1.0".to_owned());
+        *failure_kind = Some("command_failure".to_owned());
+        *exit_code = Some(1);
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(sym_id),
+            target_domain: "codegraph".to_owned(),
+            relation: "FAILED_ON".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let mut graph = aletheia_egregore::ir::Graph::new();
+    graph.push(sym);
+    graph.push(fail);
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let output = egregore()
+        .args(["query", "context", "failing_ctx_fn", "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value =
+        serde_json::from_slice(&output).expect("valid JSON from query context");
+
+    let obs = json["observations"]
+        .as_array()
+        .expect("observations array")
+        .iter()
+        .find(|o| o["record_id"].as_str() == Some(&fail_id))
+        .expect("failure record must appear in observations");
+
+    assert_eq!(
+        obs["failure_kind"].as_str(),
+        Some("command_failure"),
+        "failure_kind must be forwarded in observation output"
+    );
+    assert_eq!(
+        obs["exit_code"].as_i64(),
+        Some(1),
+        "exit_code must be forwarded in observation output"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// query context — CommandRun carries exit_code, executed_at, evidence_quality
+// ---------------------------------------------------------------------------
+//
+// Finding (line 712): ContextLinkedItem for verification evidence only exposes
+// status/verification_kind plus handles. CommandRun records may carry exit_code,
+// executed_at, and evidence_quality; without forwarding those, consumers cannot
+// determine the execution outcome from `eg query context` alone.
+
+#[test]
+fn query_context_command_run_carries_execution_metadata() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("command_run_fields.jsonl");
+
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "cmd_run_ctx_fn"]);
+    let sym = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 0,
+            end_byte: 80,
+            start_line: 1,
+            end_line: 5,
+        },
+        "cmd_run_ctx_fn".to_owned(),
+        "fn cmd_run_ctx_fn".to_owned(),
+    );
+
+    let run_id = verification_stable_id(&["run", "cli_cmd_run_test"]);
+    let mut run = GraphRecord::node(
+        run_id.clone(),
+        NodeKind::CommandRun,
+        None,
+        None,
+        None,
+        "command run for cmd_run_ctx_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut status,
+        ref mut exit_code,
+        ref mut executed_at,
+        ref mut evidence_quality,
+        ref mut evidence_links,
+        ..
+    } = run
+    {
+        *schema_version = VERIFICATION_SCHEMA_VERSION;
+        *status = Some("passed".to_owned());
+        *exit_code = Some(0);
+        *executed_at = Some("2026-04-01T11:00:00Z".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(sym_id),
+            target_domain: "codegraph".to_owned(),
+            relation: "VALIDATED_BY".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let mut graph = aletheia_egregore::ir::Graph::new();
+    graph.push(sym);
+    graph.push(run);
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let output = egregore()
+        .args(["query", "context", "cmd_run_ctx_fn", "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value =
+        serde_json::from_slice(&output).expect("valid JSON from query context");
+
+    let item = json["verification_evidence"]
+        .as_array()
+        .expect("verification_evidence array")
+        .iter()
+        .find(|v| v["record_id"].as_str() == Some(&run_id))
+        .expect("CommandRun must appear in verification_evidence");
+
+    assert_eq!(
+        item["exit_code"].as_i64(),
+        Some(0),
+        "exit_code must be forwarded for CommandRun"
+    );
+    assert_eq!(
+        item["executed_at"].as_str(),
+        Some("2026-04-01T11:00:00Z"),
+        "executed_at must be forwarded for CommandRun"
+    );
+    assert_eq!(
+        item["evidence_quality"].as_str(),
+        Some("verbatim"),
+        "evidence_quality must be forwarded for CommandRun"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// query context — PatchArtifact carries required patch metadata fields
+// ---------------------------------------------------------------------------
+//
+// Finding (line 745): ContextLinkedItem for PatchArtifact drops required schema
+// fields base_commit/unknown_base_reason, patch_bytes_size, and producer_session_id.
+// Consumers cannot verify the patch provenance or size without reloading the record.
+
+#[test]
+fn query_context_patch_artifact_carries_patch_metadata() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("patch_artifact_fields.jsonl");
+
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "patch_ctx_fn"]);
+    let sym = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 0,
+            end_byte: 80,
+            start_line: 1,
+            end_line: 5,
+        },
+        "patch_ctx_fn".to_owned(),
+        "fn patch_ctx_fn".to_owned(),
+    );
+
+    let patch_id = agent_memory_stable_id(&["patch", "cli_patch_test"]);
+    let mut patch_record = GraphRecord::node(
+        patch_id.clone(),
+        NodeKind::PatchArtifact,
+        None,
+        None,
+        None,
+        "patch artifact for patch_ctx_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut base_commit,
+        ref mut patch_bytes_size,
+        ref mut producer_session_id,
+        ref mut patch_status,
+        ref mut evidence_links,
+        ..
+    } = patch_record
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *base_commit = Some("aabbccdd".to_owned());
+        *patch_bytes_size = Some(1234);
+        *producer_session_id = Some("session:patch_ctx_test".to_owned());
+        *patch_status = Some("valid".to_owned());
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(sym_id),
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let mut graph = aletheia_egregore::ir::Graph::new();
+    graph.push(sym);
+    graph.push(patch_record);
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let output = egregore()
+        .args(["query", "context", "patch_ctx_fn", "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value =
+        serde_json::from_slice(&output).expect("valid JSON from query context");
+
+    let item = json["artifacts"]
+        .as_array()
+        .expect("artifacts array")
+        .iter()
+        .find(|a| a["record_id"].as_str() == Some(&patch_id))
+        .expect("PatchArtifact must appear in artifacts");
+
+    assert_eq!(
+        item["base_commit"].as_str(),
+        Some("aabbccdd"),
+        "base_commit must be forwarded for PatchArtifact"
+    );
+    assert_eq!(
+        item["patch_bytes_size"].as_u64(),
+        Some(1234),
+        "patch_bytes_size must be forwarded for PatchArtifact"
+    );
+    assert_eq!(
+        item["producer_session_id"].as_str(),
+        Some("session:patch_ctx_test"),
+        "producer_session_id must be forwarded for PatchArtifact"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// query context — generic Artifact without title/name/text carries summary
+// ---------------------------------------------------------------------------
+//
+// Finding (line 701): ContextLinkedItem has no summary field. For generic Artifact
+// records where title/name/text/status are all None, the only human-readable field
+// is the required GraphRecord::summary. Without it, consumers see only record_id
+// and kind and must reload the raw graph to understand the context item.
+
+#[test]
+fn query_context_linked_item_carries_summary() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("artifact_summary.jsonl");
+
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "summary_ctx_fn"]);
+    let sym = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 0,
+            end_byte: 80,
+            start_line: 1,
+            end_line: 5,
+        },
+        "summary_ctx_fn".to_owned(),
+        "fn summary_ctx_fn".to_owned(),
+    );
+
+    // Generic Artifact — no title, name, text, or status; only summary identifies it.
+    let artifact_id = agent_memory_stable_id(&["artifact", "cli_summary_test"]);
+    let mut artifact = GraphRecord::node(
+        artifact_id.clone(),
+        NodeKind::Artifact,
+        None,
+        None,
+        None,
+        "build output artifact for summary_ctx_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = artifact
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(sym_id),
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let mut graph = aletheia_egregore::ir::Graph::new();
+    graph.push(sym);
+    graph.push(artifact);
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let output = egregore()
+        .args(["query", "context", "summary_ctx_fn", "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value =
+        serde_json::from_slice(&output).expect("valid JSON from query context");
+
+    let item = json["artifacts"]
+        .as_array()
+        .expect("artifacts array")
+        .iter()
+        .find(|a| a["record_id"].as_str() == Some(&artifact_id))
+        .expect("Artifact must appear in artifacts");
+
+    assert_eq!(
+        item["summary"].as_str(),
+        Some("build output artifact for summary_ctx_fn"),
+        "summary must be forwarded for generic Artifact records without title/name/text/status"
+    );
+}
