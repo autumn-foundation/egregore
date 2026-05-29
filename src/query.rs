@@ -333,46 +333,56 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
 
     // Helper: insert a record ID into the appropriate section.
     //
-    // Guards:
-    // • Tombstoned IDs are silently skipped — stale context must not be returned.
-    // • SourceFact candidates that are not in `seed_ids` are silently skipped —
-    //   BFS must not pull sibling codegraph nodes (e.g. unrelated symbols
-    //   mentioned by the same Observation) into source_facts.
+    // Returns `true` when the node was actually inserted into a section.
+    // Returns `false` for: tombstoned IDs, missing IDs (by_id miss), non-Node
+    // records, non-seed SourceFact candidates (sibling symbols/files), and
+    // NodeKind variants with no section mapping.
+    //
+    // Callers MUST gate `next_frontier.push(id)` on this return value — only
+    // classified nodes should expand the BFS; pushing skipped IDs would allow
+    // missing ghost endpoints and sibling codegraph nodes to traverse further.
     let classify_and_insert =
         |record_id: &'a str,
          source_facts: &mut BTreeSet<&'a str>,
          observations: &mut BTreeSet<&'a str>,
          project_state: &mut BTreeSet<&'a str>,
          artifacts: &mut BTreeSet<&'a str>,
-         verification_evidence: &mut BTreeSet<&'a str>| {
+         verification_evidence: &mut BTreeSet<&'a str>| -> bool {
             if tombstoned_ids.contains(record_id) {
-                return;
+                return false;
             }
             let Some(rec) = by_id.get(record_id) else {
-                return;
+                return false;
             };
             let GraphRecord::Node { kind, .. } = rec else {
-                return;
+                return false;
             };
             match classify_node(*kind) {
                 Some(ContextSection::SourceFact) => {
                     if seed_ids.contains(record_id) {
                         source_facts.insert(record_id);
+                        true
+                    } else {
+                        false
                     }
                 }
                 Some(ContextSection::Observation) => {
                     observations.insert(record_id);
+                    true
                 }
                 Some(ContextSection::ProjectState) => {
                     project_state.insert(record_id);
+                    true
                 }
                 Some(ContextSection::Artifact) => {
                     artifacts.insert(record_id);
+                    true
                 }
                 Some(ContextSection::VerificationEvidence) => {
                     verification_evidence.insert(record_id);
+                    true
                 }
-                None => {}
+                None => false,
             }
         };
 
@@ -416,7 +426,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                     if let Some(id) = candidate
                         && visited.insert(id)
                     {
-                        classify_and_insert(
+                        let was_classified = classify_and_insert(
                             id,
                             &mut source_facts,
                             &mut observations,
@@ -424,10 +434,11 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                             &mut artifacts,
                             &mut verification_evidence,
                         );
-                        // Tombstoned nodes must not expand the frontier — their
-                        // backing evidence would be reachable only through a
-                        // deleted record and must not appear in context.
-                        if !tombstoned_ids.contains(id) {
+                        // Only expand nodes that were actually classified: tombstoned,
+                        // missing (by_id miss), and skipped codegraph (non-seed) nodes
+                        // must not enter the frontier or their neighbors will be
+                        // traversed and pulled into unrelated context.
+                        if was_classified {
                             next_frontier.push(id);
                         }
                     }
@@ -440,6 +451,11 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                     if visited.contains(node_id.as_str()) {
                         continue;
                     }
+                    // Skip tombstoned nodes before scanning their evidence_links.
+                    if tombstoned_ids.contains(node_id.as_str()) {
+                        visited.insert(node_id.as_str());
+                        continue;
+                    }
                     // Classify if any evidence link targets the current frontier.
                     let links_to_frontier = links.iter().any(|link| {
                         link.target_record_id
@@ -447,7 +463,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                             .is_some_and(|tid| frontier.contains(tid))
                     });
                     if links_to_frontier {
-                        classify_and_insert(
+                        let was_classified = classify_and_insert(
                             node_id.as_str(),
                             &mut source_facts,
                             &mut observations,
@@ -456,8 +472,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                             &mut verification_evidence,
                         );
                         visited.insert(node_id.as_str());
-                        // Tombstoned nodes must not expand the frontier.
-                        if !tombstoned_ids.contains(node_id.as_str()) {
+                        if was_classified {
                             next_frontier.push(node_id.as_str());
                         }
 
@@ -468,7 +483,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                                 if present_ids.contains(target_id.as_str())
                                     && !visited.contains(target_id.as_str())
                                 {
-                                    classify_and_insert(
+                                    let target_classified = classify_and_insert(
                                         target_id.as_str(),
                                         &mut source_facts,
                                         &mut observations,
@@ -477,8 +492,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                                         &mut verification_evidence,
                                     );
                                     visited.insert(target_id.as_str());
-                                    // Don't expand tombstoned evidence targets.
-                                    if !tombstoned_ids.contains(target_id.as_str()) {
+                                    if target_classified {
                                         next_frontier.push(target_id.as_str());
                                     }
                                 } else if !present_ids.contains(target_id.as_str()) {

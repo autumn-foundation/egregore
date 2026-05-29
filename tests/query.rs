@@ -1413,3 +1413,121 @@ fn symbol_context_topology_edges_include_defines_edge() {
         "the specific DEFINES edge must be in topology_edges"
     );
 }
+
+// ── Finding: missing edge endpoints must not expand BFS frontier ──────────────
+
+#[test]
+fn symbol_context_missing_edge_endpoint_does_not_expand_frontier() {
+    // Edge: ghost_id --MENTIONS_SYMBOL--> Symbol (ghost_id is not in records)
+    // Edge: Obs_Q --MENTIONS_SYMBOL--> ghost_id
+    //
+    // Without the fix: ghost_id is added to frontier even though classify_and_insert
+    // returns early (by_id miss). In the next hop ghost_id is in frontier, causing
+    // Obs_Q to be classified via backward MENTIONS_SYMBOL traversal.
+    let sym_id = "codegraph:v4:ghost_ep_sym001";
+    let sym = ctx_symbol(sym_id, "ghost_ep_fn", "src/lib.rs", 1);
+
+    // Observation Q is legitimately present but only linked to the ghost endpoint.
+    let unrelated_id = agent_memory_stable_id(&["obs", "ghost_ep_unrelated"]);
+    let mut unrelated_obs = GraphRecord::node(
+        unrelated_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "unrelated observation pointing at ghost".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ..
+    } = unrelated_obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+    }
+
+    let ghost_id = "ghost:missing:record";
+
+    // Ghost --MENTIONS_SYMBOL--> Symbol (ghost is source, not present in records)
+    let ghost_sym_edge = GraphRecord::agent_memory_edge(
+        EdgeLabel::MentionsSymbol,
+        ghost_id.to_owned(),
+        sym_id.to_owned(),
+        None,
+        "ghost mentions sym".to_owned(),
+    );
+    // Unrelated --MENTIONS_SYMBOL--> Ghost (would be traversed from ghost if ghost is in frontier)
+    let unrelated_ghost_edge = GraphRecord::agent_memory_edge(
+        EdgeLabel::MentionsSymbol,
+        unrelated_id.clone(),
+        ghost_id.to_owned(),
+        None,
+        "unrelated obs points at ghost".to_owned(),
+    );
+
+    let records = vec![sym, unrelated_obs, ghost_sym_edge, unrelated_ghost_edge];
+    let ctx = symbol_context(&records, "ghost_ep_fn");
+
+    assert!(
+        ctx.observations.iter().all(|r| r.id() != unrelated_id.as_str()),
+        "observation linked only via missing ghost endpoint must not appear in context"
+    );
+}
+
+// ── Finding: skipped codegraph targets (siblings) must not expand frontier ────
+
+#[test]
+fn symbol_context_skipped_codegraph_target_does_not_expand_frontier() {
+    // Obs O is linked to Symbol S via evidence_link (classified via node arm).
+    // Edge O --MENTIONS_SYMBOL--> Symbol T (sibling, not in seed_ids).
+    // Obs Q has evidence_link MENTIONS_SYMBOL --> T.
+    //
+    // Without the fix: T is discovered via O→T edge but skipped by classify_and_insert
+    // (non-seed SourceFact). T is still pushed to frontier. In the next hop, Q is
+    // discovered via T in the frontier and wrongly classified as context for S.
+    let sym_s_id = "codegraph:v4:skipfrontier_sym_s";
+    let sym_s = ctx_symbol(sym_s_id, "skipfrontier_fn_s", "src/s.rs", 1);
+
+    let sibling_id = "codegraph:v4:skipfrontier_sym_t";
+    let sibling_sym = ctx_symbol(sibling_id, "skipfrontier_fn_t", "src/t.rs", 1);
+
+    // Obs O: linked to S via evidence_link (will be classified in hop 1)
+    let obs_linked = ctx_observation("skipfrontier_obs_o", "obs about S", sym_s_id, "MENTIONS_SYMBOL", "0.9");
+    let obs_linked_id = obs_linked.id().to_owned();
+
+    // Obs Q: linked to T via evidence_link (must NOT appear when querying S)
+    let obs_unrelated = ctx_observation("skipfrontier_obs_q", "obs about T only", sibling_id, "MENTIONS_SYMBOL", "0.8");
+    let obs_unrelated_id = obs_unrelated.id().to_owned();
+
+    // Edge O --MENTIONS_SYMBOL--> T (O points to sibling T; T should be skipped)
+    let linked_sibling_edge = GraphRecord::agent_memory_edge(
+        EdgeLabel::MentionsSymbol,
+        obs_linked_id.clone(),
+        sibling_id.to_owned(),
+        None,
+        "obs_o also mentions sym_t".to_owned(),
+    );
+
+    let records = vec![sym_s, sibling_sym, obs_linked, obs_unrelated, linked_sibling_edge];
+    let ctx = symbol_context(&records, "skipfrontier_fn_s");
+
+    assert!(
+        ctx.observations.iter().any(|r| r.id() == obs_linked_id.as_str()),
+        "obs_o must be in observations (linked to sym_s)"
+    );
+    assert!(
+        ctx.observations.iter().all(|r| r.id() != obs_unrelated_id.as_str()),
+        "obs_q must NOT appear — it is only linked to sibling sym_t, not to sym_s"
+    );
+    assert!(
+        ctx.source_facts.iter().all(|r| r.id() != sibling_id),
+        "sibling sym_t must not appear in source_facts"
+    );
+}

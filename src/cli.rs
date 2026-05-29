@@ -718,6 +718,21 @@ struct ContextLinkedItem<'a> {
     /// BLAKE3 hex of the artefact at `source_artifact_path` at run time.
     #[serde(skip_serializing_if = "Option::is_none")]
     source_artifact_hash: Option<&'a str>,
+    /// File path for `FileEdit` nodes (the file that was edited).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    /// Edit operation for `FileEdit` nodes (e.g. `"modify"`, `"rename"`, `"delete"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edit_kind: Option<&'a str>,
+    /// BLAKE3 hash of the file content before the edit (`FileEdit`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    before_hash: Option<&'a str>,
+    /// BLAKE3 hash of the file content after the edit (`FileEdit`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_hash: Option<&'a str>,
+    /// New path when the file was renamed (`FileEdit`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rename_to: Option<&'a str>,
     /// Evidence links that connect this item to the queried symbol.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     evidence_links: Vec<&'a crate::ir::EvidenceLink>,
@@ -1648,6 +1663,11 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         stderr_handle,
         source_artifact_path,
         source_artifact_hash,
+        repo_relative_path,
+        edit_kind,
+        before_hash,
+        after_hash,
+        rename_to,
         evidence_links,
         ..
     } = record
@@ -1666,6 +1686,11 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         stderr_handle: stderr_handle.as_deref(),
         source_artifact_path: source_artifact_path.as_deref(),
         source_artifact_hash: source_artifact_hash.as_deref(),
+        repo_relative_path: repo_relative_path.as_deref(),
+        edit_kind: edit_kind.as_deref(),
+        before_hash: before_hash.as_deref(),
+        after_hash: after_hash.as_deref(),
+        rename_to: rename_to.as_deref(),
         evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
     })
 }
