@@ -193,7 +193,21 @@ enum ContextSection {
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> SymbolContext<'a> {
-    // Step 1: collect symbol record IDs.
+    // Step 0: collect tombstoned IDs so deleted symbols yield no-match, not
+    // stale context. This mirrors the current-state filter used by the other
+    // query paths (query symbol, query file).
+    let tombstoned_ids: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Tombstone { deleted_id, .. } = r {
+                Some(deleted_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Step 1: collect symbol record IDs, excluding any that have been tombstoned.
     let symbol_ids: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| {
@@ -206,7 +220,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             else {
                 return None;
             };
-            if name.as_deref() == Some(symbol_name) {
+            if name.as_deref() == Some(symbol_name) && !tombstoned_ids.contains(id.as_str()) {
                 Some(id.as_str())
             } else {
                 None
@@ -434,6 +448,11 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
 
 /// Returns `true` for edge labels that cross domain boundaries and therefore
 /// signal a meaningful link to a symbol for the context query.
+///
+/// This is a superset of the previous list: `RelatesTo`, `Contradicts`, and
+/// `Supersedes` are now included because they are permitted cross-domain
+/// evidence-link labels and can legally appear on graph edges between an
+/// agent-memory/project node and a code-graph symbol.
 const fn is_cross_domain_label(label: EdgeLabel) -> bool {
     matches!(
         label,
@@ -448,6 +467,9 @@ const fn is_cross_domain_label(label: EdgeLabel) -> bool {
             | EdgeLabel::ProducedPatch
             | EdgeLabel::ProducedEvidence
             | EdgeLabel::ClosesAcceptanceCriterion
+            | EdgeLabel::RelatesTo
+            | EdgeLabel::Contradicts
+            | EdgeLabel::Supersedes
     )
 }
 

@@ -413,6 +413,35 @@ fn symbol_context_no_match_returns_empty_context_with_is_no_match() {
     assert!(ctx.unresolved.is_empty());
 }
 
+// ── tombstone: deleted symbols yield no-match, not stale context ─────────────
+
+#[test]
+fn symbol_context_tombstoned_symbol_returns_no_match() {
+    let sym_id = "codegraph:v4:deadfn0001symbol".to_owned();
+    let sym = GraphRecord::node(
+        sym_id.clone(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("dead_fn".to_owned()),
+        "fn dead_fn was deleted".to_owned(),
+    );
+    let tombstone = GraphRecord::Tombstone {
+        id: "tombstone:codegraph:v4:deadfn0001".to_owned(),
+        schema_version: 0,
+        deleted_id: sym_id,
+        summary: "symbol removed".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![sym, tombstone];
+    let ctx = symbol_context(&records, "dead_fn");
+    assert!(
+        ctx.is_no_match(),
+        "tombstoned symbol must yield no-match, not stale context"
+    );
+}
+
 // ── backed evidence: present non-symbol evidence link targets are classified ──
 
 #[test]
