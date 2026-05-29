@@ -1469,8 +1469,12 @@ fn query_context_source_facts_carry_record_id_and_path() {
             "every source_fact must have a non-empty record_id"
         );
         let has_path = fact["repo_relative_path"].is_string();
-        let has_commit = fact.get("git_commit").is_some_and(serde_json::Value::is_string);
-        let has_valid_time = fact.get("valid_time").is_some_and(serde_json::Value::is_string);
+        let has_commit = fact
+            .get("git_commit")
+            .is_some_and(serde_json::Value::is_string);
+        let has_valid_time = fact
+            .get("valid_time")
+            .is_some_and(serde_json::Value::is_string);
         assert!(
             has_path || has_commit || has_valid_time,
             "source_fact {} must carry repo_relative_path, git_commit, or valid_time",
@@ -1508,15 +1512,19 @@ fn query_context_observations_carry_provenance_fields() {
         assert!(
             obs.get("provenance_handle")
                 .is_some_and(serde_json::Value::is_string)
-                || obs.get("agent_id").is_some_and(serde_json::Value::is_string),
+                || obs
+                    .get("agent_id")
+                    .is_some_and(serde_json::Value::is_string),
             "every observation must carry a provenance_handle or agent_id"
         );
         assert!(
-            obs.get("observed_at").is_some_and(serde_json::Value::is_string),
+            obs.get("observed_at")
+                .is_some_and(serde_json::Value::is_string),
             "every observation must carry observed_at"
         );
         assert!(
-            obs.get("confidence").is_some_and(serde_json::Value::is_string),
+            obs.get("confidence")
+                .is_some_and(serde_json::Value::is_string),
             "every observation must carry confidence"
         );
     }

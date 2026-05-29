@@ -253,45 +253,70 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
         };
     }
 
-    // Build a lookup map: record_id → record for fast resolution.
+    // Build a lookup map: record_id → record for fast classification checks.
+    // For records with the same stable ID (temporal versions), last-write-wins
+    // is acceptable here because we only use by_id for kind inspection.
+    // Actual resolution of output records uses records.iter() to capture all
+    // versions (see the `resolve` closure below).
     let by_id: std::collections::BTreeMap<&str, &GraphRecord> =
         records.iter().map(|r| (r.id(), r)).collect();
 
     // Step 2: the symbol nodes themselves are source_facts.
     let mut source_facts: BTreeSet<&str> = symbol_ids.clone();
-    // Also include File nodes at the same repo_relative_path as any LIVE symbol
-    // (tombstoned symbols are excluded via symbol_ids).
+
+    // Add co-located File nodes via DEFINES topology edges (primary mechanism).
+    // DEFINES edges are created within a single repository scan, so they
+    // unambiguously identify the correct file even in multi-repo stores.
+    let mut files_added_via_defines = false;
     for record in records {
-        let GraphRecord::Node {
-            id: sym_id,
-            kind: NodeKind::Symbol,
-            name,
-            repo_relative_path: Some(path),
+        if let GraphRecord::Edge {
+            label: EdgeLabel::Defines,
+            source,
+            target,
             ..
         } = record
-        else {
-            continue;
-        };
-        if name.as_deref() != Some(symbol_name) {
-            continue;
+            && symbol_ids.contains(target.as_str())
+        {
+            source_facts.insert(source.as_str());
+            files_added_via_defines = true;
         }
-        if !symbol_ids.contains(sym_id.as_str()) {
-            // Tombstoned or non-matching symbol — skip its file co-location.
-            continue;
-        }
-        // Find File nodes at this path.
-        for candidate in records {
+    }
+
+    // Path-based fallback: only used when no DEFINES edges link a file to this
+    // symbol. Path-matching may produce false positives in multi-repo stores
+    // (different repos sharing identical relative paths), so it is skipped
+    // whenever the topology edges already identified the correct file(s).
+    if !files_added_via_defines {
+        for record in records {
             let GraphRecord::Node {
-                id: file_id,
-                kind: NodeKind::File,
-                repo_relative_path: Some(file_path),
+                id: sym_id,
+                kind: NodeKind::Symbol,
+                name,
+                repo_relative_path: Some(path),
                 ..
-            } = candidate
+            } = record
             else {
                 continue;
             };
-            if file_path == path {
-                source_facts.insert(file_id.as_str());
+            if name.as_deref() != Some(symbol_name) {
+                continue;
+            }
+            if !symbol_ids.contains(sym_id.as_str()) {
+                continue;
+            }
+            for candidate in records {
+                let GraphRecord::Node {
+                    id: file_id,
+                    kind: NodeKind::File,
+                    repo_relative_path: Some(file_path),
+                    ..
+                } = candidate
+                else {
+                    continue;
+                };
+                if file_path == path {
+                    source_facts.insert(file_id.as_str());
+                }
             }
         }
     }
@@ -341,50 +366,50 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     // Callers MUST gate `next_frontier.push(id)` on this return value — only
     // classified nodes should expand the BFS; pushing skipped IDs would allow
     // missing ghost endpoints and sibling codegraph nodes to traverse further.
-    let classify_and_insert =
-        |record_id: &'a str,
-         source_facts: &mut BTreeSet<&'a str>,
-         observations: &mut BTreeSet<&'a str>,
-         project_state: &mut BTreeSet<&'a str>,
-         artifacts: &mut BTreeSet<&'a str>,
-         verification_evidence: &mut BTreeSet<&'a str>| -> bool {
-            if tombstoned_ids.contains(record_id) {
-                return false;
-            }
-            let Some(rec) = by_id.get(record_id) else {
-                return false;
-            };
-            let GraphRecord::Node { kind, .. } = rec else {
-                return false;
-            };
-            match classify_node(*kind) {
-                Some(ContextSection::SourceFact) => {
-                    if seed_ids.contains(record_id) {
-                        source_facts.insert(record_id);
-                        true
-                    } else {
-                        false
-                    }
-                }
-                Some(ContextSection::Observation) => {
-                    observations.insert(record_id);
-                    true
-                }
-                Some(ContextSection::ProjectState) => {
-                    project_state.insert(record_id);
-                    true
-                }
-                Some(ContextSection::Artifact) => {
-                    artifacts.insert(record_id);
-                    true
-                }
-                Some(ContextSection::VerificationEvidence) => {
-                    verification_evidence.insert(record_id);
-                    true
-                }
-                None => false,
-            }
+    let classify_and_insert = |record_id: &'a str,
+                               source_facts: &mut BTreeSet<&'a str>,
+                               observations: &mut BTreeSet<&'a str>,
+                               project_state: &mut BTreeSet<&'a str>,
+                               artifacts: &mut BTreeSet<&'a str>,
+                               verification_evidence: &mut BTreeSet<&'a str>|
+     -> bool {
+        if tombstoned_ids.contains(record_id) {
+            return false;
+        }
+        let Some(rec) = by_id.get(record_id) else {
+            return false;
         };
+        let GraphRecord::Node { kind, .. } = rec else {
+            return false;
+        };
+        match classify_node(*kind) {
+            Some(ContextSection::SourceFact) => {
+                if seed_ids.contains(record_id) {
+                    source_facts.insert(record_id);
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(ContextSection::Observation) => {
+                observations.insert(record_id);
+                true
+            }
+            Some(ContextSection::ProjectState) => {
+                project_state.insert(record_id);
+                true
+            }
+            Some(ContextSection::Artifact) => {
+                artifacts.insert(record_id);
+                true
+            }
+            Some(ContextSection::VerificationEvidence) => {
+                verification_evidence.insert(record_id);
+                true
+            }
+            None => false,
+        }
+    };
 
     // Step 3: bounded BFS traversal — 3 hops beyond seeds.
     //
@@ -416,9 +441,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                     }
                     let candidate = if frontier.contains(source.as_str()) {
                         Some(target.as_str())
-                    } else if frontier.contains(target.as_str())
-                        && !is_forward_only_label(*label)
-                    {
+                    } else if frontier.contains(target.as_str()) && !is_forward_only_label(*label) {
                         Some(source.as_str())
                     } else {
                         None
@@ -572,6 +595,59 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
         }
     }
 
+    // Frontier expansion for backfill discoveries: nodes newly classified by the
+    // backfill (e.g. a Task found via an Observation's evidence_links) were never
+    // in the BFS frontier, so their outgoing cross-domain edges were never scanned.
+    // Run one extra edge pass treating the backfill delta as a frontier so that,
+    // for example, OwnedByTask edges from a backfill-discovered Task can pull in
+    // AcceptanceCriteria that should appear in project_state.
+    let backfill_frontier: BTreeSet<&str> = source_facts
+        .iter()
+        .chain(observations.iter())
+        .chain(project_state.iter())
+        .chain(artifacts.iter())
+        .chain(verification_evidence.iter())
+        .copied()
+        .filter(|id| !visited.contains(*id))
+        .collect();
+
+    if !backfill_frontier.is_empty() {
+        for record in records {
+            if let GraphRecord::Edge {
+                label,
+                source,
+                target,
+                ..
+            } = record
+            {
+                if !is_cross_domain_label(*label) {
+                    continue;
+                }
+                let candidate = if backfill_frontier.contains(source.as_str()) {
+                    Some(target.as_str())
+                } else if backfill_frontier.contains(target.as_str())
+                    && !is_forward_only_label(*label)
+                {
+                    Some(source.as_str())
+                } else {
+                    None
+                };
+                if let Some(id) = candidate
+                    && visited.insert(id)
+                {
+                    classify_and_insert(
+                        id,
+                        &mut source_facts,
+                        &mut observations,
+                        &mut project_state,
+                        &mut artifacts,
+                        &mut verification_evidence,
+                    );
+                }
+            }
+        }
+    }
+
     // Remove symbol records from non-source-fact sections to avoid overlap
     // (a Symbol node classified via edge could end up in the wrong section).
     for sid in &symbol_ids {
@@ -582,10 +658,34 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     }
 
     // Resolve ID sets → sorted record slices.
+    //
+    // Using records.iter() (not by_id) captures ALL records matching each ID,
+    // including multiple temporal versions of the same symbol that share a
+    // stable ID. by_id last-write-wins would silently drop all but one version.
     let resolve = |ids: &BTreeSet<&str>| -> Vec<&'a GraphRecord> {
         let mut out: Vec<&'a GraphRecord> =
-            ids.iter().filter_map(|id| by_id.get(id).copied()).collect();
-        out.sort_by_key(|r| r.id());
+            records.iter().filter(|r| ids.contains(r.id())).collect();
+        out.sort_by(|a, b| {
+            a.id().cmp(b.id()).then_with(|| {
+                let a_commit = if let GraphRecord::Node {
+                    temporal: Some(t), ..
+                } = a
+                {
+                    t.git_commit.as_str()
+                } else {
+                    ""
+                };
+                let b_commit = if let GraphRecord::Node {
+                    temporal: Some(t), ..
+                } = b
+                {
+                    t.git_commit.as_str()
+                } else {
+                    ""
+                };
+                a_commit.cmp(b_commit)
+            })
+        });
         out
     };
 
@@ -593,9 +693,9 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
         symbol_name: symbol_name.to_owned(),
         source_facts: resolve(&source_facts),
         topology_edges: {
-            let mut out: Vec<&'a GraphRecord> = topology_edge_ids
+            let mut out: Vec<&'a GraphRecord> = records
                 .iter()
-                .filter_map(|id| by_id.get(id).copied())
+                .filter(|r| topology_edge_ids.contains(r.id()))
                 .collect();
             out.sort_by_key(|r| r.id());
             out
@@ -663,6 +763,10 @@ const fn is_cross_domain_label(label: EdgeLabel) -> bool {
 /// observations are both validated by the same `CommandRun`, following
 /// `VALIDATED_BY` backward from the run would classify the unrelated
 /// observation as context.
+///
+/// `ClosesAcceptanceCriterion` has schema direction AC → Verification. Making
+/// it forward-only prevents backward traversal from a Verification sink to
+/// unrelated `AcceptanceCriteria` that happen to share the same run.
 const fn is_forward_only_label(label: EdgeLabel) -> bool {
     matches!(
         label,
@@ -672,6 +776,7 @@ const fn is_forward_only_label(label: EdgeLabel) -> bool {
             | EdgeLabel::ProducedPatch
             | EdgeLabel::ExplainsChange
             | EdgeLabel::ReferencesTask
+            | EdgeLabel::ClosesAcceptanceCriterion
     )
 }
 

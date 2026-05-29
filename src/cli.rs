@@ -672,6 +672,10 @@ struct ContextSourceFact<'a> {
 #[derive(Serialize)]
 struct ContextObservation<'a> {
     record_id: &'a str,
+    /// Node kind (`"Observation"`, `"Decision"`, or `"Failure"`).
+    /// Lets consumers distinguish subjective observation types without
+    /// re-inspecting the raw graph.
+    kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<&'a str>,
     /// Provenance handle composed from `agent_id:session_id` when both are present.
@@ -733,6 +737,22 @@ struct ContextLinkedItem<'a> {
     /// New path when the file was renamed (`FileEdit`).
     #[serde(skip_serializing_if = "Option::is_none")]
     rename_to: Option<&'a str>,
+    // ── PatchArtifact-specific fields ────────────────────────────────────────
+    /// Patch validation status (`"valid"`, `"invalid"`, `"pending"`) for `PatchArtifact`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    patch_status: Option<&'a str>,
+    /// Storage handle for raw patch bytes (`PatchArtifact`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    patch_handle: Option<&'a crate::ir::PatchHandle>,
+    /// BLAKE3 hash of the raw patch bytes (`PatchArtifact`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    patch_bytes_hash: Option<&'a str>,
+    /// Repo-relative file paths touched by the patch (`PatchArtifact`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_files: Option<&'a [String]>,
+    /// Human-readable validation summary, redacted by policy (`PatchArtifact`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validation_summary: Option<&'a str>,
     /// Evidence links that connect this item to the queried symbol.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     evidence_links: Vec<&'a crate::ir::EvidenceLink>,
@@ -1622,6 +1642,7 @@ fn context_source_fact(record: &GraphRecord) -> Option<ContextSourceFact<'_>> {
 fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_>> {
     let GraphRecord::Node {
         id,
+        kind,
         text,
         agent_id,
         session_id,
@@ -1640,6 +1661,7 @@ fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_>> {
     };
     Some(ContextObservation {
         record_id: id,
+        kind: kind.as_str(),
         text: text.as_deref(),
         provenance_handle,
         agent_id: agent_id.as_deref(),
@@ -1668,6 +1690,11 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         before_hash,
         after_hash,
         rename_to,
+        patch_status,
+        patch_handle,
+        patch_bytes_hash,
+        target_files,
+        validation_summary,
         evidence_links,
         ..
     } = record
@@ -1691,6 +1718,11 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         before_hash: before_hash.as_deref(),
         after_hash: after_hash.as_deref(),
         rename_to: rename_to.as_deref(),
+        patch_status: patch_status.as_deref(),
+        patch_handle: patch_handle.as_deref(),
+        patch_bytes_hash: patch_bytes_hash.as_deref(),
+        target_files: target_files.as_deref(),
+        validation_summary: validation_summary.as_deref(),
         evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
     })
 }

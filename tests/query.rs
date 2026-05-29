@@ -497,8 +497,14 @@ fn symbol_context_edge_linked_node_backing_evidence_is_classified() {
         .verification_evidence
         .iter()
         .any(|r| r.id() == ver_id.as_str());
-    assert!(ver_in_evidence, "the specific verification record must be in verification_evidence");
-    assert!(ctx.unresolved.is_empty(), "no unresolved — all targets are present");
+    assert!(
+        ver_in_evidence,
+        "the specific verification record must be in verification_evidence"
+    );
+    assert!(
+        ctx.unresolved.is_empty(),
+        "no unresolved — all targets are present"
+    );
 }
 
 // ── tombstone: deleted symbols yield no-match, not stale context ─────────────
@@ -882,7 +888,13 @@ fn symbol_context_excludes_tombstoned_context_records() {
     let sym = ctx_symbol(sym_id, "tomb_ctx_fn", "src/lib.rs", 1);
 
     // Use the raw key (not the pre-hashed ID) so ctx_observation hashes once.
-    let obs = ctx_observation("tomb_ctx_obs1", "should be hidden", sym_id, "MENTIONS_SYMBOL", "1.0");
+    let obs = ctx_observation(
+        "tomb_ctx_obs1",
+        "should be hidden",
+        sym_id,
+        "MENTIONS_SYMBOL",
+        "1.0",
+    );
     let obs_id = obs.id().to_owned();
     let obs_tombstone = GraphRecord::Tombstone {
         id: "tombstone:obs_ctx:001".to_owned(),
@@ -988,15 +1000,14 @@ fn symbol_context_temporal_symbol_survives_later_tombstone() {
     // A tombstone for the same stable ID means the symbol was deleted in the
     // current state, but the historical snapshot should still be queryable.
     let sym_id = "codegraph:v4:temporal_sym_hist001";
-    let sym = ctx_symbol(sym_id, "hist_fn", "src/hist.rs", 1)
-        .with_temporal(TemporalMetadata {
-            git_commit: "aabbccdd".to_owned(),
-            git_parent_commits: vec![],
-            valid_time: "2026-01-01T00:00:00Z".to_owned(),
-            author_time: None,
-            observed_at: "2026-01-01T00:00:00Z".to_owned(),
-            valid_time_source: None,
-        });
+    let sym = ctx_symbol(sym_id, "hist_fn", "src/hist.rs", 1).with_temporal(TemporalMetadata {
+        git_commit: "aabbccdd".to_owned(),
+        git_parent_commits: vec![],
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: None,
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
+    });
     let tombstone = GraphRecord::Tombstone {
         id: "tombstone:temporal:001".to_owned(),
         schema_version: 0,
@@ -1087,12 +1098,14 @@ fn symbol_context_three_hop_bfs_discovers_verification_via_ac() {
         None,
         "task owns AC".to_owned(),
     );
+    // Schema direction: AC (source) --CLOSES_ACCEPTANCE_CRITERION--> Verification (target).
+    // Forward traversal from AC (hop 2 frontier) discovers Ver (hop 3).
     let closes_edge = GraphRecord::edge(
         EdgeLabel::ClosesAcceptanceCriterion,
-        ver_id.clone(),
         ac_id.clone(),
+        ver_id.clone(),
         None,
-        "verification closes AC".to_owned(),
+        "AC closed by verification".to_owned(),
     );
 
     let records = vec![sym, task, ac, ver, owned_edge, closes_edge];
@@ -1210,19 +1223,33 @@ fn symbol_context_shared_validation_run_does_not_pull_sibling_observations() {
         "sibling_obs validated by same run".to_owned(),
     );
 
-    let records = vec![sym, linked_obs, sibling_obs, run, sym_edge, linked_run_edge, sibling_run_edge];
+    let records = vec![
+        sym,
+        linked_obs,
+        sibling_obs,
+        run,
+        sym_edge,
+        linked_run_edge,
+        sibling_run_edge,
+    ];
     let ctx = symbol_context(&records, "sharedrun_fn");
 
     assert!(
-        ctx.observations.iter().any(|r| r.id() == linked_obs_id.as_str()),
+        ctx.observations
+            .iter()
+            .any(|r| r.id() == linked_obs_id.as_str()),
         "linked_obs must be in observations (linked to symbol)"
     );
     assert!(
-        ctx.verification_evidence.iter().any(|r| r.id() == run_id.as_str()),
+        ctx.verification_evidence
+            .iter()
+            .any(|r| r.id() == run_id.as_str()),
         "run must be in verification_evidence (backs linked_obs)"
     );
     assert!(
-        ctx.observations.iter().all(|r| r.id() != sibling_obs_id.as_str()),
+        ctx.observations
+            .iter()
+            .all(|r| r.id() != sibling_obs_id.as_str()),
         "sibling_obs must NOT appear — it only shares the run, not the symbol link"
     );
 }
@@ -1363,7 +1390,9 @@ fn symbol_context_tombstoned_context_node_does_not_expand_frontier() {
         "tombstoned observation must not appear in context"
     );
     assert!(
-        ctx.verification_evidence.iter().all(|r| r.id() != ver_id.as_str()),
+        ctx.verification_evidence
+            .iter()
+            .all(|r| r.id() != ver_id.as_str()),
         "verification reachable only through tombstoned obs must not appear in context"
     );
 }
@@ -1409,7 +1438,9 @@ fn symbol_context_topology_edges_include_defines_edge() {
         "DEFINES edge must appear in topology_edges"
     );
     assert!(
-        ctx.topology_edges.iter().any(|r| r.id() == defines_edge_id.as_str()),
+        ctx.topology_edges
+            .iter()
+            .any(|r| r.id() == defines_edge_id.as_str()),
         "the specific DEFINES edge must be in topology_edges"
     );
 }
@@ -1476,7 +1507,9 @@ fn symbol_context_missing_edge_endpoint_does_not_expand_frontier() {
     let ctx = symbol_context(&records, "ghost_ep_fn");
 
     assert!(
-        ctx.observations.iter().all(|r| r.id() != unrelated_id.as_str()),
+        ctx.observations
+            .iter()
+            .all(|r| r.id() != unrelated_id.as_str()),
         "observation linked only via missing ghost endpoint must not appear in context"
     );
 }
@@ -1499,11 +1532,23 @@ fn symbol_context_skipped_codegraph_target_does_not_expand_frontier() {
     let sibling_sym = ctx_symbol(sibling_id, "skipfrontier_fn_t", "src/t.rs", 1);
 
     // Obs O: linked to S via evidence_link (will be classified in hop 1)
-    let obs_linked = ctx_observation("skipfrontier_obs_o", "obs about S", sym_s_id, "MENTIONS_SYMBOL", "0.9");
+    let obs_linked = ctx_observation(
+        "skipfrontier_obs_o",
+        "obs about S",
+        sym_s_id,
+        "MENTIONS_SYMBOL",
+        "0.9",
+    );
     let obs_linked_id = obs_linked.id().to_owned();
 
     // Obs Q: linked to T via evidence_link (must NOT appear when querying S)
-    let obs_unrelated = ctx_observation("skipfrontier_obs_q", "obs about T only", sibling_id, "MENTIONS_SYMBOL", "0.8");
+    let obs_unrelated = ctx_observation(
+        "skipfrontier_obs_q",
+        "obs about T only",
+        sibling_id,
+        "MENTIONS_SYMBOL",
+        "0.8",
+    );
     let obs_unrelated_id = obs_unrelated.id().to_owned();
 
     // Edge O --MENTIONS_SYMBOL--> T (O points to sibling T; T should be skipped)
@@ -1515,19 +1560,393 @@ fn symbol_context_skipped_codegraph_target_does_not_expand_frontier() {
         "obs_o also mentions sym_t".to_owned(),
     );
 
-    let records = vec![sym_s, sibling_sym, obs_linked, obs_unrelated, linked_sibling_edge];
+    let records = vec![
+        sym_s,
+        sibling_sym,
+        obs_linked,
+        obs_unrelated,
+        linked_sibling_edge,
+    ];
     let ctx = symbol_context(&records, "skipfrontier_fn_s");
 
     assert!(
-        ctx.observations.iter().any(|r| r.id() == obs_linked_id.as_str()),
+        ctx.observations
+            .iter()
+            .any(|r| r.id() == obs_linked_id.as_str()),
         "obs_o must be in observations (linked to sym_s)"
     );
     assert!(
-        ctx.observations.iter().all(|r| r.id() != obs_unrelated_id.as_str()),
+        ctx.observations
+            .iter()
+            .all(|r| r.id() != obs_unrelated_id.as_str()),
         "obs_q must NOT appear — it is only linked to sibling sym_t, not to sym_s"
     );
     assert!(
         ctx.source_facts.iter().all(|r| r.id() != sibling_id),
         "sibling sym_t must not appear in source_facts"
+    );
+}
+
+// ── Finding: ClosesAcceptanceCriterion must be forward-only ───────────────────
+//
+// Schema direction: AC --CLOSES_ACCEPTANCE_CRITERION--> Verification.
+// (AC is the source; Verification is the closing evidence target.)
+//
+// Making this forward-only prevents backward traversal from Verification
+// to unrelated ACs that happen to share the same Verification run.
+
+#[test]
+fn symbol_context_closes_ac_is_forward_only() {
+    // Symbol S
+    // Obs --MENTIONS_SYMBOL edge--> S (hop 1)
+    // Obs --VALIDATED_BY edge--> Run  (hop 2: Run discovered)
+    // AC2 (source) --CLOSES_AC--> Run (target): unrelated AC that closes the same Run
+    //
+    // Without the forward-only guard, hop 3 traverses backward from Run through
+    // CLOSES_ACCEPTANCE_CRITERION and classifies AC2 — even though AC2 has no link to S.
+    let sym_id = "codegraph:v4:closes_ac_fwd_sym001";
+    let sym = ctx_symbol(sym_id, "closes_ac_fwd_fn", "src/lib.rs", 1);
+
+    let obs_id = agent_memory_stable_id(&["obs", "closes_ac_fwd_obs"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "observation about closes_ac_fwd_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+    }
+
+    let run_id = verification_stable_id(&["run", "closes_ac_fwd_run"]);
+    let run = GraphRecord::node(
+        run_id.clone(),
+        NodeKind::CommandRun,
+        None,
+        None,
+        None,
+        "command run shared with unrelated AC".to_owned(),
+    );
+
+    let ac2_id = aletheia_egregore::ir::project_stable_id(&["ac", "closes_ac_fwd_unrelated_ac"]);
+    let ac2 = GraphRecord::node(
+        ac2_id.clone(),
+        NodeKind::AcceptanceCriterion,
+        None,
+        None,
+        Some("Unrelated AC closed by same run".to_owned()),
+        "Unrelated AC".to_owned(),
+    );
+
+    // Obs --MENTIONS_SYMBOL edge--> S
+    let sym_edge = GraphRecord::agent_memory_edge(
+        EdgeLabel::MentionsSymbol,
+        obs_id.clone(),
+        sym_id.to_owned(),
+        Some("1.0".to_owned()),
+        "obs mentions closes_ac_fwd_fn".to_owned(),
+    );
+    // Obs --VALIDATED_BY edge--> Run (forward-only: Obs → Run, not Run → Obs)
+    let val_edge = GraphRecord::edge(
+        EdgeLabel::ValidatedBy,
+        obs_id.clone(),
+        run_id.clone(),
+        None,
+        "obs validated by run".to_owned(),
+    );
+    // AC2 (source) --CLOSES_ACCEPTANCE_CRITERION--> Run (target)
+    // Schema direction: AC is source, Verification is target.
+    // With forward-only: when Run is in frontier (hop 2), backward traversal to AC2
+    // is blocked, so AC2 must NOT appear in project_state.
+    let closes_edge = GraphRecord::edge(
+        EdgeLabel::ClosesAcceptanceCriterion,
+        ac2_id.clone(),
+        run_id.clone(),
+        None,
+        "unrelated AC closes same run".to_owned(),
+    );
+
+    let records = vec![sym, obs, run, ac2, sym_edge, val_edge, closes_edge];
+    let ctx = symbol_context(&records, "closes_ac_fwd_fn");
+
+    assert!(
+        ctx.observations.iter().any(|r| r.id() == obs_id.as_str()),
+        "obs must be in observations"
+    );
+    assert!(
+        ctx.verification_evidence
+            .iter()
+            .any(|r| r.id() == run_id.as_str()),
+        "run must be in verification_evidence"
+    );
+    assert!(
+        ctx.project_state.iter().all(|r| r.id() != ac2_id.as_str()),
+        "unrelated AC2 must NOT appear — it only shares the Run, not the symbol link"
+    );
+}
+
+// ── Finding: backfill discoveries must expand the BFS frontier ────────────────
+//
+// Nodes classified via the edge arm have their evidence_links scanned in
+// post-processing backfill. If backfill classifies a Task T (discovered via
+// Obs's evidence_links), T's outgoing edges (e.g. OwnedByTask → AC) must be
+// traversed so the AC appears in project_state.
+
+#[test]
+fn symbol_context_backfill_task_expands_to_ac() {
+    // Symbol S
+    // Obs --MENTIONS_SYMBOL edge--> S  (Obs classified via edge arm, hop 1)
+    // Obs --evidence_link MENTIONS_SYMBOL--> T  (Task T classified via backfill)
+    // Task T --OWNED_BY_TASK edge--> AC  (AC must be discovered via extra edge pass)
+    let sym_id = "codegraph:v4:backfill_expand_sym001";
+    let sym = ctx_symbol(sym_id, "backfill_expand_fn", "src/lib.rs", 1);
+
+    // Task T linked to symbol via Obs evidence_link
+    let task_id = aletheia_egregore::ir::project_stable_id(&["task", "backfill_expand_task"]);
+    let mut task = GraphRecord::node(
+        task_id.clone(),
+        NodeKind::Task,
+        None,
+        None,
+        Some("Backfill expand task".to_owned()),
+        "Task: Backfill expand task".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut title,
+        ref mut schema_version,
+        ..
+    } = task
+    {
+        *title = Some("Backfill expand task".to_owned());
+        *schema_version = aletheia_egregore::ir::PROJECT_SCHEMA_VERSION;
+    }
+
+    // AC owned by Task, no direct link to symbol
+    let ac_id = aletheia_egregore::ir::project_stable_id(&["ac", "backfill_expand_ac"]);
+    let ac = GraphRecord::node(
+        ac_id.clone(),
+        NodeKind::AcceptanceCriterion,
+        None,
+        None,
+        Some("AC from backfill expansion".to_owned()),
+        "AC from backfill expansion".to_owned(),
+    );
+
+    // Obs: linked to symbol via edge AND has evidence_link to Task T
+    let obs_id = agent_memory_stable_id(&["obs", "backfill_expand_obs"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "observation about backfill_expand_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ref mut evidence_links,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+        // evidence_link to Task T (this is what backfill should discover)
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(task_id.clone()),
+            target_domain: "project".to_owned(),
+            relation: "REFERENCES_TASK".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    // Edge: Obs --MENTIONS_SYMBOL--> S (classifies Obs via edge arm)
+    let obs_sym_edge = GraphRecord::agent_memory_edge(
+        EdgeLabel::MentionsSymbol,
+        obs_id.clone(),
+        sym_id.to_owned(),
+        Some("1.0".to_owned()),
+        "obs mentions backfill_expand_fn".to_owned(),
+    );
+
+    // Edge: Task T --OWNED_BY_TASK--> AC (AC is discovered via extra edge pass on backfill results)
+    let owned_edge = GraphRecord::edge(
+        EdgeLabel::OwnedByTask,
+        task_id.clone(),
+        ac_id.clone(),
+        None,
+        "task owns AC".to_owned(),
+    );
+
+    let records = vec![sym, obs, task, ac, obs_sym_edge, owned_edge];
+    let ctx = symbol_context(&records, "backfill_expand_fn");
+
+    assert!(
+        ctx.observations.iter().any(|r| r.id() == obs_id.as_str()),
+        "obs must be in observations (edge arm)"
+    );
+    assert!(
+        ctx.project_state.iter().any(|r| r.id() == task_id.as_str()),
+        "task must be in project_state (discovered via backfill from obs evidence_link)"
+    );
+    assert!(
+        ctx.project_state.iter().any(|r| r.id() == ac_id.as_str()),
+        "AC must be in project_state via extra edge pass on backfill-discovered task"
+    );
+}
+
+// ── Finding: all temporal versions of a symbol must appear in source_facts ────
+//
+// When a scan-history graph contains multiple temporal records with the same
+// stable ID (different commits), all versions must appear in source_facts.
+// The BTreeMap by_id lookup (last-write-wins) previously silenced all but one.
+
+#[test]
+fn symbol_context_all_temporal_versions_appear_in_source_facts() {
+    let sym_id = "codegraph:v4:multi_temporal_sym";
+    let sym_v1 = ctx_symbol(sym_id, "multi_temporal_fn", "src/temporal.rs", 1).with_temporal(
+        TemporalMetadata {
+            git_commit: "aaaa1111".to_owned(),
+            git_parent_commits: vec![],
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: None,
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        },
+    );
+    let sym_v2 = ctx_symbol(sym_id, "multi_temporal_fn", "src/temporal.rs", 1).with_temporal(
+        TemporalMetadata {
+            git_commit: "bbbb2222".to_owned(),
+            git_parent_commits: vec![],
+            valid_time: "2026-02-01T00:00:00Z".to_owned(),
+            author_time: None,
+            observed_at: "2026-02-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        },
+    );
+
+    let records = vec![sym_v1, sym_v2];
+    let ctx = symbol_context(&records, "multi_temporal_fn");
+
+    assert!(
+        !ctx.is_no_match(),
+        "multi-temporal symbol must not be no_match"
+    );
+    assert_eq!(
+        ctx.source_facts.len(),
+        2,
+        "both temporal versions must appear in source_facts; got {}",
+        ctx.source_facts.len()
+    );
+    let commits: Vec<&str> = ctx
+        .source_facts
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Node {
+                temporal: Some(t), ..
+            } = r
+            {
+                Some(t.git_commit.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        commits.contains(&"aaaa1111"),
+        "v1 commit must be in source_facts"
+    );
+    assert!(
+        commits.contains(&"bbbb2222"),
+        "v2 commit must be in source_facts"
+    );
+}
+
+// ── Finding: multi-repo file co-location must use DEFINES edges ───────────────
+//
+// Path-based co-location adds every File node sharing the same
+// `repo_relative_path`, even from different repositories. When DEFINES edges
+// are present they unambiguously identify the correct file, so they must be
+// used as the primary mechanism. Only fall back to path-matching when no
+// DEFINES edges are found.
+
+#[test]
+fn symbol_context_multi_repo_file_excluded_without_defines_edge() {
+    // Symbol S at "src/lib.rs" (repo A)
+    // File A at "src/lib.rs" with DEFINES edge to S  (correct, same repo A)
+    // File B at "src/lib.rs" WITHOUT a DEFINES edge to S (different repo B)
+    //
+    // Since File A has a DEFINES edge to S, the primary DEFINES-based lookup
+    // is used. File B must NOT appear in source_facts.
+    let sym_id = "codegraph:v4:multirepo_sym001";
+    let sym = ctx_symbol(sym_id, "multirepo_fn", "src/lib.rs", 1);
+
+    let correct_file_id = aletheia_egregore::ir::stable_id(&["file", "repoa:src/lib.rs"]);
+    let correct_file = GraphRecord::node(
+        correct_file_id.clone(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        None,
+        "src/lib.rs (repo A)".to_owned(),
+    );
+
+    let foreign_file_id = aletheia_egregore::ir::stable_id(&["file", "repob:src/lib.rs"]);
+    let foreign_file = GraphRecord::node(
+        foreign_file_id.clone(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        None,
+        "src/lib.rs (repo B)".to_owned(),
+    );
+
+    // DEFINES edge: correct_file → Symbol S (repo A only)
+    let defines_edge = GraphRecord::edge(
+        EdgeLabel::Defines,
+        correct_file_id.clone(),
+        sym_id.to_owned(),
+        None,
+        "file A defines symbol".to_owned(),
+    );
+
+    let records = vec![sym, correct_file, foreign_file, defines_edge];
+    let ctx = symbol_context(&records, "multirepo_fn");
+
+    assert!(
+        ctx.source_facts
+            .iter()
+            .any(|r| r.id() == correct_file_id.as_str()),
+        "correct_file must be in source_facts (has DEFINES edge to symbol)"
+    );
+    assert!(
+        ctx.source_facts
+            .iter()
+            .all(|r| r.id() != foreign_file_id.as_str()),
+        "foreign_file must NOT be in source_facts (no DEFINES edge; different repo)"
     );
 }
