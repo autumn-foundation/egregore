@@ -1127,6 +1127,7 @@ fn symbol_context_three_hop_bfs_discovers_verification_via_ac() {
 
 // ── Finding: shared evidence sink must not fan out to sibling observations ────
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn symbol_context_shared_validation_run_does_not_pull_sibling_observations() {
     // ObsA --MENTIONS_SYMBOL(edge)--> SymA  (hop 1: ObsA discovered)
@@ -1948,5 +1949,276 @@ fn symbol_context_multi_repo_file_excluded_without_defines_edge() {
             .iter()
             .all(|r| r.id() != foreign_file_id.as_str()),
         "foreign_file must NOT be in source_facts (no DEFINES edge; different repo)"
+    );
+}
+
+// ── Finding: evidence_link arm must only match seed_ids, not any frontier node ──
+//
+// The evidence_link arm fires when a node's evidence_links point at the current
+// frontier. When a shared Verification run enters the frontier via a VALIDATED_BY
+// edge traversal, a sibling observation that cites only that run via evidence_links
+// must NOT be pulled in — it has no direct link to the queried symbol/file seeds.
+// Restrict the arm to seed_ids only.
+
+#[allow(clippy::too_many_lines)]
+#[test]
+fn symbol_context_evidence_link_to_shared_run_not_pulled_in_via_evidence_link_arm() {
+    // linked_obs --MENTIONS_SYMBOL(edge)--> S   (hop 1: linked_obs via edge arm)
+    // linked_obs --VALIDATED_BY(edge)----> Run  (hop 2: Run in frontier)
+    // sibling_obs.evidence_links = [{target_record_id: run_id}]
+    //
+    // With frontier check: sibling_obs fires (run_id in frontier after hop 2).
+    // With seed_ids check: sibling_obs does NOT fire (run_id not in seed_ids).
+    let sym_id = "codegraph:v4:ev_link_fwd_sym001";
+    let sym = ctx_symbol(sym_id, "ev_link_fwd_fn", "src/lib.rs", 1);
+
+    let linked_obs_id = agent_memory_stable_id(&["obs", "ev_link_fwd_obs_linked"]);
+    let mut linked_obs = GraphRecord::node(
+        linked_obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "observation about ev_link_fwd_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ..
+    } = linked_obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+    }
+
+    let run_id = aletheia_egregore::ir::verification_stable_id(&["run", "ev_link_fwd_run"]);
+    let run = GraphRecord::node(
+        run_id.clone(),
+        NodeKind::CommandRun,
+        None,
+        None,
+        None,
+        "command run shared between linked and sibling obs".to_owned(),
+    );
+
+    // sibling_obs cites only the run via an evidence_link — no link to the symbol.
+    let sibling_obs_id = agent_memory_stable_id(&["obs", "ev_link_fwd_obs_sibling"]);
+    let mut sibling_obs = GraphRecord::node(
+        sibling_obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "sibling observation that cites only the run, not the symbol".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ref mut evidence_links,
+        ..
+    } = sibling_obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.8".to_owned());
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(run_id.clone()),
+            target_domain: "verification".to_owned(),
+            relation: "VALIDATED_BY".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    // linked_obs --MENTIONS_SYMBOL edge--> S
+    let sym_edge = GraphRecord::agent_memory_edge(
+        EdgeLabel::MentionsSymbol,
+        linked_obs_id.clone(),
+        sym_id.to_owned(),
+        Some("1.0".to_owned()),
+        "linked_obs mentions ev_link_fwd_fn".to_owned(),
+    );
+    // linked_obs --VALIDATED_BY edge--> Run
+    let val_edge = GraphRecord::edge(
+        EdgeLabel::ValidatedBy,
+        linked_obs_id.clone(),
+        run_id.clone(),
+        None,
+        "linked_obs validated by run".to_owned(),
+    );
+
+    let records = vec![sym, linked_obs, sibling_obs, run, sym_edge, val_edge];
+    let ctx = symbol_context(&records, "ev_link_fwd_fn");
+
+    assert!(
+        ctx.observations
+            .iter()
+            .any(|r| r.id() == linked_obs_id.as_str()),
+        "linked_obs must be in observations (linked to symbol via edge)"
+    );
+    assert!(
+        ctx.verification_evidence
+            .iter()
+            .any(|r| r.id() == run_id.as_str()),
+        "run must be in verification_evidence"
+    );
+    assert!(
+        ctx.observations
+            .iter()
+            .all(|r| r.id() != sibling_obs_id.as_str()),
+        "sibling_obs must NOT appear — its evidence_link targets only the run, not the symbol"
+    );
+}
+
+// ── Finding: triple-based evidence links must surface as unresolved ────────────
+//
+// An EvidenceLink may carry (target_repo_relative_path, target_span,
+// target_git_commit) instead of target_record_id when the writer cannot
+// compute the stable hash. Such links must be surfaced in `unresolved` so
+// consumers can diagnose the absent target, rather than silently discarded.
+
+#[test]
+fn symbol_context_triple_evidence_link_surfaced_as_unresolved() {
+    // Obs has two evidence_links:
+    //   1. target_record_id = sym_id (present seed) — normal resolved link
+    //   2. target_repo_relative_path + target_git_commit (triple form, no target_record_id)
+    //
+    // The triple link must appear in unresolved with a constructed handle.
+    let sym_id = agent_memory_stable_id(&["sym", "triple_ev_link_sym"]);
+    let sym = GraphRecord::node(
+        sym_id.clone(),
+        NodeKind::Symbol,
+        Some("src/triple.rs".to_owned()),
+        None,
+        Some("triple_ev_fn".to_owned()),
+        "fn triple_ev_fn".to_owned(),
+    );
+
+    let obs_id = agent_memory_stable_id(&["obs", "triple_ev_obs"]);
+    let mut obs = GraphRecord::node(
+        obs_id,
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "observation with triple evidence link".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![
+            // Resolved link: points at the symbol seed
+            EvidenceLink {
+                target_record_id: Some(sym_id),
+                target_domain: "codegraph".to_owned(),
+                relation: "MENTIONS_SYMBOL".to_owned(),
+                confidence: "0.9".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            },
+            // Triple-based link: no target_record_id, uses path+commit form
+            EvidenceLink {
+                target_record_id: None,
+                target_domain: "codegraph".to_owned(),
+                relation: "MENTIONS_SYMBOL".to_owned(),
+                confidence: "0.7".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: Some("src/other.rs".to_owned()),
+                target_span: None,
+                target_git_commit: Some("deadbeef".to_owned()),
+            },
+        ]);
+    }
+
+    let records = vec![sym, obs];
+    let ctx = symbol_context(&records, "triple_ev_fn");
+
+    assert!(
+        !ctx.observations.is_empty(),
+        "observation must be in observations"
+    );
+    assert!(
+        !ctx.unresolved.is_empty(),
+        "triple-based evidence link must surface as unresolved"
+    );
+    let has_triple_handle = ctx
+        .unresolved
+        .iter()
+        .any(|u| u.target_handle.contains("src/other.rs") && u.target_handle.contains("deadbeef"));
+    assert!(
+        has_triple_handle,
+        "unresolved entry must carry path+commit handle; got: {:?}",
+        ctx.unresolved
+    );
+}
+
+// ── Finding: DEFINES edge with absent file source must not seed source_facts ───
+//
+// When a DEFINES edge references a file node that is absent from the current
+// graph slice (stale edge from a previous scan), adding its source ID to
+// source_facts and therefore seed_ids can cause unrelated cross-domain edges
+// that happen to reference that ghost ID to pull in unrelated context.
+// Verify that the source is a live File node before seeding.
+
+#[test]
+fn symbol_context_defines_edge_absent_file_source_not_in_source_facts() {
+    // Symbol S at "src/lib.rs"
+    // DEFINES edge: ghost_file_id --DEFINES--> S
+    // No File node record for ghost_file_id exists in the records slice.
+    // No other files in the slice.
+    //
+    // Without the fix: ghost_file_id ends up in source_facts/seed_ids.
+    // With the fix: DEFINES scan skips the absent source; files_added_via_defines
+    // stays false; path-based fallback also finds no File node → S is the only
+    // record in source_facts.
+    let sym_id = "codegraph:v4:absent_file_sym001";
+    let sym = ctx_symbol(sym_id, "absent_file_fn", "src/lib.rs", 1);
+
+    let ghost_file_id = "codegraph:v4:ghost_file_absent";
+
+    let defines_edge = GraphRecord::edge(
+        EdgeLabel::Defines,
+        ghost_file_id.to_owned(),
+        sym_id.to_owned(),
+        None,
+        "stale DEFINES edge to absent file".to_owned(),
+    );
+
+    let records = vec![sym, defines_edge];
+    let ctx = symbol_context(&records, "absent_file_fn");
+
+    assert!(
+        !ctx.is_no_match(),
+        "symbol must be found even with stale DEFINES edge"
+    );
+    assert!(
+        ctx.source_facts.iter().all(|r| r.id() != ghost_file_id),
+        "ghost file ID must NOT appear in source_facts"
+    );
+    assert_eq!(
+        ctx.source_facts.len(),
+        1,
+        "only the symbol itself should be in source_facts; got: {:?}",
+        ctx.source_facts.iter().map(|r| r.id()).collect::<Vec<_>>()
     );
 }

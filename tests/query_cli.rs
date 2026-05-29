@@ -1619,6 +1619,109 @@ fn query_context_stable_ordering_across_repeated_calls() {
 }
 
 // ---------------------------------------------------------------------------
+// query context — task body_handle appears in project_state JSON
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_context_task_body_handle_in_project_state() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("task_body.jsonl");
+
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "body_handle_fn"]);
+    let sym = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 0,
+            end_byte: 100,
+            start_line: 5,
+            end_line: 15,
+        },
+        "body_handle_fn".to_owned(),
+        "fn body_handle_fn".to_owned(),
+    );
+
+    let task_id = aletheia_egregore::ir::project_stable_id(&["task", "body_handle_task"]);
+    let mut task = GraphRecord::node(
+        task_id,
+        NodeKind::Task,
+        None,
+        None,
+        Some("Implement body_handle_fn".to_owned()),
+        "Task: Implement body_handle_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut title,
+        ref mut evidence_links,
+        ref mut schema_version,
+        ref mut body_handle,
+        ..
+    } = task
+    {
+        *title = Some("Implement body_handle_fn".to_owned());
+        *schema_version = aletheia_egregore::ir::PROJECT_SCHEMA_VERSION;
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(sym_id),
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+        *body_handle = Some(Box::new(aletheia_egregore::ir::OutputHandle {
+            inline: Some("Add error handling and retry logic.".to_owned()),
+            hash: "aabbccdd".to_owned(),
+            bytes: 35,
+        }));
+    }
+
+    let mut graph = aletheia_egregore::ir::Graph::new();
+    graph.push(sym);
+    graph.push(task);
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    let output = egregore()
+        .args(["query", "context", "body_handle_fn", "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output).expect("stdout must be valid JSON");
+
+    let project_state = parsed["project_state"]
+        .as_array()
+        .expect("project_state must be array");
+
+    let task_item = project_state
+        .iter()
+        .find(|item| item["kind"].as_str() == Some("Task"))
+        .expect("Task must be in project_state");
+
+    assert!(
+        task_item.get("body_handle").is_some(),
+        "body_handle must be present in Task project_state item; got: {task_item}"
+    );
+    assert_eq!(
+        task_item["body_handle"]["hash"].as_str(),
+        Some("aabbccdd"),
+        "body_handle.hash must match"
+    );
+    assert_eq!(
+        task_item["body_handle"]["inline"].as_str(),
+        Some("Add error handling and retry logic."),
+        "body_handle.inline must match"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // query context — missing graph file exits non-zero
 // ---------------------------------------------------------------------------
 

@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use chrono::DateTime;
 
-use crate::ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata};
+use crate::ir::{EdgeLabel, EvidenceLink, GraphRecord, NodeKind, SemanticDriftMetadata};
 
 /// Finds a symbol record by name at a specific Git commit.
 ///
@@ -267,6 +267,9 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     // Add co-located File nodes via DEFINES topology edges (primary mechanism).
     // DEFINES edges are created within a single repository scan, so they
     // unambiguously identify the correct file even in multi-repo stores.
+    // Guard: only seed a file if its node is present AND not tombstoned.
+    // Absent or tombstoned file sources from stale DEFINES edges would pollute
+    // seed_ids and could pull in unrelated cross-domain context.
     let mut files_added_via_defines = false;
     for record in records {
         if let GraphRecord::Edge {
@@ -276,6 +279,16 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             ..
         } = record
             && symbol_ids.contains(target.as_str())
+            && !tombstoned_ids.contains(source.as_str())
+            && by_id.get(source.as_str()).is_some_and(|r| {
+                matches!(
+                    *r,
+                    GraphRecord::Node {
+                        kind: NodeKind::File,
+                        ..
+                    }
+                )
+            })
         {
             source_facts.insert(source.as_str());
             files_added_via_defines = true;
@@ -479,11 +492,16 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                         visited.insert(node_id.as_str());
                         continue;
                     }
-                    // Classify if any evidence link targets the current frontier.
+                    // Classify if any evidence link directly targets a symbol/file seed.
+                    // Using seed_ids (not frontier) prevents shared verification sinks
+                    // that entered the frontier via edge traversal from causing sibling
+                    // observations to be pulled in via their evidence_links. The edge arm
+                    // handles multi-hop traversal; this arm is for direct symbol/file
+                    // citations.
                     let links_to_frontier = links.iter().any(|link| {
                         link.target_record_id
                             .as_deref()
-                            .is_some_and(|tid| frontier.contains(tid))
+                            .is_some_and(|tid| seed_ids.contains(tid))
                     });
                     if links_to_frontier {
                         let was_classified = classify_and_insert(
@@ -501,6 +519,8 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
 
                         // Scan backing evidence_links: present unvisited targets are
                         // backing evidence; missing targets go to unresolved (AC5).
+                        // Triple-based links (no target_record_id) are also surfaced
+                        // as unresolved so consumers can diagnose absent targets.
                         for link in links {
                             if let Some(target_id) = &link.target_record_id {
                                 if present_ids.contains(target_id.as_str())
@@ -526,6 +546,13 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                                         target_domain: link.target_domain.clone(),
                                     });
                                 }
+                            } else if let Some(handle) = evidence_link_triple_handle(link) {
+                                unresolved.push(UnresolvedRef {
+                                    source_record_id: node_id.clone(),
+                                    target_handle: handle,
+                                    relation: link.relation.clone(),
+                                    target_domain: link.target_domain.clone(),
+                                });
                             }
                         }
                     }
@@ -591,6 +618,13 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                         target_domain: link.target_domain.clone(),
                     });
                 }
+            } else if let Some(handle) = evidence_link_triple_handle(link) {
+                unresolved.push(UnresolvedRef {
+                    source_record_id: nid.clone(),
+                    target_handle: handle,
+                    relation: link.relation.clone(),
+                    target_domain: link.target_domain.clone(),
+                });
             }
         }
     }
@@ -778,6 +812,24 @@ const fn is_forward_only_label(label: EdgeLabel) -> bool {
             | EdgeLabel::ReferencesTask
             | EdgeLabel::ClosesAcceptanceCriterion
     )
+}
+
+/// Constructs an unresolved-ref handle string from the triple fields of an
+/// `EvidenceLink` that has no `target_record_id`.
+///
+/// Returns `None` when none of the triple fields are present (link is unusable).
+/// Format: `{path}:{start}..{end}@{commit}` when all fields present; subsets
+/// when only some are available.
+fn evidence_link_triple_handle(link: &EvidenceLink) -> Option<String> {
+    let path = link.target_repo_relative_path.as_deref()?;
+    Some(match (&link.target_span, &link.target_git_commit) {
+        (Some(span), Some(commit)) => {
+            format!("{path}:{}..{}@{commit}", span.start_line, span.end_line)
+        }
+        (Some(span), None) => format!("{path}:{}..{}", span.start_line, span.end_line),
+        (None, Some(commit)) => format!("{path}@{commit}"),
+        (None, None) => path.to_owned(),
+    })
 }
 
 fn semantic_drift(record: &GraphRecord) -> Option<&SemanticDriftMetadata> {

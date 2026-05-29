@@ -753,6 +753,9 @@ struct ContextLinkedItem<'a> {
     /// Human-readable validation summary, redacted by policy (`PatchArtifact`).
     #[serde(skip_serializing_if = "Option::is_none")]
     validation_summary: Option<&'a str>,
+    /// Redacted body handle for `Task` nodes (required field per project schema).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_handle: Option<&'a crate::ir::OutputHandle>,
     /// Evidence links that connect this item to the queried symbol.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     evidence_links: Vec<&'a crate::ir::EvidenceLink>,
@@ -1695,6 +1698,7 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         patch_bytes_hash,
         target_files,
         validation_summary,
+        body_handle,
         evidence_links,
         ..
     } = record
@@ -1723,6 +1727,7 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         patch_bytes_hash: patch_bytes_hash.as_deref(),
         target_files: target_files.as_deref(),
         validation_summary: validation_summary.as_deref(),
+        body_handle: body_handle.as_deref(),
         evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
     })
 }
