@@ -213,7 +213,11 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
         })
         .collect();
 
-    // Step 1: collect symbol record IDs, excluding any that have been tombstoned.
+    // Step 1: collect symbol record IDs, excluding tombstoned CURRENT-STATE records.
+    //
+    // Temporal records (from scan-history, carrying `temporal` metadata) are
+    // historical snapshots — they must NOT be suppressed by a tombstone that
+    // reflects deletion only in the current state.
     let symbol_ids: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| {
@@ -221,12 +225,16 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                 id,
                 kind: NodeKind::Symbol,
                 name,
+                temporal,
                 ..
             } = r
             else {
                 return None;
             };
-            if name.as_deref() == Some(symbol_name) && !tombstoned_ids.contains(id.as_str()) {
+            let is_historical = temporal.is_some();
+            if name.as_deref() == Some(symbol_name)
+                && (is_historical || !tombstoned_ids.contains(id.as_str()))
+            {
                 Some(id.as_str())
             } else {
                 None
@@ -300,6 +308,12 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     let mut unresolved: Vec<UnresolvedRef> = Vec::new();
 
     // Helper: insert a record ID into the appropriate section.
+    //
+    // Guards:
+    // • Tombstoned IDs are silently skipped — stale context must not be returned.
+    // • SourceFact candidates that are not in `seed_ids` are silently skipped —
+    //   BFS must not pull sibling codegraph nodes (e.g. unrelated symbols
+    //   mentioned by the same Observation) into source_facts.
     let classify_and_insert =
         |record_id: &'a str,
          source_facts: &mut BTreeSet<&'a str>,
@@ -307,6 +321,9 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
          project_state: &mut BTreeSet<&'a str>,
          artifacts: &mut BTreeSet<&'a str>,
          verification_evidence: &mut BTreeSet<&'a str>| {
+            if tombstoned_ids.contains(record_id) {
+                return;
+            }
             let Some(rec) = by_id.get(record_id) else {
                 return;
             };
@@ -315,7 +332,9 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             };
             match classify_node(*kind) {
                 Some(ContextSection::SourceFact) => {
-                    source_facts.insert(record_id);
+                    if seed_ids.contains(record_id) {
+                        source_facts.insert(record_id);
+                    }
                 }
                 Some(ContextSection::Observation) => {
                     observations.insert(record_id);
@@ -333,11 +352,13 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             }
         };
 
-    // Step 3: bounded BFS traversal — 2 hops beyond seeds.
+    // Step 3: bounded BFS traversal — 3 hops beyond seeds.
     //
     // Hop 1 discovers nodes directly linked to the symbol/file seeds.
     // Hop 2 discovers nodes linked to hop-1 results, e.g. AcceptanceCriterion
     // nodes owned by a Task that was found in hop 1 via OWNED_BY_TASK edges.
+    // Hop 3 discovers nodes linked to hop-2 results, e.g. a Verification that
+    // closes an AC discovered in hop 2 via CLOSES_ACCEPTANCE_CRITERION.
     //
     // `visited` prevents re-classifying the same node in a later hop.
     // `frontier` is the set of IDs whose outgoing/incoming edges are scanned
@@ -345,7 +366,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     let mut visited: BTreeSet<&str> = seed_ids.clone();
     let mut frontier: BTreeSet<&str> = seed_ids.clone();
 
-    for _hop in 0..2_usize {
+    for _hop in 0..3_usize {
         let mut next_frontier: Vec<&'a str> = Vec::new();
 
         for record in records {

@@ -699,6 +699,9 @@ struct ContextLinkedItem<'a> {
     title: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
+    /// Human-readable criterion text for `AcceptanceCriterion` nodes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1598,6 +1601,7 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         kind,
         name,
         title,
+        text,
         status,
         verification_kind,
         stdout_handle,
@@ -1615,6 +1619,7 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         kind: kind.as_str(),
         title: title.as_deref(),
         name: name.as_deref(),
+        text: text.as_deref(),
         status: status.as_deref(),
         verification_kind: verification_kind.as_deref(),
         stdout_handle: stdout_handle.as_deref(),

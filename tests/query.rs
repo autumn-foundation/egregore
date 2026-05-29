@@ -871,3 +871,243 @@ fn symbol_context_finds_observations_linked_via_edges() {
         "the edge-linked observation must be in the observations section"
     );
 }
+
+// ── Finding: tombstoned context records must be excluded ─────────────────────
+
+#[test]
+fn symbol_context_excludes_tombstoned_context_records() {
+    // Observation O is linked to Symbol S but then tombstoned.
+    // It must NOT appear in the context output.
+    let sym_id = "codegraph:v4:tomb_ctx_sym001";
+    let sym = ctx_symbol(sym_id, "tomb_ctx_fn", "src/lib.rs", 1);
+
+    // Use the raw key (not the pre-hashed ID) so ctx_observation hashes once.
+    let obs = ctx_observation("tomb_ctx_obs1", "should be hidden", sym_id, "MENTIONS_SYMBOL", "1.0");
+    let obs_id = obs.id().to_owned();
+    let obs_tombstone = GraphRecord::Tombstone {
+        id: "tombstone:obs_ctx:001".to_owned(),
+        schema_version: 0,
+        deleted_id: obs_id.clone(),
+        summary: "observation removed".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![sym, obs, obs_tombstone];
+    let ctx = symbol_context(&records, "tomb_ctx_fn");
+
+    assert!(
+        !ctx.is_no_match(),
+        "symbol itself is not tombstoned so context must not be no_match"
+    );
+    assert!(
+        ctx.observations.iter().all(|r| r.id() != obs_id.as_str()),
+        "tombstoned observation must not appear in context"
+    );
+}
+
+// ── Finding: sibling codegraph symbols must not pollute source_facts ─────────
+
+#[test]
+fn symbol_context_sibling_symbol_not_pulled_via_observation() {
+    // Observation O has two evidence links: MENTIONS_SYMBOL → foo AND → bar.
+    // Querying for foo must NOT pull bar into source_facts via the 2nd hop.
+    let foo_id = "codegraph:v4:sibling_foo_sym";
+    let foo = ctx_symbol(foo_id, "sibling_foo", "src/foo.rs", 1);
+
+    let bar_id = "codegraph:v4:sibling_bar_sym";
+    let bar = ctx_symbol(bar_id, "sibling_bar", "src/bar.rs", 1);
+
+    let obs_id = agent_memory_stable_id(&["obs", "sibling_obs"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "sibling observation".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ref mut evidence_links,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_links = Some(vec![
+            EvidenceLink {
+                target_record_id: Some(foo_id.to_owned()),
+                target_domain: "codegraph".to_owned(),
+                relation: "MENTIONS_SYMBOL".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            },
+            EvidenceLink {
+                target_record_id: Some(bar_id.to_owned()),
+                target_domain: "codegraph".to_owned(),
+                relation: "MENTIONS_SYMBOL".to_owned(),
+                confidence: "0.8".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            },
+        ]);
+    }
+
+    let records = vec![foo, bar, obs];
+    let ctx = symbol_context(&records, "sibling_foo");
+
+    // The sibling symbol must NOT appear in source_facts.
+    assert!(
+        ctx.source_facts.iter().all(|r| r.id() != bar_id),
+        "sibling symbol bar must not appear in source_facts when querying foo"
+    );
+    // The observation must still appear (it references foo).
+    assert!(
+        ctx.observations.iter().any(|r| r.id() == obs_id.as_str()),
+        "observation must still appear in observations"
+    );
+}
+
+// ── Finding: temporal (scan-history) symbols survive later tombstones ─────────
+
+#[test]
+fn symbol_context_temporal_symbol_survives_later_tombstone() {
+    // In a scan-history graph a symbol record carries temporal metadata.
+    // A tombstone for the same stable ID means the symbol was deleted in the
+    // current state, but the historical snapshot should still be queryable.
+    let sym_id = "codegraph:v4:temporal_sym_hist001";
+    let sym = ctx_symbol(sym_id, "hist_fn", "src/hist.rs", 1)
+        .with_temporal(TemporalMetadata {
+            git_commit: "aabbccdd".to_owned(),
+            git_parent_commits: vec![],
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: None,
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        });
+    let tombstone = GraphRecord::Tombstone {
+        id: "tombstone:temporal:001".to_owned(),
+        schema_version: 0,
+        deleted_id: sym_id.to_owned(),
+        summary: "symbol removed in current state".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![sym, tombstone];
+    let ctx = symbol_context(&records, "hist_fn");
+
+    assert!(
+        !ctx.is_no_match(),
+        "temporal symbol must remain visible even when a tombstone for its ID exists"
+    );
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == sym_id),
+        "temporal symbol must appear in source_facts"
+    );
+}
+
+// ── Finding: 3-hop BFS discovers Verification via Task → AC → Verification ───
+
+#[test]
+fn symbol_context_three_hop_bfs_discovers_verification_via_ac() {
+    // Symbol S
+    // Task T — evidence_link MENTIONS_SYMBOL → S          (hop 1)
+    // AC    — OWNED_BY_TASK edge: T → AC                  (hop 2)
+    // Ver   — CLOSES_ACCEPTANCE_CRITERION edge: Ver → AC  (hop 3)
+    let sym_id = "codegraph:v4:three_hop_sym001";
+    let sym = ctx_symbol(sym_id, "three_hop_fn", "src/three.rs", 1);
+
+    let task_id = aletheia_egregore::ir::project_stable_id(&["task", "three_hop_task"]);
+    let mut task = GraphRecord::node(
+        task_id.clone(),
+        NodeKind::Task,
+        None,
+        None,
+        Some("Three-hop task".to_owned()),
+        "Task: Three-hop task".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ref mut title,
+        ..
+    } = task
+    {
+        *title = Some("Three-hop task".to_owned());
+        *schema_version = aletheia_egregore::ir::PROJECT_SCHEMA_VERSION;
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(sym_id.to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let ac_id = aletheia_egregore::ir::project_stable_id(&["ac", "three_hop_ac"]);
+    let ac = GraphRecord::node(
+        ac_id.clone(),
+        NodeKind::AcceptanceCriterion,
+        None,
+        None,
+        Some("AC: three_hop_fn works".to_owned()),
+        "AC: three_hop_fn works".to_owned(),
+    );
+
+    let ver_id = verification_stable_id(&["ver", "three_hop_ver"]);
+    let ver = GraphRecord::node(
+        ver_id.clone(),
+        NodeKind::Verification,
+        None,
+        None,
+        None,
+        "Verification closing the AC".to_owned(),
+    );
+
+    // Edges connecting the chain.
+    let owned_edge = GraphRecord::edge(
+        EdgeLabel::OwnedByTask,
+        task_id.clone(),
+        ac_id.clone(),
+        None,
+        "task owns AC".to_owned(),
+    );
+    let closes_edge = GraphRecord::edge(
+        EdgeLabel::ClosesAcceptanceCriterion,
+        ver_id.clone(),
+        ac_id.clone(),
+        None,
+        "verification closes AC".to_owned(),
+    );
+
+    let records = vec![sym, task, ac, ver, owned_edge, closes_edge];
+    let ctx = symbol_context(&records, "three_hop_fn");
+
+    assert!(
+        ctx.project_state.iter().any(|r| r.id() == task_id),
+        "task must be in project_state (hop 1)"
+    );
+    assert!(
+        ctx.project_state.iter().any(|r| r.id() == ac_id),
+        "AC must be in project_state (hop 2)"
+    );
+    assert!(
+        ctx.verification_evidence.iter().any(|r| r.id() == ver_id),
+        "verification must be in verification_evidence via 3-hop BFS (hop 3)"
+    );
+}
