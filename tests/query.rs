@@ -413,6 +413,99 @@ fn symbol_context_no_match_returns_empty_context_with_is_no_match() {
     assert!(ctx.unresolved.is_empty());
 }
 
+// ── backed evidence: present non-symbol evidence link targets are classified ──
+
+#[test]
+fn symbol_context_classifies_present_backing_evidence_of_linked_observation() {
+    // Observation O links to Symbol S (MENTIONS_SYMBOL) and also to
+    // Verification V (VALIDATED_BY). V has no direct link to S.
+    // The query must still surface V in verification_evidence because it
+    // backs an observation that is already in the response.
+    let sym_id = agent_memory_stable_id(&["sym", "parse_input_backed"]);
+    let sym = GraphRecord::node(
+        sym_id.clone(),
+        NodeKind::Symbol,
+        Some("src/parser.rs".to_owned()),
+        None,
+        Some("parse_input".to_owned()),
+        "fn parse_input".to_owned(),
+    );
+
+    let ver_id = verification_stable_id(&["ver", "backed_ver1"]);
+    let ver = GraphRecord::node(
+        ver_id.clone(),
+        NodeKind::Verification,
+        None,
+        None,
+        None,
+        "Verification of parse_input test run".to_owned(),
+    );
+
+    let obs_id = agent_memory_stable_id(&["obs", "backed_obs1"]);
+    let mut obs = GraphRecord::node(
+        obs_id,
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "parse_input is safe".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![
+            EvidenceLink {
+                target_record_id: Some(sym_id),
+                target_domain: "codegraph".to_owned(),
+                relation: "MENTIONS_SYMBOL".to_owned(),
+                confidence: "0.9".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            },
+            EvidenceLink {
+                target_record_id: Some(ver_id.clone()),
+                target_domain: "verification".to_owned(),
+                relation: "VALIDATED_BY".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            },
+        ]);
+    }
+
+    let records = vec![sym, ver, obs];
+    let ctx = symbol_context(&records, "parse_input");
+
+    assert!(
+        !ctx.observations.is_empty(),
+        "observation must appear in observations"
+    );
+    assert!(
+        !ctx.verification_evidence.is_empty(),
+        "backing verification must appear in verification_evidence even without a direct symbol link"
+    );
+    let ver_in_evidence = ctx
+        .verification_evidence
+        .iter()
+        .any(|r| r.id() == ver_id.as_str());
+    assert!(
+        ver_in_evidence,
+        "the specific verification record must be in verification_evidence"
+    );
+    assert!(
+        ctx.unresolved.is_empty(),
+        "no unresolved — both targets are present in the store"
+    );
+}
+
 // ── AC7: stable output ordering ──────────────────────────────────────────────
 
 #[test]

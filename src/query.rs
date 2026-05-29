@@ -358,18 +358,33 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                     );
 
                     // Step 4: scan evidence links on nodes that ARE linked to the
-                    // symbol for missing targets. Only surfaced per AC5 for nodes
-                    // that are already in the response.
+                    // symbol. Present non-symbol targets are backing evidence and get
+                    // classified into their own section. Missing targets go to
+                    // unresolved (AC5).
                     for link in links {
-                        if let Some(target_id) = &link.target_record_id
-                            && !present_ids.contains(target_id.as_str())
-                        {
-                            unresolved.push(UnresolvedRef {
-                                source_record_id: node_id.clone(),
-                                target_handle: target_id.clone(),
-                                relation: link.relation.clone(),
-                                target_domain: link.target_domain.clone(),
-                            });
+                        if let Some(target_id) = &link.target_record_id {
+                            if present_ids.contains(target_id.as_str())
+                                && !symbol_ids.contains(target_id.as_str())
+                            {
+                                // Backing record exists: classify it (e.g. a
+                                // Verification that validates an Observation that
+                                // mentions the symbol).
+                                classify_and_insert(
+                                    target_id.as_str(),
+                                    &mut source_facts,
+                                    &mut observations,
+                                    &mut project_state,
+                                    &mut artifacts,
+                                    &mut verification_evidence,
+                                );
+                            } else if !present_ids.contains(target_id.as_str()) {
+                                unresolved.push(UnresolvedRef {
+                                    source_record_id: node_id.clone(),
+                                    target_handle: target_id.clone(),
+                                    relation: link.relation.clone(),
+                                    target_domain: link.target_domain.clone(),
+                                });
+                            }
                         }
                     }
                 }
