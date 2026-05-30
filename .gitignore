@@ -4,6 +4,11 @@
 # Generated egregore stores and graph snapshots
 *.jsonl
 !tests/fixtures/**/*.jsonl
+# Ignore all .egregore* directories (runtime data, caches, variant stores)
+# then carve out the tasks directory so project JSONL files can be tracked.
 .egregore*/
+!.egregore/
+.egregore/*
 !.egregore/tasks/
+.egregore/tasks/*
 !.egregore/tasks/*.jsonl

@@ -781,6 +781,78 @@ fn import_file(
                     continue;
                 }
 
+                // Validate updated_at is a legal RFC 3339 timestamp; it becomes
+                // valid_time on the Task node and the daemon validator requires RFC 3339.
+                if chrono::DateTime::parse_from_rfc3339(&task.updated_at).is_err() {
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "task_invalid_timestamp",
+                            &task.local_id,
+                        ],
+                        line_idx,
+                    );
+                    push_diagnostic(
+                        graph,
+                        &diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[task_invalid_timestamp] task '{}' at line {} has invalid updated_at='{}'",
+                            task.local_id,
+                            line_idx + 1,
+                            task.updated_at
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
+                }
+
+                // Validate body handle object: when body is an object it must have
+                // both "hash" (str) and "bytes" (u64); missing fields mean the
+                // pre-computed handle is corrupt — skip the row rather than
+                // persisting a Task with a silently incorrect body handle.
+                if let Some(serde_json::Value::Object(ref obj)) = task.body {
+                    let hash_ok = obj
+                        .get("hash")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some();
+                    let bytes_ok = obj
+                        .get("bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some();
+                    if !hash_ok || !bytes_ok {
+                        let diag_id = per_line_diag_id(
+                            &[
+                                "project",
+                                "Diagnostic",
+                                SOURCE_KIND,
+                                &file_rel,
+                                "missing_body_bytes",
+                                &task.local_id,
+                            ],
+                            line_idx,
+                        );
+                        push_diagnostic(
+                            graph,
+                            &diag_id,
+                            Some(&file_rel),
+                            &format!(
+                                "[missing_body_bytes] task '{}' at line {} has a body object missing required '{}' field",
+                                task.local_id,
+                                line_idx + 1,
+                                if hash_ok { "bytes" } else { "hash" }
+                            ),
+                            transaction_time,
+                        );
+                        diag_count += 1;
+                        continue;
+                    }
+                }
+
                 // All validation passed — claim the local_id on first occurrence.
                 seen_local_ids
                     .entry(task.local_id.clone())
@@ -928,6 +1000,35 @@ fn import_file(
                             ac.local_id,
                             line_idx + 1,
                             ac.status
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
+                }
+
+                // Validate updated_at is RFC 3339; it becomes valid_time on the AC node.
+                if chrono::DateTime::parse_from_rfc3339(&ac.updated_at).is_err() {
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "ac_invalid_timestamp",
+                            &ac.local_id,
+                        ],
+                        line_idx,
+                    );
+                    push_diagnostic(
+                        graph,
+                        &diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[ac_invalid_timestamp] acceptance_criterion '{}' at line {} has invalid updated_at='{}'",
+                            ac.local_id,
+                            line_idx + 1,
+                            ac.updated_at
                         ),
                         transaction_time,
                     );
@@ -1233,6 +1334,65 @@ fn import_file(
                     continue;
                 }
 
+                // Validate discovered_at and updated_at are RFC 3339; both become
+                // schema-required timestamp fields on the ExternalLink node.
+                if chrono::DateTime::parse_from_rfc3339(&link.discovered_at).is_err() {
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "external_link_invalid_timestamp",
+                            &link.local_id,
+                            "discovered_at",
+                        ],
+                        line_idx,
+                    );
+                    push_diagnostic(
+                        graph,
+                        &diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[external_link_invalid_timestamp] external_link '{}' at line {} has invalid discovered_at='{}'",
+                            link.local_id,
+                            line_idx + 1,
+                            link.discovered_at,
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
+                }
+                if chrono::DateTime::parse_from_rfc3339(&link.updated_at).is_err() {
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "external_link_invalid_timestamp",
+                            &link.local_id,
+                            "updated_at",
+                        ],
+                        line_idx,
+                    );
+                    push_diagnostic(
+                        graph,
+                        &diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[external_link_invalid_timestamp] external_link '{}' at line {} has invalid updated_at='{}'",
+                            link.local_id,
+                            line_idx + 1,
+                            link.updated_at,
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
+                }
+
                 // Parent-before-child: parent must have been seen EARLIER
                 let parent_is_task = task_ids.contains_key(&link.parent_local_id);
                 let parent_is_ac = ac_ids.contains_key(&link.parent_local_id);
@@ -1489,46 +1649,29 @@ fn emit_task_records(
     );
 
     // Body handle
-    // When body is a JSON object with "hash" and "bytes" fields, treat it as a
-    // pre-computed handle and preserve the referenced hash/size. When "bytes" is
-    // absent the handle is malformed — emit a diagnostic and fall back to empty.
+    // When body is a JSON object it was validated in the first pass: "hash" (str)
+    // and "bytes" (u64) are guaranteed present; malformed objects skip the row there.
     let body_h = match &task.body {
         None => body_handle_for(""),
         Some(serde_json::Value::String(s)) => body_handle_for(&(opts.redact)(s)),
         Some(serde_json::Value::Object(obj)) => {
-            let hash = obj.get("hash").and_then(serde_json::Value::as_str);
-            let bytes = obj.get("bytes").and_then(serde_json::Value::as_u64);
-            if let (Some(h), Some(b)) = (hash, bytes) {
-                let inline = obj
-                    .get("inline")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|s| (opts.redact)(s));
-                OutputHandle {
-                    hash: h.to_owned(),
-                    bytes: b,
-                    inline,
-                }
-            } else {
-                // Malformed handle: emit a diagnostic and use empty body.
-                let diag_id = project_stable_id(&[
-                    "project",
-                    "Diagnostic",
-                    SOURCE_KIND,
-                    file_rel,
-                    "missing_body_bytes",
-                    &task.local_id,
-                ]);
-                push_diagnostic(
-                    graph,
-                    &diag_id,
-                    Some(file_rel),
-                    &format!(
-                        "[missing_body_bytes] task '{}' has a body object missing required 'bytes' field",
-                        task.local_id
-                    ),
-                    transaction_time,
-                );
-                body_handle_for("")
+            // Safe: validated in first-pass (see task_invalid_body_handle check).
+            let h = obj
+                .get("hash")
+                .and_then(serde_json::Value::as_str)
+                .expect("validated");
+            let b = obj
+                .get("bytes")
+                .and_then(serde_json::Value::as_u64)
+                .expect("validated");
+            let inline = obj
+                .get("inline")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| (opts.redact)(s));
+            OutputHandle {
+                hash: h.to_owned(),
+                bytes: b,
+                inline,
             }
         }
         Some(other) => body_handle_for(&(opts.redact)(&other.to_string())),
