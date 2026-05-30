@@ -7477,6 +7477,7 @@ fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) ->
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_verb_observations_for_symbol(
     request_id: &str,
     params: &serde_json::Value,
@@ -7561,15 +7562,20 @@ fn handle_verb_observations_for_symbol(
                 target,
                 temporal,
                 ..
-            } => match temporal.as_ref().map(|t| t.valid_time.as_str()) {
-                Some(vt_str) => chrono::DateTime::parse_from_rfc3339(vt_str)
-                    .ok()
-                    .is_some_and(|vt| vt <= as_of_dt),
-                None => {
-                    retained_node_ids.contains(source.as_str())
-                        && retained_node_ids.contains(target.as_str())
-                }
-            },
+            } => temporal
+                .as_ref()
+                .map(|t| t.valid_time.as_str())
+                .map_or_else(
+                    || {
+                        retained_node_ids.contains(source.as_str())
+                            && retained_node_ids.contains(target.as_str())
+                    },
+                    |vt_str| {
+                        chrono::DateTime::parse_from_rfc3339(vt_str)
+                            .ok()
+                            .is_some_and(|vt| vt <= as_of_dt)
+                    },
+                ),
             GraphRecord::Tombstone { .. } => false,
         });
     }

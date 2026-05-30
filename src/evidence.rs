@@ -1,0 +1,1114 @@
+// clippy::too_long_first_doc_paragraph fires on this module's doc without a span
+// (nursery lint span-reporting bug in clippy 0.1.94); suppress at module level.
+#![allow(clippy::too_long_first_doc_paragraph)]
+//! Typed evidence write workflows for agent observations, command evidence,
+//! artifacts, and verification results.
+//!
+//! This module is the default write contract for interactive clients, SDKs, and
+//! the future MCP surface. It enforces provenance, trust separation, and
+//! content-addressed idempotency for every accepted write, without requiring
+//! callers to construct raw graph records or know AletheiaDB schema details.
+//!
+//! Raw `eg ingest` remains available for batch importers; see `docs/schema/agent-memory.md`
+//! and `docs/schema/verification.md` for the full field specifications.
+//!
+//! ## Provenance contract (AC2)
+//!
+//! Every accepted write carries:
+//! - `agent_id` — stable agent identity
+//! - `session_id` — the active session
+//! - `observed_at` — RFC 3339 wall-clock observation time
+//! - `source_handle` / `source_artifact_path` + `source_artifact_hash` — citable source
+//!
+//! Writes missing any required provenance field fail with a [`ProvenanceError`] that
+//! names the field and never echoes sensitive payload text.
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+use crate::ir::{
+    AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, EdgeLabel, EvidenceLink, GraphRecord,
+    NodeKind, OutputHandle, PatchHandle, Producer, ProducerKind, VERIFICATION_SCHEMA_VERSION,
+    agent_memory_stable_id, artifact_stable_id, verification_stable_id,
+};
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const INLINE_PAYLOAD_CEILING: u64 = 16 * 1024;
+
+/// Accepted `patch_status` values (from `docs/schema/agent-actions.md`).
+const PATCH_STATUS_VALUES: &[&str] = &[
+    "applied_clean",
+    "applied_with_conflicts",
+    "invalid_syntax",
+    "invalid_no_base",
+    "rejected_validation",
+    "unverified",
+    "superseded",
+];
+
+// ── Core types ────────────────────────────────────────────────────────────────
+
+/// Required provenance fields shared by all typed evidence write requests.
+///
+/// Every accepted write must carry `agent_id`, `session_id`, `observed_at`,
+/// and either `source_handle` (for agent-memory domain writes) or the
+/// `source_artifact_path` / `source_artifact_hash` fields on the specific request type.
+///
+/// `agent_kind` defaults to `"other"` when left empty; callers SHOULD supply the
+/// specific agent kind from the published enum.
+#[derive(Debug, Clone)]
+pub struct EvidenceProvenance {
+    /// Stable agent identity string; must be non-empty.
+    pub agent_id: String,
+    /// Agent kind from the published enum (e.g. `"claude-code"`). Defaults to `"other"`.
+    pub agent_kind: String,
+    /// Active session identifier; must be non-empty.
+    pub session_id: String,
+    /// RFC 3339 wall-clock time of observation; must be non-empty.
+    pub observed_at: String,
+    /// Citable source artifact path or hash for agent-memory domain writes.
+    /// Required for `ObservationRequest` and `ArtifactRequest`.
+    pub source_handle: Option<String>,
+}
+
+/// Machine-readable provenance or field validation error.
+///
+/// The `code` is always a stable, machine-parseable string (`"missing_field"` or
+/// `"invalid_field"`). The `field` names the exact field path. The error message
+/// **never echoes sensitive payload text**.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ProvenanceError {
+    /// Stable error code: `"missing_field"` or `"invalid_field"`.
+    pub code: &'static str,
+    /// Dot-separated field path (e.g. `"agent_id"`, `"source_handle"`).
+    pub field: String,
+}
+
+impl ProvenanceError {
+    /// Creates a `missing_field` error for the named field.
+    #[must_use]
+    pub fn missing(field: impl Into<String>) -> Self {
+        Self {
+            code: "missing_field",
+            field: field.into(),
+        }
+    }
+
+    /// Creates an `invalid_field` error for the named field.
+    #[must_use]
+    pub fn invalid(field: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_field",
+            field: field.into(),
+        }
+    }
+}
+
+impl fmt::Display for ProvenanceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: field '{}' is required", self.code, self.field)
+    }
+}
+
+/// Outcome of a successful typed evidence write.
+///
+/// `record_id` is the stable content-addressed ID of the primary evidence node;
+/// it can be used as a citation handle in future `EvidenceLink` records.
+/// `evidence_handle` is always equal to `record_id` in this implementation.
+#[derive(Debug)]
+pub struct EvidenceWriteOutcome {
+    /// Stable record ID for the primary evidence node (citable handle).
+    pub record_id: String,
+    /// Citable reference — always equal to `record_id`.
+    pub evidence_handle: String,
+    /// All graph records in the write batch (nodes + edges).
+    pub records: Vec<GraphRecord>,
+}
+
+// ── Request types ─────────────────────────────────────────────────────────────
+
+/// Typed request for writing an agent `Observation` node.
+///
+/// The `evidence_links` must contain at least one entry that anchors the claim
+/// to a code-graph node or verification record. An observation without evidence
+/// links cannot be accepted per `docs/schema/agent-memory.md`.
+pub struct ObservationRequest {
+    /// Provenance fields required on every agent-memory write.
+    pub provenance: EvidenceProvenance,
+    /// Observation body text; must be non-empty.
+    pub text: String,
+    /// Extraction confidence in `[0.0, 1.0]`.
+    pub confidence: f64,
+    /// Evidence citations. At least one is required.
+    pub evidence_links: Vec<EvidenceLink>,
+}
+
+/// Typed request for writing a `CommandRun` (command evidence) record.
+///
+/// `CommandRun` nodes live in the **verification** domain (`verification:v1:` prefix).
+/// Either `source_artifact_path` or `source_artifact_hash` must be non-empty.
+pub struct CommandEvidenceRequest {
+    /// Provenance fields required on every write.
+    pub provenance: EvidenceProvenance,
+    /// RFC 3339 wall-clock time the command was executed.
+    pub executed_at: String,
+    /// Shell exit code.
+    pub exit_code: i64,
+    /// Optional captured stdout text.
+    pub stdout: Option<String>,
+    /// Optional captured stderr text.
+    pub stderr: Option<String>,
+    /// Evidence quality enum: `"verbatim"`, `"summarized"`, or `"referenced_only"`.
+    pub evidence_quality: String,
+    /// Repository-relative or absolute path to the source artifact.
+    pub source_artifact_path: String,
+    /// BLAKE3 or SHA256 hex hash of the source artifact.
+    pub source_artifact_hash: String,
+}
+
+/// Typed request for writing a `PatchArtifact` record.
+///
+/// `PatchArtifact` nodes live in the **artifact** domain (`artifact:v1:` prefix).
+/// Both `source_artifact_path` and `source_artifact_hash` must be non-empty.
+pub struct ArtifactRequest {
+    /// Provenance fields required on every write.
+    pub provenance: EvidenceProvenance,
+    /// Raw patch bytes (unified diff).
+    pub patch_bytes: Vec<u8>,
+    /// Repository-relative target files touched by the patch.
+    pub target_files: Vec<String>,
+    /// Patch validation status from the published enum.
+    pub patch_status: String,
+    /// Git commit SHA the patch was authored against, when known.
+    pub base_commit: Option<String>,
+    /// Repository-relative or absolute path to the source artifact.
+    pub source_artifact_path: String,
+    /// BLAKE3 or SHA256 hex hash of the source artifact.
+    pub source_artifact_hash: String,
+}
+
+/// Typed request for writing a `Verification` record.
+///
+/// `Verification` nodes live in the **verification** domain (`verification:v1:` prefix).
+/// Both `source_artifact_path` and `source_artifact_hash` must be non-empty.
+pub struct VerificationRequest {
+    /// Provenance fields required on every write.
+    pub provenance: EvidenceProvenance,
+    /// RFC 3339 wall-clock time the verification was executed.
+    pub executed_at: String,
+    /// Verification outcome: `"pass"`, `"fail"`, `"skip"`, `"error"`, or `"timeout"`.
+    pub status: String,
+    /// Verification subtype: `"test_run"`, `"command_run"`, `"ci_status"`, etc.
+    pub verification_kind: String,
+    /// Optional captured stdout text (for `test_run` and `command_run`).
+    pub stdout: Option<String>,
+    /// Evidence quality enum: `"verbatim"`, `"summarized"`, or `"referenced_only"`.
+    pub evidence_quality: String,
+    /// Repository-relative or absolute path to the source artifact.
+    pub source_artifact_path: String,
+    /// BLAKE3 or SHA256 hex hash of the source artifact.
+    pub source_artifact_hash: String,
+    /// Optional stable ID of a `CommandRun` record that produced this result.
+    pub linked_command_evidence_id: Option<String>,
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Validates the common provenance fields required on every agent-memory write.
+///
+/// Returns the first missing field as a [`ProvenanceError`], or `Ok(())` when all
+/// required fields are present and non-empty. Payload text is never included in
+/// the error message.
+fn validate_provenance_base(prov: &EvidenceProvenance) -> Result<(), ProvenanceError> {
+    if prov.agent_id.is_empty() {
+        return Err(ProvenanceError::missing("agent_id"));
+    }
+    if prov.session_id.is_empty() {
+        return Err(ProvenanceError::missing("session_id"));
+    }
+    if prov.observed_at.is_empty() {
+        return Err(ProvenanceError::missing("observed_at"));
+    }
+    Ok(())
+}
+
+/// Validates that `source_handle` is present and non-empty (required for
+/// `ObservationRequest` and `ArtifactRequest` per AC2).
+fn validate_source_handle(prov: &EvidenceProvenance) -> Result<(), ProvenanceError> {
+    if prov.source_handle.as_deref().is_none_or(str::is_empty) {
+        return Err(ProvenanceError::missing("source_handle"));
+    }
+    Ok(())
+}
+
+/// Validates that at least one of `source_artifact_path` or `source_artifact_hash`
+/// is non-empty (required for verification and command-evidence writes per AC2).
+fn validate_source_artifact(path: &str, hash: &str) -> Result<(), ProvenanceError> {
+    if path.is_empty() && hash.is_empty() {
+        return Err(ProvenanceError::missing("source_artifact_path"));
+    }
+    Ok(())
+}
+
+/// Returns the effective `agent_kind`, defaulting to `"other"` when empty.
+const fn effective_agent_kind(prov: &EvidenceProvenance) -> &str {
+    if prov.agent_kind.is_empty() {
+        "other"
+    } else {
+        prov.agent_kind.as_str()
+    }
+}
+
+/// Returns the current UTC time as an RFC 3339 string for `ingested_at`.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Builds an `OutputHandle` from optional inline text.
+fn output_handle(content: &str) -> OutputHandle {
+    let bytes = content.len() as u64;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(content.as_bytes());
+    OutputHandle {
+        inline: (bytes <= INLINE_PAYLOAD_CEILING).then(|| content.to_owned()),
+        hash: hasher.finalize().to_hex().to_string(),
+        bytes,
+    }
+}
+
+/// Builds the producer envelope for the evidence writer.
+fn evidence_producer() -> Producer {
+    Producer {
+        egregore_version: env!("CARGO_PKG_VERSION").to_owned(),
+        egregore_git: None,
+        producer_kind: ProducerKind::ObservationWriter,
+        producer_components: BTreeMap::new(),
+        producer_started_at: now_rfc3339(),
+    }
+}
+
+// ── Agent and AgentSession node builders ─────────────────────────────────────
+
+/// Builds an `Agent` node for the given `agent_id`.
+///
+/// Agent nodes carry a stable ID based on `agent_id` only; they are invariant
+/// across sessions so repeated registrations produce the same stable ID.
+fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
+    let id = agent_memory_stable_id(&["node", "agent", agent_id]);
+    GraphRecord::Node {
+        id,
+        kind: NodeKind::Agent,
+        schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+        repo_relative_path: None,
+        span: None,
+        name: Some(agent_id.to_owned()),
+        language: None,
+        symbol_kind: None,
+        disambiguator: None,
+        temporal: None,
+        semantic_drift: None,
+        evidence_links: None,
+        repository_identity: None,
+        text: None,
+        superseded_by: None,
+        agent_id: Some(agent_id.to_owned()),
+        agent_kind: Some(agent_kind.to_owned()),
+        session_id: None,
+        observed_at: None,
+        ingested_at: None,
+        confidence: None,
+        source_handle: None,
+        redaction_policy_version: None,
+        valid_time: None,
+        valid_time_source: None,
+        entity_id: None,
+        title: None,
+        body_handle: None,
+        source_kind: None,
+        source_external_link_id: None,
+        assignees: None,
+        labels: None,
+        priority: None,
+        parent_task_id: None,
+        ordinal: None,
+        verification_link_id: None,
+        system: None,
+        url: None,
+        system_native_id: None,
+        repository_remote: None,
+        discovered_at: None,
+        transaction_time: None,
+        summary: format!("Agent {agent_id}"),
+        domain: Some("agent_memory".to_owned()),
+        importer_id: None,
+        importer_version: None,
+        source_artifact_path: None,
+        source_artifact_hash: None,
+        patch_status: None,
+        base_commit: None,
+        unknown_base_reason: None,
+        target_files: None,
+        patch_bytes_hash: None,
+        patch_bytes_size: None,
+        patch_handle: None,
+        validation_summary: None,
+        producer_session_id: None,
+        edit_kind: None,
+        before_hash: None,
+        after_hash: None,
+        rename_to: None,
+        hunk_count: None,
+        linked_patch_id: None,
+        linked_turn_id: None,
+        tool_name: None,
+        tool_kind: None,
+        arguments_summary: None,
+        arguments_handle: None,
+        result_handle: None,
+        produced_evidence_id: None,
+        started_at: None,
+        finished_at: None,
+        failure_kind: None,
+        exit_code: None,
+        turn_index: None,
+        stdout_handle: None,
+        stderr_handle: None,
+        evidence_quality: None,
+        executed_at: None,
+        verification_kind: None,
+        status: None,
+        user_context: crate::ir::UserContextFields::empty(),
+        producer: None,
+    }
+}
+
+/// Builds an `AgentSession` node for the given session.
+fn build_agent_session_node(
+    prov: &EvidenceProvenance,
+    agent_kind: &str,
+    ingested_at: &str,
+) -> GraphRecord {
+    let id = agent_memory_stable_id(&["node", "agent_session", &prov.agent_id, &prov.session_id]);
+    GraphRecord::Node {
+        id,
+        kind: NodeKind::AgentSession,
+        schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+        repo_relative_path: None,
+        span: None,
+        name: Some(prov.session_id.clone()),
+        language: None,
+        symbol_kind: None,
+        disambiguator: None,
+        temporal: None,
+        semantic_drift: None,
+        evidence_links: None,
+        repository_identity: None,
+        text: None,
+        superseded_by: None,
+        agent_id: Some(prov.agent_id.clone()),
+        agent_kind: Some(agent_kind.to_owned()),
+        session_id: Some(prov.session_id.clone()),
+        observed_at: Some(prov.observed_at.clone()),
+        ingested_at: Some(ingested_at.to_owned()),
+        confidence: None,
+        source_handle: prov.source_handle.clone(),
+        redaction_policy_version: None,
+        valid_time: None,
+        valid_time_source: None,
+        entity_id: None,
+        title: None,
+        body_handle: None,
+        source_kind: None,
+        source_external_link_id: None,
+        assignees: None,
+        labels: None,
+        priority: None,
+        parent_task_id: None,
+        ordinal: None,
+        verification_link_id: None,
+        system: None,
+        url: None,
+        system_native_id: None,
+        repository_remote: None,
+        discovered_at: None,
+        transaction_time: None,
+        summary: format!("AgentSession {}", prov.session_id),
+        domain: Some("agent_memory".to_owned()),
+        importer_id: None,
+        importer_version: None,
+        source_artifact_path: None,
+        source_artifact_hash: None,
+        patch_status: None,
+        base_commit: None,
+        unknown_base_reason: None,
+        target_files: None,
+        patch_bytes_hash: None,
+        patch_bytes_size: None,
+        patch_handle: None,
+        validation_summary: None,
+        producer_session_id: None,
+        edit_kind: None,
+        before_hash: None,
+        after_hash: None,
+        rename_to: None,
+        hunk_count: None,
+        linked_patch_id: None,
+        linked_turn_id: None,
+        tool_name: None,
+        tool_kind: None,
+        arguments_summary: None,
+        arguments_handle: None,
+        result_handle: None,
+        produced_evidence_id: None,
+        started_at: None,
+        finished_at: None,
+        failure_kind: None,
+        exit_code: None,
+        turn_index: None,
+        stdout_handle: None,
+        stderr_handle: None,
+        evidence_quality: None,
+        executed_at: None,
+        verification_kind: None,
+        status: None,
+        user_context: crate::ir::UserContextFields::empty(),
+        producer: None,
+    }
+}
+
+/// Builds a `SESSION_OF` edge from an `AgentSession` to an `Agent`.
+fn build_session_of_edge(session_id: &str, agent_id: &str) -> GraphRecord {
+    let id = agent_memory_stable_id(&["edge", "SESSION_OF", session_id, agent_id]);
+    GraphRecord::Edge {
+        id,
+        schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+        label: EdgeLabel::SessionOf,
+        source: session_id.to_owned(),
+        target: agent_id.to_owned(),
+        confidence: None,
+        temporal: None,
+        summary: format!("AgentSession {session_id} SESSION_OF Agent {agent_id}"),
+        producer: None,
+    }
+}
+
+/// Builds an `AUTHORED_BY` edge from a record to its producing session.
+fn build_authored_by_edge(record_id: &str, session_id: &str) -> GraphRecord {
+    let id = agent_memory_stable_id(&["edge", "AUTHORED_BY", record_id, session_id]);
+    GraphRecord::Edge {
+        id,
+        schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+        label: EdgeLabel::AuthoredBy,
+        source: record_id.to_owned(),
+        target: session_id.to_owned(),
+        confidence: None,
+        temporal: None,
+        summary: format!("{record_id} AUTHORED_BY {session_id}"),
+        producer: None,
+    }
+}
+
+// ── Public builder functions ──────────────────────────────────────────────────
+
+/// Builds a typed `Observation` record batch from a provenance-bearing request.
+///
+/// Validates all required provenance fields and returns a [`ProvenanceError`]
+/// if any are missing or invalid. The error names the missing field and never
+/// echoes payload text.
+///
+/// On success, returns an [`EvidenceWriteOutcome`] containing:
+/// - A stable `agent_memory:v1:` record ID (the citable evidence handle)
+/// - All graph records: `Agent`, `AgentSession`, `Observation` nodes plus
+///   `SESSION_OF` and `AUTHORED_BY` edges
+///
+/// # Errors
+///
+/// Returns a [`ProvenanceError`] when any required field is missing or invalid.
+#[allow(clippy::too_many_lines)]
+pub fn build_observation_records(
+    req: &ObservationRequest,
+) -> Result<EvidenceWriteOutcome, ProvenanceError> {
+    validate_provenance_base(&req.provenance)?;
+    validate_source_handle(&req.provenance)?;
+
+    if req.text.is_empty() {
+        return Err(ProvenanceError::missing("text"));
+    }
+    if req.evidence_links.is_empty() {
+        return Err(ProvenanceError::missing("evidence_links"));
+    }
+    if !(0.0..=1.0).contains(&req.confidence) {
+        return Err(ProvenanceError::invalid("confidence"));
+    }
+
+    let agent_kind = effective_agent_kind(&req.provenance);
+    let now = now_rfc3339();
+
+    let agent_id_node = agent_memory_stable_id(&["node", "agent", &req.provenance.agent_id]);
+    let session_node_id = agent_memory_stable_id(&[
+        "node",
+        "agent_session",
+        &req.provenance.agent_id,
+        &req.provenance.session_id,
+    ]);
+
+    // Observation ID is content-addressed on agent, session, and text hash.
+    let text_hash = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(req.text.as_bytes());
+        hasher.finalize().to_hex().to_string()
+    };
+    let obs_id = agent_memory_stable_id(&[
+        "node",
+        "observation",
+        &req.provenance.agent_id,
+        &req.provenance.session_id,
+        &text_hash,
+    ]);
+
+    // Build the observation node
+    let obs_node = GraphRecord::Node {
+        id: obs_id.clone(),
+        kind: NodeKind::Observation,
+        schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+        repo_relative_path: None,
+        span: None,
+        name: None,
+        language: None,
+        symbol_kind: None,
+        disambiguator: None,
+        temporal: None,
+        semantic_drift: None,
+        evidence_links: Some(req.evidence_links.clone()),
+        repository_identity: None,
+        text: Some(req.text.clone()),
+        superseded_by: None,
+        agent_id: Some(req.provenance.agent_id.clone()),
+        agent_kind: Some(agent_kind.to_owned()),
+        session_id: Some(req.provenance.session_id.clone()),
+        observed_at: Some(req.provenance.observed_at.clone()),
+        ingested_at: Some(now.clone()),
+        confidence: Some(req.confidence.to_string()),
+        source_handle: req.provenance.source_handle.clone(),
+        redaction_policy_version: None,
+        valid_time: None,
+        valid_time_source: None,
+        entity_id: None,
+        title: None,
+        body_handle: None,
+        source_kind: None,
+        source_external_link_id: None,
+        assignees: None,
+        labels: None,
+        priority: None,
+        parent_task_id: None,
+        ordinal: None,
+        verification_link_id: None,
+        system: None,
+        url: None,
+        system_native_id: None,
+        repository_remote: None,
+        discovered_at: None,
+        transaction_time: None,
+        summary: format!(
+            "Observation by {} in {}: {}",
+            req.provenance.agent_id,
+            req.provenance.session_id,
+            req.text.chars().take(60).collect::<String>()
+        ),
+        domain: Some("agent_memory".to_owned()),
+        importer_id: None,
+        importer_version: None,
+        source_artifact_path: None,
+        source_artifact_hash: None,
+        patch_status: None,
+        base_commit: None,
+        unknown_base_reason: None,
+        target_files: None,
+        patch_bytes_hash: None,
+        patch_bytes_size: None,
+        patch_handle: None,
+        validation_summary: None,
+        producer_session_id: None,
+        edit_kind: None,
+        before_hash: None,
+        after_hash: None,
+        rename_to: None,
+        hunk_count: None,
+        linked_patch_id: None,
+        linked_turn_id: None,
+        tool_name: None,
+        tool_kind: None,
+        arguments_summary: None,
+        arguments_handle: None,
+        result_handle: None,
+        produced_evidence_id: None,
+        started_at: None,
+        finished_at: None,
+        failure_kind: None,
+        exit_code: None,
+        turn_index: None,
+        stdout_handle: None,
+        stderr_handle: None,
+        evidence_quality: None,
+        executed_at: None,
+        verification_kind: None,
+        status: None,
+        user_context: crate::ir::UserContextFields::empty(),
+        producer: Some(evidence_producer()),
+    };
+
+    let agent_node = build_agent_node(&req.provenance.agent_id, agent_kind);
+    let session_node = build_agent_session_node(&req.provenance, agent_kind, &now);
+    let session_of_edge = build_session_of_edge(&session_node_id, &agent_id_node);
+    let authored_by_edge = build_authored_by_edge(&obs_id, &session_node_id);
+
+    let records = vec![
+        agent_node,
+        session_node,
+        session_of_edge,
+        obs_node,
+        authored_by_edge,
+    ];
+
+    Ok(EvidenceWriteOutcome {
+        evidence_handle: obs_id.clone(),
+        record_id: obs_id,
+        records,
+    })
+}
+
+/// Builds a typed `CommandRun` record batch (command evidence) from a
+/// provenance-bearing request.
+///
+/// `CommandRun` nodes live in the **verification** domain (`verification:v1:` prefix).
+/// Either `source_artifact_path` or `source_artifact_hash` must be non-empty.
+///
+/// # Errors
+///
+/// Returns a [`ProvenanceError`] when any required field is missing or invalid.
+#[allow(clippy::too_many_lines)]
+pub fn build_command_evidence_records(
+    req: &CommandEvidenceRequest,
+) -> Result<EvidenceWriteOutcome, ProvenanceError> {
+    validate_provenance_base(&req.provenance)?;
+    validate_source_artifact(&req.source_artifact_path, &req.source_artifact_hash)?;
+
+    if req.executed_at.is_empty() {
+        return Err(ProvenanceError::missing("executed_at"));
+    }
+
+    let agent_kind = effective_agent_kind(&req.provenance);
+    let now = now_rfc3339();
+
+    // Content-addressed on agent, session, execution time, and exit code.
+    let cmd_id = verification_stable_id(&[
+        "node",
+        "command_run",
+        &req.provenance.agent_id,
+        &req.provenance.session_id,
+        &req.executed_at,
+        &req.exit_code.to_string(),
+        &req.source_artifact_hash,
+    ]);
+
+    let stdout_handle = req.stdout.as_deref().map(output_handle).map(Box::new);
+
+    let stderr_handle = req.stderr.as_deref().map(output_handle).map(Box::new);
+
+    let exit_status = if req.exit_code == 0 { "pass" } else { "fail" };
+
+    let cmd_node = GraphRecord::Node {
+        id: cmd_id.clone(),
+        kind: NodeKind::CommandRun,
+        schema_version: VERIFICATION_SCHEMA_VERSION,
+        repo_relative_path: None,
+        span: None,
+        name: None,
+        language: None,
+        symbol_kind: None,
+        disambiguator: None,
+        temporal: None,
+        semantic_drift: None,
+        evidence_links: None,
+        repository_identity: None,
+        text: None,
+        superseded_by: None,
+        agent_id: Some(req.provenance.agent_id.clone()),
+        agent_kind: Some(agent_kind.to_owned()),
+        session_id: Some(req.provenance.session_id.clone()),
+        observed_at: Some(req.provenance.observed_at.clone()),
+        ingested_at: Some(now),
+        confidence: None,
+        source_handle: req.provenance.source_handle.clone(),
+        redaction_policy_version: None,
+        valid_time: None,
+        valid_time_source: None,
+        entity_id: None,
+        title: None,
+        body_handle: None,
+        source_kind: None,
+        source_external_link_id: None,
+        assignees: None,
+        labels: None,
+        priority: None,
+        parent_task_id: None,
+        ordinal: None,
+        verification_link_id: None,
+        system: None,
+        url: None,
+        system_native_id: None,
+        repository_remote: None,
+        discovered_at: None,
+        transaction_time: None,
+        summary: format!(
+            "CommandRun by {} in {} at {} (exit {})",
+            req.provenance.agent_id, req.provenance.session_id, req.executed_at, req.exit_code
+        ),
+        domain: Some("verification".to_owned()),
+        importer_id: None,
+        importer_version: None,
+        source_artifact_path: Some(req.source_artifact_path.clone()),
+        source_artifact_hash: Some(req.source_artifact_hash.clone()),
+        patch_status: None,
+        base_commit: None,
+        unknown_base_reason: None,
+        target_files: None,
+        patch_bytes_hash: None,
+        patch_bytes_size: None,
+        patch_handle: None,
+        validation_summary: None,
+        producer_session_id: None,
+        edit_kind: None,
+        before_hash: None,
+        after_hash: None,
+        rename_to: None,
+        hunk_count: None,
+        linked_patch_id: None,
+        linked_turn_id: None,
+        tool_name: None,
+        tool_kind: None,
+        arguments_summary: None,
+        arguments_handle: None,
+        result_handle: None,
+        produced_evidence_id: None,
+        started_at: None,
+        finished_at: None,
+        failure_kind: None,
+        exit_code: Some(req.exit_code),
+        turn_index: None,
+        stdout_handle,
+        stderr_handle,
+        evidence_quality: Some(req.evidence_quality.clone()),
+        executed_at: Some(req.executed_at.clone()),
+        verification_kind: None,
+        status: Some(exit_status.to_owned()),
+        user_context: crate::ir::UserContextFields::empty(),
+        producer: Some(evidence_producer()),
+    };
+
+    Ok(EvidenceWriteOutcome {
+        evidence_handle: cmd_id.clone(),
+        record_id: cmd_id,
+        records: vec![cmd_node],
+    })
+}
+
+/// Builds a typed `PatchArtifact` record batch from a provenance-bearing request.
+///
+/// `PatchArtifact` nodes live in the **artifact** domain (`artifact:v1:` prefix).
+/// Both `source_artifact_path` and `source_artifact_hash` must be non-empty.
+///
+/// # Errors
+///
+/// Returns a [`ProvenanceError`] when any required field is missing or invalid.
+#[allow(clippy::too_many_lines)]
+pub fn build_artifact_records(
+    req: &ArtifactRequest,
+) -> Result<EvidenceWriteOutcome, ProvenanceError> {
+    validate_provenance_base(&req.provenance)?;
+    validate_source_artifact(&req.source_artifact_path, &req.source_artifact_hash)?;
+
+    if !PATCH_STATUS_VALUES.contains(&req.patch_status.as_str()) {
+        return Err(ProvenanceError::invalid("patch_status"));
+    }
+
+    let agent_kind = effective_agent_kind(&req.provenance);
+    let now = now_rfc3339();
+
+    // Hash the patch bytes for content addressing
+    let patch_hash = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&req.patch_bytes);
+        hasher.finalize().to_hex().to_string()
+    };
+
+    let art_id = artifact_stable_id(&[
+        "node",
+        "patch_artifact",
+        &req.provenance.agent_id,
+        &req.provenance.session_id,
+        &patch_hash,
+    ]);
+
+    let patch_bytes_size = req.patch_bytes.len() as u64;
+    let patch_inline = (patch_bytes_size <= INLINE_PAYLOAD_CEILING)
+        .then(|| String::from_utf8_lossy(&req.patch_bytes).into_owned());
+
+    let patch_handle = Box::new(PatchHandle {
+        path: format!("patches/{art_id}.patch"),
+        inline: patch_inline,
+    });
+
+    let (base_commit_field, unknown_base_reason) = req.base_commit.as_ref().map_or_else(
+        || (None, Some("unknown_base".to_owned())),
+        |bc| (Some(bc.clone()), None),
+    );
+
+    let art_node = GraphRecord::Node {
+        id: art_id.clone(),
+        kind: NodeKind::PatchArtifact,
+        schema_version: ARTIFACT_SCHEMA_VERSION,
+        repo_relative_path: None,
+        span: None,
+        name: None,
+        language: None,
+        symbol_kind: None,
+        disambiguator: None,
+        temporal: None,
+        semantic_drift: None,
+        evidence_links: None,
+        repository_identity: None,
+        text: None,
+        superseded_by: None,
+        agent_id: Some(req.provenance.agent_id.clone()),
+        agent_kind: Some(agent_kind.to_owned()),
+        session_id: Some(req.provenance.session_id.clone()),
+        observed_at: Some(req.provenance.observed_at.clone()),
+        ingested_at: Some(now),
+        confidence: None,
+        source_handle: req.provenance.source_handle.clone(),
+        redaction_policy_version: None,
+        valid_time: Some(req.provenance.observed_at.clone()),
+        valid_time_source: Some("observed_at".to_owned()),
+        entity_id: None,
+        title: None,
+        body_handle: None,
+        source_kind: None,
+        source_external_link_id: None,
+        assignees: None,
+        labels: None,
+        priority: None,
+        parent_task_id: None,
+        ordinal: None,
+        verification_link_id: None,
+        system: None,
+        url: None,
+        system_native_id: None,
+        repository_remote: None,
+        discovered_at: None,
+        transaction_time: None,
+        summary: format!(
+            "PatchArtifact by {} targeting {}",
+            req.provenance.agent_id,
+            req.target_files.join(", ")
+        ),
+        domain: Some("artifact".to_owned()),
+        importer_id: None,
+        importer_version: None,
+        source_artifact_path: Some(req.source_artifact_path.clone()),
+        source_artifact_hash: Some(req.source_artifact_hash.clone()),
+        patch_status: Some(req.patch_status.clone()),
+        base_commit: base_commit_field,
+        unknown_base_reason,
+        target_files: Some(req.target_files.clone()),
+        patch_bytes_hash: Some(patch_hash),
+        patch_bytes_size: Some(patch_bytes_size),
+        patch_handle: Some(patch_handle),
+        validation_summary: None,
+        producer_session_id: Some(req.provenance.session_id.clone()),
+        edit_kind: None,
+        before_hash: None,
+        after_hash: None,
+        rename_to: None,
+        hunk_count: None,
+        linked_patch_id: None,
+        linked_turn_id: None,
+        tool_name: None,
+        tool_kind: None,
+        arguments_summary: None,
+        arguments_handle: None,
+        result_handle: None,
+        produced_evidence_id: None,
+        started_at: None,
+        finished_at: None,
+        failure_kind: None,
+        exit_code: None,
+        turn_index: None,
+        stdout_handle: None,
+        stderr_handle: None,
+        evidence_quality: None,
+        executed_at: None,
+        verification_kind: None,
+        status: None,
+        user_context: crate::ir::UserContextFields::empty(),
+        producer: Some(evidence_producer()),
+    };
+
+    Ok(EvidenceWriteOutcome {
+        evidence_handle: art_id.clone(),
+        record_id: art_id,
+        records: vec![art_node],
+    })
+}
+
+/// Builds a typed `Verification` record batch from a provenance-bearing request.
+///
+/// `Verification` nodes live in the **verification** domain (`verification:v1:` prefix).
+/// Both `source_artifact_path` and `source_artifact_hash` must be non-empty.
+///
+/// When `linked_command_evidence_id` is supplied, a `HAS_EVIDENCE` edge links
+/// the verification record to the command evidence that produced it.
+///
+/// # Errors
+///
+/// Returns a [`ProvenanceError`] when any required field is missing or invalid.
+#[allow(clippy::too_many_lines)]
+pub fn build_verification_records(
+    req: &VerificationRequest,
+) -> Result<EvidenceWriteOutcome, ProvenanceError> {
+    validate_provenance_base(&req.provenance)?;
+    validate_source_artifact(&req.source_artifact_path, &req.source_artifact_hash)?;
+
+    if req.executed_at.is_empty() {
+        return Err(ProvenanceError::missing("executed_at"));
+    }
+    if req.status.is_empty() {
+        return Err(ProvenanceError::missing("status"));
+    }
+
+    let agent_kind = effective_agent_kind(&req.provenance);
+    let now = now_rfc3339();
+
+    let ver_id = verification_stable_id(&[
+        "node",
+        "verification",
+        &req.provenance.agent_id,
+        &req.provenance.session_id,
+        &req.executed_at,
+        &req.status,
+        &req.source_artifact_hash,
+    ]);
+
+    let stdout_handle = req.stdout.as_deref().map(output_handle).map(Box::new);
+
+    let ver_node = GraphRecord::Node {
+        id: ver_id.clone(),
+        kind: NodeKind::Verification,
+        schema_version: VERIFICATION_SCHEMA_VERSION,
+        repo_relative_path: None,
+        span: None,
+        name: None,
+        language: None,
+        symbol_kind: None,
+        disambiguator: None,
+        temporal: None,
+        semantic_drift: None,
+        evidence_links: None,
+        repository_identity: None,
+        text: None,
+        superseded_by: None,
+        agent_id: Some(req.provenance.agent_id.clone()),
+        agent_kind: Some(agent_kind.to_owned()),
+        session_id: Some(req.provenance.session_id.clone()),
+        observed_at: Some(req.provenance.observed_at.clone()),
+        ingested_at: Some(now),
+        confidence: None,
+        source_handle: req.provenance.source_handle.clone(),
+        redaction_policy_version: None,
+        valid_time: None,
+        valid_time_source: None,
+        entity_id: None,
+        title: None,
+        body_handle: None,
+        source_kind: None,
+        source_external_link_id: None,
+        assignees: None,
+        labels: None,
+        priority: None,
+        parent_task_id: None,
+        ordinal: None,
+        verification_link_id: None,
+        system: None,
+        url: None,
+        system_native_id: None,
+        repository_remote: None,
+        discovered_at: None,
+        transaction_time: None,
+        summary: format!(
+            "Verification {} by {} in {} at {}",
+            req.status, req.provenance.agent_id, req.provenance.session_id, req.executed_at
+        ),
+        domain: Some("verification".to_owned()),
+        importer_id: None,
+        importer_version: None,
+        source_artifact_path: Some(req.source_artifact_path.clone()),
+        source_artifact_hash: Some(req.source_artifact_hash.clone()),
+        patch_status: None,
+        base_commit: None,
+        unknown_base_reason: None,
+        target_files: None,
+        patch_bytes_hash: None,
+        patch_bytes_size: None,
+        patch_handle: None,
+        validation_summary: None,
+        producer_session_id: None,
+        edit_kind: None,
+        before_hash: None,
+        after_hash: None,
+        rename_to: None,
+        hunk_count: None,
+        linked_patch_id: None,
+        linked_turn_id: None,
+        tool_name: None,
+        tool_kind: None,
+        arguments_summary: None,
+        arguments_handle: None,
+        result_handle: None,
+        produced_evidence_id: req.linked_command_evidence_id.clone(),
+        started_at: None,
+        finished_at: None,
+        failure_kind: None,
+        exit_code: None,
+        turn_index: None,
+        stdout_handle,
+        stderr_handle: None,
+        evidence_quality: Some(req.evidence_quality.clone()),
+        executed_at: Some(req.executed_at.clone()),
+        verification_kind: Some(req.verification_kind.clone()),
+        status: Some(req.status.clone()),
+        user_context: crate::ir::UserContextFields::empty(),
+        producer: Some(evidence_producer()),
+    };
+
+    let mut records = vec![ver_node];
+
+    // If there's a linked command evidence record, emit a HAS_EVIDENCE edge.
+    if let Some(ref cmd_id) = req.linked_command_evidence_id {
+        let has_evidence_edge = GraphRecord::agent_memory_edge(
+            EdgeLabel::HasEvidence,
+            ver_id.clone(),
+            cmd_id.clone(),
+            None,
+            format!("{ver_id} HAS_EVIDENCE {cmd_id}"),
+        );
+        records.push(has_evidence_edge);
+    }
+
+    Ok(EvidenceWriteOutcome {
+        evidence_handle: ver_id.clone(),
+        record_id: ver_id,
+        records,
+    })
+}

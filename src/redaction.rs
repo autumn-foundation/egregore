@@ -242,9 +242,15 @@ fn check_sensitive_fields(record: &GraphRecord) -> Result<()> {
             check_field(&format!("labels[{i}]"), Some(item.as_str()))?;
         }
     }
-    check_field("proposed_rule_text", user_context.proposed_rule_text.as_deref())?;
+    check_field(
+        "proposed_rule_text",
+        user_context.proposed_rule_text.as_deref(),
+    )?;
     check_field("prompt_text", user_context.prompt_text.as_deref())?;
-    check_field("decision_rationale", user_context.decision_rationale.as_deref())?;
+    check_field(
+        "decision_rationale",
+        user_context.decision_rationale.as_deref(),
+    )?;
     check_field("edited_rule_text", user_context.edited_rule_text.as_deref())?;
     check_field("rule_text", user_context.rule_text.as_deref())?;
     check_field("action_summary", user_context.action_summary.as_deref())?;
@@ -287,9 +293,15 @@ fn check_sensitive_fields(record: &GraphRecord) -> Result<()> {
                 check_marker_field(&format!("labels[{i}]"), Some(item.as_str()))?;
             }
         }
-        check_marker_field("proposed_rule_text", user_context.proposed_rule_text.as_deref())?;
+        check_marker_field(
+            "proposed_rule_text",
+            user_context.proposed_rule_text.as_deref(),
+        )?;
         check_marker_field("prompt_text", user_context.prompt_text.as_deref())?;
-        check_marker_field("decision_rationale", user_context.decision_rationale.as_deref())?;
+        check_marker_field(
+            "decision_rationale",
+            user_context.decision_rationale.as_deref(),
+        )?;
         check_marker_field("edited_rule_text", user_context.edited_rule_text.as_deref())?;
         check_marker_field("rule_text", user_context.rule_text.as_deref())?;
         check_marker_field("action_summary", user_context.action_summary.as_deref())?;
@@ -488,13 +500,13 @@ fn find_session_cookie(value: &str) -> Option<usize> {
 fn find_api_token(value: &str) -> Option<usize> {
     // Well-known API token prefixes
     const PREFIXES: &[&str] = &[
-        "sk-",           // OpenAI and compatible providers
-        "ghp_",          // GitHub personal access token (classic)
-        "ghs_",          // GitHub server-to-server token
-        "github_pat_",   // GitHub fine-grained PAT
-        "glpat-",        // GitLab personal access token
-        "xoxb-",         // Slack bot token
-        "xoxp-",         // Slack user token
+        "sk-",         // OpenAI and compatible providers
+        "ghp_",        // GitHub personal access token (classic)
+        "ghs_",        // GitHub server-to-server token
+        "github_pat_", // GitHub fine-grained PAT
+        "glpat-",      // GitLab personal access token
+        "xoxb-",       // Slack bot token
+        "xoxp-",       // Slack user token
     ];
     for prefix in PREFIXES {
         if let Some(pos) = value.find(prefix) {
