@@ -186,6 +186,8 @@ pub struct ArtifactRequest {
     pub source_artifact_path: String,
     /// BLAKE3 or SHA256 hex hash of the source artifact.
     pub source_artifact_hash: String,
+    /// Human-readable summary of any validation performed on this artifact.
+    pub validation_summary: String,
 }
 
 /// Typed request for writing a `Verification` record.
@@ -553,10 +555,15 @@ pub fn build_observation_records(
         &req.provenance.session_id,
     ]);
 
+    // Redact free-text before hashing or storing — secrets must not reach the store.
+    let redacted_text = crate::redaction::redact_value(&req.text);
+    let redaction_policy_version = crate::redaction::is_redacted(&redacted_text)
+        .then(|| crate::redaction::REDACTION_POLICY_VERSION.to_owned());
+
     // Observation ID is content-addressed on agent, session, and text hash.
     let text_hash = {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(req.text.as_bytes());
+        hasher.update(redacted_text.as_bytes());
         hasher.finalize().to_hex().to_string()
     };
     let obs_id = agent_memory_stable_id(&[
@@ -582,7 +589,7 @@ pub fn build_observation_records(
         semantic_drift: None,
         evidence_links: Some(req.evidence_links.clone()),
         repository_identity: None,
-        text: Some(req.text.clone()),
+        text: Some(redacted_text.clone()),
         superseded_by: None,
         agent_id: Some(req.provenance.agent_id.clone()),
         agent_kind: Some(agent_kind.to_owned()),
@@ -591,7 +598,7 @@ pub fn build_observation_records(
         ingested_at: Some(now.clone()),
         confidence: Some(req.confidence.to_string()),
         source_handle: req.provenance.source_handle.clone(),
-        redaction_policy_version: None,
+        redaction_policy_version,
         valid_time: None,
         valid_time_source: None,
         entity_id: None,
@@ -615,7 +622,7 @@ pub fn build_observation_records(
             "Observation by {} in {}: {}",
             req.provenance.agent_id,
             req.provenance.session_id,
-            req.text.chars().take(60).collect::<String>()
+            redacted_text.chars().take(60).collect::<String>()
         ),
         domain: Some("agent_memory".to_owned()),
         importer_id: None,
@@ -705,7 +712,7 @@ pub fn build_command_evidence_records(
     // Content-addressed on agent, session, execution time, and exit code.
     let cmd_id = verification_stable_id(&[
         "node",
-        "command_run",
+        "command_evidence",
         &req.provenance.agent_id,
         &req.provenance.session_id,
         &req.executed_at,
@@ -721,7 +728,7 @@ pub fn build_command_evidence_records(
 
     let cmd_node = GraphRecord::Node {
         id: cmd_id.clone(),
-        kind: NodeKind::CommandRun,
+        kind: NodeKind::CommandEvidence,
         schema_version: VERIFICATION_SCHEMA_VERSION,
         repo_relative_path: None,
         span: None,
@@ -763,7 +770,7 @@ pub fn build_command_evidence_records(
         discovered_at: None,
         transaction_time: None,
         summary: format!(
-            "CommandRun by {} in {} at {} (exit {})",
+            "CommandEvidence by {} in {} at {} (exit {})",
             req.provenance.agent_id, req.provenance.session_id, req.executed_at, req.exit_code
         ),
         domain: Some("verification".to_owned()),
@@ -836,6 +843,13 @@ pub fn build_artifact_records(
 
     let agent_kind = effective_agent_kind(&req.provenance);
     let now = now_rfc3339();
+
+    let session_node_id = agent_memory_stable_id(&[
+        "node",
+        "agent_session",
+        &req.provenance.agent_id,
+        &req.provenance.session_id,
+    ]);
 
     // Hash the patch bytes for content addressing
     let patch_hash = {
@@ -926,8 +940,8 @@ pub fn build_artifact_records(
         patch_bytes_hash: Some(patch_hash),
         patch_bytes_size: Some(patch_bytes_size),
         patch_handle: Some(patch_handle),
-        validation_summary: None,
-        producer_session_id: Some(req.provenance.session_id.clone()),
+        validation_summary: Some(req.validation_summary.clone()),
+        producer_session_id: Some(session_node_id),
         edit_kind: None,
         before_hash: None,
         after_hash: None,

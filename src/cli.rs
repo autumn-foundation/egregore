@@ -458,6 +458,9 @@ enum WriteKind {
         /// Source artifact hash.
         #[arg(long, default_value = "")]
         source_artifact_hash: String,
+        /// Human-readable summary of any validation performed on this artifact.
+        #[arg(long, default_value = "")]
+        validation_summary: String,
         /// Output JSONL path for the produced records.
         #[arg(long, required = true)]
         out: PathBuf,
@@ -658,6 +661,7 @@ fn write_evidence(kind: WriteKind) -> Result<()> {
             base_commit,
             source_artifact_path,
             source_artifact_hash,
+            validation_summary,
             out,
         } => {
             let patch_bytes = fs::read(&patch_file)
@@ -676,6 +680,7 @@ fn write_evidence(kind: WriteKind) -> Result<()> {
                 base_commit,
                 source_artifact_path,
                 source_artifact_hash,
+                validation_summary,
             };
             let outcome = build_artifact_records(&req).map_err(|e| {
                 eprintln!(r#"{{"code":"{}", "field":"{}"}}"#, e.code, e.field);

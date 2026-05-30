@@ -267,7 +267,7 @@ fn accepted_observation_carries_required_provenance() {
 }
 
 #[test]
-fn accepted_command_evidence_produces_command_run_node() {
+fn accepted_command_evidence_produces_command_evidence_node() {
     let req = CommandEvidenceRequest {
         provenance: valid_provenance(),
         executed_at: "2026-05-30T10:01:00Z".to_owned(),
@@ -287,16 +287,19 @@ fn accepted_command_evidence_produces_command_run_node() {
         outcome.record_id
     );
 
-    let has_command_run = outcome.records.iter().any(|r| {
+    let has_command_evidence = outcome.records.iter().any(|r| {
         matches!(
             r,
             aletheia_egregore::ir::GraphRecord::Node {
-                kind: NodeKind::CommandRun,
+                kind: NodeKind::CommandEvidence,
                 ..
             }
         )
     });
-    assert!(has_command_run, "records must include CommandRun node");
+    assert!(
+        has_command_evidence,
+        "records must include CommandEvidence node"
+    );
 }
 
 #[test]
@@ -321,12 +324,12 @@ fn accepted_command_evidence_carries_required_provenance() {
             matches!(
                 r,
                 aletheia_egregore::ir::GraphRecord::Node {
-                    kind: NodeKind::CommandRun,
+                    kind: NodeKind::CommandEvidence,
                     ..
                 }
             )
         })
-        .expect("CommandRun node must be present");
+        .expect("CommandEvidence node must be present");
 
     if let aletheia_egregore::ir::GraphRecord::Node {
         agent_id,
@@ -399,6 +402,7 @@ fn accepted_artifact_produces_patch_artifact_node() {
         base_commit: Some("abc123def456".to_owned()),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "patch applies cleanly".to_owned(),
     };
     let outcome = build_artifact_records(&req).expect("valid artifact must succeed");
 
@@ -684,6 +688,7 @@ fn full_workflow_writes_all_four_evidence_types() {
         base_commit: Some("abc123def456".to_owned()),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:fixture001".to_owned(),
+        validation_summary: "patch applies cleanly".to_owned(),
     };
     let art = build_artifact_records(&art_req).expect("artifact must succeed");
     assert!(art.record_id.starts_with("artifact:v1:"));
@@ -773,8 +778,16 @@ fn same_inputs_produce_same_evidence_handles() {
     );
 
     // Verify all record IDs are identical across both runs
-    let first_ids: Vec<_> = first.records.iter().map(aletheia_egregore::GraphRecord::id).collect();
-    let second_ids: Vec<_> = second.records.iter().map(aletheia_egregore::GraphRecord::id).collect();
+    let first_ids: Vec<_> = first
+        .records
+        .iter()
+        .map(aletheia_egregore::GraphRecord::id)
+        .collect();
+    let second_ids: Vec<_> = second
+        .records
+        .iter()
+        .map(aletheia_egregore::GraphRecord::id)
+        .collect();
     assert_eq!(
         first_ids, second_ids,
         "all record IDs must be identical across two identical writes"
@@ -806,6 +819,7 @@ fn artifact_rejects_unknown_patch_status() {
         base_commit: Some("abc123".to_owned()),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "n/a".to_owned(),
     };
     let err = build_artifact_records(&req).expect_err("unknown patch_status must be rejected");
     assert_eq!(err.code, "invalid_field");
@@ -846,7 +860,7 @@ fn evidence_writer_uses_only_existing_node_kinds() {
                 NodeKind::Agent
                     | NodeKind::AgentSession
                     | NodeKind::Observation
-                    | NodeKind::CommandRun
+                    | NodeKind::CommandEvidence
                     | NodeKind::PatchArtifact
                     | NodeKind::Verification
                     | NodeKind::TestRun
