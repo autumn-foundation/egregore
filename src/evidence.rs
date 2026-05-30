@@ -278,6 +278,23 @@ const fn effective_agent_kind(prov: &EvidenceProvenance) -> &str {
     }
 }
 
+const VALID_AGENT_KINDS: &[&str] = &[
+    "codex",
+    "claude-code",
+    "vantage",
+    "rust-swe-agent",
+    "human",
+    "other",
+];
+
+/// Validates the `agent_kind` against the published enum.
+fn validate_agent_kind(prov: &EvidenceProvenance) -> Result<(), ProvenanceError> {
+    if !VALID_AGENT_KINDS.contains(&effective_agent_kind(prov)) {
+        return Err(ProvenanceError::invalid("agent_kind"));
+    }
+    Ok(())
+}
+
 /// Returns the current UTC time as an RFC 3339 string for `ingested_at`.
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -423,12 +440,12 @@ fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> Grap
         agent_id: Some(prov.agent_id.clone()),
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(prov.session_id.clone()),
-        // observed_at and ingested_at are intentionally omitted: AgentSession is a
-        // singleton keyed by (agent_id, session_id). Including wall-clock times would
-        // make repeated writes for the same session produce records with identical IDs
-        // but different payloads, which the daemon rejects as conflicting duplicates.
-        observed_at: None,
-        ingested_at: None,
+        // Use prov.observed_at for both timestamps — wall-clock now() would change per
+        // call and produce records with the same stable ID but different payloads, which
+        // the daemon rejects as ambiguous duplicates. Using the provenance time makes
+        // the session record idempotent for a given (agent_id, session_id, observed_at).
+        observed_at: Some(prov.observed_at.clone()),
+        ingested_at: Some(prov.observed_at.clone()),
         confidence: None,
         source_handle: None,
         redaction_policy_version: None,
@@ -548,6 +565,7 @@ pub fn build_observation_records(
     req: &ObservationRequest,
 ) -> Result<EvidenceWriteOutcome, ProvenanceError> {
     validate_provenance_base(&req.provenance)?;
+    validate_agent_kind(&req.provenance)?;
     validate_source_handle(&req.provenance)?;
 
     if req.text.is_empty() {
@@ -561,7 +579,6 @@ pub fn build_observation_records(
     }
 
     let agent_kind = effective_agent_kind(&req.provenance);
-    let now = now_rfc3339();
 
     let agent_id_node = agent_memory_stable_id(&["node", "agent", &req.provenance.agent_id]);
     let session_node_id = agent_memory_stable_id(&[
@@ -611,7 +628,7 @@ pub fn build_observation_records(
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(req.provenance.session_id.clone()),
         observed_at: Some(req.provenance.observed_at.clone()),
-        ingested_at: Some(now),
+        ingested_at: Some(req.provenance.observed_at.clone()),
         confidence: Some(req.confidence.to_string()),
         source_handle: req.provenance.source_handle.clone(),
         redaction_policy_version,
@@ -716,6 +733,7 @@ pub fn build_command_evidence_records(
     req: &CommandEvidenceRequest,
 ) -> Result<EvidenceWriteOutcome, ProvenanceError> {
     validate_provenance_base(&req.provenance)?;
+    validate_agent_kind(&req.provenance)?;
     validate_source_artifact(&req.source_artifact_path, &req.source_artifact_hash)?;
 
     if req.executed_at.is_empty() {
@@ -726,7 +744,6 @@ pub fn build_command_evidence_records(
     }
 
     let agent_kind = effective_agent_kind(&req.provenance);
-    let now = now_rfc3339();
 
     // Redact stdout/stderr before hashing or inline storage.
     let redacted_stdout = req.stdout.as_deref().map(crate::redaction::redact_value);
@@ -787,7 +804,7 @@ pub fn build_command_evidence_records(
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(req.provenance.session_id.clone()),
         observed_at: Some(req.provenance.observed_at.clone()),
-        ingested_at: Some(now),
+        ingested_at: Some(req.provenance.observed_at.clone()),
         confidence: None,
         source_handle: req.provenance.source_handle.clone(),
         redaction_policy_version,
@@ -876,6 +893,7 @@ pub fn build_artifact_records(
     req: &ArtifactRequest,
 ) -> Result<EvidenceWriteOutcome, ProvenanceError> {
     validate_provenance_base(&req.provenance)?;
+    validate_agent_kind(&req.provenance)?;
     validate_source_artifact_both(&req.source_artifact_path, &req.source_artifact_hash)?;
 
     if !PATCH_STATUS_VALUES.contains(&req.patch_status.as_str()) {
@@ -889,7 +907,6 @@ pub fn build_artifact_records(
     }
 
     let agent_kind = effective_agent_kind(&req.provenance);
-    let now = now_rfc3339();
 
     let session_node_id = agent_memory_stable_id(&[
         "node",
@@ -915,8 +932,8 @@ pub fn build_artifact_records(
 
     let patch_bytes_size = req.patch_bytes.len() as u64;
 
-    // Decode patch bytes and redact before inline storage. Always store inline
-    // because JSONL has no sidecar mechanism for large payloads.
+    // Decode patch bytes and redact before inline storage.
+    // Only inline when below the ceiling; the daemon rejects inline_payload_exceeds_ceiling.
     let patch_str = String::from_utf8_lossy(&req.patch_bytes).into_owned();
     let redacted_patch = crate::redaction::redact_value(&patch_str);
     let redacted_validation_summary = crate::redaction::redact_value(&req.validation_summary);
@@ -925,9 +942,10 @@ pub fn build_artifact_records(
     let redaction_policy_version = (patch_redacted || summary_redacted)
         .then(|| crate::redaction::REDACTION_POLICY_VERSION.to_owned());
 
+    let patch_inline = (patch_bytes_size <= INLINE_PAYLOAD_CEILING).then_some(redacted_patch);
     let patch_handle = Box::new(PatchHandle {
         path: format!("patches/{art_id}.patch"),
-        inline: Some(redacted_patch),
+        inline: patch_inline,
     });
 
     let (base_commit_field, unknown_base_reason) = req.base_commit.as_ref().map_or_else(
@@ -955,7 +973,7 @@ pub fn build_artifact_records(
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(req.provenance.session_id.clone()),
         observed_at: Some(req.provenance.observed_at.clone()),
-        ingested_at: Some(now),
+        ingested_at: Some(req.provenance.observed_at.clone()),
         confidence: None,
         source_handle: req.provenance.source_handle.clone(),
         redaction_policy_version,
@@ -1065,6 +1083,7 @@ pub fn build_verification_records(
     req: &VerificationRequest,
 ) -> Result<EvidenceWriteOutcome, ProvenanceError> {
     validate_provenance_base(&req.provenance)?;
+    validate_agent_kind(&req.provenance)?;
     validate_source_artifact(&req.source_artifact_path, &req.source_artifact_hash)?;
 
     if req.executed_at.is_empty() {
@@ -1078,7 +1097,6 @@ pub fn build_verification_records(
     }
 
     let agent_kind = effective_agent_kind(&req.provenance);
-    let now = now_rfc3339();
 
     let ver_id = verification_stable_id(&[
         "node",
@@ -1120,7 +1138,7 @@ pub fn build_verification_records(
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(req.provenance.session_id.clone()),
         observed_at: Some(req.provenance.observed_at.clone()),
-        ingested_at: Some(now),
+        ingested_at: Some(req.provenance.observed_at.clone()),
         confidence: None,
         source_handle: req.provenance.source_handle.clone(),
         redaction_policy_version,

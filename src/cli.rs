@@ -4,6 +4,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    process,
 };
 
 use anyhow::{Context, Result};
@@ -567,6 +568,17 @@ fn run_cli(cli: Cli) -> Result<()> {
 /// On provenance failure the function writes a JSON error to stderr
 /// (`{"code":"missing_field","field":"<name>"}`) and returns an error.
 #[allow(clippy::too_many_lines)]
+/// Prints a machine-readable JSON error envelope to stderr and exits with code 1.
+///
+/// Callers that detect a [`crate::evidence::ProvenanceError`] use this instead of
+/// propagating the error so that `main` does not emit a second human-readable line
+/// after the JSON envelope has already been written.
+fn write_evidence_error(e: &crate::evidence::ProvenanceError) -> ! {
+    eprintln!(r#"{{"code":"{}", "field":"{}"}}"#, e.code, e.field);
+    process::exit(1);
+}
+
+#[allow(clippy::too_many_lines)]
 fn write_evidence(kind: WriteKind) -> Result<()> {
     match kind {
         WriteKind::Observation {
@@ -606,10 +618,8 @@ fn write_evidence(kind: WriteKind) -> Result<()> {
                 confidence,
                 evidence_links,
             };
-            let outcome = build_observation_records(&req).map_err(|e| {
-                eprintln!(r#"{{"code":"{}", "field":"{}"}}"#, e.code, e.field);
-                anyhow::anyhow!("{e}")
-            })?;
+            let outcome =
+                build_observation_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
             write_evidence_outcome(&outcome.records, &out, &outcome.record_id)
         }
         WriteKind::CommandEvidence {
@@ -643,10 +653,8 @@ fn write_evidence(kind: WriteKind) -> Result<()> {
                 source_artifact_path,
                 source_artifact_hash,
             };
-            let outcome = build_command_evidence_records(&req).map_err(|e| {
-                eprintln!(r#"{{"code":"{}", "field":"{}"}}"#, e.code, e.field);
-                anyhow::anyhow!("{e}")
-            })?;
+            let outcome =
+                build_command_evidence_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
             write_evidence_outcome(&outcome.records, &out, &outcome.record_id)
         }
         WriteKind::Artifact {
@@ -682,10 +690,7 @@ fn write_evidence(kind: WriteKind) -> Result<()> {
                 source_artifact_hash,
                 validation_summary,
             };
-            let outcome = build_artifact_records(&req).map_err(|e| {
-                eprintln!(r#"{{"code":"{}", "field":"{}"}}"#, e.code, e.field);
-                anyhow::anyhow!("{e}")
-            })?;
+            let outcome = build_artifact_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
             write_evidence_outcome(&outcome.records, &out, &outcome.record_id)
         }
         WriteKind::Verification {
@@ -721,10 +726,8 @@ fn write_evidence(kind: WriteKind) -> Result<()> {
                 source_artifact_hash,
                 linked_command_evidence_id,
             };
-            let outcome = build_verification_records(&req).map_err(|e| {
-                eprintln!(r#"{{"code":"{}", "field":"{}"}}"#, e.code, e.field);
-                anyhow::anyhow!("{e}")
-            })?;
+            let outcome =
+                build_verification_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
             write_evidence_outcome(&outcome.records, &out, &outcome.record_id)
         }
     }

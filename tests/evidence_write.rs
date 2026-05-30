@@ -981,6 +981,67 @@ fn repeated_observation_writes_produce_identical_session_nodes() {
 }
 
 #[test]
+fn observation_rejects_unknown_agent_kind() {
+    let req = ObservationRequest {
+        provenance: EvidenceProvenance {
+            agent_kind: "totally-unknown-bot".to_owned(),
+            ..valid_provenance()
+        },
+        text: "agent kind check".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+    };
+    let err = build_observation_records(&req).expect_err("unknown agent_kind must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "agent_kind");
+}
+
+#[test]
+fn repeated_observation_identical_inputs_produce_identical_session_nodes_with_required_fields() {
+    let req = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "idempotency check".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+    };
+
+    let out_a = build_observation_records(&req).expect("first write must succeed");
+    let out_b = build_observation_records(&req).expect("second write must succeed");
+
+    // Observation nodes must have observed_at and ingested_at (daemon requires them)
+    let obs = out_a
+        .records
+        .iter()
+        .find(|r| {
+            matches!(
+                r,
+                aletheia_egregore::ir::GraphRecord::Node {
+                    kind: NodeKind::Observation,
+                    ..
+                }
+            )
+        })
+        .expect("observation node must exist");
+    if let aletheia_egregore::ir::GraphRecord::Node {
+        observed_at,
+        ingested_at,
+        ..
+    } = obs
+    {
+        assert!(observed_at.is_some(), "Observation must have observed_at");
+        assert!(ingested_at.is_some(), "Observation must have ingested_at");
+    }
+
+    // Serialize both batches — payload must be identical (idempotent)
+    let json_a = serde_json::to_string(&out_a.records).expect("serialize a");
+    let json_b = serde_json::to_string(&out_b.records).expect("serialize b");
+    assert_eq!(
+        json_a, json_b,
+        "identical inputs must produce identical record batches"
+    );
+}
+
+#[test]
 fn observation_rejects_non_rfc3339_observed_at() {
     let req = ObservationRequest {
         provenance: EvidenceProvenance {
