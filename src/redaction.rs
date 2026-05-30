@@ -184,6 +184,7 @@ const fn is_code_graph_kind(kind: NodeKind) -> bool {
 }
 
 /// Checks all sensitive fields on a non-code-graph node.
+#[allow(clippy::too_many_lines)]
 fn check_sensitive_fields(record: &GraphRecord) -> Result<()> {
     let GraphRecord::Node {
         text,
@@ -200,16 +201,15 @@ fn check_sensitive_fields(record: &GraphRecord) -> Result<()> {
         labels,
         url,
         user_context,
+        redaction_policy_version,
         ..
     } = record
     else {
         return Ok(());
     };
 
-    // Agent-memory domain: Observation body text
+    // Pass 1: reject raw (unredacted) secrets.
     check_field("text", text.as_deref())?;
-
-    // Artifact domain
     check_field("validation_summary", validation_summary.as_deref())?;
     check_field("arguments_summary", arguments_summary.as_deref())?;
     if let Some(h) = arguments_handle {
@@ -221,16 +221,12 @@ fn check_sensitive_fields(record: &GraphRecord) -> Result<()> {
     if let Some(h) = patch_handle {
         check_field("patch_handle.inline", h.inline.as_deref())?;
     }
-
-    // Verification domain
     if let Some(h) = stdout_handle {
         check_field("stdout_handle.inline", h.inline.as_deref())?;
     }
     if let Some(h) = stderr_handle {
         check_field("stderr_handle.inline", h.inline.as_deref())?;
     }
-
-    // Project domain
     check_field("title", title.as_deref())?;
     if let Some(h) = body_handle {
         check_field("body_handle.inline", h.inline.as_deref())?;
@@ -246,21 +242,59 @@ fn check_sensitive_fields(record: &GraphRecord) -> Result<()> {
             check_field(&format!("labels[{i}]"), Some(item.as_str()))?;
         }
     }
-
-    // User-context domain
-    check_field(
-        "proposed_rule_text",
-        user_context.proposed_rule_text.as_deref(),
-    )?;
+    check_field("proposed_rule_text", user_context.proposed_rule_text.as_deref())?;
     check_field("prompt_text", user_context.prompt_text.as_deref())?;
-    check_field(
-        "decision_rationale",
-        user_context.decision_rationale.as_deref(),
-    )?;
+    check_field("decision_rationale", user_context.decision_rationale.as_deref())?;
     check_field("edited_rule_text", user_context.edited_rule_text.as_deref())?;
     check_field("rule_text", user_context.rule_text.as_deref())?;
     check_field("action_summary", user_context.action_summary.as_deref())?;
     check_field("constraint_text", user_context.constraint_text.as_deref())?;
+
+    // Pass 2: if any sensitive field carries a redaction marker, the node must
+    // also carry `redaction_policy_version` so auditors can trace the policy
+    // that was applied.  Reject marker-bearing fields when the version is absent.
+    if redaction_policy_version.is_none() {
+        check_marker_field("text", text.as_deref())?;
+        check_marker_field("validation_summary", validation_summary.as_deref())?;
+        check_marker_field("arguments_summary", arguments_summary.as_deref())?;
+        if let Some(h) = arguments_handle {
+            check_marker_field("arguments_handle.inline", h.inline.as_deref())?;
+        }
+        if let Some(h) = result_handle {
+            check_marker_field("result_handle.inline", h.inline.as_deref())?;
+        }
+        if let Some(h) = patch_handle {
+            check_marker_field("patch_handle.inline", h.inline.as_deref())?;
+        }
+        if let Some(h) = stdout_handle {
+            check_marker_field("stdout_handle.inline", h.inline.as_deref())?;
+        }
+        if let Some(h) = stderr_handle {
+            check_marker_field("stderr_handle.inline", h.inline.as_deref())?;
+        }
+        check_marker_field("title", title.as_deref())?;
+        if let Some(h) = body_handle {
+            check_marker_field("body_handle.inline", h.inline.as_deref())?;
+        }
+        check_marker_field("url", url.as_deref())?;
+        if let Some(items) = assignees {
+            for (i, item) in items.iter().enumerate() {
+                check_marker_field(&format!("assignees[{i}]"), Some(item.as_str()))?;
+            }
+        }
+        if let Some(items) = labels {
+            for (i, item) in items.iter().enumerate() {
+                check_marker_field(&format!("labels[{i}]"), Some(item.as_str()))?;
+            }
+        }
+        check_marker_field("proposed_rule_text", user_context.proposed_rule_text.as_deref())?;
+        check_marker_field("prompt_text", user_context.prompt_text.as_deref())?;
+        check_marker_field("decision_rationale", user_context.decision_rationale.as_deref())?;
+        check_marker_field("edited_rule_text", user_context.edited_rule_text.as_deref())?;
+        check_marker_field("rule_text", user_context.rule_text.as_deref())?;
+        check_marker_field("action_summary", user_context.action_summary.as_deref())?;
+        check_marker_field("constraint_text", user_context.constraint_text.as_deref())?;
+    }
 
     Ok(())
 }
@@ -270,6 +304,17 @@ fn check_field(field_path: &str, value: Option<&str>) -> Result<()> {
     let Some(v) = value else { return Ok(()) };
     if detect_secret(v).is_some() {
         return Err(CodegraphError::RedactionRequired {
+            field_path: field_path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Rejects a field that carries a redaction marker when the node has no policy version.
+fn check_marker_field(field_path: &str, value: Option<&str>) -> Result<()> {
+    let Some(v) = value else { return Ok(()) };
+    if is_redacted(v) {
+        return Err(CodegraphError::RedactionMetadataMissing {
             field_path: field_path.to_owned(),
         });
     }
@@ -295,12 +340,18 @@ fn find_database_url(value: &str) -> Option<usize> {
         "postgresql://",
         "mysql://",
         "mongodb://",
+        "mongodb+srv://",
         "redis://",
         "mssql://",
     ];
     for scheme in SCHEMES {
-        if let Some(pos) = value.find(scheme) {
-            let after = &value[pos + scheme.len()..];
+        // Scan ALL occurrences of the scheme so a non-credentialed decoy URL
+        // (e.g. `postgres://readonly@host/db`) does not shadow a later
+        // credentialed URL with the same scheme.
+        let mut search_from = 0_usize;
+        while let Some(rel) = value[search_from..].find(scheme) {
+            let abs = search_from + rel;
+            let after = &value[abs + scheme.len()..];
             // Require user:password@host — at must follow a colon-separated pair.
             if let Some(at) = after.find('@') {
                 let before_at = &after[..at];
@@ -308,9 +359,13 @@ fn find_database_url(value: &str) -> Option<usize> {
                     // Password (after colon) must be non-empty; username may be empty
                     // to cover password-only URLs like `redis://:p4ssw0rd@host`.
                     if colon + 1 < before_at.len() {
-                        return Some(pos);
+                        return Some(abs);
                     }
                 }
+            }
+            search_from = abs + 1;
+            if search_from >= value.len() {
+                break;
             }
         }
     }
@@ -352,14 +407,22 @@ fn find_cloud_credential(value: &str) -> Option<usize> {
 }
 
 fn find_webhook_secret(value: &str) -> Option<usize> {
-    if let Some(pos) = value.find("whsec_") {
-        let after = &value[pos + 6..];
+    // Scan ALL occurrences so a short non-secret example (e.g. `whsec_test`)
+    // does not shadow a later real signing secret.
+    let mut search_from = 0_usize;
+    while let Some(rel) = value[search_from..].find("whsec_") {
+        let abs = search_from + rel;
+        let after = &value[abs + 6..];
         let len = after
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
             .count();
         if len >= 20 {
-            return Some(pos);
+            return Some(abs);
+        }
+        search_from = abs + 1;
+        if search_from >= value.len() {
+            break;
         }
     }
     None
@@ -398,12 +461,13 @@ fn find_session_cookie(value: &str) -> Option<usize> {
 fn find_api_token(value: &str) -> Option<usize> {
     // Well-known API token prefixes
     const PREFIXES: &[&str] = &[
-        "sk-",    // OpenAI and compatible providers
-        "ghp_",   // GitHub personal access token
-        "ghs_",   // GitHub server-to-server token
-        "glpat-", // GitLab personal access token
-        "xoxb-",  // Slack bot token
-        "xoxp-",  // Slack user token
+        "sk-",           // OpenAI and compatible providers
+        "ghp_",          // GitHub personal access token (classic)
+        "ghs_",          // GitHub server-to-server token
+        "github_pat_",   // GitHub fine-grained PAT
+        "glpat-",        // GitLab personal access token
+        "xoxb-",         // Slack bot token
+        "xoxp-",         // Slack user token
     ];
     for prefix in PREFIXES {
         if let Some(pos) = value.find(prefix) {

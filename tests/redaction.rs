@@ -600,15 +600,22 @@ fn validate_record_err_for_all_user_context_fields() {
     }
 }
 
-// ── Already-redacted marker passes gate (AC5) ─────────────────────────────────
+// ── Already-redacted marker passes gate when policy version is stamped (AC5) ────
 
 #[test]
 fn validate_record_ok_when_text_field_carries_redaction_marker() {
     let mut r = base_agent_node();
-    if let GraphRecord::Node { text, .. } = &mut r {
+    if let GraphRecord::Node {
+        text,
+        redaction_policy_version,
+        ..
+    } = &mut r
+    {
         *text = Some("<REDACTED:api_token:abc123def456>".to_owned());
+        *redaction_policy_version = Some("v1".to_owned());
     }
-    validate_record(&r).expect("already-redacted marker must pass the validation gate");
+    validate_record(&r)
+        .expect("already-redacted marker with policy version must pass the validation gate");
 }
 
 // ── Error safety: RedactionRequired never echoes the raw secret (AC6) ─────────
@@ -790,5 +797,93 @@ fn detect_api_token_bearer_lowercase() {
 fn detect_api_token_bearer_uppercase() {
     let header = "AUTHORIZATION: BEARER ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789XXYY";
     let (class, _) = detect_secret(header).expect("uppercase BEARER token must be detected");
+    assert_eq!(class, SecretClass::ApiToken);
+}
+
+// ── Round 2 review-fix tests ──────────────────────────────────────────────────
+
+// Fix R2-1: marker-bearing field without policy version is rejected.
+#[test]
+fn validate_record_err_marker_field_without_policy_version() {
+    let mut r = base_agent_node();
+    if let GraphRecord::Node { text, .. } = &mut r {
+        *text = Some("<REDACTED:api_token:abc123def456>".to_owned());
+    }
+    // redaction_policy_version is None (not set) — must be rejected
+    let err = validate_record(&r).unwrap_err();
+    match err {
+        CodegraphError::RedactionMetadataMissing { field_path } => {
+            assert_eq!(field_path, "text");
+        }
+        other => panic!("expected RedactionMetadataMissing, got {other:?}"),
+    }
+}
+
+// Fix R2-1 (complement): marker + policy version present → Ok.
+#[test]
+fn validate_record_ok_marker_field_with_policy_version_set() {
+    let mut r = base_agent_node();
+    if let GraphRecord::Node {
+        text,
+        redaction_policy_version,
+        ..
+    } = &mut r
+    {
+        *text = Some("<REDACTED:api_token:abc123def456>".to_owned());
+        *redaction_policy_version = Some("v1".to_owned());
+    }
+    validate_record(&r)
+        .expect("marker field with redaction_policy_version set must pass the validation gate");
+}
+
+// Fix R2-2: database URL scanner catches credentialed URL after a username-only decoy.
+// The decoy `postgres://readonly@host/db` has a username but NO password (no `:` in userinfo).
+// With only first-occurrence scanning the second credentialed URL is never examined.
+#[test]
+fn detect_database_url_second_occurrence_after_decoy() {
+    let value =
+        "config: postgres://readonly@localhost/dev prod: postgres://admin:S3cr3t@prod.example.com/myapp";
+    let (class, _) = detect_secret(value).expect(
+        "credentialed postgres:// after a username-only decoy must still be detected",
+    );
+    assert_eq!(class, SecretClass::DatabaseUrl);
+}
+
+// Fix R2-2: redact_value also catches the credentialed second occurrence.
+#[test]
+fn redact_value_detects_second_database_url_occurrence() {
+    let value =
+        "config: postgres://readonly@localhost/test secret: postgres://u:p4ssw0rd@db.example.com/prod";
+    let result = redact_value(value);
+    assert!(
+        result.starts_with("<REDACTED:"),
+        "redact_value must redact the credentialed postgres:// even after a username-only decoy; got: {result}"
+    );
+}
+
+// Fix R2-3: webhook scanner catches long secret after a short non-secret prefix occurrence.
+#[test]
+fn detect_webhook_secret_second_occurrence_after_short() {
+    // First whsec_ candidate is shorter than 20 chars; second is the real secret.
+    let value = "example whsec_short whsec_abcdefghijklmnopqrstuvwxyz012345";
+    let (class, _) = detect_secret(value)
+        .expect("real whsec_ secret after a short decoy occurrence must still be detected");
+    assert_eq!(class, SecretClass::WebhookSecret);
+}
+
+// Fix R2-4: MongoDB Atlas SRV connection strings are detected as database credentials.
+#[test]
+fn detect_database_url_mongodb_srv_scheme() {
+    let url = "mongodb+srv://atlasUser:AtlasP4ssw0rd@cluster0.mongodb.net/mydb?retryWrites=true";
+    let (class, _) =
+        detect_secret(url).expect("mongodb+srv:// URL with credentials must be detected");
+    assert_eq!(class, SecretClass::DatabaseUrl);
+}
+
+// Fix R2-5: GitHub fine-grained PAT prefix (github_pat_) is detected as api_token.
+#[test]
+fn detect_api_token_github_fine_grained_pat() {
+    let token = "github_pat_abcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJ";
+    let (class, _) = detect_secret(token).expect("github_pat_ token must be detected");
     assert_eq!(class, SecretClass::ApiToken);
 }

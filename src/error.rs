@@ -129,4 +129,20 @@ pub enum CodegraphError {
         /// Example: `"text"`, `"validation_summary"`, `"stdout_handle.inline"`.
         field_path: String,
     },
+
+    /// A graph record carries a redaction marker in a sensitive field but the node
+    /// is not stamped with a `redaction_policy_version`.
+    ///
+    /// Set `redaction_policy_version` via
+    /// [`GraphRecord::with_redaction_policy_version`](crate::ir::GraphRecord::with_redaction_policy_version)
+    /// before submission.
+    #[error(
+        "redaction_metadata_missing: field '{field_path}' carries a redaction marker but \
+        redaction_policy_version is not set on the node; stamp the node with the current \
+        policy version before submission"
+    )]
+    RedactionMetadataMissing {
+        /// Dot-separated path to the field carrying the unversioned marker.
+        field_path: String,
+    },
 }
