@@ -86,13 +86,19 @@ egregore query symbol daemon::handle_query --data-dir .egregore --at <commit-sha
 **Semantic queries** (natural language — requires `--embed` store):
 
 ```powershell
-# Ask in plain English; results are ranked by cosine similarity
-egregore query semantic "error handling and budget limits" --data-dir .egregore-semantic --format text
+# Default output is JSON; pass --format text for human-readable lines
+egregore query semantic "write nodes to database storage" --data-dir .egregore-semantic
+egregore query semantic "error handling and budget limits" --data-dir .egregore-semantic --limit 5
 egregore query semantic "temporal history git commit tracking" --data-dir .egregore-semantic --format text
-egregore query semantic "write nodes to database storage" --data-dir .egregore-semantic --format text
 ```
 
-Example output:
+Agent-citable JSON result (stable fields: `record_id`, `score`, `name`, `repo_relative_path`, `span`):
+
+```json
+{"record_id":"codegraph:v1:abc123","name":"EmbeddedAletheiaSink::write_record","repo_relative_path":"src/sink/embedded.rs","score":0.9231,"span":{"start_byte":4096,"end_byte":5200,"start_line":142,"end_line":168}}
+```
+
+Human-readable text output (`--format text`, not a stable parsing contract):
 
 ```
 history::GitCommit score=0.4974 @ src/history.rs:138
@@ -102,7 +108,7 @@ history::git_output score=0.4610 @ src/history.rs:312
 
 The semantic index finds code by **meaning**, not by name. Querying `"write nodes to database storage"` surfaces `EmbeddedAletheiaSink::write_record` even though none of those words appear in the function name.
 
-Query output is newline-delimited JSON by default (`--format json`). Pass `--format text` for human-readable terminal output. See [docs/cli/query.md](docs/cli/query.md) for the full output schema.
+See [docs/cli/query.md](docs/cli/query.md) for the full JSON output contract, no-result exit codes, and operator actions.
 
 ---
 
