@@ -344,17 +344,27 @@ fn find_database_url(value: &str) -> Option<usize> {
         "redis://",
         "mssql://",
     ];
+    // Case-insensitive matching: `to_ascii_lowercase` preserves byte length for ASCII,
+    // so positions in `lower` are identical to positions in `value`.
+    let lower = value.to_ascii_lowercase();
     for scheme in SCHEMES {
-        // Scan ALL occurrences of the scheme so a non-credentialed decoy URL
-        // (e.g. `postgres://readonly@host/db`) does not shadow a later
-        // credentialed URL with the same scheme.
+        // Scan ALL occurrences so a non-credentialed decoy (e.g. `postgres://readonly@host/db`)
+        // does not shadow a later credentialed URL with the same scheme.
         let mut search_from = 0_usize;
-        while let Some(rel) = value[search_from..].find(scheme) {
+        while let Some(rel) = lower[search_from..].find(scheme) {
             let abs = search_from + rel;
+            // Use the original value for credential extraction so we preserve the original casing.
             let after = &value[abs + scheme.len()..];
-            // Require user:password@host — at must follow a colon-separated pair.
-            if let Some(at) = after.find('@') {
-                let before_at = &after[..at];
+            // Limit credential search to the URL authority (everything before the first path,
+            // query, fragment, or whitespace delimiter) to avoid matching an `@` that appears
+            // in unrelated prose after the URL.
+            let authority_end = after
+                .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#'))
+                .unwrap_or(after.len());
+            let authority = &after[..authority_end];
+            // Require user:password@host — @ must follow a colon-separated pair.
+            if let Some(at) = authority.find('@') {
+                let before_at = &authority[..at];
                 if let Some(colon) = before_at.find(':') {
                     // Password (after colon) must be non-empty; username may be empty
                     // to cover password-only URLs like `redis://:p4ssw0rd@host`.
@@ -432,26 +442,43 @@ fn find_session_cookie(value: &str) -> Option<usize> {
     // Named session cookie prefixes (declared before any statements per Clippy).
     const SESSION_PREFIXES: &[&str] = &["sessionid=", "session=", "sid=", "connect.sid="];
 
-    // JWT tokens always begin with eyJ (base64url of `{"`)
-    if let Some(pos) = value.find("eyJ") {
-        let after = &value[pos + 3..];
+    // JWT tokens always begin with eyJ (base64url of `{"`).
+    // Scan ALL occurrences so a short mention ("JWTs start with eyJ") does not
+    // shadow a real token that follows.
+    let mut search_from = 0_usize;
+    while let Some(rel) = value[search_from..].find("eyJ") {
+        let abs = search_from + rel;
+        let after = &value[abs + 3..];
         let len = after
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/'))
             .count();
         if len >= 20 {
-            return Some(pos);
+            return Some(abs);
+        }
+        search_from = abs + 1;
+        if search_from >= value.len() {
+            break;
         }
     }
+
+    // Named session cookie prefixes — scan ALL occurrences per prefix so a short
+    // decoy value ("session=test") does not block detection of the real cookie.
     for prefix in SESSION_PREFIXES {
-        if let Some(pos) = value.find(prefix) {
-            let after = &value[pos + prefix.len()..];
+        let mut search_from = 0_usize;
+        while let Some(rel) = value[search_from..].find(prefix) {
+            let abs = search_from + rel;
+            let after = &value[abs + prefix.len()..];
             let len = after
                 .chars()
                 .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | ','))
                 .count();
             if len >= 8 {
-                return Some(pos);
+                return Some(abs);
+            }
+            search_from = abs + 1;
+            if search_from >= value.len() {
+                break;
             }
         }
     }
@@ -482,12 +509,20 @@ fn find_api_token(value: &str) -> Option<usize> {
         }
     }
     // Bearer token (HTTP Authorization header) — matched case-insensitively.
+    // Scan ALL occurrences so a short example ("Bearer test") does not shadow
+    // a real token that appears later in the same field.
     let lower = value.to_ascii_lowercase();
-    if let Some(pos) = lower.find("bearer ") {
-        let after = &value[pos + 7..];
+    let mut search_from = 0_usize;
+    while let Some(rel) = lower[search_from..].find("bearer ") {
+        let abs = search_from + rel;
+        let after = &value[abs + 7..];
         let len = after.chars().take_while(|c| !c.is_whitespace()).count();
         if len >= 20 {
-            return Some(pos);
+            return Some(abs);
+        }
+        search_from = abs + 1;
+        if search_from >= lower.len() {
+            break;
         }
     }
     None

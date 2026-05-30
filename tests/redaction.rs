@@ -887,3 +887,55 @@ fn detect_api_token_github_fine_grained_pat() {
     let (class, _) = detect_secret(token).expect("github_pat_ token must be detected");
     assert_eq!(class, SecretClass::ApiToken);
 }
+
+// ── Round 3 review-fix tests ──────────────────────────────────────────────────
+
+// Fix R3-1: Bearer scanner catches long token after a short decoy occurrence.
+#[test]
+fn detect_api_token_bearer_long_after_short_decoy() {
+    let value =
+        "Authorization: Bearer test ... Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456";
+    let (class, _) = detect_secret(value)
+        .expect("real Bearer token after a short decoy must still be detected");
+    assert_eq!(class, SecretClass::ApiToken);
+}
+
+// Fix R3-2: Session cookie scanner catches long value after a short decoy occurrence.
+#[test]
+fn detect_session_cookie_second_occurrence_after_short() {
+    let value = "session=test; session=abcdefghijklmnopqrstuvwxyz";
+    let (class, _) = detect_secret(value)
+        .expect("real session cookie after a short decoy must still be detected");
+    assert_eq!(class, SecretClass::SessionCookie);
+}
+
+// Fix R3-3 / R3-4: Mixed-case database URL scheme is detected case-insensitively.
+#[test]
+fn detect_database_url_mixed_case_scheme() {
+    let url = "Postgres://admin:S3cr3t@db.example.com/prod";
+    let (class, _) =
+        detect_secret(url).expect("Postgres:// (mixed-case) with credentials must be detected");
+    assert_eq!(class, SecretClass::DatabaseUrl);
+}
+
+// Fix R3-4 (JWT): JWT scanner catches real token after a short eyJ decoy.
+#[test]
+fn detect_session_cookie_jwt_second_occurrence_after_short() {
+    // First eyJ candidate is immediately followed by a non-base64url char, so length < 20.
+    let value =
+        "JWTs start with eyJ; actual: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig";
+    let (class, _) = detect_secret(value)
+        .expect("real JWT after a short eyJ decoy must still be detected");
+    assert_eq!(class, SecretClass::SessionCookie);
+}
+
+// Fix R3-5: @ in prose after a non-credentialed DB URL is not flagged as a credential.
+#[test]
+fn detect_database_url_at_in_prose_not_flagged() {
+    // "user:pass@example.com" is an email address in prose, not inside the URL authority.
+    let value = "database postgres://localhost/db contact user:pass@example.com for support";
+    assert!(
+        detect_secret(value).is_none(),
+        "@ in prose outside the URL authority must not be flagged as database credential"
+    );
+}
