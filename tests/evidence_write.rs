@@ -826,7 +826,159 @@ fn artifact_rejects_unknown_patch_status() {
     assert_eq!(err.field, "patch_status");
 }
 
+// ── Artifact batch completeness ──────────────────────────────────────────────
+
+#[test]
+fn artifact_batch_includes_agent_and_session_nodes() {
+    let req = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"--- a/src/lib.rs\n+++ b/src/lib.rs\n".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc123def456".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "patch applies cleanly".to_owned(),
+    };
+    let outcome = build_artifact_records(&req).expect("valid artifact must succeed");
+
+    let node_kinds: Vec<NodeKind> = outcome
+        .records
+        .iter()
+        .filter_map(|r| {
+            if let aletheia_egregore::ir::GraphRecord::Node { kind, .. } = r {
+                Some(*kind)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert!(
+        node_kinds.contains(&NodeKind::Agent),
+        "artifact batch must include Agent node"
+    );
+    assert!(
+        node_kinds.contains(&NodeKind::AgentSession),
+        "artifact batch must include AgentSession node"
+    );
+    assert!(
+        node_kinds.contains(&NodeKind::PatchArtifact),
+        "artifact batch must include PatchArtifact node"
+    );
+}
+
 // ── P2 Validation: RFC 3339, artifact constraints ────────────────────────────
+
+#[test]
+fn artifact_rejects_invalid_no_base_with_base_commit() {
+    let req = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"diff content".to_vec(),
+        target_files: vec![],
+        patch_status: "invalid_no_base".to_owned(),
+        base_commit: Some("abc123".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "no base found".to_owned(),
+    };
+    let err = build_artifact_records(&req)
+        .expect_err("invalid_no_base with base_commit must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "base_commit");
+}
+
+#[test]
+fn command_evidence_rejects_non_rfc3339_executed_at() {
+    let req = CommandEvidenceRequest {
+        provenance: valid_provenance(),
+        executed_at: "not-a-timestamp".to_owned(),
+        exit_code: 0,
+        stdout: None,
+        stderr: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+    };
+    let err =
+        build_command_evidence_records(&req).expect_err("invalid executed_at must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "executed_at");
+}
+
+#[test]
+fn verification_rejects_non_rfc3339_executed_at() {
+    let req = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "not-a-timestamp".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        linked_command_evidence_id: None,
+    };
+    let err = build_verification_records(&req).expect_err("invalid executed_at must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "executed_at");
+}
+
+#[test]
+fn repeated_observation_writes_produce_identical_session_nodes() {
+    let prov = valid_provenance();
+    let make_req = |text: &str| ObservationRequest {
+        provenance: prov.clone(),
+        text: text.to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+    };
+
+    let out_a = build_observation_records(&make_req("observation one")).expect("a must succeed");
+    let out_b = build_observation_records(&make_req("observation two")).expect("b must succeed");
+
+    let session_a = out_a
+        .records
+        .iter()
+        .find(|r| {
+            matches!(
+                r,
+                aletheia_egregore::ir::GraphRecord::Node {
+                    kind: NodeKind::AgentSession,
+                    ..
+                }
+            )
+        })
+        .expect("session node must be in batch a");
+    let session_b = out_b
+        .records
+        .iter()
+        .find(|r| {
+            matches!(
+                r,
+                aletheia_egregore::ir::GraphRecord::Node {
+                    kind: NodeKind::AgentSession,
+                    ..
+                }
+            )
+        })
+        .expect("session node must be in batch b");
+
+    // Same ID — deterministic key
+    assert_eq!(
+        session_a.id(),
+        session_b.id(),
+        "AgentSession IDs must match for same session"
+    );
+
+    // Serialize both and compare — payload must be identical
+    let json_a = serde_json::to_string(session_a).expect("serialize a");
+    let json_b = serde_json::to_string(session_b).expect("serialize b");
+    assert_eq!(
+        json_a, json_b,
+        "AgentSession payloads must be identical across writes for the same session"
+    );
+}
 
 #[test]
 fn observation_rejects_non_rfc3339_observed_at() {

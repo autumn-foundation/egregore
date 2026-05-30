@@ -402,11 +402,7 @@ fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
 }
 
 /// Builds an `AgentSession` node for the given session.
-fn build_agent_session_node(
-    prov: &EvidenceProvenance,
-    agent_kind: &str,
-    ingested_at: &str,
-) -> GraphRecord {
+fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> GraphRecord {
     let id = agent_memory_stable_id(&["node", "agent_session", &prov.agent_id, &prov.session_id]);
     GraphRecord::Node {
         id,
@@ -427,10 +423,14 @@ fn build_agent_session_node(
         agent_id: Some(prov.agent_id.clone()),
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(prov.session_id.clone()),
-        observed_at: Some(prov.observed_at.clone()),
-        ingested_at: Some(ingested_at.to_owned()),
+        // observed_at and ingested_at are intentionally omitted: AgentSession is a
+        // singleton keyed by (agent_id, session_id). Including wall-clock times would
+        // make repeated writes for the same session produce records with identical IDs
+        // but different payloads, which the daemon rejects as conflicting duplicates.
+        observed_at: None,
+        ingested_at: None,
         confidence: None,
-        source_handle: prov.source_handle.clone(),
+        source_handle: None,
         redaction_policy_version: None,
         valid_time: None,
         valid_time_source: None,
@@ -611,7 +611,7 @@ pub fn build_observation_records(
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(req.provenance.session_id.clone()),
         observed_at: Some(req.provenance.observed_at.clone()),
-        ingested_at: Some(now.clone()),
+        ingested_at: Some(now),
         confidence: Some(req.confidence.to_string()),
         source_handle: req.provenance.source_handle.clone(),
         redaction_policy_version,
@@ -683,7 +683,7 @@ pub fn build_observation_records(
     };
 
     let agent_node = build_agent_node(&req.provenance.agent_id, agent_kind);
-    let session_node = build_agent_session_node(&req.provenance, agent_kind, &now);
+    let session_node = build_agent_session_node(&req.provenance, agent_kind);
     let session_of_edge = build_session_of_edge(&session_node_id, &agent_id_node);
     let authored_by_edge = build_authored_by_edge(&obs_id, &session_node_id);
 
@@ -721,6 +721,9 @@ pub fn build_command_evidence_records(
     if req.executed_at.is_empty() {
         return Err(ProvenanceError::missing("executed_at"));
     }
+    if chrono::DateTime::parse_from_rfc3339(&req.executed_at).is_err() {
+        return Err(ProvenanceError::invalid("executed_at"));
+    }
 
     let agent_kind = effective_agent_kind(&req.provenance);
     let now = now_rfc3339();
@@ -745,7 +748,8 @@ pub fn build_command_evidence_records(
         h.finalize().to_hex().to_string()
     };
 
-    // Content-addressed on agent, session, execution time, exit code, and stdout.
+    // Content-addressed on agent, session, execution time, exit code, source, and stdout.
+    // Both path and hash are included so path-only and hash-only inputs don't collide.
     let cmd_id = agent_memory_stable_id(&[
         "node",
         "command_evidence",
@@ -753,6 +757,7 @@ pub fn build_command_evidence_records(
         &req.provenance.session_id,
         &req.executed_at,
         &req.exit_code.to_string(),
+        &req.source_artifact_path,
         &req.source_artifact_hash,
         &stdout_hash,
     ]);
@@ -879,6 +884,9 @@ pub fn build_artifact_records(
     if req.patch_status == "invalid_syntax" && !req.target_files.is_empty() {
         return Err(ProvenanceError::invalid("target_files"));
     }
+    if req.patch_status == "invalid_no_base" && req.base_commit.is_some() {
+        return Err(ProvenanceError::invalid("base_commit"));
+    }
 
     let agent_kind = effective_agent_kind(&req.provenance);
     let now = now_rfc3339();
@@ -906,12 +914,20 @@ pub fn build_artifact_records(
     ]);
 
     let patch_bytes_size = req.patch_bytes.len() as u64;
-    let patch_inline = (patch_bytes_size <= INLINE_PAYLOAD_CEILING)
-        .then(|| String::from_utf8_lossy(&req.patch_bytes).into_owned());
+
+    // Decode patch bytes and redact before inline storage. Always store inline
+    // because JSONL has no sidecar mechanism for large payloads.
+    let patch_str = String::from_utf8_lossy(&req.patch_bytes).into_owned();
+    let redacted_patch = crate::redaction::redact_value(&patch_str);
+    let redacted_validation_summary = crate::redaction::redact_value(&req.validation_summary);
+    let patch_redacted = crate::redaction::is_redacted(&redacted_patch);
+    let summary_redacted = crate::redaction::is_redacted(&redacted_validation_summary);
+    let redaction_policy_version = (patch_redacted || summary_redacted)
+        .then(|| crate::redaction::REDACTION_POLICY_VERSION.to_owned());
 
     let patch_handle = Box::new(PatchHandle {
         path: format!("patches/{art_id}.patch"),
-        inline: patch_inline,
+        inline: Some(redacted_patch),
     });
 
     let (base_commit_field, unknown_base_reason) = req.base_commit.as_ref().map_or_else(
@@ -942,7 +958,7 @@ pub fn build_artifact_records(
         ingested_at: Some(now),
         confidence: None,
         source_handle: req.provenance.source_handle.clone(),
-        redaction_policy_version: None,
+        redaction_policy_version,
         valid_time: Some(req.provenance.observed_at.clone()),
         valid_time_source: Some("produced_at".to_owned()),
         entity_id: None,
@@ -979,8 +995,8 @@ pub fn build_artifact_records(
         patch_bytes_hash: Some(patch_hash),
         patch_bytes_size: Some(patch_bytes_size),
         patch_handle: Some(patch_handle),
-        validation_summary: Some(req.validation_summary.clone()),
-        producer_session_id: Some(session_node_id),
+        validation_summary: Some(redacted_validation_summary),
+        producer_session_id: Some(session_node_id.clone()),
         edit_kind: None,
         before_hash: None,
         after_hash: None,
@@ -1009,10 +1025,27 @@ pub fn build_artifact_records(
         producer: Some(evidence_producer()),
     };
 
+    // The artifact references a specific AgentSession via producer_session_id; include
+    // the Agent and AgentSession nodes so a standalone artifact batch is self-contained
+    // and passes validate_agent_session_ref on a fresh store.
+    let agent_node = build_agent_node(&req.provenance.agent_id, agent_kind);
+    let session_node = build_agent_session_node(&req.provenance, agent_kind);
+
+    let session_of_edge = GraphRecord::agent_memory_edge(
+        EdgeLabel::SessionOf,
+        session_node_id,
+        agent_node.id().to_owned(),
+        None,
+        format!(
+            "{} SESSION_OF {}",
+            req.provenance.session_id, req.provenance.agent_id
+        ),
+    );
+
     Ok(EvidenceWriteOutcome {
         evidence_handle: art_id.clone(),
         record_id: art_id,
-        records: vec![art_node],
+        records: vec![agent_node, session_node, session_of_edge, art_node],
     })
 }
 
@@ -1036,6 +1069,9 @@ pub fn build_verification_records(
 
     if req.executed_at.is_empty() {
         return Err(ProvenanceError::missing("executed_at"));
+    }
+    if chrono::DateTime::parse_from_rfc3339(&req.executed_at).is_err() {
+        return Err(ProvenanceError::invalid("executed_at"));
     }
     if req.status.is_empty() {
         return Err(ProvenanceError::missing("status"));
