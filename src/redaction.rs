@@ -151,10 +151,12 @@ pub fn redact_value(value: &str) -> String {
 /// Returns `Err(CodegraphError::RedactionRequired)` when a sensitive field on a
 /// non-code-graph node contains an unredacted secret.
 pub fn validate_record(record: &GraphRecord) -> Result<()> {
-    let GraphRecord::Node { kind, .. } = record else {
+    let GraphRecord::Node { kind, domain, .. } = record else {
         return Ok(());
     };
-    if is_code_graph_kind(*kind) {
+    // `NodeKind::Diagnostic` is reused by agent-memory importers (traj, codex) which
+    // set a non-None `domain`.  Only code-graph diagnostics (domain == None) are exempt.
+    if is_code_graph_kind(*kind) && (*kind != NodeKind::Diagnostic || domain.is_none()) {
         return Ok(());
     }
     check_sensitive_fields(record)
@@ -303,8 +305,9 @@ fn find_database_url(value: &str) -> Option<usize> {
             if let Some(at) = after.find('@') {
                 let before_at = &after[..at];
                 if let Some(colon) = before_at.find(':') {
-                    // Both user (before colon) and password (after colon) must be non-empty.
-                    if colon > 0 && colon + 1 < before_at.len() {
+                    // Password (after colon) must be non-empty; username may be empty
+                    // to cover password-only URLs like `redis://:p4ssw0rd@host`.
+                    if colon + 1 < before_at.len() {
                         return Some(pos);
                     }
                 }
@@ -414,8 +417,9 @@ fn find_api_token(value: &str) -> Option<usize> {
             }
         }
     }
-    // Bearer token (HTTP Authorization header)
-    if let Some(pos) = value.find("Bearer ") {
+    // Bearer token (HTTP Authorization header) — matched case-insensitively.
+    let lower = value.to_ascii_lowercase();
+    if let Some(pos) = lower.find("bearer ") {
         let after = &value[pos + 7..];
         let len = after.chars().take_while(|c| !c.is_whitespace()).count();
         if len >= 20 {

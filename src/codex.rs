@@ -100,12 +100,15 @@ pub struct ImportOptions {
     /// (no redaction) is only permitted on explicit dry-run or test paths via
     /// [`ImportOptions::passthrough`].
     pub redact: Box<dyn Fn(&str) -> String + Send + Sync>,
+    /// Policy version stamped on every emitted node record, or `None` for passthrough.
+    pub policy_version: Option<&'static str>,
 }
 
 impl Default for ImportOptions {
     fn default() -> Self {
         Self {
             redact: Box::new(crate::redaction::redact_value),
+            policy_version: Some(crate::redaction::REDACTION_POLICY_VERSION),
         }
     }
 }
@@ -118,6 +121,7 @@ impl ImportOptions {
     pub fn passthrough() -> Self {
         Self {
             redact: Box::new(|s: &str| s.to_owned()),
+            policy_version: None,
         }
     }
 }
@@ -648,6 +652,7 @@ pub fn import_codex(path: &Path, opts: &ImportOptions) -> Result<Graph> {
         source_artifact_hash,
         session_id: session_id.clone(),
         default_timestamp,
+        redaction_policy_version: opts.policy_version.map(str::to_owned),
     };
 
     let mut graph = Graph::new();
@@ -1462,6 +1467,7 @@ struct ImportCtx {
     source_artifact_hash: String,
     session_id: String,
     default_timestamp: String,
+    redaction_policy_version: Option<String>,
 }
 
 #[derive(Default)]
@@ -1530,7 +1536,7 @@ fn make_node(
             "{}:{}",
             ctx.source_artifact_path, ctx.source_artifact_hash
         )),
-        redaction_policy_version: None,
+        redaction_policy_version: ctx.redaction_policy_version.clone(),
         summary,
         domain: Some(DOMAIN.to_owned()),
         importer_id: Some(IMPORTER_ID.to_owned()),

@@ -645,6 +645,7 @@ fn session_redaction_hook_applied_to_command_text() {
     let sentinel = "__CODEX_REDACTED__";
     let opts = ImportOptions {
         redact: Box::new(|_| sentinel.to_owned()),
+        policy_version: None,
     };
     let records = import_codex(Path::new(SESSION_FIXTURE), &opts)
         .expect("import with custom redactor")

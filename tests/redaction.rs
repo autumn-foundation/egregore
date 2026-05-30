@@ -698,3 +698,97 @@ fn import_options_passthrough_does_not_redact() {
         "codex ImportOptions::passthrough() must not redact"
     );
 }
+
+// ── Review-fix tests ──────────────────────────────────────────────────────────
+
+// Fix 1: agent-memory Diagnostic nodes must pass through the gate.
+#[test]
+fn validate_record_err_agent_memory_diagnostic_with_raw_secret() {
+    let mut r = GraphRecord::node(
+        "diag-id".to_owned(),
+        NodeKind::Diagnostic,
+        None,
+        None,
+        None,
+        "diagnostic summary".to_owned(),
+    );
+    if let GraphRecord::Node { text, domain, .. } = &mut r {
+        *text = Some(SECRET_API_TOKEN_SK.to_owned());
+        *domain = Some("agent_memory".to_owned());
+    }
+    let err = validate_record(&r).unwrap_err();
+    match err {
+        CodegraphError::RedactionRequired { field_path } => {
+            assert_eq!(field_path, "text");
+        }
+        other => panic!("expected RedactionRequired, got {other:?}"),
+    }
+}
+
+// Fix 1 (complement): code-graph Diagnostic (no domain) must still be exempt.
+#[test]
+fn validate_record_ok_for_code_graph_diagnostic_no_domain() {
+    let mut r = GraphRecord::node(
+        "diag-id".to_owned(),
+        NodeKind::Diagnostic,
+        None,
+        None,
+        None,
+        "parse error".to_owned(),
+    );
+    if let GraphRecord::Node { text, .. } = &mut r {
+        *text = Some(SECRET_API_TOKEN_SK.to_owned());
+    }
+    // domain is None (code-graph diagnostic) — must be exempt
+    validate_record(&r).expect("code-graph Diagnostic with no domain must be exempt");
+}
+
+// Fix 2: default ImportOptions stamps policy_version on every node.
+#[test]
+fn import_options_default_sets_policy_version_field() {
+    let opts = aletheia_egregore::traj::ImportOptions::default();
+    assert_eq!(
+        opts.policy_version,
+        Some("v1"),
+        "default ImportOptions must carry policy_version v1"
+    );
+    let codex_opts = aletheia_egregore::codex::ImportOptions::default();
+    assert_eq!(
+        codex_opts.policy_version,
+        Some("v1"),
+        "codex default ImportOptions must carry policy_version v1"
+    );
+}
+
+// Fix 2 (complement): passthrough ImportOptions must NOT carry a policy_version.
+#[test]
+fn import_options_passthrough_has_no_policy_version() {
+    let opts = aletheia_egregore::traj::ImportOptions::passthrough();
+    assert!(
+        opts.policy_version.is_none(),
+        "passthrough ImportOptions must not set policy_version"
+    );
+}
+
+// Fix 4: password-only Redis URL (empty user) must be detected as a database credential.
+#[test]
+fn detect_database_url_redis_password_only_no_username() {
+    let url = "redis://:p4ssw0rd@cache.example.com:6379/0";
+    let (class, _) = detect_secret(url).expect("redis password-only URL must be detected");
+    assert_eq!(class, SecretClass::DatabaseUrl);
+}
+
+// Fix 5: Bearer token detection is case-insensitive.
+#[test]
+fn detect_api_token_bearer_lowercase() {
+    let header = "authorization: bearer abcdefghijklmnopqrstuvwxyz123456789XXYY";
+    let (class, _) = detect_secret(header).expect("lowercase bearer token must be detected");
+    assert_eq!(class, SecretClass::ApiToken);
+}
+
+#[test]
+fn detect_api_token_bearer_uppercase() {
+    let header = "AUTHORIZATION: BEARER ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789XXYY";
+    let (class, _) = detect_secret(header).expect("uppercase BEARER token must be detected");
+    assert_eq!(class, SecretClass::ApiToken);
+}
