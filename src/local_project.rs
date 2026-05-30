@@ -27,8 +27,8 @@ use serde::Deserialize;
 use crate::{
     error::{CodegraphError, Result},
     ir::{
-        EdgeLabel, Graph, GraphRecord, NodeKind, OutputHandle, PROJECT_SCHEMA_VERSION,
-        Producer, ProducerKind, project_stable_id,
+        EdgeLabel, Graph, GraphRecord, NodeKind, OutputHandle, PROJECT_SCHEMA_VERSION, Producer,
+        ProducerKind, project_stable_id,
     },
 };
 
@@ -46,9 +46,8 @@ pub const SOURCE_KIND: &str = "local_jsonl";
 const INLINE_BODY_CEILING: usize = 16 * 1024;
 
 /// Process-start timestamp stamped on every producer envelope emitted by this module.
-static IMPORTER_STARTED_AT: LazyLock<String> = LazyLock::new(|| {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-});
+static IMPORTER_STARTED_AT: LazyLock<String> =
+    LazyLock::new(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
 
 /// Build the producer envelope for this importer.
 ///
@@ -63,12 +62,13 @@ fn task_writer_producer(fixed_started_at: Option<&str>) -> Producer {
         producer_kind: ProducerKind::TaskWriter,
         producer_components: BTreeMap::from([
             ("importer_id".to_owned(), IMPORTER_ID.to_owned()),
-            ("importer_schema_version".to_owned(), IMPORTER_VERSION.to_owned()),
+            (
+                "importer_schema_version".to_owned(),
+                IMPORTER_VERSION.to_owned(),
+            ),
         ]),
-        producer_started_at: fixed_started_at.map_or_else(
-            || IMPORTER_STARTED_AT.clone(),
-            str::to_owned,
-        ),
+        producer_started_at: fixed_started_at
+            .map_or_else(|| IMPORTER_STARTED_AT.clone(), str::to_owned),
     }
 }
 
@@ -179,7 +179,7 @@ pub fn import_local_tasks(
                 ]);
                 push_diagnostic(
                     &mut graph,
-                    diag_id,
+                    &diag_id,
                     Some(&file_rel),
                     &format!(
                         "[duplicate_project_slug] slug '{slug}' from '{}' already seen in '{}'",
@@ -193,8 +193,7 @@ pub fn import_local_tasks(
             }
             seen_slugs.insert(slug, file_path.clone());
 
-            total_diags +=
-                import_file(file_path, repo_root, opts, &transaction_time, &mut graph)?;
+            total_diags += import_file(file_path, repo_root, opts, &transaction_time, &mut graph)?;
         }
     } else {
         total_diags += import_file(tasks_path, repo_root, opts, &transaction_time, &mut graph)?;
@@ -216,10 +215,8 @@ const VALID_TASK_STATUSES: &[&str] = &[
     "unknown",
 ];
 const VALID_TASK_PRIORITIES: &[&str] = &["low", "normal", "high", "urgent", "unknown"];
-const VALID_AC_STATUSES: &[&str] =
-    &["unverified", "verified", "failed", "superseded", "unknown"];
-const VALID_LINK_SYSTEMS: &[&str] =
-    &["github", "gitlab", "local_file", "harness_legacy", "other"];
+const VALID_AC_STATUSES: &[&str] = &["unverified", "verified", "failed", "superseded", "unknown"];
+const VALID_LINK_SYSTEMS: &[&str] = &["github", "gitlab", "local_file", "harness_legacy", "other"];
 
 // ── Source handle encoding ────────────────────────────────────────────────────
 
@@ -296,26 +293,40 @@ fn body_handle_for(body: &str) -> OutputHandle {
 
 // ── Diagnostic helpers ────────────────────────────────────────────────────────
 
+/// Compute a per-line diagnostic ID.
+///
+/// Appends the 1-based line number so that two invalid rows for the same
+/// `local_id` and field produce distinct graph IDs instead of colliding.
+fn per_line_diag_id(parts: &[&str], line_idx: usize) -> String {
+    let line_str = (line_idx + 1).to_string();
+    let mut all: Vec<&str> = Vec::with_capacity(parts.len() + 1);
+    all.extend_from_slice(parts);
+    all.push(&line_str);
+    project_stable_id(&all)
+}
+
 fn push_diagnostic(
     graph: &mut Graph,
-    id: String,
+    id: &str,
     file_rel_path: Option<&str>,
     message: &str,
     transaction_time: &str,
 ) {
     let mut record = GraphRecord::node(
-        id,
+        id.to_string(),
         NodeKind::Diagnostic,
         file_rel_path.map(str::to_owned),
         None,
         None,
         message.to_owned(),
     );
+    // Diagnostics are valid project records: entity_id == id, valid_time == transaction_time.
+    // This keeps partial-import JSONL ingestible; the daemon validator requires both fields.
     set_project_base_fields(
         &mut record,
         transaction_time,
-        None, // no entity_id for diagnostics
-        None, // no valid_time
+        Some(id),
+        Some(transaction_time),
         None, // no source_handle
     );
     graph.push(record);
@@ -467,7 +478,7 @@ fn import_file(
         ]);
         push_diagnostic(
             graph,
-            diag_id,
+            &diag_id,
             Some(&file_rel),
             &format!("[missing_header] '{file_rel}' is empty — first line must be a header"),
             transaction_time,
@@ -488,7 +499,7 @@ fn import_file(
             ]);
             push_diagnostic(
                 graph,
-                diag_id,
+                &diag_id,
                 Some(&file_rel),
                 &format!("[missing_header] first line of '{file_rel}' is not valid JSON: {e}"),
                 transaction_time,
@@ -507,7 +518,7 @@ fn import_file(
         ]);
         push_diagnostic(
             graph,
-            diag_id,
+            &diag_id,
             Some(&file_rel),
             &format!(
                 "[missing_header] first line of '{file_rel}' has kind='{}', expected 'header'",
@@ -531,7 +542,7 @@ fn import_file(
             ]);
             push_diagnostic(
                 graph,
-                diag_id,
+                &diag_id,
                 Some(&file_rel),
                 &format!("[missing_header] header line of '{file_rel}' has invalid fields: {e}"),
                 transaction_time,
@@ -551,7 +562,7 @@ fn import_file(
         ]);
         push_diagnostic(
             graph,
-            diag_id,
+            &diag_id,
             Some(&file_rel),
             &format!(
                 "[unsupported_schema_version] '{file_rel}' has schema_version={}, expected 1",
@@ -575,7 +586,7 @@ fn import_file(
         ]);
         push_diagnostic(
             graph,
-            diag_id,
+            &diag_id,
             Some(&file_rel),
             &format!(
                 "[project_slug_mismatch] project_slug='{}' does not match filename stem '{file_stem}' in '{file_rel}'",
@@ -621,17 +632,20 @@ fn import_file(
         let disc: KindDiscriminator = match serde_json::from_str(line) {
             Ok(d) => d,
             Err(e) => {
-                let diag_id = project_stable_id(&[
-                    "project",
-                    "Diagnostic",
-                    SOURCE_KIND,
-                    &file_rel,
-                    "invalid_json",
-                    &line_idx.to_string(),
-                ]);
+                let diag_id = per_line_diag_id(
+                    &[
+                        "project",
+                        "Diagnostic",
+                        SOURCE_KIND,
+                        &file_rel,
+                        "invalid_json",
+                        &line_idx.to_string(),
+                    ],
+                    line_idx,
+                );
                 push_diagnostic(
                     graph,
-                    diag_id,
+                    &diag_id,
                     Some(&file_rel),
                     &format!(
                         "[invalid_json] line {} of '{file_rel}' is not valid JSON: {e}",
@@ -649,17 +663,20 @@ fn import_file(
                 let task: TaskLine = match serde_json::from_str(line) {
                     Ok(t) => t,
                     Err(e) => {
-                        let diag_id = project_stable_id(&[
-                            "project",
-                            "Diagnostic",
-                            SOURCE_KIND,
-                            &file_rel,
-                            "invalid_task_fields",
-                            &line_idx.to_string(),
-                        ]);
+                        let diag_id = per_line_diag_id(
+                            &[
+                                "project",
+                                "Diagnostic",
+                                SOURCE_KIND,
+                                &file_rel,
+                                "invalid_task_fields",
+                                &line_idx.to_string(),
+                            ],
+                            line_idx,
+                        );
                         push_diagnostic(
                             graph,
-                            diag_id,
+                            &diag_id,
                             Some(&file_rel),
                             &format!(
                                 "[invalid_json] task at line {} of '{file_rel}' has invalid fields: {e}",
@@ -675,17 +692,20 @@ fn import_file(
                 if let Some(&existing_kind) = seen_local_ids.get(&task.local_id)
                     && existing_kind != "task"
                 {
-                    let diag_id = project_stable_id(&[
-                        "project",
-                        "Diagnostic",
-                        SOURCE_KIND,
-                        &file_rel,
-                        "duplicate_local_id_kind_mismatch",
-                        &task.local_id,
-                    ]);
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "duplicate_local_id_kind_mismatch",
+                            &task.local_id,
+                        ],
+                        line_idx,
+                    );
                     push_diagnostic(
                         graph,
-                        diag_id,
+                        &diag_id,
                         Some(&file_rel),
                         &format!(
                             "[duplicate_local_id_kind_mismatch] local_id='{}' at line {} has kind='task' but was previously seen with kind='{existing_kind}'",
@@ -705,18 +725,21 @@ fn import_file(
 
                 // Validate closed enum fields per local-project-jsonl.md schema.
                 if !VALID_TASK_STATUSES.contains(&task.status.as_str()) {
-                    let diag_id = project_stable_id(&[
-                        "project",
-                        "Diagnostic",
-                        SOURCE_KIND,
-                        &file_rel,
-                        "task_invalid_field_value",
-                        &task.local_id,
-                        "status",
-                    ]);
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "task_invalid_field_value",
+                            &task.local_id,
+                            "status",
+                        ],
+                        line_idx,
+                    );
                     push_diagnostic(
                         graph,
-                        diag_id,
+                        &diag_id,
                         Some(&file_rel),
                         &format!(
                             "[task_invalid_field_value] task '{}' at line {} has invalid status='{}'",
@@ -730,18 +753,21 @@ fn import_file(
                     continue;
                 }
                 if !VALID_TASK_PRIORITIES.contains(&task.priority.as_str()) {
-                    let diag_id = project_stable_id(&[
-                        "project",
-                        "Diagnostic",
-                        SOURCE_KIND,
-                        &file_rel,
-                        "task_invalid_field_value",
-                        &task.local_id,
-                        "priority",
-                    ]);
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "task_invalid_field_value",
+                            &task.local_id,
+                            "priority",
+                        ],
+                        line_idx,
+                    );
                     push_diagnostic(
                         graph,
-                        diag_id,
+                        &diag_id,
                         Some(&file_rel),
                         &format!(
                             "[task_invalid_field_value] task '{}' at line {} has invalid priority='{}'",
@@ -756,7 +782,9 @@ fn import_file(
                 }
 
                 // All validation passed — claim the local_id on first occurrence.
-                seen_local_ids.entry(task.local_id.clone()).or_insert("task");
+                seen_local_ids
+                    .entry(task.local_id.clone())
+                    .or_insert("task");
 
                 // Compute stable entity ID (same for all revisions of this local_id)
                 let identity_handle = source_identity_handle(&file_rel, &task.local_id);
@@ -769,6 +797,15 @@ fn import_file(
                 ]);
                 task_ids.insert(task.local_id.clone(), task_id);
 
+                // Register the materialized source-link identity so an explicit
+                // external_link row with the same (local_file, native_id) is caught
+                // as a graph-identity collision rather than silently producing a
+                // duplicate ExternalLink node.
+                let mat_native = source_identity_handle(&file_rel, &task.local_id);
+                link_graph_identity
+                    .entry(("local_file".to_owned(), mat_native))
+                    .or_insert_with(|| task.local_id.clone());
+
                 parsed.push((line_idx, ParsedRecord::Task { line: task, raw }));
             }
 
@@ -776,17 +813,20 @@ fn import_file(
                 let ac: AcLine = match serde_json::from_str(line) {
                     Ok(a) => a,
                     Err(e) => {
-                        let diag_id = project_stable_id(&[
-                            "project",
-                            "Diagnostic",
-                            SOURCE_KIND,
-                            &file_rel,
-                            "invalid_ac_fields",
-                            &line_idx.to_string(),
-                        ]);
+                        let diag_id = per_line_diag_id(
+                            &[
+                                "project",
+                                "Diagnostic",
+                                SOURCE_KIND,
+                                &file_rel,
+                                "invalid_ac_fields",
+                                &line_idx.to_string(),
+                            ],
+                            line_idx,
+                        );
                         push_diagnostic(
                             graph,
-                            diag_id,
+                            &diag_id,
                             Some(&file_rel),
                             &format!(
                                 "[invalid_json] acceptance_criterion at line {} of '{file_rel}' has invalid fields: {e}",
@@ -804,14 +844,17 @@ fn import_file(
                 // Emitting a verified AC without verification_link_id causes
                 // the daemon validator to reject the whole ingest.
                 if ac.status == "verified" {
-                    let diag_id = project_stable_id(&[
-                        "project",
-                        "Diagnostic",
-                        SOURCE_KIND,
-                        &file_rel,
-                        "acceptance_criterion_missing_verification",
-                        &ac.local_id,
-                    ]);
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "acceptance_criterion_missing_verification",
+                            &ac.local_id,
+                        ],
+                        line_idx,
+                    );
                     let reason = if ac.verification_handle.is_some() {
                         "has status='verified' with a verification_handle that cannot be resolved to verification_link_id"
                     } else {
@@ -819,7 +862,7 @@ fn import_file(
                     };
                     push_diagnostic(
                         graph,
-                        diag_id,
+                        &diag_id,
                         Some(&file_rel),
                         &format!(
                             "[acceptance_criterion_missing_verification] acceptance_criterion '{}' at line {} {reason}",
@@ -836,17 +879,20 @@ fn import_file(
                 // verification_link_id=null but must produce a diagnostic so operators
                 // know the handle was not resolved.
                 if ac.status != "verified" && ac.verification_handle.is_some() {
-                    let diag_id = project_stable_id(&[
-                        "project",
-                        "Diagnostic",
-                        SOURCE_KIND,
-                        &file_rel,
-                        "unresolved_verification_handle",
-                        &ac.local_id,
-                    ]);
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "unresolved_verification_handle",
+                            &ac.local_id,
+                        ],
+                        line_idx,
+                    );
                     push_diagnostic(
                         graph,
-                        diag_id,
+                        &diag_id,
                         Some(&file_rel),
                         &format!(
                             "[unresolved_verification_handle] acceptance_criterion '{}' at line {} has status='{}' with a verification_handle that cannot be resolved",
@@ -862,17 +908,20 @@ fn import_file(
 
                 // Validate AC status against the closed enum.
                 if !VALID_AC_STATUSES.contains(&ac.status.as_str()) {
-                    let diag_id = project_stable_id(&[
-                        "project",
-                        "Diagnostic",
-                        SOURCE_KIND,
-                        &file_rel,
-                        "ac_invalid_field_value",
-                        &ac.local_id,
-                    ]);
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "ac_invalid_field_value",
+                            &ac.local_id,
+                        ],
+                        line_idx,
+                    );
                     push_diagnostic(
                         graph,
-                        diag_id,
+                        &diag_id,
                         Some(&file_rel),
                         &format!(
                             "[ac_invalid_field_value] acceptance_criterion '{}' at line {} has invalid status='{}'",
@@ -888,17 +937,20 @@ fn import_file(
 
                 // Parent-before-child: parent task must have been seen EARLIER
                 let Some(parent_task_id) = task_ids.get(&ac.parent_task_local_id).cloned() else {
-                    let diag_id = project_stable_id(&[
-                        "project",
-                        "Diagnostic",
-                        SOURCE_KIND,
-                        &file_rel,
-                        "unresolved_parent_task",
-                        &ac.local_id,
-                    ]);
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "unresolved_parent_task",
+                            &ac.local_id,
+                        ],
+                        line_idx,
+                    );
                     push_diagnostic(
                         graph,
-                        diag_id,
+                        &diag_id,
                         Some(&file_rel),
                         &format!(
                             "[unresolved_parent_task] acceptance_criterion '{}' at line {} references unknown task '{}'",
@@ -914,17 +966,20 @@ fn import_file(
 
                 if let Some(&existing_kind) = seen_local_ids.get(&ac.local_id) {
                     if existing_kind != "acceptance_criterion" {
-                        let diag_id = project_stable_id(&[
-                            "project",
-                            "Diagnostic",
-                            SOURCE_KIND,
-                            &file_rel,
-                            "duplicate_local_id_kind_mismatch",
-                            &ac.local_id,
-                        ]);
+                        let diag_id = per_line_diag_id(
+                            &[
+                                "project",
+                                "Diagnostic",
+                                SOURCE_KIND,
+                                &file_rel,
+                                "duplicate_local_id_kind_mismatch",
+                                &ac.local_id,
+                            ],
+                            line_idx,
+                        );
                         push_diagnostic(
                             graph,
-                            diag_id,
+                            &diag_id,
                             Some(&file_rel),
                             &format!(
                                 "[duplicate_local_id_kind_mismatch] local_id='{}' at line {} has kind='acceptance_criterion' but was previously seen with kind='{existing_kind}'",
@@ -940,17 +995,20 @@ fn import_file(
                     if let Some((prev_parent, prev_ordinal)) = ac_identity.get(&ac.local_id)
                         && (*prev_parent != ac.parent_task_local_id || *prev_ordinal != ac.ordinal)
                     {
-                        let diag_id = project_stable_id(&[
-                            "project",
-                            "Diagnostic",
-                            SOURCE_KIND,
-                            &file_rel,
-                            "revision_identity_mismatch",
-                            &ac.local_id,
-                        ]);
+                        let diag_id = per_line_diag_id(
+                            &[
+                                "project",
+                                "Diagnostic",
+                                SOURCE_KIND,
+                                &file_rel,
+                                "revision_identity_mismatch",
+                                &ac.local_id,
+                            ],
+                            line_idx,
+                        );
                         push_diagnostic(
                             graph,
-                            diag_id,
+                            &diag_id,
                             Some(&file_rel),
                             &format!(
                                 "[revision_identity_mismatch] acceptance_criterion '{}' at line {} changes identity fields (parent_task_local_id or ordinal)",
@@ -967,17 +1025,20 @@ fn import_file(
                     // already owns this (parent, ordinal) pair.
                     let graph_key = (ac.parent_task_local_id.clone(), ac.ordinal);
                     if let Some(prior_local_id) = ac_graph_identity.get(&graph_key) {
-                        let diag_id = project_stable_id(&[
-                            "project",
-                            "Diagnostic",
-                            SOURCE_KIND,
-                            &file_rel,
-                            "duplicate_ac_graph_identity",
-                            &ac.local_id,
-                        ]);
+                        let diag_id = per_line_diag_id(
+                            &[
+                                "project",
+                                "Diagnostic",
+                                SOURCE_KIND,
+                                &file_rel,
+                                "duplicate_ac_graph_identity",
+                                &ac.local_id,
+                            ],
+                            line_idx,
+                        );
                         push_diagnostic(
                             graph,
-                            diag_id,
+                            &diag_id,
                             Some(&file_rel),
                             &format!(
                                 "[duplicate_ac_graph_identity] acceptance_criterion '{}' at line {} shares (parent_task_local_id='{}', ordinal={}) with '{}'",
@@ -1021,17 +1082,20 @@ fn import_file(
                 let link: ExternalLinkLine = match serde_json::from_str(line) {
                     Ok(l) => l,
                     Err(e) => {
-                        let diag_id = project_stable_id(&[
-                            "project",
-                            "Diagnostic",
-                            SOURCE_KIND,
-                            &file_rel,
-                            "invalid_link_fields",
-                            &line_idx.to_string(),
-                        ]);
+                        let diag_id = per_line_diag_id(
+                            &[
+                                "project",
+                                "Diagnostic",
+                                SOURCE_KIND,
+                                &file_rel,
+                                "invalid_link_fields",
+                                &line_idx.to_string(),
+                            ],
+                            line_idx,
+                        );
                         push_diagnostic(
                             graph,
-                            diag_id,
+                            &diag_id,
                             Some(&file_rel),
                             &format!(
                                 "[invalid_json] external_link at line {} of '{file_rel}' has invalid fields: {e}",
@@ -1056,17 +1120,20 @@ fn import_file(
                         if let Some(&existing_kind) = seen_local_ids.get(&link.local_id)
                             && existing_kind != "external_link"
                         {
-                            let diag_id = project_stable_id(&[
-                                "project",
-                                "Diagnostic",
-                                SOURCE_KIND,
-                                &file_rel,
-                                "duplicate_local_id_kind_mismatch",
-                                &link.local_id,
-                            ]);
+                            let diag_id = per_line_diag_id(
+                                &[
+                                    "project",
+                                    "Diagnostic",
+                                    SOURCE_KIND,
+                                    &file_rel,
+                                    "duplicate_local_id_kind_mismatch",
+                                    &link.local_id,
+                                ],
+                                line_idx,
+                            );
                             push_diagnostic(
                                 graph,
-                                diag_id,
+                                &diag_id,
                                 Some(&file_rel),
                                 &format!(
                                     "[duplicate_local_id_kind_mismatch] refinement local_id='{}' at line {} was previously seen with kind='{existing_kind}'",
@@ -1086,17 +1153,20 @@ fn import_file(
                                 || *prev_native_id != materialized_native
                                 || *prev_parent != link.parent_local_id)
                         {
-                            let diag_id = project_stable_id(&[
-                                "project",
-                                "Diagnostic",
-                                SOURCE_KIND,
-                                &file_rel,
-                                "revision_identity_mismatch",
-                                &link.local_id,
-                            ]);
+                            let diag_id = per_line_diag_id(
+                                &[
+                                    "project",
+                                    "Diagnostic",
+                                    SOURCE_KIND,
+                                    &file_rel,
+                                    "revision_identity_mismatch",
+                                    &link.local_id,
+                                ],
+                                line_idx,
+                            );
                             push_diagnostic(
                                 graph,
-                                diag_id,
+                                &diag_id,
                                 Some(&file_rel),
                                 &format!(
                                     "[revision_identity_mismatch] refinement local_id='{}' at line {} has different identity from prior external_link row",
@@ -1121,30 +1191,35 @@ fn import_file(
                         seen_local_ids.insert(link.local_id.clone(), "external_link");
                         // Record identity so a later row with the same local_id
                         // cannot change system/system_native_id without a diagnostic.
-                        link_identity.entry(link.local_id.clone()).or_insert_with(|| {
-                            (
-                                "local_file".to_owned(),
-                                link.system_native_id.clone(),
-                                link.parent_local_id.clone(),
-                            )
-                        });
+                        link_identity
+                            .entry(link.local_id.clone())
+                            .or_insert_with(|| {
+                                (
+                                    "local_file".to_owned(),
+                                    link.system_native_id.clone(),
+                                    link.parent_local_id.clone(),
+                                )
+                            });
                         continue;
                     }
                 }
 
                 // Validate system against the closed enum.
                 if !VALID_LINK_SYSTEMS.contains(&link.system.as_str()) {
-                    let diag_id = project_stable_id(&[
-                        "project",
-                        "Diagnostic",
-                        SOURCE_KIND,
-                        &file_rel,
-                        "external_link_invalid_system",
-                        &link.local_id,
-                    ]);
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "external_link_invalid_system",
+                            &link.local_id,
+                        ],
+                        line_idx,
+                    );
                     push_diagnostic(
                         graph,
-                        diag_id,
+                        &diag_id,
                         Some(&file_rel),
                         &format!(
                             "[external_link_invalid_system] external_link '{}' at line {} has invalid system='{}'",
@@ -1162,17 +1237,20 @@ fn import_file(
                 let parent_is_task = task_ids.contains_key(&link.parent_local_id);
                 let parent_is_ac = ac_ids.contains_key(&link.parent_local_id);
                 if !parent_is_task && !parent_is_ac {
-                    let diag_id = project_stable_id(&[
-                        "project",
-                        "Diagnostic",
-                        SOURCE_KIND,
-                        &file_rel,
-                        "unresolved_parent_local_id",
-                        &link.local_id,
-                    ]);
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "unresolved_parent_local_id",
+                            &link.local_id,
+                        ],
+                        line_idx,
+                    );
                     push_diagnostic(
                         graph,
-                        diag_id,
+                        &diag_id,
                         Some(&file_rel),
                         &format!(
                             "[unresolved_parent_local_id] external_link '{}' at line {} references unknown parent '{}'",
@@ -1188,17 +1266,20 @@ fn import_file(
 
                 if let Some(&existing_kind) = seen_local_ids.get(&link.local_id) {
                     if existing_kind != "external_link" {
-                        let diag_id = project_stable_id(&[
-                            "project",
-                            "Diagnostic",
-                            SOURCE_KIND,
-                            &file_rel,
-                            "duplicate_local_id_kind_mismatch",
-                            &link.local_id,
-                        ]);
+                        let diag_id = per_line_diag_id(
+                            &[
+                                "project",
+                                "Diagnostic",
+                                SOURCE_KIND,
+                                &file_rel,
+                                "duplicate_local_id_kind_mismatch",
+                                &link.local_id,
+                            ],
+                            line_idx,
+                        );
                         push_diagnostic(
                             graph,
-                            diag_id,
+                            &diag_id,
                             Some(&file_rel),
                             &format!(
                                 "[duplicate_local_id_kind_mismatch] local_id='{}' at line {} has kind='external_link' but was previously seen with kind='{existing_kind}'",
@@ -1218,17 +1299,20 @@ fn import_file(
                             || *prev_native_id != link.system_native_id
                             || *prev_parent != link.parent_local_id)
                     {
-                        let diag_id = project_stable_id(&[
-                            "project",
-                            "Diagnostic",
-                            SOURCE_KIND,
-                            &file_rel,
-                            "revision_identity_mismatch",
-                            &link.local_id,
-                        ]);
+                        let diag_id = per_line_diag_id(
+                            &[
+                                "project",
+                                "Diagnostic",
+                                SOURCE_KIND,
+                                &file_rel,
+                                "revision_identity_mismatch",
+                                &link.local_id,
+                            ],
+                            line_idx,
+                        );
                         push_diagnostic(
                             graph,
-                            diag_id,
+                            &diag_id,
                             Some(&file_rel),
                             &format!(
                                 "[revision_identity_mismatch] external_link '{}' at line {} changes identity fields (system, system_native_id, or parent_local_id)",
@@ -1244,17 +1328,20 @@ fn import_file(
                     // Check for graph-identity collision across different local_ids.
                     let graph_key = (link.system.clone(), link.system_native_id.clone());
                     if let Some(prior_local_id) = link_graph_identity.get(&graph_key) {
-                        let diag_id = project_stable_id(&[
-                            "project",
-                            "Diagnostic",
-                            SOURCE_KIND,
-                            &file_rel,
-                            "duplicate_external_link_graph_identity",
-                            &link.local_id,
-                        ]);
+                        let diag_id = per_line_diag_id(
+                            &[
+                                "project",
+                                "Diagnostic",
+                                SOURCE_KIND,
+                                &file_rel,
+                                "duplicate_external_link_graph_identity",
+                                &link.local_id,
+                            ],
+                            line_idx,
+                        );
                         push_diagnostic(
                             graph,
-                            diag_id,
+                            &diag_id,
                             Some(&file_rel),
                             &format!(
                                 "[duplicate_external_link_graph_identity] external_link '{}' at line {} shares (system='{}', system_native_id='{}') with '{}'",
@@ -1286,18 +1373,21 @@ fn import_file(
             }
 
             other => {
-                let diag_id = project_stable_id(&[
-                    "project",
-                    "Diagnostic",
-                    SOURCE_KIND,
-                    &file_rel,
-                    "unknown_kind",
-                    other,
-                    &line_idx.to_string(),
-                ]);
+                let diag_id = per_line_diag_id(
+                    &[
+                        "project",
+                        "Diagnostic",
+                        SOURCE_KIND,
+                        &file_rel,
+                        "unknown_kind",
+                        other,
+                        &line_idx.to_string(),
+                    ],
+                    line_idx,
+                );
                 push_diagnostic(
                     graph,
-                    diag_id,
+                    &diag_id,
                     Some(&file_rel),
                     &format!(
                         "[unknown_kind] line {} of '{file_rel}' has unknown kind='{other}', skipping",
@@ -1399,12 +1489,50 @@ fn emit_task_records(
     );
 
     // Body handle
-    let body_str = match &task.body {
-        None => String::new(),
-        Some(serde_json::Value::String(s)) => (opts.redact)(s),
-        Some(other) => (opts.redact)(&other.to_string()),
+    // When body is a JSON object with "hash" and "bytes" fields, treat it as a
+    // pre-computed handle and preserve the referenced hash/size. When "bytes" is
+    // absent the handle is malformed — emit a diagnostic and fall back to empty.
+    let body_h = match &task.body {
+        None => body_handle_for(""),
+        Some(serde_json::Value::String(s)) => body_handle_for(&(opts.redact)(s)),
+        Some(serde_json::Value::Object(obj)) => {
+            let hash = obj.get("hash").and_then(serde_json::Value::as_str);
+            let bytes = obj.get("bytes").and_then(serde_json::Value::as_u64);
+            if let (Some(h), Some(b)) = (hash, bytes) {
+                let inline = obj
+                    .get("inline")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|s| (opts.redact)(s));
+                OutputHandle {
+                    hash: h.to_owned(),
+                    bytes: b,
+                    inline,
+                }
+            } else {
+                // Malformed handle: emit a diagnostic and use empty body.
+                let diag_id = project_stable_id(&[
+                    "project",
+                    "Diagnostic",
+                    SOURCE_KIND,
+                    file_rel,
+                    "missing_body_bytes",
+                    &task.local_id,
+                ]);
+                push_diagnostic(
+                    graph,
+                    &diag_id,
+                    Some(file_rel),
+                    &format!(
+                        "[missing_body_bytes] task '{}' has a body object missing required 'bytes' field",
+                        task.local_id
+                    ),
+                    transaction_time,
+                );
+                body_handle_for("")
+            }
+        }
+        Some(other) => body_handle_for(&(opts.redact)(&other.to_string())),
     };
-    let body_h = body_handle_for(&body_str);
     let title = (opts.redact)(&task.title);
     let assignees: Vec<String> = task.assignees.iter().map(|a| (opts.redact)(a)).collect();
     let labels: Vec<String> = task.labels.iter().map(|l| (opts.redact)(l)).collect();

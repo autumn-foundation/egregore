@@ -2074,6 +2074,9 @@ const PROJECT_NODE_KINDS: &[NodeKind] = &[
     NodeKind::PR,
     NodeKind::Review,
     NodeKind::LocalTask,
+    // Importer diagnostics are valid project records; they carry entity_id == id
+    // and valid_time == transaction_time so partial imports remain ingestible.
+    NodeKind::Diagnostic,
 ];
 
 const PROJECT_FULL_NODE_KINDS: &[NodeKind] = &[
