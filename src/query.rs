@@ -391,7 +391,10 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             ..
         } = record
             && label.is_codegraph_topology_label()
-            && !tombstoned_ids.contains(id.as_str())
+            // Temporal guard: historical topology edges must not be suppressed by a
+            // current-state tombstone. Only non-temporal edges are excluded by tombstones.
+            && (has_any_temporal_version.contains(id.as_str())
+                || !tombstoned_ids.contains(id.as_str()))
             && seed_ids.contains(source.as_str())
             && seed_ids.contains(target.as_str())
         {
@@ -523,7 +526,14 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                         // kinds (e.g. ToolCall) which bridge classifiable sections but
                         // have no output section of their own. Tombstoned and missing
                         // (by_id miss) nodes still must not enter the frontier.
-                        if was_classified || is_bfs_relay_node(id, &by_id, &tombstoned_ids) {
+                        if was_classified
+                            || is_bfs_relay_node(
+                                id,
+                                &by_id,
+                                &tombstoned_ids,
+                                &has_any_temporal_version,
+                            )
+                        {
                             next_frontier.push(id);
                         }
                     }
@@ -602,6 +612,33 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                                     relation: link.relation.clone(),
                                     target_domain: link.target_domain.clone(),
                                 });
+                            }
+                        }
+                    } else {
+                        // Node has no resolved evidence link to seed_ids but may have
+                        // triple-form links (target_repo_relative_path/span/commit with
+                        // no target_record_id). Pre-resolution graph slices produced
+                        // before daemon resolution can contain only these triples.
+                        // Surface them in `unresolved` so consumers can diagnose the
+                        // citation without requiring a raw graph reload.
+                        let has_triple = links.iter().any(|link| {
+                            link.target_record_id.is_none()
+                                && evidence_link_triple_handle(link).is_some()
+                        });
+                        if has_triple {
+                            visited.insert(node_id.as_str());
+                            for link in links {
+                                if link.target_record_id.is_none() {
+                                    let Some(handle) = evidence_link_triple_handle(link) else {
+                                        continue;
+                                    };
+                                    unresolved.push(UnresolvedRef {
+                                        source_record_id: node_id.clone(),
+                                        target_handle: handle,
+                                        relation: link.relation.clone(),
+                                        target_domain: link.target_domain.clone(),
+                                    });
+                                }
                             }
                         }
                     }
@@ -729,7 +766,9 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                         &mut artifacts,
                         &mut verification_evidence,
                     );
-                    if was_classified || is_bfs_relay_node(id, &by_id, &tombstoned_ids) {
+                    if was_classified
+                        || is_bfs_relay_node(id, &by_id, &tombstoned_ids, &has_any_temporal_version)
+                    {
                         next_extra.push(id);
                     }
                 }
@@ -897,13 +936,16 @@ const fn is_forward_only_label(label: EdgeLabel) -> bool {
 ///   `ToolCall`; its `PRODUCED_EVIDENCE` forward edges then reach `CommandRun`/`TestRun`.
 ///
 /// Relay expansion is only allowed for nodes that are present in `by_id` and
-/// not tombstoned — the same guards applied before `classify_and_insert`.
+/// not tombstoned (current-state). Temporal relay nodes with the same stable ID
+/// as a current-state tombstone are exempt — the tombstone reflects only the
+/// current state; the historical relay must still bridge its edges.
 fn is_bfs_relay_node(
     record_id: &str,
     by_id: &std::collections::BTreeMap<&str, &GraphRecord>,
     tombstoned_ids: &BTreeSet<&str>,
+    has_any_temporal_version: &BTreeSet<&str>,
 ) -> bool {
-    if tombstoned_ids.contains(record_id) {
+    if tombstoned_ids.contains(record_id) && !has_any_temporal_version.contains(record_id) {
         return false;
     }
     let Some(rec) = by_id.get(record_id) else {

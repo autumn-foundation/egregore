@@ -676,6 +676,10 @@ struct ContextObservation<'a> {
     /// Lets consumers distinguish subjective observation types without
     /// re-inspecting the raw graph.
     kind: &'static str,
+    /// Agent-facing summary from the raw `GraphRecord`. Always present —
+    /// `Decision` records use this field for their human-readable content
+    /// rather than `text`, so consumers must not rely on `text` alone.
+    summary: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<&'a str>,
     /// Provenance handle composed from `agent_id:session_id` when both are present.
@@ -1686,6 +1690,7 @@ fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_>> {
     let GraphRecord::Node {
         id,
         kind,
+        summary,
         text,
         agent_id,
         session_id,
@@ -1707,6 +1712,7 @@ fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_>> {
     Some(ContextObservation {
         record_id: id,
         kind: kind.as_str(),
+        summary,
         text: text.as_deref(),
         provenance_handle,
         agent_id: agent_id.as_deref(),

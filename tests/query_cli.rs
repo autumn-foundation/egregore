@@ -2231,3 +2231,100 @@ fn query_context_linked_item_carries_summary() {
         "summary must be forwarded for generic Artifact records without title/name/text/status"
     );
 }
+
+// ---------------------------------------------------------------------------
+// query context — Decision observation carries summary field
+// ---------------------------------------------------------------------------
+//
+// Finding (line 1710): Decision records are classified into observations but do
+// not populate the Observation-only `text` field. Their human-readable content
+// is in GraphRecord::summary. Without a summary field in ContextObservation,
+// consumers cannot understand the Decision item without reloading the raw graph.
+
+#[test]
+fn query_context_decision_carries_summary() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("decision_summary.jsonl");
+
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "decision_ctx_fn"]);
+    let sym = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 0,
+            end_byte: 80,
+            start_line: 1,
+            end_line: 5,
+        },
+        "decision_ctx_fn".to_owned(),
+        "fn decision_ctx_fn".to_owned(),
+    );
+
+    let dec_id = agent_memory_stable_id(&["decision", "cli_decision_test"]);
+    let mut decision = GraphRecord::node(
+        dec_id.clone(),
+        NodeKind::Decision,
+        None,
+        None,
+        None,
+        "approved approach: use streaming parser for decision_ctx_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ref mut evidence_links,
+        // text intentionally NOT set — Decision uses summary, not text
+        ..
+    } = decision
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-04-01T09:00:00Z".to_owned());
+        *confidence = Some("0.95".to_owned());
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(sym_id),
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "0.95".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let mut graph = aletheia_egregore::ir::Graph::new();
+    graph.push(sym);
+    graph.push(decision);
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let output = egregore()
+        .args(["query", "context", "decision_ctx_fn", "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value =
+        serde_json::from_slice(&output).expect("valid JSON from query context");
+
+    let dec_item = json["observations"]
+        .as_array()
+        .expect("observations array")
+        .iter()
+        .find(|o| o["record_id"].as_str() == Some(&dec_id))
+        .expect("Decision must appear in observations");
+
+    assert_eq!(
+        dec_item["summary"].as_str(),
+        Some("approved approach: use streaming parser for decision_ctx_fn"),
+        "Decision must carry summary field in observation output (Decision records \
+         use summary, not text, for their human-readable content)"
+    );
+}
