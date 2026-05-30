@@ -7511,6 +7511,37 @@ fn handle_verb_observations_for_symbol(
                 );
             }
         };
+        // First pass: collect IDs of nodes that fall within the as-of window.
+        // Used to decide whether to keep untimed current-state edges.
+        let retained_node_ids: BTreeSet<String> = records
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Node {
+                    id,
+                    temporal,
+                    valid_time,
+                    ..
+                } => {
+                    let vt_str = temporal
+                        .as_ref()
+                        .map(|t| t.valid_time.as_str())
+                        .or(valid_time.as_deref());
+                    vt_str
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .is_some_and(|vt| vt <= as_of_dt)
+                        .then(|| id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        // Second pass: apply the actual filter.
+        // - Nodes: keep if their valid_time is <= as_of_dt.
+        // - Timed edges: keep if their valid_time is <= as_of_dt.
+        // - Untimed edges: keep only if both endpoints are in the retained slice
+        //   (current-state project MENTIONS_SYMBOL / DEFINES edges are still valid).
+        // - Tombstones: drop — they have no valid_time so we cannot determine whether
+        //   the deletion occurred before or after as_of_dt; retaining them would
+        //   erroneously hide records that existed at the requested instant.
         records.retain(|r| match r {
             GraphRecord::Node {
                 temporal,
@@ -7525,15 +7556,21 @@ fn handle_verb_observations_for_symbol(
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .is_some_and(|vt| vt <= as_of_dt)
             }
-            GraphRecord::Edge { temporal, .. } => {
-                let vt_str = temporal.as_ref().map(|t| t.valid_time.as_str());
-                vt_str.is_some_and(|s| {
-                    chrono::DateTime::parse_from_rfc3339(s)
-                        .ok()
-                        .is_some_and(|vt| vt <= as_of_dt)
-                })
-            }
-            GraphRecord::Tombstone { .. } => true,
+            GraphRecord::Edge {
+                source,
+                target,
+                temporal,
+                ..
+            } => match temporal.as_ref().map(|t| t.valid_time.as_str()) {
+                Some(vt_str) => chrono::DateTime::parse_from_rfc3339(vt_str)
+                    .ok()
+                    .is_some_and(|vt| vt <= as_of_dt),
+                None => {
+                    retained_node_ids.contains(source.as_str())
+                        && retained_node_ids.contains(target.as_str())
+                }
+            },
+            GraphRecord::Tombstone { .. } => false,
         });
     }
 
