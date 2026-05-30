@@ -77,6 +77,11 @@ fn task_writer_producer(fixed_started_at: Option<&str>) -> Producer {
 /// Options controlling local-JSONL import behaviour.
 pub struct ImportOptions {
     /// Redaction closure applied to every free-text field before storage.
+    ///
+    /// The default is [`crate::redaction::redact_value`], which applies the
+    /// v1 redaction policy and replaces detected secrets with a
+    /// `<REDACTED:class:hash>` marker. To disable redaction (e.g. for testing
+    /// or explicit pass-through), use `ImportOptions::pass_through()`.
     pub redact: Box<dyn Fn(&str) -> String + Send + Sync>,
     /// Fixed RFC 3339 `transaction_time` for deterministic / test output.
     /// When `None`, the current wall-clock instant is used.
@@ -85,6 +90,19 @@ pub struct ImportOptions {
 
 impl Default for ImportOptions {
     fn default() -> Self {
+        Self {
+            redact: Box::new(crate::redaction::redact_value),
+            transaction_time: None,
+        }
+    }
+}
+
+impl ImportOptions {
+    /// Build options with the identity redaction closure (no secret scrubbing).
+    ///
+    /// Prefer `Default::default()` for production use. Use `pass_through` only
+    /// in tests or when the caller has already applied redaction upstream.
+    pub fn pass_through() -> Self {
         Self {
             redact: Box::new(str::to_owned),
             transaction_time: None,
@@ -1782,16 +1800,13 @@ fn emit_task_records(
     let task_id = project_stable_id(&["project", "Task", SOURCE_KIND, file_rel, &identity_handle]);
     let full_source_handle = source_handle_for_line(file_rel, &task.local_id, raw);
 
-    // Materialized source ExternalLink
+    // Materialized source ExternalLink — uses the same global ID format as explicit
+    // ExternalLinks: (system, system_native_id). Since src_link_native_id is
+    // source_identity_handle(file_rel, local_id) — a hash of file_rel+local_id — the
+    // ID is unique per (file, task) without needing SOURCE_KIND or file_rel in the key.
     let src_link_native_id = identity_handle;
-    let src_link_id = project_stable_id(&[
-        "project",
-        "ExternalLink",
-        SOURCE_KIND,
-        file_rel,
-        "local_file",
-        &src_link_native_id,
-    ]);
+    let src_link_id =
+        project_stable_id(&["project", "ExternalLink", "local_file", &src_link_native_id]);
     // Explicit refinement wins for url; otherwise default to file:// URL.
     // Both paths go through opts.redact so the redaction policy is consistently applied.
     let src_link_url = src_link_refinement.map_or_else(
@@ -1874,9 +1889,10 @@ fn emit_task_records(
     // node; re-emitting the source ExternalLink would create spurious source-link
     // history for edits that did not change the source identity.
     //
-    // NOTE: the daemon synthesizes the Task→ExternalLink EXTERNAL_HANDLE edge from
-    // Task.source_external_link_id, so this function intentionally does NOT emit
-    // that edge — submitting it would conflict with synthesis and fail ingest.
+    // The EXTERNAL_HANDLE edge is emitted here so that embedded-adapter stores
+    // (the primary documented workflow) are fully traversable. The daemon write
+    // path synthesizes this edge from source_external_link_id and rejects it if
+    // submitted; pre-filter it before daemon ingest if the daemon adapter is used.
     if emitted_src_links.insert(src_link_id.clone()) {
         // Refinement wins for valid_time (updated_at) and discovered_at
         let src_link_valid_time =
@@ -1920,14 +1936,36 @@ fn emit_task_records(
             *discovered_at = Some(src_link_discovered_at);
         }
         graph.push(src_link_node);
+
+        // Task → ExternalLink edge (EXTERNAL_HANDLE)
+        let edge_id = project_stable_id(&[
+            "project",
+            "edge",
+            EdgeLabel::ExternalHandle.as_str(),
+            &task_id,
+            &src_link_id,
+        ]);
+        graph.push(GraphRecord::Edge {
+            id: edge_id,
+            schema_version: PROJECT_SCHEMA_VERSION,
+            label: EdgeLabel::ExternalHandle,
+            source: task_id.clone(),
+            target: src_link_id,
+            confidence: None,
+            temporal: None,
+            summary: format!(
+                "Task '{}' has local-file source ExternalLink",
+                task.local_id
+            ),
+            producer: None,
+        });
     }
 }
 
-/// Emit an `AcceptanceCriterion` node.
+/// Emit an `AcceptanceCriterion` node and its `OWNED_BY_TASK` edge.
 ///
-/// The daemon synthesizes the `OWNED_BY_TASK` edge from
-/// `AcceptanceCriterion.parent_task_id`, so this function does NOT emit that
-/// edge — submitting it would conflict with synthesis and fail ingest.
+/// The edge is included for embedded-adapter completeness. The daemon write
+/// path synthesizes it from `parent_task_id`; pre-filter before daemon ingest.
 fn emit_ac_record(
     graph: &mut Graph,
     ac: &AcLine,
@@ -1979,6 +2017,26 @@ fn emit_ac_record(
         *status = Some(ac.status.clone());
     }
     graph.push(ac_node);
+
+    // AcceptanceCriterion → Task edge (OWNED_BY_TASK)
+    let edge_id = project_stable_id(&[
+        "project",
+        "edge",
+        EdgeLabel::OwnedByTask.as_str(),
+        &ac_id,
+        parent_task_id,
+    ]);
+    graph.push(GraphRecord::Edge {
+        id: edge_id,
+        schema_version: PROJECT_SCHEMA_VERSION,
+        label: EdgeLabel::OwnedByTask,
+        source: ac_id,
+        target: parent_task_id.to_owned(),
+        confidence: None,
+        temporal: None,
+        summary: format!("AcceptanceCriterion '{}' owned by task", ac.local_id),
+        producer: None,
+    });
 }
 
 /// Emit an explicit `ExternalLink` node and its `ExternalHandle` edge.
