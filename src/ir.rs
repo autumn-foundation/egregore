@@ -1305,6 +1305,22 @@ impl GraphRecord {
         self
     }
 
+    /// Stamps the redaction policy version on a node record.
+    ///
+    /// Called by importers after applying the v1 redaction policy; see
+    /// `docs/schema/redaction.md` and `crate::redaction::REDACTION_POLICY_VERSION`.
+    #[must_use]
+    pub fn with_redaction_policy_version(mut self, policy_version: impl Into<String>) -> Self {
+        if let Self::Node {
+            redaction_policy_version,
+            ..
+        } = &mut self
+        {
+            *redaction_policy_version = Some(policy_version.into());
+        }
+        self
+    }
+
     /// Stamps the producer identity envelope on this record.
     ///
     /// The `producer` field is a non-identity envelope: it MUST NOT contribute

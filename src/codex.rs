@@ -33,8 +33,10 @@
 //! # Redaction
 //!
 //! All free-text fields (command arguments, stdout/stderr excerpts, assistant prose)
-//! pass through a caller-supplied redaction closure before being stored.
-//! TODO: replace with #4 policy at the single call site in [`redact`].
+//! pass through a caller-supplied redaction closure before being stored. The
+//! default [`ImportOptions`] applies the v1 redaction policy via
+//! [`crate::redaction::redact_value`]. Pass-through requires an explicit
+//! [`ImportOptions::passthrough`].
 //!
 //! # Idempotency
 //!
@@ -93,14 +95,28 @@ const INLINE_PAYLOAD_CEILING: u64 = 16 * 1024;
 pub struct ImportOptions {
     /// Redaction closure applied to every free-text field before storage.
     ///
-    /// TODO: replace with #4 policy at the single [`redact`] call site.
+    /// The default closure is [`crate::redaction::redact_value`], which applies
+    /// the v1 redaction policy from `docs/schema/redaction.md`. Pass-through
+    /// (no redaction) is only permitted on explicit dry-run or test paths via
+    /// [`ImportOptions::passthrough`].
     pub redact: Box<dyn Fn(&str) -> String + Send + Sync>,
 }
 
 impl Default for ImportOptions {
     fn default() -> Self {
         Self {
-            // TODO: replace with #4 policy
+            redact: Box::new(crate::redaction::redact_value),
+        }
+    }
+}
+
+impl ImportOptions {
+    /// Returns an `ImportOptions` with a pass-through redaction closure.
+    ///
+    /// Only use this for dry-run or test invocations where redaction is not required.
+    #[must_use]
+    pub fn passthrough() -> Self {
+        Self {
             redact: Box::new(|s: &str| s.to_owned()),
         }
     }
