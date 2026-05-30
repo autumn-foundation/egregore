@@ -282,8 +282,8 @@ fn accepted_command_evidence_produces_command_evidence_node() {
         build_command_evidence_records(&req).expect("valid command evidence must succeed");
 
     assert!(
-        outcome.record_id.starts_with("verification:v1:"),
-        "command evidence record_id must use verification:v1: prefix, got {}",
+        outcome.record_id.starts_with("agent_memory:v1:"),
+        "command evidence record_id must use agent_memory:v1: prefix, got {}",
         outcome.record_id
     );
 
@@ -677,7 +677,7 @@ fn full_workflow_writes_all_four_evidence_types() {
         source_artifact_hash: "sha256:fixture001".to_owned(),
     };
     let cmd = build_command_evidence_records(&cmd_req).expect("command evidence must succeed");
-    assert!(cmd.record_id.starts_with("verification:v1:"));
+    assert!(cmd.record_id.starts_with("agent_memory:v1:"));
 
     // 3. Artifact
     let art_req = ArtifactRequest {
@@ -824,6 +824,138 @@ fn artifact_rejects_unknown_patch_status() {
     let err = build_artifact_records(&req).expect_err("unknown patch_status must be rejected");
     assert_eq!(err.code, "invalid_field");
     assert_eq!(err.field, "patch_status");
+}
+
+// ── P2 Validation: RFC 3339, artifact constraints ────────────────────────────
+
+#[test]
+fn observation_rejects_non_rfc3339_observed_at() {
+    let req = ObservationRequest {
+        provenance: EvidenceProvenance {
+            observed_at: "not-a-timestamp".to_owned(),
+            ..valid_provenance()
+        },
+        text: "timestamp check".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+    };
+    let err = build_observation_records(&req).expect_err("invalid observed_at must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "observed_at");
+}
+
+#[test]
+fn artifact_rejects_invalid_syntax_with_target_files() {
+    let req = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"bad patch".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "invalid_syntax".to_owned(),
+        base_commit: None,
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "syntax error".to_owned(),
+    };
+    let err = build_artifact_records(&req)
+        .expect_err("invalid_syntax with target_files must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "target_files");
+}
+
+#[test]
+fn artifact_rejects_missing_source_artifact_hash() {
+    let req = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"diff content".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: None,
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: String::new(),
+        validation_summary: "n/a".to_owned(),
+    };
+    let err =
+        build_artifact_records(&req).expect_err("empty source_artifact_hash must be rejected");
+    assert_eq!(err.code, "missing_field");
+    assert_eq!(err.field, "source_artifact_hash");
+}
+
+#[test]
+fn command_evidence_record_id_uses_agent_memory_prefix() {
+    let req = CommandEvidenceRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:01:00Z".to_owned(),
+        exit_code: 0,
+        stdout: None,
+        stderr: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+    };
+    let outcome =
+        build_command_evidence_records(&req).expect("valid command evidence must succeed");
+    assert!(
+        outcome.record_id.starts_with("agent_memory:v1:"),
+        "command evidence must use agent_memory:v1: prefix, got {}",
+        outcome.record_id
+    );
+}
+
+#[test]
+fn distinct_stdout_produces_distinct_command_evidence_ids() {
+    let base = CommandEvidenceRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:01:00Z".to_owned(),
+        exit_code: 0,
+        stdout: Some("output A".to_owned()),
+        stderr: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+    };
+    let id_a = build_command_evidence_records(&base)
+        .expect("run A must succeed")
+        .record_id;
+    let req_b = CommandEvidenceRequest {
+        stdout: Some("output B".to_owned()),
+        ..base
+    };
+    let id_b = build_command_evidence_records(&req_b)
+        .expect("run B must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different stdout must produce different record IDs"
+    );
+}
+
+#[test]
+fn distinct_verification_kind_produces_distinct_verification_ids() {
+    let base = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        linked_command_evidence_id: None,
+    };
+    let id_a = build_verification_records(&base)
+        .expect("test_run must succeed")
+        .record_id;
+    let req_b = VerificationRequest {
+        verification_kind: "ci_status".to_owned(),
+        ..base
+    };
+    let id_b = build_verification_records(&req_b)
+        .expect("ci_status must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different verification_kind must produce different record IDs"
+    );
 }
 
 // ── AC9: Uses existing schema — no new node kinds or edge labels ─────────────

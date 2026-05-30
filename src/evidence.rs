@@ -232,6 +232,9 @@ fn validate_provenance_base(prov: &EvidenceProvenance) -> Result<(), ProvenanceE
     if prov.observed_at.is_empty() {
         return Err(ProvenanceError::missing("observed_at"));
     }
+    if chrono::DateTime::parse_from_rfc3339(&prov.observed_at).is_err() {
+        return Err(ProvenanceError::invalid("observed_at"));
+    }
     Ok(())
 }
 
@@ -249,6 +252,19 @@ fn validate_source_handle(prov: &EvidenceProvenance) -> Result<(), ProvenanceErr
 fn validate_source_artifact(path: &str, hash: &str) -> Result<(), ProvenanceError> {
     if path.is_empty() && hash.is_empty() {
         return Err(ProvenanceError::missing("source_artifact_path"));
+    }
+    Ok(())
+}
+
+/// Validates that both `source_artifact_path` and `source_artifact_hash` are
+/// non-empty (required for `PatchArtifact` writes — the embedded daemon calls
+/// `required_str` on both fields).
+fn validate_source_artifact_both(path: &str, hash: &str) -> Result<(), ProvenanceError> {
+    if path.is_empty() {
+        return Err(ProvenanceError::missing("source_artifact_path"));
+    }
+    if hash.is_empty() {
+        return Err(ProvenanceError::missing("source_artifact_hash"));
     }
     Ok(())
 }
@@ -686,10 +702,10 @@ pub fn build_observation_records(
     })
 }
 
-/// Builds a typed `CommandRun` record batch (command evidence) from a
+/// Builds a typed `CommandEvidence` record batch (command evidence) from a
 /// provenance-bearing request.
 ///
-/// `CommandRun` nodes live in the **verification** domain (`verification:v1:` prefix).
+/// `CommandEvidence` nodes live in the **agent-memory** domain (`agent_memory:v1:` prefix).
 /// Either `source_artifact_path` or `source_artifact_hash` must be non-empty.
 ///
 /// # Errors
@@ -709,8 +725,28 @@ pub fn build_command_evidence_records(
     let agent_kind = effective_agent_kind(&req.provenance);
     let now = now_rfc3339();
 
-    // Content-addressed on agent, session, execution time, and exit code.
-    let cmd_id = verification_stable_id(&[
+    // Redact stdout/stderr before hashing or inline storage.
+    let redacted_stdout = req.stdout.as_deref().map(crate::redaction::redact_value);
+    let redacted_stderr = req.stderr.as_deref().map(crate::redaction::redact_value);
+    let stdout_redacted = redacted_stdout
+        .as_deref()
+        .is_some_and(crate::redaction::is_redacted);
+    let stderr_redacted = redacted_stderr
+        .as_deref()
+        .is_some_and(crate::redaction::is_redacted);
+    let redaction_policy_version = (stdout_redacted || stderr_redacted)
+        .then(|| crate::redaction::REDACTION_POLICY_VERSION.to_owned());
+
+    // Stdout hash is included in the stable ID so two runs with identical timing
+    // but different output produce distinct evidence handles.
+    let stdout_hash = {
+        let mut h = blake3::Hasher::new();
+        h.update(redacted_stdout.as_deref().unwrap_or("").as_bytes());
+        h.finalize().to_hex().to_string()
+    };
+
+    // Content-addressed on agent, session, execution time, exit code, and stdout.
+    let cmd_id = agent_memory_stable_id(&[
         "node",
         "command_evidence",
         &req.provenance.agent_id,
@@ -718,18 +754,18 @@ pub fn build_command_evidence_records(
         &req.executed_at,
         &req.exit_code.to_string(),
         &req.source_artifact_hash,
+        &stdout_hash,
     ]);
 
-    let stdout_handle = req.stdout.as_deref().map(output_handle).map(Box::new);
-
-    let stderr_handle = req.stderr.as_deref().map(output_handle).map(Box::new);
+    let stdout_handle = redacted_stdout.as_deref().map(output_handle).map(Box::new);
+    let stderr_handle = redacted_stderr.as_deref().map(output_handle).map(Box::new);
 
     let exit_status = if req.exit_code == 0 { "pass" } else { "fail" };
 
     let cmd_node = GraphRecord::Node {
         id: cmd_id.clone(),
         kind: NodeKind::CommandEvidence,
-        schema_version: VERIFICATION_SCHEMA_VERSION,
+        schema_version: AGENT_MEMORY_SCHEMA_VERSION,
         repo_relative_path: None,
         span: None,
         name: None,
@@ -749,7 +785,7 @@ pub fn build_command_evidence_records(
         ingested_at: Some(now),
         confidence: None,
         source_handle: req.provenance.source_handle.clone(),
-        redaction_policy_version: None,
+        redaction_policy_version,
         valid_time: None,
         valid_time_source: None,
         entity_id: None,
@@ -773,7 +809,7 @@ pub fn build_command_evidence_records(
             "CommandEvidence by {} in {} at {} (exit {})",
             req.provenance.agent_id, req.provenance.session_id, req.executed_at, req.exit_code
         ),
-        domain: Some("verification".to_owned()),
+        domain: Some("agent_memory".to_owned()),
         importer_id: None,
         importer_version: None,
         source_artifact_path: Some(req.source_artifact_path.clone()),
@@ -835,10 +871,13 @@ pub fn build_artifact_records(
     req: &ArtifactRequest,
 ) -> Result<EvidenceWriteOutcome, ProvenanceError> {
     validate_provenance_base(&req.provenance)?;
-    validate_source_artifact(&req.source_artifact_path, &req.source_artifact_hash)?;
+    validate_source_artifact_both(&req.source_artifact_path, &req.source_artifact_hash)?;
 
     if !PATCH_STATUS_VALUES.contains(&req.patch_status.as_str()) {
         return Err(ProvenanceError::invalid("patch_status"));
+    }
+    if req.patch_status == "invalid_syntax" && !req.target_files.is_empty() {
+        return Err(ProvenanceError::invalid("target_files"));
     }
 
     let agent_kind = effective_agent_kind(&req.provenance);
@@ -905,7 +944,7 @@ pub fn build_artifact_records(
         source_handle: req.provenance.source_handle.clone(),
         redaction_policy_version: None,
         valid_time: Some(req.provenance.observed_at.clone()),
-        valid_time_source: Some("observed_at".to_owned()),
+        valid_time_source: Some("produced_at".to_owned()),
         entity_id: None,
         title: None,
         body_handle: None,
@@ -1012,10 +1051,18 @@ pub fn build_verification_records(
         &req.provenance.session_id,
         &req.executed_at,
         &req.status,
+        &req.verification_kind,
         &req.source_artifact_hash,
     ]);
 
-    let stdout_handle = req.stdout.as_deref().map(output_handle).map(Box::new);
+    // Redact stdout before inline storage.
+    let redacted_stdout = req.stdout.as_deref().map(crate::redaction::redact_value);
+    let stdout_redacted = redacted_stdout
+        .as_deref()
+        .is_some_and(crate::redaction::is_redacted);
+    let redaction_policy_version =
+        stdout_redacted.then(|| crate::redaction::REDACTION_POLICY_VERSION.to_owned());
+    let stdout_handle = redacted_stdout.as_deref().map(output_handle).map(Box::new);
 
     let ver_node = GraphRecord::Node {
         id: ver_id.clone(),
@@ -1040,7 +1087,7 @@ pub fn build_verification_records(
         ingested_at: Some(now),
         confidence: None,
         source_handle: req.provenance.source_handle.clone(),
-        redaction_policy_version: None,
+        redaction_policy_version,
         valid_time: None,
         valid_time_source: None,
         entity_id: None,
