@@ -1214,3 +1214,184 @@ fn evidence_writer_uses_only_existing_node_kinds() {
         );
     }
 }
+
+// ── P2 round-5: evidence_quality enum, agent ID stability, verification path, patch size ──
+
+#[test]
+fn command_evidence_rejects_invalid_evidence_quality() {
+    let req = CommandEvidenceRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:01:00Z".to_owned(),
+        exit_code: 0,
+        stdout: None,
+        stderr: None,
+        evidence_quality: "typo".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+    };
+    let err = build_command_evidence_records(&req)
+        .expect_err("unknown evidence_quality must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "evidence_quality");
+}
+
+#[test]
+fn verification_rejects_invalid_evidence_quality() {
+    let req = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: None,
+        evidence_quality: "unknown_quality".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        linked_command_evidence_id: None,
+    };
+    let err = build_verification_records(&req)
+        .expect_err("unknown evidence_quality must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "evidence_quality");
+}
+
+#[test]
+fn agent_node_id_differs_by_agent_kind() {
+    // Same agent_id but different agent_kind must produce different Agent node IDs so that
+    // the embedded sink does not see a mismatched payload for the same record ID.
+    let prov_a = EvidenceProvenance {
+        agent_kind: "other".to_owned(),
+        ..valid_provenance()
+    };
+    let prov_b = EvidenceProvenance {
+        agent_kind: "codex".to_owned(),
+        ..valid_provenance()
+    };
+    let out_a = build_observation_records(&ObservationRequest {
+        provenance: prov_a,
+        text: "obs A".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+    })
+    .expect("write A must succeed");
+    let out_b = build_observation_records(&ObservationRequest {
+        provenance: prov_b,
+        text: "obs B".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+    })
+    .expect("write B must succeed");
+
+    let agent_id_a = out_a
+        .records
+        .iter()
+        .find(|r| {
+            matches!(
+                r,
+                aletheia_egregore::ir::GraphRecord::Node {
+                    kind: NodeKind::Agent,
+                    ..
+                }
+            )
+        })
+        .map(aletheia_egregore::GraphRecord::id)
+        .expect("Agent node must be in batch A");
+    let agent_id_b = out_b
+        .records
+        .iter()
+        .find(|r| {
+            matches!(
+                r,
+                aletheia_egregore::ir::GraphRecord::Node {
+                    kind: NodeKind::Agent,
+                    ..
+                }
+            )
+        })
+        .map(aletheia_egregore::GraphRecord::id)
+        .expect("Agent node must be in batch B");
+
+    assert_ne!(
+        agent_id_a, agent_id_b,
+        "Agent nodes with different agent_kind must have different IDs"
+    );
+}
+
+#[test]
+fn distinct_source_path_produces_distinct_verification_ids() {
+    // When source_artifact_hash is empty (path-only mode), two verifications with the
+    // same agent/session/executed_at/status/kind but different source_artifact_path
+    // must receive different IDs.
+    let base = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: String::new(),
+        linked_command_evidence_id: None,
+    };
+    let id_a = build_verification_records(&base)
+        .expect("path A must succeed")
+        .record_id;
+    let req_b = VerificationRequest {
+        source_artifact_path: "tests/fixtures/rust_advanced".to_owned(),
+        ..base
+    };
+    let id_b = build_verification_records(&req_b)
+        .expect("path B must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different source_artifact_path must produce different verification IDs"
+    );
+}
+
+#[test]
+fn artifact_inline_size_covers_redacted_content() {
+    // A patch containing API_KEY=... is shorter than its <REDACTED:env_secret:…> marker.
+    // The stored patch_bytes_size must be >= the inline content length so the embedded
+    // validator does not reject the record.
+    let req = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"API_KEY=supersecretvalue12345".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc123def456".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "patch reviewed".to_owned(),
+    };
+    let outcome = build_artifact_records(&req).expect("artifact with secret patch must succeed");
+
+    let art_record = outcome
+        .records
+        .iter()
+        .find(|r| {
+            matches!(
+                r,
+                aletheia_egregore::ir::GraphRecord::Node {
+                    kind: NodeKind::PatchArtifact,
+                    ..
+                }
+            )
+        })
+        .expect("PatchArtifact node must be in batch");
+
+    if let aletheia_egregore::ir::GraphRecord::Node {
+        patch_bytes_size,
+        patch_handle: Some(handle),
+        ..
+    } = art_record
+        && let Some(inline) = &handle.inline
+    {
+        let stored_size = patch_bytes_size.unwrap_or(0);
+        assert!(
+            inline.len() as u64 <= stored_size,
+            "inline content length {} must not exceed patch_bytes_size {}",
+            inline.len(),
+            stored_size
+        );
+    }
+}

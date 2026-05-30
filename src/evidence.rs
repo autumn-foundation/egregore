@@ -295,6 +295,16 @@ fn validate_agent_kind(prov: &EvidenceProvenance) -> Result<(), ProvenanceError>
     Ok(())
 }
 
+const VALID_EVIDENCE_QUALITY: &[&str] = &["verbatim", "summarized", "referenced_only"];
+
+/// Validates the `evidence_quality` field against the published enum.
+fn validate_evidence_quality(quality: &str) -> Result<(), ProvenanceError> {
+    if !VALID_EVIDENCE_QUALITY.contains(&quality) {
+        return Err(ProvenanceError::invalid("evidence_quality"));
+    }
+    Ok(())
+}
+
 /// Returns the current UTC time as an RFC 3339 string for `ingested_at`.
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -327,10 +337,11 @@ fn evidence_producer() -> Producer {
 
 /// Builds an `Agent` node for the given `agent_id`.
 ///
-/// Agent nodes carry a stable ID based on `agent_id` only; they are invariant
-/// across sessions so repeated registrations produce the same stable ID.
+/// Agent nodes carry a stable ID based on `agent_id` and `agent_kind`; the same
+/// agent registered with different kinds produces distinct records, preventing
+/// mismatched-payload conflicts in the embedded sink.
 fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
-    let id = agent_memory_stable_id(&["node", "agent", agent_id]);
+    let id = agent_memory_stable_id(&["node", "agent", agent_id, agent_kind]);
     GraphRecord::Node {
         id,
         kind: NodeKind::Agent,
@@ -735,6 +746,7 @@ pub fn build_command_evidence_records(
     validate_provenance_base(&req.provenance)?;
     validate_agent_kind(&req.provenance)?;
     validate_source_artifact(&req.source_artifact_path, &req.source_artifact_hash)?;
+    validate_evidence_quality(&req.evidence_quality)?;
 
     if req.executed_at.is_empty() {
         return Err(ProvenanceError::missing("executed_at"));
@@ -930,8 +942,6 @@ pub fn build_artifact_records(
         &patch_hash,
     ]);
 
-    let patch_bytes_size = req.patch_bytes.len() as u64;
-
     // Decode patch bytes and redact before inline storage.
     // Only inline when below the ceiling; the daemon rejects inline_payload_exceeds_ceiling.
     let patch_str = String::from_utf8_lossy(&req.patch_bytes).into_owned();
@@ -941,6 +951,10 @@ pub fn build_artifact_records(
     let summary_redacted = crate::redaction::is_redacted(&redacted_validation_summary);
     let redaction_policy_version = (patch_redacted || summary_redacted)
         .then(|| crate::redaction::REDACTION_POLICY_VERSION.to_owned());
+    // Use the larger of original and redacted lengths as the stored size bound so that the
+    // embedded validator's `len(inline) <= patch_bytes_size` invariant holds even when a
+    // short secret is replaced by a longer <REDACTED:…> marker.
+    let patch_bytes_size = redacted_patch.len().max(req.patch_bytes.len()) as u64;
 
     let patch_inline = (patch_bytes_size <= INLINE_PAYLOAD_CEILING).then_some(redacted_patch);
     let patch_handle = Box::new(PatchHandle {
@@ -1085,6 +1099,7 @@ pub fn build_verification_records(
     validate_provenance_base(&req.provenance)?;
     validate_agent_kind(&req.provenance)?;
     validate_source_artifact(&req.source_artifact_path, &req.source_artifact_hash)?;
+    validate_evidence_quality(&req.evidence_quality)?;
 
     if req.executed_at.is_empty() {
         return Err(ProvenanceError::missing("executed_at"));
@@ -1106,6 +1121,7 @@ pub fn build_verification_records(
         &req.executed_at,
         &req.status,
         &req.verification_kind,
+        &req.source_artifact_path,
         &req.source_artifact_hash,
     ]);
 
