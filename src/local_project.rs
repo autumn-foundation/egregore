@@ -331,6 +331,8 @@ struct AcLine {
     ordinal: u32,
     text: String,
     status: String,
+    #[serde(default)]
+    verification_handle: Option<serde_json::Value>,
     updated_at: String,
 }
 
@@ -341,6 +343,16 @@ struct ExternalLinkLine {
     system: String,
     url: String,
     system_native_id: String,
+    discovered_at: String,
+    updated_at: String,
+}
+
+// ── Source-link refinement ────────────────────────────────────────────────────
+
+/// Override fields from an explicit `external_link` row that refines the
+/// materialized local source link for a task.
+struct SrcLinkRefinement {
+    url: String,
     discovered_at: String,
     updated_at: String,
 }
@@ -513,14 +525,22 @@ fn import_file(
     }
 
     // ── Parse remaining lines ─────────────────────────────────────────────────
-    // Two-pass: first collect all records (updating task_ids map for Task lines),
-    // then emit graph nodes. This ensures task_ids is complete before ACs are
-    // wired to their parents.
+    // Two-pass: first collect all records, validating parents and identity
+    // constraints as we go (ordering enforced in first pass), then emit graph
+    // nodes in the second pass.
 
     // local_id → kind string (for duplicate-kind detection)
     let mut seen_local_ids: HashMap<String, &'static str> = HashMap::new();
     // local_id → stable graph record ID for tasks
     let mut task_ids: HashMap<String, String> = HashMap::new();
+    // local_id → stable graph record ID for ACs (built during first pass)
+    let mut ac_ids: HashMap<String, String> = HashMap::new();
+    // AC identity fields: local_id → (parent_task_local_id, ordinal)
+    let mut ac_identity: HashMap<String, (String, u32)> = HashMap::new();
+    // ExternalLink identity fields: local_id → (system, system_native_id)
+    let mut link_identity: HashMap<String, (String, String)> = HashMap::new();
+    // Source-link refinements: task local_id → refinement fields
+    let mut src_link_refinements: HashMap<String, SrcLinkRefinement> = HashMap::new();
     // Ordered list of successfully-parsed records
     let mut parsed: Vec<(usize, ParsedRecord)> = Vec::new();
 
@@ -655,6 +675,57 @@ fn import_file(
                     }
                 };
 
+                // P1: verified ACs without verification_handle are skipped
+                if ac.status == "verified" && ac.verification_handle.is_none() {
+                    let diag_id = project_stable_id(&[
+                        "project",
+                        "Diagnostic",
+                        SOURCE_KIND,
+                        &file_rel,
+                        "acceptance_criterion_missing_verification",
+                        &ac.local_id,
+                    ]);
+                    push_diagnostic(
+                        graph,
+                        diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[acceptance_criterion_missing_verification] acceptance_criterion '{}' at line {} has status='verified' but no verification_handle",
+                            ac.local_id,
+                            line_idx + 1
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
+                }
+
+                // Parent-before-child: parent task must have been seen EARLIER
+                let Some(parent_task_id) = task_ids.get(&ac.parent_task_local_id).cloned() else {
+                    let diag_id = project_stable_id(&[
+                        "project",
+                        "Diagnostic",
+                        SOURCE_KIND,
+                        &file_rel,
+                        "unresolved_parent_task",
+                        &ac.local_id,
+                    ]);
+                    push_diagnostic(
+                        graph,
+                        diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[unresolved_parent_task] acceptance_criterion '{}' at line {} references unknown task '{}'",
+                            ac.local_id,
+                            line_idx + 1,
+                            ac.parent_task_local_id
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
+                };
+
                 if let Some(&existing_kind) = seen_local_ids.get(&ac.local_id) {
                     if existing_kind != "acceptance_criterion" {
                         let diag_id = project_stable_id(&[
@@ -679,8 +750,49 @@ fn import_file(
                         diag_count += 1;
                         continue;
                     }
+                    // Same kind = revision; check identity fields
+                    if let Some((prev_parent, prev_ordinal)) = ac_identity.get(&ac.local_id)
+                        && (*prev_parent != ac.parent_task_local_id || *prev_ordinal != ac.ordinal)
+                    {
+                        let diag_id = project_stable_id(&[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "revision_identity_mismatch",
+                            &ac.local_id,
+                        ]);
+                        push_diagnostic(
+                            graph,
+                            diag_id,
+                            Some(&file_rel),
+                            &format!(
+                                "[revision_identity_mismatch] acceptance_criterion '{}' at line {} changes identity fields (parent_task_local_id or ordinal)",
+                                ac.local_id,
+                                line_idx + 1
+                            ),
+                            transaction_time,
+                        );
+                        diag_count += 1;
+                        continue;
+                    }
                 } else {
                     seen_local_ids.insert(ac.local_id.clone(), "acceptance_criterion");
+                    // Record identity fields on first occurrence
+                    ac_identity.insert(
+                        ac.local_id.clone(),
+                        (ac.parent_task_local_id.clone(), ac.ordinal),
+                    );
+                    // Compute and store the AC's stable ID for use by external_links
+                    let ac_stable_id = project_stable_id(&[
+                        "project",
+                        "AcceptanceCriterion",
+                        SOURCE_KIND,
+                        &file_rel,
+                        &parent_task_id,
+                        &ac.ordinal.to_string(),
+                    ]);
+                    ac_ids.insert(ac.local_id.clone(), ac_stable_id);
                 }
 
                 parsed.push((
@@ -716,6 +828,52 @@ fn import_file(
                     }
                 };
 
+                // Source-link refinement check: collect and skip from parsed
+                if link.system == "local_file" {
+                    let materialized_native =
+                        source_identity_handle(&file_rel, &link.parent_local_id);
+                    if link.system_native_id == materialized_native {
+                        src_link_refinements.insert(
+                            link.parent_local_id.clone(),
+                            SrcLinkRefinement {
+                                url: link.url.clone(),
+                                discovered_at: link.discovered_at.clone(),
+                                updated_at: link.updated_at.clone(),
+                            },
+                        );
+                        seen_local_ids.insert(link.local_id.clone(), "external_link");
+                        continue;
+                    }
+                }
+
+                // Parent-before-child: parent must have been seen EARLIER
+                let parent_is_task = task_ids.contains_key(&link.parent_local_id);
+                let parent_is_ac = ac_ids.contains_key(&link.parent_local_id);
+                if !parent_is_task && !parent_is_ac {
+                    let diag_id = project_stable_id(&[
+                        "project",
+                        "Diagnostic",
+                        SOURCE_KIND,
+                        &file_rel,
+                        "unresolved_parent_local_id",
+                        &link.local_id,
+                    ]);
+                    push_diagnostic(
+                        graph,
+                        diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[unresolved_parent_local_id] external_link '{}' at line {} references unknown parent '{}'",
+                            link.local_id,
+                            line_idx + 1,
+                            link.parent_local_id
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
+                }
+
                 if let Some(&existing_kind) = seen_local_ids.get(&link.local_id) {
                     if existing_kind != "external_link" {
                         let diag_id = project_stable_id(&[
@@ -740,8 +898,39 @@ fn import_file(
                         diag_count += 1;
                         continue;
                     }
+                    // Same kind = revision; check identity fields
+                    if let Some((prev_system, prev_native_id)) = link_identity.get(&link.local_id)
+                        && (*prev_system != link.system || *prev_native_id != link.system_native_id)
+                    {
+                        let diag_id = project_stable_id(&[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "revision_identity_mismatch",
+                            &link.local_id,
+                        ]);
+                        push_diagnostic(
+                            graph,
+                            diag_id,
+                            Some(&file_rel),
+                            &format!(
+                                "[revision_identity_mismatch] external_link '{}' at line {} changes identity fields (system or system_native_id)",
+                                link.local_id,
+                                line_idx + 1
+                            ),
+                            transaction_time,
+                        );
+                        diag_count += 1;
+                        continue;
+                    }
                 } else {
                     seen_local_ids.insert(link.local_id.clone(), "external_link");
+                    // Record identity fields on first occurrence
+                    link_identity.insert(
+                        link.local_id.clone(),
+                        (link.system.clone(), link.system_native_id.clone()),
+                    );
                 }
 
                 parsed.push((line_idx, ParsedRecord::ExternalLink { line: link, raw }));
@@ -773,36 +962,27 @@ fn import_file(
     }
 
     // ── Second pass: emit graph nodes ─────────────────────────────────────────
-    for (line_idx, record) in &parsed {
+    // Parent validation was done in the first pass; all records in `parsed`
+    // have valid parents. The second pass only needs to look up parent IDs to
+    // wire edges.
+    for (_line_idx, record) in &parsed {
         match record {
             ParsedRecord::Task { line: task, raw } => {
-                emit_task_records(graph, task, raw, &file_rel, opts, transaction_time);
+                emit_task_records(
+                    graph,
+                    task,
+                    raw,
+                    &file_rel,
+                    opts,
+                    transaction_time,
+                    src_link_refinements.get(&task.local_id),
+                );
             }
             ParsedRecord::AcceptanceCriterion { line: ac, raw } => {
-                let Some(parent_task_id) = task_ids.get(&ac.parent_task_local_id) else {
-                    let diag_id = project_stable_id(&[
-                        "project",
-                        "Diagnostic",
-                        SOURCE_KIND,
-                        &file_rel,
-                        "unresolved_parent_task",
-                        &ac.local_id,
-                    ]);
-                    push_diagnostic(
-                        graph,
-                        diag_id,
-                        Some(&file_rel),
-                        &format!(
-                            "[unresolved_parent_task] acceptance_criterion '{}' at line {} references unknown task '{}'",
-                            ac.local_id,
-                            line_idx + 1,
-                            ac.parent_task_local_id
-                        ),
-                        transaction_time,
-                    );
-                    diag_count += 1;
-                    continue;
-                };
+                // Parent was validated in first pass; unwrap is safe.
+                let parent_task_id = task_ids
+                    .get(&ac.parent_task_local_id)
+                    .expect("parent validated in first pass");
                 emit_ac_record(
                     graph,
                     ac,
@@ -814,41 +994,14 @@ fn import_file(
                 );
             }
             ParsedRecord::ExternalLink { line: link, raw } => {
-                // Validate parent exists
-                let parent_is_task = task_ids.contains_key(&link.parent_local_id);
-                let parent_is_ac = seen_local_ids
-                    .get(&link.parent_local_id)
-                    .is_some_and(|&k| k == "acceptance_criterion");
-                if !parent_is_task && !parent_is_ac {
-                    let diag_id = project_stable_id(&[
-                        "project",
-                        "Diagnostic",
-                        SOURCE_KIND,
-                        &file_rel,
-                        "unresolved_parent_local_id",
-                        &link.local_id,
-                    ]);
-                    push_diagnostic(
-                        graph,
-                        diag_id,
-                        Some(&file_rel),
-                        &format!(
-                            "[unresolved_parent_local_id] external_link '{}' at line {} references unknown parent '{}'",
-                            link.local_id,
-                            line_idx + 1,
-                            link.parent_local_id
-                        ),
-                        transaction_time,
-                    );
-                    diag_count += 1;
-                    continue;
-                }
+                // Parent was validated in first pass; unwrap is safe.
                 emit_external_link_record(
                     graph,
                     link,
                     raw,
                     &file_rel,
                     &task_ids,
+                    &ac_ids,
                     opts,
                     transaction_time,
                 );
@@ -862,6 +1015,9 @@ fn import_file(
 // ── Record emitters ───────────────────────────────────────────────────────────
 
 /// Emit a Task node, its materialized source `ExternalLink`, and the `ExternalHandle` edge.
+///
+/// When `src_link_refinement` is `Some`, its `url`, `discovered_at`, and
+/// `updated_at` fields override the defaults for the materialized source link.
 #[allow(clippy::too_many_lines)]
 fn emit_task_records(
     graph: &mut Graph,
@@ -870,6 +1026,7 @@ fn emit_task_records(
     file_rel: &str,
     opts: &ImportOptions,
     transaction_time: &str,
+    src_link_refinement: Option<&SrcLinkRefinement>,
 ) {
     let identity_handle = source_identity_handle(file_rel, &task.local_id);
     let task_id = project_stable_id(&["project", "Task", SOURCE_KIND, file_rel, &identity_handle]);
@@ -885,7 +1042,9 @@ fn emit_task_records(
         "local_file",
         &src_link_native_id,
     ]);
-    let src_link_url = format!("file://{file_rel}");
+    // Explicit refinement wins for url; otherwise default to file:// URL
+    let src_link_url =
+        src_link_refinement.map_or_else(|| format!("file://{file_rel}"), |r| r.url.clone());
 
     // Body handle
     let body_str = match &task.body {
@@ -905,7 +1064,7 @@ fn emit_task_records(
         Some(file_rel.to_owned()),
         None,
         Some(task.local_id.clone()),
-        format!("Task: {}", task.title),
+        format!("Task: {title}"),
     );
     set_project_base_fields(
         &mut task_node,
@@ -938,6 +1097,11 @@ fn emit_task_records(
     graph.push(task_node);
 
     // Materialized source ExternalLink node
+    // Refinement wins for valid_time (updated_at) and discovered_at
+    let src_link_valid_time =
+        src_link_refinement.map_or(task.updated_at.as_str(), |r| r.updated_at.as_str());
+    let src_link_discovered_at =
+        src_link_refinement.map_or_else(|| task.updated_at.clone(), |r| r.discovered_at.clone());
     let src_link_source_handle = source_handle_for_line(file_rel, &task.local_id, raw);
     let mut src_link_node = GraphRecord::node(
         src_link_id.clone(),
@@ -951,7 +1115,7 @@ fn emit_task_records(
         &mut src_link_node,
         transaction_time,
         Some(&src_link_id),
-        Some(&task.updated_at),
+        Some(src_link_valid_time),
         Some(&src_link_source_handle),
     );
     if let GraphRecord::Node {
@@ -967,7 +1131,7 @@ fn emit_task_records(
         *system = Some("local_file".to_owned());
         *url = Some(src_link_url);
         *system_native_id = Some(src_link_native_id);
-        *discovered_at = Some(task.updated_at.clone());
+        *discovered_at = Some(src_link_discovered_at);
     }
     graph.push(src_link_node);
 
@@ -1016,7 +1180,7 @@ fn emit_ac_record(
         Some(file_rel.to_owned()),
         None,
         Some(ac.local_id.clone()),
-        format!("AcceptanceCriterion: {}", ac.text),
+        format!("AcceptanceCriterion: {text}"),
     );
     set_project_base_fields(
         &mut ac_node,
@@ -1059,29 +1223,20 @@ fn emit_ac_record(
 
 /// Emit an explicit `ExternalLink` node and its `ExternalHandle` edge.
 ///
-/// Source-link refinement: if the explicit link has `system=local_file` and
-/// its `system_native_id` matches the materialized source-link identity for
-/// its parent task, it would be a duplicate — skip it.
+/// The parent can be a task or an acceptance criterion; `task_ids` and
+/// `ac_ids` are both consulted. Source-link refinements are handled in the
+/// first pass and never reach this function.
+#[allow(clippy::too_many_arguments)]
 fn emit_external_link_record(
     graph: &mut Graph,
     link: &ExternalLinkLine,
     raw: &[u8],
     file_rel: &str,
     task_ids: &HashMap<String, String>,
+    ac_ids: &HashMap<String, String>,
     opts: &ImportOptions,
     transaction_time: &str,
 ) {
-    // Source-refinement check: skip if this is the materialized source link
-    if link.system == "local_file"
-        && let Some(_parent_task_id) = task_ids.get(&link.parent_local_id)
-    {
-        let materialized_native = source_identity_handle(file_rel, &link.parent_local_id);
-        if link.system_native_id == materialized_native {
-            // This is a refinement of the materialized source link; skip duplicate
-            return;
-        }
-    }
-
     let link_id = project_stable_id(&[
         "project",
         "ExternalLink",
@@ -1126,24 +1281,27 @@ fn emit_external_link_record(
     graph.push(link_node);
 
     // Parent → ExternalLink edge (ExternalHandle)
-    if let Some(parent_task_stable_id) = task_ids.get(&link.parent_local_id) {
-        let edge_id = project_stable_id(&[
-            "project",
-            "edge",
-            "ExternalHandle",
-            parent_task_stable_id,
-            &link_id,
-        ]);
-        graph.push(GraphRecord::Edge {
-            id: edge_id,
-            schema_version: PROJECT_SCHEMA_VERSION,
-            label: EdgeLabel::ExternalHandle,
-            source: parent_task_stable_id.clone(),
-            target: link_id,
-            confidence: None,
-            temporal: None,
-            summary: format!("Task '{}' has ExternalLink", link.parent_local_id),
-            producer: None,
-        });
-    }
+    // Parent was validated in first pass; it is either a task or an AC.
+    let parent_stable_id = task_ids
+        .get(&link.parent_local_id)
+        .or_else(|| ac_ids.get(&link.parent_local_id))
+        .expect("parent validated in first pass");
+    let edge_id = project_stable_id(&[
+        "project",
+        "edge",
+        "ExternalHandle",
+        parent_stable_id,
+        &link_id,
+    ]);
+    graph.push(GraphRecord::Edge {
+        id: edge_id,
+        schema_version: PROJECT_SCHEMA_VERSION,
+        label: EdgeLabel::ExternalHandle,
+        source: parent_stable_id.clone(),
+        target: link_id,
+        confidence: None,
+        temporal: None,
+        summary: format!("'{}' has ExternalLink", link.parent_local_id),
+        producer: None,
+    });
 }
