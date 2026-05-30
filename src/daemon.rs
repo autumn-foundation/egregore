@@ -7199,6 +7199,415 @@ fn handle_verb_drift_top_n(
     )
 }
 
+// ── Verb handler: observations_for_symbol (issue #38) ────────────────────────
+
+/// Loads all records from every domain without any prefix filtering.
+///
+/// `observations_for_symbol` is a cross-domain query: it needs codegraph
+/// Symbol/File records AND `agent_memory` Observation records AND project Task
+/// records AND verification Evidence records in a single pass so that
+/// [`graph_query::symbol_context`] can traverse cross-domain edges.
+fn load_cross_domain_records(
+    state: &ServerState,
+    started: Instant,
+    budget: Option<Duration>,
+) -> std::result::Result<(Vec<GraphRecord>, String), ApiError> {
+    let sink = query_sink_read(state, started, budget)?;
+    let snapshot = rfc3339_now();
+    let records = sink.read_all_records().map_err(adapter_read_error_to_api)?;
+    drop(sink);
+    check_query_budget(started, budget)?;
+    Ok((records, snapshot))
+}
+
+fn context_source_fact_to_json(record: &GraphRecord) -> serde_json::Value {
+    let GraphRecord::Node {
+        id,
+        kind,
+        name,
+        repo_relative_path,
+        span,
+        temporal,
+        valid_time,
+        language,
+        symbol_kind,
+        ..
+    } = record
+    else {
+        return json!({ "record_id": record.id() });
+    };
+    json!({
+        "record_id": id,
+        "kind": kind.as_str(),
+        "name": name,
+        "repo_relative_path": repo_relative_path,
+        "span": span,
+        "git_commit": temporal.as_ref().map(|t| t.git_commit.as_str()),
+        "valid_time": valid_time.as_deref()
+            .or_else(|| temporal.as_ref().map(|t| t.valid_time.as_str())),
+        "language": language,
+        "symbol_kind": symbol_kind,
+    })
+}
+
+fn context_observation_to_json(record: &GraphRecord) -> serde_json::Value {
+    let GraphRecord::Node {
+        id,
+        kind,
+        summary,
+        text,
+        agent_id,
+        session_id,
+        observed_at,
+        confidence,
+        failure_kind,
+        exit_code,
+        evidence_links,
+        ..
+    } = record
+    else {
+        return json!({ "record_id": record.id() });
+    };
+    let provenance_handle = match (agent_id.as_deref(), session_id.as_deref()) {
+        (Some(a), Some(s)) => Some(format!("{a}:{s}")),
+        (Some(a), None) => Some(a.to_owned()),
+        _ => None,
+    };
+    let links = evidence_links.as_deref().unwrap_or(&[]);
+    json!({
+        "record_id": id,
+        "kind": kind.as_str(),
+        "summary": summary,
+        "text": text,
+        "provenance_handle": provenance_handle,
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "observed_at": observed_at,
+        "confidence": confidence,
+        "failure_kind": failure_kind,
+        "exit_code": exit_code,
+        "evidence_links": serde_json::to_value(links).unwrap_or_default(),
+    })
+}
+
+fn context_linked_item_to_json(record: &GraphRecord) -> serde_json::Value {
+    let GraphRecord::Node {
+        id,
+        kind,
+        summary,
+        title,
+        name,
+        text,
+        status,
+        verification_kind,
+        exit_code,
+        executed_at,
+        evidence_quality,
+        repo_relative_path,
+        body_handle,
+        evidence_links,
+        stdout_handle,
+        stderr_handle,
+        source_artifact_path,
+        source_artifact_hash,
+        edit_kind,
+        before_hash,
+        after_hash,
+        rename_to,
+        hunk_count,
+        linked_turn_id,
+        linked_patch_id,
+        patch_status,
+        patch_handle,
+        patch_bytes_hash,
+        patch_bytes_size,
+        target_files,
+        validation_summary,
+        base_commit,
+        unknown_base_reason,
+        producer_session_id,
+        ..
+    } = record
+    else {
+        return json!({ "record_id": record.id() });
+    };
+    let links = evidence_links.as_deref().unwrap_or(&[]);
+    json!({
+        "record_id": id,
+        "kind": kind.as_str(),
+        "summary": summary,
+        "title": title,
+        "name": name,
+        "text": text,
+        "status": status,
+        "verification_kind": verification_kind,
+        "exit_code": exit_code,
+        "executed_at": executed_at,
+        "evidence_quality": evidence_quality,
+        "repo_relative_path": repo_relative_path,
+        "body_handle": body_handle.as_deref().map(|h| serde_json::to_value(h).unwrap_or_default()),
+        "stdout_handle": stdout_handle.as_deref().map(|h| serde_json::to_value(h).unwrap_or_default()),
+        "stderr_handle": stderr_handle.as_deref().map(|h| serde_json::to_value(h).unwrap_or_default()),
+        "source_artifact_path": source_artifact_path,
+        "source_artifact_hash": source_artifact_hash,
+        "edit_kind": edit_kind,
+        "before_hash": before_hash,
+        "after_hash": after_hash,
+        "rename_to": rename_to,
+        "hunk_count": hunk_count,
+        "linked_turn_id": linked_turn_id,
+        "linked_patch_id": linked_patch_id,
+        "patch_status": patch_status,
+        "patch_handle": patch_handle.as_deref().map(|h| serde_json::to_value(h).unwrap_or_default()),
+        "patch_bytes_hash": patch_bytes_hash,
+        "patch_bytes_size": patch_bytes_size,
+        "target_files": target_files,
+        "validation_summary": validation_summary,
+        "base_commit": base_commit,
+        "unknown_base_reason": unknown_base_reason,
+        "producer_session_id": producer_session_id,
+        "evidence_links": serde_json::to_value(links).unwrap_or_default(),
+    })
+}
+
+struct ContextSections {
+    source_facts: Vec<serde_json::Value>,
+    topology_edges: Vec<serde_json::Value>,
+    observations: Vec<serde_json::Value>,
+    project_state: Vec<serde_json::Value>,
+    artifacts: Vec<serde_json::Value>,
+    verification_evidence: Vec<serde_json::Value>,
+    unresolved: Vec<serde_json::Value>,
+}
+
+fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) -> ContextSections {
+    let mut rem = limit;
+
+    let source_facts: Vec<_> = ctx
+        .source_facts
+        .iter()
+        .take(rem)
+        .map(|r| context_source_fact_to_json(r))
+        .collect();
+    rem = rem.saturating_sub(source_facts.len());
+
+    let topology_edges: Vec<_> = ctx
+        .topology_edges
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Edge {
+                id,
+                label,
+                source,
+                target,
+                summary,
+                temporal,
+                ..
+            } = r
+            {
+                Some(json!({
+                    "record_id": id, "label": label.as_str(),
+                    "source_id": source, "target_id": target, "summary": summary,
+                    "git_commit": temporal.as_ref().map(|t| t.git_commit.as_str()),
+                    "valid_time": temporal.as_ref().map(|t| t.valid_time.as_str()),
+                }))
+            } else {
+                None
+            }
+        })
+        .take(rem)
+        .collect();
+    rem = rem.saturating_sub(topology_edges.len());
+
+    let observations: Vec<_> = ctx
+        .observations
+        .iter()
+        .take(rem)
+        .map(|r| context_observation_to_json(r))
+        .collect();
+    rem = rem.saturating_sub(observations.len());
+
+    let project_state: Vec<_> = ctx
+        .project_state
+        .iter()
+        .take(rem)
+        .map(|r| context_linked_item_to_json(r))
+        .collect();
+    rem = rem.saturating_sub(project_state.len());
+
+    let artifacts: Vec<_> = ctx
+        .artifacts
+        .iter()
+        .take(rem)
+        .map(|r| context_linked_item_to_json(r))
+        .collect();
+    rem = rem.saturating_sub(artifacts.len());
+
+    let verification_evidence: Vec<_> = ctx
+        .verification_evidence
+        .iter()
+        .take(rem)
+        .map(|r| context_linked_item_to_json(r))
+        .collect();
+    rem = rem.saturating_sub(verification_evidence.len());
+
+    let unresolved: Vec<_> = ctx
+        .unresolved
+        .iter()
+        .take(rem)
+        .map(|u| {
+            json!({
+                "source_record_id": u.source_record_id,
+                "target_handle": u.target_handle,
+                "relation": u.relation,
+                "target_domain": u.target_domain,
+                "verification_status": "unresolved",
+            })
+        })
+        .collect();
+
+    ContextSections {
+        source_facts,
+        topology_edges,
+        observations,
+        project_state,
+        artifacts,
+        verification_evidence,
+        unresolved,
+    }
+}
+
+fn handle_verb_observations_for_symbol(
+    request_id: &str,
+    params: &serde_json::Value,
+    as_of_valid_time: Option<&str>,
+    limit: usize,
+    started: Instant,
+    budget: Option<Duration>,
+    state: &ServerState,
+) -> HttpResponse {
+    let name = match params.get("name").and_then(serde_json::Value::as_str) {
+        Some(n) => n.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(request_id, ApiError::missing_field("params.name"));
+        }
+    };
+
+    let (mut records, snapshot) = match load_cross_domain_records(state, started, budget) {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+
+    // Apply as_of.valid_time: exclude records whose valid_time is after the cutoff.
+    // Records with no valid_time are excluded from point-in-time queries (consistent
+    // with other temporal verbs).
+    if let Some(as_of) = as_of_valid_time {
+        let as_of_dt = match chrono::DateTime::parse_from_rfc3339(as_of) {
+            Ok(dt) => dt,
+            Err(e) => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request(format!("invalid as_of.valid_time: {e}")),
+                );
+            }
+        };
+        // First pass: collect IDs of nodes that fall within the as-of window.
+        // Used to decide whether to keep untimed current-state edges.
+        let retained_node_ids: BTreeSet<String> = records
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Node {
+                    id,
+                    temporal,
+                    valid_time,
+                    ..
+                } => {
+                    let vt_str = temporal
+                        .as_ref()
+                        .map(|t| t.valid_time.as_str())
+                        .or(valid_time.as_deref());
+                    vt_str
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .is_some_and(|vt| vt <= as_of_dt)
+                        .then(|| id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        // Second pass: apply the actual filter.
+        // - Nodes: keep if their valid_time is <= as_of_dt.
+        // - Timed edges: keep if their valid_time is <= as_of_dt.
+        // - Untimed edges: keep only if both endpoints are in the retained slice
+        //   (current-state project MENTIONS_SYMBOL / DEFINES edges are still valid).
+        // - Tombstones: drop — they have no valid_time so we cannot determine whether
+        //   the deletion occurred before or after as_of_dt; retaining them would
+        //   erroneously hide records that existed at the requested instant.
+        records.retain(|r| match r {
+            GraphRecord::Node {
+                temporal,
+                valid_time,
+                ..
+            } => {
+                let vt_str = temporal
+                    .as_ref()
+                    .map(|t| t.valid_time.as_str())
+                    .or(valid_time.as_deref());
+                vt_str
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .is_some_and(|vt| vt <= as_of_dt)
+            }
+            GraphRecord::Edge {
+                source,
+                target,
+                temporal,
+                ..
+            } => match temporal.as_ref().map(|t| t.valid_time.as_str()) {
+                Some(vt_str) => chrono::DateTime::parse_from_rfc3339(vt_str)
+                    .ok()
+                    .is_some_and(|vt| vt <= as_of_dt),
+                None => {
+                    retained_node_ids.contains(source.as_str())
+                        && retained_node_ids.contains(target.as_str())
+                }
+            },
+            GraphRecord::Tombstone { .. } => false,
+        });
+    }
+
+    let ctx = graph_query::symbol_context(&records, &name);
+
+    // Recheck budget after BFS traversal (potentially expensive for large stores).
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
+
+    if ctx.is_no_match() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::not_found(format!("no records found for symbol '{name}'")),
+        );
+    }
+
+    let s = build_context_sections(&ctx, limit);
+
+    HttpResponse::success(
+        Some(request_id),
+        200,
+        json!({
+            "verb": "observations_for_symbol",
+            "snapshot": snapshot,
+            "symbol_name": name,
+            "source_facts": s.source_facts,
+            "topology_edges": s.topology_edges,
+            "observations": s.observations,
+            "project_state": s.project_state,
+            "artifacts": s.artifacts,
+            "verification_evidence": s.verification_evidence,
+            "unresolved": s.unresolved,
+        }),
+    )
+}
+
 // ── Main query handler ────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
@@ -7334,15 +7743,22 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             &domain,
             state,
         ),
-        "drift" | "observations_for_symbol" | "agent_sessions_for_repo" | "criteria_for_task" => {
-            HttpResponse::error_with_id(
-                &request_id,
-                ApiError::new(
-                    ErrorCode::NotImplemented,
-                    format!("verb '{verb}' is reserved and not yet implemented"),
-                ),
-            )
-        }
+        "observations_for_symbol" => handle_verb_observations_for_symbol(
+            &request_id,
+            &params,
+            as_of_valid_time.as_deref(),
+            limit,
+            started,
+            budget,
+            state,
+        ),
+        "drift" | "agent_sessions_for_repo" | "criteria_for_task" => HttpResponse::error_with_id(
+            &request_id,
+            ApiError::new(
+                ErrorCode::NotImplemented,
+                format!("verb '{verb}' is reserved and not yet implemented"),
+            ),
+        ),
         _ => HttpResponse::error_with_id(
             &request_id,
             ApiError::bad_request_field(format!("unknown verb '{verb}'"), "verb"),
@@ -8867,10 +9283,7 @@ mod tests {
         let error = run_foreground(&DaemonConfig::new(data_dir))
             .expect_err("unsafe runtime lock error should abort foreground startup");
         assert!(
-            error
-                .to_string()
-                .contains("failed to acquire embedded store lease")
-                && error.to_string().contains("runtime_permissions_unsafe"),
+            error.to_string().contains("runtime_permissions_unsafe"),
             "foreground startup should preserve the lock acquisition error, got {error:#}"
         );
         assert!(

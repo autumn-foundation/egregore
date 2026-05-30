@@ -8448,7 +8448,7 @@ fn query_verb_conformance() {
         );
     }
 
-    // ── (b) reserved: observations_for_symbol → not_implemented ───────────────
+    // ── (b) implemented: observations_for_symbol → 404 for unknown symbol ───────
     {
         let res = http_json(
             &metadata,
@@ -8458,18 +8458,18 @@ fn query_verb_conformance() {
                 "request_id": "vqc-reserved-obs",
                 "agent_id": "verb-test-agent",
                 "verb": "observations_for_symbol",
-                "params": { "symbol_id": "codegraph:v1:fake" }
+                "params": { "name": "no_such_symbol_xyz" }
             }),
         );
         assert!(
-            res.starts_with("HTTP/1.1 501"),
-            "observations_for_symbol should return 501, got {res}"
+            res.starts_with("HTTP/1.1 404"),
+            "observations_for_symbol with unknown symbol should return 404, got {res}"
         );
         let body = response_json(&res);
         assert_eq!(body["ok"], false, "error must have ok:false, got {body}");
         assert_eq!(
-            body["error"]["code"], "not_implemented",
-            "reserved verb must return not_implemented, got {body}"
+            body["error"]["code"], "not_found",
+            "unknown symbol must return not_found, got {body}"
         );
     }
 
@@ -9643,6 +9643,354 @@ fn verification_stdout_handle_empty_hash_rejected() {
     assert_eq!(
         body["error"]["code"], "bad_request",
         "empty stdout_handle.hash must produce bad_request, got {body}"
+    );
+
+    daemon.stop();
+}
+
+// ── observations_for_symbol: cross-domain context query (issue #38) ───────────
+
+/// Unique constant IDs for the `observations_for_symbol` fixture.
+/// Kept out of the shared `PROJECT_TASK_ID` / `PROJECT_EXTERNAL_LINK_ID` namespace
+/// so this test can run in parallel with other project-domain tests.
+const OFS_SYMBOL_ID: &str = "codegraph:v4:obs4sym-symbol00000001";
+const OFS_EXTERNAL_LINK_ID: &str = "project:v1:obs4sym-external-link01";
+const OFS_TASK_ID: &str = "project:v1:obs4sym-task000000000001";
+const OFS_TASK_EDGE_ID: &str = "project:v1:obs4sym-mentions-sym0001";
+const OFS_VERIFICATION_ID: &str = "verification:v1:obs4sym-ver000000001";
+const OFS_OBSERVATION_ID: &str = "agent_memory:v1:obs4sym-obs000000001";
+
+/// AC1+AC2+AC3+AC4+AC6: `observations_for_symbol` returns all trust-separated
+/// sections for a symbol with linked cross-domain records, and returns 404 for
+/// symbols that do not exist.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn observations_for_symbol_returns_cross_domain_context() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // ── seed codegraph: one Symbol ───────────────────────────────────────────
+    let cg_ingest = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ofs-cg-ingest",
+            "agent_id": "ofs-test-agent",
+            "session_id": "ofs-test-session",
+            "idempotency_key": "ofs-cg-key",
+            "domain": "codegraph",
+            "created_at": "2026-05-30T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": OFS_SYMBOL_ID,
+                    "kind": "Symbol",
+                    "schema_version": SCHEMA_VERSION,
+                    "repo_relative_path": "src/lib.rs",
+                    "name": "obs4sym_fn",
+                    "symbol_kind": "fn",
+                    "span": {"start_byte": 0, "end_byte": 50,
+                             "start_line": 10, "end_line": 15},
+                    "summary": "fn obs4sym_fn in src/lib.rs"
+                }]
+            }
+        }),
+    );
+    assert!(
+        cg_ingest.starts_with("HTTP/1.1 200"),
+        "codegraph symbol ingest must succeed, got {cg_ingest}"
+    );
+
+    // ── seed project: ExternalLink + Task + MENTIONS_SYMBOL edge ─────────────
+    let proj_ingest = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ofs-proj-ingest",
+            "agent_id": "ofs-test-agent",
+            "session_id": "ofs-test-session",
+            "idempotency_key": "ofs-proj-key",
+            "domain": "project",
+            "created_at": "2026-05-30T00:00:00Z",
+            "payload": {
+                "records": [
+                    project_external_link_json(OFS_EXTERNAL_LINK_ID),
+                    {
+                        "record_type": "node",
+                        "id": OFS_TASK_ID,
+                        "kind": "Task",
+                        "schema_version": PROJECT_SCHEMA_VERSION,
+                        "domain": "project",
+                        "entity_id": OFS_TASK_ID,
+                        "title": "Implement obs4sym_fn",
+                        "body_handle": {
+                            "inline": "Task body for obs4sym fixture",
+                            "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "bytes": 30
+                        },
+                        "status": "open",
+                        "source_kind": "github_issue",
+                        "source_external_link_id": OFS_EXTERNAL_LINK_ID,
+                        "assignees": [],
+                        "labels": [],
+                        "priority": "normal",
+                        "confidence": "1.0",
+                        "valid_time": "2026-05-30T00:00:01Z",
+                        "valid_time_source": "github_updated_at",
+                        "transaction_time": "2026-05-30T00:00:01Z",
+                        "summary": "Task: Implement obs4sym_fn"
+                    },
+                    {
+                        "record_type": "edge",
+                        "id": OFS_TASK_EDGE_ID,
+                        "label": "MENTIONS_SYMBOL",
+                        "source": OFS_TASK_ID,
+                        "target": OFS_SYMBOL_ID,
+                        "schema_version": PROJECT_SCHEMA_VERSION,
+                        "confidence": "1.0",
+                        "summary": "Task mentions obs4sym_fn"
+                    }
+                ]
+            }
+        }),
+    );
+    assert!(
+        proj_ingest.starts_with("HTTP/1.1 200"),
+        "project task ingest must succeed, got {proj_ingest}"
+    );
+
+    // ── seed verification: Verification record ────────────────────────────────
+    let ver_ingest = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ofs-ver-ingest",
+            "agent_id": "ofs-test-agent",
+            "session_id": "ofs-test-session",
+            "idempotency_key": "ofs-ver-key",
+            "domain": "verification",
+            "created_at": "2026-05-30T00:00:00Z",
+            "payload": {
+                "records": [verification_record_json(OFS_VERIFICATION_ID)]
+            }
+        }),
+    );
+    assert!(
+        ver_ingest.starts_with("HTTP/1.1 200"),
+        "verification ingest must succeed, got {ver_ingest}"
+    );
+
+    // ── seed agent_memory: Observation with cross-domain evidence links ───────
+    // Links: MENTIONS_SYMBOL → Symbol + VALIDATED_BY → Verification
+    let am_ingest = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ofs-am-ingest",
+            "agent_id": "ofs-test-agent",
+            "session_id": "ofs-test-session",
+            "idempotency_key": "ofs-am-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-30T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": OFS_OBSERVATION_ID,
+                    "kind": "Observation",
+                    "schema_version": 1,
+                    "agent_id": "ofs-test-agent",
+                    "agent_kind": "claude-code",
+                    "session_id": "ofs-test-session",
+                    "observed_at": "2026-05-30T10:00:00Z",
+                    "ingested_at": "2026-05-30T10:00:00Z",
+                    "confidence": "0.9",
+                    "text": "obs4sym_fn is well-tested",
+                    "summary": "Observation: obs4sym_fn is well-tested",
+                    "evidence_links": [
+                        {
+                            "target_record_id": OFS_SYMBOL_ID,
+                            "target_domain": "codegraph",
+                            "relation": "MENTIONS_SYMBOL",
+                            "confidence": "0.9"
+                        },
+                        {
+                            "target_record_id": OFS_VERIFICATION_ID,
+                            "target_domain": "verification",
+                            "relation": "VALIDATED_BY",
+                            "confidence": "1.0"
+                        }
+                    ]
+                }]
+            }
+        }),
+    );
+    assert!(
+        am_ingest.starts_with("HTTP/1.1 200"),
+        "agent_memory observation ingest must succeed, got {am_ingest}"
+    );
+
+    // ── call observations_for_symbol ──────────────────────────────────────────
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "ofs-query",
+            "agent_id": "ofs-test-agent",
+            "verb": "observations_for_symbol",
+            "params": {"name": "obs4sym_fn"}
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "observations_for_symbol must return 200, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], true, "response must be ok:true, got {body}");
+
+    let result = &body["result"];
+    assert_eq!(result["verb"], "observations_for_symbol", "verb must match");
+    assert_eq!(
+        result["symbol_name"], "obs4sym_fn",
+        "symbol_name must match"
+    );
+    assert!(
+        !result["snapshot"].as_str().unwrap_or("").is_empty(),
+        "snapshot must be present"
+    );
+
+    // AC1: all four sections populated
+    let source_facts = result["source_facts"]
+        .as_array()
+        .expect("source_facts is array");
+    let observations = result["observations"]
+        .as_array()
+        .expect("observations is array");
+    let project_state = result["project_state"]
+        .as_array()
+        .expect("project_state is array");
+    let ver_evidence = result["verification_evidence"]
+        .as_array()
+        .expect("verification_evidence is array");
+    assert!(
+        !source_facts.is_empty(),
+        "source_facts must be non-empty (AC1)"
+    );
+    assert!(
+        !observations.is_empty(),
+        "observations must be non-empty (AC1)"
+    );
+    assert!(
+        !project_state.is_empty(),
+        "project_state must be non-empty (AC1)"
+    );
+    assert!(
+        !ver_evidence.is_empty(),
+        "verification_evidence must be non-empty (AC1)"
+    );
+
+    // AC2: every source fact carries record_id plus path/span or commit
+    for fact in source_facts {
+        let rid = fact["record_id"].as_str().unwrap_or("");
+        assert!(
+            !rid.is_empty(),
+            "AC2: source_fact must have non-empty record_id"
+        );
+        let has_path = !fact["repo_relative_path"].is_null();
+        let has_span = !fact["span"].is_null();
+        let has_commit = !fact["git_commit"].is_null();
+        assert!(
+            has_path || has_span || has_commit,
+            "AC2: source_fact {rid} must carry repo_relative_path, span, or git_commit"
+        );
+    }
+
+    // AC3: every observation carries provenance fields
+    for obs in observations {
+        let rid = obs["record_id"].as_str().unwrap_or("");
+        assert!(
+            !rid.is_empty(),
+            "AC3: observation must have non-empty record_id"
+        );
+        assert!(
+            !obs["agent_id"].is_null(),
+            "AC3: observation {rid} must carry agent_id"
+        );
+        assert!(
+            !obs["observed_at"].is_null(),
+            "AC3: observation {rid} must carry observed_at"
+        );
+        assert!(
+            !obs["confidence"].is_null(),
+            "AC3: observation {rid} must carry confidence"
+        );
+    }
+
+    // AC4: no Observation node in source_facts
+    for fact in source_facts {
+        assert_ne!(
+            fact["kind"].as_str().unwrap_or(""),
+            "Observation",
+            "AC4: Observation must not appear in source_facts"
+        );
+    }
+
+    // AC4: symbol must be in source_facts
+    assert!(
+        source_facts.iter().any(|r| r["record_id"] == OFS_SYMBOL_ID),
+        "AC4: Symbol must be in source_facts"
+    );
+    // AC4: task must be in project_state, not source_facts
+    assert!(
+        project_state.iter().any(|r| r["record_id"] == OFS_TASK_ID),
+        "AC4: Task must be in project_state"
+    );
+    assert!(
+        !source_facts.iter().any(|r| r["record_id"] == OFS_TASK_ID),
+        "AC4: Task must not be in source_facts"
+    );
+
+    // AC6: no-match returns machine-readable 404
+    let nomatch = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "ofs-nomatch",
+            "agent_id": "ofs-test-agent",
+            "verb": "observations_for_symbol",
+            "params": {"name": "nonexistent_fn_zzz_xyz"}
+        }),
+    );
+    assert!(
+        nomatch.starts_with("HTTP/1.1 404"),
+        "no-match must return 404, got {nomatch}"
+    );
+    let nm_body = response_json(&nomatch);
+    assert_eq!(nm_body["ok"], false, "no-match must be ok:false");
+    assert!(!nm_body["error"]["code"].as_str().unwrap_or("").is_empty());
+
+    // AC6: missing name param returns bad request
+    let missing_name = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "ofs-missing-name",
+            "agent_id": "ofs-test-agent",
+            "verb": "observations_for_symbol",
+            "params": {}
+        }),
+    );
+    assert!(
+        missing_name.starts_with("HTTP/1.1 4"),
+        "missing params.name must return 4xx, got {missing_name}"
     );
 
     daemon.stop();
