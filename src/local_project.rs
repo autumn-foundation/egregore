@@ -362,6 +362,9 @@ struct SrcLinkRefinement {
     url: String,
     discovered_at: String,
     updated_at: String,
+    /// `local_id` and raw bytes of the refinement row itself, for provenance.
+    local_id: String,
+    raw: Vec<u8>,
 }
 
 // ── Parsed record accumulator ─────────────────────────────────────────────────
@@ -842,12 +845,41 @@ fn import_file(
                     let materialized_native =
                         source_identity_handle(&file_rel, &link.parent_local_id);
                     if link.system_native_id == materialized_native {
+                        // Validate the refinement local_id is not already claimed by a
+                        // different kind (task, acceptance_criterion) before recording.
+                        if let Some(&existing_kind) = seen_local_ids.get(&link.local_id)
+                            && existing_kind != "external_link"
+                        {
+                            let diag_id = project_stable_id(&[
+                                "project",
+                                "Diagnostic",
+                                SOURCE_KIND,
+                                &file_rel,
+                                "duplicate_local_id_kind_mismatch",
+                                &link.local_id,
+                            ]);
+                            push_diagnostic(
+                                graph,
+                                diag_id,
+                                Some(&file_rel),
+                                &format!(
+                                    "[duplicate_local_id_kind_mismatch] refinement local_id='{}' at line {} was previously seen with kind='{existing_kind}'",
+                                    link.local_id,
+                                    line_idx + 1
+                                ),
+                                transaction_time,
+                            );
+                            diag_count += 1;
+                            continue;
+                        }
                         src_link_refinements.insert(
                             link.parent_local_id.clone(),
                             SrcLinkRefinement {
                                 url: link.url.clone(),
                                 discovered_at: link.discovered_at.clone(),
                                 updated_at: link.updated_at.clone(),
+                                local_id: link.local_id.clone(),
+                                raw: raw.clone(),
                             },
                         );
                         seen_local_ids.insert(link.local_id.clone(), "external_link");
@@ -1052,8 +1084,8 @@ fn emit_task_records(
         &src_link_native_id,
     ]);
     // Explicit refinement wins for url; otherwise default to file:// URL
-    let src_link_url =
-        src_link_refinement.map_or_else(|| format!("file://{file_rel}"), |r| r.url.clone());
+    let src_link_url = src_link_refinement
+        .map_or_else(|| format!("file://{file_rel}"), |r| (opts.redact)(&r.url));
 
     // Body handle
     let body_str = match &task.body {
@@ -1111,7 +1143,12 @@ fn emit_task_records(
         src_link_refinement.map_or(task.updated_at.as_str(), |r| r.updated_at.as_str());
     let src_link_discovered_at =
         src_link_refinement.map_or_else(|| task.updated_at.clone(), |r| r.discovered_at.clone());
-    let src_link_source_handle = source_handle_for_line(file_rel, &task.local_id, raw);
+    // When a refinement row exists, its provenance (local_id + raw bytes) is the
+    // authoritative source for the materialized ExternalLink's source_handle.
+    let src_link_source_handle = src_link_refinement.map_or_else(
+        || source_handle_for_line(file_rel, &task.local_id, raw),
+        |r| source_handle_for_line(file_rel, &r.local_id, &r.raw),
+    );
     let mut src_link_node = GraphRecord::node(
         src_link_id.clone(),
         NodeKind::ExternalLink,
