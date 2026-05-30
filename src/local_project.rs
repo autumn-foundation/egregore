@@ -209,11 +209,18 @@ fn source_handle_for_line(file_rel_path: &str, local_id: &str, line_bytes: &[u8]
 }
 
 /// Compute the repo-relative path of `file_path` relative to `repo_root`.
-/// Falls back to the raw display path when `strip_prefix` fails (e.g.
-/// when the file lives outside the repo root in tests).
+/// Canonicalizes both paths first so non-canonical spellings (`.`, `./`, symlinks)
+/// produce consistent stable IDs. Falls back to the raw display path when
+/// canonicalization fails or the file is outside the repo root.
 fn repo_relative(file_path: &Path, repo_root: &Path) -> String {
-    file_path
-        .strip_prefix(repo_root)
+    let canonical_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let canonical_file = file_path
+        .canonicalize()
+        .unwrap_or_else(|_| file_path.to_path_buf());
+    canonical_file
+        .strip_prefix(&canonical_root)
         .unwrap_or(file_path)
         .to_string_lossy()
         .replace('\\', "/")
@@ -828,8 +835,10 @@ fn import_file(
                     }
                 };
 
-                // Source-link refinement check: collect and skip from parsed
-                if link.system == "local_file" {
+                // Source-link refinement check: only applies when parent is a known TASK.
+                // An AC-parent local_file link with a matching native_id is not a task
+                // source-link refinement and must not be silently swallowed here.
+                if link.system == "local_file" && task_ids.contains_key(&link.parent_local_id) {
                     let materialized_native =
                         source_identity_handle(&file_rel, &link.parent_local_id);
                     if link.system_native_id == materialized_native {
