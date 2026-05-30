@@ -95,11 +95,6 @@ pub fn import_local_tasks(
     repo_root: &Path,
     opts: &ImportOptions,
 ) -> Result<ImportResult> {
-    let transaction_time = opts
-        .transaction_time
-        .clone()
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-
     let mut graph = Graph::new();
     let mut total_diags: usize = 0;
     let mut seen_slugs: HashMap<String, PathBuf> = HashMap::new();
@@ -147,17 +142,25 @@ pub fn import_local_tasks(
                         file_rel,
                         existing.display()
                     ),
-                    &transaction_time,
+                    &file_mtime_rfc3339(file_path),
                 );
                 total_diags += 1;
                 continue;
             }
             seen_slugs.insert(slug, file_path.clone());
 
-            total_diags += import_file(file_path, repo_root, opts, &transaction_time, &mut graph)?;
+            let tx_time = opts
+                .transaction_time
+                .clone()
+                .unwrap_or_else(|| file_mtime_rfc3339(file_path));
+            total_diags += import_file(file_path, repo_root, opts, &tx_time, &mut graph)?;
         }
     } else {
-        total_diags += import_file(tasks_path, repo_root, opts, &transaction_time, &mut graph)?;
+        let tx_time = opts
+            .transaction_time
+            .clone()
+            .unwrap_or_else(|| file_mtime_rfc3339(tasks_path));
+        total_diags += import_file(tasks_path, repo_root, opts, &tx_time, &mut graph)?;
     }
 
     Ok(ImportResult {
@@ -165,6 +168,30 @@ pub fn import_local_tasks(
         diagnostic_count: total_diags,
     })
 }
+
+/// Return the file's mtime as RFC 3339 (seconds precision, UTC).
+/// Falls back to `Utc::now()` if the metadata cannot be read.
+fn file_mtime_rfc3339(path: &Path) -> String {
+    let fallback = || chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let Ok(meta) = std::fs::metadata(path) else {
+        return fallback();
+    };
+    let Ok(mtime) = meta.modified() else {
+        return fallback();
+    };
+    let dt: chrono::DateTime<chrono::Utc> = mtime.into();
+    dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+const VALID_TASK_STATUSES: &[&str] = &[
+    "open",
+    "in_progress",
+    "blocked",
+    "closed_completed",
+    "closed_dropped",
+    "unknown",
+];
+const VALID_TASK_PRIORITIES: &[&str] = &["low", "normal", "high", "urgent", "unknown"];
 
 // ── Source handle encoding ────────────────────────────────────────────────────
 
@@ -547,6 +574,8 @@ fn import_file(
     let mut ac_ids: HashMap<String, String> = HashMap::new();
     // AC identity fields: local_id → (parent_task_local_id, ordinal)
     let mut ac_identity: HashMap<String, (String, u32)> = HashMap::new();
+    // AC graph identity: (parent_task_local_id, ordinal) → local_id (first owner)
+    let mut ac_graph_identity: HashMap<(String, u32), String> = HashMap::new();
     // ExternalLink identity fields: local_id → (system, system_native_id)
     let mut link_identity: HashMap<String, (String, String)> = HashMap::new();
     // Source-link refinements: task local_id → refinement fields
@@ -644,6 +673,58 @@ fn import_file(
                     seen_local_ids.insert(task.local_id.clone(), "task");
                 }
 
+                // Validate closed enum fields per local-project-jsonl.md schema.
+                if !VALID_TASK_STATUSES.contains(&task.status.as_str()) {
+                    let diag_id = project_stable_id(&[
+                        "project",
+                        "Diagnostic",
+                        SOURCE_KIND,
+                        &file_rel,
+                        "task_invalid_field_value",
+                        &task.local_id,
+                        "status",
+                    ]);
+                    push_diagnostic(
+                        graph,
+                        diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[task_invalid_field_value] task '{}' at line {} has invalid status='{}'",
+                            task.local_id,
+                            line_idx + 1,
+                            task.status
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
+                }
+                if !VALID_TASK_PRIORITIES.contains(&task.priority.as_str()) {
+                    let diag_id = project_stable_id(&[
+                        "project",
+                        "Diagnostic",
+                        SOURCE_KIND,
+                        &file_rel,
+                        "task_invalid_field_value",
+                        &task.local_id,
+                        "priority",
+                    ]);
+                    push_diagnostic(
+                        graph,
+                        diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[task_invalid_field_value] task '{}' at line {} has invalid priority='{}'",
+                            task.local_id,
+                            line_idx + 1,
+                            task.priority
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
+                }
+
                 // Compute stable entity ID (same for all revisions of this local_id)
                 let identity_handle = source_identity_handle(&file_rel, &task.local_id);
                 let task_id = project_stable_id(&[
@@ -685,8 +766,11 @@ fn import_file(
                     }
                 };
 
-                // P1: verified ACs without verification_handle are skipped
-                if ac.status == "verified" && ac.verification_handle.is_none() {
+                // P1: verified ACs are skipped because this importer cannot
+                // resolve verification_handle to a verification_link_id.
+                // Emitting a verified AC without verification_link_id causes
+                // the daemon validator to reject the whole ingest.
+                if ac.status == "verified" {
                     let diag_id = project_stable_id(&[
                         "project",
                         "Diagnostic",
@@ -695,12 +779,17 @@ fn import_file(
                         "acceptance_criterion_missing_verification",
                         &ac.local_id,
                     ]);
+                    let reason = if ac.verification_handle.is_some() {
+                        "has status='verified' with a verification_handle that cannot be resolved to verification_link_id"
+                    } else {
+                        "has status='verified' but no verification_handle"
+                    };
                     push_diagnostic(
                         graph,
                         diag_id,
                         Some(&file_rel),
                         &format!(
-                            "[acceptance_criterion_missing_verification] acceptance_criterion '{}' at line {} has status='verified' but no verification_handle",
+                            "[acceptance_criterion_missing_verification] acceptance_criterion '{}' at line {} {reason}",
                             ac.local_id,
                             line_idx + 1
                         ),
@@ -787,12 +876,42 @@ fn import_file(
                         continue;
                     }
                 } else {
+                    // Check for graph-identity collision: a different local_id
+                    // already owns this (parent, ordinal) pair.
+                    let graph_key = (ac.parent_task_local_id.clone(), ac.ordinal);
+                    if let Some(prior_local_id) = ac_graph_identity.get(&graph_key) {
+                        let diag_id = project_stable_id(&[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "duplicate_ac_graph_identity",
+                            &ac.local_id,
+                        ]);
+                        push_diagnostic(
+                            graph,
+                            diag_id,
+                            Some(&file_rel),
+                            &format!(
+                                "[duplicate_ac_graph_identity] acceptance_criterion '{}' at line {} shares (parent_task_local_id='{}', ordinal={}) with '{}'",
+                                ac.local_id,
+                                line_idx + 1,
+                                ac.parent_task_local_id,
+                                ac.ordinal,
+                                prior_local_id
+                            ),
+                            transaction_time,
+                        );
+                        diag_count += 1;
+                        continue;
+                    }
                     seen_local_ids.insert(ac.local_id.clone(), "acceptance_criterion");
                     // Record identity fields on first occurrence
                     ac_identity.insert(
                         ac.local_id.clone(),
                         (ac.parent_task_local_id.clone(), ac.ordinal),
                     );
+                    ac_graph_identity.insert(graph_key, ac.local_id.clone());
                     // Compute and store the AC's stable ID for use by external_links
                     let ac_stable_id = project_stable_id(&[
                         "project",
@@ -883,6 +1002,11 @@ fn import_file(
                             },
                         );
                         seen_local_ids.insert(link.local_id.clone(), "external_link");
+                        // Record identity so a later row with the same local_id
+                        // cannot change system/system_native_id without a diagnostic.
+                        link_identity.entry(link.local_id.clone()).or_insert_with(|| {
+                            ("local_file".to_owned(), link.system_native_id.clone())
+                        });
                         continue;
                     }
                 }
