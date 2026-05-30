@@ -841,19 +841,16 @@ fn validate_record_ok_marker_field_with_policy_version_set() {
 // With only first-occurrence scanning the second credentialed URL is never examined.
 #[test]
 fn detect_database_url_second_occurrence_after_decoy() {
-    let value =
-        "config: postgres://readonly@localhost/dev prod: postgres://admin:S3cr3t@prod.example.com/myapp";
-    let (class, _) = detect_secret(value).expect(
-        "credentialed postgres:// after a username-only decoy must still be detected",
-    );
+    let value = "config: postgres://readonly@localhost/dev prod: postgres://admin:S3cr3t@prod.example.com/myapp";
+    let (class, _) = detect_secret(value)
+        .expect("credentialed postgres:// after a username-only decoy must still be detected");
     assert_eq!(class, SecretClass::DatabaseUrl);
 }
 
 // Fix R2-2: redact_value also catches the credentialed second occurrence.
 #[test]
 fn redact_value_detects_second_database_url_occurrence() {
-    let value =
-        "config: postgres://readonly@localhost/test secret: postgres://u:p4ssw0rd@db.example.com/prod";
+    let value = "config: postgres://readonly@localhost/test secret: postgres://u:p4ssw0rd@db.example.com/prod";
     let result = redact_value(value);
     assert!(
         result.starts_with("<REDACTED:"),
@@ -895,8 +892,8 @@ fn detect_api_token_github_fine_grained_pat() {
 fn detect_api_token_bearer_long_after_short_decoy() {
     let value =
         "Authorization: Bearer test ... Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456";
-    let (class, _) = detect_secret(value)
-        .expect("real Bearer token after a short decoy must still be detected");
+    let (class, _) =
+        detect_secret(value).expect("real Bearer token after a short decoy must still be detected");
     assert_eq!(class, SecretClass::ApiToken);
 }
 
@@ -922,10 +919,9 @@ fn detect_database_url_mixed_case_scheme() {
 #[test]
 fn detect_session_cookie_jwt_second_occurrence_after_short() {
     // First eyJ candidate is immediately followed by a non-base64url char, so length < 20.
-    let value =
-        "JWTs start with eyJ; actual: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig";
-    let (class, _) = detect_secret(value)
-        .expect("real JWT after a short eyJ decoy must still be detected");
+    let value = "JWTs start with eyJ; actual: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig";
+    let (class, _) =
+        detect_secret(value).expect("real JWT after a short eyJ decoy must still be detected");
     assert_eq!(class, SecretClass::SessionCookie);
 }
 

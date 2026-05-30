@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::{
     adapters::{DryRunSink, ingest_records, records_from_jsonl},
     ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan},
-    query, scan_repository_history_with_override, scan_repository_with_override,
+    local_project, query, scan_repository_history_with_override, scan_repository_with_override,
     schema_version::{RecordVersion, record_version},
     traj::{self, ImportOptions},
 };
@@ -109,6 +109,22 @@ enum Commands {
         /// Output JSONL path.
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Import local project/task JSONL into project-graph JSONL.
+    ImportLocalTasks {
+        /// Directory containing `.jsonl` task files, or path to a single `.jsonl` file.
+        tasks_path: PathBuf,
+        /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Repository root used to compute repo-relative source handles.
+        /// Defaults to the current working directory.
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
+        /// Fixed RFC 3339 transaction time for deterministic output (useful for tests).
+        /// Defaults to the current wall-clock instant.
+        #[arg(long)]
+        transaction_time: Option<String>,
     },
     /// Query an existing graph JSONL for symbols, files, or drift records.
     Query {
@@ -345,10 +361,51 @@ fn run_cli(cli: Cli) -> Result<()> {
         ),
         Commands::ImportTraj { traj_path, out } => import_traj_cmd(&traj_path, &out),
         Commands::ImportCodex { codex_path, out } => import_codex_cmd(&codex_path, &out),
+        Commands::ImportLocalTasks {
+            tasks_path,
+            out,
+            repo_root,
+            transaction_time,
+        } => import_local_tasks_cmd(
+            &tasks_path,
+            &out,
+            repo_root.as_deref(),
+            transaction_time.as_deref(),
+        ),
         Commands::Query { subcommand } => query_cmd(subcommand),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Daemon { action } => daemon(action),
     }
+}
+
+fn import_local_tasks_cmd(
+    tasks_path: &Path,
+    out: &Path,
+    repo_root: Option<&Path>,
+    transaction_time: Option<&str>,
+) -> Result<()> {
+    let repo_root = match repo_root {
+        Some(r) => r.to_path_buf(),
+        None => std::env::current_dir().context("failed to determine current directory")?,
+    };
+    let opts = local_project::ImportOptions {
+        transaction_time: transaction_time.map(str::to_owned),
+        ..local_project::ImportOptions::default()
+    };
+    let result = local_project::import_local_tasks(tasks_path, &repo_root, &opts)
+        .with_context(|| format!("failed to import local tasks from {}", tasks_path.display()))?;
+    let jsonl = result
+        .graph
+        .to_jsonl()
+        .context("failed to serialize project-graph JSONL")?;
+    fs::write(out, jsonl).with_context(|| format!("failed to write JSONL to {}", out.display()))?;
+    println!(
+        "imported {} records ({} diagnostics) from {}",
+        result.graph.records().len(),
+        result.diagnostic_count,
+        tasks_path.display()
+    );
+    Ok(())
 }
 
 fn import_codex_cmd(codex_path: &Path, out: &Path) -> Result<()> {
@@ -1973,7 +2030,7 @@ impl InspectCounts {
 mod semantic_contract {
     use super::*;
 
-    fn full_span() -> SourceSpan {
+    const fn full_span() -> SourceSpan {
         SourceSpan {
             start_byte: 4096,
             end_byte: 5200,
@@ -2029,7 +2086,7 @@ mod semantic_contract {
         }
     }
 
-    /// Optional fields absent when None — verifies skip_serializing_if contract.
+    /// Optional fields absent when None — verifies `skip_serializing_if` contract.
     #[test]
     fn semantic_result_json_contract_optional_fields_omitted_when_none() {
         let result = SemanticResult {

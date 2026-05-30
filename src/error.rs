@@ -112,6 +112,13 @@ pub enum CodegraphError {
         path: PathBuf,
     },
 
+    /// A caller supplied an invalid argument value.
+    #[error("invalid argument: {message}")]
+    InvalidArgument {
+        /// Detail message.
+        message: String,
+    },
+
     /// A graph record was rejected because a sensitive field contains unredacted
     /// raw secret material.
     ///
