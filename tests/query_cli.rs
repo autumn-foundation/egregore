@@ -2328,3 +2328,108 @@ fn query_context_decision_carries_summary() {
          use summary, not text, for their human-readable content)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// query context — FileEdit carries hunk_count, linked_turn_id, linked_patch_id
+// ---------------------------------------------------------------------------
+//
+// Finding (cli.rs:1786): ContextLinkedItem drops FileEdit-required fields
+// `hunk_count` and `linked_turn_id` (and optional `linked_patch_id`).
+// Consumers need these to reconstruct the edit event or associate it with
+// its owning agent turn/patch from the context response alone.
+
+#[test]
+fn query_context_file_edit_carries_fileedit_metadata() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("file_edit_fields.jsonl");
+
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "file_edit_ctx_fn"]);
+    let sym = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 0,
+            end_byte: 80,
+            start_line: 1,
+            end_line: 5,
+        },
+        "file_edit_ctx_fn".to_owned(),
+        "fn file_edit_ctx_fn".to_owned(),
+    );
+
+    let file_edit_id = agent_memory_stable_id(&["fileedit", "file_edit_ctx_test"]);
+    let mut file_edit = GraphRecord::node(
+        file_edit_id.clone(),
+        NodeKind::FileEdit,
+        Some("src/lib.rs".to_owned()),
+        None,
+        None,
+        "file edit for file_edit_ctx_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut edit_kind,
+        ref mut hunk_count,
+        ref mut linked_turn_id,
+        ref mut linked_patch_id,
+        ref mut evidence_links,
+        ..
+    } = file_edit
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *edit_kind = Some("modify".to_owned());
+        *hunk_count = Some(3);
+        *linked_turn_id = Some("agent_memory:v1:turn:fe_ctx_turn".to_owned());
+        *linked_patch_id = Some("agent_memory:v1:patch:fe_ctx_patch".to_owned());
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(sym_id),
+            target_domain: "codegraph".to_owned(),
+            relation: "TOUCHED_FILE".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let mut graph = aletheia_egregore::ir::Graph::new();
+    graph.push(sym);
+    graph.push(file_edit);
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let output = egregore()
+        .args(["query", "context", "file_edit_ctx_fn", "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value =
+        serde_json::from_slice(&output).expect("valid JSON from query context");
+
+    let item = json["artifacts"]
+        .as_array()
+        .expect("artifacts array")
+        .iter()
+        .find(|a| a["record_id"].as_str() == Some(&file_edit_id))
+        .expect("FileEdit must appear in artifacts");
+
+    assert_eq!(
+        item["hunk_count"].as_u64(),
+        Some(3),
+        "hunk_count must be forwarded for FileEdit"
+    );
+    assert_eq!(
+        item["linked_turn_id"].as_str(),
+        Some("agent_memory:v1:turn:fe_ctx_turn"),
+        "linked_turn_id must be forwarded for FileEdit"
+    );
+    assert_eq!(
+        item["linked_patch_id"].as_str(),
+        Some("agent_memory:v1:patch:fe_ctx_patch"),
+        "linked_patch_id must be forwarded for FileEdit (optional but present)"
+    );
+}

@@ -3536,3 +3536,449 @@ fn symbol_context_temporal_topology_edge_survives_tombstone() {
          tombstoned in current state"
     );
 }
+
+// ── Finding: triple-only else branch must not consume node before edge arm ────
+//
+// When a node has only triple-form evidence links (no resolved target_record_id),
+// the else branch enters and marks the node visited without classifying it. If a
+// graph edge connecting that node to the symbol comes later in the records slice
+// (the common nodes-before-edges layout), the edge arm finds the node already
+// visited and skips classification. The node must NOT be marked visited before
+// it is actually classified.
+
+#[test]
+fn symbol_context_triple_only_node_not_consumed_before_edge_traversal() {
+    // Symbol S at "src/lib.rs"
+    // Obs O: ONLY a triple evidence link targeting "src/lib.rs" (no resolved target_record_id)
+    //        AND a graph edge O --MENTIONS_SYMBOL--> S
+    // Records order: [S, O (node), E (edge)]  — nodes before edges
+    // Expected: O in observations via edge arm (triple else branch must not mark O visited)
+    let sym_id = "codegraph:v4:triple_consume_sym001";
+    let sym = ctx_symbol(sym_id, "triple_consume_fn", "src/lib.rs", 1);
+
+    let obs_id = agent_memory_stable_id(&["obs", "triple_consume_obs"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "obs with triple link and edge to symbol".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ref mut evidence_links,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+        // Triple-form only: no target_record_id, path matches the symbol's file
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: None,
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "0.9".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: Some("src/lib.rs".to_owned()),
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    // Graph edge comes AFTER the node record (nodes-before-edges layout)
+    let edge = GraphRecord::agent_memory_edge(
+        EdgeLabel::MentionsSymbol,
+        obs_id.clone(),
+        sym_id.to_owned(),
+        Some("1.0".to_owned()),
+        "obs mentions symbol via edge".to_owned(),
+    );
+
+    let records = vec![sym, obs, edge]; // <-- node before edge
+    let ctx = symbol_context(&records, "triple_consume_fn");
+
+    assert!(!ctx.is_no_match(), "symbol must be found");
+    assert!(
+        ctx.observations.iter().any(|r| r.id() == obs_id.as_str()),
+        "obs must be classified into observations via the graph edge even though it \
+         also has a triple-form evidence link; the triple-only else branch must not \
+         mark the node visited before the edge arm runs"
+    );
+}
+
+// ── Finding: relay node reached via evidence_links must expand BFS frontier ───
+//
+// When a relay node (ToolCall/AgentTurn/AgentRun) is reached through an inline
+// evidence link to the seed symbol/file, `classify_and_insert` returns false and
+// the evidence_links arm must still add the relay to the frontier so its outgoing
+// edges (PRODUCED_EVIDENCE, PRODUCED_PATCH) are traversed in the next hop.
+
+#[test]
+fn symbol_context_relay_node_via_evidence_link_expands_frontier() {
+    // Symbol S and File F (DEFINES F → S, so F is a seed)
+    // ToolCall TC: evidence_link TOUCHED_FILE → F (matches seed F → links_to_frontier=true)
+    // TC --PRODUCED_EVIDENCE--> CommandRun CR
+    // Expected: CR in verification_evidence (TC must enter frontier despite not being classified)
+    let sym_id = "codegraph:v4:relay_evi_sym001";
+    let sym = ctx_symbol(sym_id, "relay_evi_fn", "src/lib.rs", 1);
+
+    let file_id = aletheia_egregore::ir::stable_id(&["file", "relay_evi_file"]);
+    let file = GraphRecord::node(
+        file_id.clone(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        None,
+        "src/lib.rs".to_owned(),
+    );
+
+    let defines_edge = GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id.clone(),
+        sym_id.to_owned(),
+        None,
+        "file defines relay_evi_fn".to_owned(),
+    );
+
+    let tc_id = agent_memory_stable_id(&["toolcall", "relay_evi_tc"]);
+    let mut tc = GraphRecord::node(
+        tc_id.clone(),
+        NodeKind::ToolCall,
+        None,
+        None,
+        None,
+        "tool call touching relay_evi file".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = tc
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        // Evidence link to seed File F — this puts TC in the evidence_links arm
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(file_id),
+            target_domain: "codegraph".to_owned(),
+            relation: "TOUCHED_FILE".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let run_id = verification_stable_id(&["run", "relay_evi_run"]);
+    let mut run = GraphRecord::node(
+        run_id.clone(),
+        NodeKind::CommandRun,
+        None,
+        None,
+        None,
+        "command run produced by relay_evi tool call".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ..
+    } = run
+    {
+        *schema_version = VERIFICATION_SCHEMA_VERSION;
+    }
+
+    // TC --PRODUCED_EVIDENCE--> CR (must be traversed from TC's frontier in next hop)
+    let produced_edge = GraphRecord::edge(
+        EdgeLabel::ProducedEvidence,
+        tc_id,
+        run_id.clone(),
+        None,
+        "tool call produced command run".to_owned(),
+    );
+
+    let records = vec![sym, file, defines_edge, tc, run, produced_edge];
+    let ctx = symbol_context(&records, "relay_evi_fn");
+
+    assert!(!ctx.is_no_match(), "symbol must be found");
+    assert!(
+        ctx.verification_evidence
+            .iter()
+            .any(|r| r.id() == run_id.as_str()),
+        "CommandRun must be in verification_evidence via relay ToolCall reached through \
+         evidence_link — the evidence_links arm must expand relay nodes into the frontier"
+    );
+}
+
+// ── Finding: each temporal version of a node must have its evidence_links scanned
+//
+// When multiple temporal records share the same stable ID but have different
+// evidence_links, the first version processed marks the stable ID visited and
+// all later versions are skipped. For scan-history slices where each commit may
+// link different backing evidence, only the first version's evidence is surfaced.
+
+#[test]
+#[allow(clippy::similar_names, clippy::too_many_lines)]
+fn symbol_context_temporal_observation_evidence_links_scanned_per_version() {
+    // Symbol S (current-state)
+    // Obs O@commitA (temporal): MENTIONS_SYMBOL → S AND VALIDATED_BY → RunA
+    // Obs O@commitB (temporal): MENTIONS_SYMBOL → S AND VALIDATED_BY → RunB
+    // RunA, RunB: present CommandRun nodes
+    // Expected: both RunA and RunB in verification_evidence
+    let sym_id = "codegraph:v4:temporal_evi_scan_sym001";
+    let sym = ctx_symbol(sym_id, "temporal_evi_scan_fn", "src/lib.rs", 1);
+
+    let obs_id = agent_memory_stable_id(&["obs", "temporal_evi_scan_obs"]);
+    let run_a_id = verification_stable_id(&["run", "temporal_evi_scan_run_a"]);
+    let run_b_id = verification_stable_id(&["run", "temporal_evi_scan_run_b"]);
+
+    let make_obs_version = |commit: &str, run_id: &str| -> GraphRecord {
+        let mut obs = GraphRecord::node(
+            obs_id.clone(),
+            NodeKind::Observation,
+            None,
+            None,
+            None,
+            format!("temporal observation at commit {commit}"),
+        );
+        if let GraphRecord::Node {
+            ref mut schema_version,
+            ref mut agent_id,
+            ref mut session_id,
+            ref mut observed_at,
+            ref mut confidence,
+            ref mut evidence_links,
+            ..
+        } = obs
+        {
+            *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+            *agent_id = Some("agent:test".to_owned());
+            *session_id = Some("session:test".to_owned());
+            *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+            *confidence = Some("0.9".to_owned());
+            *evidence_links = Some(vec![
+                EvidenceLink {
+                    target_record_id: Some(sym_id.to_owned()),
+                    target_domain: "codegraph".to_owned(),
+                    relation: "MENTIONS_SYMBOL".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some(run_id.to_owned()),
+                    target_domain: "verification".to_owned(),
+                    relation: "VALIDATED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+            ]);
+        }
+        obs.with_temporal(temporal(commit, "2026-01-01T00:00:00Z"))
+    };
+
+    let obs_v1 = make_obs_version("aaaa1111", &run_a_id);
+    let obs_v2 = make_obs_version("bbbb2222", &run_b_id);
+
+    let mut run_a = GraphRecord::node(
+        run_a_id.clone(),
+        NodeKind::CommandRun,
+        None,
+        None,
+        None,
+        "run for commit A".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ..
+    } = run_a
+    {
+        *schema_version = VERIFICATION_SCHEMA_VERSION;
+    }
+
+    let mut run_b = GraphRecord::node(
+        run_b_id.clone(),
+        NodeKind::CommandRun,
+        None,
+        None,
+        None,
+        "run for commit B".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ..
+    } = run_b
+    {
+        *schema_version = VERIFICATION_SCHEMA_VERSION;
+    }
+
+    // obs_v1 before obs_v2 in slice — v1 processed first, marks visited,
+    // v2 would be skipped without the per-version scan fix
+    let records = vec![sym, obs_v1, obs_v2, run_a, run_b];
+    let ctx = symbol_context(&records, "temporal_evi_scan_fn");
+
+    assert!(!ctx.is_no_match(), "symbol must be found");
+    assert!(
+        ctx.verification_evidence
+            .iter()
+            .any(|r| r.id() == run_a_id.as_str()),
+        "RunA must be in verification_evidence (from O@commitA evidence_links)"
+    );
+    assert!(
+        ctx.verification_evidence
+            .iter()
+            .any(|r| r.id() == run_b_id.as_str()),
+        "RunB must be in verification_evidence (from O@commitB evidence_links — \
+         the second temporal version must be scanned independently)"
+    );
+}
+
+// ── Finding: backfill must scan evidence_links of newly discovered nodes ──────
+//
+// The post-BFS backfill snapshots classified nodes and scans their evidence_links
+// once. A newly classified target from that scan (e.g. ObsB found via ObsA's
+// RELATES_TO evidence_link) has its own evidence_links (e.g. VALIDATED_BY →
+// CommandRun) that need scanning, but are skipped because classified_for_backfill
+// was captured before ObsB was added. The backfill must be iterative.
+
+#[test]
+#[allow(clippy::similar_names, clippy::too_many_lines)]
+fn symbol_context_backfill_evidence_links_scanned_recursively() {
+    // Symbol S
+    // ObsA --MENTIONS_SYMBOL(edge)--> S  (ObsA classified via edge arm)
+    // ObsA.evidence_links = [RELATES_TO → ObsB]  (ObsB classified in first backfill pass)
+    // ObsB.evidence_links = [VALIDATED_BY → CommandRun CR]  (CR must appear in second pass)
+    // Expected: CR in verification_evidence
+    let sym_id = "codegraph:v4:backfill_recursive_sym001";
+    let sym = ctx_symbol(sym_id, "backfill_recursive_fn", "src/lib.rs", 1);
+
+    let obs_a_id = agent_memory_stable_id(&["obs", "backfill_recursive_obs_a"]);
+    let obs_b_id = agent_memory_stable_id(&["obs", "backfill_recursive_obs_b"]);
+    let run_id = verification_stable_id(&["run", "backfill_recursive_run"]);
+
+    let mut obs_b = GraphRecord::node(
+        obs_b_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "nested observation B".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ref mut evidence_links,
+        ..
+    } = obs_b
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.8".to_owned());
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(run_id.clone()),
+            target_domain: "verification".to_owned(),
+            relation: "VALIDATED_BY".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let mut obs_a = GraphRecord::node(
+        obs_a_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "observation A linking to observation B".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ref mut evidence_links,
+        ..
+    } = obs_a
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(obs_b_id.clone()),
+            target_domain: "agent_memory".to_owned(),
+            relation: "RELATES_TO".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let mut run = GraphRecord::node(
+        run_id.clone(),
+        NodeKind::CommandRun,
+        None,
+        None,
+        None,
+        "command run validating observation B".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ..
+    } = run
+    {
+        *schema_version = VERIFICATION_SCHEMA_VERSION;
+    }
+
+    // Edge: ObsA --MENTIONS_SYMBOL--> S (classifies ObsA via edge arm)
+    let obs_a_sym_edge = GraphRecord::agent_memory_edge(
+        EdgeLabel::MentionsSymbol,
+        obs_a_id.clone(),
+        sym_id.to_owned(),
+        Some("1.0".to_owned()),
+        "obs_a mentions backfill_recursive_fn".to_owned(),
+    );
+
+    let records = vec![sym, obs_a, obs_b, run, obs_a_sym_edge];
+    let ctx = symbol_context(&records, "backfill_recursive_fn");
+
+    assert!(!ctx.is_no_match(), "symbol must be found");
+    assert!(
+        ctx.observations.iter().any(|r| r.id() == obs_a_id.as_str()),
+        "ObsA must be in observations (edge arm)"
+    );
+    assert!(
+        ctx.observations.iter().any(|r| r.id() == obs_b_id.as_str()),
+        "ObsB must be in observations (first backfill pass via ObsA's evidence_links)"
+    );
+    assert!(
+        ctx.verification_evidence
+            .iter()
+            .any(|r| r.id() == run_id.as_str()),
+        "CommandRun must be in verification_evidence via iterative backfill: \
+         ObsA → ObsB → CommandRun (second backfill pass on newly classified ObsB)"
+    );
+}

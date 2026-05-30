@@ -500,6 +500,9 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     // in the current hop.
     let mut visited: BTreeSet<&str> = seed_ids.clone();
     let mut frontier: BTreeSet<&str> = seed_ids.clone();
+    // Per-version scan tracking for temporal nodes: keyed by "id@git_commit" so
+    // each temporal version of a node has its evidence_links scanned independently.
+    let mut temporal_evidence_scanned: BTreeSet<String> = BTreeSet::new();
 
     for _hop in 0..3_usize {
         let mut next_frontier: Vec<&'a str> = Vec::new();
@@ -563,13 +566,26 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                 GraphRecord::Node {
                     id: node_id,
                     evidence_links: Some(links),
+                    temporal,
                     ..
                 } => {
-                    if visited.contains(node_id.as_str()) {
+                    // For temporal nodes, track per-version by "id@git_commit" so
+                    // each historical version has its evidence_links scanned independently.
+                    // For current-state nodes, fall back to the visited set.
+                    let already_scanned = temporal.as_ref().map_or_else(
+                        || visited.contains(node_id.as_str()),
+                        |t| {
+                            let key = format!("{}@{}", node_id, t.git_commit);
+                            !temporal_evidence_scanned.insert(key)
+                        },
+                    );
+                    if already_scanned {
                         continue;
                     }
-                    // Skip tombstoned nodes before scanning their evidence_links.
-                    if tombstoned_ids.contains(node_id.as_str()) {
+                    // Skip tombstoned non-temporal nodes before scanning evidence_links.
+                    if tombstoned_ids.contains(node_id.as_str())
+                        && !has_any_temporal_version.contains(node_id.as_str())
+                    {
                         visited.insert(node_id.as_str());
                         continue;
                     }
@@ -594,7 +610,14 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                             &mut verification_evidence,
                         );
                         visited.insert(node_id.as_str());
-                        if was_classified {
+                        if was_classified
+                            || is_bfs_relay_node(
+                                node_id.as_str(),
+                                &by_id,
+                                &tombstoned_ids,
+                                &has_any_temporal_version,
+                            )
+                        {
                             next_frontier.push(node_id.as_str());
                         }
 
@@ -648,7 +671,10 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                                 && evidence_link_triple_handle(link).is_some()
                         });
                         if has_triple {
-                            visited.insert(node_id.as_str());
+                            // Do NOT mark visited here — a node that only has
+                            // triple-form links may also be reachable via a graph
+                            // edge, and marking it visited would prevent the edge arm
+                            // from classifying it on a subsequent hop.
                             for link in links {
                                 if link.target_record_id.is_none() {
                                     let Some(handle) = evidence_link_triple_handle(link) else {
@@ -691,58 +717,79 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     // This covers cases like Obs --edge--> Symbol where Obs also has a VALIDATED_BY
     // link to a Verification that needs to appear in verification_evidence.
     //
-    // Collect IDs as owned Strings to release borrows on the BTreeSets before
-    // calling classify_and_insert with mutable references to them.
-    let classified_for_backfill: Vec<String> = source_facts
-        .iter()
-        .chain(observations.iter())
-        .chain(project_state.iter())
-        .chain(artifacts.iter())
-        .chain(verification_evidence.iter())
-        .filter(|id| !symbol_ids.contains(**id))
-        .map(|id| (*id).to_owned())
-        .collect();
+    // Iterative until convergence: a newly classified node (e.g. ObsB found via
+    // ObsA's evidence_links) may itself have evidence_links (e.g. VALIDATED_BY →
+    // CommandRun) that need scanning in a subsequent pass. Loop until no new nodes
+    // are classified.
+    //
+    // `backfill_scanned` tracks which IDs have already been scanned so that the
+    // convergence loop does not re-process nodes from earlier passes.
+    let mut backfill_scanned: BTreeSet<String> =
+        symbol_ids.iter().map(ToString::to_string).collect();
 
-    for node_id in &classified_for_backfill {
-        // .copied() converts Option<&&'a GraphRecord> → Option<&'a GraphRecord>
-        // so that sub-borrows (nid, links) carry lifetime 'a and satisfy
-        // the classify_and_insert closure's &'a str constraint.
-        let Some(GraphRecord::Node {
-            id: nid,
-            evidence_links: Some(links),
-            ..
-        }) = by_id.get(node_id.as_str()).copied()
-        else {
-            continue;
-        };
-        for link in links {
-            if let Some(target_id) = &link.target_record_id {
-                if present_ids.contains(target_id.as_str())
-                    && !symbol_ids.contains(target_id.as_str())
-                {
-                    classify_and_insert(
-                        target_id.as_str(),
-                        &mut source_facts,
-                        &mut observations,
-                        &mut project_state,
-                        &mut artifacts,
-                        &mut verification_evidence,
-                    );
-                } else if !present_ids.contains(target_id.as_str()) {
+    loop {
+        // Collect IDs that have been classified but not yet scanned in backfill.
+        // Owned Strings release the borrows on the section BTreeSets so that
+        // classify_and_insert can take mutable references below.
+        let to_scan: Vec<String> = source_facts
+            .iter()
+            .chain(observations.iter())
+            .chain(project_state.iter())
+            .chain(artifacts.iter())
+            .chain(verification_evidence.iter())
+            .filter(|id| !backfill_scanned.contains(**id))
+            .map(|id| (*id).to_owned())
+            .collect();
+
+        if to_scan.is_empty() {
+            break;
+        }
+
+        for node_id in &to_scan {
+            backfill_scanned.insert(node_id.clone());
+        }
+
+        for node_id in &to_scan {
+            // .copied() converts Option<&&'a GraphRecord> → Option<&'a GraphRecord>
+            // so that sub-borrows (nid, links) carry lifetime 'a and satisfy
+            // the classify_and_insert closure's &'a str constraint.
+            let Some(GraphRecord::Node {
+                id: nid,
+                evidence_links: Some(links),
+                ..
+            }) = by_id.get(node_id.as_str()).copied()
+            else {
+                continue;
+            };
+            for link in links {
+                if let Some(target_id) = &link.target_record_id {
+                    if present_ids.contains(target_id.as_str())
+                        && !symbol_ids.contains(target_id.as_str())
+                    {
+                        classify_and_insert(
+                            target_id.as_str(),
+                            &mut source_facts,
+                            &mut observations,
+                            &mut project_state,
+                            &mut artifacts,
+                            &mut verification_evidence,
+                        );
+                    } else if !present_ids.contains(target_id.as_str()) {
+                        unresolved.push(UnresolvedRef {
+                            source_record_id: nid.clone(),
+                            target_handle: target_id.clone(),
+                            relation: link.relation.clone(),
+                            target_domain: link.target_domain.clone(),
+                        });
+                    }
+                } else if let Some(handle) = evidence_link_triple_handle(link) {
                     unresolved.push(UnresolvedRef {
                         source_record_id: nid.clone(),
-                        target_handle: target_id.clone(),
+                        target_handle: handle,
                         relation: link.relation.clone(),
                         target_domain: link.target_domain.clone(),
                     });
                 }
-            } else if let Some(handle) = evidence_link_triple_handle(link) {
-                unresolved.push(UnresolvedRef {
-                    source_record_id: nid.clone(),
-                    target_handle: handle,
-                    relation: link.relation.clone(),
-                    target_domain: link.target_domain.clone(),
-                });
             }
         }
     }

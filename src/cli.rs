@@ -760,6 +760,15 @@ struct ContextLinkedItem<'a> {
     /// New path when the file was renamed (`FileEdit`).
     #[serde(skip_serializing_if = "Option::is_none")]
     rename_to: Option<&'a str>,
+    /// Number of diff hunks in the edit (`FileEdit`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hunk_count: Option<u32>,
+    /// Agent turn that produced this edit (`FileEdit`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    linked_turn_id: Option<&'a str>,
+    /// Patch artifact this edit belongs to (`FileEdit`, optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    linked_patch_id: Option<&'a str>,
     // ── PatchArtifact-specific fields ────────────────────────────────────────
     /// Patch validation status (`"valid"`, `"invalid"`, `"pending"`) for `PatchArtifact`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1747,6 +1756,9 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         before_hash,
         after_hash,
         rename_to,
+        hunk_count,
+        linked_turn_id,
+        linked_patch_id,
         patch_status,
         patch_handle,
         patch_bytes_hash,
@@ -1784,6 +1796,9 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         before_hash: before_hash.as_deref(),
         after_hash: after_hash.as_deref(),
         rename_to: rename_to.as_deref(),
+        hunk_count: *hunk_count,
+        linked_turn_id: linked_turn_id.as_deref(),
+        linked_patch_id: linked_patch_id.as_deref(),
         patch_status: patch_status.as_deref(),
         patch_handle: patch_handle.as_deref(),
         patch_bytes_hash: patch_bytes_hash.as_deref(),
