@@ -840,11 +840,8 @@ fn import_file(
                             .get("hash")
                             .and_then(serde_json::Value::as_str)
                             .filter(|h| !h.is_empty());
-                        let bytes_ok = obj
-                            .get("bytes")
-                            .and_then(serde_json::Value::as_u64)
-                            .is_some();
-                        if hash_str.is_none() || !bytes_ok {
+                        let bytes_val = obj.get("bytes").and_then(serde_json::Value::as_u64);
+                        if hash_str.is_none() || bytes_val.is_none() {
                             let missing = if hash_str.is_none() { "hash" } else { "bytes" };
                             let diag_id = per_line_diag_id(
                                 &[
@@ -870,6 +867,43 @@ fn import_file(
                             );
                             diag_count += 1;
                             continue;
+                        }
+                        // If inline is present, bytes must equal inline.len() and
+                        // must not exceed the ceiling (handles above the ceiling
+                        // must not carry inline content).
+                        if let Some(inline_str) =
+                            obj.get("inline").and_then(serde_json::Value::as_str)
+                        {
+                            let declared_bytes = bytes_val.expect("checked above");
+                            let actual_len = inline_str.len() as u64;
+                            let ceiling = INLINE_BODY_CEILING as u64;
+                            if declared_bytes != actual_len || declared_bytes > ceiling {
+                                let diag_id = per_line_diag_id(
+                                    &[
+                                        "project",
+                                        "Diagnostic",
+                                        SOURCE_KIND,
+                                        &file_rel,
+                                        "invalid_inline_body_handle",
+                                        &task.local_id,
+                                    ],
+                                    line_idx,
+                                );
+                                push_diagnostic(
+                                    graph,
+                                    &diag_id,
+                                    Some(&file_rel),
+                                    &format!(
+                                        "[invalid_inline_body_handle] task '{}' at line {} has inconsistent inline body handle: declared bytes={declared_bytes}, inline len={actual_len}, ceiling={}",
+                                        task.local_id,
+                                        line_idx + 1,
+                                        INLINE_BODY_CEILING,
+                                    ),
+                                    transaction_time,
+                                );
+                                diag_count += 1;
+                                continue;
+                            }
                         }
                     }
                     Some(_) => {
@@ -1671,6 +1705,10 @@ fn import_file(
     // Parent validation was done in the first pass; all records in `parsed`
     // have valid parents. The second pass only needs to look up parent IDs to
     // wire edges.
+    // Track which materialized source ExternalLink IDs have already been emitted
+    // so that task revisions (same local_id, later rows) don't re-emit the source
+    // link and create spurious source-link history for unchanged identity.
+    let mut emitted_src_links: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (_line_idx, record) in &parsed {
         match record {
             ParsedRecord::Task { line: task, raw } => {
@@ -1682,6 +1720,7 @@ fn import_file(
                     opts,
                     transaction_time,
                     src_link_refinements.get(&task.local_id),
+                    &mut emitted_src_links,
                 );
             }
             ParsedRecord::AcceptanceCriterion { line: ac, raw } => {
@@ -1720,11 +1759,15 @@ fn import_file(
 
 // ── Record emitters ───────────────────────────────────────────────────────────
 
-/// Emit a Task node, its materialized source `ExternalLink`, and the `ExternalHandle` edge.
+/// Emit a Task node and (on first occurrence) its materialized source `ExternalLink`.
 ///
 /// When `src_link_refinement` is `Some`, its `url`, `discovered_at`, and
 /// `updated_at` fields override the defaults for the materialized source link.
-#[allow(clippy::too_many_lines)]
+///
+/// The daemon synthesizes `EXTERNAL_HANDLE` (Task→ExternalLink) from
+/// `Task.source_external_link_id`, so this function does NOT emit that edge —
+/// submitting it would conflict with daemon synthesis and cause ingest to fail.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn emit_task_records(
     graph: &mut Graph,
     task: &TaskLine,
@@ -1733,6 +1776,7 @@ fn emit_task_records(
     opts: &ImportOptions,
     transaction_time: &str,
     src_link_refinement: Option<&SrcLinkRefinement>,
+    emitted_src_links: &mut std::collections::HashSet<String>,
 ) {
     let identity_handle = source_identity_handle(file_rel, &task.local_id);
     let task_id = project_stable_id(&["project", "Task", SOURCE_KIND, file_rel, &identity_handle]);
@@ -1825,75 +1869,65 @@ fn emit_task_records(
     }
     graph.push(task_node);
 
-    // Materialized source ExternalLink node
-    // Refinement wins for valid_time (updated_at) and discovered_at
-    let src_link_valid_time =
-        src_link_refinement.map_or(task.updated_at.as_str(), |r| r.updated_at.as_str());
-    let src_link_discovered_at =
-        src_link_refinement.map_or_else(|| task.updated_at.clone(), |r| r.discovered_at.clone());
-    // When a refinement row exists, its provenance (local_id + raw bytes) is the
-    // authoritative source for the materialized ExternalLink's source_handle.
-    let src_link_source_handle = src_link_refinement.map_or_else(
-        || source_handle_for_line(file_rel, &task.local_id, raw),
-        |r| source_handle_for_line(file_rel, &r.local_id, &r.raw),
-    );
-    let mut src_link_node = GraphRecord::node(
-        src_link_id.clone(),
-        NodeKind::ExternalLink,
-        Some(file_rel.to_owned()),
-        None,
-        None,
-        format!("ExternalLink: local_file:{src_link_native_id}"),
-    );
-    set_project_base_fields(
-        &mut src_link_node,
-        transaction_time,
-        Some(&src_link_id),
-        Some(src_link_valid_time),
-        Some(&src_link_source_handle),
-    );
-    if let GraphRecord::Node {
-        source_kind,
-        system,
-        url,
-        system_native_id,
-        discovered_at,
-        ..
-    } = &mut src_link_node
-    {
-        *source_kind = Some(SOURCE_KIND.to_owned());
-        *system = Some("local_file".to_owned());
-        *url = Some(src_link_url);
-        *system_native_id = Some(src_link_native_id);
-        *discovered_at = Some(src_link_discovered_at);
+    // Materialized source ExternalLink — only emitted for the first row with this
+    // local_id. Subsequent task revisions (appended rows) update only the Task
+    // node; re-emitting the source ExternalLink would create spurious source-link
+    // history for edits that did not change the source identity.
+    //
+    // NOTE: the daemon synthesizes the Task→ExternalLink EXTERNAL_HANDLE edge from
+    // Task.source_external_link_id, so this function intentionally does NOT emit
+    // that edge — submitting it would conflict with synthesis and fail ingest.
+    if emitted_src_links.insert(src_link_id.clone()) {
+        // Refinement wins for valid_time (updated_at) and discovered_at
+        let src_link_valid_time =
+            src_link_refinement.map_or(task.updated_at.as_str(), |r| r.updated_at.as_str());
+        let src_link_discovered_at = src_link_refinement
+            .map_or_else(|| task.updated_at.clone(), |r| r.discovered_at.clone());
+        // When a refinement row exists, its provenance (local_id + raw bytes) is the
+        // authoritative source for the materialized ExternalLink's source_handle.
+        let src_link_source_handle = src_link_refinement.map_or_else(
+            || source_handle_for_line(file_rel, &task.local_id, raw),
+            |r| source_handle_for_line(file_rel, &r.local_id, &r.raw),
+        );
+        let mut src_link_node = GraphRecord::node(
+            src_link_id.clone(),
+            NodeKind::ExternalLink,
+            Some(file_rel.to_owned()),
+            None,
+            None,
+            format!("ExternalLink: local_file:{src_link_native_id}"),
+        );
+        set_project_base_fields(
+            &mut src_link_node,
+            transaction_time,
+            Some(&src_link_id),
+            Some(src_link_valid_time),
+            Some(&src_link_source_handle),
+        );
+        if let GraphRecord::Node {
+            source_kind,
+            system,
+            url,
+            system_native_id,
+            discovered_at,
+            ..
+        } = &mut src_link_node
+        {
+            *source_kind = Some(SOURCE_KIND.to_owned());
+            *system = Some("local_file".to_owned());
+            *url = Some(src_link_url);
+            *system_native_id = Some(src_link_native_id);
+            *discovered_at = Some(src_link_discovered_at);
+        }
+        graph.push(src_link_node);
     }
-    graph.push(src_link_node);
-
-    // Task → ExternalLink edge (ExternalHandle)
-    let edge_id = project_stable_id(&[
-        "project",
-        "edge",
-        EdgeLabel::ExternalHandle.as_str(),
-        &task_id,
-        &src_link_id,
-    ]);
-    graph.push(GraphRecord::Edge {
-        id: edge_id,
-        schema_version: PROJECT_SCHEMA_VERSION,
-        label: EdgeLabel::ExternalHandle,
-        source: task_id.clone(),
-        target: src_link_id,
-        confidence: None,
-        temporal: None,
-        summary: format!(
-            "Task '{}' has local-file source ExternalLink",
-            task.local_id
-        ),
-        producer: None,
-    });
 }
 
-/// Emit an `AcceptanceCriterion` node and its `OwnedByTask` edge.
+/// Emit an `AcceptanceCriterion` node.
+///
+/// The daemon synthesizes the `OWNED_BY_TASK` edge from
+/// `AcceptanceCriterion.parent_task_id`, so this function does NOT emit that
+/// edge — submitting it would conflict with synthesis and fail ingest.
 fn emit_ac_record(
     graph: &mut Graph,
     ac: &AcLine,
@@ -1945,26 +1979,6 @@ fn emit_ac_record(
         *status = Some(ac.status.clone());
     }
     graph.push(ac_node);
-
-    // AcceptanceCriterion → Task edge (OwnedByTask)
-    let edge_id = project_stable_id(&[
-        "project",
-        "edge",
-        EdgeLabel::OwnedByTask.as_str(),
-        &ac_id,
-        parent_task_id,
-    ]);
-    graph.push(GraphRecord::Edge {
-        id: edge_id,
-        schema_version: PROJECT_SCHEMA_VERSION,
-        label: EdgeLabel::OwnedByTask,
-        source: ac_id,
-        target: parent_task_id.to_owned(),
-        confidence: None,
-        temporal: None,
-        summary: format!("AcceptanceCriterion '{}' owned by task", ac.local_id),
-        producer: None,
-    });
 }
 
 /// Emit an explicit `ExternalLink` node and its `ExternalHandle` edge.
