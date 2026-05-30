@@ -29,6 +29,8 @@ pub mod incremental;
 pub mod ir;
 /// Language-specific extractors.
 pub mod languages;
+/// Evidence-to-code-graph resolver (issue #43).
+pub mod link_evidence;
 /// Local project/task JSONL importer (issue #42).
 pub mod local_project;
 /// Parser orchestration.

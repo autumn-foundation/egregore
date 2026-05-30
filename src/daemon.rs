@@ -5239,10 +5239,11 @@ fn validate_evidence_endpoint_constraints(
                         | NodeKind::CommandRun
                         | NodeKind::TestRun
                         | NodeKind::CIStatus
+                        | NodeKind::PatchArtifact
                 )
             {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a FileEdit, ToolCall, CommandRun, TestRun, or CIStatus source node, not {}",
+                    "evidence link relation '{}' requires a FileEdit, ToolCall, CommandRun, TestRun, CIStatus, or PatchArtifact source node, not {}",
                     label.as_str(),
                     sk.as_str()
                 )));
@@ -7565,15 +7566,20 @@ fn handle_verb_observations_for_symbol(
                 target,
                 temporal,
                 ..
-            } => match temporal.as_ref().map(|t| t.valid_time.as_str()) {
-                Some(vt_str) => chrono::DateTime::parse_from_rfc3339(vt_str)
-                    .ok()
-                    .is_some_and(|vt| vt <= as_of_dt),
-                None => {
-                    retained_node_ids.contains(source.as_str())
-                        && retained_node_ids.contains(target.as_str())
-                }
-            },
+            } => temporal
+                .as_ref()
+                .map(|t| t.valid_time.as_str())
+                .map_or_else(
+                    || {
+                        retained_node_ids.contains(source.as_str())
+                            && retained_node_ids.contains(target.as_str())
+                    },
+                    |vt_str| {
+                        chrono::DateTime::parse_from_rfc3339(vt_str)
+                            .ok()
+                            .is_some_and(|vt| vt <= as_of_dt)
+                    },
+                ),
             GraphRecord::Tombstone { .. } => false,
         });
     }

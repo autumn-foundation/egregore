@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::{
     adapters::{DryRunSink, ingest_records, records_from_jsonl},
     ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan},
+    link_evidence::{self, LinkOptions},
     local_project, query, scan_repository_history_with_override, scan_repository_with_override,
     schema_version::{RecordVersion, record_version},
     traj::{self, ImportOptions},
@@ -125,6 +126,28 @@ enum Commands {
         /// Defaults to the current wall-clock instant.
         #[arg(long)]
         transaction_time: Option<String>,
+    },
+    /// Link imported agent evidence to code-graph facts.
+    ///
+    /// Reads a code-graph JSONL (from `scan`) and an agent-evidence JSONL
+    /// (from `import-traj` or `import-codex`) and resolves every unambiguous
+    /// repo-relative file or symbol handle to a stable code-graph record ID.
+    ///
+    /// Resolved handles emit `TOUCHED_FILE`, `FAILED_ON`, or `MENTIONS_SYMBOL`
+    /// edges in the output JSONL.  Unresolved handles are written to stderr as
+    /// machine-readable JSON diagnostics (one object per line).
+    ///
+    /// Documented in `docs/cli/link-evidence.md`.
+    LinkEvidence {
+        /// Code-graph JSONL produced by `scan`.
+        #[arg(long)]
+        code_graph: PathBuf,
+        /// Agent-evidence JSONL produced by `import-traj` or `import-codex`.
+        #[arg(long)]
+        evidence: PathBuf,
+        /// Output JSONL path for resolved cross-domain edges.
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Query an existing graph JSONL for symbols, files, or drift records.
     Query {
@@ -372,6 +395,11 @@ fn run_cli(cli: Cli) -> Result<()> {
             repo_root.as_deref(),
             transaction_time.as_deref(),
         ),
+        Commands::LinkEvidence {
+            code_graph,
+            evidence,
+            out,
+        } => link_evidence_cmd(&code_graph, &evidence, &out),
         Commands::Query { subcommand } => query_cmd(subcommand),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Daemon { action } => daemon(action),
@@ -436,6 +464,66 @@ fn import_traj_cmd(traj_path: &Path, out: &Path) -> Result<()> {
         "imported {} records from {}",
         graph.records().len(),
         traj_path.display()
+    );
+    Ok(())
+}
+
+fn link_evidence_cmd(code_graph_path: &Path, evidence_path: &Path, out: &Path) -> Result<()> {
+    let cg_jsonl = fs::read_to_string(code_graph_path).with_context(|| {
+        format!(
+            "failed to read code-graph JSONL from {}",
+            code_graph_path.display()
+        )
+    })?;
+    let ev_jsonl = fs::read_to_string(evidence_path).with_context(|| {
+        format!(
+            "failed to read evidence JSONL from {}",
+            evidence_path.display()
+        )
+    })?;
+
+    let code_graph = records_from_jsonl(&cg_jsonl).with_context(|| {
+        format!(
+            "failed to parse code-graph JSONL from {}",
+            code_graph_path.display()
+        )
+    })?;
+    let evidence = records_from_jsonl(&ev_jsonl).with_context(|| {
+        format!(
+            "failed to parse evidence JSONL from {}",
+            evidence_path.display()
+        )
+    })?;
+
+    let link_output = link_evidence::link_evidence(&code_graph, &evidence, &LinkOptions::default());
+
+    // Write diagnostics to stderr as JSON lines (machine-readable, per AC5).
+    for diag in &link_output.diagnostics {
+        let line = serde_json::to_string(diag).context("failed to serialize diagnostic")?;
+        eprintln!("{line}");
+    }
+
+    // Serialize resolved edges as JSONL.
+    let mut lines: Vec<String> = Vec::with_capacity(link_output.edges.len());
+    for edge in &link_output.edges {
+        let line = serde_json::to_string(edge).context("failed to serialize linked edge")?;
+        lines.push(line);
+    }
+    let content = if lines.is_empty() {
+        String::new()
+    } else {
+        let mut s = lines.join("\n");
+        s.push('\n');
+        s
+    };
+
+    fs::write(out, content)
+        .with_context(|| format!("failed to write output to {}", out.display()))?;
+
+    println!(
+        "linked: {} edges resolved, {} diagnostics",
+        link_output.edges.len(),
+        link_output.diagnostics.len()
     );
     Ok(())
 }
