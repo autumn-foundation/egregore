@@ -877,6 +877,42 @@ fn no_wrong_repo_when_code_graph_has_no_repo_node() {
     assert_eq!(output.edges.len(), 1);
 }
 
+#[test]
+fn wrong_repo_diagnostics_for_mixed_repo_code_graph() {
+    // A code graph containing two Repository nodes: one matching, one not.
+    // The file index contains files from both repos (same path), so accepting
+    // such a graph would silently link evidence to the wrong repo's file.
+    let code_graph = vec![
+        make_repo_node("codegraph:v4:repo-abc"),
+        make_file_node("codegraph:v4:file-abc-lib".to_string(), "src/lib.rs"),
+        make_repo_node("codegraph:v4:repo-xyz"),
+        make_file_node("codegraph:v4:file-xyz-lib".to_string(), "src/lib.rs"),
+    ];
+    let evidence = vec![make_agent_memory_node(
+        "agent_memory:v1:edit-1".to_string(),
+        NodeKind::FileEdit,
+        Some("src/lib.rs".to_string()),
+        None,
+        None,
+    )];
+
+    let opts = LinkOptions {
+        expected_repo_id: Some("codegraph:v4:repo-abc".to_string()),
+    };
+    let output = link_evidence::link_evidence(&code_graph, &evidence, &opts);
+
+    assert!(
+        output.edges.is_empty(),
+        "no edges when code graph contains a foreign repository"
+    );
+    assert_eq!(
+        output.diagnostics.len(),
+        1,
+        "one WrongRepo diagnostic per evidence node"
+    );
+    assert_eq!(output.diagnostics[0].reason, DiagnosticReason::WrongRepo);
+}
+
 // ── PatchArtifact TOUCHED_FILE ingestibility ──────────────────────────────────
 
 #[test]

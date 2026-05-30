@@ -111,15 +111,15 @@ struct CodeGraphIndex<'a> {
     files_by_path: BTreeMap<&'a str, &'a str>,
     /// Symbol `name` → Vec of Symbol node IDs (multiple = overloaded name).
     symbols_by_name: BTreeMap<&'a str, Vec<&'a str>>,
-    /// Repository node ID found in the code graph, when present.
-    repo_id: Option<&'a str>,
+    /// All Repository node IDs found in the code graph (normally exactly one).
+    repo_ids: BTreeSet<&'a str>,
 }
 
 impl<'a> CodeGraphIndex<'a> {
     fn build(code_graph: &'a [GraphRecord]) -> Self {
         let mut files_by_path: BTreeMap<&str, &str> = BTreeMap::new();
         let mut symbols_by_name: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        let mut repo_id: Option<&str> = None;
+        let mut repo_ids: BTreeSet<&str> = BTreeSet::new();
 
         for record in code_graph {
             let GraphRecord::Node {
@@ -148,9 +148,7 @@ impl<'a> CodeGraphIndex<'a> {
                     }
                 }
                 NodeKind::Repository => {
-                    if repo_id.is_none() {
-                        repo_id = Some(id.as_str());
-                    }
+                    repo_ids.insert(id.as_str());
                 }
                 _ => {}
             }
@@ -159,7 +157,7 @@ impl<'a> CodeGraphIndex<'a> {
         Self {
             files_by_path,
             symbols_by_name,
-            repo_id,
+            repo_ids,
         }
     }
 }
@@ -189,28 +187,29 @@ pub fn link_evidence(
     let index = CodeGraphIndex::build(code_graph);
 
     // When the caller asserts an expected repository identity, reject evidence
-    // linked against a mismatched code graph rather than emitting stale edges.
+    // if any Repository node in the code graph does not match — including mixed-repo
+    // inputs where one repo matches but a second one's files are also indexed.
     if let Some(expected) = &opts.expected_repo_id {
-        if let Some(actual) = index.repo_id {
-            if actual != expected.as_str() {
-                for record in evidence {
-                    if let GraphRecord::Node {
-                        id, source_handle, ..
-                    } = record
-                    {
-                        output.diagnostics.push(LinkDiagnostic {
-                            source_record_id: id.clone(),
-                            source_handle: source_handle.clone(),
-                            repo_relative_path: None,
-                            symbol_name: None,
-                            reason: DiagnosticReason::WrongRepo,
-                            attempted_relation: "any".to_string(),
-                        });
-                    }
+        let has_wrong_repo =
+            !index.repo_ids.is_empty() && index.repo_ids.iter().any(|&id| id != expected.as_str());
+        if has_wrong_repo {
+            for record in evidence {
+                if let GraphRecord::Node {
+                    id, source_handle, ..
+                } = record
+                {
+                    output.diagnostics.push(LinkDiagnostic {
+                        source_record_id: id.clone(),
+                        source_handle: source_handle.clone(),
+                        repo_relative_path: None,
+                        symbol_name: None,
+                        reason: DiagnosticReason::WrongRepo,
+                        attempted_relation: "any".to_string(),
+                    });
                 }
-                output.diagnostics.sort();
-                return output;
             }
+            output.diagnostics.sort();
+            return output;
         }
     }
 
