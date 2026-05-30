@@ -463,7 +463,24 @@ fn import_file(
         path: file_path.to_path_buf(),
         source,
     })?;
-    let file_rel = repo_relative(file_path, repo_root);
+    // Compute repo-relative path; reject files outside the repo root so that
+    // absolute machine paths never appear in stable IDs or source handles.
+    let file_rel = {
+        let canonical_root = repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| repo_root.to_path_buf());
+        let canonical_file = file_path
+            .canonicalize()
+            .unwrap_or_else(|_| file_path.to_path_buf());
+        canonical_file
+            .strip_prefix(&canonical_root)
+            .map_err(|_| CodegraphError::PathOutsideRepository {
+                path: file_path.to_path_buf(),
+                root: repo_root.to_path_buf(),
+            })?
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
     let mut diag_count: usize = 0;
 
     // ── First line: must be a header ──────────────────────────────────────────
@@ -811,27 +828,59 @@ fn import_file(
                     continue;
                 }
 
-                // Validate body handle object: when body is an object it must have
-                // both "hash" (str) and "bytes" (u64); missing fields mean the
-                // pre-computed handle is corrupt — skip the row rather than
-                // persisting a Task with a silently incorrect body handle.
-                if let Some(serde_json::Value::Object(ref obj)) = task.body {
-                    let hash_ok = obj
-                        .get("hash")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some();
-                    let bytes_ok = obj
-                        .get("bytes")
-                        .and_then(serde_json::Value::as_u64)
-                        .is_some();
-                    if !hash_ok || !bytes_ok {
+                // Validate body type and content:
+                // - null / absent: fine (no body)
+                // - string: fine (inline body text)
+                // - object: must have "hash" (non-empty str) and "bytes" (u64)
+                // - anything else (array, number, bool): invalid schema, skip
+                match &task.body {
+                    None | Some(serde_json::Value::String(_)) => {}
+                    Some(serde_json::Value::Object(obj)) => {
+                        let hash_str = obj
+                            .get("hash")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|h| !h.is_empty());
+                        let bytes_ok = obj
+                            .get("bytes")
+                            .and_then(serde_json::Value::as_u64)
+                            .is_some();
+                        if hash_str.is_none() || !bytes_ok {
+                            let missing = if hash_str.is_none() { "hash" } else { "bytes" };
+                            let diag_id = per_line_diag_id(
+                                &[
+                                    "project",
+                                    "Diagnostic",
+                                    SOURCE_KIND,
+                                    &file_rel,
+                                    "missing_body_bytes",
+                                    &task.local_id,
+                                ],
+                                line_idx,
+                            );
+                            push_diagnostic(
+                                graph,
+                                &diag_id,
+                                Some(&file_rel),
+                                &format!(
+                                    "[missing_body_bytes] task '{}' at line {} has a body object missing or empty required '{missing}' field",
+                                    task.local_id,
+                                    line_idx + 1,
+                                ),
+                                transaction_time,
+                            );
+                            diag_count += 1;
+                            continue;
+                        }
+                    }
+                    Some(_) => {
+                        // Body is a number, bool, or array — not allowed by the schema.
                         let diag_id = per_line_diag_id(
                             &[
                                 "project",
                                 "Diagnostic",
                                 SOURCE_KIND,
                                 &file_rel,
-                                "missing_body_bytes",
+                                "invalid_body_type",
                                 &task.local_id,
                             ],
                             line_idx,
@@ -841,10 +890,9 @@ fn import_file(
                             &diag_id,
                             Some(&file_rel),
                             &format!(
-                                "[missing_body_bytes] task '{}' at line {} has a body object missing required '{}' field",
+                                "[invalid_body_type] task '{}' at line {} has a body that is not null, a string, or a handle object",
                                 task.local_id,
                                 line_idx + 1,
-                                if hash_ok { "bytes" } else { "hash" }
                             ),
                             transaction_time,
                         );
@@ -1279,6 +1327,65 @@ fn import_file(
                             diag_count += 1;
                             continue;
                         }
+                        // Refinement timestamps become ExternalLink.discovered_at and
+                        // valid_time; validate them before storing so a malformed
+                        // refinement doesn't cause the whole ingest batch to fail.
+                        if chrono::DateTime::parse_from_rfc3339(&link.discovered_at).is_err() {
+                            let diag_id = per_line_diag_id(
+                                &[
+                                    "project",
+                                    "Diagnostic",
+                                    SOURCE_KIND,
+                                    &file_rel,
+                                    "external_link_invalid_timestamp",
+                                    &link.local_id,
+                                    "discovered_at",
+                                ],
+                                line_idx,
+                            );
+                            push_diagnostic(
+                                graph,
+                                &diag_id,
+                                Some(&file_rel),
+                                &format!(
+                                    "[external_link_invalid_timestamp] refinement '{}' at line {} has invalid discovered_at='{}'",
+                                    link.local_id,
+                                    line_idx + 1,
+                                    link.discovered_at,
+                                ),
+                                transaction_time,
+                            );
+                            diag_count += 1;
+                            continue;
+                        }
+                        if chrono::DateTime::parse_from_rfc3339(&link.updated_at).is_err() {
+                            let diag_id = per_line_diag_id(
+                                &[
+                                    "project",
+                                    "Diagnostic",
+                                    SOURCE_KIND,
+                                    &file_rel,
+                                    "external_link_invalid_timestamp",
+                                    &link.local_id,
+                                    "updated_at",
+                                ],
+                                line_idx,
+                            );
+                            push_diagnostic(
+                                graph,
+                                &diag_id,
+                                Some(&file_rel),
+                                &format!(
+                                    "[external_link_invalid_timestamp] refinement '{}' at line {} has invalid updated_at='{}'",
+                                    link.local_id,
+                                    line_idx + 1,
+                                    link.updated_at,
+                                ),
+                                transaction_time,
+                            );
+                            diag_count += 1;
+                            continue;
+                        }
                         src_link_refinements.insert(
                             link.parent_local_id.clone(),
                             SrcLinkRefinement {
@@ -1648,22 +1755,21 @@ fn emit_task_records(
         |r| (opts.redact)(&r.url),
     );
 
-    // Body handle
-    // When body is a JSON object it was validated in the first pass: "hash" (str)
-    // and "bytes" (u64) are guaranteed present; malformed objects skip the row there.
+    // Body handle — first pass guarantees: None, String, or valid Object
+    // (non-empty hash str + u64 bytes); all other shapes are rejected there.
     let body_h = match &task.body {
         None => body_handle_for(""),
         Some(serde_json::Value::String(s)) => body_handle_for(&(opts.redact)(s)),
         Some(serde_json::Value::Object(obj)) => {
-            // Safe: validated in first-pass (see task_invalid_body_handle check).
+            // Safe: validated in first-pass (non-empty hash + bytes guaranteed).
             let h = obj
                 .get("hash")
                 .and_then(serde_json::Value::as_str)
-                .expect("validated");
+                .expect("validated non-empty hash");
             let b = obj
                 .get("bytes")
                 .and_then(serde_json::Value::as_u64)
-                .expect("validated");
+                .expect("validated bytes");
             let inline = obj
                 .get("inline")
                 .and_then(serde_json::Value::as_str)
@@ -1674,7 +1780,7 @@ fn emit_task_records(
                 inline,
             }
         }
-        Some(other) => body_handle_for(&(opts.redact)(&other.to_string())),
+        Some(_) => unreachable!("non-string/non-object body rejected in first pass"),
     };
     let title = (opts.redact)(&task.title);
     let assignees: Vec<String> = task.assignees.iter().map(|a| (opts.redact)(a)).collect();
@@ -1764,7 +1870,13 @@ fn emit_task_records(
     graph.push(src_link_node);
 
     // Task → ExternalLink edge (ExternalHandle)
-    let edge_id = project_stable_id(&["project", "edge", "ExternalHandle", &task_id, &src_link_id]);
+    let edge_id = project_stable_id(&[
+        "project",
+        "edge",
+        EdgeLabel::ExternalHandle.as_str(),
+        &task_id,
+        &src_link_id,
+    ]);
     graph.push(GraphRecord::Edge {
         id: edge_id,
         schema_version: PROJECT_SCHEMA_VERSION,
@@ -1835,7 +1947,13 @@ fn emit_ac_record(
     graph.push(ac_node);
 
     // AcceptanceCriterion → Task edge (OwnedByTask)
-    let edge_id = project_stable_id(&["project", "edge", "OwnedByTask", &ac_id, parent_task_id]);
+    let edge_id = project_stable_id(&[
+        "project",
+        "edge",
+        EdgeLabel::OwnedByTask.as_str(),
+        &ac_id,
+        parent_task_id,
+    ]);
     graph.push(GraphRecord::Edge {
         id: edge_id,
         schema_version: PROJECT_SCHEMA_VERSION,
@@ -1865,11 +1983,12 @@ fn emit_external_link_record(
     opts: &ImportOptions,
     transaction_time: &str,
 ) {
+    // ExternalLink identity is (system, system_native_id) per the project schema —
+    // no file_rel so the same external handle referenced from multiple task files
+    // maps to one canonical ExternalLink node rather than per-file duplicates.
     let link_id = project_stable_id(&[
         "project",
         "ExternalLink",
-        SOURCE_KIND,
-        file_rel,
         &link.system,
         &link.system_native_id,
     ]);
@@ -1917,7 +2036,7 @@ fn emit_external_link_record(
     let edge_id = project_stable_id(&[
         "project",
         "edge",
-        "ExternalHandle",
+        EdgeLabel::ExternalHandle.as_str(),
         parent_stable_id,
         &link_id,
     ]);
