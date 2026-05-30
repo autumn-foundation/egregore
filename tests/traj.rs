@@ -510,6 +510,7 @@ fn redaction_hook_is_applied_to_free_text() {
     let sentinel = "__REDACTED__";
     let opts = ImportOptions {
         redact: Box::new(|_s| sentinel.to_owned()),
+        policy_version: None,
     };
     let graph = import_traj(Path::new(FIXTURE), &opts).expect("import with custom redactor");
     let records = graph.records();
