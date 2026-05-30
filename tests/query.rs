@@ -3240,6 +3240,234 @@ fn symbol_context_temporal_relay_node_survives_tombstone() {
     );
 }
 
+// ── Finding: temporal cross-domain edge must survive tombstone ───────────────
+//
+// The BFS edge arm's unconditional tombstone check suppresses historical
+// cross-domain edges whose stable ID is tombstoned in the current state.
+// A temporal edge must be exempt: its tombstone reflects only a current-state
+// deletion, not the historical link that is cited in scan-history output.
+
+#[test]
+fn symbol_context_temporal_cross_domain_edge_survives_tombstone() {
+    // Symbol S (current-state)
+    // Observation O (temporal, commit A)
+    // MENTIONS_SYMBOL edge E (temporal, commit A): O → S
+    // Tombstone for edge E's stable ID (current-state deletion of the edge)
+    // Expected: O still appears in observations
+    let sym_id = "codegraph:v4:temporal_cde_sym001";
+    let sym = ctx_symbol(sym_id, "temporal_cde_fn", "src/lib.rs", 1);
+
+    let obs_id = agent_memory_stable_id(&["obs", "temporal_cde_obs"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "historical observation about temporal_cde_fn".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+    }
+
+    // Temporal MENTIONS_SYMBOL edge: O → S (historical link, commit A)
+    let edge = GraphRecord::agent_memory_edge(
+        EdgeLabel::MentionsSymbol,
+        obs_id.clone(),
+        sym_id.to_owned(),
+        Some("1.0".to_owned()),
+        "temporal edge: obs mentions symbol at commit A".to_owned(),
+    )
+    .with_temporal(temporal("aaaaaaaa", "2026-01-01T00:00:00Z"));
+    let edge_id = edge.id().to_owned();
+
+    // Current-state tombstone for the edge's stable ID
+    let edge_tombstone = GraphRecord::Tombstone {
+        id: "tombstone:temporal_cde_edge".to_owned(),
+        schema_version: 0,
+        deleted_id: edge_id,
+        summary: "edge deleted in current state".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![sym, obs, edge, edge_tombstone];
+    let ctx = symbol_context(&records, "temporal_cde_fn");
+
+    assert!(!ctx.is_no_match(), "symbol must be found");
+    assert!(
+        ctx.observations.iter().any(|r| r.id() == obs_id.as_str()),
+        "historical observation must appear in observations via temporal edge \
+         even though the edge stable ID is tombstoned in current state"
+    );
+}
+
+// ── Finding: tombstoned non-temporal topology edge must not appear in output ──
+//
+// When `topology_edge_ids` is populated by a temporal edge (exempt from the
+// tombstone guard), the final collection must still exclude any non-temporal
+// record with the same stable ID that is in tombstoned_ids. Without filtering,
+// a deleted current-state DEFINES edge would be emitted alongside the historical
+// one, producing indistinguishable entries for consumers.
+
+#[test]
+fn symbol_context_tombstoned_current_topology_edge_excluded_from_output() {
+    // Symbol S, File F — both non-temporal (live)
+    // DEFINES edge (temporal, commit A): F → S (historical snapshot)
+    // DEFINES edge (non-temporal, current): same stable ID (same source/target/label)
+    // Tombstone for the DEFINES edge stable ID
+    // Expected: topology_edges contains ONLY the temporal version, NOT the non-temporal one
+    let sym_id = "codegraph:v4:topo_filter_sym001";
+    let sym = ctx_symbol(sym_id, "topo_filter_fn", "src/lib.rs", 1);
+
+    let file_id = aletheia_egregore::ir::stable_id(&["file", "topo_filter_file"]);
+    let file = GraphRecord::node(
+        file_id.clone(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        None,
+        "src/lib.rs".to_owned(),
+    );
+
+    // Temporal DEFINES edge: same stable ID will be shared with non-temporal below
+    let defines_temporal = GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id.clone(),
+        sym_id.to_owned(),
+        None,
+        "temporal defines edge".to_owned(),
+    )
+    .with_temporal(temporal("aaaaaaaa", "2026-01-01T00:00:00Z"));
+    let defines_edge_id = defines_temporal.id().to_owned();
+
+    // Non-temporal DEFINES edge: same source/target/label → same stable ID
+    let defines_current = GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id,
+        sym_id.to_owned(),
+        None,
+        "temporal defines edge".to_owned(), // same summary = same ID
+    );
+
+    // Tombstone for the shared stable ID (current-state deletion)
+    let edge_tombstone = GraphRecord::Tombstone {
+        id: "tombstone:topo_filter_edge".to_owned(),
+        schema_version: 0,
+        deleted_id: defines_edge_id.clone(),
+        summary: "DEFINES edge tombstoned".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![sym, file, defines_temporal, defines_current, edge_tombstone];
+    let ctx = symbol_context(&records, "topo_filter_fn");
+
+    assert!(!ctx.is_no_match(), "symbol must be found");
+    let topo_count = ctx
+        .topology_edges
+        .iter()
+        .filter(|r| r.id() == defines_edge_id.as_str())
+        .count();
+    assert_eq!(
+        topo_count, 1,
+        "topology_edges must contain only the temporal DEFINES edge (not the tombstoned \
+         non-temporal version); got {topo_count} records with that stable ID"
+    );
+    // The one record must be the temporal version
+    let is_temporal = ctx.topology_edges.iter().any(|r| {
+        r.id() == defines_edge_id.as_str()
+            && matches!(
+                r,
+                GraphRecord::Edge {
+                    temporal: Some(_),
+                    ..
+                }
+            )
+    });
+    assert!(
+        is_temporal,
+        "the single topology edge in the output must be the temporal version"
+    );
+}
+
+// ── Finding: triple evidence links must be gated to seed file paths ───────────
+//
+// The pure-triple else branch (nodes with only triple-form evidence links and no
+// resolved target_record_id) adds every triple to `unresolved` without checking
+// whether the triple's target_repo_relative_path actually matches a seed file.
+// An unrelated agent-memory node citing a DIFFERENT file via triple must not
+// pollute the context for the queried symbol.
+
+#[test]
+fn symbol_context_unrelated_triple_evidence_link_not_in_unresolved() {
+    // Symbol S at "src/lib.rs"
+    // Unrelated Observation O: triple evidence link → "src/other.rs" (different file)
+    // Expected: the triple does NOT appear in ctx.unresolved
+    let sym_id = "codegraph:v4:triple_gate_sym001";
+    let sym = ctx_symbol(sym_id, "triple_gate_fn", "src/lib.rs", 1);
+
+    let unrelated_obs_id = agent_memory_stable_id(&["obs", "triple_gate_unrelated"]);
+    let mut unrelated_obs = GraphRecord::node(
+        unrelated_obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "observation about other.rs, not lib.rs".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut agent_id,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut confidence,
+        ref mut evidence_links,
+        ..
+    } = unrelated_obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent:test".to_owned());
+        *session_id = Some("session:test".to_owned());
+        *observed_at = Some("2026-01-15T10:00:00Z".to_owned());
+        *confidence = Some("0.8".to_owned());
+        // Triple-form only, targeting a DIFFERENT file than the queried symbol
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: None,
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "0.8".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: Some("src/other.rs".to_owned()),
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let records = vec![sym, unrelated_obs];
+    let ctx = symbol_context(&records, "triple_gate_fn");
+
+    assert!(!ctx.is_no_match(), "symbol must be found");
+    assert!(
+        ctx.unresolved
+            .iter()
+            .all(|u| u.source_record_id != unrelated_obs_id),
+        "triple citation targeting 'src/other.rs' must NOT appear in unresolved \
+         when querying a symbol in 'src/lib.rs'; got: {:?}",
+        ctx.unresolved
+    );
+}
+
 // ── Finding: temporal topology edge must survive tombstone ────────────────────
 //
 // The topology_edge_ids collection uses an unconditional tombstone guard. When a

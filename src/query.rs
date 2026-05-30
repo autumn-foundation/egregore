@@ -378,6 +378,23 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
     // file-scoped relations such as CommandRun --TOUCHED_FILE--> File.
     let seed_ids: BTreeSet<&str> = source_facts.iter().copied().collect();
 
+    // Paths from seed nodes (Symbol + File) for gating triple-form evidence links.
+    // Only triple-only citations whose target_repo_relative_path matches a seed path
+    // are surfaced in `unresolved`; unrelated citations to other files must not
+    // pollute the context for the queried symbol.
+    let seed_paths: BTreeSet<&str> = seed_ids
+        .iter()
+        .filter_map(|id| {
+            by_id.get(id).and_then(|r| match r {
+                GraphRecord::Node {
+                    repo_relative_path: Some(p),
+                    ..
+                } => Some(p.as_str()),
+                _ => None,
+            })
+        })
+        .collect();
+
     // Step 2b: collect topology edges where BOTH endpoints are in seed_ids.
     // These provide citable provenance for the file→symbol definition
     // relationship (and other structural topology) without BFS traversal.
@@ -501,7 +518,12 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                     }
                     // Skip tombstoned edges — a retracted relationship must not
                     // carry the BFS to its formerly-linked node.
-                    if tombstoned_ids.contains(edge_id.as_str()) {
+                    // Temporal guard: a historical edge is exempt from current-state
+                    // tombstone suppression. The tombstone reflects a current deletion;
+                    // a temporal edge carries valid historical provenance.
+                    if tombstoned_ids.contains(edge_id.as_str())
+                        && !has_any_temporal_version.contains(edge_id.as_str())
+                    {
                         continue;
                     }
                     let candidate = if frontier.contains(source.as_str()) {
@@ -632,6 +654,16 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                                     let Some(handle) = evidence_link_triple_handle(link) else {
                                         continue;
                                     };
+                                    // Only surface triples that target one of the seed file
+                                    // paths; unrelated citations to other files must not
+                                    // pollute the context for the queried symbol.
+                                    if !link
+                                        .target_repo_relative_path
+                                        .as_deref()
+                                        .is_some_and(|p| seed_paths.contains(p))
+                                    {
+                                        continue;
+                                    }
                                     unresolved.push(UnresolvedRef {
                                         source_record_id: node_id.clone(),
                                         target_handle: handle,
@@ -744,7 +776,10 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                 if !is_cross_domain_label(*label) {
                     continue;
                 }
-                if tombstoned_ids.contains(edge_id.as_str()) {
+                // Same temporal guard as the main BFS edge arm.
+                if tombstoned_ids.contains(edge_id.as_str())
+                    && !has_any_temporal_version.contains(edge_id.as_str())
+                {
                     continue;
                 }
                 let candidate = if extra_frontier.contains(source.as_str()) {
@@ -839,7 +874,17 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
         topology_edges: {
             let mut out: Vec<&'a GraphRecord> = records
                 .iter()
-                .filter(|r| topology_edge_ids.contains(r.id()))
+                .filter(|r| {
+                    topology_edge_ids.contains(r.id())
+                        // Exclude non-temporal records whose ID is tombstoned.
+                        // Temporal (historical) versions of the same stable ID must be kept.
+                        && match r {
+                            GraphRecord::Edge {
+                                temporal: Some(_), ..
+                            } => true,
+                            _ => !tombstoned_ids.contains(r.id()),
+                        }
+                })
                 .collect();
             out.sort_by_key(|r| r.id());
             out
