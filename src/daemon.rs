@@ -7268,10 +7268,11 @@ fn context_observation_to_json(record: &GraphRecord) -> serde_json::Value {
     else {
         return json!({ "record_id": record.id() });
     };
-    let provenance_handle = agent_id
-        .as_deref()
-        .zip(session_id.as_deref())
-        .map(|(a, s)| format!("{a}:{s}"));
+    let provenance_handle = match (agent_id.as_deref(), session_id.as_deref()) {
+        (Some(a), Some(s)) => Some(format!("{a}:{s}")),
+        (Some(a), None) => Some(a.to_owned()),
+        _ => None,
+    };
     let links = evidence_links.as_deref().unwrap_or(&[]);
     json!({
         "record_id": id,
@@ -7380,13 +7381,17 @@ struct ContextSections {
 }
 
 fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) -> ContextSections {
-    let source_facts = ctx
+    let mut rem = limit;
+
+    let source_facts: Vec<_> = ctx
         .source_facts
         .iter()
-        .take(limit)
+        .take(rem)
         .map(|r| context_source_fact_to_json(r))
         .collect();
-    let topology_edges = ctx
+    rem = rem.saturating_sub(source_facts.len());
+
+    let topology_edges: Vec<_> = ctx
         .topology_edges
         .iter()
         .filter_map(|r| {
@@ -7410,36 +7415,46 @@ fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) ->
                 None
             }
         })
-        .take(limit)
+        .take(rem)
         .collect();
-    let observations = ctx
+    rem = rem.saturating_sub(topology_edges.len());
+
+    let observations: Vec<_> = ctx
         .observations
         .iter()
-        .take(limit)
+        .take(rem)
         .map(|r| context_observation_to_json(r))
         .collect();
-    let project_state = ctx
+    rem = rem.saturating_sub(observations.len());
+
+    let project_state: Vec<_> = ctx
         .project_state
         .iter()
-        .take(limit)
+        .take(rem)
         .map(|r| context_linked_item_to_json(r))
         .collect();
-    let artifacts = ctx
+    rem = rem.saturating_sub(project_state.len());
+
+    let artifacts: Vec<_> = ctx
         .artifacts
         .iter()
-        .take(limit)
+        .take(rem)
         .map(|r| context_linked_item_to_json(r))
         .collect();
-    let verification_evidence = ctx
+    rem = rem.saturating_sub(artifacts.len());
+
+    let verification_evidence: Vec<_> = ctx
         .verification_evidence
         .iter()
-        .take(limit)
+        .take(rem)
         .map(|r| context_linked_item_to_json(r))
         .collect();
-    let unresolved = ctx
+    rem = rem.saturating_sub(verification_evidence.len());
+
+    let unresolved: Vec<_> = ctx
         .unresolved
         .iter()
-        .take(limit)
+        .take(rem)
         .map(|u| {
             json!({
                 "source_record_id": u.source_record_id,
@@ -7450,6 +7465,7 @@ fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) ->
             })
         })
         .collect();
+
     ContextSections {
         source_facts,
         topology_edges,
@@ -7464,6 +7480,7 @@ fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) ->
 fn handle_verb_observations_for_symbol(
     request_id: &str,
     params: &serde_json::Value,
+    as_of_valid_time: Option<&str>,
     limit: usize,
     started: Instant,
     budget: Option<Duration>,
@@ -7476,12 +7493,56 @@ fn handle_verb_observations_for_symbol(
         }
     };
 
-    let (records, snapshot) = match load_cross_domain_records(state, started, budget) {
+    let (mut records, snapshot) = match load_cross_domain_records(state, started, budget) {
         Ok(r) => r,
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
 
+    // Apply as_of.valid_time: exclude records whose valid_time is after the cutoff.
+    // Records with no valid_time are excluded from point-in-time queries (consistent
+    // with other temporal verbs).
+    if let Some(as_of) = as_of_valid_time {
+        let as_of_dt = match chrono::DateTime::parse_from_rfc3339(as_of) {
+            Ok(dt) => dt,
+            Err(e) => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request(format!("invalid as_of.valid_time: {e}")),
+                );
+            }
+        };
+        records.retain(|r| match r {
+            GraphRecord::Node {
+                temporal,
+                valid_time,
+                ..
+            } => {
+                let vt_str = temporal
+                    .as_ref()
+                    .map(|t| t.valid_time.as_str())
+                    .or(valid_time.as_deref());
+                vt_str
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .is_some_and(|vt| vt <= as_of_dt)
+            }
+            GraphRecord::Edge { temporal, .. } => {
+                let vt_str = temporal.as_ref().map(|t| t.valid_time.as_str());
+                vt_str.is_some_and(|s| {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .ok()
+                        .is_some_and(|vt| vt <= as_of_dt)
+                })
+            }
+            GraphRecord::Tombstone { .. } => true,
+        });
+    }
+
     let ctx = graph_query::symbol_context(&records, &name);
+
+    // Recheck budget after BFS traversal (potentially expensive for large stores).
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
 
     if ctx.is_no_match() {
         return HttpResponse::error_with_id(
@@ -7645,9 +7706,15 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             &domain,
             state,
         ),
-        "observations_for_symbol" => {
-            handle_verb_observations_for_symbol(&request_id, &params, limit, started, budget, state)
-        }
+        "observations_for_symbol" => handle_verb_observations_for_symbol(
+            &request_id,
+            &params,
+            as_of_valid_time.as_deref(),
+            limit,
+            started,
+            budget,
+            state,
+        ),
         "drift" | "agent_sessions_for_repo" | "criteria_for_task" => HttpResponse::error_with_id(
             &request_id,
             ApiError::new(
