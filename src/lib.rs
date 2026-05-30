@@ -29,6 +29,8 @@ pub mod incremental;
 pub mod ir;
 /// Language-specific extractors.
 pub mod languages;
+/// Local project/task JSONL importer (issue #42).
+pub mod local_project;
 /// Parser orchestration.
 pub mod parser;
 /// Agent-facing graph query helpers.
@@ -51,8 +53,9 @@ pub use ir::{
     SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, SelectionBasis,
     SemanticDriftMetadata, SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION,
     UserContextFields, UserContextScope, agent_memory_stable_id, artifact_stable_id,
-    semantic_stable_id, stable_id, user_context_stable_id,
+    project_stable_id, semantic_stable_id, stable_id, user_context_stable_id,
 };
+pub use local_project::import_local_tasks;
 pub use query::{SymbolContext, UnresolvedRef, symbol_context};
 pub use schema_version::{
     RecordLineRead, RecordReadError, RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE,

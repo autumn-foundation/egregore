@@ -7477,6 +7477,7 @@ fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) ->
     }
 }
 
+#[allow(clippy::option_if_let_else)]
 fn handle_verb_observations_for_symbol(
     request_id: &str,
     params: &serde_json::Value,
