@@ -7199,6 +7199,254 @@ fn handle_verb_drift_top_n(
     )
 }
 
+// ── Verb handler: observations_for_symbol (issue #38) ────────────────────────
+
+/// Loads all records from every domain without any prefix filtering.
+///
+/// `observations_for_symbol` is a cross-domain query: it needs codegraph
+/// Symbol/File records AND agent_memory Observation records AND project Task
+/// records AND verification Evidence records in a single pass so that
+/// [`graph_query::symbol_context`] can traverse cross-domain edges.
+fn load_cross_domain_records(
+    state: &ServerState,
+    started: Instant,
+    budget: Option<Duration>,
+) -> std::result::Result<(Vec<GraphRecord>, String), ApiError> {
+    let sink = query_sink_read(state, started, budget)?;
+    let snapshot = rfc3339_now();
+    let records = sink.read_all_records().map_err(adapter_read_error_to_api)?;
+    drop(sink);
+    check_query_budget(started, budget)?;
+    Ok((records, snapshot))
+}
+
+fn context_source_fact_to_json(record: &GraphRecord) -> serde_json::Value {
+    let GraphRecord::Node {
+        id,
+        kind,
+        name,
+        repo_relative_path,
+        span,
+        temporal,
+        valid_time,
+        language,
+        symbol_kind,
+        ..
+    } = record
+    else {
+        return json!({ "record_id": record.id() });
+    };
+    json!({
+        "record_id": id,
+        "kind": kind.as_str(),
+        "name": name,
+        "repo_relative_path": repo_relative_path,
+        "span": span,
+        "git_commit": temporal.as_ref().map(|t| t.git_commit.as_str()),
+        "valid_time": valid_time.as_deref()
+            .or_else(|| temporal.as_ref().map(|t| t.valid_time.as_str())),
+        "language": language,
+        "symbol_kind": symbol_kind,
+    })
+}
+
+fn context_observation_to_json(record: &GraphRecord) -> serde_json::Value {
+    let GraphRecord::Node {
+        id,
+        kind,
+        summary,
+        text,
+        agent_id,
+        session_id,
+        observed_at,
+        confidence,
+        failure_kind,
+        exit_code,
+        evidence_links,
+        ..
+    } = record
+    else {
+        return json!({ "record_id": record.id() });
+    };
+    let provenance_handle = agent_id
+        .as_deref()
+        .zip(session_id.as_deref())
+        .map(|(a, s)| format!("{a}:{s}"));
+    let links = evidence_links.as_deref().unwrap_or(&[]);
+    json!({
+        "record_id": id,
+        "kind": kind.as_str(),
+        "summary": summary,
+        "text": text,
+        "provenance_handle": provenance_handle,
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "observed_at": observed_at,
+        "confidence": confidence,
+        "failure_kind": failure_kind,
+        "exit_code": exit_code,
+        "evidence_links": serde_json::to_value(links).unwrap_or_default(),
+    })
+}
+
+fn context_linked_item_to_json(record: &GraphRecord) -> serde_json::Value {
+    let GraphRecord::Node {
+        id,
+        kind,
+        summary,
+        title,
+        name,
+        text,
+        status,
+        verification_kind,
+        exit_code,
+        executed_at,
+        evidence_quality,
+        repo_relative_path,
+        body_handle,
+        evidence_links,
+        ..
+    } = record
+    else {
+        return json!({ "record_id": record.id() });
+    };
+    let links = evidence_links.as_deref().unwrap_or(&[]);
+    json!({
+        "record_id": id,
+        "kind": kind.as_str(),
+        "summary": summary,
+        "title": title,
+        "name": name,
+        "text": text,
+        "status": status,
+        "verification_kind": verification_kind,
+        "exit_code": exit_code,
+        "executed_at": executed_at,
+        "evidence_quality": evidence_quality,
+        "repo_relative_path": repo_relative_path,
+        "body_handle": body_handle.as_deref().map(|h| serde_json::to_value(h).unwrap_or_default()),
+        "evidence_links": serde_json::to_value(links).unwrap_or_default(),
+    })
+}
+
+fn handle_verb_observations_for_symbol(
+    request_id: &str,
+    params: &serde_json::Value,
+    started: Instant,
+    budget: Option<Duration>,
+    state: &ServerState,
+) -> HttpResponse {
+    let name = match params.get("name").and_then(serde_json::Value::as_str) {
+        Some(n) => n.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(request_id, ApiError::missing_field("params.name"));
+        }
+    };
+
+    let (records, snapshot) = match load_cross_domain_records(state, started, budget) {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+
+    let ctx = graph_query::symbol_context(&records, &name);
+
+    if ctx.is_no_match() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::not_found(format!("no records found for symbol '{name}'")),
+        );
+    }
+
+    let source_facts: Vec<serde_json::Value> = ctx
+        .source_facts
+        .iter()
+        .map(|r| context_source_fact_to_json(r))
+        .collect();
+
+    let topology_edges: Vec<serde_json::Value> = ctx
+        .topology_edges
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Edge {
+                id,
+                label,
+                source,
+                target,
+                summary,
+                temporal,
+                ..
+            } = r
+            {
+                Some(json!({
+                    "record_id": id,
+                    "label": label.as_str(),
+                    "source_id": source,
+                    "target_id": target,
+                    "summary": summary,
+                    "git_commit": temporal.as_ref().map(|t| t.git_commit.as_str()),
+                }))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let observations: Vec<serde_json::Value> = ctx
+        .observations
+        .iter()
+        .map(|r| context_observation_to_json(r))
+        .collect();
+
+    let project_state: Vec<serde_json::Value> = ctx
+        .project_state
+        .iter()
+        .map(|r| context_linked_item_to_json(r))
+        .collect();
+
+    let artifacts: Vec<serde_json::Value> = ctx
+        .artifacts
+        .iter()
+        .map(|r| context_linked_item_to_json(r))
+        .collect();
+
+    let verification_evidence: Vec<serde_json::Value> = ctx
+        .verification_evidence
+        .iter()
+        .map(|r| context_linked_item_to_json(r))
+        .collect();
+
+    let unresolved: Vec<serde_json::Value> = ctx
+        .unresolved
+        .iter()
+        .map(|u| {
+            json!({
+                "source_record_id": u.source_record_id,
+                "target_handle": u.target_handle,
+                "relation": u.relation,
+                "target_domain": u.target_domain,
+                "verification_status": "unresolved",
+            })
+        })
+        .collect();
+
+    HttpResponse::success(
+        Some(request_id),
+        200,
+        json!({
+            "verb": "observations_for_symbol",
+            "snapshot": snapshot,
+            "symbol_name": name,
+            "source_facts": source_facts,
+            "topology_edges": topology_edges,
+            "observations": observations,
+            "project_state": project_state,
+            "artifacts": artifacts,
+            "verification_evidence": verification_evidence,
+            "unresolved": unresolved,
+        }),
+    )
+}
+
 // ── Main query handler ────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
@@ -7334,15 +7582,16 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             &domain,
             state,
         ),
-        "drift" | "observations_for_symbol" | "agent_sessions_for_repo" | "criteria_for_task" => {
-            HttpResponse::error_with_id(
-                &request_id,
-                ApiError::new(
-                    ErrorCode::NotImplemented,
-                    format!("verb '{verb}' is reserved and not yet implemented"),
-                ),
-            )
+        "observations_for_symbol" => {
+            handle_verb_observations_for_symbol(&request_id, &params, started, budget, state)
         }
+        "drift" | "agent_sessions_for_repo" | "criteria_for_task" => HttpResponse::error_with_id(
+            &request_id,
+            ApiError::new(
+                ErrorCode::NotImplemented,
+                format!("verb '{verb}' is reserved and not yet implemented"),
+            ),
+        ),
         _ => HttpResponse::error_with_id(
             &request_id,
             ApiError::bad_request_field(format!("unknown verb '{verb}'"), "verb"),
