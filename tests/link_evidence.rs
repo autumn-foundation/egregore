@@ -35,14 +35,24 @@ fn link_evidence_agent_session() -> Vec<GraphRecord> {
 }
 
 const fn is_touched_file_edge(r: &GraphRecord) -> bool {
-    matches!(r, GraphRecord::Edge { label: EdgeLabel::TouchedFile, .. })
+    matches!(
+        r,
+        GraphRecord::Edge {
+            label: EdgeLabel::TouchedFile,
+            ..
+        }
+    )
 }
 
 fn file_node_ids(records: &[GraphRecord]) -> Vec<&str> {
     records
         .iter()
         .filter_map(|r| match r {
-            GraphRecord::Node { id, kind: NodeKind::File, .. } => Some(id.as_str()),
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::File,
+                ..
+            } => Some(id.as_str()),
             _ => None,
         })
         .collect()
@@ -52,7 +62,11 @@ fn file_edit_ids(records: &[GraphRecord]) -> Vec<&str> {
     records
         .iter()
         .filter_map(|r| match r {
-            GraphRecord::Node { id, kind: NodeKind::FileEdit, .. } => Some(id.as_str()),
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::FileEdit,
+                ..
+            } => Some(id.as_str()),
             _ => None,
         })
         .collect()
@@ -62,7 +76,11 @@ fn verification_ids(records: &[GraphRecord]) -> Vec<&str> {
     records
         .iter()
         .filter_map(|r| match r {
-            GraphRecord::Node { id, kind: NodeKind::Verification, .. } => Some(id.as_str()),
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::Verification,
+                ..
+            } => Some(id.as_str()),
             _ => None,
         })
         .collect()
@@ -195,6 +213,17 @@ fn make_symbol_node(id: String, path: &str, name: &str) -> GraphRecord {
     )
 }
 
+fn make_repo_node(id: &str) -> GraphRecord {
+    GraphRecord::node(
+        id.to_string(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some(id.to_string()),
+        format!("Repository {id}"),
+    )
+}
+
 // ── AC: fixture existence ─────────────────────────────────────────────────────
 
 #[test]
@@ -237,7 +266,12 @@ fn touched_file_edge_target_is_file_node_from_code_graph() {
     let output = link_evidence::link_evidence(&code_graph, &evidence, &LinkOptions::default());
 
     for edge in &output.edges {
-        if let GraphRecord::Edge { label: EdgeLabel::TouchedFile, target, .. } = edge {
+        if let GraphRecord::Edge {
+            label: EdgeLabel::TouchedFile,
+            target,
+            ..
+        } = edge
+        {
             assert!(
                 file_ids.contains(&target.as_str()),
                 "TOUCHED_FILE target {target} is not a File node from the code graph"
@@ -388,10 +422,13 @@ fn ambiguous_symbol_name_produces_diagnostic_not_edge() {
     );
 
     assert!(
-        output
-            .edges
-            .iter()
-            .all(|r| !matches!(r, GraphRecord::Edge { label: EdgeLabel::MentionsSymbol, .. })),
+        output.edges.iter().all(|r| !matches!(
+            r,
+            GraphRecord::Edge {
+                label: EdgeLabel::MentionsSymbol,
+                ..
+            }
+        )),
         "must not emit MENTIONS_SYMBOL edge for ambiguous name"
     );
 }
@@ -414,7 +451,15 @@ fn unambiguous_symbol_name_emits_mentions_symbol_edge() {
     let count = output
         .edges
         .iter()
-        .filter(|r| matches!(r, GraphRecord::Edge { label: EdgeLabel::MentionsSymbol, .. }))
+        .filter(|r| {
+            matches!(
+                r,
+                GraphRecord::Edge {
+                    label: EdgeLabel::MentionsSymbol,
+                    ..
+                }
+            )
+        })
         .count();
 
     assert_eq!(
@@ -434,7 +479,12 @@ fn verification_node_does_not_get_touched_file_link() {
     let output = link_evidence::link_evidence(&code_graph, &evidence, &LinkOptions::default());
 
     for edge in &output.edges {
-        if let GraphRecord::Edge { label: EdgeLabel::TouchedFile, source, .. } = edge {
+        if let GraphRecord::Edge {
+            label: EdgeLabel::TouchedFile,
+            source,
+            ..
+        } = edge
+        {
             assert!(
                 !ver_ids.contains(&source.as_str()),
                 "Verification node {source} must not get a TOUCHED_FILE link"
@@ -453,9 +503,11 @@ fn all_unresolvable_file_edits_emit_diagnostics() {
     let resolved_paths: std::collections::BTreeSet<&str> = code_graph
         .iter()
         .filter_map(|r| match r {
-            GraphRecord::Node { kind: NodeKind::File, repo_relative_path: Some(p), .. } => {
-                Some(p.as_str())
-            }
+            GraphRecord::Node {
+                kind: NodeKind::File,
+                repo_relative_path: Some(p),
+                ..
+            } => Some(p.as_str()),
             _ => None,
         })
         .collect();
@@ -478,7 +530,10 @@ fn all_unresolvable_file_edits_emit_diagnostics() {
                     && matches!(d.reason, DiagnosticReason::MissingFile)
                     && d.repo_relative_path.as_deref() == Some(path.as_str())
             });
-            assert!(has_diag, "FileEdit {id} for path {path} has no missing_file diagnostic");
+            assert!(
+                has_diag,
+                "FileEdit {id} for path {path} has no missing_file diagnostic"
+            );
         }
     }
 }
@@ -496,7 +551,11 @@ fn link_evidence_is_deterministic_across_five_runs() {
             .iter()
             .map(|r| serde_json::to_string(r).unwrap())
             .collect();
-        lines.extend(o.diagnostics.iter().map(|d| serde_json::to_string(d).unwrap()));
+        lines.extend(
+            o.diagnostics
+                .iter()
+                .map(|d| serde_json::to_string(d).unwrap()),
+        );
         lines
     };
 
@@ -711,4 +770,148 @@ fn cli_link_evidence_is_idempotent_on_unchanged_inputs() {
     let content1 = std::fs::read_to_string(&out1).unwrap();
     let content2 = std::fs::read_to_string(&out2).unwrap();
     assert_eq!(content1, content2, "link-evidence must be idempotent");
+}
+
+// ── expected_repo_id guard ─────────────────────────────────────────────────────
+
+#[test]
+fn wrong_repo_diagnostics_when_repo_id_mismatches() {
+    let code_graph = vec![
+        make_repo_node("codegraph:v4:repo-abc"),
+        make_file_node("codegraph:v4:file-1".to_string(), "src/lib.rs"),
+    ];
+    let evidence = vec![make_agent_memory_node(
+        "agent_memory:v1:edit-1".to_string(),
+        NodeKind::FileEdit,
+        Some("src/lib.rs".to_string()),
+        None,
+        None,
+    )];
+
+    let opts = LinkOptions {
+        expected_repo_id: Some("codegraph:v4:repo-DIFFERENT".to_string()),
+    };
+    let output = link_evidence::link_evidence(&code_graph, &evidence, &opts);
+
+    assert!(output.edges.is_empty(), "no edges when repo ID mismatches");
+    assert_eq!(output.diagnostics.len(), 1);
+    assert_eq!(output.diagnostics[0].reason, DiagnosticReason::WrongRepo);
+    assert_eq!(
+        output.diagnostics[0].source_record_id,
+        "agent_memory:v1:edit-1"
+    );
+}
+
+#[test]
+fn no_wrong_repo_when_repo_id_matches() {
+    let code_graph = vec![
+        make_repo_node("codegraph:v4:repo-abc"),
+        make_file_node("codegraph:v4:file-1".to_string(), "src/lib.rs"),
+    ];
+    let evidence = vec![make_agent_memory_node(
+        "agent_memory:v1:edit-1".to_string(),
+        NodeKind::FileEdit,
+        Some("src/lib.rs".to_string()),
+        None,
+        None,
+    )];
+
+    let opts = LinkOptions {
+        expected_repo_id: Some("codegraph:v4:repo-abc".to_string()),
+    };
+    let output = link_evidence::link_evidence(&code_graph, &evidence, &opts);
+
+    assert!(
+        output.diagnostics.is_empty(),
+        "no wrong_repo diagnostics when repo ID matches"
+    );
+    assert_eq!(output.edges.len(), 1, "TOUCHED_FILE edge must be emitted");
+}
+
+#[test]
+fn no_wrong_repo_when_expected_repo_id_not_set() {
+    let code_graph = vec![
+        make_repo_node("codegraph:v4:repo-abc"),
+        make_file_node("codegraph:v4:file-1".to_string(), "src/lib.rs"),
+    ];
+    let evidence = vec![make_agent_memory_node(
+        "agent_memory:v1:edit-1".to_string(),
+        NodeKind::FileEdit,
+        Some("src/lib.rs".to_string()),
+        None,
+        None,
+    )];
+
+    let output = link_evidence::link_evidence(&code_graph, &evidence, &LinkOptions::default());
+
+    assert!(
+        output.diagnostics.is_empty(),
+        "no wrong_repo diagnostics when expected_repo_id is unset"
+    );
+    assert_eq!(output.edges.len(), 1);
+}
+
+#[test]
+fn no_wrong_repo_when_code_graph_has_no_repo_node() {
+    let code_graph = vec![make_file_node(
+        "codegraph:v4:file-1".to_string(),
+        "src/lib.rs",
+    )];
+    let evidence = vec![make_agent_memory_node(
+        "agent_memory:v1:edit-1".to_string(),
+        NodeKind::FileEdit,
+        Some("src/lib.rs".to_string()),
+        None,
+        None,
+    )];
+
+    let opts = LinkOptions {
+        expected_repo_id: Some("codegraph:v4:repo-abc".to_string()),
+    };
+    let output = link_evidence::link_evidence(&code_graph, &evidence, &opts);
+
+    assert!(
+        output.diagnostics.is_empty(),
+        "no wrong_repo diagnostics when code graph has no Repository node to compare"
+    );
+    assert_eq!(output.edges.len(), 1);
+}
+
+// ── PatchArtifact TOUCHED_FILE ingestibility ──────────────────────────────────
+
+#[test]
+fn patch_artifact_touched_file_edges_pass_dry_run_ingest() {
+    use aletheia_egregore::adapters::{DryRunSink, GraphSink};
+
+    let file_id = "codegraph:v4:file-1".to_string();
+    let code_graph = vec![make_file_node(file_id, "src/lib.rs")];
+
+    let mut patch_node = make_agent_memory_node(
+        "agent_memory:v1:patch-1".to_string(),
+        NodeKind::PatchArtifact,
+        None,
+        None,
+        None,
+    );
+    if let GraphRecord::Node { target_files, .. } = &mut patch_node {
+        *target_files = Some(vec!["src/lib.rs".to_string()]);
+    }
+    let evidence = vec![patch_node];
+
+    let output = link_evidence::link_evidence(&code_graph, &evidence, &LinkOptions::default());
+
+    assert!(
+        !output.edges.is_empty(),
+        "PatchArtifact must produce TOUCHED_FILE edges"
+    );
+    assert!(
+        output.edges.iter().all(is_touched_file_edge),
+        "all edges must be TOUCHED_FILE"
+    );
+
+    let mut sink = DryRunSink::default();
+    for edge in &output.edges {
+        sink.write_record(edge)
+            .expect("PatchArtifact TOUCHED_FILE edge must be accepted by DryRunSink");
+    }
 }

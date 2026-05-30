@@ -111,12 +111,15 @@ struct CodeGraphIndex<'a> {
     files_by_path: BTreeMap<&'a str, &'a str>,
     /// Symbol `name` → Vec of Symbol node IDs (multiple = overloaded name).
     symbols_by_name: BTreeMap<&'a str, Vec<&'a str>>,
+    /// Repository node ID found in the code graph, when present.
+    repo_id: Option<&'a str>,
 }
 
 impl<'a> CodeGraphIndex<'a> {
     fn build(code_graph: &'a [GraphRecord]) -> Self {
         let mut files_by_path: BTreeMap<&str, &str> = BTreeMap::new();
         let mut symbols_by_name: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        let mut repo_id: Option<&str> = None;
 
         for record in code_graph {
             let GraphRecord::Node {
@@ -144,6 +147,11 @@ impl<'a> CodeGraphIndex<'a> {
                             .push(id.as_str());
                     }
                 }
+                NodeKind::Repository => {
+                    if repo_id.is_none() {
+                        repo_id = Some(id.as_str());
+                    }
+                }
                 _ => {}
             }
         }
@@ -151,6 +159,7 @@ impl<'a> CodeGraphIndex<'a> {
         Self {
             files_by_path,
             symbols_by_name,
+            repo_id,
         }
     }
 }
@@ -174,12 +183,38 @@ impl<'a> CodeGraphIndex<'a> {
 pub fn link_evidence(
     code_graph: &[GraphRecord],
     evidence: &[GraphRecord],
-    _opts: &LinkOptions,
+    opts: &LinkOptions,
 ) -> LinkOutput {
     let mut output = LinkOutput::default();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
     let index = CodeGraphIndex::build(code_graph);
 
+    // When the caller asserts an expected repository identity, reject evidence
+    // linked against a mismatched code graph rather than emitting stale edges.
+    if let Some(expected) = &opts.expected_repo_id {
+        if let Some(actual) = index.repo_id {
+            if actual != expected.as_str() {
+                for record in evidence {
+                    if let GraphRecord::Node {
+                        id, source_handle, ..
+                    } = record
+                    {
+                        output.diagnostics.push(LinkDiagnostic {
+                            source_record_id: id.clone(),
+                            source_handle: source_handle.clone(),
+                            repo_relative_path: None,
+                            symbol_name: None,
+                            reason: DiagnosticReason::WrongRepo,
+                            attempted_relation: "any".to_string(),
+                        });
+                    }
+                }
+                output.diagnostics.sort();
+                return output;
+            }
+        }
+    }
+
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     for record in evidence {
         process_evidence_record(record, &index, &mut output, &mut seen);
     }

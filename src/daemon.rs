@@ -5239,10 +5239,11 @@ fn validate_evidence_endpoint_constraints(
                         | NodeKind::CommandRun
                         | NodeKind::TestRun
                         | NodeKind::CIStatus
+                        | NodeKind::PatchArtifact
                 )
             {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a FileEdit, ToolCall, CommandRun, TestRun, or CIStatus source node, not {}",
+                    "evidence link relation '{}' requires a FileEdit, ToolCall, CommandRun, TestRun, CIStatus, or PatchArtifact source node, not {}",
                     label.as_str(),
                     sk.as_str()
                 )));
