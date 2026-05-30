@@ -1961,3 +1961,99 @@ impl InspectCounts {
         Ok(counts)
     }
 }
+
+// ---------------------------------------------------------------------------
+// AC7: Semantic query JSON output contract conformance
+//
+// This test module locks the stable field names for `eg query semantic --format
+// json`. If any field is removed or renamed without updating this test (and the
+// docs in docs/cli/query.md), the test suite will fail during CI.
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "embeddings"))]
+mod semantic_contract {
+    use super::*;
+
+    fn full_span() -> SourceSpan {
+        SourceSpan {
+            start_byte: 4096,
+            end_byte: 5200,
+            start_line: 142,
+            end_line: 168,
+        }
+    }
+
+    /// All stable fields present — verifies required and optional contract fields.
+    #[test]
+    fn semantic_result_json_contract_all_stable_fields_present() {
+        let result = SemanticResult {
+            record_id: "codegraph:v1:abc123",
+            name: Some("EmbeddedAletheiaSink::write_record"),
+            repo_relative_path: Some("src/sink/embedded.rs"),
+            score: 0.9231_f32,
+            span: Some(full_span()),
+        };
+        let json =
+            serde_json::to_value(&result).expect("SemanticResult must serialize to JSON value");
+
+        // Required stable fields — test fails if either is removed or renamed.
+        assert!(
+            json.get("record_id").is_some(),
+            "stable contract field 'record_id' must be present in JSON output"
+        );
+        assert!(
+            json.get("score").is_some(),
+            "stable contract field 'score' must be present in JSON output"
+        );
+
+        // Optional stable fields — must appear in the JSON when the field is populated.
+        assert!(
+            json.get("name").is_some(),
+            "optional contract field 'name' must appear in JSON when populated"
+        );
+        assert!(
+            json.get("repo_relative_path").is_some(),
+            "optional contract field 'repo_relative_path' must appear in JSON when populated"
+        );
+        assert!(
+            json.get("span").is_some(),
+            "optional contract field 'span' must appear in JSON when populated"
+        );
+
+        // span sub-fields are part of the stable contract.
+        let span = &json["span"];
+        for sub in ["start_byte", "end_byte", "start_line", "end_line"] {
+            assert!(
+                span.get(sub).is_some(),
+                "span.{sub} is a stable contract sub-field and must be present"
+            );
+        }
+    }
+
+    /// Optional fields absent when None — verifies skip_serializing_if contract.
+    #[test]
+    fn semantic_result_json_contract_optional_fields_omitted_when_none() {
+        let result = SemanticResult {
+            record_id: "codegraph:v1:abc123",
+            name: None,
+            repo_relative_path: None,
+            score: 0.42_f32,
+            span: None,
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+
+        assert!(json.get("record_id").is_some(), "record_id always present");
+        assert!(json.get("score").is_some(), "score always present");
+        assert!(
+            json.get("name").is_none(),
+            "contract: 'name' must be absent from JSON when None"
+        );
+        assert!(
+            json.get("repo_relative_path").is_none(),
+            "contract: 'repo_relative_path' must be absent from JSON when None"
+        );
+        assert!(
+            json.get("span").is_none(),
+            "contract: 'span' must be absent from JSON when None"
+        );
+    }
+}
