@@ -16,10 +16,11 @@
 //!   appear in stable IDs or source handles.
 //! - No network access or daemon is required.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use serde::Deserialize;
 
@@ -27,7 +28,7 @@ use crate::{
     error::{CodegraphError, Result},
     ir::{
         EdgeLabel, Graph, GraphRecord, NodeKind, OutputHandle, PROJECT_SCHEMA_VERSION,
-        project_stable_id,
+        Producer, ProducerKind, project_stable_id,
     },
 };
 
@@ -43,6 +44,25 @@ pub const DOMAIN: &str = "project";
 pub const SOURCE_KIND: &str = "local_jsonl";
 /// Maximum bytes to inline in a body handle.
 const INLINE_BODY_CEILING: usize = 16 * 1024;
+
+/// Process-start timestamp stamped on every producer envelope emitted by this module.
+static IMPORTER_STARTED_AT: LazyLock<String> = LazyLock::new(|| {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+});
+
+/// Build the producer envelope for this importer.
+fn task_writer_producer() -> Producer {
+    Producer {
+        egregore_version: env!("CARGO_PKG_VERSION").to_owned(),
+        egregore_git: None,
+        producer_kind: ProducerKind::TaskWriter,
+        producer_components: BTreeMap::from([
+            ("importer_id".to_owned(), IMPORTER_ID.to_owned()),
+            ("importer_schema_version".to_owned(), IMPORTER_VERSION.to_owned()),
+        ]),
+        producer_started_at: IMPORTER_STARTED_AT.clone(),
+    }
+}
 
 // ── Import options ────────────────────────────────────────────────────────────
 
@@ -164,7 +184,7 @@ pub fn import_local_tasks(
     }
 
     Ok(ImportResult {
-        graph,
+        graph: graph.stamp_producer(&task_writer_producer()),
         diagnostic_count: total_diags,
     })
 }
@@ -192,6 +212,10 @@ const VALID_TASK_STATUSES: &[&str] = &[
     "unknown",
 ];
 const VALID_TASK_PRIORITIES: &[&str] = &["low", "normal", "high", "urgent", "unknown"];
+const VALID_AC_STATUSES: &[&str] =
+    &["unverified", "verified", "failed", "superseded", "unknown"];
+const VALID_LINK_SYSTEMS: &[&str] =
+    &["github", "gitlab", "local_file", "harness_legacy", "other"];
 
 // ── Source handle encoding ────────────────────────────────────────────────────
 
@@ -349,9 +373,7 @@ struct TaskLine {
     body: Option<serde_json::Value>,
     status: String,
     priority: String,
-    #[serde(default)]
     assignees: Vec<String>,
-    #[serde(default)]
     labels: Vec<String>,
     #[allow(dead_code)]
     created_at: String,
@@ -799,6 +821,32 @@ fn import_file(
                     continue;
                 }
 
+                // Validate AC status against the closed enum.
+                if !VALID_AC_STATUSES.contains(&ac.status.as_str()) {
+                    let diag_id = project_stable_id(&[
+                        "project",
+                        "Diagnostic",
+                        SOURCE_KIND,
+                        &file_rel,
+                        "ac_invalid_field_value",
+                        &ac.local_id,
+                    ]);
+                    push_diagnostic(
+                        graph,
+                        diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[ac_invalid_field_value] acceptance_criterion '{}' at line {} has invalid status='{}'",
+                            ac.local_id,
+                            line_idx + 1,
+                            ac.status
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
+                }
+
                 // Parent-before-child: parent task must have been seen EARLIER
                 let Some(parent_task_id) = task_ids.get(&ac.parent_task_local_id).cloned() else {
                     let diag_id = project_stable_id(&[
@@ -1009,6 +1057,32 @@ fn import_file(
                         });
                         continue;
                     }
+                }
+
+                // Validate system against the closed enum.
+                if !VALID_LINK_SYSTEMS.contains(&link.system.as_str()) {
+                    let diag_id = project_stable_id(&[
+                        "project",
+                        "Diagnostic",
+                        SOURCE_KIND,
+                        &file_rel,
+                        "external_link_invalid_system",
+                        &link.local_id,
+                    ]);
+                    push_diagnostic(
+                        graph,
+                        diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[external_link_invalid_system] external_link '{}' at line {} has invalid system='{}'",
+                            link.local_id,
+                            line_idx + 1,
+                            link.system
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
                 }
 
                 // Parent-before-child: parent must have been seen EARLIER
