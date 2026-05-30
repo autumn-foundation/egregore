@@ -429,6 +429,7 @@ fn strip_git_suffix(s: &str) -> &str {
 ///
 /// A mismatch indicates either a tampered payload or a bug in the write path; such records
 /// should be treated as machine-local unsafe regardless of the declared `identity_source`.
+#[allow(dead_code)]
 pub(crate) fn repository_id_matches_payload(
     submitted_id: &str,
     payload: &RepositoryIdentityPayload,
