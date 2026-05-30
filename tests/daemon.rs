@@ -9650,8 +9650,8 @@ fn verification_stdout_handle_empty_hash_rejected() {
 
 // ── observations_for_symbol: cross-domain context query (issue #38) ───────────
 
-/// Unique constant IDs for the observations_for_symbol fixture.
-/// Kept out of the shared PROJECT_TASK_ID / PROJECT_EXTERNAL_LINK_ID namespace
+/// Unique constant IDs for the `observations_for_symbol` fixture.
+/// Kept out of the shared `PROJECT_TASK_ID` / `PROJECT_EXTERNAL_LINK_ID` namespace
 /// so this test can run in parallel with other project-domain tests.
 const OFS_SYMBOL_ID: &str = "codegraph:v4:obs4sym-symbol00000001";
 const OFS_EXTERNAL_LINK_ID: &str = "project:v1:obs4sym-external-link01";

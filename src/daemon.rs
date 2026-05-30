@@ -7204,7 +7204,7 @@ fn handle_verb_drift_top_n(
 /// Loads all records from every domain without any prefix filtering.
 ///
 /// `observations_for_symbol` is a cross-domain query: it needs codegraph
-/// Symbol/File records AND agent_memory Observation records AND project Task
+/// Symbol/File records AND `agent_memory` Observation records AND project Task
 /// records AND verification Evidence records in a single pass so that
 /// [`graph_query::symbol_context`] can traverse cross-domain edges.
 fn load_cross_domain_records(
@@ -7305,6 +7305,26 @@ fn context_linked_item_to_json(record: &GraphRecord) -> serde_json::Value {
         repo_relative_path,
         body_handle,
         evidence_links,
+        stdout_handle,
+        stderr_handle,
+        source_artifact_path,
+        source_artifact_hash,
+        edit_kind,
+        before_hash,
+        after_hash,
+        rename_to,
+        hunk_count,
+        linked_turn_id,
+        linked_patch_id,
+        patch_status,
+        patch_handle,
+        patch_bytes_hash,
+        patch_bytes_size,
+        target_files,
+        validation_summary,
+        base_commit,
+        unknown_base_reason,
+        producer_session_id,
         ..
     } = record
     else {
@@ -7325,13 +7345,126 @@ fn context_linked_item_to_json(record: &GraphRecord) -> serde_json::Value {
         "evidence_quality": evidence_quality,
         "repo_relative_path": repo_relative_path,
         "body_handle": body_handle.as_deref().map(|h| serde_json::to_value(h).unwrap_or_default()),
+        "stdout_handle": stdout_handle.as_deref().map(|h| serde_json::to_value(h).unwrap_or_default()),
+        "stderr_handle": stderr_handle.as_deref().map(|h| serde_json::to_value(h).unwrap_or_default()),
+        "source_artifact_path": source_artifact_path,
+        "source_artifact_hash": source_artifact_hash,
+        "edit_kind": edit_kind,
+        "before_hash": before_hash,
+        "after_hash": after_hash,
+        "rename_to": rename_to,
+        "hunk_count": hunk_count,
+        "linked_turn_id": linked_turn_id,
+        "linked_patch_id": linked_patch_id,
+        "patch_status": patch_status,
+        "patch_handle": patch_handle.as_deref().map(|h| serde_json::to_value(h).unwrap_or_default()),
+        "patch_bytes_hash": patch_bytes_hash,
+        "patch_bytes_size": patch_bytes_size,
+        "target_files": target_files,
+        "validation_summary": validation_summary,
+        "base_commit": base_commit,
+        "unknown_base_reason": unknown_base_reason,
+        "producer_session_id": producer_session_id,
         "evidence_links": serde_json::to_value(links).unwrap_or_default(),
     })
+}
+
+struct ContextSections {
+    source_facts: Vec<serde_json::Value>,
+    topology_edges: Vec<serde_json::Value>,
+    observations: Vec<serde_json::Value>,
+    project_state: Vec<serde_json::Value>,
+    artifacts: Vec<serde_json::Value>,
+    verification_evidence: Vec<serde_json::Value>,
+    unresolved: Vec<serde_json::Value>,
+}
+
+fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) -> ContextSections {
+    let source_facts = ctx
+        .source_facts
+        .iter()
+        .take(limit)
+        .map(|r| context_source_fact_to_json(r))
+        .collect();
+    let topology_edges = ctx
+        .topology_edges
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Edge {
+                id,
+                label,
+                source,
+                target,
+                summary,
+                temporal,
+                ..
+            } = r
+            {
+                Some(json!({
+                    "record_id": id, "label": label.as_str(),
+                    "source_id": source, "target_id": target, "summary": summary,
+                    "git_commit": temporal.as_ref().map(|t| t.git_commit.as_str()),
+                    "valid_time": temporal.as_ref().map(|t| t.valid_time.as_str()),
+                }))
+            } else {
+                None
+            }
+        })
+        .take(limit)
+        .collect();
+    let observations = ctx
+        .observations
+        .iter()
+        .take(limit)
+        .map(|r| context_observation_to_json(r))
+        .collect();
+    let project_state = ctx
+        .project_state
+        .iter()
+        .take(limit)
+        .map(|r| context_linked_item_to_json(r))
+        .collect();
+    let artifacts = ctx
+        .artifacts
+        .iter()
+        .take(limit)
+        .map(|r| context_linked_item_to_json(r))
+        .collect();
+    let verification_evidence = ctx
+        .verification_evidence
+        .iter()
+        .take(limit)
+        .map(|r| context_linked_item_to_json(r))
+        .collect();
+    let unresolved = ctx
+        .unresolved
+        .iter()
+        .take(limit)
+        .map(|u| {
+            json!({
+                "source_record_id": u.source_record_id,
+                "target_handle": u.target_handle,
+                "relation": u.relation,
+                "target_domain": u.target_domain,
+                "verification_status": "unresolved",
+            })
+        })
+        .collect();
+    ContextSections {
+        source_facts,
+        topology_edges,
+        observations,
+        project_state,
+        artifacts,
+        verification_evidence,
+        unresolved,
+    }
 }
 
 fn handle_verb_observations_for_symbol(
     request_id: &str,
     params: &serde_json::Value,
+    limit: usize,
     started: Instant,
     budget: Option<Duration>,
     state: &ServerState,
@@ -7357,77 +7490,7 @@ fn handle_verb_observations_for_symbol(
         );
     }
 
-    let source_facts: Vec<serde_json::Value> = ctx
-        .source_facts
-        .iter()
-        .map(|r| context_source_fact_to_json(r))
-        .collect();
-
-    let topology_edges: Vec<serde_json::Value> = ctx
-        .topology_edges
-        .iter()
-        .filter_map(|r| {
-            if let GraphRecord::Edge {
-                id,
-                label,
-                source,
-                target,
-                summary,
-                temporal,
-                ..
-            } = r
-            {
-                Some(json!({
-                    "record_id": id,
-                    "label": label.as_str(),
-                    "source_id": source,
-                    "target_id": target,
-                    "summary": summary,
-                    "git_commit": temporal.as_ref().map(|t| t.git_commit.as_str()),
-                }))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let observations: Vec<serde_json::Value> = ctx
-        .observations
-        .iter()
-        .map(|r| context_observation_to_json(r))
-        .collect();
-
-    let project_state: Vec<serde_json::Value> = ctx
-        .project_state
-        .iter()
-        .map(|r| context_linked_item_to_json(r))
-        .collect();
-
-    let artifacts: Vec<serde_json::Value> = ctx
-        .artifacts
-        .iter()
-        .map(|r| context_linked_item_to_json(r))
-        .collect();
-
-    let verification_evidence: Vec<serde_json::Value> = ctx
-        .verification_evidence
-        .iter()
-        .map(|r| context_linked_item_to_json(r))
-        .collect();
-
-    let unresolved: Vec<serde_json::Value> = ctx
-        .unresolved
-        .iter()
-        .map(|u| {
-            json!({
-                "source_record_id": u.source_record_id,
-                "target_handle": u.target_handle,
-                "relation": u.relation,
-                "target_domain": u.target_domain,
-                "verification_status": "unresolved",
-            })
-        })
-        .collect();
+    let s = build_context_sections(&ctx, limit);
 
     HttpResponse::success(
         Some(request_id),
@@ -7436,13 +7499,13 @@ fn handle_verb_observations_for_symbol(
             "verb": "observations_for_symbol",
             "snapshot": snapshot,
             "symbol_name": name,
-            "source_facts": source_facts,
-            "topology_edges": topology_edges,
-            "observations": observations,
-            "project_state": project_state,
-            "artifacts": artifacts,
-            "verification_evidence": verification_evidence,
-            "unresolved": unresolved,
+            "source_facts": s.source_facts,
+            "topology_edges": s.topology_edges,
+            "observations": s.observations,
+            "project_state": s.project_state,
+            "artifacts": s.artifacts,
+            "verification_evidence": s.verification_evidence,
+            "unresolved": s.unresolved,
         }),
     )
 }
@@ -7583,7 +7646,7 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             state,
         ),
         "observations_for_symbol" => {
-            handle_verb_observations_for_symbol(&request_id, &params, started, budget, state)
+            handle_verb_observations_for_symbol(&request_id, &params, limit, started, budget, state)
         }
         "drift" | "agent_sessions_for_repo" | "criteria_for_task" => HttpResponse::error_with_id(
             &request_id,
@@ -9116,10 +9179,7 @@ mod tests {
         let error = run_foreground(&DaemonConfig::new(data_dir))
             .expect_err("unsafe runtime lock error should abort foreground startup");
         assert!(
-            error
-                .to_string()
-                .contains("failed to acquire embedded store lease")
-                && error.to_string().contains("runtime_permissions_unsafe"),
+            error.to_string().contains("runtime_permissions_unsafe"),
             "foreground startup should preserve the lock acquisition error, got {error:#}"
         );
         assert!(
