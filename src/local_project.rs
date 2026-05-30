@@ -133,6 +133,12 @@ pub fn import_local_tasks(
         .clone()
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
 
+    if let Some(t) = &opts.transaction_time {
+        chrono::DateTime::parse_from_rfc3339(t).map_err(|e| CodegraphError::InvalidArgument {
+            message: format!("--transaction-time '{t}' is not a valid RFC 3339 timestamp: {e}"),
+        })?;
+    }
+
     let mut graph = Graph::new();
     let mut total_diags: usize = 0;
     let mut seen_slugs: HashMap<String, PathBuf> = HashMap::new();
@@ -598,6 +604,8 @@ fn import_file(
     let mut ac_graph_identity: HashMap<(String, u32), String> = HashMap::new();
     // ExternalLink identity fields: local_id → (system, system_native_id, parent_local_id)
     let mut link_identity: HashMap<String, (String, String, String)> = HashMap::new();
+    // ExternalLink graph identity: (system, system_native_id) → local_id (first owner)
+    let mut link_graph_identity: HashMap<(String, String), String> = HashMap::new();
     // Source-link refinements: task local_id → refinement fields
     let mut src_link_refinements: HashMap<String, SrcLinkRefinement> = HashMap::new();
     // Ordered list of successfully-parsed records
@@ -824,6 +832,34 @@ fn import_file(
                     continue;
                 }
 
+                // Non-verified ACs with a verification_handle are imported with
+                // verification_link_id=null but must produce a diagnostic so operators
+                // know the handle was not resolved.
+                if ac.status != "verified" && ac.verification_handle.is_some() {
+                    let diag_id = project_stable_id(&[
+                        "project",
+                        "Diagnostic",
+                        SOURCE_KIND,
+                        &file_rel,
+                        "unresolved_verification_handle",
+                        &ac.local_id,
+                    ]);
+                    push_diagnostic(
+                        graph,
+                        diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[unresolved_verification_handle] acceptance_criterion '{}' at line {} has status='{}' with a verification_handle that cannot be resolved",
+                            ac.local_id,
+                            line_idx + 1,
+                            ac.status
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    // Do NOT continue — the record is still imported with verification_link_id=null.
+                }
+
                 // Validate AC status against the closed enum.
                 if !VALID_AC_STATUSES.contains(&ac.status.as_str()) {
                     let diag_id = project_stable_id(&[
@@ -1042,6 +1078,36 @@ fn import_file(
                             diag_count += 1;
                             continue;
                         }
+                        // Check that a prior external_link row with the same local_id
+                        // had the same (local_file, materialized_native, parent) identity.
+                        if let Some((prev_system, prev_native_id, prev_parent)) =
+                            link_identity.get(&link.local_id)
+                            && (prev_system.as_str() != "local_file"
+                                || *prev_native_id != materialized_native
+                                || *prev_parent != link.parent_local_id)
+                        {
+                            let diag_id = project_stable_id(&[
+                                "project",
+                                "Diagnostic",
+                                SOURCE_KIND,
+                                &file_rel,
+                                "revision_identity_mismatch",
+                                &link.local_id,
+                            ]);
+                            push_diagnostic(
+                                graph,
+                                diag_id,
+                                Some(&file_rel),
+                                &format!(
+                                    "[revision_identity_mismatch] refinement local_id='{}' at line {} has different identity from prior external_link row",
+                                    link.local_id,
+                                    line_idx + 1
+                                ),
+                                transaction_time,
+                            );
+                            diag_count += 1;
+                            continue;
+                        }
                         src_link_refinements.insert(
                             link.parent_local_id.clone(),
                             SrcLinkRefinement {
@@ -1175,7 +1241,36 @@ fn import_file(
                         continue;
                     }
                 } else {
+                    // Check for graph-identity collision across different local_ids.
+                    let graph_key = (link.system.clone(), link.system_native_id.clone());
+                    if let Some(prior_local_id) = link_graph_identity.get(&graph_key) {
+                        let diag_id = project_stable_id(&[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "duplicate_external_link_graph_identity",
+                            &link.local_id,
+                        ]);
+                        push_diagnostic(
+                            graph,
+                            diag_id,
+                            Some(&file_rel),
+                            &format!(
+                                "[duplicate_external_link_graph_identity] external_link '{}' at line {} shares (system='{}', system_native_id='{}') with '{}'",
+                                link.local_id,
+                                line_idx + 1,
+                                link.system,
+                                link.system_native_id,
+                                prior_local_id
+                            ),
+                            transaction_time,
+                        );
+                        diag_count += 1;
+                        continue;
+                    }
                     seen_local_ids.insert(link.local_id.clone(), "external_link");
+                    link_graph_identity.insert(graph_key, link.local_id.clone());
                     // Record identity fields on first occurrence
                     link_identity.insert(
                         link.local_id.clone(),
@@ -1296,9 +1391,12 @@ fn emit_task_records(
         "local_file",
         &src_link_native_id,
     ]);
-    // Explicit refinement wins for url; otherwise default to file:// URL
-    let src_link_url = src_link_refinement
-        .map_or_else(|| format!("file://{file_rel}"), |r| (opts.redact)(&r.url));
+    // Explicit refinement wins for url; otherwise default to file:// URL.
+    // Both paths go through opts.redact so the redaction policy is consistently applied.
+    let src_link_url = src_link_refinement.map_or_else(
+        || (opts.redact)(&format!("file://{file_rel}")),
+        |r| (opts.redact)(&r.url),
+    );
 
     // Body handle
     let body_str = match &task.body {

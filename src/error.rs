@@ -111,4 +111,11 @@ pub enum CodegraphError {
         /// Path of the file that produced no events.
         path: PathBuf,
     },
+
+    /// A caller supplied an invalid argument value.
+    #[error("invalid argument: {message}")]
+    InvalidArgument {
+        /// Detail message.
+        message: String,
+    },
 }
