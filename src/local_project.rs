@@ -51,7 +51,12 @@ static IMPORTER_STARTED_AT: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// Build the producer envelope for this importer.
-fn task_writer_producer() -> Producer {
+///
+/// When `fixed_started_at` is `Some`, that timestamp is used as
+/// `producer_started_at`, making the envelope byte-stable across processes
+/// for fixed-`--transaction-time` imports. When `None`, the process-start
+/// wall clock is used.
+fn task_writer_producer(fixed_started_at: Option<&str>) -> Producer {
     Producer {
         egregore_version: env!("CARGO_PKG_VERSION").to_owned(),
         egregore_git: None,
@@ -60,7 +65,10 @@ fn task_writer_producer() -> Producer {
             ("importer_id".to_owned(), IMPORTER_ID.to_owned()),
             ("importer_schema_version".to_owned(), IMPORTER_VERSION.to_owned()),
         ]),
-        producer_started_at: IMPORTER_STARTED_AT.clone(),
+        producer_started_at: fixed_started_at.map_or_else(
+            || IMPORTER_STARTED_AT.clone(),
+            str::to_owned,
+        ),
     }
 }
 
@@ -115,6 +123,16 @@ pub fn import_local_tasks(
     repo_root: &Path,
     opts: &ImportOptions,
 ) -> Result<ImportResult> {
+    // transaction_time represents "when did this import happen". For default
+    // imports use Utc::now() so the transaction-time axis is accurate. Callers
+    // that want byte-stable / deterministic output pass --transaction-time
+    // explicitly; that same value is forwarded to the producer envelope so the
+    // output is fully reproducible across processes.
+    let transaction_time = opts
+        .transaction_time
+        .clone()
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+
     let mut graph = Graph::new();
     let mut total_diags: usize = 0;
     let mut seen_slugs: HashMap<String, PathBuf> = HashMap::new();
@@ -162,45 +180,25 @@ pub fn import_local_tasks(
                         file_rel,
                         existing.display()
                     ),
-                    &file_mtime_rfc3339(file_path),
+                    &transaction_time,
                 );
                 total_diags += 1;
                 continue;
             }
             seen_slugs.insert(slug, file_path.clone());
 
-            let tx_time = opts
-                .transaction_time
-                .clone()
-                .unwrap_or_else(|| file_mtime_rfc3339(file_path));
-            total_diags += import_file(file_path, repo_root, opts, &tx_time, &mut graph)?;
+            total_diags +=
+                import_file(file_path, repo_root, opts, &transaction_time, &mut graph)?;
         }
     } else {
-        let tx_time = opts
-            .transaction_time
-            .clone()
-            .unwrap_or_else(|| file_mtime_rfc3339(tasks_path));
-        total_diags += import_file(tasks_path, repo_root, opts, &tx_time, &mut graph)?;
+        total_diags += import_file(tasks_path, repo_root, opts, &transaction_time, &mut graph)?;
     }
 
+    let producer = task_writer_producer(opts.transaction_time.as_deref());
     Ok(ImportResult {
-        graph: graph.stamp_producer(&task_writer_producer()),
+        graph: graph.stamp_producer(&producer),
         diagnostic_count: total_diags,
     })
-}
-
-/// Return the file's mtime as RFC 3339 (seconds precision, UTC).
-/// Falls back to `Utc::now()` if the metadata cannot be read.
-fn file_mtime_rfc3339(path: &Path) -> String {
-    let fallback = || chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let Ok(meta) = std::fs::metadata(path) else {
-        return fallback();
-    };
-    let Ok(mtime) = meta.modified() else {
-        return fallback();
-    };
-    let dt: chrono::DateTime<chrono::Utc> = mtime.into();
-    dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 const VALID_TASK_STATUSES: &[&str] = &[
@@ -598,8 +596,8 @@ fn import_file(
     let mut ac_identity: HashMap<String, (String, u32)> = HashMap::new();
     // AC graph identity: (parent_task_local_id, ordinal) → local_id (first owner)
     let mut ac_graph_identity: HashMap<(String, u32), String> = HashMap::new();
-    // ExternalLink identity fields: local_id → (system, system_native_id)
-    let mut link_identity: HashMap<String, (String, String)> = HashMap::new();
+    // ExternalLink identity fields: local_id → (system, system_native_id, parent_local_id)
+    let mut link_identity: HashMap<String, (String, String, String)> = HashMap::new();
     // Source-link refinements: task local_id → refinement fields
     let mut src_link_refinements: HashMap<String, SrcLinkRefinement> = HashMap::new();
     // Ordered list of successfully-parsed records
@@ -666,34 +664,36 @@ fn import_file(
                     }
                 };
 
-                if let Some(&existing_kind) = seen_local_ids.get(&task.local_id) {
-                    if existing_kind != "task" {
-                        let diag_id = project_stable_id(&[
-                            "project",
-                            "Diagnostic",
-                            SOURCE_KIND,
-                            &file_rel,
-                            "duplicate_local_id_kind_mismatch",
-                            &task.local_id,
-                        ]);
-                        push_diagnostic(
-                            graph,
-                            diag_id,
-                            Some(&file_rel),
-                            &format!(
-                                "[duplicate_local_id_kind_mismatch] local_id='{}' at line {} has kind='task' but was previously seen with kind='{existing_kind}'",
-                                task.local_id,
-                                line_idx + 1
-                            ),
-                            transaction_time,
-                        );
-                        diag_count += 1;
-                        continue;
-                    }
-                    // Same kind = valid revision; fall through
-                } else {
-                    seen_local_ids.insert(task.local_id.clone(), "task");
+                if let Some(&existing_kind) = seen_local_ids.get(&task.local_id)
+                    && existing_kind != "task"
+                {
+                    let diag_id = project_stable_id(&[
+                        "project",
+                        "Diagnostic",
+                        SOURCE_KIND,
+                        &file_rel,
+                        "duplicate_local_id_kind_mismatch",
+                        &task.local_id,
+                    ]);
+                    push_diagnostic(
+                        graph,
+                        diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[duplicate_local_id_kind_mismatch] local_id='{}' at line {} has kind='task' but was previously seen with kind='{existing_kind}'",
+                            task.local_id,
+                            line_idx + 1
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    continue;
                 }
+                // If existing_kind == "task" → valid revision; fall through.
+                // Note: seen_local_ids is NOT updated here — we defer that until
+                // after field validation so that a skipped invalid task row does
+                // not poison the ID space for later valid rows with the same
+                // local_id.
 
                 // Validate closed enum fields per local-project-jsonl.md schema.
                 if !VALID_TASK_STATUSES.contains(&task.status.as_str()) {
@@ -746,6 +746,9 @@ fn import_file(
                     diag_count += 1;
                     continue;
                 }
+
+                // All validation passed — claim the local_id on first occurrence.
+                seen_local_ids.entry(task.local_id.clone()).or_insert("task");
 
                 // Compute stable entity ID (same for all revisions of this local_id)
                 let identity_handle = source_identity_handle(&file_rel, &task.local_id);
@@ -1053,7 +1056,11 @@ fn import_file(
                         // Record identity so a later row with the same local_id
                         // cannot change system/system_native_id without a diagnostic.
                         link_identity.entry(link.local_id.clone()).or_insert_with(|| {
-                            ("local_file".to_owned(), link.system_native_id.clone())
+                            (
+                                "local_file".to_owned(),
+                                link.system_native_id.clone(),
+                                link.parent_local_id.clone(),
+                            )
                         });
                         continue;
                     }
@@ -1137,9 +1144,13 @@ fn import_file(
                         diag_count += 1;
                         continue;
                     }
-                    // Same kind = revision; check identity fields
-                    if let Some((prev_system, prev_native_id)) = link_identity.get(&link.local_id)
-                        && (*prev_system != link.system || *prev_native_id != link.system_native_id)
+                    // Same kind = revision; check identity fields (parent moves
+                    // would leave stale edges so they are also rejected).
+                    if let Some((prev_system, prev_native_id, prev_parent)) =
+                        link_identity.get(&link.local_id)
+                        && (*prev_system != link.system
+                            || *prev_native_id != link.system_native_id
+                            || *prev_parent != link.parent_local_id)
                     {
                         let diag_id = project_stable_id(&[
                             "project",
@@ -1154,7 +1165,7 @@ fn import_file(
                             diag_id,
                             Some(&file_rel),
                             &format!(
-                                "[revision_identity_mismatch] external_link '{}' at line {} changes identity fields (system or system_native_id)",
+                                "[revision_identity_mismatch] external_link '{}' at line {} changes identity fields (system, system_native_id, or parent_local_id)",
                                 link.local_id,
                                 line_idx + 1
                             ),
@@ -1168,7 +1179,11 @@ fn import_file(
                     // Record identity fields on first occurrence
                     link_identity.insert(
                         link.local_id.clone(),
-                        (link.system.clone(), link.system_native_id.clone()),
+                        (
+                            link.system.clone(),
+                            link.system_native_id.clone(),
+                            link.parent_local_id.clone(),
+                        ),
                     );
                 }
 
