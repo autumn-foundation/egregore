@@ -118,4 +118,38 @@ pub enum CodegraphError {
         /// Detail message.
         message: String,
     },
+
+    /// A graph record was rejected because a sensitive field contains unredacted
+    /// raw secret material.
+    ///
+    /// The error names the field path but **never echoes the raw secret value**.
+    /// Apply the default redaction policy (`crate::redaction::redact_value`) to
+    /// the field, set `redaction_policy_version`, and resubmit the record.
+    ///
+    /// Documented in `docs/schema/redaction.md` and `docs/cli/redaction.md`.
+    #[error(
+        "redaction_required: field '{field_path}' contains unredacted sensitive material; \
+        apply the v1 redaction policy before submission"
+    )]
+    RedactionRequired {
+        /// Dot-separated path to the field containing sensitive material.
+        /// Example: `"text"`, `"validation_summary"`, `"stdout_handle.inline"`.
+        field_path: String,
+    },
+
+    /// A graph record carries a redaction marker in a sensitive field but the node
+    /// is not stamped with a `redaction_policy_version`.
+    ///
+    /// Set `redaction_policy_version` via
+    /// [`GraphRecord::with_redaction_policy_version`](crate::ir::GraphRecord::with_redaction_policy_version)
+    /// before submission.
+    #[error(
+        "redaction_metadata_missing: field '{field_path}' carries a redaction marker but \
+        redaction_policy_version is not set on the node; stamp the node with the current \
+        policy version before submission"
+    )]
+    RedactionMetadataMissing {
+        /// Dot-separated path to the field carrying the unversioned marker.
+        field_path: String,
+    },
 }

@@ -33,8 +33,10 @@
 //! # Redaction
 //!
 //! All free-text fields (command arguments, stdout/stderr excerpts, assistant prose)
-//! pass through a caller-supplied redaction closure before being stored.
-//! TODO: replace with #4 policy at the single call site in [`redact`].
+//! pass through a caller-supplied redaction closure before being stored. The
+//! default [`ImportOptions`] applies the v1 redaction policy via
+//! [`crate::redaction::redact_value`]. Pass-through requires an explicit
+//! [`ImportOptions::passthrough`].
 //!
 //! # Idempotency
 //!
@@ -93,15 +95,33 @@ const INLINE_PAYLOAD_CEILING: u64 = 16 * 1024;
 pub struct ImportOptions {
     /// Redaction closure applied to every free-text field before storage.
     ///
-    /// TODO: replace with #4 policy at the single [`redact`] call site.
+    /// The default closure is [`crate::redaction::redact_value`], which applies
+    /// the v1 redaction policy from `docs/schema/redaction.md`. Pass-through
+    /// (no redaction) is only permitted on explicit dry-run or test paths via
+    /// [`ImportOptions::passthrough`].
     pub redact: Box<dyn Fn(&str) -> String + Send + Sync>,
+    /// Policy version stamped on every emitted node record, or `None` for passthrough.
+    pub policy_version: Option<&'static str>,
 }
 
 impl Default for ImportOptions {
     fn default() -> Self {
         Self {
-            // TODO: replace with #4 policy
+            redact: Box::new(crate::redaction::redact_value),
+            policy_version: Some(crate::redaction::REDACTION_POLICY_VERSION),
+        }
+    }
+}
+
+impl ImportOptions {
+    /// Returns an `ImportOptions` with a pass-through redaction closure.
+    ///
+    /// Only use this for dry-run or test invocations where redaction is not required.
+    #[must_use]
+    pub fn passthrough() -> Self {
+        Self {
             redact: Box::new(|s: &str| s.to_owned()),
+            policy_version: None,
         }
     }
 }
@@ -632,6 +652,7 @@ pub fn import_codex(path: &Path, opts: &ImportOptions) -> Result<Graph> {
         source_artifact_hash,
         session_id: session_id.clone(),
         default_timestamp,
+        redaction_policy_version: opts.policy_version.map(str::to_owned),
     };
 
     let mut graph = Graph::new();
@@ -1446,6 +1467,7 @@ struct ImportCtx {
     source_artifact_hash: String,
     session_id: String,
     default_timestamp: String,
+    redaction_policy_version: Option<String>,
 }
 
 #[derive(Default)]
@@ -1514,7 +1536,7 @@ fn make_node(
             "{}:{}",
             ctx.source_artifact_path, ctx.source_artifact_hash
         )),
-        redaction_policy_version: None,
+        redaction_policy_version: ctx.redaction_policy_version.clone(),
         summary,
         domain: Some(DOMAIN.to_owned()),
         importer_id: Some(IMPORTER_ID.to_owned()),

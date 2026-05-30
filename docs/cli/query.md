@@ -1,22 +1,25 @@
 # eg query
 
-Query an existing graph JSONL for symbols, files, or semantic drift records.
+Query an existing graph JSONL for symbols, files, semantic drift records, or by natural-language similarity.
 
 ## Synopsis
 
 ```text
-eg query symbol <NAME> --graph <PATH>    [--at <COMMIT>] [--format json|text]
-eg query symbol <NAME> --data-dir <DIR>  [--at <COMMIT>] [--format json|text]
-eg query file <PATH>   --graph <PATH>    [--format json|text]
-eg query file <PATH>   --data-dir <DIR>  [--format json|text]
-eg query drift         --graph <PATH>    [--limit N] [--format json|text]
-eg query drift         --data-dir <DIR>  [--limit N] [--format json|text]
+eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--format json|text]
+eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--format json|text]
+eg query file     <PATH>  --graph <PATH>    [--format json|text]
+eg query file     <PATH>  --data-dir <DIR>  [--format json|text]
+eg query drift            --graph <PATH>    [--limit N] [--format json|text]
+eg query drift            --data-dir <DIR>  [--limit N] [--format json|text]
+eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--format json|text]
 ```
 
-Each subcommand accepts exactly one input source:
+Most subcommands accept exactly one input source:
 
 - `--graph <PATH>` — read from a JSONL file produced by `eg scan` or `eg scan-history`.
 - `--data-dir <DIR>` — read from an embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. Requires the `embedded-aletheiadb` feature (enabled by default). Providing both `--graph` and `--data-dir` is an error.
+
+`eg query semantic` accepts **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results.
 
 ## Exit codes
 
@@ -143,3 +146,72 @@ eg query drift --graph <PATH> [--limit N] [--format json|text]
 | `name` | string or null | when resolvable | Name of the drift target. |
 
 Ties in `score` are broken by `record_id` ascending.
+
+---
+
+## eg query semantic
+
+Find code nodes by natural-language similarity using dense vector embeddings.
+
+```text
+eg query semantic <QUERY> --data-dir <DIR> [--limit N] [--format json|text]
+```
+
+The query string is embedded with the same model used during ingest and compared against stored vectors using cosine similarity. Results are returned in descending similarity order.
+
+The embedded store **must** have been populated with `eg ingest --embed`. A store created without `--embed` contains no embedding vectors and returns no results.
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `<QUERY>` | yes | Natural-language search text, symbol name, or code snippet. |
+| `--data-dir <DIR>` | yes | Embedded `AletheiaDB` store created by `eg ingest --adapter embedded --embed`. `--graph` is not accepted by this subcommand. |
+| `--limit N` | no | Maximum number of results (default `10`). |
+| `--format` | no | `json` (default) or `text`. |
+
+### JSON output fields
+
+One JSON object per line (JSONL). The default output format is `json`. Field names are stable across releases.
+
+| Field | Type | Always present | Description |
+|-------|------|----------------|-------------|
+| `record_id` | string | yes | Stable BLAKE3-based record ID (`codegraph:v1:…`). Safe to cite, log, and pass to other `eg` commands. |
+| `score` | number | yes | Cosine similarity score (0.0–1.0). Higher = more similar to the query. |
+| `name` | string | when available | Symbol or file name from the matched record. Absent when the record has no name field. |
+| `repo_relative_path` | string | when available | Repository-relative file path, e.g. `"src/lib.rs"`. Absent when the record has no path field. |
+| `span` | object | when available | Source span: `start_byte`, `end_byte`, `start_line`, `end_line` (all integers). Absent when the record has no span. |
+
+Machine consumers must depend only on the fields listed above. Additional fields may be added in future releases; removing or renaming any of the fields above constitutes a breaking contract change and requires a version bump.
+
+### No-result and missing-embedding behavior
+
+| Condition | Exit code | Stderr message | Operator action |
+|-----------|-----------|----------------|-----------------|
+| Store directory does not exist | `1` | `embedded store not found … run ingest` | Create the store: `eg ingest --adapter embedded --data-dir <DIR> [--embed]`. |
+| `semantic_search` returns no matches | `2` | `no results — store may not have embeddings (re-run ingest with --embed)` | Re-run ingest: `eg ingest --adapter embedded --data-dir <DIR> --embed`. |
+
+Exit code `2` is also returned when the query produced no cosine-similar results above the search threshold. This is semantically equivalent to "no match" in other query subcommands.
+
+### `--format text`
+
+`--format text` emits one human-readable line per result for terminal use, for example:
+
+```text
+scan_repository score=0.9500 @ src/lib.rs:51
+```
+
+The exact format of `--format text` output is **not stable** and must not be parsed by scripts or agents. Use `--format json` for machine-readable output with stable field names.
+
+### Example
+
+```sh
+eg ingest graph.jsonl --adapter embedded --data-dir .egregore-semantic --embed
+eg query semantic "write nodes to database storage" --data-dir .egregore-semantic
+```
+
+```json
+{"record_id":"codegraph:v1:abc123","name":"EmbeddedAletheiaSink::write_record","repo_relative_path":"src/sink/embedded.rs","score":0.9231,"span":{"start_byte":4096,"end_byte":5200,"start_line":142,"end_line":168}}
+```
+
+The `record_id` is stable across re-scans of the same commit and can be cited in agent-memory records. The `repo_relative_path` and `span` together give a file and line-range handle that agents can pass directly to editor tools or other `eg` commands.

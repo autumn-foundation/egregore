@@ -12,9 +12,10 @@
 //! # Redaction
 //!
 //! All free-text fields (command text, stdout/stderr excerpts, task descriptions)
-//! pass through a caller-supplied redaction closure before being stored.  The
-//! default [`ImportOptions`] uses a pass-through closure.
-//! TODO: replace with #4 policy at the single call site in [`redact`].
+//! pass through a caller-supplied redaction closure before being stored. The
+//! default [`ImportOptions`] applies the v1 redaction policy via
+//! [`crate::redaction::redact_value`]. Pass-through requires an explicit
+//! [`ImportOptions::passthrough`].
 //!
 //! # Idempotency
 //!
@@ -51,23 +52,38 @@ const INLINE_PAYLOAD_CEILING: u64 = 16 * 1024;
 pub struct ImportOptions {
     /// Redaction closure applied to every free-text field before storage.
     ///
-    /// TODO: replace with #4 policy at the single [`redact`] call site.
+    /// The default closure is [`crate::redaction::redact_value`], which applies
+    /// the v1 redaction policy from `docs/schema/redaction.md`. Pass-through
+    /// (no redaction) is only permitted on explicit dry-run or test paths via
+    /// [`ImportOptions::passthrough`].
     pub redact: Box<dyn Fn(&str) -> String + Send + Sync>,
+    /// Policy version stamped on every emitted node record, or `None` for passthrough.
+    pub policy_version: Option<&'static str>,
 }
 
 impl Default for ImportOptions {
     fn default() -> Self {
         Self {
-            // TODO: replace with #4 policy
+            redact: Box::new(crate::redaction::redact_value),
+            policy_version: Some(crate::redaction::REDACTION_POLICY_VERSION),
+        }
+    }
+}
+
+impl ImportOptions {
+    /// Returns an `ImportOptions` with a pass-through redaction closure.
+    ///
+    /// Only use this for dry-run or test invocations where redaction is not required.
+    #[must_use]
+    pub fn passthrough() -> Self {
+        Self {
             redact: Box::new(|s: &str| s.to_owned()),
+            policy_version: None,
         }
     }
 }
 
 /// Apply the redaction closure to a free-text value.
-///
-/// This is the **single call site** for redaction in the traj importer.
-/// TODO: replace the closure dispatch with the #4 policy once that lands.
 #[inline]
 fn redact(value: &str, opts: &ImportOptions) -> String {
     (opts.redact)(value)
@@ -209,6 +225,7 @@ pub fn import_traj(path: &Path, opts: &ImportOptions) -> Result<Graph> {
             .started_at
             .clone()
             .unwrap_or_else(|| DEFAULT_TRAJ_TIMESTAMP.to_owned()),
+        redaction_policy_version: opts.policy_version.map(str::to_owned),
     };
 
     let mut graph = Graph::new();
@@ -829,12 +846,14 @@ fn build_output_summary(
         (_, Some(e)) => e.to_owned(),
         (None, None) => String::new(),
     };
-    let truncated = if combined.len() > MAX_LEN {
-        format!("{}…", safe_truncate(&combined, MAX_LEN))
+    // Redact the full combined output BEFORE truncating: truncating first could
+    // produce a partial secret that falls below a detector's minimum-length threshold.
+    let redacted = redact(&combined, opts);
+    if redacted.len() > MAX_LEN {
+        format!("{}…", safe_truncate(&redacted, MAX_LEN))
     } else {
-        combined
-    };
-    redact(&truncated, opts)
+        redacted
+    }
 }
 
 /// Truncate `s` to at most `max_bytes` bytes while keeping valid UTF-8.
@@ -858,6 +877,7 @@ struct ImportCtx {
     traj_format: String,
     session_id: String,
     default_timestamp: String,
+    redaction_policy_version: Option<String>,
 }
 
 /// Optional extra fields for a single node emit call.
@@ -926,7 +946,7 @@ fn make_node(
             "{}:{}",
             ctx.source_artifact_path, ctx.source_artifact_hash
         )),
-        redaction_policy_version: None,
+        redaction_policy_version: ctx.redaction_policy_version.clone(),
         summary,
         domain: Some(DOMAIN.to_owned()),
         importer_id: Some(IMPORTER_ID.to_owned()),
@@ -1104,6 +1124,7 @@ mod unit_tests {
         // A redactor that blanks everything should not suppress FileEdit classification.
         let opts = crate::traj::ImportOptions {
             redact: Box::new(|_| "[REDACTED]".to_owned()),
+            policy_version: None,
         };
         assert!(is_file_edit_command("sed -i 's/a/b/' foo.py"));
         // Confirm the redactor would destroy classification signal.

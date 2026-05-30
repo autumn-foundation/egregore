@@ -35,6 +35,8 @@ pub mod local_project;
 pub mod parser;
 /// Agent-facing graph query helpers.
 pub mod query;
+/// Redaction policy engine (`docs/schema/redaction.md` v1).
+pub mod redaction;
 /// Record schema-version compatibility checks.
 pub mod schema_version;
 /// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
