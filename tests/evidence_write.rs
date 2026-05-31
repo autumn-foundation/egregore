@@ -1982,3 +1982,182 @@ fn verification_rejects_empty_linked_command_evidence_id() {
     assert_eq!(err.code, "missing_field");
     assert_eq!(err.field, "linked_command_evidence_id");
 }
+
+#[test]
+fn observation_evidence_links_are_stored_in_canonical_sorted_order() {
+    fn obs_links(out: &aletheia_egregore::evidence::EvidenceWriteOutcome) -> &Vec<EvidenceLink> {
+        for r in &out.records {
+            if let aletheia_egregore::ir::GraphRecord::Node {
+                kind: NodeKind::Observation,
+                evidence_links,
+                ..
+            } = r
+            {
+                return evidence_links
+                    .as_ref()
+                    .expect("evidence_links must be set on Observation");
+            }
+        }
+        panic!("no Observation node in records")
+    }
+    // Two writes with the same links in different order must produce the same ID
+    // and store the links in the same canonical sorted order.
+    let link_a = dummy_evidence_link("codegraph:v4:aaa");
+    let link_b = dummy_evidence_link("codegraph:v4:zzz");
+    let req_ab = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "canonical link order".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![link_a.clone(), link_b.clone()],
+    };
+    let req_ba = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "canonical link order".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![link_b, link_a],
+    };
+    let out_ab = build_observation_records(&req_ab).expect("ab order must succeed");
+    let out_ba = build_observation_records(&req_ba).expect("ba order must succeed");
+    assert_eq!(
+        out_ab.record_id, out_ba.record_id,
+        "link order must not affect the observation ID"
+    );
+    let links_ab = obs_links(&out_ab);
+    let links_ba = obs_links(&out_ba);
+    assert_eq!(
+        links_ab, links_ba,
+        "stored evidence_links must be in canonical sorted order regardless of submission order"
+    );
+}
+
+#[test]
+fn artifact_target_files_are_stored_in_canonical_sorted_order() {
+    fn artifact_files(out: &aletheia_egregore::evidence::EvidenceWriteOutcome) -> &Vec<String> {
+        for r in &out.records {
+            if let aletheia_egregore::ir::GraphRecord::Node {
+                kind: NodeKind::PatchArtifact,
+                target_files,
+                ..
+            } = r
+            {
+                return target_files
+                    .as_ref()
+                    .expect("target_files must be set on PatchArtifact");
+            }
+        }
+        panic!("no PatchArtifact node in records")
+    }
+    // Two writes with the same target_files in different order must produce the same ID
+    // and store the files in the same canonical sorted order.
+    let req_ab = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"--- a\n+++ b\n".to_vec(),
+        target_files: vec!["src/a.rs".to_owned(), "src/z.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "ok".to_owned(),
+    };
+    let req_ba = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"--- a\n+++ b\n".to_vec(),
+        target_files: vec!["src/z.rs".to_owned(), "src/a.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "ok".to_owned(),
+    };
+    let out_ab = build_artifact_records(&req_ab).expect("ab order must succeed");
+    let out_ba = build_artifact_records(&req_ba).expect("ba order must succeed");
+    assert_eq!(
+        out_ab.record_id, out_ba.record_id,
+        "target_file order must not affect the artifact ID"
+    );
+    let files_ab = artifact_files(&out_ab);
+    let files_ba = artifact_files(&out_ba);
+    assert_eq!(
+        files_ab, files_ba,
+        "stored target_files must be in canonical sorted order regardless of submission order"
+    );
+}
+
+#[test]
+fn artifact_rejects_oversized_patch_bytes() {
+    let large = vec![b'x'; 16 * 1024 + 1];
+    let req = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: large,
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "ok".to_owned(),
+    };
+    let err = build_artifact_records(&req).expect_err("oversized patch_bytes must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "patch_bytes");
+}
+
+#[test]
+fn distinct_observed_at_produces_distinct_verification_ids() {
+    let base = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        linked_command_evidence_id: None,
+    };
+    let id_a = build_verification_records(&base)
+        .expect("base must succeed")
+        .record_id;
+    let req_b = VerificationRequest {
+        provenance: EvidenceProvenance {
+            observed_at: "2026-05-30T11:00:00Z".to_owned(),
+            ..valid_provenance()
+        },
+        ..base
+    };
+    let id_b = build_verification_records(&req_b)
+        .expect("req_b must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different observed_at must produce different verification IDs"
+    );
+}
+
+#[test]
+fn distinct_evidence_quality_produces_distinct_verification_ids() {
+    let base = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        linked_command_evidence_id: None,
+    };
+    let id_a = build_verification_records(&base)
+        .expect("verbatim must succeed")
+        .record_id;
+    let req_b = VerificationRequest {
+        evidence_quality: "summarized".to_owned(),
+        ..base
+    };
+    let id_b = build_verification_records(&req_b)
+        .expect("summarized must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different evidence_quality must produce different verification IDs"
+    );
+}

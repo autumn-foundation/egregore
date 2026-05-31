@@ -629,16 +629,19 @@ pub fn build_observation_records(
         hasher.update(redacted_text.as_bytes());
         hasher.finalize().to_hex().to_string()
     };
+    // Sort links canonically for the ID hash and for storage so that two writes with the same
+    // links in different order produce the same ID and identical stored evidence_links arrays.
+    let mut sorted_links = req.evidence_links.clone();
+    sorted_links.sort_unstable_by(|a, b| {
+        a.target_record_id
+            .as_deref()
+            .unwrap_or("")
+            .cmp(b.target_record_id.as_deref().unwrap_or(""))
+    });
     let links_hash = {
         let mut h = blake3::Hasher::new();
-        let mut targets: Vec<&str> = req
-            .evidence_links
-            .iter()
-            .map(|l| l.target_record_id.as_deref().unwrap_or(""))
-            .collect();
-        targets.sort_unstable();
-        for t in &targets {
-            h.update(t.as_bytes());
+        for l in &sorted_links {
+            h.update(l.target_record_id.as_deref().unwrap_or("").as_bytes());
             h.update(b"\0");
         }
         h.finalize().to_hex().to_string()
@@ -668,7 +671,7 @@ pub fn build_observation_records(
         disambiguator: None,
         temporal: None,
         semantic_drift: None,
-        evidence_links: Some(req.evidence_links.clone()),
+        evidence_links: Some(sorted_links),
         repository_identity: None,
         text: Some(redacted_text.clone()),
         superseded_by: None,
@@ -1002,12 +1005,13 @@ pub fn build_artifact_records(
         hasher.finalize().to_hex().to_string()
     };
 
-    // Hash target_files so different file lists produce distinct IDs.
+    // Sort target_files canonically for the ID hash and for storage so that two writes with
+    // the same file list in different order produce the same ID and identical stored arrays.
+    let mut sorted_target_files = req.target_files.clone();
+    sorted_target_files.sort_unstable();
     let target_files_hash = {
         let mut h = blake3::Hasher::new();
-        let mut sorted = req.target_files.clone();
-        sorted.sort_unstable();
-        for f in &sorted {
+        for f in &sorted_target_files {
             h.update(f.as_bytes());
             h.update(b"\0");
         }
@@ -1044,10 +1048,12 @@ pub fn build_artifact_records(
     // short secret is replaced by a longer <REDACTED:…> marker.
     let patch_bytes_size = redacted_patch.len().max(req.patch_bytes.len()) as u64;
 
-    let patch_inline = (patch_bytes_size <= INLINE_PAYLOAD_CEILING).then_some(redacted_patch);
+    if patch_bytes_size > INLINE_PAYLOAD_CEILING {
+        return Err(ProvenanceError::invalid("patch_bytes"));
+    }
     let patch_handle = Box::new(PatchHandle {
         path: format!("patches/{art_id}.patch"),
-        inline: patch_inline,
+        inline: Some(redacted_patch),
     });
 
     // Treat Some("") the same as None — the validator requires unknown_base_reason when
@@ -1104,7 +1110,7 @@ pub fn build_artifact_records(
         summary: format!(
             "PatchArtifact by {} targeting {}",
             req.provenance.agent_id,
-            req.target_files.join(", ")
+            sorted_target_files.join(", ")
         ),
         domain: Some("artifact".to_owned()),
         importer_id: None,
@@ -1114,7 +1120,7 @@ pub fn build_artifact_records(
         patch_status: Some(req.patch_status.clone()),
         base_commit: base_commit_field,
         unknown_base_reason,
-        target_files: Some(req.target_files.clone()),
+        target_files: Some(sorted_target_files),
         patch_bytes_hash: Some(patch_hash),
         patch_bytes_size: Some(patch_bytes_size),
         patch_handle: Some(patch_handle),
@@ -1224,6 +1230,9 @@ pub fn build_verification_records(
         "verification",
         &req.provenance.agent_id,
         &req.provenance.session_id,
+        &req.provenance.observed_at,
+        agent_kind,
+        &req.evidence_quality,
         &req.executed_at,
         &req.status,
         &req.verification_kind,
