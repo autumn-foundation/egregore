@@ -959,9 +959,10 @@ fn import_github_cmd(
         process::exit(1);
     }
 
-    let api_base = api_base
-        .map(str::to_owned)
-        .unwrap_or_else(|| crate::github::client::DEFAULT_API_BASE.to_owned());
+    let api_base = api_base.map_or_else(
+        || crate::github::client::DEFAULT_API_BASE.to_owned(),
+        str::to_owned,
+    );
 
     // Default state-file path: alongside the handoff output.
     let default_state = out

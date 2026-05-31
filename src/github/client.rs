@@ -2,7 +2,7 @@
 //!
 //! Built on `ureq` for full control over the request budget the conformance
 //! tests assert: a two-step repo-probe auth state machine, `Link` pagination,
-//! per-page `ETag` conditional fetch, rate-limit header handling with backoff, and
+//! per-page ETag conditional fetch, rate-limit header handling with backoff, and
 //! a request counter. The base URL is injectable so tests drive it against a
 //! local mock server with no live network access.
 
@@ -24,7 +24,7 @@ pub const DEFAULT_API_BASE: &str = "https://api.github.com";
 
 /// Outcome of a single conditional list fetch.
 pub enum FetchOutcome {
-    /// Endpoint changed (or first fetch): JSON items plus the new per-page `ETags`.
+    /// Endpoint changed (or first fetch): JSON items plus the new per-page ETags.
     Modified {
         /// Flattened items across all pages.
         items: Vec<Value>,
@@ -67,7 +67,7 @@ impl Client {
             requests: AtomicU64::new(0),
             last_remaining: AtomicU64::new(u64::MAX),
             max_retries: 5,
-            sleep: Box::new(std::thread::sleep),
+            sleep: Box::new(|d| std::thread::sleep(d)),
         }
     }
 
@@ -93,7 +93,7 @@ impl Client {
 
     /// Whether this client carries a token (drives the probe state machine).
     #[must_use]
-    pub const fn has_token(&self) -> bool {
+    pub fn has_token(&self) -> bool {
         self.token.is_some()
     }
 
@@ -160,21 +160,22 @@ impl Client {
 
         // Step 2 — authenticated re-probe.
         self.requests.fetch_add(1, Ordering::Relaxed);
-        let step2 = self.request(&url, true).call();
-        match &step2 {
+        match self.request(&url, true).call() {
             Ok(resp) => {
                 self.record_rate_limit(&resp);
                 Ok(())
             }
             Err(ureq::Error::Status(401 | 403, _)) => Err(GithubError::AuthRejected),
-            Err(ureq::Error::Status(404, _)) | Err(_) => Err(GithubError::RepoNotFound),
+            // 404 (repo missing / token lacks access) and any transport error
+            // both surface as "repository not found" at this step.
+            Err(_) => Err(GithubError::RepoNotFound),
         }
     }
 
     /// Conditionally fetches all pages of a list endpoint.
     ///
-    /// `prior_etags` maps `"<path>?page=<n>"` to a stored `ETag`; when the first
-    /// page's stored `ETag` still matches (304) the whole endpoint is treated as
+    /// `prior_etags` maps `"<path>?page=<n>"` to a stored ETag; when the first
+    /// page's stored ETag still matches (304) the whole endpoint is treated as
     /// unchanged and [`FetchOutcome::NotModified`] is returned without fetching
     /// further pages.
     ///
@@ -284,7 +285,7 @@ impl Client {
                 Err(ureq::Error::Status(401 | 403, _)) => {
                     return Err(GithubError::AuthRejected);
                 }
-                Err(ureq::Error::Status(code @ 502..=504, _)) => {
+                Err(ureq::Error::Status(code @ (502 | 503 | 504), _)) => {
                     last_status = code;
                     if attempt >= self.max_retries {
                         return Err(GithubError::FetchFailed {

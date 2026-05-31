@@ -65,7 +65,7 @@ pub struct Emitted {
 }
 
 impl Emitted {
-    fn extend(&mut self, other: Emitted) {
+    fn extend(&mut self, other: Self) {
         self.records.extend(other.records);
         self.link_diagnostics += other.link_diagnostics;
     }
@@ -75,12 +75,15 @@ impl Emitted {
 
 /// Redacts a multi-line string line-by-line so structural context survives but
 /// any line carrying a secret is replaced with a redaction marker. Used for
-/// bodies and (per the diff_hunk sub-policy) diff hunks.
+/// bodies and (per the `diff_hunk` sub-policy) diff hunks.
 fn redact_lines(redact: &Redact<'_>, text: &str) -> String {
     text.split('\n').map(redact).collect::<Vec<_>>().join("\n")
 }
 
 /// Builds a redacted `OutputHandle` from already-redacted content.
+///
+/// Returns a `Box` because every caller stores it in an `Option<Box<_>>` field.
+#[allow(clippy::unnecessary_box_returns)]
 fn handle_for(content: &str) -> Box<OutputHandle> {
     let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
     let bytes = content.len() as u64;
@@ -148,7 +151,7 @@ fn set_common(record: &mut GraphRecord, id: &str, valid_time: &str, ctx: &Contex
 
 /// Builds the redacted `Task.body_handle` blob carrying the body plus the
 /// GitHub-only metadata that has no dedicated v1 `Task` field.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::unnecessary_box_returns)]
 fn body_blob(
     ctx: &Context<'_>,
     body: Option<&str>,
@@ -161,7 +164,7 @@ fn body_blob(
     base_ref: Option<&str>,
     merge_commit_sha: Option<&str>,
     closed_at: Option<&str>,
-) -> OutputHandle {
+) -> Box<OutputHandle> {
     let redacted_body = body.map(|b| redact_lines(ctx.redact, b));
     let redacted_milestone = milestone.map(|m| (ctx.redact)(m));
     let blob = serde_json::json!({
@@ -266,7 +269,7 @@ fn task_and_link(
     labels: &[model::Label],
     assignees: &[model::User],
     author: Option<&str>,
-    body_handle: OutputHandle,
+    body_handle: Box<OutputHandle>,
 ) -> Emitted {
     let number_s = number.to_string();
     let task_id = project_stable_id(&["project", "Task", ctx.source_repo, &number_s, native_id]);
@@ -306,7 +309,7 @@ fn task_and_link(
     } = &mut task
     {
         *t = Some(redacted_title);
-        *bh = Some(Box::new(body_handle));
+        *bh = Some(body_handle);
         *st = Some(status.to_owned());
         *sk = Some(source_kind.to_owned());
         *sel = Some(link_id.clone());
@@ -531,7 +534,7 @@ fn link_diagnostic(
     rec
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 fn review_node(
     ctx: &Context<'_>,
     native_id: &str,
@@ -539,7 +542,7 @@ fn review_node(
     review_kind: &str,
     valid_time: &str,
     author: Option<&str>,
-    body: Option<&str>,
+    body: Option<String>,
     parent_task_id: &str,
 ) -> GraphRecord {
     let id = review_id_for(ctx, native_id);
@@ -563,7 +566,7 @@ fn review_node(
     {
         *rk = Some(review_kind.to_owned());
         *au = author.map(str::to_owned);
-        *bh = body.map(|b| Box::new(handle_for(b)));
+        *bh = body.as_deref().map(handle_for);
         *system_native_id = Some(native_id.to_owned());
         *pt = Some(parent_task_id.to_owned());
     }
@@ -601,7 +604,7 @@ fn set_review_extra(
                 end_byte: 0,
             });
         }
-        *diff_hunk_handle = diff_hunk.map(|d| Box::new(handle_for(d)));
+        *diff_hunk_handle = diff_hunk.map(handle_for);
     }
 }
 

@@ -73,6 +73,7 @@ pub struct ImportOutcome {
 ///
 /// Returns a typed [`GithubError`] naming the failing source class on auth,
 /// repo-availability, rate-limit, or fetch failure.
+#[allow(clippy::too_many_lines)]
 pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<ImportOutcome> {
     let started = std::time::Instant::now();
     let transaction_time = opts
@@ -271,8 +272,8 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
 
     // Finalise state bookkeeping.
     state.last_run_at_unix_ms = now_unix_ms();
-    state.api_base_url = opts.api_base.clone();
-    state.source_repo = opts.source_repo.to_owned();
+    state.api_base_url.clone_from(&opts.api_base);
+    opts.source_repo.clone_into(&mut state.source_repo);
 
     let jsonl = graph.to_jsonl().map_err(|e| GithubError::Io {
         detail: format!("serialize handoff: {e}"),

@@ -264,9 +264,12 @@ fn import_github_schema_doc_is_linked_and_coordinated() {
 
     // AC 1: linked from local-JSONL schema
     assert_contains_all("docs/schema/local-project-jsonl.md", &["import-github.md"]);
+}
 
 // ─── Behaviour conformance tests ───
 //
-// The observable contract these stubs described is now implemented in
-// `tests/import_github_behaviour.rs`, which drives the `eg import github`
-// CLI against a local mock HTTP server (no live network access).
+// The observable contract the original `#[ignore]` stubs described is now
+// implemented in `tests/import_github_behaviour.rs`, which drives the real
+// `eg import github` CLI against a local mock HTTP server (no live network
+// access). See that file for the fresh-import shape, idempotent re-import,
+// redaction, failure-mode, file-link, and threaded-review conformance tests.

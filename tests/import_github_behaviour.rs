@@ -13,6 +13,11 @@
 // nursery/pedantic rewrites clippy suggests here.
 #![allow(clippy::option_if_let_else)]
 #![allow(clippy::format_push_string)]
+#![allow(clippy::needless_lifetimes)]
+// Test-harness ergonomics: the mock server favours readability over the
+// nursery/pedantic rewrites clippy suggests here.
+#![allow(clippy::option_if_let_else)]
+#![allow(clippy::format_push_string)]
 
 use std::{
     collections::HashMap,

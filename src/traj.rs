@@ -905,6 +905,7 @@ struct NodeExtra {
     status: Option<String>,
 }
 
+#[allow(clippy::too_many_lines)]
 fn make_node(
     id: String,
     kind: NodeKind,

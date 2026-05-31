@@ -25,6 +25,11 @@ const CLASSIC_PREFIXES: &[&str] = &["ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
 ///
 /// The scan is greedy on the token body so the entire secret is replaced, not
 /// just its prefix. Non-token text is preserved byte-for-byte.
+///
+/// # Panics
+///
+/// Does not panic: the inner `expect` is unreachable because the loop only
+/// indexes within `value`'s bounds while bytes remain.
 #[must_use]
 pub fn scrub(value: &str) -> String {
     // Fast path: a token prefix always contains "gh" (`ghp_`/`gho_`/… or
@@ -40,12 +45,11 @@ pub fn scrub(value: &str) -> String {
         if let Some(end) = match_token(value, i) {
             out.push_str(SCRUB_MARKER);
             i = end;
-        } else if let Some(ch) = value[i..].chars().next() {
+        } else {
             // Push one UTF-8 char to keep the output valid.
+            let ch = value[i..].chars().next().expect("non-empty slice");
             out.push(ch);
             i += ch.len_utf8();
-        } else {
-            break;
         }
     }
     out
