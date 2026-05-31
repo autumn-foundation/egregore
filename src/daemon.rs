@@ -9772,12 +9772,12 @@ mod tests {
         // event is emitted.
         tracker.on_complete();
         assert_ne!(tracker.state(), PressureState::Saturated);
-        let exit_events: Vec<_> = tracker
+        let exit_events = tracker
             .events_snapshot()
             .into_iter()
             .filter(|event| event.transition == "exited_saturation")
-            .collect();
-        assert_eq!(exit_events.len(), 1, "exactly one exit event per recovery");
+            .count();
+        assert_eq!(exit_events, 1, "exactly one exit event per recovery");
         assert!(tracker.last_recovered_at_unix_ms.load(Ordering::SeqCst) > 0);
     }
 
