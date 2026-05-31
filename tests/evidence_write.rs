@@ -2830,3 +2830,130 @@ fn distinct_source_handle_produces_distinct_artifact_ids() {
         "different source_handle must produce different artifact IDs"
     );
 }
+
+#[test]
+fn verification_normalizes_verification_kind_to_lowercase() {
+    let req_upper = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "Test_Run".to_owned(),
+        stdout: None,
+        evidence_quality: "high".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        linked_command_evidence_id: None,
+    };
+    let req_lower = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: None,
+        evidence_quality: "high".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        linked_command_evidence_id: None,
+    };
+    let id_upper = build_verification_records(&req_upper)
+        .expect("mixed-case verification_kind must succeed")
+        .record_id;
+    let id_lower = build_verification_records(&req_lower)
+        .expect("lowercase verification_kind must succeed")
+        .record_id;
+    assert_eq!(
+        id_upper, id_lower,
+        "case-only difference in verification_kind must produce same ID"
+    );
+
+    let outcome = build_verification_records(&req_upper).expect("must succeed");
+    for record in &outcome.records {
+        if let aletheia_egregore::ir::GraphRecord::Node {
+            kind: NodeKind::Verification,
+            verification_kind,
+            ..
+        } = record
+        {
+            assert_eq!(
+                verification_kind.as_deref(),
+                Some("test_run"),
+                "stored verification_kind must be lowercase"
+            );
+        }
+    }
+}
+
+#[test]
+fn observation_distinct_as_of_commit_produces_distinct_ids() {
+    let link_base = EvidenceLink {
+        target_record_id: Some("codegraph:v4:abc".to_owned()),
+        target_domain: "codegraph".to_owned(),
+        relation: EdgeLabel::Observes.as_str().to_owned(),
+        confidence: "0.9".to_owned(),
+        as_of_commit: Some("commit-a".to_owned()),
+        target_repo_relative_path: None,
+        target_span: None,
+        target_git_commit: None,
+    };
+    let req_a = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "temporal link test".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![link_base],
+    };
+    let link_b = EvidenceLink {
+        target_record_id: Some("codegraph:v4:abc".to_owned()),
+        target_domain: "codegraph".to_owned(),
+        relation: EdgeLabel::Observes.as_str().to_owned(),
+        confidence: "0.9".to_owned(),
+        as_of_commit: Some("commit-b".to_owned()),
+        target_repo_relative_path: None,
+        target_span: None,
+        target_git_commit: None,
+    };
+    let req_b = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "temporal link test".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![link_b],
+    };
+    let id_a = build_observation_records(&req_a)
+        .expect("commit-a must succeed")
+        .record_id;
+    let id_b = build_observation_records(&req_b)
+        .expect("commit-b must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different as_of_commit must produce different observation IDs"
+    );
+}
+
+#[test]
+fn observation_distinct_target_git_commit_produces_distinct_ids() {
+    let make_req = |git_commit: &str| ObservationRequest {
+        provenance: valid_provenance(),
+        text: "git commit test".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![EvidenceLink {
+            target_record_id: Some("codegraph:v4:abc".to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: EdgeLabel::Observes.as_str().to_owned(),
+            confidence: "0.9".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: Some(git_commit.to_owned()),
+        }],
+    };
+    let id_a = build_observation_records(&make_req("sha-aaa"))
+        .expect("sha-aaa must succeed")
+        .record_id;
+    let id_b = build_observation_records(&make_req("sha-bbb"))
+        .expect("sha-bbb must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different target_git_commit must produce different observation IDs"
+    );
+}

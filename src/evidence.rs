@@ -688,6 +688,27 @@ pub fn build_observation_records(
                     .unwrap_or("")
                     .cmp(b.target_repo_relative_path.as_deref().unwrap_or("")),
             )
+            .then(
+                a.as_of_commit
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.as_of_commit.as_deref().unwrap_or("")),
+            )
+            .then(
+                a.target_git_commit
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.target_git_commit.as_deref().unwrap_or("")),
+            )
+            .then({
+                let a_span = a.target_span.as_ref().map_or((0, 0, 0, 0), |s| {
+                    (s.start_byte, s.end_byte, s.start_line, s.end_line)
+                });
+                let b_span = b.target_span.as_ref().map_or((0, 0, 0, 0), |s| {
+                    (s.start_byte, s.end_byte, s.start_line, s.end_line)
+                });
+                a_span.cmp(&b_span)
+            })
     });
     let links_hash = {
         let mut h = blake3::Hasher::new();
@@ -706,6 +727,18 @@ pub fn build_observation_records(
                     .unwrap_or("")
                     .as_bytes(),
             );
+            h.update(b"\0");
+            h.update(l.as_of_commit.as_deref().unwrap_or("").as_bytes());
+            h.update(b"\0");
+            h.update(l.target_git_commit.as_deref().unwrap_or("").as_bytes());
+            h.update(b"\0");
+            let span_key = l.target_span.as_ref().map_or_else(String::new, |s| {
+                format!(
+                    "{}:{}:{}:{}",
+                    s.start_byte, s.end_byte, s.start_line, s.end_line
+                )
+            });
+            h.update(span_key.as_bytes());
             h.update(b"\0");
         }
         h.finalize().to_hex().to_string()
@@ -882,6 +915,20 @@ pub fn build_command_evidence_records(
     // Redact stdout/stderr before hashing or inline storage.
     let redacted_stdout = req.stdout.as_deref().map(crate::redaction::redact_value);
     let redacted_stderr = req.stderr.as_deref().map(crate::redaction::redact_value);
+    // Redaction can expand content (e.g. short API key → longer marker); reject if the
+    // redacted form still won't fit inline — no sidecar persistence is available.
+    if redacted_stdout
+        .as_deref()
+        .is_some_and(|s| s.len() as u64 > INLINE_PAYLOAD_CEILING)
+    {
+        return Err(ProvenanceError::invalid("stdout"));
+    }
+    if redacted_stderr
+        .as_deref()
+        .is_some_and(|s| s.len() as u64 > INLINE_PAYLOAD_CEILING)
+    {
+        return Err(ProvenanceError::invalid("stderr"));
+    }
     let stdout_redacted = redacted_stdout
         .as_deref()
         .is_some_and(crate::redaction::is_redacted);
@@ -1314,6 +1361,13 @@ pub fn build_verification_records(
 
     // Redact stdout before stable ID so stdout content is part of the identity.
     let redacted_stdout = req.stdout.as_deref().map(crate::redaction::redact_value);
+    // Redaction can expand content; reject if the redacted form exceeds the inline ceiling.
+    if redacted_stdout
+        .as_deref()
+        .is_some_and(|s| s.len() as u64 > INLINE_PAYLOAD_CEILING)
+    {
+        return Err(ProvenanceError::invalid("stdout"));
+    }
     let stdout_hash = {
         let mut h = blake3::Hasher::new();
         h.update(redacted_stdout.as_deref().unwrap_or("").as_bytes());
@@ -1435,7 +1489,7 @@ pub fn build_verification_records(
         stderr_handle: None,
         evidence_quality: Some(req.evidence_quality.clone()),
         executed_at: Some(req.executed_at.clone()),
-        verification_kind: Some(req.verification_kind.clone()),
+        verification_kind: Some(req.verification_kind.to_ascii_lowercase()),
         status: Some(req.status.clone()),
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
