@@ -227,7 +227,7 @@ pub struct ReviewComment {
     /// `LEFT` or `RIGHT`.
     #[serde(default)]
     pub side: Option<String>,
-    /// Diff hunk context (redacted per the diff_hunk sub-policy).
+    /// Diff hunk context (redacted per the `diff_hunk` sub-policy).
     #[serde(default)]
     pub diff_hunk: Option<String>,
     /// Parent comment ID for threaded replies.

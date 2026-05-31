@@ -1,7 +1,7 @@
 //! Idempotency state file (`.github-import-state.json`).
 //!
 //! Per `docs/schema/import-github.md` §5 the importer persists per-repository
-//! ETags, update watermarks, a label-list hash, and per-resource content hashes
+//! `ETags`, update watermarks, a label-list hash, and per-resource content hashes
 //! so an unchanged re-import issues only conditional probes and emits zero
 //! per-resource records, while a changed re-import emits only the resources that
 //! actually changed.
