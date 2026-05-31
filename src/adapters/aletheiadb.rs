@@ -1179,6 +1179,11 @@ impl EmbeddedAletheiaSink {
             executed_at,
             verification_kind,
             status,
+            review_kind,
+            review_state,
+            in_reply_to_id,
+            author,
+            diff_hunk_handle,
             user_context,
             producer,
         } = record
@@ -1360,6 +1365,15 @@ impl EmbeddedAletheiaSink {
         builder = insert_optional(builder, "executed_at", executed_at.as_deref());
         builder = insert_optional(builder, "verification_kind", verification_kind.as_deref());
         builder = insert_optional(builder, "status", status.as_deref());
+        builder = insert_optional(builder, "review_kind", review_kind.as_deref());
+        builder = insert_optional(builder, "review_state", review_state.as_deref());
+        builder = insert_optional(builder, "in_reply_to_id", in_reply_to_id.as_deref());
+        builder = insert_optional(builder, "author", author.as_deref());
+        if let Some(handle) = diff_hunk_handle
+            && let Ok(json) = serde_json::to_string(handle.as_ref())
+        {
+            builder = builder.insert("diff_hunk_handle_json", json.as_str());
+        }
         if !user_context.is_empty()
             && let Ok(json) = serde_json::to_string(user_context)
         {
@@ -2216,6 +2230,32 @@ impl EmbeddedAletheiaSink {
                 node.get_property("verification_kind"),
             )?,
             status: optional_str_property(record_id, "status", node.get_property("status"))?,
+            review_kind: optional_str_property(
+                record_id,
+                "review_kind",
+                node.get_property("review_kind"),
+            )?,
+            review_state: optional_str_property(
+                record_id,
+                "review_state",
+                node.get_property("review_state"),
+            )?,
+            in_reply_to_id: optional_str_property(
+                record_id,
+                "in_reply_to_id",
+                node.get_property("in_reply_to_id"),
+            )?,
+            author: optional_str_property(record_id, "author", node.get_property("author"))?,
+            diff_hunk_handle: optional_str_property(
+                record_id,
+                "diff_hunk_handle_json",
+                node.get_property("diff_hunk_handle_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::OutputHandle>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("diff_hunk_handle_json invalid: {e}")))?
+            .map(Box::new),
             user_context: optional_str_property(
                 record_id,
                 "user_context_json",

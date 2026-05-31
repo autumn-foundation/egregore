@@ -1,0 +1,220 @@
+//! Idempotency state file (`.github-import-state.json`).
+//!
+//! Per `docs/schema/import-github.md` §5 the importer persists per-repository
+//! ETags, update watermarks, a label-list hash, and per-resource content hashes
+//! so an unchanged re-import issues only conditional probes and emits zero
+//! per-resource records, while a changed re-import emits only the resources that
+//! actually changed.
+
+use std::{collections::BTreeMap, path::Path};
+
+use serde::{Deserialize, Serialize};
+
+use crate::github::model;
+
+/// Current idempotency-state schema version.
+pub const STATE_SCHEMA_VERSION: u32 = 1;
+
+/// Per-endpoint update watermarks (inclusive `>=` selection, §5).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Watermarks {
+    /// Highest `updated_at` seen across imported issues.
+    #[serde(default)]
+    pub issues: Option<String>,
+    /// Highest `updated_at` seen across imported pull requests.
+    #[serde(default)]
+    pub pulls: Option<String>,
+}
+
+/// On-disk idempotency state, one object per `<owner>/<repo>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct State {
+    /// State-file schema version; mismatched files are treated as missing.
+    pub schema_version: u32,
+    /// `<owner>/<repo>` this state belongs to.
+    pub source_repo: String,
+    /// API base URL the state was captured against.
+    pub api_base_url: String,
+    /// Wall-clock of the last completed run (Unix ms).
+    pub last_run_at_unix_ms: u128,
+    /// `"<endpoint>?page=<n>" -> "<etag>"`.
+    #[serde(default)]
+    pub etags: BTreeMap<String, String>,
+    /// `"<endpoint>" -> next cursor` (reserved; REST uses Link headers).
+    #[serde(default)]
+    pub cursors: BTreeMap<String, Option<String>>,
+    /// Per-endpoint update watermarks.
+    #[serde(default)]
+    pub last_seen_updated_at: Watermarks,
+    /// Hash of the sorted label list (name+color+description).
+    #[serde(default)]
+    pub label_list_hash: Option<String>,
+    /// `"issue:<n>" | "pr:<n>" -> blake3(content hash of key fields)`.
+    #[serde(default)]
+    pub resource_hashes: BTreeMap<String, String>,
+}
+
+impl State {
+    /// Builds a fresh empty state for `source_repo` against `api_base_url`.
+    #[must_use]
+    pub fn fresh(source_repo: &str, api_base_url: &str) -> Self {
+        Self {
+            schema_version: STATE_SCHEMA_VERSION,
+            source_repo: source_repo.to_owned(),
+            api_base_url: api_base_url.to_owned(),
+            last_run_at_unix_ms: 0,
+            etags: BTreeMap::new(),
+            cursors: BTreeMap::new(),
+            last_seen_updated_at: Watermarks::default(),
+            label_list_hash: None,
+            resource_hashes: BTreeMap::new(),
+        }
+    }
+
+    /// Loads state from `path`, returning a fresh state when the file is
+    /// missing, unreadable, unparseable, or carries an unsupported
+    /// `schema_version` (a partial file from a crashed run, per §5).
+    #[must_use]
+    pub fn load_or_fresh(path: &Path, source_repo: &str, api_base_url: &str) -> Self {
+        let fallback = || Self::fresh(source_repo, api_base_url);
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return fallback();
+        };
+        match serde_json::from_str::<Self>(&raw) {
+            Ok(s) if s.schema_version == STATE_SCHEMA_VERSION && s.source_repo == source_repo => s,
+            _ => fallback(),
+        }
+    }
+
+    /// Serialises state to `path` (pretty JSON for operator inspection).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be written.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(self).unwrap_or_default();
+        std::fs::write(path, json)
+    }
+
+    /// Returns `true` when `key`'s stored content hash equals `hash` (i.e. the
+    /// resource is unchanged since the last run and must not be re-emitted).
+    #[must_use]
+    pub fn is_unchanged(&self, key: &str, hash: &str) -> bool {
+        self.resource_hashes.get(key).is_some_and(|h| h == hash)
+    }
+
+    /// Records `key`'s new content hash.
+    pub fn record_hash(&mut self, key: String, hash: String) {
+        self.resource_hashes.insert(key, hash);
+    }
+}
+
+/// Computes the content hash of an issue's emission-affecting key fields (§5).
+#[must_use]
+pub fn issue_hash(issue: &model::Issue) -> String {
+    let key = serde_json::json!({
+        "number": issue.number,
+        "state": issue.state,
+        "state_reason": issue.state_reason,
+        "title": issue.title,
+        "body": issue.body,
+        "labels": issue.labels.iter().map(|l| &l.name).collect::<Vec<_>>(),
+        "assignees": issue.assignees.iter().map(|u| &u.login).collect::<Vec<_>>(),
+        "milestone": issue.milestone.as_ref().map(|m| &m.title),
+        "updated_at": issue.updated_at,
+        "closed_at": issue.closed_at,
+    });
+    blake3::hash(serde_json::to_string(&key).unwrap_or_default().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// Computes the content hash of a PR's emission-affecting key fields (§5).
+#[must_use]
+pub fn pull_hash(pr: &model::PullRequest) -> String {
+    let key = serde_json::json!({
+        "number": pr.number,
+        "state": pr.state,
+        "title": pr.title,
+        "body": pr.body,
+        "labels": pr.labels.iter().map(|l| &l.name).collect::<Vec<_>>(),
+        "assignees": pr.assignees.iter().map(|u| &u.login).collect::<Vec<_>>(),
+        "milestone": pr.milestone.as_ref().map(|m| &m.title),
+        "updated_at": pr.updated_at,
+        "closed_at": pr.closed_at,
+        "merged_at": pr.merged_at,
+        "draft": pr.draft,
+        "head_sha": pr.head.as_ref().map(|h| &h.sha),
+        "base_ref": pr.base.as_ref().map(|b| &b.ref_name),
+    });
+    blake3::hash(serde_json::to_string(&key).unwrap_or_default().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// Computes the label-list hash (sorted name+color+description), §5.
+#[must_use]
+pub fn label_list_hash(labels: &[model::Label]) -> String {
+    let mut rows: Vec<String> = labels
+        .iter()
+        .map(|l| format!("{}\u{1}{}\u{1}{}", l.name, l.color, l.description.clone().unwrap_or_default()))
+        .collect();
+    rows.sort();
+    blake3::hash(rows.join("\n").as_bytes()).to_hex().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn issue(n: u64, title: &str) -> model::Issue {
+        model::Issue {
+            number: n,
+            title: title.to_owned(),
+            body: None,
+            state: "open".to_owned(),
+            state_reason: None,
+            labels: vec![],
+            assignees: vec![],
+            user: None,
+            milestone: None,
+            created_at: String::new(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            closed_at: None,
+            html_url: String::new(),
+            pull_request: None,
+        }
+    }
+
+    #[test]
+    fn hash_changes_when_title_changes() {
+        assert_ne!(issue_hash(&issue(1, "a")), issue_hash(&issue(1, "b")));
+        assert_eq!(issue_hash(&issue(1, "a")), issue_hash(&issue(1, "a")));
+    }
+
+    #[test]
+    fn load_rejects_wrong_schema_version() {
+        let dir = std::env::temp_dir().join(format!("egst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, r#"{"schema_version":2,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0}"#).unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert!(s.resource_hashes.is_empty());
+        assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn roundtrip_save_load() {
+        let dir = std::env::temp_dir().join(format!("egst2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut s = State::fresh("o/r", "https://api.github.com");
+        s.record_hash("issue:1".to_owned(), "abc".to_owned());
+        s.save(&path).unwrap();
+        let loaded = State::load_or_fresh(&path, "o/r", "https://api.github.com");
+        assert!(loaded.is_unchanged("issue:1", "abc"));
+        assert!(!loaded.is_unchanged("issue:1", "def"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

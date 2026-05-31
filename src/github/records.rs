@@ -15,8 +15,7 @@ use std::collections::BTreeMap;
 use crate::{
     github::model,
     ir::{
-        EdgeLabel, GraphRecord, NodeKind, OutputHandle, PROJECT_SCHEMA_VERSION, SourceSpan,
-        project_stable_id,
+        EdgeLabel, GraphRecord, NodeKind, OutputHandle, PROJECT_SCHEMA_VERSION, project_stable_id,
     },
     redaction::REDACTION_POLICY_VERSION,
 };
@@ -595,9 +594,13 @@ fn set_review_extra(
         *irt = in_reply_to_id.map(str::to_owned);
         *repo_relative_path = path.map(str::to_owned);
         if let Some(l) = line {
-            *span = Some(SourceSpan {
-                start_line: start_line.unwrap_or(l),
-                end_line: l,
+            // GitHub provides 1-based line numbers, not byte offsets; record the
+            // line range and leave byte offsets at 0 (not available over REST).
+            *span = Some(crate::ir::SourceSpan {
+                start_line: start_line.unwrap_or(l) as usize,
+                end_line: l as usize,
+                start_byte: 0,
+                end_byte: 0,
             });
         }
         *diff_hunk_handle = diff_hunk.map(handle_for);
