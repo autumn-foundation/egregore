@@ -7,6 +7,11 @@
 //! state file. The importer is local-first and explicit — it never runs inside
 //! the daemon, polls, subscribes to webhooks, or crawls beyond the named repo.
 
+pub mod auth;
+pub mod client;
+pub mod error;
+pub mod import;
 pub mod model;
 pub mod records;
 pub mod scrubber;
+pub mod state;
