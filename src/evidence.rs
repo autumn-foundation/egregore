@@ -603,6 +603,24 @@ pub fn build_observation_records(
         if !(0.0..=1.0).contains(&c) {
             return Err(ProvenanceError::invalid("evidence_links.confidence"));
         }
+        if link.relation.is_empty() {
+            return Err(ProvenanceError::missing("evidence_links.relation"));
+        }
+        if link.target_domain.is_empty() {
+            return Err(ProvenanceError::missing("evidence_links.target_domain"));
+        }
+        // Reject relation/domain mismatches the daemon would reject.
+        if link.relation == EdgeLabel::Observes.as_str() && link.target_domain != "codegraph" {
+            return Err(ProvenanceError::invalid("evidence_links.relation"));
+        }
+        if link.relation == EdgeLabel::ValidatedBy.as_str() && link.target_domain != "verification"
+        {
+            return Err(ProvenanceError::invalid("evidence_links.relation"));
+        }
+        // An explicitly-set but empty target_record_id is semantically invalid.
+        if link.target_record_id.as_deref() == Some("") {
+            return Err(ProvenanceError::missing("evidence_links.target_record_id"));
+        }
     }
 
     let agent_kind = effective_agent_kind(&req.provenance);
@@ -681,6 +699,7 @@ pub fn build_observation_records(
         &req.provenance.agent_id,
         &req.provenance.session_id,
         &req.provenance.observed_at,
+        agent_kind,
         &req.confidence.to_string(),
         &text_hash,
         &links_hash,
@@ -883,6 +902,7 @@ pub fn build_command_evidence_records(
         &req.evidence_quality,
         &req.source_artifact_path,
         &req.source_artifact_hash,
+        req.provenance.source_handle.as_deref().unwrap_or(""),
         &stdout_hash,
         &stderr_hash,
     ]);
@@ -1048,9 +1068,20 @@ pub fn build_artifact_records(
         h.finalize().to_hex().to_string()
     };
 
-    // ID covers all payload-bearing fields so that the same bytes re-written with
-    // a corrected base_commit, target_files, source hash, or observed_at produce a
-    // distinct record rather than a mismatched-payload conflict on the existing one.
+    // Redact validation_summary before the stable ID so the stored value and the ID
+    // inputs are consistent — a re-write with different summary text produces a distinct ID.
+    let patch_str = String::from_utf8_lossy(&req.patch_bytes).into_owned();
+    let redacted_patch = crate::redaction::redact_value(&patch_str);
+    let redacted_validation_summary = crate::redaction::redact_value(&req.validation_summary);
+    let validation_summary_hash = {
+        let mut h = blake3::Hasher::new();
+        h.update(redacted_validation_summary.as_bytes());
+        h.finalize().to_hex().to_string()
+    };
+
+    // ID covers all stored payload-bearing fields so that any correction to source path,
+    // validation summary, base_commit, target_files, or source hash produces a distinct
+    // record rather than a mismatched-payload conflict on the existing one.
     let art_id = artifact_stable_id(&[
         "node",
         "patch_artifact",
@@ -1059,16 +1090,12 @@ pub fn build_artifact_records(
         &req.provenance.observed_at,
         &patch_hash,
         &req.patch_status,
+        &req.source_artifact_path,
         &req.source_artifact_hash,
         req.base_commit.as_deref().unwrap_or(""),
         &target_files_hash,
+        &validation_summary_hash,
     ]);
-
-    // Decode patch bytes and redact before inline storage.
-    // Only inline when below the ceiling; the daemon rejects inline_payload_exceeds_ceiling.
-    let patch_str = String::from_utf8_lossy(&req.patch_bytes).into_owned();
-    let redacted_patch = crate::redaction::redact_value(&patch_str);
-    let redacted_validation_summary = crate::redaction::redact_value(&req.validation_summary);
     let patch_redacted = crate::redaction::is_redacted(&redacted_patch);
     let summary_redacted = crate::redaction::is_redacted(&redacted_validation_summary);
     let redaction_policy_version = (patch_redacted || summary_redacted)
@@ -1268,6 +1295,7 @@ pub fn build_verification_records(
         &req.verification_kind,
         &req.source_artifact_path,
         &req.source_artifact_hash,
+        req.provenance.source_handle.as_deref().unwrap_or(""),
         &stdout_hash,
         req.linked_command_evidence_id.as_deref().unwrap_or(""),
     ]);

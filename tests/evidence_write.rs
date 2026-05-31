@@ -2288,3 +2288,230 @@ fn verification_rejects_non_agent_memory_linked_command_evidence_id() {
     assert_eq!(err.code, "invalid_field");
     assert_eq!(err.field, "linked_command_evidence_id");
 }
+
+#[test]
+fn distinct_agent_kind_produces_distinct_observation_ids() {
+    let req_other = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "agent kind check".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+    };
+    let req_codex = ObservationRequest {
+        provenance: EvidenceProvenance {
+            agent_kind: "codex".to_owned(),
+            ..valid_provenance()
+        },
+        text: "agent kind check".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+    };
+    let id_a = build_observation_records(&req_other)
+        .expect("other must succeed")
+        .record_id;
+    let id_b = build_observation_records(&req_codex)
+        .expect("codex must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different agent_kind must produce different observation IDs"
+    );
+}
+
+#[test]
+fn distinct_source_handle_produces_distinct_command_evidence_ids() {
+    let base = CommandEvidenceRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:01:00Z".to_owned(),
+        exit_code: 0,
+        stdout: None,
+        stderr: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+    };
+    let id_a = build_command_evidence_records(&base)
+        .expect("base must succeed")
+        .record_id;
+    let req_b = CommandEvidenceRequest {
+        provenance: EvidenceProvenance {
+            source_handle: Some("src/lib.rs:other".to_owned()),
+            ..valid_provenance()
+        },
+        ..base
+    };
+    let id_b = build_command_evidence_records(&req_b)
+        .expect("req_b must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different source_handle must produce different command evidence IDs"
+    );
+}
+
+#[test]
+fn distinct_source_artifact_path_produces_distinct_artifact_ids() {
+    let base = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"--- a\n+++ b\n".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "ok".to_owned(),
+    };
+    let id_a = build_artifact_records(&base)
+        .expect("base must succeed")
+        .record_id;
+    let req_b = ArtifactRequest {
+        source_artifact_path: "tests/fixtures/other".to_owned(),
+        provenance: valid_provenance(),
+        patch_bytes: b"--- a\n+++ b\n".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc".to_owned()),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "ok".to_owned(),
+    };
+    let id_b = build_artifact_records(&req_b)
+        .expect("req_b must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different source_artifact_path must produce different artifact IDs"
+    );
+}
+
+#[test]
+fn distinct_validation_summary_produces_distinct_artifact_ids() {
+    let base = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"--- a\n+++ b\n".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "ok".to_owned(),
+    };
+    let id_a = build_artifact_records(&base)
+        .expect("base must succeed")
+        .record_id;
+    let req_b = ArtifactRequest {
+        validation_summary: "needs review".to_owned(),
+        provenance: valid_provenance(),
+        patch_bytes: b"--- a\n+++ b\n".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+    };
+    let id_b = build_artifact_records(&req_b)
+        .expect("req_b must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different validation_summary must produce different artifact IDs"
+    );
+}
+
+#[test]
+fn distinct_source_handle_produces_distinct_verification_ids() {
+    let base = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        linked_command_evidence_id: None,
+    };
+    let id_a = build_verification_records(&base)
+        .expect("base must succeed")
+        .record_id;
+    let req_b = VerificationRequest {
+        provenance: EvidenceProvenance {
+            source_handle: Some("src/lib.rs:corrected".to_owned()),
+            ..valid_provenance()
+        },
+        ..base
+    };
+    let id_b = build_verification_records(&req_b)
+        .expect("req_b must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different source_handle must produce different verification IDs"
+    );
+}
+
+#[test]
+fn observation_rejects_observes_relation_on_verification_domain() {
+    let req = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "domain mismatch check".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![EvidenceLink {
+            target_record_id: Some("verification:v1:abc123".to_owned()),
+            target_domain: "verification".to_owned(),
+            relation: EdgeLabel::Observes.as_str().to_owned(),
+            confidence: "0.9".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }],
+    };
+    let err = build_observation_records(&req)
+        .expect_err("OBSERVES targeting verification must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "evidence_links.relation");
+}
+
+#[test]
+fn observation_rejects_empty_evidence_link_relation() {
+    let req = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "empty relation check".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![EvidenceLink {
+            target_record_id: Some("codegraph:v4:abc123".to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: String::new(),
+            confidence: "0.9".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }],
+    };
+    let err = build_observation_records(&req).expect_err("empty relation must be rejected");
+    assert_eq!(err.code, "missing_field");
+    assert_eq!(err.field, "evidence_links.relation");
+}
+
+#[test]
+fn observation_rejects_empty_target_record_id() {
+    let req = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "empty target check".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![EvidenceLink {
+            target_record_id: Some(String::new()),
+            target_domain: "codegraph".to_owned(),
+            relation: EdgeLabel::Observes.as_str().to_owned(),
+            confidence: "0.9".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }],
+    };
+    let err = build_observation_records(&req).expect_err("empty target_record_id must be rejected");
+    assert_eq!(err.code, "missing_field");
+    assert_eq!(err.field, "evidence_links.target_record_id");
+}
