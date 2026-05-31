@@ -435,7 +435,7 @@ fn accepted_verification_produces_verification_node() {
         status: "pass".to_owned(),
         verification_kind: "test_run".to_owned(),
         stdout: Some("test ok - 5 passed, 0 failed".to_owned()),
-        evidence_quality: "verbatim".to_owned(),
+        evidence_quality: "high".to_owned(),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
         linked_command_evidence_id: None,
@@ -700,7 +700,7 @@ fn full_workflow_writes_all_four_evidence_types() {
         status: "pass".to_owned(),
         verification_kind: "test_run".to_owned(),
         stdout: Some("test result: ok. 3 passed".to_owned()),
-        evidence_quality: "verbatim".to_owned(),
+        evidence_quality: "high".to_owned(),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:fixture001".to_owned(),
         linked_command_evidence_id: Some(cmd.record_id.clone()),
@@ -914,7 +914,7 @@ fn verification_rejects_non_rfc3339_executed_at() {
         status: "pass".to_owned(),
         verification_kind: "test_run".to_owned(),
         stdout: None,
-        evidence_quality: "verbatim".to_owned(),
+        evidence_quality: "high".to_owned(),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
         linked_command_evidence_id: None,
@@ -1153,7 +1153,7 @@ fn distinct_verification_kind_produces_distinct_verification_ids() {
         status: "pass".to_owned(),
         verification_kind: "test_run".to_owned(),
         stdout: None,
-        evidence_quality: "verbatim".to_owned(),
+        evidence_quality: "high".to_owned(),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
         linked_command_evidence_id: None,
@@ -1330,7 +1330,7 @@ fn distinct_source_path_produces_distinct_verification_ids() {
         status: "pass".to_owned(),
         verification_kind: "test_run".to_owned(),
         stdout: None,
-        evidence_quality: "verbatim".to_owned(),
+        evidence_quality: "high".to_owned(),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: String::new(),
         linked_command_evidence_id: None,
@@ -1552,7 +1552,7 @@ fn verification_rejects_oversized_stdout() {
         status: "pass".to_owned(),
         verification_kind: "test_run".to_owned(),
         stdout: Some(big_stdout),
-        evidence_quality: "verbatim".to_owned(),
+        evidence_quality: "high".to_owned(),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
         linked_command_evidence_id: None,
@@ -1949,7 +1949,7 @@ fn verification_rejects_empty_linked_command_evidence_id() {
         status: "pass".to_owned(),
         verification_kind: "test_run".to_owned(),
         stdout: None,
-        evidence_quality: "verbatim".to_owned(),
+        evidence_quality: "high".to_owned(),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
         linked_command_evidence_id: Some(String::new()),
@@ -2086,7 +2086,7 @@ fn distinct_observed_at_produces_distinct_verification_ids() {
         status: "pass".to_owned(),
         verification_kind: "test_run".to_owned(),
         stdout: None,
-        evidence_quality: "verbatim".to_owned(),
+        evidence_quality: "high".to_owned(),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
         linked_command_evidence_id: None,
@@ -2118,20 +2118,20 @@ fn distinct_evidence_quality_produces_distinct_verification_ids() {
         status: "pass".to_owned(),
         verification_kind: "test_run".to_owned(),
         stdout: None,
-        evidence_quality: "verbatim".to_owned(),
+        evidence_quality: "high".to_owned(),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
         linked_command_evidence_id: None,
     };
     let id_a = build_verification_records(&base)
-        .expect("verbatim must succeed")
+        .expect("high must succeed")
         .record_id;
     let req_b = VerificationRequest {
-        evidence_quality: "summarized".to_owned(),
+        evidence_quality: "medium".to_owned(),
         ..base
     };
     let id_b = build_verification_records(&req_b)
-        .expect("summarized must succeed")
+        .expect("medium must succeed")
         .record_id;
     assert_ne!(
         id_a, id_b,
@@ -2255,7 +2255,7 @@ fn verification_rejects_non_agent_memory_linked_command_evidence_id() {
         status: "pass".to_owned(),
         verification_kind: "test_run".to_owned(),
         stdout: None,
-        evidence_quality: "verbatim".to_owned(),
+        evidence_quality: "high".to_owned(),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
         linked_command_evidence_id: Some("verification:v1:abc123deadbeef".to_owned()),
@@ -2402,7 +2402,7 @@ fn distinct_source_handle_produces_distinct_verification_ids() {
         status: "pass".to_owned(),
         verification_kind: "test_run".to_owned(),
         stdout: None,
-        evidence_quality: "verbatim".to_owned(),
+        evidence_quality: "high".to_owned(),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
         linked_command_evidence_id: None,
@@ -2501,7 +2501,7 @@ fn verification_rejects_unknown_status() {
         status: "unknown_status".to_owned(),
         verification_kind: "test_run".to_owned(),
         stdout: None,
-        evidence_quality: "verbatim".to_owned(),
+        evidence_quality: "high".to_owned(),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
         linked_command_evidence_id: None,
@@ -2520,7 +2520,7 @@ fn verification_accepts_all_valid_statuses() {
             status: (*status).to_owned(),
             verification_kind: "test_run".to_owned(),
             stdout: None,
-            evidence_quality: "verbatim".to_owned(),
+            evidence_quality: "high".to_owned(),
             source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
             source_artifact_hash: "sha256:abc123".to_owned(),
             linked_command_evidence_id: None,
@@ -2544,7 +2544,7 @@ fn verification_normalizes_agent_id_and_session_id_to_lowercase() {
         status: "pass".to_owned(),
         verification_kind: "test_run".to_owned(),
         stdout: None,
-        evidence_quality: "verbatim".to_owned(),
+        evidence_quality: "high".to_owned(),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
         linked_command_evidence_id: None,
@@ -2659,7 +2659,7 @@ fn verification_summary_uses_normalized_agent_and_session_ids() {
         status: "pass".to_owned(),
         verification_kind: "test_run".to_owned(),
         stdout: None,
-        evidence_quality: "verbatim".to_owned(),
+        evidence_quality: "high".to_owned(),
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
         linked_command_evidence_id: None,
@@ -2682,4 +2682,151 @@ fn verification_summary_uses_normalized_agent_and_session_ids() {
             );
         }
     }
+}
+
+#[test]
+fn verification_rejects_agent_memory_evidence_quality() {
+    for quality in &["verbatim", "summarized", "referenced_only"] {
+        let req = VerificationRequest {
+            provenance: valid_provenance(),
+            executed_at: "2026-05-30T10:02:00Z".to_owned(),
+            status: "pass".to_owned(),
+            verification_kind: "test_run".to_owned(),
+            stdout: None,
+            evidence_quality: (*quality).to_owned(),
+            source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+            source_artifact_hash: "sha256:abc123".to_owned(),
+            linked_command_evidence_id: None,
+        };
+        let err = build_verification_records(&req).expect_err(&format!(
+            "agent-memory quality '{quality}' must be rejected for verification"
+        ));
+        assert_eq!(err.code, "invalid_field");
+        assert_eq!(err.field, "evidence_quality");
+    }
+}
+
+#[test]
+fn verification_accepts_all_verification_evidence_quality_values() {
+    for quality in &["high", "medium", "low"] {
+        let req = VerificationRequest {
+            provenance: valid_provenance(),
+            executed_at: "2026-05-30T10:02:00Z".to_owned(),
+            status: "pass".to_owned(),
+            verification_kind: "test_run".to_owned(),
+            stdout: None,
+            evidence_quality: (*quality).to_owned(),
+            source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+            source_artifact_hash: "sha256:abc123".to_owned(),
+            linked_command_evidence_id: None,
+        };
+        build_verification_records(&req).unwrap_or_else(|_| {
+            panic!("evidence_quality '{quality}' must be accepted for verification")
+        });
+    }
+}
+
+#[test]
+fn verification_normalizes_source_artifact_fields_to_lowercase() {
+    let req_upper = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: None,
+        evidence_quality: "high".to_owned(),
+        source_artifact_path: "Tests/Fixtures/RUST_BASIC".to_owned(),
+        source_artifact_hash: "SHA256:ABC123".to_owned(),
+        linked_command_evidence_id: None,
+    };
+    let req_lower = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: None,
+        evidence_quality: "high".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        linked_command_evidence_id: None,
+    };
+
+    let id_upper = build_verification_records(&req_upper)
+        .expect("uppercase source fields must succeed")
+        .record_id;
+    let id_lower = build_verification_records(&req_lower)
+        .expect("lowercase source fields must succeed")
+        .record_id;
+    assert_eq!(
+        id_upper, id_lower,
+        "case-only difference in source_artifact fields must produce same verification ID"
+    );
+}
+
+#[test]
+fn distinct_agent_kind_produces_distinct_artifact_ids() {
+    let base = ArtifactRequest {
+        provenance: EvidenceProvenance {
+            agent_kind: "codex".to_owned(),
+            ..valid_provenance()
+        },
+        patch_bytes: b"--- a\n+++ b\n".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc123".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "ok".to_owned(),
+    };
+    let id_a = build_artifact_records(&base)
+        .expect("codex artifact must succeed")
+        .record_id;
+    let req_b = ArtifactRequest {
+        provenance: EvidenceProvenance {
+            agent_kind: "claude-code".to_owned(),
+            ..valid_provenance()
+        },
+        ..base
+    };
+    let id_b = build_artifact_records(&req_b)
+        .expect("claude-code artifact must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different agent_kind must produce different artifact IDs"
+    );
+}
+
+#[test]
+fn distinct_source_handle_produces_distinct_artifact_ids() {
+    let base = ArtifactRequest {
+        provenance: EvidenceProvenance {
+            source_handle: Some("handle-a".to_owned()),
+            ..valid_provenance()
+        },
+        patch_bytes: b"--- a\n+++ b\n".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc123".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "ok".to_owned(),
+    };
+    let id_a = build_artifact_records(&base)
+        .expect("handle-a artifact must succeed")
+        .record_id;
+    let req_b = ArtifactRequest {
+        provenance: EvidenceProvenance {
+            source_handle: Some("handle-b".to_owned()),
+            ..valid_provenance()
+        },
+        ..base
+    };
+    let id_b = build_artifact_records(&req_b)
+        .expect("handle-b artifact must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different source_handle must produce different artifact IDs"
+    );
 }

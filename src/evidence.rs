@@ -300,12 +300,23 @@ fn validate_agent_kind(prov: &EvidenceProvenance) -> Result<(), ProvenanceError>
 
 const VALID_EVIDENCE_QUALITY: &[&str] = &["verbatim", "summarized", "referenced_only"];
 
+/// Accepted `evidence_quality` values for verification records (`docs/schema/verification.md`).
+const VALID_VERIFICATION_EVIDENCE_QUALITY: &[&str] = &["high", "medium", "low"];
+
 /// Accepted `status` values for verification records (from `docs/schema/verification.md`).
 const VALID_VERIFICATION_STATUSES: &[&str] = &["pass", "fail", "skip", "error", "timeout"];
 
-/// Validates the `evidence_quality` field against the published enum.
+/// Validates the `evidence_quality` field against the agent-memory domain enum.
 fn validate_evidence_quality(quality: &str) -> Result<(), ProvenanceError> {
     if !VALID_EVIDENCE_QUALITY.contains(&quality) {
+        return Err(ProvenanceError::invalid("evidence_quality"));
+    }
+    Ok(())
+}
+
+/// Validates the `evidence_quality` field against the verification domain enum.
+fn validate_verification_evidence_quality(quality: &str) -> Result<(), ProvenanceError> {
+    if !VALID_VERIFICATION_EVIDENCE_QUALITY.contains(&quality) {
         return Err(ProvenanceError::invalid("evidence_quality"));
     }
     Ok(())
@@ -733,7 +744,7 @@ pub fn build_observation_records(
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(req.provenance.session_id.clone()),
         observed_at: Some(req.provenance.observed_at.clone()),
-        ingested_at: Some(now_rfc3339()),
+        ingested_at: Some(req.provenance.observed_at.clone()),
         confidence: Some(req.confidence.to_string()),
         source_handle: req.provenance.source_handle.clone(),
         redaction_policy_version,
@@ -938,7 +949,7 @@ pub fn build_command_evidence_records(
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(req.provenance.session_id.clone()),
         observed_at: Some(req.provenance.observed_at.clone()),
-        ingested_at: Some(now_rfc3339()),
+        ingested_at: Some(req.provenance.observed_at.clone()),
         confidence: None,
         source_handle: req.provenance.source_handle.clone(),
         redaction_policy_version,
@@ -1104,6 +1115,8 @@ pub fn build_artifact_records(
         &req.provenance.agent_id,
         &req.provenance.session_id,
         &req.provenance.observed_at,
+        agent_kind,
+        req.provenance.source_handle.as_deref().unwrap_or(""),
         &patch_hash,
         &req.patch_status,
         &req.source_artifact_path,
@@ -1163,7 +1176,7 @@ pub fn build_artifact_records(
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(req.provenance.session_id.clone()),
         observed_at: Some(req.provenance.observed_at.clone()),
-        ingested_at: Some(now_rfc3339()),
+        ingested_at: Some(req.provenance.observed_at.clone()),
         confidence: None,
         source_handle: req.provenance.source_handle.clone(),
         redaction_policy_version,
@@ -1275,7 +1288,7 @@ pub fn build_verification_records(
     validate_provenance_base(&req.provenance)?;
     validate_agent_kind(&req.provenance)?;
     validate_source_artifact(&req.source_artifact_path, &req.source_artifact_hash)?;
-    validate_evidence_quality(&req.evidence_quality)?;
+    validate_verification_evidence_quality(&req.evidence_quality)?;
 
     if req.executed_at.is_empty() {
         return Err(ProvenanceError::missing("executed_at"));
@@ -1352,9 +1365,13 @@ pub fn build_verification_records(
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(req.provenance.session_id.to_ascii_lowercase()),
         observed_at: Some(req.provenance.observed_at.clone()),
-        ingested_at: Some(now_rfc3339()),
+        ingested_at: Some(req.provenance.observed_at.clone()),
         confidence: None,
-        source_handle: req.provenance.source_handle.clone(),
+        source_handle: req
+            .provenance
+            .source_handle
+            .as_deref()
+            .map(str::to_ascii_lowercase),
         redaction_policy_version,
         valid_time: None,
         valid_time_source: None,
@@ -1385,8 +1402,8 @@ pub fn build_verification_records(
         domain: Some("verification".to_owned()),
         importer_id: None,
         importer_version: None,
-        source_artifact_path: Some(req.source_artifact_path.clone()),
-        source_artifact_hash: Some(req.source_artifact_hash.clone()),
+        source_artifact_path: Some(req.source_artifact_path.to_ascii_lowercase()),
+        source_artifact_hash: Some(req.source_artifact_hash.to_ascii_lowercase()),
         patch_status: None,
         base_commit: None,
         unknown_base_reason: None,

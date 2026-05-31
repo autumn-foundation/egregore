@@ -534,8 +534,8 @@ enum WriteKind {
         /// Captured stdout text.
         #[arg(long)]
         stdout: Option<String>,
-        /// Evidence quality.
-        #[arg(long, default_value = "verbatim")]
+        /// Evidence quality: `high`, `medium`, or `low`.
+        #[arg(long, default_value = "high")]
         evidence_quality: String,
         /// Source artifact path.
         #[arg(long, default_value = "")]
