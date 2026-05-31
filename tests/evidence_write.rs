@@ -2163,26 +2163,27 @@ fn distinct_evidence_quality_produces_distinct_verification_ids() {
 }
 
 #[test]
-fn agent_session_node_is_invariant_across_multiple_observations() {
-    fn session_record(
+fn agent_session_nodes_distinct_per_observed_at_and_each_have_valid_timestamps() {
+    fn find_session(
         out: &aletheia_egregore::evidence::EvidenceWriteOutcome,
-    ) -> &aletheia_egregore::ir::GraphRecord {
-        out.records
-            .iter()
-            .find(|r| {
-                matches!(
-                    r,
-                    aletheia_egregore::ir::GraphRecord::Node {
-                        kind: NodeKind::AgentSession,
-                        ..
-                    }
-                )
-            })
-            .expect("AgentSession node must be present")
+    ) -> (&str, Option<&str>) {
+        for r in &out.records {
+            if let aletheia_egregore::ir::GraphRecord::Node {
+                id,
+                kind: NodeKind::AgentSession,
+                observed_at,
+                ..
+            } = r
+            {
+                return (id.as_str(), observed_at.as_deref());
+            }
+        }
+        panic!("AgentSession node must be present")
     }
     // Two observations in the same session at different observed_at times must produce
-    // the same AgentSession record so that a long-lived session does not trigger a
-    // mismatched-duplicate rejection on the second write.
+    // distinct AgentSession nodes (observed_at is part of the ID), so neither write
+    // triggers a mismatched-duplicate rejection on the embedded sink. Both nodes must
+    // carry non-null observed_at to pass the ingest validator.
     let req_early = ObservationRequest {
         provenance: EvidenceProvenance {
             observed_at: "2026-05-30T09:00:00Z".to_owned(),
@@ -2203,11 +2204,19 @@ fn agent_session_node_is_invariant_across_multiple_observations() {
     };
     let out_early = build_observation_records(&req_early).expect("early must succeed");
     let out_late = build_observation_records(&req_late).expect("late must succeed");
-    let session_early = session_record(&out_early);
-    let session_late = session_record(&out_late);
-    assert_eq!(
-        session_early, session_late,
-        "AgentSession nodes for the same session must be identical across writes at different observed_at"
+    let (id_early, ts_early) = find_session(&out_early);
+    let (id_late, ts_late) = find_session(&out_late);
+    assert_ne!(
+        id_early, id_late,
+        "different observed_at must produce distinct AgentSession IDs"
+    );
+    assert!(
+        ts_early.is_some_and(|s| !s.is_empty()),
+        "AgentSession observed_at must be non-null for ingest validation"
+    );
+    assert!(
+        ts_late.is_some_and(|s| !s.is_empty()),
+        "AgentSession observed_at must be non-null for ingest validation"
     );
 }
 

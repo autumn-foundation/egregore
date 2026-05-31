@@ -437,6 +437,7 @@ fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> Grap
         &prov.agent_id,
         &prov.session_id,
         agent_kind,
+        &prov.observed_at,
     ]);
     GraphRecord::Node {
         id,
@@ -457,12 +458,12 @@ fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> Grap
         agent_id: Some(prov.agent_id.clone()),
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(prov.session_id.clone()),
-        // Omit observed_at/ingested_at so the AgentSession payload is invariant across all
-        // observations within the same session. Storing the per-request timestamp would make
-        // the second write in a long-lived session a mismatched-duplicate rejection on the
-        // embedded sink, since the stable ID does not include observed_at.
-        observed_at: None,
-        ingested_at: None,
+        // observed_at is included in the stable ID so two writes with different observed_at
+        // produce distinct session nodes. This makes each node payload-invariant for its ID
+        // and satisfies the ingest validator's requirement for non-null timestamps on
+        // agent-memory nodes other than Agent.
+        observed_at: Some(prov.observed_at.clone()),
+        ingested_at: Some(prov.observed_at.clone()),
         confidence: None,
         source_handle: None,
         redaction_policy_version: None,
@@ -614,6 +615,7 @@ pub fn build_observation_records(
         &req.provenance.agent_id,
         &req.provenance.session_id,
         agent_kind,
+        &req.provenance.observed_at,
     ]);
 
     // Redact free-text before hashing or storing — secrets must not reach the store.
@@ -1023,6 +1025,7 @@ pub fn build_artifact_records(
         &req.provenance.agent_id,
         &req.provenance.session_id,
         agent_kind,
+        &req.provenance.observed_at,
     ]);
 
     // Hash the patch bytes for content addressing
