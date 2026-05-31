@@ -647,6 +647,14 @@ fn write_evidence(kind: WriteKind) -> Result<()> {
             evidence_domain,
             out,
         } => {
+            // Only codegraph (OBSERVES) and verification (VALIDATED_BY) are supported.
+            // The daemon rejects OBSERVES on non-codegraph targets and VALIDATED_BY on
+            // non-verification targets, so any other domain would produce invalid JSONL.
+            if evidence_domain != "codegraph" && evidence_domain != "verification" {
+                write_evidence_error(&crate::evidence::ProvenanceError::invalid(
+                    "evidence_domain",
+                ));
+            }
             let relation = if evidence_domain == "verification" {
                 EdgeLabel::ValidatedBy.as_str().to_owned()
             } else {

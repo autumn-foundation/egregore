@@ -2161,3 +2161,121 @@ fn distinct_evidence_quality_produces_distinct_verification_ids() {
         "different evidence_quality must produce different verification IDs"
     );
 }
+
+#[test]
+fn agent_session_node_is_invariant_across_multiple_observations() {
+    fn session_record(
+        out: &aletheia_egregore::evidence::EvidenceWriteOutcome,
+    ) -> &aletheia_egregore::ir::GraphRecord {
+        out.records
+            .iter()
+            .find(|r| {
+                matches!(
+                    r,
+                    aletheia_egregore::ir::GraphRecord::Node {
+                        kind: NodeKind::AgentSession,
+                        ..
+                    }
+                )
+            })
+            .expect("AgentSession node must be present")
+    }
+    // Two observations in the same session at different observed_at times must produce
+    // the same AgentSession record so that a long-lived session does not trigger a
+    // mismatched-duplicate rejection on the second write.
+    let req_early = ObservationRequest {
+        provenance: EvidenceProvenance {
+            observed_at: "2026-05-30T09:00:00Z".to_owned(),
+            ..valid_provenance()
+        },
+        text: "first observation".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+    };
+    let req_late = ObservationRequest {
+        provenance: EvidenceProvenance {
+            observed_at: "2026-05-30T11:00:00Z".to_owned(),
+            ..valid_provenance()
+        },
+        text: "second observation".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+    };
+    let out_early = build_observation_records(&req_early).expect("early must succeed");
+    let out_late = build_observation_records(&req_late).expect("late must succeed");
+    let session_early = session_record(&out_early);
+    let session_late = session_record(&out_late);
+    assert_eq!(
+        session_early, session_late,
+        "AgentSession nodes for the same session must be identical across writes at different observed_at"
+    );
+}
+
+#[test]
+fn distinct_evidence_link_relation_produces_distinct_observation_ids() {
+    // Two observations with the same target but different relations must produce distinct IDs.
+    let req_observes = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "relation check".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![EvidenceLink {
+            target_record_id: Some("codegraph:v4:abc123".to_owned()),
+            target_domain: aletheia_egregore::ir::Domain::CodeGraph.as_str().to_owned(),
+            relation: aletheia_egregore::ir::EdgeLabel::Observes
+                .as_str()
+                .to_owned(),
+            confidence: "0.9".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }],
+    };
+    let req_validated = ObservationRequest {
+        evidence_links: vec![EvidenceLink {
+            relation: aletheia_egregore::ir::EdgeLabel::ValidatedBy
+                .as_str()
+                .to_owned(),
+            target_domain: "verification".to_owned(),
+            ..req_observes.evidence_links[0].clone()
+        }],
+        ..ObservationRequest {
+            provenance: valid_provenance(),
+            text: "relation check".to_owned(),
+            confidence: 0.9,
+            evidence_links: vec![],
+        }
+    };
+    let id_a = build_observation_records(&req_observes)
+        .expect("observes must succeed")
+        .record_id;
+    let id_b = build_observation_records(&req_validated)
+        .expect("validated_by must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different evidence link relation must produce different observation IDs"
+    );
+}
+
+#[test]
+fn verification_rejects_non_agent_memory_linked_command_evidence_id() {
+    // linked_command_evidence_id must reference a CommandEvidence node (agent_memory domain).
+    // Passing a verification-domain ID (e.g., CommandRun) is rejected up-front since
+    // HAS_EVIDENCE does not allow CommandRun targets.
+    let req = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        linked_command_evidence_id: Some("verification:v1:abc123deadbeef".to_owned()),
+    };
+    let err = build_verification_records(&req)
+        .expect_err("non-agent_memory linked_command_evidence_id must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "linked_command_evidence_id");
+}

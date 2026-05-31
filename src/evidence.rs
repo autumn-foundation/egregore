@@ -457,12 +457,12 @@ fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> Grap
         agent_id: Some(prov.agent_id.clone()),
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(prov.session_id.clone()),
-        // Use prov.observed_at for both timestamps — wall-clock now() would change per
-        // call and produce records with the same stable ID but different payloads, which
-        // the daemon rejects as ambiguous duplicates. Using the provenance time makes
-        // the session record idempotent for a given (agent_id, session_id, observed_at).
-        observed_at: Some(prov.observed_at.clone()),
-        ingested_at: Some(prov.observed_at.clone()),
+        // Omit observed_at/ingested_at so the AgentSession payload is invariant across all
+        // observations within the same session. Storing the per-request timestamp would make
+        // the second write in a long-lived session a mismatched-duplicate rejection on the
+        // embedded sink, since the stable ID does not include observed_at.
+        observed_at: None,
+        ingested_at: None,
         confidence: None,
         source_handle: None,
         redaction_policy_version: None,
@@ -629,19 +629,46 @@ pub fn build_observation_records(
         hasher.update(redacted_text.as_bytes());
         hasher.finalize().to_hex().to_string()
     };
-    // Sort links canonically for the ID hash and for storage so that two writes with the same
-    // links in different order produce the same ID and identical stored evidence_links arrays.
+    // Sort links canonically by all identity fields and hash the full payload so that
+    // two observations with the same target but different relation/domain/confidence
+    // produce distinct IDs, and same links in different submission order produce the
+    // same ID and identical stored arrays.
     let mut sorted_links = req.evidence_links.clone();
     sorted_links.sort_unstable_by(|a, b| {
-        a.target_record_id
-            .as_deref()
-            .unwrap_or("")
-            .cmp(b.target_record_id.as_deref().unwrap_or(""))
+        a.relation
+            .cmp(&b.relation)
+            .then(a.target_domain.cmp(&b.target_domain))
+            .then(
+                a.target_record_id
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.target_record_id.as_deref().unwrap_or("")),
+            )
+            .then(a.confidence.cmp(&b.confidence))
+            .then(
+                a.target_repo_relative_path
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.target_repo_relative_path.as_deref().unwrap_or("")),
+            )
     });
     let links_hash = {
         let mut h = blake3::Hasher::new();
         for l in &sorted_links {
             h.update(l.target_record_id.as_deref().unwrap_or("").as_bytes());
+            h.update(b"\0");
+            h.update(l.relation.as_bytes());
+            h.update(b"\0");
+            h.update(l.target_domain.as_bytes());
+            h.update(b"\0");
+            h.update(l.confidence.as_bytes());
+            h.update(b"\0");
+            h.update(
+                l.target_repo_relative_path
+                    .as_deref()
+                    .unwrap_or("")
+                    .as_bytes(),
+            );
             h.update(b"\0");
         }
         h.finalize().to_hex().to_string()
@@ -1341,11 +1368,15 @@ pub fn build_verification_records(
     let mut records = vec![ver_node];
 
     // If there's a linked command evidence record, validate and emit a HAS_EVIDENCE edge.
-    // An empty string is rejected — embedded ingest validates HAS_EVIDENCE targets are
-    // resolvable, so an invalid ID causes a later rejection rather than a clean failure.
+    // Empty strings and non-agent_memory IDs are rejected up-front: HAS_EVIDENCE only
+    // allows CommandEvidence targets (agent_memory:v1: domain), not CommandRun or other
+    // verification-domain nodes, and the daemon rejects mismatched target kinds.
     if let Some(ref cmd_id) = req.linked_command_evidence_id {
         if cmd_id.is_empty() {
             return Err(ProvenanceError::missing("linked_command_evidence_id"));
+        }
+        if !cmd_id.starts_with("agent_memory:v1:") {
+            return Err(ProvenanceError::invalid("linked_command_evidence_id"));
         }
         let has_evidence_edge = GraphRecord::agent_memory_edge(
             EdgeLabel::HasEvidence,
