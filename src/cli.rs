@@ -440,9 +440,9 @@ enum WriteKind {
         /// RFC 3339 execution timestamp; required.
         #[arg(long, default_value = "")]
         executed_at: String,
-        /// Shell exit code.
-        #[arg(long, default_value_t = 0)]
-        exit_code: i64,
+        /// Shell exit code; required.
+        #[arg(long)]
+        exit_code: Option<i64>,
         /// Captured stdout text.
         #[arg(long)]
         stdout: Option<String>,
@@ -704,6 +704,9 @@ fn write_evidence(kind: WriteKind) -> Result<()> {
             source_artifact_hash,
             out,
         } => {
+            let exit_code = exit_code.unwrap_or_else(|| {
+                write_evidence_error(&crate::evidence::ProvenanceError::missing("exit_code"))
+            });
             let req = CommandEvidenceRequest {
                 provenance: EvidenceProvenance {
                     agent_id,

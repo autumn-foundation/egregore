@@ -2515,3 +2515,82 @@ fn observation_rejects_empty_target_record_id() {
     assert_eq!(err.code, "missing_field");
     assert_eq!(err.field, "evidence_links.target_record_id");
 }
+
+#[test]
+fn verification_rejects_unknown_status() {
+    let req = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "unknown_status".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        linked_command_evidence_id: None,
+    };
+    let err = build_verification_records(&req).expect_err("unknown status must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "status");
+}
+
+#[test]
+fn verification_accepts_all_valid_statuses() {
+    for status in &["pass", "fail", "skip", "error", "timeout"] {
+        let req = VerificationRequest {
+            provenance: valid_provenance(),
+            executed_at: "2026-05-30T10:02:00Z".to_owned(),
+            status: (*status).to_owned(),
+            verification_kind: "test_run".to_owned(),
+            stdout: None,
+            evidence_quality: "verbatim".to_owned(),
+            source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+            source_artifact_hash: "sha256:abc123".to_owned(),
+            linked_command_evidence_id: None,
+        };
+        build_verification_records(&req)
+            .unwrap_or_else(|_| panic!("status '{status}' must be accepted"));
+    }
+}
+
+#[test]
+fn verification_normalizes_agent_id_and_session_id_to_lowercase() {
+    let req = VerificationRequest {
+        provenance: EvidenceProvenance {
+            agent_id: "AGENT-MIXED-CASE".to_owned(),
+            session_id: "SESSION-MIXED-CASE".to_owned(),
+            agent_kind: "other".to_owned(),
+            observed_at: "2026-05-30T10:00:00Z".to_owned(),
+            source_handle: None,
+        },
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        linked_command_evidence_id: None,
+    };
+    let outcome = build_verification_records(&req).expect("mixed-case provenance must succeed");
+    for record in &outcome.records {
+        if let aletheia_egregore::ir::GraphRecord::Node {
+            kind: NodeKind::Verification,
+            agent_id,
+            session_id,
+            ..
+        } = record
+        {
+            assert_eq!(
+                agent_id.as_deref(),
+                Some("agent-mixed-case"),
+                "agent_id must be stored as lowercase"
+            );
+            assert_eq!(
+                session_id.as_deref(),
+                Some("session-mixed-case"),
+                "session_id must be stored as lowercase"
+            );
+        }
+    }
+}

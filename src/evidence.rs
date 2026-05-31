@@ -297,6 +297,9 @@ fn validate_agent_kind(prov: &EvidenceProvenance) -> Result<(), ProvenanceError>
 
 const VALID_EVIDENCE_QUALITY: &[&str] = &["verbatim", "summarized", "referenced_only"];
 
+/// Accepted `status` values for verification records (from `docs/schema/verification.md`).
+const VALID_VERIFICATION_STATUSES: &[&str] = &["pass", "fail", "skip", "error", "timeout"];
+
 /// Validates the `evidence_quality` field against the published enum.
 fn validate_evidence_quality(quality: &str) -> Result<(), ProvenanceError> {
     if !VALID_EVIDENCE_QUALITY.contains(&quality) {
@@ -1100,17 +1103,20 @@ pub fn build_artifact_records(
     let summary_redacted = crate::redaction::is_redacted(&redacted_validation_summary);
     let redaction_policy_version = (patch_redacted || summary_redacted)
         .then(|| crate::redaction::REDACTION_POLICY_VERSION.to_owned());
-    // Use the larger of original and redacted lengths as the stored size bound so that the
-    // embedded validator's `len(inline) <= patch_bytes_size` invariant holds even when a
-    // short secret is replaced by a longer <REDACTED:…> marker.
-    let patch_bytes_size = redacted_patch.len().max(req.patch_bytes.len()) as u64;
+    // The schema pairs patch_bytes_size with patch_bytes_hash, so it must reflect
+    // the raw byte count. Use max(raw, redacted) for the ceiling check to ensure
+    // the inline content also fits; only inline when redacted fits within the raw
+    // size so the validator's inline_len <= patch_bytes_size invariant always holds.
+    let raw_bytes_size = req.patch_bytes.len() as u64;
+    let redacted_bytes_size = redacted_patch.len() as u64;
 
-    if patch_bytes_size > INLINE_PAYLOAD_CEILING {
+    if raw_bytes_size.max(redacted_bytes_size) > INLINE_PAYLOAD_CEILING {
         return Err(ProvenanceError::invalid("patch_bytes"));
     }
+    let patch_inline = (redacted_bytes_size <= raw_bytes_size).then_some(redacted_patch);
     let patch_handle = Box::new(PatchHandle {
         path: format!("patches/{art_id}.patch"),
-        inline: Some(redacted_patch),
+        inline: patch_inline,
     });
 
     // Treat Some("") the same as None — the validator requires unknown_base_reason when
@@ -1179,7 +1185,7 @@ pub fn build_artifact_records(
         unknown_base_reason,
         target_files: Some(sorted_target_files),
         patch_bytes_hash: Some(patch_hash),
-        patch_bytes_size: Some(patch_bytes_size),
+        patch_bytes_size: Some(raw_bytes_size),
         patch_handle: Some(patch_handle),
         validation_summary: Some(redacted_validation_summary),
         producer_session_id: Some(session_node_id.clone()),
@@ -1264,6 +1270,9 @@ pub fn build_verification_records(
     if req.status.is_empty() {
         return Err(ProvenanceError::missing("status"));
     }
+    if !VALID_VERIFICATION_STATUSES.contains(&req.status.as_str()) {
+        return Err(ProvenanceError::invalid("status"));
+    }
     if req
         .stdout
         .as_deref()
@@ -1323,9 +1332,9 @@ pub fn build_verification_records(
         repository_identity: None,
         text: None,
         superseded_by: None,
-        agent_id: Some(req.provenance.agent_id.clone()),
+        agent_id: Some(req.provenance.agent_id.to_ascii_lowercase()),
         agent_kind: Some(agent_kind.to_owned()),
-        session_id: Some(req.provenance.session_id.clone()),
+        session_id: Some(req.provenance.session_id.to_ascii_lowercase()),
         observed_at: Some(req.provenance.observed_at.clone()),
         ingested_at: Some(req.provenance.observed_at.clone()),
         confidence: None,

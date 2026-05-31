@@ -1953,7 +1953,7 @@ pub(crate) fn versioned_stable_id(version: u32, parts: &[&str]) -> String {
 pub fn verification_stable_id(parts: &[&str]) -> String {
     let mut hasher = blake3::Hasher::new();
     for part in parts {
-        hasher.update(part.as_bytes());
+        hasher.update(part.to_ascii_lowercase().as_bytes());
         hasher.update(b"\0");
     }
     format!(
