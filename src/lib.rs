@@ -21,6 +21,8 @@ pub mod error;
 pub mod evidence;
 /// Filesystem discovery.
 pub mod fs;
+/// GitHub Issues/PRs importer (issue #46).
+pub mod github;
 /// Git history replay.
 pub mod history;
 /// Repository identity computation.
