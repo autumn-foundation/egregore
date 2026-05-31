@@ -24,8 +24,10 @@ const MIN_TOKEN_BODY: usize = 36;
 /// just its prefix. Non-token text is preserved byte-for-byte.
 #[must_use]
 pub fn scrub(value: &str) -> String {
-    // Fast path: nothing token-shaped present.
-    if !value.contains("gh") {
+    // Fast path: a token prefix always contains "gh" (`ghp_`/`gho_`/… or
+    // `github_pat_`). Note `github` itself has no "gh" substring, so the guard
+    // must check for the literal prefixes, not the bigram "gh".
+    if !value.contains("gh") && !value.contains("github_pat_") {
         return value.to_owned();
     }
     let bytes = value.as_bytes();

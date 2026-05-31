@@ -10,7 +10,7 @@
 //! file-anchored review comments, `TOUCHES_FILE`) edges. Re-imports are
 //! conditional (`If-None-Match`) and emit only changed resources.
 
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{path::Path, time::Duration};
 
 use serde_json::Value;
 

@@ -249,6 +249,12 @@ impl Client {
                 req = req.set("If-None-Match", etag);
             }
             match req.call() {
+                // ureq returns 3xx (including 304 Not Modified) in the Ok arm,
+                // so the conditional-fetch short-circuit must be checked here.
+                Ok(resp) if resp.status() == 304 => {
+                    self.record_rate_limit(&resp);
+                    return Ok(ConditionalResponse::NotModified);
+                }
                 Ok(resp) => {
                     let (remaining, reset) = self.record_rate_limit(&resp);
                     self.maybe_throttle(remaining, reset);
