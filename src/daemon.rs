@@ -430,6 +430,25 @@ const QUEUE_FULL_RETRY_AFTER_MS: u64 = 500;
 /// Maximum number of recent pressure-transition events retained for operator
 /// inspection. The buffer is bounded so diagnostics never grow without limit.
 const PRESSURE_EVENT_CAPACITY: usize = 32;
+/// Maximum byte length of a `request_id` retained in a pressure diagnostic
+/// event or structured log. `request_id` is caller-controlled and bounded only
+/// by the request body limit, so the diagnostic copy is truncated to keep
+/// `recent_events` and logs bounded. The full id is still echoed to the caller
+/// in the `queue_full` error envelope.
+const PRESSURE_REQUEST_HANDLE_MAX_BYTES: usize = 64;
+
+/// Truncates a caller-supplied request handle to a bounded length on a UTF-8
+/// char boundary, appending an ellipsis when truncation occurred.
+fn truncate_request_handle(request_id: &str) -> String {
+    if request_id.len() <= PRESSURE_REQUEST_HANDLE_MAX_BYTES {
+        return request_id.to_owned();
+    }
+    let mut end = PRESSURE_REQUEST_HANDLE_MAX_BYTES;
+    while end > 0 && !request_id.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &request_id[..end])
+}
 
 /// Machine-readable write-admission pressure classification surfaced by
 /// `GET /v1/status`.
@@ -526,13 +545,8 @@ impl PressureTracker {
 
     /// Records that the worker finished a write, draining one queue slot.
     fn on_complete(&self) {
-        let prev = self.inflight.fetch_sub(1, Ordering::SeqCst);
-        let depth = prev.saturating_sub(1);
-        if depth <= self.recovery_watermark() && self.saturated.swap(false, Ordering::SeqCst) {
-            self.last_recovered_at_unix_ms
-                .store(unix_ms_u64(), Ordering::SeqCst);
-            self.record_transition("exited_saturation", "write_worker", "queue_full", "drain");
-        }
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
+        self.maybe_recover();
     }
 
     /// Records a `queue_full` rejection and raises saturation on the first one.
@@ -543,6 +557,24 @@ impl PressureTracker {
         if !self.saturated.swap(true, Ordering::SeqCst) {
             self.saturation_transitions.fetch_add(1, Ordering::SeqCst);
             self.record_transition("entered_saturation", operation, "queue_full", request_id);
+        }
+        // Guard against the drain-before-rejection race: if the queue already
+        // emptied to the recovery watermark while this rejection was being
+        // recorded, recover immediately so status does not report `saturated`
+        // with nothing in flight until some future write happens to complete.
+        self.maybe_recover();
+    }
+
+    /// Clears saturation and emits one recovery event once the backlog has
+    /// drained to the recovery watermark. Safe to call from any path: the
+    /// atomic swap guarantees exactly one recovery per saturation episode.
+    fn maybe_recover(&self) {
+        if self.inflight.load(Ordering::SeqCst) <= self.recovery_watermark()
+            && self.saturated.swap(false, Ordering::SeqCst)
+        {
+            self.last_recovered_at_unix_ms
+                .store(unix_ms_u64(), Ordering::SeqCst);
+            self.record_transition("exited_saturation", "write_worker", "queue_full", "drain");
         }
     }
 
@@ -572,7 +604,7 @@ impl PressureTracker {
             transition,
             operation,
             code,
-            request_id: request_id.to_owned(),
+            request_id: truncate_request_handle(request_id),
         };
         // Structured operator log. Carries only bounded metadata so that no
         // submitted payload body, graph record, or secret can leak via logs.
@@ -9739,9 +9771,12 @@ mod tests {
 
     #[test]
     fn pressure_tracker_reports_idle_busy_saturated_and_recovers() {
-        let tracker = PressureTracker::new(2);
+        let tracker = PressureTracker::new(2); // recovery watermark = 1
         assert_eq!(tracker.state(), PressureState::Idle);
 
+        // Fill the queue to capacity so a rejection reflects a genuinely full
+        // queue (in flight above the recovery watermark).
+        tracker.on_enqueue();
         tracker.on_enqueue();
         assert_eq!(tracker.state(), PressureState::Busy);
 
@@ -9779,6 +9814,61 @@ mod tests {
             .count();
         assert_eq!(exit_events, 1, "exactly one exit event per recovery");
         assert!(tracker.last_recovered_at_unix_ms.load(Ordering::SeqCst) > 0);
+    }
+
+    #[test]
+    fn rejection_after_queue_drains_does_not_stick_saturated() {
+        // Models the race where the worker finishes the last admitted writes in
+        // the gap between a failed `try_send` and recording the rejection: the
+        // drain's `on_complete` sees `saturated == false`, then the late
+        // rejection sets `saturated` with nothing in flight. Status must not
+        // stay `saturated` with a drained queue.
+        let tracker = PressureTracker::new(2);
+        tracker.on_enqueue(); // admitted write A
+        tracker.on_enqueue(); // admitted write B (queue full)
+        tracker.on_enqueue(); // rejected write C's speculative count
+        // Worker drains A and B before C's rejection is recorded.
+        tracker.on_complete();
+        tracker.on_complete();
+        // C's rejection is now recorded (rolling back its speculative count).
+        tracker.on_reject_after_rollback("records/ingest", "req-late");
+
+        assert_eq!(
+            tracker.state(),
+            PressureState::Idle,
+            "a drained queue must not remain saturated after a late rejection"
+        );
+        assert_eq!(
+            tracker.total_rejections.load(Ordering::SeqCst),
+            1,
+            "the rejection is still counted even though pressure recovered"
+        );
+    }
+
+    #[test]
+    fn pressure_event_request_handle_is_length_bounded() {
+        let tracker = PressureTracker::new(2);
+        // Fill to capacity so the rejection keeps the daemon saturated and the
+        // entry event is retained.
+        tracker.on_enqueue();
+        tracker.on_enqueue();
+        let huge = "x".repeat(10_000);
+        tracker.on_reject("records/ingest", &huge);
+
+        let events = tracker.events_snapshot();
+        let entry = events
+            .iter()
+            .find(|event| event.transition == "entered_saturation")
+            .expect("rejection must record an entry event");
+        assert!(
+            entry.request_id.len() < huge.len(),
+            "oversized request handle must be truncated"
+        );
+        assert!(
+            entry.request_id.len() <= PRESSURE_REQUEST_HANDLE_MAX_BYTES + "…".len(),
+            "retained request handle must stay bounded, got {} bytes",
+            entry.request_id.len()
+        );
     }
 
     #[test]

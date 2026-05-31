@@ -477,8 +477,11 @@ actually recovers, so a saturated daemon never looks idle.
 
   `transition` is `entered_saturation` or `exited_saturation`. Events carry only
   bounded metadata — never payload bodies, graph records, command output, or
-  secrets. The same event is also emitted as a one-line structured `stderr` log
-  (`"egregore_event": "daemon_pressure"`) for operators tailing daemon output.
+  secrets. The `request_id` is the caller's correlation id truncated to a
+  bounded length for the diagnostic copy (the full id is still echoed in the
+  `queue_full` error envelope). The same event is also emitted as a one-line
+  structured `stderr` log (`"egregore_event": "daemon_pressure"`) for operators
+  tailing daemon output.
 
 - `retry_after_ms` — present only while `state` is `saturated`; the minimum
   back-off before retrying, matching the `queue_full` error field.
