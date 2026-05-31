@@ -17,6 +17,8 @@ pub mod daemon;
 pub mod embeddings;
 /// Error and result types.
 pub mod error;
+/// Typed evidence write workflows for observations, command evidence, artifacts, and verification.
+pub mod evidence;
 /// Filesystem discovery.
 pub mod fs;
 /// Git history replay.
@@ -56,8 +58,9 @@ pub use ir::{
     Producer, ProducerKind, RepositoryIdentityPayload, SCHEMA_VERSION,
     SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, SelectionBasis,
     SemanticDriftMetadata, SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION,
-    UserContextFields, UserContextScope, agent_memory_stable_id, artifact_stable_id,
-    project_stable_id, semantic_stable_id, stable_id, user_context_stable_id,
+    UserContextFields, UserContextScope, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
+    artifact_stable_id, project_stable_id, semantic_stable_id, stable_id, user_context_stable_id,
+    verification_stable_id,
 };
 pub use local_project::import_local_tasks;
 pub use query::{SymbolContext, UnresolvedRef, symbol_context};

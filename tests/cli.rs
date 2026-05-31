@@ -56,6 +56,35 @@ fn eg_alias_runs_cli() {
 }
 
 #[test]
+fn write_observation_missing_agent_id_emits_json_error() {
+    // When --agent-id is omitted the CLI must exit non-zero and write a
+    // machine-readable JSON envelope to stderr, never a clap usage error.
+    let temp = tempfile::tempdir().expect("temp dir");
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .args([
+            "write",
+            "observation",
+            "--session-id",
+            "s1",
+            "--observed-at",
+            "2026-05-30T10:00:00Z",
+            "--source-handle",
+            "src/lib.rs:sha256:abc",
+            "--text",
+            "test",
+            "--evidence-target",
+            "codegraph:v4:abc",
+            "--out",
+            temp.path().join("out.jsonl").to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(r#""code":"missing_field""#))
+        .stderr(predicate::str::contains(r#""field":"agent_id""#));
+}
+
+#[test]
 fn cargo_run_defaults_to_egregore_binary() {
     let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let manifest = fs::read_to_string(manifest_path).expect("manifest should be readable");

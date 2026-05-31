@@ -4,6 +4,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    process,
 };
 
 use anyhow::{Context, Result};
@@ -12,7 +13,14 @@ use serde::Serialize;
 
 use crate::{
     adapters::{DryRunSink, ingest_records, records_from_jsonl},
-    ir::{EdgeLabel, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan},
+    evidence::{
+        ArtifactRequest, CommandEvidenceRequest, EvidenceProvenance, ObservationRequest,
+        VerificationRequest, build_artifact_records, build_command_evidence_records,
+        build_observation_records, build_verification_records,
+    },
+    ir::{
+        EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan,
+    },
     link_evidence::{self, LinkOptions},
     local_project, query, scan_repository_history_with_override, scan_repository_with_override,
     schema_version::{RecordVersion, record_version},
@@ -154,6 +162,35 @@ enum Commands {
         /// Query subcommand.
         #[command(subcommand)]
         subcommand: QuerySubcommand,
+    },
+    /// Write typed evidence records (observations, command evidence, artifacts, verification).
+    ///
+    /// This is the default contract for interactive clients, SDKs, and the future MCP surface.
+    /// Use `eg ingest` for batch importers that already produce well-formed JSONL.
+    ///
+    /// Rejected writes exit with code 1 and print a machine-readable error to stderr:
+    ///   `{"code":"missing_field","field":"agent_id"}`
+    ///
+    /// Example (accepted observation):
+    ///   eg write observation \
+    ///     --agent-id my-agent --session-id sess-001 \
+    ///     --observed-at 2026-05-30T10:00:00Z \
+    ///     --source-handle "src/lib.rs:sha256:abc123" \
+    ///     --text "function f has high complexity" \
+    ///     --confidence 0.9 \
+    ///     --evidence-target codegraph:v4:deadbeef \
+    ///     --out evidence.jsonl
+    ///
+    /// Example (rejected — missing agent-id):
+    ///   eg write observation --session-id sess-001 ...
+    ///   # exits 1, stderr: `{"code":"missing_field","field":"agent_id"}`
+    ///
+    /// Example (read-back to verify handles survived):
+    ///   eg inspect evidence.jsonl
+    Write {
+        /// Write subcommand.
+        #[command(subcommand)]
+        kind: WriteKind,
     },
     /// Manage the local Egregore daemon.
     #[cfg(feature = "embedded-aletheiadb")]
@@ -341,6 +378,180 @@ enum DaemonAction {
     },
 }
 
+/// Subcommands for `write`.
+#[derive(Debug, Subcommand)]
+enum WriteKind {
+    /// Write a typed Observation node backed by at least one evidence link.
+    ///
+    /// Writes fail immediately when any required provenance field is absent.
+    ///
+    /// The error is a machine-readable JSON object on stderr naming the field;
+    /// it never echoes the observation text or any other payload value.
+    Observation {
+        /// Stable agent identity; required.
+        #[arg(long, default_value = "")]
+        agent_id: String,
+        /// Agent kind (`other`, `claude-code`, `vantage`, `codex`, `rust-swe-agent`, `human`).
+        #[arg(long, default_value = "other")]
+        agent_kind: String,
+        /// Active session identifier; required.
+        #[arg(long, default_value = "")]
+        session_id: String,
+        /// RFC 3339 observation timestamp; required.
+        #[arg(long, default_value = "")]
+        observed_at: String,
+        /// Citable source artifact path or hash; required.
+        #[arg(long, default_value = "")]
+        source_handle: String,
+        /// Observation body text; required.
+        #[arg(long, default_value = "")]
+        text: String,
+        /// Confidence in `[0.0, 1.0]`.
+        #[arg(long, default_value_t = 0.9)]
+        confidence: f64,
+        /// Stable record IDs to cite as evidence (space-separated or repeated).
+        /// At least one is required.
+        #[arg(long, num_args = 0..)]
+        evidence_target: Vec<String>,
+        /// Domain of the evidence targets (`codegraph`, `verification`, etc.).
+        #[arg(long, default_value = "codegraph")]
+        evidence_domain: String,
+        /// Output JSONL path for the produced records.
+        #[arg(long, required = true)]
+        out: PathBuf,
+    },
+    /// Write a typed `CommandRun` (command evidence) record in the verification domain.
+    CommandEvidence {
+        /// Stable agent identity; required.
+        #[arg(long, default_value = "")]
+        agent_id: String,
+        /// Agent kind.
+        #[arg(long, default_value = "other")]
+        agent_kind: String,
+        /// Active session identifier; required.
+        #[arg(long, default_value = "")]
+        session_id: String,
+        /// RFC 3339 observation timestamp; required.
+        #[arg(long, default_value = "")]
+        observed_at: String,
+        /// Citable source artifact path or hash.
+        #[arg(long)]
+        source_handle: Option<String>,
+        /// RFC 3339 execution timestamp; required.
+        #[arg(long, default_value = "")]
+        executed_at: String,
+        /// Shell exit code; required.
+        #[arg(long)]
+        exit_code: Option<i64>,
+        /// Captured stdout text.
+        #[arg(long)]
+        stdout: Option<String>,
+        /// Captured stderr text.
+        #[arg(long)]
+        stderr: Option<String>,
+        /// Evidence quality: `verbatim`, `summarized`, or `referenced_only`.
+        #[arg(long, default_value = "verbatim")]
+        evidence_quality: String,
+        /// Source artifact path; at least one of `--source-artifact-path` or
+        /// `--source-artifact-hash` is required.
+        #[arg(long, default_value = "")]
+        source_artifact_path: String,
+        /// Source artifact hash.
+        #[arg(long, default_value = "")]
+        source_artifact_hash: String,
+        /// Output JSONL path for the produced records.
+        #[arg(long, required = true)]
+        out: PathBuf,
+    },
+    /// Write a typed `PatchArtifact` record in the artifact domain.
+    Artifact {
+        /// Stable agent identity; required.
+        #[arg(long, default_value = "")]
+        agent_id: String,
+        /// Agent kind.
+        #[arg(long, default_value = "other")]
+        agent_kind: String,
+        /// Active session identifier; required.
+        #[arg(long, default_value = "")]
+        session_id: String,
+        /// RFC 3339 observation timestamp; required.
+        #[arg(long, default_value = "")]
+        observed_at: String,
+        /// Citable source artifact path or hash.
+        #[arg(long)]
+        source_handle: Option<String>,
+        /// Path to the raw patch file (unified diff).
+        #[arg(long, required = true)]
+        patch_file: PathBuf,
+        /// Repository-relative target files touched by the patch (repeated).
+        #[arg(long, num_args = 0..)]
+        target_file: Vec<String>,
+        /// Patch validation status.
+        #[arg(long, default_value = "unverified")]
+        patch_status: String,
+        /// Git commit SHA the patch was authored against.
+        #[arg(long)]
+        base_commit: Option<String>,
+        /// Source artifact path.
+        #[arg(long, default_value = "")]
+        source_artifact_path: String,
+        /// Source artifact hash.
+        #[arg(long, default_value = "")]
+        source_artifact_hash: String,
+        /// Human-readable summary of any validation performed on this artifact.
+        #[arg(long, default_value = "")]
+        validation_summary: String,
+        /// Output JSONL path for the produced records.
+        #[arg(long, required = true)]
+        out: PathBuf,
+    },
+    /// Write a typed Verification record in the verification domain.
+    Verification {
+        /// Stable agent identity; required.
+        #[arg(long, default_value = "")]
+        agent_id: String,
+        /// Agent kind.
+        #[arg(long, default_value = "other")]
+        agent_kind: String,
+        /// Active session identifier; required.
+        #[arg(long, default_value = "")]
+        session_id: String,
+        /// RFC 3339 observation timestamp; required.
+        #[arg(long, default_value = "")]
+        observed_at: String,
+        /// Citable source artifact path or hash.
+        #[arg(long)]
+        source_handle: Option<String>,
+        /// RFC 3339 execution timestamp; required.
+        #[arg(long, default_value = "")]
+        executed_at: String,
+        /// Verification outcome: `pass`, `fail`, `skip`, `error`, or `timeout`.
+        #[arg(long, default_value = "")]
+        status: String,
+        /// Verification kind: `test_run`, `command_run`, `ci_status`, etc.
+        #[arg(long, default_value = "command_run")]
+        verification_kind: String,
+        /// Captured stdout text.
+        #[arg(long)]
+        stdout: Option<String>,
+        /// Evidence quality: `high`, `medium`, or `low`.
+        #[arg(long, default_value = "high")]
+        evidence_quality: String,
+        /// Source artifact path.
+        #[arg(long, default_value = "")]
+        source_artifact_path: String,
+        /// Source artifact hash.
+        #[arg(long, default_value = "")]
+        source_artifact_hash: String,
+        /// Stable ID of a `CommandRun` record that produced this result.
+        #[arg(long)]
+        linked_command_evidence_id: Option<String>,
+        /// Output JSONL path for the produced records.
+        #[arg(long, required = true)]
+        out: PathBuf,
+    },
+}
+
 /// Parses process arguments and runs the CLI.
 ///
 /// # Errors
@@ -401,9 +612,218 @@ fn run_cli(cli: Cli) -> Result<()> {
             out,
         } => link_evidence_cmd(&code_graph, &evidence, &out),
         Commands::Query { subcommand } => query_cmd(subcommand),
+        Commands::Write { kind } => write_evidence(kind),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Daemon { action } => daemon(action),
     }
+}
+
+/// Prints a machine-readable JSON error envelope to stderr and exits with code 1.
+///
+/// Callers that detect a [`crate::evidence::ProvenanceError`] use this instead of
+/// propagating the error so that `main` does not emit a second human-readable line
+/// after the JSON envelope has already been written.
+fn write_evidence_error(e: &crate::evidence::ProvenanceError) -> ! {
+    eprintln!(r#"{{"code":"{}", "field":"{}"}}"#, e.code, e.field);
+    process::exit(1);
+}
+
+/// Handles `eg write <kind>` subcommands.
+///
+/// On provenance failure the function writes a JSON error to stderr
+/// (`{"code":"missing_field","field":"<name>"}`) and returns an error.
+#[allow(clippy::too_many_lines)]
+fn write_evidence(kind: WriteKind) -> Result<()> {
+    match kind {
+        WriteKind::Observation {
+            agent_id,
+            agent_kind,
+            session_id,
+            observed_at,
+            source_handle,
+            text,
+            confidence,
+            evidence_target,
+            evidence_domain,
+            out,
+        } => {
+            // Only codegraph (OBSERVES) and verification (VALIDATED_BY) are supported.
+            // The daemon rejects OBSERVES on non-codegraph targets and VALIDATED_BY on
+            // non-verification targets, so any other domain would produce invalid JSONL.
+            if evidence_domain != "codegraph" && evidence_domain != "verification" {
+                write_evidence_error(&crate::evidence::ProvenanceError::invalid(
+                    "evidence_domain",
+                ));
+            }
+            let relation = if evidence_domain == "verification" {
+                EdgeLabel::ValidatedBy.as_str().to_owned()
+            } else {
+                EdgeLabel::Observes.as_str().to_owned()
+            };
+            let evidence_links: Vec<EvidenceLink> = evidence_target
+                .into_iter()
+                .map(|target_id| EvidenceLink {
+                    target_record_id: Some(target_id),
+                    target_domain: evidence_domain.clone(),
+                    relation: relation.clone(),
+                    confidence: confidence.to_string(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                })
+                .collect();
+            let req = ObservationRequest {
+                provenance: EvidenceProvenance {
+                    agent_id,
+                    agent_kind,
+                    session_id,
+                    observed_at,
+                    source_handle: Some(source_handle),
+                },
+                text,
+                confidence,
+                evidence_links,
+            };
+            let outcome =
+                build_observation_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
+            write_evidence_outcome(&outcome.records, &out, &outcome.record_id)
+        }
+        WriteKind::CommandEvidence {
+            agent_id,
+            agent_kind,
+            session_id,
+            observed_at,
+            source_handle,
+            executed_at,
+            exit_code,
+            stdout,
+            stderr,
+            evidence_quality,
+            source_artifact_path,
+            source_artifact_hash,
+            out,
+        } => {
+            let exit_code = exit_code.unwrap_or_else(|| {
+                write_evidence_error(&crate::evidence::ProvenanceError::missing("exit_code"))
+            });
+            let req = CommandEvidenceRequest {
+                provenance: EvidenceProvenance {
+                    agent_id,
+                    agent_kind,
+                    session_id,
+                    observed_at,
+                    source_handle,
+                },
+                executed_at,
+                exit_code,
+                stdout,
+                stderr,
+                evidence_quality,
+                source_artifact_path,
+                source_artifact_hash,
+            };
+            let outcome =
+                build_command_evidence_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
+            write_evidence_outcome(&outcome.records, &out, &outcome.record_id)
+        }
+        WriteKind::Artifact {
+            agent_id,
+            agent_kind,
+            session_id,
+            observed_at,
+            source_handle,
+            patch_file,
+            target_file,
+            patch_status,
+            base_commit,
+            source_artifact_path,
+            source_artifact_hash,
+            validation_summary,
+            out,
+        } => {
+            let patch_bytes = fs::read(&patch_file)
+                .with_context(|| format!("failed to read patch file {}", patch_file.display()))?;
+            let req = ArtifactRequest {
+                provenance: EvidenceProvenance {
+                    agent_id,
+                    agent_kind,
+                    session_id,
+                    observed_at,
+                    source_handle,
+                },
+                patch_bytes,
+                target_files: target_file,
+                patch_status,
+                base_commit,
+                source_artifact_path,
+                source_artifact_hash,
+                validation_summary,
+            };
+            let outcome = build_artifact_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
+            write_evidence_outcome(&outcome.records, &out, &outcome.record_id)
+        }
+        WriteKind::Verification {
+            agent_id,
+            agent_kind,
+            session_id,
+            observed_at,
+            source_handle,
+            executed_at,
+            status,
+            verification_kind,
+            stdout,
+            evidence_quality,
+            source_artifact_path,
+            source_artifact_hash,
+            linked_command_evidence_id,
+            out,
+        } => {
+            let req = VerificationRequest {
+                provenance: EvidenceProvenance {
+                    agent_id,
+                    agent_kind,
+                    session_id,
+                    observed_at,
+                    source_handle,
+                },
+                executed_at,
+                status,
+                verification_kind,
+                stdout,
+                evidence_quality,
+                source_artifact_path,
+                source_artifact_hash,
+                linked_command_evidence_id,
+            };
+            let outcome =
+                build_verification_records(&req).unwrap_or_else(|e| write_evidence_error(&e));
+            write_evidence_outcome(&outcome.records, &out, &outcome.record_id)
+        }
+    }
+}
+
+/// Serializes evidence records to JSONL and prints the evidence handle.
+fn write_evidence_outcome(
+    records: &[GraphRecord],
+    out: &Path,
+    evidence_handle: &str,
+) -> Result<()> {
+    let mut graph = Graph::new();
+    for record in records {
+        graph.push(record.clone());
+    }
+    let jsonl = graph
+        .to_jsonl()
+        .context("failed to serialize evidence JSONL")?;
+    fs::write(out, jsonl)
+        .with_context(|| format!("failed to write evidence JSONL to {}", out.display()))?;
+    println!(
+        r#"{{"ok":true,"evidence_handle":"{}","records":{}}}"#,
+        evidence_handle,
+        records.len()
+    );
+    Ok(())
 }
 
 fn import_local_tasks_cmd(
