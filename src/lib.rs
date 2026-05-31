@@ -59,8 +59,8 @@ pub use ir::{
     SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, SelectionBasis,
     SemanticDriftMetadata, SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION,
     UserContextFields, UserContextScope, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
-    artifact_stable_id, project_stable_id, semantic_stable_id, stable_id,
-    user_context_stable_id, verification_stable_id,
+    artifact_stable_id, project_stable_id, semantic_stable_id, stable_id, user_context_stable_id,
+    verification_stable_id,
 };
 pub use local_project::import_local_tasks;
 pub use query::{SymbolContext, UnresolvedRef, symbol_context};

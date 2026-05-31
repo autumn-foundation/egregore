@@ -1248,8 +1248,8 @@ fn verification_rejects_invalid_evidence_quality() {
         source_artifact_hash: "sha256:abc123".to_owned(),
         linked_command_evidence_id: None,
     };
-    let err = build_verification_records(&req)
-        .expect_err("unknown evidence_quality must be rejected");
+    let err =
+        build_verification_records(&req).expect_err("unknown evidence_quality must be rejected");
     assert_eq!(err.code, "invalid_field");
     assert_eq!(err.field, "evidence_quality");
 }
@@ -1461,8 +1461,7 @@ fn artifact_rejects_empty_validation_summary() {
         source_artifact_hash: "sha256:abc123".to_owned(),
         validation_summary: String::new(),
     };
-    let err =
-        build_artifact_records(&req).expect_err("empty validation_summary must be rejected");
+    let err = build_artifact_records(&req).expect_err("empty validation_summary must be rejected");
     assert_eq!(err.code, "missing_field");
     assert_eq!(err.field, "validation_summary");
 }
@@ -1544,8 +1543,7 @@ fn command_evidence_rejects_oversized_stdout() {
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
     };
-    let err =
-        build_command_evidence_records(&req).expect_err("oversized stdout must be rejected");
+    let err = build_command_evidence_records(&req).expect_err("oversized stdout must be rejected");
     assert_eq!(err.code, "invalid_field");
     assert_eq!(err.field, "stdout");
 }
@@ -1563,8 +1561,7 @@ fn command_evidence_rejects_oversized_stderr() {
         source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
         source_artifact_hash: "sha256:abc123".to_owned(),
     };
-    let err =
-        build_command_evidence_records(&req).expect_err("oversized stderr must be rejected");
+    let err = build_command_evidence_records(&req).expect_err("oversized stderr must be rejected");
     assert_eq!(err.code, "invalid_field");
     assert_eq!(err.field, "stderr");
 }
@@ -1583,8 +1580,7 @@ fn verification_rejects_oversized_stdout() {
         source_artifact_hash: "sha256:abc123".to_owned(),
         linked_command_evidence_id: None,
     };
-    let err =
-        build_verification_records(&req).expect_err("oversized stdout must be rejected");
+    let err = build_verification_records(&req).expect_err("oversized stdout must be rejected");
     assert_eq!(err.code, "invalid_field");
     assert_eq!(err.field, "stdout");
 }
@@ -1626,7 +1622,9 @@ fn observation_rejects_non_numeric_evidence_link_confidence() {
         evidence_links: vec![EvidenceLink {
             target_record_id: Some("codegraph:v4:abc123".to_owned()),
             target_domain: aletheia_egregore::ir::Domain::CodeGraph.as_str().to_owned(),
-            relation: aletheia_egregore::ir::EdgeLabel::Observes.as_str().to_owned(),
+            relation: aletheia_egregore::ir::EdgeLabel::Observes
+                .as_str()
+                .to_owned(),
             confidence: "not-a-number".to_owned(),
             as_of_commit: None,
             target_repo_relative_path: None,
@@ -1649,7 +1647,9 @@ fn observation_rejects_out_of_range_evidence_link_confidence() {
         evidence_links: vec![EvidenceLink {
             target_record_id: Some("codegraph:v4:abc123".to_owned()),
             target_domain: aletheia_egregore::ir::Domain::CodeGraph.as_str().to_owned(),
-            relation: aletheia_egregore::ir::EdgeLabel::Observes.as_str().to_owned(),
+            relation: aletheia_egregore::ir::EdgeLabel::Observes
+                .as_str()
+                .to_owned(),
             confidence: "1.5".to_owned(),
             as_of_commit: None,
             target_repo_relative_path: None,
