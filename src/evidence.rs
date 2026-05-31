@@ -828,8 +828,11 @@ pub fn build_command_evidence_records(
         "command_evidence",
         &req.provenance.agent_id,
         &req.provenance.session_id,
+        &req.provenance.observed_at,
         &req.executed_at,
         &req.exit_code.to_string(),
+        agent_kind,
+        &req.evidence_quality,
         &req.source_artifact_path,
         &req.source_artifact_hash,
         &stdout_hash,
@@ -983,16 +986,32 @@ pub fn build_artifact_records(
         hasher.finalize().to_hex().to_string()
     };
 
-    // patch_status is included so that the same patch written with different statuses
-    // (e.g. unverified → applied_clean) produces distinct append-only records rather
-    // than a mismatched-payload conflict on the existing record.
+    // Hash target_files so different file lists produce distinct IDs.
+    let target_files_hash = {
+        let mut h = blake3::Hasher::new();
+        let mut sorted = req.target_files.clone();
+        sorted.sort_unstable();
+        for f in &sorted {
+            h.update(f.as_bytes());
+            h.update(b"\0");
+        }
+        h.finalize().to_hex().to_string()
+    };
+
+    // ID covers all payload-bearing fields so that the same bytes re-written with
+    // a corrected base_commit, target_files, source hash, or observed_at produce a
+    // distinct record rather than a mismatched-payload conflict on the existing one.
     let art_id = artifact_stable_id(&[
         "node",
         "patch_artifact",
         &req.provenance.agent_id,
         &req.provenance.session_id,
+        &req.provenance.observed_at,
         &patch_hash,
         &req.patch_status,
+        &req.source_artifact_hash,
+        req.base_commit.as_deref().unwrap_or(""),
+        &target_files_hash,
     ]);
 
     // Decode patch bytes and redact before inline storage.
@@ -1015,9 +1034,12 @@ pub fn build_artifact_records(
         inline: patch_inline,
     });
 
-    let (base_commit_field, unknown_base_reason) = req.base_commit.as_ref().map_or_else(
+    // Treat Some("") the same as None — the validator requires unknown_base_reason when
+    // base_commit is absent or empty.
+    let normalized_base = req.base_commit.as_deref().filter(|bc| !bc.is_empty());
+    let (base_commit_field, unknown_base_reason) = normalized_base.map_or_else(
         || (None, Some("unknown_base".to_owned())),
-        |bc| (Some(bc.clone()), None),
+        |bc| (Some(bc.to_owned()), None),
     );
 
     let art_node = GraphRecord::Node {
@@ -1281,8 +1303,13 @@ pub fn build_verification_records(
 
     let mut records = vec![ver_node];
 
-    // If there's a linked command evidence record, emit a HAS_EVIDENCE edge.
+    // If there's a linked command evidence record, validate and emit a HAS_EVIDENCE edge.
+    // An empty string is rejected — embedded ingest validates HAS_EVIDENCE targets are
+    // resolvable, so an invalid ID causes a later rejection rather than a clean failure.
     if let Some(ref cmd_id) = req.linked_command_evidence_id {
+        if cmd_id.is_empty() {
+            return Err(ProvenanceError::missing("linked_command_evidence_id"));
+        }
         let has_evidence_edge = GraphRecord::agent_memory_edge(
             EdgeLabel::HasEvidence,
             ver_id.clone(),

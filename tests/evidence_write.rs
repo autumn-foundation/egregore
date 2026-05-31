@@ -1770,3 +1770,215 @@ fn distinct_observed_at_produces_distinct_observation_ids() {
         "different observed_at must produce different observation IDs"
     );
 }
+
+// ── P2 round-9 ───────────────────────────────────────────────────────────────
+
+#[test]
+fn distinct_observed_at_produces_distinct_artifact_ids() {
+    let base = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"--- a/src/lib.rs\n+++ b/src/lib.rs\n".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc123".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "ok".to_owned(),
+    };
+    let id_a = build_artifact_records(&base)
+        .expect("base must succeed")
+        .record_id;
+    let req_b = ArtifactRequest {
+        provenance: EvidenceProvenance {
+            observed_at: "2026-06-01T10:00:00Z".to_owned(),
+            ..valid_provenance()
+        },
+        ..base
+    };
+    let id_b = build_artifact_records(&req_b)
+        .expect("req_b must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different observed_at must produce different artifact IDs"
+    );
+}
+
+#[test]
+fn distinct_source_hash_produces_distinct_artifact_ids() {
+    let base = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"--- a/src/lib.rs\n+++ b/src/lib.rs\n".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc123".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:aaa111".to_owned(),
+        validation_summary: "ok".to_owned(),
+    };
+    let id_a = build_artifact_records(&base)
+        .expect("hash aaa must succeed")
+        .record_id;
+    let req_b = ArtifactRequest {
+        source_artifact_hash: "sha256:bbb222".to_owned(),
+        ..base
+    };
+    let id_b = build_artifact_records(&req_b)
+        .expect("hash bbb must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different source_artifact_hash must produce different artifact IDs"
+    );
+}
+
+#[test]
+fn distinct_target_files_produces_distinct_artifact_ids() {
+    let base = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"--- a/src/lib.rs\n+++ b/src/lib.rs\n".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc123".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "ok".to_owned(),
+    };
+    let id_a = build_artifact_records(&base)
+        .expect("file A must succeed")
+        .record_id;
+    let req_b = ArtifactRequest {
+        target_files: vec!["src/main.rs".to_owned()],
+        ..base
+    };
+    let id_b = build_artifact_records(&req_b)
+        .expect("file B must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different target_files must produce different artifact IDs"
+    );
+}
+
+#[test]
+fn artifact_normalizes_empty_base_commit() {
+    // Some("") must be treated as None: unknown_base_reason set, base_commit absent.
+    let req = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"diff content".to_vec(),
+        target_files: vec![],
+        patch_status: "invalid_syntax".to_owned(),
+        base_commit: Some(String::new()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "syntax error in patch".to_owned(),
+    };
+    let outcome = build_artifact_records(&req).expect("empty base_commit must be normalized");
+    let art = outcome
+        .records
+        .iter()
+        .find(|r| {
+            matches!(
+                r,
+                aletheia_egregore::ir::GraphRecord::Node {
+                    kind: NodeKind::PatchArtifact,
+                    ..
+                }
+            )
+        })
+        .expect("PatchArtifact must be present");
+    if let aletheia_egregore::ir::GraphRecord::Node {
+        base_commit,
+        unknown_base_reason,
+        ..
+    } = art
+    {
+        assert!(
+            base_commit.is_none(),
+            "empty base_commit string must be normalized to None"
+        );
+        assert_eq!(
+            unknown_base_reason.as_deref(),
+            Some("unknown_base"),
+            "unknown_base_reason must be set when base_commit is empty"
+        );
+    }
+}
+
+#[test]
+fn distinct_observed_at_produces_distinct_command_evidence_ids() {
+    let base = CommandEvidenceRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:01:00Z".to_owned(),
+        exit_code: 0,
+        stdout: None,
+        stderr: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+    };
+    let id_a = build_command_evidence_records(&base)
+        .expect("observed_at A must succeed")
+        .record_id;
+    let req_b = CommandEvidenceRequest {
+        provenance: EvidenceProvenance {
+            observed_at: "2026-06-01T10:00:00Z".to_owned(),
+            ..valid_provenance()
+        },
+        ..base
+    };
+    let id_b = build_command_evidence_records(&req_b)
+        .expect("observed_at B must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different observed_at must produce different command evidence IDs"
+    );
+}
+
+#[test]
+fn distinct_evidence_quality_produces_distinct_command_evidence_ids() {
+    let base = CommandEvidenceRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:01:00Z".to_owned(),
+        exit_code: 0,
+        stdout: None,
+        stderr: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+    };
+    let id_a = build_command_evidence_records(&base)
+        .expect("verbatim must succeed")
+        .record_id;
+    let req_b = CommandEvidenceRequest {
+        evidence_quality: "summarized".to_owned(),
+        ..base
+    };
+    let id_b = build_command_evidence_records(&req_b)
+        .expect("summarized must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different evidence_quality must produce different command evidence IDs"
+    );
+}
+
+#[test]
+fn verification_rejects_empty_linked_command_evidence_id() {
+    let req = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        linked_command_evidence_id: Some(String::new()),
+    };
+    let err = build_verification_records(&req)
+        .expect_err("empty linked_command_evidence_id must be rejected");
+    assert_eq!(err.code, "missing_field");
+    assert_eq!(err.field, "linked_command_evidence_id");
+}
