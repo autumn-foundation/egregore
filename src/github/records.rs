@@ -161,7 +161,7 @@ fn body_blob(
     base_ref: Option<&str>,
     merge_commit_sha: Option<&str>,
     closed_at: Option<&str>,
-) -> Box<OutputHandle> {
+) -> OutputHandle {
     let redacted_body = body.map(|b| redact_lines(ctx.redact, b));
     let redacted_milestone = milestone.map(|m| (ctx.redact)(m));
     let blob = serde_json::json!({
@@ -266,7 +266,7 @@ fn task_and_link(
     labels: &[model::Label],
     assignees: &[model::User],
     author: Option<&str>,
-    body_handle: Box<OutputHandle>,
+    body_handle: OutputHandle,
 ) -> Emitted {
     let number_s = number.to_string();
     let task_id = project_stable_id(&["project", "Task", ctx.source_repo, &number_s, native_id]);
@@ -306,7 +306,7 @@ fn task_and_link(
     } = &mut task
     {
         *t = Some(redacted_title);
-        *bh = Some(body_handle);
+        *bh = Some(Box::new(body_handle));
         *st = Some(status.to_owned());
         *sk = Some(source_kind.to_owned());
         *sel = Some(link_id.clone());
@@ -414,10 +414,11 @@ pub fn pr_review_records(ctx: &Context<'_>, pr_number: u64, r: &model::Review) -
     edge_and_pack(rec, parent, None)
 }
 
-/// Emits a `Review` (`pr_review_comment`) plus its `REFERENCES_TASK` edge and,
-/// when the anchored file resolves unambiguously, a `TOUCHES_FILE` edge.
-/// Missing/renamed/ambiguous files produce a diagnostic with source handles
-/// instead of a guessed link.
+/// Emits a `pr_review_comment` `Review` plus its edges.
+///
+/// Always emits a `REFERENCES_TASK` edge and, when the anchored file resolves
+/// unambiguously, a `TOUCHES_FILE` edge. Missing/renamed/ambiguous files
+/// produce a diagnostic with source handles instead of a guessed link.
 #[must_use]
 pub fn review_comment_records(ctx: &Context<'_>, c: &model::ReviewComment) -> Emitted {
     let Some(number) = model::trailing_number(&c.pull_request_url) else {
@@ -538,7 +539,7 @@ fn review_node(
     review_kind: &str,
     valid_time: &str,
     author: Option<&str>,
-    body: Option<String>,
+    body: Option<&str>,
     parent_task_id: &str,
 ) -> GraphRecord {
     let id = review_id_for(ctx, native_id);
@@ -562,7 +563,7 @@ fn review_node(
     {
         *rk = Some(review_kind.to_owned());
         *au = author.map(str::to_owned);
-        *bh = body.as_deref().map(handle_for);
+        *bh = body.map(|b| Box::new(handle_for(b)));
         *system_native_id = Some(native_id.to_owned());
         *pt = Some(parent_task_id.to_owned());
     }
@@ -600,7 +601,7 @@ fn set_review_extra(
                 end_byte: 0,
             });
         }
-        *diff_hunk_handle = diff_hunk.map(handle_for);
+        *diff_hunk_handle = diff_hunk.map(|d| Box::new(handle_for(d)));
     }
 }
 

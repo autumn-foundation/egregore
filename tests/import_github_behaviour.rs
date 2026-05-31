@@ -4,11 +4,15 @@
 //! in-process mock GitHub server built on `std::net::TcpListener`. No live
 //! network access is used: the CLI is pointed at the mock via `--api-base`.
 //!
-//! The mock gives byte-level control over status codes, ETags, `Link`
+//! The mock gives byte-level control over status codes, `ETags`, `Link`
 //! pagination, and `X-RateLimit-*` headers, which is what the conformance
 //! budget assertions (exact request counts, 304 re-import) require.
 #![allow(missing_docs)]
 #![allow(clippy::too_many_lines)]
+// Test-harness ergonomics: the mock server favours readability over the
+// nursery/pedantic rewrites clippy suggests here.
+#![allow(clippy::option_if_let_else)]
+#![allow(clippy::format_push_string)]
 
 use std::{
     collections::HashMap,
@@ -382,7 +386,7 @@ fn run_import(
     (jsonl, stderr, output.status.success())
 }
 
-fn nodes_of_kind<'a>(jsonl: &'a str, kind: &str) -> Vec<serde_json::Value> {
+fn nodes_of_kind(jsonl: &str, kind: &str) -> Vec<serde_json::Value> {
     jsonl
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())

@@ -17,6 +17,9 @@ pub const SCRUB_MARKER: &str = "[REDACTED_GH_TOKEN]";
 /// Minimum body length (characters after the prefix) for a match.
 const MIN_TOKEN_BODY: usize = 36;
 
+/// Classic/OAuth PAT prefixes: `gh[pousr]_`.
+const CLASSIC_PREFIXES: &[&str] = &["ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
+
 /// Returns `value` with every GitHub-token-shaped substring replaced by
 /// [`SCRUB_MARKER`].
 ///
@@ -37,11 +40,12 @@ pub fn scrub(value: &str) -> String {
         if let Some(end) = match_token(value, i) {
             out.push_str(SCRUB_MARKER);
             i = end;
-        } else {
+        } else if let Some(ch) = value[i..].chars().next() {
             // Push one UTF-8 char to keep the output valid.
-            let ch = value[i..].chars().next().expect("non-empty slice");
             out.push(ch);
             i += ch.len_utf8();
+        } else {
+            break;
         }
     }
     out
@@ -61,8 +65,7 @@ fn match_token(value: &str, start: usize) -> Option<usize> {
         return None;
     }
     // Classic/OAuth PAT: gh[pousr]_ + [A-Za-z0-9]{36,}
-    const CLASSIC: &[&str] = &["ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
-    for prefix in CLASSIC {
+    for prefix in CLASSIC_PREFIXES {
         if let Some(after) = rest.strip_prefix(prefix) {
             let len = run_len(after, |c| c.is_ascii_alphanumeric());
             if len >= MIN_TOKEN_BODY {
