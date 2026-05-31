@@ -431,7 +431,7 @@ fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
 
 /// Builds an `AgentSession` node for the given session.
 fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> GraphRecord {
-    let id = agent_memory_stable_id(&["node", "agent_session", &prov.agent_id, &prov.session_id]);
+    let id = agent_memory_stable_id(&["node", "agent_session", &prov.agent_id, &prov.session_id, agent_kind]);
     GraphRecord::Node {
         id,
         kind: NodeKind::AgentSession,
@@ -588,6 +588,15 @@ pub fn build_observation_records(
     if !(0.0..=1.0).contains(&req.confidence) {
         return Err(ProvenanceError::invalid("confidence"));
     }
+    for link in &req.evidence_links {
+        let c: f64 = link
+            .confidence
+            .parse()
+            .map_err(|_| ProvenanceError::invalid("evidence_links.confidence"))?;
+        if !(0.0..=1.0).contains(&c) {
+            return Err(ProvenanceError::invalid("evidence_links.confidence"));
+        }
+    }
 
     let agent_kind = effective_agent_kind(&req.provenance);
 
@@ -597,6 +606,7 @@ pub fn build_observation_records(
         "agent_session",
         &req.provenance.agent_id,
         &req.provenance.session_id,
+        agent_kind,
     ]);
 
     // Redact free-text before hashing or storing — secrets must not reach the store.
@@ -757,6 +767,15 @@ pub fn build_command_evidence_records(
 
     let agent_kind = effective_agent_kind(&req.provenance);
 
+    // Reject oversized stdout/stderr — the writer has no external storage for payloads
+    // larger than the inline ceiling, so silently demoting them would produce unrecoverable handles.
+    if req.stdout.as_deref().is_some_and(|s| s.len() as u64 > INLINE_PAYLOAD_CEILING) {
+        return Err(ProvenanceError::invalid("stdout"));
+    }
+    if req.stderr.as_deref().is_some_and(|s| s.len() as u64 > INLINE_PAYLOAD_CEILING) {
+        return Err(ProvenanceError::invalid("stderr"));
+    }
+
     // Redact stdout/stderr before hashing or inline storage.
     let redacted_stdout = req.stdout.as_deref().map(crate::redaction::redact_value);
     let redacted_stderr = req.stderr.as_deref().map(crate::redaction::redact_value);
@@ -769,15 +788,21 @@ pub fn build_command_evidence_records(
     let redaction_policy_version = (stdout_redacted || stderr_redacted)
         .then(|| crate::redaction::REDACTION_POLICY_VERSION.to_owned());
 
-    // Stdout hash is included in the stable ID so two runs with identical timing
-    // but different output produce distinct evidence handles.
+    // Stdout and stderr hashes are included in the stable ID so two runs with identical
+    // timing but different output produce distinct evidence handles.
     let stdout_hash = {
         let mut h = blake3::Hasher::new();
         h.update(redacted_stdout.as_deref().unwrap_or("").as_bytes());
         h.finalize().to_hex().to_string()
     };
 
-    // Content-addressed on agent, session, execution time, exit code, source, and stdout.
+    let stderr_hash = {
+        let mut h = blake3::Hasher::new();
+        h.update(redacted_stderr.as_deref().unwrap_or("").as_bytes());
+        h.finalize().to_hex().to_string()
+    };
+
+    // Content-addressed on agent, session, execution time, exit code, source, stdout, and stderr.
     // Both path and hash are included so path-only and hash-only inputs don't collide.
     let cmd_id = agent_memory_stable_id(&[
         "node",
@@ -789,6 +814,7 @@ pub fn build_command_evidence_records(
         &req.source_artifact_path,
         &req.source_artifact_hash,
         &stdout_hash,
+        &stderr_hash,
     ]);
 
     let stdout_handle = redacted_stdout.as_deref().map(output_handle).map(Box::new);
@@ -928,6 +954,7 @@ pub fn build_artifact_records(
         "agent_session",
         &req.provenance.agent_id,
         &req.provenance.session_id,
+        agent_kind,
     ]);
 
     // Hash the patch bytes for content addressing
@@ -1112,6 +1139,9 @@ pub fn build_verification_records(
     }
     if req.status.is_empty() {
         return Err(ProvenanceError::missing("status"));
+    }
+    if req.stdout.as_deref().is_some_and(|s| s.len() as u64 > INLINE_PAYLOAD_CEILING) {
+        return Err(ProvenanceError::invalid("stdout"));
     }
 
     let agent_kind = effective_agent_kind(&req.provenance);

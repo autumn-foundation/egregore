@@ -1466,3 +1466,199 @@ fn artifact_rejects_empty_validation_summary() {
     assert_eq!(err.code, "missing_field");
     assert_eq!(err.field, "validation_summary");
 }
+
+// ── P2 round-7 ───────────────────────────────────────────────────────────────
+
+#[test]
+fn agent_session_id_differs_by_agent_kind() {
+    // Same agent_id/session_id with different agent_kind must produce different
+    // AgentSession IDs to avoid mismatched-payload conflicts in the embedded sink.
+    let prov_a = EvidenceProvenance {
+        agent_kind: "other".to_owned(),
+        ..valid_provenance()
+    };
+    let prov_b = EvidenceProvenance {
+        agent_kind: "codex".to_owned(),
+        ..valid_provenance()
+    };
+    let out_a = build_observation_records(&ObservationRequest {
+        provenance: prov_a,
+        text: "session id check a".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+    })
+    .expect("write A must succeed");
+    let out_b = build_observation_records(&ObservationRequest {
+        provenance: prov_b,
+        text: "session id check b".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+    })
+    .expect("write B must succeed");
+
+    let session_id_a = out_a
+        .records
+        .iter()
+        .find(|r| {
+            matches!(
+                r,
+                aletheia_egregore::ir::GraphRecord::Node {
+                    kind: NodeKind::AgentSession,
+                    ..
+                }
+            )
+        })
+        .map(aletheia_egregore::GraphRecord::id)
+        .expect("AgentSession must be in batch A");
+    let session_id_b = out_b
+        .records
+        .iter()
+        .find(|r| {
+            matches!(
+                r,
+                aletheia_egregore::ir::GraphRecord::Node {
+                    kind: NodeKind::AgentSession,
+                    ..
+                }
+            )
+        })
+        .map(aletheia_egregore::GraphRecord::id)
+        .expect("AgentSession must be in batch B");
+
+    assert_ne!(
+        session_id_a, session_id_b,
+        "AgentSession nodes with different agent_kind must have different IDs"
+    );
+}
+
+#[test]
+fn command_evidence_rejects_oversized_stdout() {
+    let big_stdout = "x".repeat((16 * 1024 + 1) as usize);
+    let req = CommandEvidenceRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:01:00Z".to_owned(),
+        exit_code: 0,
+        stdout: Some(big_stdout),
+        stderr: None,
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+    };
+    let err =
+        build_command_evidence_records(&req).expect_err("oversized stdout must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "stdout");
+}
+
+#[test]
+fn command_evidence_rejects_oversized_stderr() {
+    let big_stderr = "e".repeat((16 * 1024 + 1) as usize);
+    let req = CommandEvidenceRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:01:00Z".to_owned(),
+        exit_code: 1,
+        stdout: None,
+        stderr: Some(big_stderr),
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+    };
+    let err =
+        build_command_evidence_records(&req).expect_err("oversized stderr must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "stderr");
+}
+
+#[test]
+fn verification_rejects_oversized_stdout() {
+    let big_stdout = "v".repeat((16 * 1024 + 1) as usize);
+    let req = VerificationRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:02:00Z".to_owned(),
+        status: "pass".to_owned(),
+        verification_kind: "test_run".to_owned(),
+        stdout: Some(big_stdout),
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        linked_command_evidence_id: None,
+    };
+    let err =
+        build_verification_records(&req).expect_err("oversized stdout must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "stdout");
+}
+
+#[test]
+fn distinct_stderr_produces_distinct_command_evidence_ids() {
+    let base = CommandEvidenceRequest {
+        provenance: valid_provenance(),
+        executed_at: "2026-05-30T10:01:00Z".to_owned(),
+        exit_code: 1,
+        stdout: None,
+        stderr: Some("error A".to_owned()),
+        evidence_quality: "verbatim".to_owned(),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+    };
+    let id_a = build_command_evidence_records(&base)
+        .expect("run A must succeed")
+        .record_id;
+    let req_b = CommandEvidenceRequest {
+        stderr: Some("error B".to_owned()),
+        ..base
+    };
+    let id_b = build_command_evidence_records(&req_b)
+        .expect("run B must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different stderr must produce different command evidence IDs"
+    );
+}
+
+#[test]
+fn observation_rejects_non_numeric_evidence_link_confidence() {
+    let req = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "link confidence check".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![EvidenceLink {
+            target_record_id: Some("codegraph:v4:abc123".to_owned()),
+            target_domain: aletheia_egregore::ir::Domain::CodeGraph.as_str().to_owned(),
+            relation: aletheia_egregore::ir::EdgeLabel::Observes.as_str().to_owned(),
+            confidence: "not-a-number".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }],
+    };
+    let err = build_observation_records(&req)
+        .expect_err("non-numeric evidence_link confidence must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "evidence_links.confidence");
+}
+
+#[test]
+fn observation_rejects_out_of_range_evidence_link_confidence() {
+    let req = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "link confidence range check".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![EvidenceLink {
+            target_record_id: Some("codegraph:v4:abc123".to_owned()),
+            target_domain: aletheia_egregore::ir::Domain::CodeGraph.as_str().to_owned(),
+            relation: aletheia_egregore::ir::EdgeLabel::Observes.as_str().to_owned(),
+            confidence: "1.5".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }],
+    };
+    let err = build_observation_records(&req)
+        .expect_err("out-of-range evidence_link confidence must be rejected");
+    assert_eq!(err.code, "invalid_field");
+    assert_eq!(err.field, "evidence_links.confidence");
+}
