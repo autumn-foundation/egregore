@@ -50,6 +50,62 @@ struct DaemonMetadata {
 }
 
 #[test]
+fn daemon_status_surfaces_idle_pressure_contract() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+
+    let response = http_get_authed(&metadata, "/v1/status");
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "GET /v1/status should return 200, got {response}"
+    );
+    let body = response_json(&response);
+    assert_eq!(body["api_version"], "v1", "status must surface api_version");
+    assert!(
+        body.get("data_dir").is_some(),
+        "status must surface store identity (data_dir), got {body}"
+    );
+    let pressure = &body["pressure"];
+    assert_eq!(
+        pressure["state"], "idle",
+        "a daemon with no write pressure must report idle, got {body}"
+    );
+    assert_eq!(
+        pressure["alive"], true,
+        "pressure must report the daemon as alive, got {body}"
+    );
+    assert!(
+        pressure["queue_capacity"].as_u64().is_some(),
+        "pressure must expose a bounded queue_capacity, got {body}"
+    );
+    assert_eq!(
+        pressure["total_rejections"], 0,
+        "an idle daemon must report zero rejections, got {body}"
+    );
+    assert!(
+        pressure["recent_events"]
+            .as_array()
+            .is_some_and(std::vec::Vec::is_empty),
+        "an idle daemon must have no pressure events, got {body}"
+    );
+
+    // The CLI renders the pressure state and idle guidance to stdout.
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("daemon")
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pressure: idle"));
+
+    daemon.stop();
+}
+
+#[test]
 fn foreground_daemon_status_stop_and_requires_auth() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let data_dir = temp.path().join("store");

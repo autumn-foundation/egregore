@@ -67,6 +67,11 @@ pub struct EmbeddedAletheiaSink {
     _lease: Option<StoreLease>,
     #[cfg(feature = "embeddings")]
     embedding_vectors: EmbeddingVectorMap,
+    /// Bounds how many embedded stores run concurrently during in-crate tests
+    /// so each store's `GroupCommit` background flush thread stays schedulable.
+    /// Held for the store's lifetime; released on drop. Test-only.
+    #[cfg(test)]
+    _store_gate_permit: embedded_store_gate::StorePermit,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -225,6 +230,10 @@ impl EmbeddedAletheiaSink {
     }
 
     fn open_inner(data_dir: &Path, lease: Option<StoreLease>) -> AdapterResult<Self> {
+        // Test-only: cap concurrent embedded stores (and serialise under disk
+        // pressure) before spinning up the store's background flush thread.
+        #[cfg(test)]
+        let store_gate_permit = embedded_store_gate::acquire();
         let mut config = ::aletheiadb::config::durable_config_for_data_dir(data_dir);
         if is_fresh_data_dir(data_dir) {
             config.persistence.load_on_startup = false;
@@ -247,6 +256,8 @@ impl EmbeddedAletheiaSink {
             _lease: lease,
             #[cfg(feature = "embeddings")]
             embedding_vectors: BTreeMap::new(),
+            #[cfg(test)]
+            _store_gate_permit: store_gate_permit,
         };
         sink.rebuild_lookup_indexes()?;
         Ok(sink)
@@ -3001,6 +3012,134 @@ fn semantic_candidate_fetch_limits(limit: usize, total_nodes: usize) -> Vec<usiz
         limits.push(current);
     }
     limits
+}
+
+/// Test-only concurrency gate for embedded stores.
+///
+/// Each embedded `AletheiaDB` store runs a `GroupCommit` background flush
+/// thread whose write-acknowledgement path has a hard ~10s timeout (a
+/// "deadlock detector", not a performance SLA). Under heavy parallel test load
+/// — especially when the disk is near-full and `fsync` stalls — that timeout
+/// can fire and surface as a spurious `"Group commit timeout"` WAL write
+/// failure even though nothing is actually deadlocked.
+///
+/// This gate bounds how many embedded stores are open at once during in-crate
+/// tests, and serialises store opens further when free disk space is low, so
+/// the flush threads stay schedulable and `fsync` pressure stays bounded. It
+/// is compiled only for `cargo test` of this crate; production code paths and
+/// the standalone binary never see it.
+#[cfg(test)]
+mod embedded_store_gate {
+    use std::sync::{Condvar, Mutex};
+
+    /// Default ceiling on concurrently open embedded stores.
+    const MAX_CONCURRENT: usize = 2;
+    /// Ceiling used when free disk space is below `LOW_DISK_THRESHOLD_BYTES`.
+    const MAX_CONCURRENT_LOW_DISK: usize = 1;
+    /// Free-space threshold (2 GiB) below which store opens are serialised.
+    const LOW_DISK_THRESHOLD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+    static OPEN_STORES: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+    /// RAII permit; releases its slot when the owning store is dropped.
+    pub struct StorePermit;
+
+    impl Drop for StorePermit {
+        fn drop(&mut self) {
+            let (lock, cvar) = &OPEN_STORES;
+            if let Ok(mut count) = lock.lock() {
+                *count = count.saturating_sub(1);
+                cvar.notify_one();
+            }
+        }
+    }
+
+    /// Blocks until an embedded-store slot is available, then claims it.
+    ///
+    /// No single in-crate test holds two stores at once (the exclusive store
+    /// lease forces sequential open/reopen on a data dir), so a permit can
+    /// never self-deadlock even at a limit of one.
+    pub fn acquire() -> StorePermit {
+        let limit = if low_disk() {
+            MAX_CONCURRENT_LOW_DISK
+        } else {
+            MAX_CONCURRENT
+        };
+        let (lock, cvar) = &OPEN_STORES;
+        let mut count = lock.lock().expect("store gate mutex poisoned");
+        while *count >= limit {
+            count = cvar.wait(count).expect("store gate condvar poisoned");
+        }
+        *count += 1;
+        StorePermit
+    }
+
+    fn low_disk() -> bool {
+        available_bytes().is_some_and(|bytes| bytes < LOW_DISK_THRESHOLD_BYTES)
+    }
+
+    /// Best-effort free-space probe for the temp filesystem used by store
+    /// fixtures. Returns `None` (treated as "not low") when it cannot be
+    /// determined, so an unknown environment never over-serialises.
+    #[cfg(unix)]
+    fn available_bytes() -> Option<u64> {
+        use std::process::Command;
+        let dir = std::env::temp_dir();
+        let output = Command::new("df").arg("-kP").arg(&dir).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        // Header line, then one data line whose 4th column is available 1K blocks.
+        let avail_kb: u64 = text
+            .lines()
+            .nth(1)?
+            .split_whitespace()
+            .nth(3)?
+            .parse()
+            .ok()?;
+        Some(avail_kb.saturating_mul(1024))
+    }
+
+    #[cfg(not(unix))]
+    fn available_bytes() -> Option<u64> {
+        None
+    }
+
+    #[test]
+    fn permits_bound_concurrent_stores() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+        use std::time::Duration;
+
+        // Each thread holds a permit briefly; the peak number of permits this
+        // test ever holds at once must not exceed the gate ceiling, even though
+        // it shares the global gate with any concurrently running store tests.
+        let peak = Arc::new(AtomicUsize::new(0));
+        let live = Arc::new(AtomicUsize::new(0));
+        // All threads must be spawned before any is joined, otherwise the
+        // permits would be acquired and released one at a time.
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let peak = Arc::clone(&peak);
+            let live = Arc::clone(&live);
+            handles.push(thread::spawn(move || {
+                let _permit = acquire();
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(5));
+                live.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("gate test thread should not panic");
+        }
+        assert!(
+            peak.load(Ordering::SeqCst) <= MAX_CONCURRENT,
+            "gate must bound concurrently held permits to at most {MAX_CONCURRENT}"
+        );
+    }
 }
 
 #[cfg(test)]
