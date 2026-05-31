@@ -36,6 +36,9 @@ use crate::ir::{
 
 const INLINE_PAYLOAD_CEILING: u64 = 16 * 1024;
 
+/// `patch_status` values that require a known `base_commit`.
+const APPLIED_STATUSES: &[&str] = &["applied_clean", "applied_with_conflicts"];
+
 /// Accepted `patch_status` values (from `docs/schema/agent-actions.md`).
 const PATCH_STATUS_VALUES: &[&str] = &[
     "applied_clean",
@@ -730,7 +733,7 @@ pub fn build_observation_records(
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(req.provenance.session_id.clone()),
         observed_at: Some(req.provenance.observed_at.clone()),
-        ingested_at: Some(req.provenance.observed_at.clone()),
+        ingested_at: Some(now_rfc3339()),
         confidence: Some(req.confidence.to_string()),
         source_handle: req.provenance.source_handle.clone(),
         redaction_policy_version,
@@ -935,7 +938,7 @@ pub fn build_command_evidence_records(
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(req.provenance.session_id.clone()),
         observed_at: Some(req.provenance.observed_at.clone()),
-        ingested_at: Some(req.provenance.observed_at.clone()),
+        ingested_at: Some(now_rfc3339()),
         confidence: None,
         source_handle: req.provenance.source_handle.clone(),
         redaction_policy_version,
@@ -1036,6 +1039,16 @@ pub fn build_artifact_records(
     if req.patch_status == "invalid_no_base" && req.base_commit.is_some() {
         return Err(ProvenanceError::invalid("base_commit"));
     }
+    // Applied statuses imply a known base — unknown_base_reason is only for unverified/invalid.
+    if APPLIED_STATUSES.contains(&req.patch_status.as_str())
+        && req
+            .base_commit
+            .as_deref()
+            .filter(|bc| !bc.is_empty())
+            .is_none()
+    {
+        return Err(ProvenanceError::missing("base_commit"));
+    }
     if req.validation_summary.is_empty() {
         return Err(ProvenanceError::missing("validation_summary"));
     }
@@ -1103,17 +1116,20 @@ pub fn build_artifact_records(
     let summary_redacted = crate::redaction::is_redacted(&redacted_validation_summary);
     let redaction_policy_version = (patch_redacted || summary_redacted)
         .then(|| crate::redaction::REDACTION_POLICY_VERSION.to_owned());
-    // The schema pairs patch_bytes_size with patch_bytes_hash, so it must reflect
-    // the raw byte count. Use max(raw, redacted) for the ceiling check to ensure
-    // the inline content also fits; only inline when redacted fits within the raw
-    // size so the validator's inline_len <= patch_bytes_size invariant always holds.
+    // patch_bytes_size and patch_bytes_hash both reflect the raw bytes (schema contract).
+    // The validator requires inline_len <= patch_bytes_size, so redaction must not expand
+    // the patch. Reject if redacted size exceeds raw size — no sidecar persistence is
+    // available in this writer to handle a handle-only record safely.
     let raw_bytes_size = req.patch_bytes.len() as u64;
     let redacted_bytes_size = redacted_patch.len() as u64;
 
     if raw_bytes_size.max(redacted_bytes_size) > INLINE_PAYLOAD_CEILING {
         return Err(ProvenanceError::invalid("patch_bytes"));
     }
-    let patch_inline = (redacted_bytes_size <= raw_bytes_size).then_some(redacted_patch);
+    if redacted_bytes_size > raw_bytes_size {
+        return Err(ProvenanceError::invalid("patch_bytes"));
+    }
+    let patch_inline = Some(redacted_patch);
     let patch_handle = Box::new(PatchHandle {
         path: format!("patches/{art_id}.patch"),
         inline: patch_inline,
@@ -1147,7 +1163,7 @@ pub fn build_artifact_records(
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(req.provenance.session_id.clone()),
         observed_at: Some(req.provenance.observed_at.clone()),
-        ingested_at: Some(req.provenance.observed_at.clone()),
+        ingested_at: Some(now_rfc3339()),
         confidence: None,
         source_handle: req.provenance.source_handle.clone(),
         redaction_policy_version,
@@ -1336,7 +1352,7 @@ pub fn build_verification_records(
         agent_kind: Some(agent_kind.to_owned()),
         session_id: Some(req.provenance.session_id.to_ascii_lowercase()),
         observed_at: Some(req.provenance.observed_at.clone()),
-        ingested_at: Some(req.provenance.observed_at.clone()),
+        ingested_at: Some(now_rfc3339()),
         confidence: None,
         source_handle: req.provenance.source_handle.clone(),
         redaction_policy_version,
@@ -1361,7 +1377,10 @@ pub fn build_verification_records(
         transaction_time: None,
         summary: format!(
             "Verification {} by {} in {} at {}",
-            req.status, req.provenance.agent_id, req.provenance.session_id, req.executed_at
+            req.status,
+            req.provenance.agent_id.to_ascii_lowercase(),
+            req.provenance.session_id.to_ascii_lowercase(),
+            req.executed_at
         ),
         domain: Some("verification".to_owned()),
         importer_id: None,
