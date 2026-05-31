@@ -156,6 +156,10 @@ Coordination: issue #19 reserves `insufficient_promotion_evidence` and
 `unapproved_durable_user_context` for authorization-derived user-context writes.
 See [`docs/schema/user-context.md`](user-context.md).
 
+Coordination: issue #45 freezes the write-admission pressure contract carried by
+`GET /v1/status` and the `queue_full` retry envelope. See
+[§ 10 — Write-admission pressure](#10--write-admission-pressure).
+
 ---
 
 ## 6 — Idempotency contract
@@ -214,11 +218,29 @@ Any request including `tx_as_of` or `tx_since` fields must receive a
 {
   "api_version": "v1",
   "status": "running",
+  "data_dir": "<canonical store path>",
   "jobs": <integer>,
   "agents": <integer>,
-  "idempotency_store_size": <integer>
+  "idempotency_store_size": <integer>,
+  "pressure": {
+    "state": "idle",
+    "alive": true,
+    "queue_capacity": <integer>,
+    "queue_depth": <integer>,
+    "total_rejections": <integer>,
+    "saturation_transitions": <integer>,
+    "last_saturated_at_unix_ms": <integer or null>,
+    "last_recovered_at_unix_ms": <integer or null>,
+    "recent_events": [ <PressureEvent...> ],
+    "retry_after_ms": <integer, only present while saturated>
+  }
 }
 ```
+
+The `pressure` block is the machine-readable write-admission pressure contract.
+It is the stable surface that clients and SDKs read; the `eg daemon status` CLI
+renders the same data for humans but is not a contract. See
+[§ 10 — Write-admission pressure](#10--write-admission-pressure).
 
 ### `POST /v1/records/ingest` — synchronous write
 
@@ -404,3 +426,77 @@ HTTP/1.1 429 Too Many Requests
   }
 }
 ```
+
+Every `queue_full` rejection echoes the caller's `request_id`, carries a
+positive `retry_after_ms`, and never echoes graph records, command output,
+secrets, or any other submitted payload text. The message is a fixed string.
+
+---
+
+## 10 — Write-admission pressure
+
+The daemon is the single owner of a local store, so when several agents write
+at once a transiently overloaded daemon must be distinguishable from a broken
+one. `GET /v1/status` exposes a bounded, redacted `pressure` block for this.
+
+### Pressure states
+
+| `state`     | Meaning | Operator action |
+|-------------|---------|-----------------|
+| `idle`      | No writes queued or in flight. | None. |
+| `busy`      | Writes are queued or in flight; the queue is admitting them. | None; the daemon is healthy. |
+| `saturated` | The bounded write queue rejected at least one write and is shedding load via `queue_full`. | Back off and retry per `retry_after_ms`; the daemon is **alive**, not failed. |
+
+Saturation is *sticky*: it is raised on the first `queue_full` rejection and
+cleared only once the backlog drains to the recovery watermark. A status sample
+taken any time after a rejection classifies the daemon as `saturated` until it
+actually recovers, so a saturated daemon never looks idle.
+
+### Pressure fields
+
+- `state` — one of `idle`, `busy`, `saturated`.
+- `alive` — always `true`; pressure is backpressure, never a liveness signal.
+- `queue_capacity` — the bounded write-queue capacity.
+- `queue_depth` — writes currently admitted but not yet completed.
+- `total_rejections` — monotonic count of `queue_full` rejections.
+- `saturation_transitions` — count of distinct entries into saturation.
+- `last_saturated_at_unix_ms` / `last_recovered_at_unix_ms` — transition
+  timestamps, or `null` if the transition has not occurred.
+- `recent_events` — a bounded ring buffer (most recent first-in-first-out) of
+  pressure-transition diagnostics. Each `PressureEvent` is:
+
+  ```json
+  {
+    "at_unix_ms": 1748649600000,
+    "transition": "entered_saturation",
+    "operation": "records/ingest",
+    "code": "queue_full",
+    "request_id": "req-abc126"
+  }
+  ```
+
+  `transition` is `entered_saturation` or `exited_saturation`. Events carry only
+  bounded metadata — never payload bodies, graph records, command output, or
+  secrets. The same event is also emitted as a one-line structured `stderr` log
+  (`"egregore_event": "daemon_pressure"`) for operators tailing daemon output.
+
+- `retry_after_ms` — present only while `state` is `saturated`; the minimum
+  back-off before retrying, matching the `queue_full` error field.
+
+### How an agent should respond to `queue_full`
+
+1. **Wait at least `retry_after_ms`** before retrying. The value is positive on
+   every rejection.
+2. **Retry with the same `idempotency_key`** when the write is otherwise
+   unchanged. Idempotency semantics are unchanged by pressure: a replayed write
+   returns the original result, and a different payload under the same key still
+   returns `idempotency_conflict`.
+3. **Do not bypass the daemon with direct embedded writes.** The daemon is the
+   single owner of the store (ADR 0003); falling back to embedded writes under
+   load reintroduces the contention the daemon exists to remove. Embedded
+   fallback rules are unchanged — fall back only when the daemon is *absent*,
+   not when it is `saturated`.
+
+A `saturated` daemon that keeps returning `queue_full` with `alive: true` is
+healthy and backpressuring; escalate to operator inspection only if status
+calls themselves fail or the daemon stops responding.

@@ -1,7 +1,7 @@
 //! Local daemon for shared Egregore store access.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt::Write as _,
     fs::{self, File, OpenOptions, TryLockError as FileTryLockError},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -10,7 +10,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, RwLock, RwLockReadGuard, TryLockError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -410,6 +410,7 @@ struct ServerState {
     agents: Arc<Mutex<BTreeMap<AgentSessionKey, AgentStatus>>>,
     idempotency: Arc<Mutex<IdempotencyStore>>,
     shutdown: Arc<AtomicBool>,
+    pressure: Arc<PressureTracker>,
 }
 
 struct WriteCommand {
@@ -417,6 +418,236 @@ struct WriteCommand {
     payload_hash: String,
     records: Vec<GraphRecord>,
     response_tx: mpsc::Sender<WriteResult>,
+}
+
+/// Retry-after hint (milliseconds) returned with every `queue_full` rejection.
+///
+/// Frozen as part of the daemon pressure contract documented in
+/// `docs/schema/daemon-api.md`. Agents must wait at least this long before
+/// retrying an overloaded write with the same idempotency key.
+const QUEUE_FULL_RETRY_AFTER_MS: u64 = 500;
+
+/// Maximum number of recent pressure-transition events retained for operator
+/// inspection. The buffer is bounded so diagnostics never grow without limit.
+const PRESSURE_EVENT_CAPACITY: usize = 32;
+
+/// Machine-readable write-admission pressure classification surfaced by
+/// `GET /v1/status`.
+///
+/// `idle` and `busy` both mean the daemon is accepting writes; `saturated`
+/// means the bounded write queue rejected at least one write and is shedding
+/// load via `queue_full`. The daemon is alive in every state — `saturated` is
+/// backpressure, not failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PressureState {
+    /// No writes are queued or in flight.
+    Idle,
+    /// Writes are queued or in flight but the queue is admitting them.
+    Busy,
+    /// The bounded write queue is shedding load with `queue_full`.
+    Saturated,
+}
+
+impl PressureState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Busy => "busy",
+            Self::Saturated => "saturated",
+        }
+    }
+}
+
+/// One structured diagnostic event recorded when the daemon enters or leaves
+/// saturation. Carries only bounded metadata — never submitted payload bodies,
+/// graph records, command output, or secrets.
+#[derive(Debug, Clone, Serialize)]
+struct PressureEvent {
+    /// Unix milliseconds when the transition occurred.
+    at_unix_ms: u128,
+    /// `entered_saturation` or `exited_saturation`.
+    transition: &'static str,
+    /// Route or operation class that triggered the transition.
+    operation: &'static str,
+    /// Stable error code associated with the transition.
+    code: &'static str,
+    /// Caller request handle (`request_id`), or a worker sentinel on recovery.
+    request_id: String,
+}
+
+/// Tracks bounded write-admission pressure for the daemon.
+///
+/// The bounded `mpsc::sync_channel` write queue does not expose its depth, so
+/// the tracker maintains an in-flight counter incremented on every accepted
+/// write and decremented when the worker finishes one. Saturation is sticky:
+/// it is raised on the first `queue_full` rejection and cleared once the
+/// backlog drains to the recovery watermark, so a momentarily full queue is
+/// still reported as `saturated` until it actually recovers.
+struct PressureTracker {
+    capacity: usize,
+    inflight: AtomicUsize,
+    saturated: AtomicBool,
+    total_rejections: AtomicU64,
+    saturation_transitions: AtomicU64,
+    last_saturated_at_unix_ms: AtomicU64,
+    last_recovered_at_unix_ms: AtomicU64,
+    events: Mutex<VecDeque<PressureEvent>>,
+}
+
+impl PressureTracker {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            inflight: AtomicUsize::new(0),
+            saturated: AtomicBool::new(false),
+            total_rejections: AtomicU64::new(0),
+            saturation_transitions: AtomicU64::new(0),
+            last_saturated_at_unix_ms: AtomicU64::new(0),
+            last_recovered_at_unix_ms: AtomicU64::new(0),
+            events: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Records that a write was admitted to the bounded queue.
+    fn on_enqueue(&self) {
+        self.inflight.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Undoes an `on_enqueue` for a write that was never admitted to the queue.
+    fn rollback_enqueue(&self) {
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Rolls back the speculative enqueue count and records the rejection.
+    fn on_reject_after_rollback(&self, operation: &'static str, request_id: &str) {
+        self.rollback_enqueue();
+        self.on_reject(operation, request_id);
+    }
+
+    /// Records that the worker finished a write, draining one queue slot.
+    fn on_complete(&self) {
+        let prev = self.inflight.fetch_sub(1, Ordering::SeqCst);
+        let depth = prev.saturating_sub(1);
+        if depth <= self.recovery_watermark() && self.saturated.swap(false, Ordering::SeqCst) {
+            self.last_recovered_at_unix_ms
+                .store(unix_ms_u64(), Ordering::SeqCst);
+            self.record_transition("exited_saturation", "write_worker", "queue_full", "drain");
+        }
+    }
+
+    /// Records a `queue_full` rejection and raises saturation on the first one.
+    fn on_reject(&self, operation: &'static str, request_id: &str) {
+        self.total_rejections.fetch_add(1, Ordering::SeqCst);
+        self.last_saturated_at_unix_ms
+            .store(unix_ms_u64(), Ordering::SeqCst);
+        if !self.saturated.swap(true, Ordering::SeqCst) {
+            self.saturation_transitions.fetch_add(1, Ordering::SeqCst);
+            self.record_transition("entered_saturation", operation, "queue_full", request_id);
+        }
+    }
+
+    const fn recovery_watermark(&self) -> usize {
+        self.capacity / 2
+    }
+
+    fn state(&self) -> PressureState {
+        if self.saturated.load(Ordering::SeqCst) {
+            PressureState::Saturated
+        } else if self.inflight.load(Ordering::SeqCst) > 0 {
+            PressureState::Busy
+        } else {
+            PressureState::Idle
+        }
+    }
+
+    fn record_transition(
+        &self,
+        transition: &'static str,
+        operation: &'static str,
+        code: &'static str,
+        request_id: &str,
+    ) {
+        let event = PressureEvent {
+            at_unix_ms: unix_ms(),
+            transition,
+            operation,
+            code,
+            request_id: request_id.to_owned(),
+        };
+        // Structured operator log. Carries only bounded metadata so that no
+        // submitted payload body, graph record, or secret can leak via logs.
+        eprintln!(
+            "{}",
+            json!({
+                "egregore_event": "daemon_pressure",
+                "transition": event.transition,
+                "operation": event.operation,
+                "code": event.code,
+                "request_id": event.request_id,
+                "at_unix_ms": event.at_unix_ms,
+            })
+        );
+        if let Ok(mut events) = self.events.lock() {
+            if events.len() >= PRESSURE_EVENT_CAPACITY {
+                events.pop_front();
+            }
+            events.push_back(event);
+        }
+    }
+
+    /// Builds the machine-readable pressure block embedded in `GET /v1/status`.
+    fn snapshot_json(&self) -> serde_json::Value {
+        let state = self.state();
+        let recent_events: Vec<serde_json::Value> = self
+            .events
+            .lock()
+            .map(|events| events.iter().map(pressure_event_json).collect())
+            .unwrap_or_default();
+        let mut block = json!({
+            "state": state.as_str(),
+            "alive": true,
+            "queue_capacity": self.capacity,
+            "queue_depth": self.inflight.load(Ordering::SeqCst),
+            "total_rejections": self.total_rejections.load(Ordering::SeqCst),
+            "saturation_transitions": self.saturation_transitions.load(Ordering::SeqCst),
+            "last_saturated_at_unix_ms": optional_unix_ms(&self.last_saturated_at_unix_ms),
+            "last_recovered_at_unix_ms": optional_unix_ms(&self.last_recovered_at_unix_ms),
+            "recent_events": recent_events,
+        });
+        if state == PressureState::Saturated {
+            block["retry_after_ms"] = json!(QUEUE_FULL_RETRY_AFTER_MS);
+        }
+        block
+    }
+
+    #[cfg(test)]
+    fn events_snapshot(&self) -> Vec<PressureEvent> {
+        self.events
+            .lock()
+            .map(|events| events.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+fn pressure_event_json(event: &PressureEvent) -> serde_json::Value {
+    json!({
+        "at_unix_ms": event.at_unix_ms,
+        "transition": event.transition,
+        "operation": event.operation,
+        "code": event.code,
+        "request_id": event.request_id,
+    })
+}
+
+fn optional_unix_ms(value: &AtomicU64) -> serde_json::Value {
+    match value.load(Ordering::SeqCst) {
+        0 => serde_json::Value::Null,
+        ms => json!(ms),
+    }
+}
+
+fn unix_ms_u64() -> u64 {
+    u64::try_from(unix_ms()).unwrap_or(u64::MAX)
 }
 
 type WriteResult<T = DaemonIngestResponse> = std::result::Result<T, ApiError>;
@@ -682,7 +913,7 @@ impl ApiError {
             code: ErrorCode::QueueFull,
             message: "write queue is full".into(),
             field: None,
-            retry_after_ms: Some(500),
+            retry_after_ms: Some(QUEUE_FULL_RETRY_AFTER_MS),
             partial_result: None,
         }
     }
@@ -1038,6 +1269,7 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
     let idempotency_path = runtime_dir(&config.data_dir).join(IDEMPOTENCY_FILE);
     let idempotency = Arc::new(Mutex::new(IdempotencyStore::load(idempotency_path)?));
     let shutdown = Arc::new(AtomicBool::new(false));
+    let pressure = Arc::new(PressureTracker::new(config.write_queue_capacity));
     let state = Arc::new(ServerState {
         token,
         store_identity: store_identity_text(&config.data_dir),
@@ -1047,8 +1279,9 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
         agents: Arc::new(Mutex::new(BTreeMap::new())),
         idempotency: Arc::clone(&idempotency),
         shutdown: Arc::clone(&shutdown),
+        pressure: Arc::clone(&pressure),
     });
-    let worker = spawn_write_worker(write_rx, sink, idempotency);
+    let worker = spawn_write_worker(write_rx, sink, idempotency, pressure);
 
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -1229,6 +1462,24 @@ impl DaemonClient {
         }
     }
 
+    /// Fetches the daemon's machine-readable status, including the
+    /// write-admission pressure block.
+    ///
+    /// The returned JSON is the stable `GET /v1/status` contract documented in
+    /// `docs/schema/daemon-api.md`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon does not respond successfully or the
+    /// response cannot be parsed.
+    pub fn status(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.request("GET", "/v1/status", None, CLIENT_TIMEOUT, true)?;
+        if status != 200 {
+            return Err(anyhow!("daemon status failed with HTTP {status}: {body}"));
+        }
+        serde_json::from_str(&body).context("failed to parse daemon status response")
+    }
+
     /// Sends a verb query to the daemon and returns the `result.records` array.
     ///
     /// `verb` must be one of the documented verbs in `docs/schema/daemon-query.md`.
@@ -1346,10 +1597,14 @@ fn spawn_write_worker(
     write_rx: mpsc::Receiver<WriteCommand>,
     sink: Arc<RwLock<EmbeddedAletheiaSink>>,
     idempotency: Arc<Mutex<IdempotencyStore>>,
+    pressure: Arc<PressureTracker>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         while let Ok(command) = write_rx.recv() {
             let result = apply_write(&command, &sink, &idempotency);
+            // Drain one queue slot before replying so pressure recovery is
+            // observable as soon as the worker finishes the write.
+            pressure.on_complete();
             let _ = command.response_tx.send(result);
         }
     })
@@ -6266,9 +6521,11 @@ fn handle_status(state: &ServerState) -> HttpResponse {
         json!({
             "api_version": "v1",
             "status": "running",
+            "data_dir": state.store_identity.as_str(),
             "jobs": jobs,
             "agents": agents,
             "idempotency_store_size": idempotency_store_size,
+            "pressure": state.pressure.snapshot_json(),
         }),
     )
 }
@@ -8261,12 +8518,21 @@ fn enqueue_write(
         records,
         response_tx,
     };
+    // Count the in-flight write before the worker can observe it, so the
+    // worker's matching `on_complete` can never underflow the depth counter.
+    state.pressure.on_enqueue();
     match state.write_tx.try_send(command) {
         Ok(()) => response_rx.recv().map_err(|_| {
             ApiError::internal(format!("write worker dropped request {request_id}"))
         })?,
-        Err(mpsc::TrySendError::Full(_)) => Err(ApiError::overloaded()),
+        Err(mpsc::TrySendError::Full(_)) => {
+            state
+                .pressure
+                .on_reject_after_rollback("records/ingest", request_id);
+            Err(ApiError::overloaded())
+        }
         Err(mpsc::TrySendError::Disconnected(_)) => {
+            state.pressure.rollback_enqueue();
             Err(ApiError::internal("write worker disconnected"))
         }
     }
@@ -9084,6 +9350,7 @@ mod tests {
             agents: Arc::new(Mutex::new(BTreeMap::new())),
             idempotency,
             shutdown: Arc::new(AtomicBool::new(false)),
+            pressure: Arc::new(PressureTracker::new(1)),
         };
         let request = HttpRequest {
             method: "POST".to_owned(),
@@ -9194,6 +9461,7 @@ mod tests {
             agents: Arc::new(Mutex::new(BTreeMap::new())),
             idempotency,
             shutdown: Arc::new(AtomicBool::new(false)),
+            pressure: Arc::new(PressureTracker::new(1)),
         };
 
         let read_response = handle_get_record(&record_id, &state);
@@ -9423,6 +9691,209 @@ mod tests {
             assert_eq!(sink.edge_observation_count_for_test(edge.id()), 1);
             drop(sink);
         }
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn build_pressure_test_state(
+        temp: &Path,
+        capacity: usize,
+    ) -> Result<(
+        ServerState,
+        mpsc::SyncSender<WriteCommand>,
+        mpsc::Receiver<WriteCommand>,
+    )> {
+        let sink = Arc::new(RwLock::new(
+            EmbeddedAletheiaSink::open(temp).map_err(|error| anyhow!(error.to_string()))?,
+        ));
+        let (write_tx, write_rx) = mpsc::sync_channel(capacity);
+        let idempotency = Arc::new(Mutex::new(IdempotencyStore {
+            path: temp.join("idempotency.json"),
+            entries: BTreeMap::new(),
+        }));
+        let state = ServerState {
+            token: "test-token".to_owned(),
+            store_identity: store_identity_text(temp),
+            sink,
+            write_tx: write_tx.clone(),
+            jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            agents: Arc::new(Mutex::new(BTreeMap::new())),
+            idempotency,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            pressure: Arc::new(PressureTracker::new(capacity)),
+        };
+        // The caller keeps `write_rx` alive so the bounded channel reports
+        // `Full` (not `Disconnected`) once its buffer fills.
+        Ok((state, write_tx, write_rx))
+    }
+
+    fn dummy_write_command() -> WriteCommand {
+        let (response_tx, _response_rx) = mpsc::channel();
+        WriteCommand {
+            idempotency_key: "queue-filler".to_owned(),
+            payload_hash: "queue-filler-hash".to_owned(),
+            records: Vec::new(),
+            response_tx,
+        }
+    }
+
+    #[test]
+    fn pressure_tracker_reports_idle_busy_saturated_and_recovers() {
+        let tracker = PressureTracker::new(2);
+        assert_eq!(tracker.state(), PressureState::Idle);
+
+        tracker.on_enqueue();
+        assert_eq!(tracker.state(), PressureState::Busy);
+
+        // First rejection raises saturation and emits exactly one entry event.
+        tracker.on_reject("records/ingest", "req-1");
+        assert_eq!(tracker.state(), PressureState::Saturated);
+        // A second rejection while already saturated bumps the counter but does
+        // not emit a duplicate transition event.
+        tracker.on_reject("records/ingest", "req-2");
+        assert_eq!(tracker.total_rejections.load(Ordering::SeqCst), 2);
+        assert_eq!(tracker.saturation_transitions.load(Ordering::SeqCst), 1);
+
+        let entry_events: Vec<_> = tracker
+            .events_snapshot()
+            .into_iter()
+            .filter(|event| event.transition == "entered_saturation")
+            .collect();
+        assert_eq!(
+            entry_events.len(),
+            1,
+            "exactly one entry event per saturation"
+        );
+        assert_eq!(entry_events[0].code, "queue_full");
+        assert_eq!(entry_events[0].operation, "records/ingest");
+        assert_eq!(entry_events[0].request_id, "req-1");
+
+        // Drain below the recovery watermark: saturation clears and one exit
+        // event is emitted.
+        tracker.on_complete();
+        assert_ne!(tracker.state(), PressureState::Saturated);
+        let exit_events: Vec<_> = tracker
+            .events_snapshot()
+            .into_iter()
+            .filter(|event| event.transition == "exited_saturation")
+            .collect();
+        assert_eq!(exit_events.len(), 1, "exactly one exit event per recovery");
+        assert!(tracker.last_recovered_at_unix_ms.load(Ordering::SeqCst) > 0);
+    }
+
+    #[test]
+    fn pressure_event_buffer_is_bounded() {
+        let tracker = PressureTracker::new(2);
+        for index in 0..(PRESSURE_EVENT_CAPACITY * 2) {
+            // Force a full enter/exit cycle each iteration.
+            tracker.on_enqueue();
+            tracker.on_reject("records/ingest", &format!("req-{index}"));
+            tracker.on_complete();
+        }
+        assert!(
+            tracker.events_snapshot().len() <= PRESSURE_EVENT_CAPACITY,
+            "pressure event buffer must stay bounded"
+        );
+    }
+
+    #[test]
+    fn pressure_contract_observed_in_one_local_run() -> Result<()> {
+        // Single local run, no network: idle status, induced saturation, an
+        // overloaded-write rejection, a structured diagnostic event with no
+        // payload, and recovery back to a non-saturated state.
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let capacity = 2;
+        let (state, write_tx, _write_rx) = build_pressure_test_state(temp.path(), capacity)?;
+
+        // (1) Idle status surfaces api_version, store identity, and pressure.
+        let idle = handle_status(&state);
+        assert_eq!(idle.status, 200);
+        assert_eq!(idle.body["api_version"], "v1");
+        assert_eq!(idle.body["data_dir"], store_identity_text(temp.path()));
+        assert_eq!(idle.body["pressure"]["state"], "idle");
+        assert_eq!(idle.body["pressure"]["alive"], true);
+        assert_eq!(idle.body["pressure"]["queue_capacity"], capacity);
+
+        // Fill the bounded queue so the next admission is rejected.
+        for _ in 0..capacity {
+            state.pressure.on_enqueue();
+            write_tx
+                .try_send(dummy_write_command())
+                .map_err(|_| anyhow!("queue filler should buffer"))?;
+        }
+        assert_eq!(handle_status(&state).body["pressure"]["state"], "busy");
+
+        // (3) An overloaded write is rejected with queue_full + retry_after_ms.
+        let payload_summary = "SECRET-PAYLOAD-BODY-must-not-leak";
+        let record = GraphRecord::node(
+            "codegraph:v3:pressure-overflow-node".to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("repo".to_owned()),
+            payload_summary.to_owned(),
+        );
+        let rejection = enqueue_write(
+            &state,
+            "pressure-overflow-key".to_owned(),
+            vec![record],
+            "req-overload",
+        )
+        .expect_err("overloaded write must be rejected");
+        assert_eq!(rejection.code, ErrorCode::QueueFull);
+        assert_eq!(rejection.status, 429);
+        assert!(
+            rejection.retry_after_ms.is_some_and(|ms| ms > 0),
+            "queue_full must carry a positive retry_after_ms"
+        );
+
+        // (2) Saturated status is observable within 500 ms of the rejection.
+        let measured = Instant::now();
+        let saturated = handle_status(&state);
+        assert!(
+            measured.elapsed() < Duration::from_millis(500),
+            "saturated status must classify within 500 ms"
+        );
+        assert_eq!(saturated.body["pressure"]["state"], "saturated");
+        assert_eq!(saturated.body["pressure"]["alive"], true);
+        assert!(
+            saturated.body["pressure"]["retry_after_ms"]
+                .as_u64()
+                .is_some_and(|ms| ms > 0),
+            "saturated status must advertise retry guidance"
+        );
+        assert_eq!(saturated.body["pressure"]["total_rejections"], 1);
+
+        // (5) A structured diagnostic event marks the saturation transition and
+        // carries no submitted payload body.
+        let events = state.pressure.events_snapshot();
+        let entry = events
+            .iter()
+            .find(|event| event.transition == "entered_saturation")
+            .expect("entry into saturation must emit a diagnostic event");
+        assert_eq!(entry.code, "queue_full");
+        assert_eq!(entry.operation, "records/ingest");
+        assert_eq!(entry.request_id, "req-overload");
+        let serialized = serde_json::to_string(&saturated.body)?;
+        assert!(
+            !serialized.contains(payload_summary),
+            "no diagnostic output may echo submitted payload bodies"
+        );
+
+        // (7) Recovery: draining the backlog returns to a non-saturated state.
+        for _ in 0..capacity {
+            state.pressure.on_complete();
+        }
+        let recovered = handle_status(&state);
+        assert_eq!(recovered.body["pressure"]["state"], "idle");
+        assert!(
+            state
+                .pressure
+                .events_snapshot()
+                .iter()
+                .any(|event| event.transition == "exited_saturation"),
+            "recovery must emit an exit diagnostic event"
+        );
         Ok(())
     }
 }

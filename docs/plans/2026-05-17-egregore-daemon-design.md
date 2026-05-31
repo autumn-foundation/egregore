@@ -363,8 +363,17 @@ Still planned:
 2. Dedicated observation, artifact, verification, and command-evidence write
    endpoints. `POST /v1/observations` owns user-context candidate creation per
    [docs/schema/user-context.md](../schema/user-context.md).
-3. Structured logs, metrics, and retry-after fields on queue overload.
-4. Explicit offline-exclusive repair mode that acquires the same lease.
+3. Explicit offline-exclusive repair mode that acquires the same lease.
+
+Done:
+
+- Structured logs, bounded counters, and retry-after fields on queue overload.
+  `GET /v1/status` now exposes a machine-readable `pressure` block (idle / busy
+  / saturated with bounded counters, transition timestamps, and a redacted
+  event ring buffer), `eg daemon status` renders the state and retry guidance,
+  and every `queue_full` rejection carries a positive `retry_after_ms`. The
+  contract is frozen in
+  [docs/schema/daemon-api.md § 10](../schema/daemon-api.md#10--write-admission-pressure).
 
 ## Open Questions
 
