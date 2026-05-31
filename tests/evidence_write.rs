@@ -1395,3 +1395,74 @@ fn artifact_inline_size_covers_redacted_content() {
         );
     }
 }
+
+// ── P1/P2 round-6 ───────────────────────────────────────────────────────────
+
+#[test]
+fn observation_session_of_edge_targets_emitted_agent_node() {
+    // The SESSION_OF edge target must match the actual Agent node ID in the batch.
+    // After including agent_kind in the Agent stable ID, the edge target must also
+    // include agent_kind — otherwise embedded ingest rejects the batch on a fresh store.
+    let prov = EvidenceProvenance {
+        agent_kind: "codex".to_owned(),
+        ..valid_provenance()
+    };
+    let req = ObservationRequest {
+        provenance: prov,
+        text: "edge target check".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc123")],
+    };
+    let outcome = build_observation_records(&req).expect("observation must succeed");
+
+    let agent_id = outcome
+        .records
+        .iter()
+        .find(|r| {
+            matches!(
+                r,
+                aletheia_egregore::ir::GraphRecord::Node {
+                    kind: NodeKind::Agent,
+                    ..
+                }
+            )
+        })
+        .map(aletheia_egregore::GraphRecord::id)
+        .expect("Agent node must be in batch");
+
+    let session_of_target = outcome
+        .records
+        .iter()
+        .find_map(|r| {
+            if let aletheia_egregore::ir::GraphRecord::Edge { label, target, .. } = r
+                && label.as_str() == "SESSION_OF"
+            {
+                return Some(target.clone());
+            }
+            None
+        })
+        .expect("SESSION_OF edge must be in batch");
+
+    assert_eq!(
+        session_of_target, agent_id,
+        "SESSION_OF edge target must match the emitted Agent node ID"
+    );
+}
+
+#[test]
+fn artifact_rejects_empty_validation_summary() {
+    let req = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"diff content".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc123".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: String::new(),
+    };
+    let err =
+        build_artifact_records(&req).expect_err("empty validation_summary must be rejected");
+    assert_eq!(err.code, "missing_field");
+    assert_eq!(err.field, "validation_summary");
+}

@@ -591,7 +591,7 @@ pub fn build_observation_records(
 
     let agent_kind = effective_agent_kind(&req.provenance);
 
-    let agent_id_node = agent_memory_stable_id(&["node", "agent", &req.provenance.agent_id]);
+    let agent_id_node = agent_memory_stable_id(&["node", "agent", &req.provenance.agent_id, agent_kind]);
     let session_node_id = agent_memory_stable_id(&[
         "node",
         "agent_session",
@@ -916,6 +916,9 @@ pub fn build_artifact_records(
     }
     if req.patch_status == "invalid_no_base" && req.base_commit.is_some() {
         return Err(ProvenanceError::invalid("base_commit"));
+    }
+    if req.validation_summary.is_empty() {
+        return Err(ProvenanceError::missing("validation_summary"));
     }
 
     let agent_kind = effective_agent_kind(&req.provenance);
