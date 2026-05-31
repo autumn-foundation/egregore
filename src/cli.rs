@@ -389,29 +389,29 @@ enum WriteKind {
     /// it never echoes the observation text or any other payload value.
     Observation {
         /// Stable agent identity; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         agent_id: String,
         /// Agent kind (`other`, `claude-code`, `vantage`, `codex`, `rust-swe-agent`, `human`).
         #[arg(long, default_value = "other")]
         agent_kind: String,
         /// Active session identifier; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         session_id: String,
         /// RFC 3339 observation timestamp; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         observed_at: String,
         /// Citable source artifact path or hash; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         source_handle: String,
         /// Observation body text; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         text: String,
         /// Confidence in `[0.0, 1.0]`.
         #[arg(long, default_value_t = 0.9)]
         confidence: f64,
         /// Stable record IDs to cite as evidence (space-separated or repeated).
         /// At least one is required.
-        #[arg(long, required = true, num_args = 1..)]
+        #[arg(long, num_args = 0..)]
         evidence_target: Vec<String>,
         /// Domain of the evidence targets (`codegraph`, `verification`, etc.).
         #[arg(long, default_value = "codegraph")]
@@ -423,22 +423,22 @@ enum WriteKind {
     /// Write a typed `CommandRun` (command evidence) record in the verification domain.
     CommandEvidence {
         /// Stable agent identity; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         agent_id: String,
         /// Agent kind.
         #[arg(long, default_value = "other")]
         agent_kind: String,
         /// Active session identifier; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         session_id: String,
         /// RFC 3339 observation timestamp; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         observed_at: String,
         /// Citable source artifact path or hash.
         #[arg(long)]
         source_handle: Option<String>,
         /// RFC 3339 execution timestamp; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         executed_at: String,
         /// Shell exit code.
         #[arg(long, default_value_t = 0)]
@@ -466,16 +466,16 @@ enum WriteKind {
     /// Write a typed `PatchArtifact` record in the artifact domain.
     Artifact {
         /// Stable agent identity; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         agent_id: String,
         /// Agent kind.
         #[arg(long, default_value = "other")]
         agent_kind: String,
         /// Active session identifier; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         session_id: String,
         /// RFC 3339 observation timestamp; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         observed_at: String,
         /// Citable source artifact path or hash.
         #[arg(long)]
@@ -484,7 +484,7 @@ enum WriteKind {
         #[arg(long, required = true)]
         patch_file: PathBuf,
         /// Repository-relative target files touched by the patch (repeated).
-        #[arg(long, required = true, num_args = 1..)]
+        #[arg(long, num_args = 0..)]
         target_file: Vec<String>,
         /// Patch validation status.
         #[arg(long, default_value = "unverified")]
@@ -508,25 +508,25 @@ enum WriteKind {
     /// Write a typed Verification record in the verification domain.
     Verification {
         /// Stable agent identity; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         agent_id: String,
         /// Agent kind.
         #[arg(long, default_value = "other")]
         agent_kind: String,
         /// Active session identifier; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         session_id: String,
         /// RFC 3339 observation timestamp; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         observed_at: String,
         /// Citable source artifact path or hash.
         #[arg(long)]
         source_handle: Option<String>,
         /// RFC 3339 execution timestamp; required.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         executed_at: String,
         /// Verification outcome: `pass`, `fail`, `skip`, `error`, or `timeout`.
-        #[arg(long, required = true)]
+        #[arg(long, default_value = "")]
         status: String,
         /// Verification kind: `test_run`, `command_run`, `ci_status`, etc.
         #[arg(long, default_value = "command_run")]

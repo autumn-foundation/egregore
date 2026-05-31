@@ -614,18 +614,37 @@ pub fn build_observation_records(
     let redaction_policy_version = crate::redaction::is_redacted(&redacted_text)
         .then(|| crate::redaction::REDACTION_POLICY_VERSION.to_owned());
 
-    // Observation ID is content-addressed on agent, session, and text hash.
+    // Observation ID is content-addressed on agent, session, text, observed_at, confidence,
+    // and evidence-link targets so that the same text with different citations, timestamps,
+    // or confidence values produces distinct records rather than mismatched-payload conflicts.
     let text_hash = {
         let mut hasher = blake3::Hasher::new();
         hasher.update(redacted_text.as_bytes());
         hasher.finalize().to_hex().to_string()
+    };
+    let links_hash = {
+        let mut h = blake3::Hasher::new();
+        let mut targets: Vec<&str> = req
+            .evidence_links
+            .iter()
+            .map(|l| l.target_record_id.as_deref().unwrap_or(""))
+            .collect();
+        targets.sort_unstable();
+        for t in &targets {
+            h.update(t.as_bytes());
+            h.update(b"\0");
+        }
+        h.finalize().to_hex().to_string()
     };
     let obs_id = agent_memory_stable_id(&[
         "node",
         "observation",
         &req.provenance.agent_id,
         &req.provenance.session_id,
+        &req.provenance.observed_at,
+        &req.confidence.to_string(),
         &text_hash,
+        &links_hash,
     ]);
 
     // Build the observation node
@@ -964,12 +983,16 @@ pub fn build_artifact_records(
         hasher.finalize().to_hex().to_string()
     };
 
+    // patch_status is included so that the same patch written with different statuses
+    // (e.g. unverified → applied_clean) produces distinct append-only records rather
+    // than a mismatched-payload conflict on the existing record.
     let art_id = artifact_stable_id(&[
         "node",
         "patch_artifact",
         &req.provenance.agent_id,
         &req.provenance.session_id,
         &patch_hash,
+        &req.patch_status,
     ]);
 
     // Decode patch bytes and redact before inline storage.

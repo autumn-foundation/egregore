@@ -1662,3 +1662,111 @@ fn observation_rejects_out_of_range_evidence_link_confidence() {
     assert_eq!(err.code, "invalid_field");
     assert_eq!(err.field, "evidence_links.confidence");
 }
+
+// ── P2 round-8 ───────────────────────────────────────────────────────────────
+
+#[test]
+fn distinct_patch_status_produces_distinct_artifact_ids() {
+    // Same patch bytes written with different patch_status values must produce
+    // distinct PatchArtifact records so the status workflow can append new states.
+    let base = ArtifactRequest {
+        provenance: valid_provenance(),
+        patch_bytes: b"--- a/src/lib.rs\n+++ b/src/lib.rs\n".to_vec(),
+        target_files: vec!["src/lib.rs".to_owned()],
+        patch_status: "unverified".to_owned(),
+        base_commit: Some("abc123".to_owned()),
+        source_artifact_path: "tests/fixtures/rust_basic".to_owned(),
+        source_artifact_hash: "sha256:abc123".to_owned(),
+        validation_summary: "initial write".to_owned(),
+    };
+    let id_a = build_artifact_records(&base)
+        .expect("unverified must succeed")
+        .record_id;
+    let req_b = ArtifactRequest {
+        patch_status: "applied_clean".to_owned(),
+        validation_summary: "applied successfully".to_owned(),
+        ..base
+    };
+    let id_b = build_artifact_records(&req_b)
+        .expect("applied_clean must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different patch_status must produce different artifact record IDs"
+    );
+}
+
+#[test]
+fn distinct_evidence_target_produces_distinct_observation_ids() {
+    let base = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "same text".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:target-A")],
+    };
+    let id_a = build_observation_records(&base)
+        .expect("target A must succeed")
+        .record_id;
+    let req_b = ObservationRequest {
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:target-B")],
+        ..base
+    };
+    let id_b = build_observation_records(&req_b)
+        .expect("target B must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different evidence_target must produce different observation IDs"
+    );
+}
+
+#[test]
+fn distinct_confidence_produces_distinct_observation_ids() {
+    let base = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "same text".to_owned(),
+        confidence: 0.8,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+    };
+    let id_a = build_observation_records(&base)
+        .expect("confidence 0.8 must succeed")
+        .record_id;
+    let req_b = ObservationRequest {
+        confidence: 0.5,
+        ..base
+    };
+    let id_b = build_observation_records(&req_b)
+        .expect("confidence 0.5 must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different confidence must produce different observation IDs"
+    );
+}
+
+#[test]
+fn distinct_observed_at_produces_distinct_observation_ids() {
+    let base = ObservationRequest {
+        provenance: valid_provenance(),
+        text: "same text".to_owned(),
+        confidence: 0.9,
+        evidence_links: vec![dummy_evidence_link("codegraph:v4:abc")],
+    };
+    let id_a = build_observation_records(&base)
+        .expect("observed_at A must succeed")
+        .record_id;
+    let req_b = ObservationRequest {
+        provenance: EvidenceProvenance {
+            observed_at: "2026-06-01T10:00:00Z".to_owned(),
+            ..valid_provenance()
+        },
+        ..base
+    };
+    let id_b = build_observation_records(&req_b)
+        .expect("observed_at B must succeed")
+        .record_id;
+    assert_ne!(
+        id_a, id_b,
+        "different observed_at must produce different observation IDs"
+    );
+}
