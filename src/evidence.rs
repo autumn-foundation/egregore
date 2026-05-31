@@ -431,7 +431,13 @@ fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
 
 /// Builds an `AgentSession` node for the given session.
 fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> GraphRecord {
-    let id = agent_memory_stable_id(&["node", "agent_session", &prov.agent_id, &prov.session_id, agent_kind]);
+    let id = agent_memory_stable_id(&[
+        "node",
+        "agent_session",
+        &prov.agent_id,
+        &prov.session_id,
+        agent_kind,
+    ]);
     GraphRecord::Node {
         id,
         kind: NodeKind::AgentSession,
@@ -600,7 +606,8 @@ pub fn build_observation_records(
 
     let agent_kind = effective_agent_kind(&req.provenance);
 
-    let agent_id_node = agent_memory_stable_id(&["node", "agent", &req.provenance.agent_id, agent_kind]);
+    let agent_id_node =
+        agent_memory_stable_id(&["node", "agent", &req.provenance.agent_id, agent_kind]);
     let session_node_id = agent_memory_stable_id(&[
         "node",
         "agent_session",
@@ -645,6 +652,7 @@ pub fn build_observation_records(
         &req.confidence.to_string(),
         &text_hash,
         &links_hash,
+        req.provenance.source_handle.as_deref().unwrap_or(""),
     ]);
 
     // Build the observation node
@@ -788,10 +796,18 @@ pub fn build_command_evidence_records(
 
     // Reject oversized stdout/stderr — the writer has no external storage for payloads
     // larger than the inline ceiling, so silently demoting them would produce unrecoverable handles.
-    if req.stdout.as_deref().is_some_and(|s| s.len() as u64 > INLINE_PAYLOAD_CEILING) {
+    if req
+        .stdout
+        .as_deref()
+        .is_some_and(|s| s.len() as u64 > INLINE_PAYLOAD_CEILING)
+    {
         return Err(ProvenanceError::invalid("stdout"));
     }
-    if req.stderr.as_deref().is_some_and(|s| s.len() as u64 > INLINE_PAYLOAD_CEILING) {
+    if req
+        .stderr
+        .as_deref()
+        .is_some_and(|s| s.len() as u64 > INLINE_PAYLOAD_CEILING)
+    {
         return Err(ProvenanceError::invalid("stderr"));
     }
 
@@ -1185,11 +1201,23 @@ pub fn build_verification_records(
     if req.status.is_empty() {
         return Err(ProvenanceError::missing("status"));
     }
-    if req.stdout.as_deref().is_some_and(|s| s.len() as u64 > INLINE_PAYLOAD_CEILING) {
+    if req
+        .stdout
+        .as_deref()
+        .is_some_and(|s| s.len() as u64 > INLINE_PAYLOAD_CEILING)
+    {
         return Err(ProvenanceError::invalid("stdout"));
     }
 
     let agent_kind = effective_agent_kind(&req.provenance);
+
+    // Redact stdout before stable ID so stdout content is part of the identity.
+    let redacted_stdout = req.stdout.as_deref().map(crate::redaction::redact_value);
+    let stdout_hash = {
+        let mut h = blake3::Hasher::new();
+        h.update(redacted_stdout.as_deref().unwrap_or("").as_bytes());
+        h.finalize().to_hex().to_string()
+    };
 
     let ver_id = verification_stable_id(&[
         "node",
@@ -1201,10 +1229,10 @@ pub fn build_verification_records(
         &req.verification_kind,
         &req.source_artifact_path,
         &req.source_artifact_hash,
+        &stdout_hash,
+        req.linked_command_evidence_id.as_deref().unwrap_or(""),
     ]);
 
-    // Redact stdout before inline storage.
-    let redacted_stdout = req.stdout.as_deref().map(crate::redaction::redact_value);
     let stdout_redacted = redacted_stdout
         .as_deref()
         .is_some_and(crate::redaction::is_redacted);

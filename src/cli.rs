@@ -647,12 +647,17 @@ fn write_evidence(kind: WriteKind) -> Result<()> {
             evidence_domain,
             out,
         } => {
+            let relation = if evidence_domain == "verification" {
+                EdgeLabel::ValidatedBy.as_str().to_owned()
+            } else {
+                EdgeLabel::Observes.as_str().to_owned()
+            };
             let evidence_links: Vec<EvidenceLink> = evidence_target
                 .into_iter()
                 .map(|target_id| EvidenceLink {
                     target_record_id: Some(target_id),
                     target_domain: evidence_domain.clone(),
-                    relation: EdgeLabel::Observes.as_str().to_owned(),
+                    relation: relation.clone(),
                     confidence: confidence.to_string(),
                     as_of_commit: None,
                     target_repo_relative_path: None,
