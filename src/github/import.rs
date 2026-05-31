@@ -106,10 +106,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     };
 
     // ── Issues (Task + ExternalLink) ────────────────────────────────────────────
-    let issues_path = format!(
-        "/repos/{}/issues?state=all&per_page=100",
-        opts.source_repo
-    );
+    let issues_path = format!("/repos/{}/issues?state=all&per_page=100", opts.source_repo);
     if let FetchOutcome::Modified { items, etags } =
         client.fetch_paginated("issues", &issues_path, &state.etags)?
     {
@@ -130,7 +127,11 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                 continue;
             }
             state.record_hash(key, hash);
-            push_emitted(&mut graph, &mut emitted_count, records::issue_records(&ctx, &issue));
+            push_emitted(
+                &mut graph,
+                &mut emitted_count,
+                records::issue_records(&ctx, &issue),
+            );
         }
         state.last_seen_updated_at.issues = watermark;
     }
@@ -157,7 +158,11 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                 continue;
             }
             state.record_hash(key, hash);
-            push_emitted(&mut graph, &mut emitted_count, records::pull_records(&ctx, &pr));
+            push_emitted(
+                &mut graph,
+                &mut emitted_count,
+                records::pull_records(&ctx, &pr),
+            );
         }
         state.last_seen_updated_at.pulls = watermark;
     }
@@ -176,10 +181,7 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     }
 
     // ── Issue comments → project.Review (issue_comment) ─────────────────────────
-    let ic_path = format!(
-        "/repos/{}/issues/comments?per_page=100",
-        opts.source_repo
-    );
+    let ic_path = format!("/repos/{}/issues/comments?per_page=100", opts.source_repo);
     if let FetchOutcome::Modified { items, etags } =
         client.fetch_paginated("issue_comments", &ic_path, &state.etags)?
     {
@@ -232,7 +234,10 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
         changed_pr_numbers.sort_unstable();
         changed_pr_numbers.dedup();
         for number in changed_pr_numbers {
-            let path = format!("/repos/{}/pulls/{number}/reviews?per_page=100", opts.source_repo);
+            let path = format!(
+                "/repos/{}/pulls/{number}/reviews?per_page=100",
+                opts.source_repo
+            );
             if let FetchOutcome::Modified { items, etags } =
                 client.fetch_paginated("pr_reviews", &path, &state.etags)?
             {
@@ -269,9 +274,9 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     state.api_base_url = opts.api_base.clone();
     state.source_repo = opts.source_repo.to_owned();
 
-    let jsonl = graph
-        .to_jsonl()
-        .map_err(|e| GithubError::Io { detail: format!("serialize handoff: {e}") })?;
+    let jsonl = graph.to_jsonl().map_err(|e| GithubError::Io {
+        detail: format!("serialize handoff: {e}"),
+    })?;
 
     let summary = RunSummary {
         requests: client.request_count(),

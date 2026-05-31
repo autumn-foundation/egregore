@@ -77,10 +77,7 @@ impl Emitted {
 /// any line carrying a secret is replaced with a redaction marker. Used for
 /// bodies and (per the diff_hunk sub-policy) diff hunks.
 fn redact_lines(redact: &Redact<'_>, text: &str) -> String {
-    text.split('\n')
-        .map(redact)
-        .collect::<Vec<_>>()
-        .join("\n")
+    text.split('\n').map(redact).collect::<Vec<_>>().join("\n")
 }
 
 /// Builds a redacted `OutputHandle` from already-redacted content.
@@ -283,12 +280,15 @@ fn task_and_link(
     ]);
 
     // ── Task node ──────────────────────────────────────────────────────────────
+    // Redact the title once and use it for BOTH the `name` and `title` fields so
+    // a secret in the title never survives in the human-readable `name`.
+    let redacted_title = (ctx.redact)(title);
     let mut task = GraphRecord::node(
         task_id.clone(),
         kind,
         None,
         None,
-        Some(title.to_owned()),
+        Some(redacted_title.clone()),
         format!("{source_kind} #{number}"),
     );
     set_common(&mut task, &task_id, updated_at, ctx);
@@ -305,7 +305,7 @@ fn task_and_link(
         ..
     } = &mut task
     {
-        *t = Some((ctx.redact)(title));
+        *t = Some(redacted_title);
         *bh = Some(body_handle);
         *st = Some(status.to_owned());
         *sk = Some(source_kind.to_owned());
@@ -440,10 +440,7 @@ pub fn review_comment_records(ctx: &Context<'_>, c: &model::ReviewComment) -> Em
         .in_reply_to_id
         .map(|id| format!("pr_review_comment:{number}:{id}"))
         .map(|n| review_id_for(ctx, &n));
-    let diff = c
-        .diff_hunk
-        .as_deref()
-        .map(|d| redact_lines(ctx.redact, d));
+    let diff = c.diff_hunk.as_deref().map(|d| redact_lines(ctx.redact, d));
     set_review_extra(
         &mut rec,
         None,
@@ -761,9 +758,18 @@ mod tests {
     #[test]
     fn status_mapping() {
         assert_eq!(issue_status("open", None), "open");
-        assert_eq!(issue_status("closed", Some("completed")), "closed_completed");
-        assert_eq!(issue_status("closed", Some("not_planned")), "closed_dropped");
-        assert_eq!(pr_status("closed", Some("2026-01-01T00:00:00Z")), "closed_completed");
+        assert_eq!(
+            issue_status("closed", Some("completed")),
+            "closed_completed"
+        );
+        assert_eq!(
+            issue_status("closed", Some("not_planned")),
+            "closed_dropped"
+        );
+        assert_eq!(
+            pr_status("closed", Some("2026-01-01T00:00:00Z")),
+            "closed_completed"
+        );
         assert_eq!(pr_status("closed", None), "closed_dropped");
         assert_eq!(pr_status("open", None), "open");
     }
@@ -789,7 +795,10 @@ mod tests {
     #[test]
     fn review_comment_links_unambiguous_file() {
         let mut idx = FileIndex::new();
-        idx.insert("src/lib.rs".to_owned(), vec!["codegraph:v4:file1".to_owned()]);
+        idx.insert(
+            "src/lib.rs".to_owned(),
+            vec!["codegraph:v4:file1".to_owned()],
+        );
         let c = ctx("o/r", &idx, &identity);
         let comment = model::ReviewComment {
             id: 99,
@@ -843,9 +852,11 @@ mod tests {
         };
         let e = review_comment_records(&c, &comment);
         assert_eq!(e.link_diagnostics, 1);
-        let has_touches = e.records.iter().any(|r| matches!(
-            r, GraphRecord::Edge { label, .. } if label.as_str() == "TOUCHES_FILE"
-        ));
+        let has_touches = e.records.iter().any(|r| {
+            matches!(
+                r, GraphRecord::Edge { label, .. } if label.as_str() == "TOUCHES_FILE"
+            )
+        });
         assert!(!has_touches, "must not guess a file link");
     }
 
@@ -876,10 +887,18 @@ mod tests {
         };
         let root_rec = &review_comment_records(&c, &root).records[0];
         let reply_rec = &review_comment_records(&c, &reply).records[0];
-        let GraphRecord::Node { in_reply_to_id: root_irt, .. } = root_rec else {
+        let GraphRecord::Node {
+            in_reply_to_id: root_irt,
+            ..
+        } = root_rec
+        else {
             panic!()
         };
-        let GraphRecord::Node { in_reply_to_id: reply_irt, .. } = reply_rec else {
+        let GraphRecord::Node {
+            in_reply_to_id: reply_irt,
+            ..
+        } = reply_rec
+        else {
             panic!()
         };
         assert!(root_irt.is_none(), "thread root has no in_reply_to_id");

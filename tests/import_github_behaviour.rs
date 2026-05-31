@@ -309,7 +309,10 @@ fn one_pr_review_json() -> String {
 /// Builds the full route table for the canonical fixture.
 fn full_routes() -> HashMap<String, Canned> {
     let mut routes = HashMap::new();
-    routes.insert("/repos/o/r".to_owned(), Canned::ok("{\"full_name\":\"o/r\"}", "\"repo\""));
+    routes.insert(
+        "/repos/o/r".to_owned(),
+        Canned::ok("{\"full_name\":\"o/r\"}", "\"repo\""),
+    );
     routes.insert(
         "/repos/o/r/issues?state=all&per_page=100".to_owned(),
         Canned::ok(&two_issues_json(), "\"issues-v1\""),
@@ -450,7 +453,10 @@ fn fresh_import_emits_tasks_links_reviews_with_source_handles() {
         assert!(link["url"].is_string());
     }
     for review in &reviews {
-        assert!(review["review_kind"].is_string(), "Review carries review_kind");
+        assert!(
+            review["review_kind"].is_string(),
+            "Review carries review_kind"
+        );
         assert!(
             review["system_native_id"].is_string(),
             "Review carries source native id"
@@ -460,13 +466,21 @@ fn fresh_import_emits_tasks_links_reviews_with_source_handles() {
     // Labels/assignees present and a milestone round-tripped into body blob.
     let issue1 = tasks
         .iter()
-        .find(|t| t["summary"].as_str().unwrap_or("").contains("github_issue #1"))
+        .find(|t| {
+            t["summary"]
+                .as_str()
+                .unwrap_or("")
+                .contains("github_issue #1")
+        })
         .expect("issue 1 task");
     assert_eq!(issue1["labels"][0], "bug");
     assert_eq!(issue1["assignees"][0], "alice");
     assert_eq!(issue1["author"], "reporter");
     let body_inline = issue1["body_handle"]["inline"].as_str().unwrap_or("");
-    assert!(body_inline.contains("M1"), "milestone title round-trips into body");
+    assert!(
+        body_inline.contains("M1"),
+        "milestone title round-trips into body"
+    );
 
     // Per-run stderr summary fields (AC of #46 / policy §4).
     assert!(stderr.contains("egregore-github-import:"));
@@ -599,11 +613,23 @@ fn token_strings_are_redacted_in_output_and_readback() {
     assert!(ok);
 
     // Zero raw token strings in generated output.
-    assert!(!jsonl.contains(&raw_token_a), "raw ghp_ token must not persist");
-    assert!(!jsonl.contains(&raw_token_b), "raw github_pat_ token must not persist");
-    assert!(!stderr.contains(&raw_token_a), "raw token must not reach stderr");
+    assert!(
+        !jsonl.contains(&raw_token_a),
+        "raw ghp_ token must not persist"
+    );
+    assert!(
+        !jsonl.contains(&raw_token_b),
+        "raw github_pat_ token must not persist"
+    );
+    assert!(
+        !stderr.contains(&raw_token_a),
+        "raw token must not reach stderr"
+    );
     // The schema redaction marker is present in the persisted record.
-    assert!(jsonl.contains("<REDACTED:api_token:"), "schema marker present");
+    assert!(
+        jsonl.contains("<REDACTED:api_token:"),
+        "schema marker present"
+    );
 
     // Read-back through inspect must not surface raw tokens either.
     let inspect = egregore()
@@ -664,7 +690,10 @@ fn invalid_repo_arg_exits_with_stable_code() {
         .expect("run");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("github_invalid_repo_arg"), "stderr={stderr}");
+    assert!(
+        stderr.contains("github_invalid_repo_arg"),
+        "stderr={stderr}"
+    );
 }
 
 // ── AC7: file-anchored review comments link to seeded code-graph files ────────────
@@ -700,9 +729,11 @@ fn review_comment_links_to_seeded_file_or_diagnoses_missing() {
     let touches_target_ok = jsonl
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .any(|v| v["record_type"] == "edge"
-            && v["label"] == "TOUCHES_FILE"
-            && v["target"] == "codegraph:v4:file-librs");
+        .any(|v| {
+            v["record_type"] == "edge"
+                && v["label"] == "TOUCHES_FILE"
+                && v["target"] == "codegraph:v4:file-librs"
+        });
     assert!(touches_target_ok, "edge targets the seeded File record id");
 }
 
@@ -724,11 +755,19 @@ fn review_comment_missing_file_emits_diagnostic_not_guess() {
     let unresolved = jsonl
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| v["record_type"] == "node"
-            && v["kind"] == "Diagnostic"
-            && v["summary"].as_str().unwrap_or("").contains("github_file_unresolved"))
+        .filter(|v| {
+            v["record_type"] == "node"
+                && v["kind"] == "Diagnostic"
+                && v["summary"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("github_file_unresolved")
+        })
         .count();
-    assert!(unresolved >= 1, "missing file produces a diagnostic with handles");
+    assert!(
+        unresolved >= 1,
+        "missing file produces a diagnostic with handles"
+    );
 }
 
 // ── PR review thread reconstructs via in_reply_to_id (issue #46 AC) ───────────────
@@ -785,10 +824,7 @@ fn unchanged_reimport_sends_only_conditional_probes() {
     // 1 repo probe + the conditional endpoint probes; all single-page.
     // Endpoints: issues, pulls, labels, issue comments, pr review comments.
     // (Per-PR reviews fire only when the pulls list changed; here pulls=304.)
-    assert!(
-        paths.iter().any(|p| p == "/repos/o/r"),
-        "repo probe issued"
-    );
+    assert!(paths.iter().any(|p| p == "/repos/o/r"), "repo probe issued");
     assert!(
         paths
             .iter()

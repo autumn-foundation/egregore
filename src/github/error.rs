@@ -114,11 +114,9 @@ impl fmt::Display for GithubError {
                 self.code()
             ),
             Self::Io { detail } => write!(f, "{}: {detail}", self.code()),
-            Self::InvalidRepoArg { arg } => write!(
-                f,
-                "{}: `{arg}` is not in <owner>/<repo> form",
-                self.code()
-            ),
+            Self::InvalidRepoArg { arg } => {
+                write!(f, "{}: `{arg}` is not in <owner>/<repo> form", self.code())
+            }
         }
     }
 }

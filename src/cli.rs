@@ -983,9 +983,8 @@ fn import_github_cmd(
 
     match run_import(&opts, prior_state) {
         Ok(outcome) => {
-            fs::write(out, &outcome.jsonl).with_context(|| {
-                format!("failed to write handoff JSONL to {}", out.display())
-            })?;
+            fs::write(out, &outcome.jsonl)
+                .with_context(|| format!("failed to write handoff JSONL to {}", out.display()))?;
             outcome
                 .state
                 .save(&state_path)

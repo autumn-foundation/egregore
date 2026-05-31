@@ -109,9 +109,7 @@ impl Client {
             .set("User-Agent", "egregore-github-import")
             .set("Accept", "application/vnd.github+json")
             .set("X-GitHub-Api-Version", "2022-11-28");
-        if authed
-            && let Some(token) = &self.token
-        {
+        if authed && let Some(token) = &self.token {
             req = req.set("Authorization", &format!("Bearer {token}"));
         }
         req
@@ -165,7 +163,7 @@ impl Client {
         let step2 = self.request(&url, true).call();
         match &step2 {
             Ok(resp) => {
-                self.record_rate_limit(resp);
+                self.record_rate_limit(&resp);
                 Ok(())
             }
             Err(ureq::Error::Status(404, _)) => Err(GithubError::RepoNotFound),
@@ -212,11 +210,10 @@ impl Client {
                     break;
                 }
                 ConditionalResponse::Modified { body, etag, link } => {
-                    let parsed: Value = serde_json::from_str(&body).map_err(|_| {
-                        GithubError::InvalidResponse {
+                    let parsed: Value =
+                        serde_json::from_str(&body).map_err(|_| GithubError::InvalidResponse {
                             source_class: source_class.to_owned(),
-                        }
-                    })?;
+                        })?;
                     match parsed {
                         Value::Array(arr) => items.extend(arr),
                         other => items.push(other),
@@ -260,17 +257,17 @@ impl Client {
                     self.maybe_throttle(remaining, reset);
                     let etag = resp.header("ETag").map(str::to_owned);
                     let link = resp.header("Link").map(str::to_owned);
-                    let body = resp.into_string().map_err(|_| GithubError::InvalidResponse {
-                        source_class: source_class.to_owned(),
-                    })?;
+                    let body = resp
+                        .into_string()
+                        .map_err(|_| GithubError::InvalidResponse {
+                            source_class: source_class.to_owned(),
+                        })?;
                     return Ok(ConditionalResponse::Modified { body, etag, link });
                 }
                 Err(ureq::Error::Status(304, _)) => {
                     return Ok(ConditionalResponse::NotModified);
                 }
-                Err(ureq::Error::Status(code @ (429 | 403), resp))
-                    if is_rate_limited(&resp) =>
-                {
+                Err(ureq::Error::Status(code @ (429 | 403), resp)) if is_rate_limited(&resp) => {
                     last_status = code;
                     let (_, reset) = self.record_rate_limit(&resp);
                     if attempt >= self.max_retries {
@@ -349,14 +346,14 @@ enum ProbeStep {
     RateLimitNoToken,
 }
 
-fn classify_probe(result: &Result<ureq::Response, ureq::Error>, client: &Client) -> ProbeStep {
+fn classify_probe(result: Result<ureq::Response, ureq::Error>, client: &Client) -> ProbeStep {
     match result {
         Ok(resp) => {
-            client.record_rate_limit(resp);
+            client.record_rate_limit(&resp);
             ProbeStep::Ok
         }
         Err(ureq::Error::Status(404, _)) => ProbeStep::NeedAuth,
-        Err(ureq::Error::Status(403, resp)) if is_rate_limited(resp) => {
+        Err(ureq::Error::Status(403, ref resp)) if is_rate_limited(resp) => {
             client.record_rate_limit(resp);
             if client.has_token() {
                 // Anonymous IP quota exhausted but auth quota is separate.

@@ -157,10 +157,19 @@ pub fn pull_hash(pr: &model::PullRequest) -> String {
 pub fn label_list_hash(labels: &[model::Label]) -> String {
     let mut rows: Vec<String> = labels
         .iter()
-        .map(|l| format!("{}\u{1}{}\u{1}{}", l.name, l.color, l.description.clone().unwrap_or_default()))
+        .map(|l| {
+            format!(
+                "{}\u{1}{}\u{1}{}",
+                l.name,
+                l.color,
+                l.description.clone().unwrap_or_default()
+            )
+        })
         .collect();
     rows.sort();
-    blake3::hash(rows.join("\n").as_bytes()).to_hex().to_string()
+    blake3::hash(rows.join("\n").as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 #[cfg(test)]
