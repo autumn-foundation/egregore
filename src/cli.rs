@@ -21,7 +21,8 @@ use crate::{
     ir::{
         EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan,
     },
-    query, scan_repository_history_with_override, scan_repository_with_override,
+    link_evidence::{self, LinkOptions},
+    local_project, query, scan_repository_history_with_override, scan_repository_with_override,
     schema_version::{RecordVersion, record_version},
     traj::{self, ImportOptions},
 };
@@ -115,6 +116,44 @@ enum Commands {
         /// Path to the Codex session or rollout JSONL file.
         codex_path: PathBuf,
         /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Import local project/task JSONL into project-graph JSONL.
+    ImportLocalTasks {
+        /// Directory containing `.jsonl` task files, or path to a single `.jsonl` file.
+        tasks_path: PathBuf,
+        /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Repository root used to compute repo-relative source handles.
+        /// Defaults to the current working directory.
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
+        /// Fixed RFC 3339 transaction time for deterministic output (useful for tests).
+        /// Defaults to the current wall-clock instant.
+        #[arg(long)]
+        transaction_time: Option<String>,
+    },
+    /// Link imported agent evidence to code-graph facts.
+    ///
+    /// Reads a code-graph JSONL (from `scan`) and an agent-evidence JSONL
+    /// (from `import-traj` or `import-codex`) and resolves every unambiguous
+    /// repo-relative file or symbol handle to a stable code-graph record ID.
+    ///
+    /// Resolved handles emit `TOUCHED_FILE`, `FAILED_ON`, or `MENTIONS_SYMBOL`
+    /// edges in the output JSONL.  Unresolved handles are written to stderr as
+    /// machine-readable JSON diagnostics (one object per line).
+    ///
+    /// Documented in `docs/cli/link-evidence.md`.
+    LinkEvidence {
+        /// Code-graph JSONL produced by `scan`.
+        #[arg(long)]
+        code_graph: PathBuf,
+        /// Agent-evidence JSONL produced by `import-traj` or `import-codex`.
+        #[arg(long)]
+        evidence: PathBuf,
+        /// Output JSONL path for resolved cross-domain edges.
         #[arg(long)]
         out: PathBuf,
     },
@@ -556,6 +595,22 @@ fn run_cli(cli: Cli) -> Result<()> {
         ),
         Commands::ImportTraj { traj_path, out } => import_traj_cmd(&traj_path, &out),
         Commands::ImportCodex { codex_path, out } => import_codex_cmd(&codex_path, &out),
+        Commands::ImportLocalTasks {
+            tasks_path,
+            out,
+            repo_root,
+            transaction_time,
+        } => import_local_tasks_cmd(
+            &tasks_path,
+            &out,
+            repo_root.as_deref(),
+            transaction_time.as_deref(),
+        ),
+        Commands::LinkEvidence {
+            code_graph,
+            evidence,
+            out,
+        } => link_evidence_cmd(&code_graph, &evidence, &out),
         Commands::Query { subcommand } => query_cmd(subcommand),
         Commands::Write { kind } => write_evidence(kind),
         #[cfg(feature = "embedded-aletheiadb")]
@@ -563,11 +618,6 @@ fn run_cli(cli: Cli) -> Result<()> {
     }
 }
 
-/// Handles `eg write <kind>` subcommands.
-///
-/// On provenance failure the function writes a JSON error to stderr
-/// (`{"code":"missing_field","field":"<name>"}`) and returns an error.
-#[allow(clippy::too_many_lines)]
 /// Prints a machine-readable JSON error envelope to stderr and exits with code 1.
 ///
 /// Callers that detect a [`crate::evidence::ProvenanceError`] use this instead of
@@ -578,6 +628,10 @@ fn write_evidence_error(e: &crate::evidence::ProvenanceError) -> ! {
     process::exit(1);
 }
 
+/// Handles `eg write <kind>` subcommands.
+///
+/// On provenance failure the function writes a JSON error to stderr
+/// (`{"code":"missing_field","field":"<name>"}`) and returns an error.
 #[allow(clippy::too_many_lines)]
 fn write_evidence(kind: WriteKind) -> Result<()> {
     match kind {
@@ -756,6 +810,36 @@ fn write_evidence_outcome(
     Ok(())
 }
 
+fn import_local_tasks_cmd(
+    tasks_path: &Path,
+    out: &Path,
+    repo_root: Option<&Path>,
+    transaction_time: Option<&str>,
+) -> Result<()> {
+    let repo_root = match repo_root {
+        Some(r) => r.to_path_buf(),
+        None => std::env::current_dir().context("failed to determine current directory")?,
+    };
+    let opts = local_project::ImportOptions {
+        transaction_time: transaction_time.map(str::to_owned),
+        ..local_project::ImportOptions::default()
+    };
+    let result = local_project::import_local_tasks(tasks_path, &repo_root, &opts)
+        .with_context(|| format!("failed to import local tasks from {}", tasks_path.display()))?;
+    let jsonl = result
+        .graph
+        .to_jsonl()
+        .context("failed to serialize project-graph JSONL")?;
+    fs::write(out, jsonl).with_context(|| format!("failed to write JSONL to {}", out.display()))?;
+    println!(
+        "imported {} records ({} diagnostics) from {}",
+        result.graph.records().len(),
+        result.diagnostic_count,
+        tasks_path.display()
+    );
+    Ok(())
+}
+
 fn import_codex_cmd(codex_path: &Path, out: &Path) -> Result<()> {
     let opts = crate::codex::ImportOptions::default();
     let graph = crate::codex::import_codex(codex_path, &opts)
@@ -784,6 +868,66 @@ fn import_traj_cmd(traj_path: &Path, out: &Path) -> Result<()> {
         "imported {} records from {}",
         graph.records().len(),
         traj_path.display()
+    );
+    Ok(())
+}
+
+fn link_evidence_cmd(code_graph_path: &Path, evidence_path: &Path, out: &Path) -> Result<()> {
+    let cg_jsonl = fs::read_to_string(code_graph_path).with_context(|| {
+        format!(
+            "failed to read code-graph JSONL from {}",
+            code_graph_path.display()
+        )
+    })?;
+    let ev_jsonl = fs::read_to_string(evidence_path).with_context(|| {
+        format!(
+            "failed to read evidence JSONL from {}",
+            evidence_path.display()
+        )
+    })?;
+
+    let code_graph = records_from_jsonl(&cg_jsonl).with_context(|| {
+        format!(
+            "failed to parse code-graph JSONL from {}",
+            code_graph_path.display()
+        )
+    })?;
+    let evidence = records_from_jsonl(&ev_jsonl).with_context(|| {
+        format!(
+            "failed to parse evidence JSONL from {}",
+            evidence_path.display()
+        )
+    })?;
+
+    let link_output = link_evidence::link_evidence(&code_graph, &evidence, &LinkOptions::default());
+
+    // Write diagnostics to stderr as JSON lines (machine-readable, per AC5).
+    for diag in &link_output.diagnostics {
+        let line = serde_json::to_string(diag).context("failed to serialize diagnostic")?;
+        eprintln!("{line}");
+    }
+
+    // Serialize resolved edges as JSONL.
+    let mut lines: Vec<String> = Vec::with_capacity(link_output.edges.len());
+    for edge in &link_output.edges {
+        let line = serde_json::to_string(edge).context("failed to serialize linked edge")?;
+        lines.push(line);
+    }
+    let content = if lines.is_empty() {
+        String::new()
+    } else {
+        let mut s = lines.join("\n");
+        s.push('\n');
+        s
+    };
+
+    fs::write(out, content)
+        .with_context(|| format!("failed to write output to {}", out.display()))?;
+
+    println!(
+        "linked: {} edges resolved, {} diagnostics",
+        link_output.edges.len(),
+        link_output.diagnostics.len()
     );
     Ok(())
 }

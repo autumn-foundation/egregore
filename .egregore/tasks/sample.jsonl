@@ -1,0 +1,7 @@
+{"kind":"header","schema_version":1,"project_slug":"sample","created_at":"2026-05-18T00:00:00Z"}
+{"kind":"task","local_id":"sample-t1","title":"Wire local JSONL import","body":"Make project state editable offline.","status":"open","priority":"normal","assignees":[],"labels":["local-jsonl"],"created_at":"2026-05-18T00:00:00Z","updated_at":"2026-05-18T00:00:00Z"}
+{"kind":"task","local_id":"sample-t2","title":"Add inspect-tasks surface","body":"Show per-file totals.","status":"open","priority":"low","assignees":[],"labels":["local-jsonl"],"created_at":"2026-05-18T00:01:00Z","updated_at":"2026-05-18T00:01:00Z"}
+{"kind":"acceptance_criterion","local_id":"sample-t1-ac-1","parent_task_local_id":"sample-t1","ordinal":1,"text":"The importer reads the header.","status":"unverified","updated_at":"2026-05-18T00:00:00Z"}
+{"kind":"acceptance_criterion","local_id":"sample-t1-ac-2","parent_task_local_id":"sample-t1","ordinal":2,"text":"Re-import is idempotent.","status":"unverified","updated_at":"2026-05-18T00:00:00Z"}
+{"kind":"acceptance_criterion","local_id":"sample-t2-ac-1","parent_task_local_id":"sample-t2","ordinal":1,"text":"Inspect shows task counts.","status":"unverified","updated_at":"2026-05-18T00:01:00Z"}
+{"kind":"external_link","local_id":"sample-t1-github","parent_local_id":"sample-t1","system":"github","url":"https://github.com/madmax983/egregore/issues/42","system_native_id":"madmax983/egregore#42","discovered_at":"2026-05-18T00:00:00Z","updated_at":"2026-05-18T00:00:00Z"}

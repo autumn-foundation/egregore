@@ -2074,6 +2074,9 @@ const PROJECT_NODE_KINDS: &[NodeKind] = &[
     NodeKind::PR,
     NodeKind::Review,
     NodeKind::LocalTask,
+    // Importer diagnostics are valid project records; they carry entity_id == id
+    // and valid_time == transaction_time so partial imports remain ingestible.
+    NodeKind::Diagnostic,
 ];
 
 const PROJECT_FULL_NODE_KINDS: &[NodeKind] = &[
@@ -5236,10 +5239,11 @@ fn validate_evidence_endpoint_constraints(
                         | NodeKind::CommandRun
                         | NodeKind::TestRun
                         | NodeKind::CIStatus
+                        | NodeKind::PatchArtifact
                 )
             {
                 return Err(ApiError::bad_request(format!(
-                    "evidence link relation '{}' requires a FileEdit, ToolCall, CommandRun, TestRun, or CIStatus source node, not {}",
+                    "evidence link relation '{}' requires a FileEdit, ToolCall, CommandRun, TestRun, CIStatus, or PatchArtifact source node, not {}",
                     label.as_str(),
                     sk.as_str()
                 )));
@@ -7478,6 +7482,7 @@ fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) ->
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::option_if_let_else)]
 fn handle_verb_observations_for_symbol(
     request_id: &str,
     params: &serde_json::Value,
