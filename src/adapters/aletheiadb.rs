@@ -620,8 +620,13 @@ impl EmbeddedAletheiaSink {
         count
     }
 
-    #[cfg(test)]
-    pub(crate) fn force_latest_node_schema_version_for_test(
+    /// Forces the schema version of the latest node for a given record ID.
+    /// Used only for testing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node cannot be found or if updating the node fails.
+    pub fn force_latest_node_schema_version_for_test(
         &self,
         record_id: &str,
         schema_version: u32,

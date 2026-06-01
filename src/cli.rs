@@ -2638,6 +2638,13 @@ impl InspectCounts {
         }
         for record in records {
             counts.records += 1;
+            if let Err(unknown) = crate::schema_version::validate_record_version(record) {
+                *counts
+                    .unknown_schema_versions
+                    .entry(unknown.version.clone())
+                    .or_default() += 1;
+                continue;
+            }
             *counts
                 .schema_versions
                 .entry(record_version(record))

@@ -10351,6 +10351,133 @@ fn test_cli_inspect_daemon_readonly() {
     daemon.stop();
 }
 
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn test_cli_inspect_daemon_future_schema_version() {
+    use aletheia_egregore::{GraphRecord, NodeKind, SCHEMA_VERSION};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("store");
+
+    // Construct a Repository node record that has a future/unknown schema version
+    let record = GraphRecord::node(
+        "codegraph:v5:test-repo".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "test repo".to_owned(),
+    );
+    let mut record_val = serde_json::to_value(&record).unwrap();
+    let future_version = SCHEMA_VERSION + 1;
+    record_val["schema_version"] = serde_json::Value::from(future_version);
+
+    let mock_response = serde_json::json!({
+        "ok": true,
+        "result": {
+            "records": [record_val],
+            "snapshot_timestamp": "2026-06-01T00:00:00Z"
+        }
+    });
+
+    // Spawn mock daemon server
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock daemon listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("should get address")
+        .to_string();
+
+    // Acquire store lease to hold the lock on egregored.lock (preventing metadata from being stale)
+    let _lease = StoreLease::acquire(&data_dir).expect("should acquire store lease");
+
+    // Write fake egregored.json metadata
+    let runtime_path = runtime_dir(&data_dir);
+    fs::create_dir_all(&runtime_path).expect("should create runtime dir");
+    let metadata_path = runtime_path.join("egregored.json");
+
+    let metadata = serde_json::json!({
+        "schema_version": 1,
+        "pid": std::process::id(),
+        "address": address,
+        "token": "mock-token",
+        "data_dir": data_dir,
+        "version": "0.1.0",
+        "started_at_unix_ms": 1_716_300_000_000_u64,
+        "state": "running"
+    });
+    fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap())
+        .expect("should write metadata");
+
+    let data_dir_canonical = fs::create_dir_all(&data_dir)
+        .and_then(|()| data_dir.canonicalize())
+        .unwrap_or_else(|_| data_dir.clone());
+    let store_identity = data_dir_canonical.to_string_lossy().into_owned();
+
+    let _mock_thread = thread::spawn(move || {
+        for _ in 0..10 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+
+            let mut request_bytes = [0; 4096];
+            let read_bytes = match stream.read(&mut request_bytes) {
+                Ok(n) if n > 0 => n,
+                _ => continue,
+            };
+            let request_str = String::from_utf8_lossy(&request_bytes[..read_bytes]);
+
+            let response_body = if request_str.contains("GET /v1/health") {
+                serde_json::json!({
+                    "status": "ok",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "data_dir": store_identity
+                })
+            } else if request_str.contains("GET /v1/records") {
+                mock_response.clone()
+            } else {
+                serde_json::json!({ "error": "not found" })
+            };
+
+            let body_str = serde_json::to_string(&response_body).unwrap();
+            let response_str = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body_str.len(),
+                body_str
+            );
+
+            let _ = stream.write_all(response_str.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    // 4. Inspect via daemon with JSON format
+    let inspect_output = Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("inspect")
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let inspect_str = String::from_utf8(inspect_output).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&inspect_str).unwrap();
+
+    // The record must be counted under unknown_schema_versions, not schema_versions
+    assert_eq!(parsed["records"], 1);
+    let unknown_key = format!("codegraph:Repository:{future_version}");
+    assert_eq!(parsed["unknown_schema_versions"][unknown_key], 1);
+    assert_eq!(parsed["schema_versions"].as_object().unwrap().len(), 0);
+    // Ensure it's not counted as nodes, edges, or tombstones!
+    assert_eq!(parsed["nodes"], 0);
+    assert_eq!(parsed["edges"], 0);
+    assert_eq!(parsed["tombstones"], 0);
+}
+
 fn get_dir_file_times(dir: &Path) -> std::collections::BTreeMap<PathBuf, std::time::SystemTime> {
     let mut files = std::collections::BTreeMap::new();
     if let Ok(entries) = fs::read_dir(dir) {
