@@ -10072,8 +10072,15 @@ fn test_daemon_inspect_get_records_endpoint() {
         "GET /v1/records should succeed, got {response}"
     );
     let json = response_json(&response);
-    assert!(json["records"].is_array(), "should return records array");
-    assert_eq!(json["records"].as_array().unwrap().len(), 0);
+    assert!(
+        json["result"]["records"].is_array(),
+        "should return records array"
+    );
+    assert_eq!(json["result"]["records"].as_array().unwrap().len(), 0);
+    assert!(
+        json["result"]["snapshot_timestamp"].is_string(),
+        "should return snapshot timestamp"
+    );
 
     // 2. Unauthorized GET /v1/records (wrong token) should fail with 401
     let response_unauth = http_request(

@@ -1518,8 +1518,9 @@ impl DaemonClient {
     ///
     /// Returns an error if the daemon does not respond successfully or the
     /// response cannot be parsed.
-    pub fn get_all_records(&self) -> Result<Vec<GraphRecord>> {
-        let (status, body) = self.request("GET", "/v1/records", None, CLIENT_TIMEOUT, true)?;
+    pub fn get_all_records(&self) -> Result<(Vec<GraphRecord>, String)> {
+        let (status, body) =
+            self.request("GET", "/v1/records", None, CLIENT_OPERATION_TIMEOUT, true)?;
         if status != 200 {
             return Err(anyhow!(
                 "daemon get_all_records failed with HTTP {status}: {body}"
@@ -1527,9 +1528,13 @@ impl DaemonClient {
         }
         let envelope: serde_json::Value =
             serde_json::from_str(&body).context("failed to parse daemon records response")?;
-        let records = serde_json::from_value(envelope["records"].clone())
+        let records = serde_json::from_value(envelope["result"]["records"].clone())
             .context("failed to parse records from envelope")?;
-        Ok(records)
+        let snapshot_timestamp = envelope["result"]["snapshot_timestamp"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        Ok((records, snapshot_timestamp))
     }
 
     /// Sends a verb query to the daemon and returns the `result.records` array.
@@ -6587,12 +6592,20 @@ fn handle_get_all_records(state: &ServerState) -> HttpResponse {
     let Ok(sink) = state.sink.read() else {
         return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
     };
+    let snapshot_timestamp = chrono::Utc::now().to_rfc3339();
     let records = match sink.read_all_records() {
         Ok(r) => r,
         Err(e) => return HttpResponse::error(adapter_read_error_to_api(e)),
     };
     drop(sink);
-    HttpResponse::json(200, json!({ "records": records }))
+    HttpResponse::success(
+        None,
+        200,
+        json!({
+            "records": records,
+            "snapshot_timestamp": snapshot_timestamp,
+        }),
+    )
 }
 
 fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {

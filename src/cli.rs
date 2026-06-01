@@ -1079,7 +1079,7 @@ fn inspect(
                 data_dir.display()
             )
         })?;
-        let records = client.get_all_records().with_context(|| {
+        let (records, snapshot_timestamp) = client.get_all_records().with_context(|| {
             format!(
                 "failed to inspect data-dir {}: invalid authorization token or daemon read error",
                 data_dir.display()
@@ -1087,7 +1087,6 @@ fn inspect(
         })?;
 
         let counts = InspectCounts::from_records(&records, &[]);
-        let snapshot_timestamp = chrono::Utc::now().to_rfc3339();
 
         match format {
             OutputFormat::Json => {
