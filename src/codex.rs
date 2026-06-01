@@ -1603,6 +1603,7 @@ fn make_node(
         in_reply_to_id: None,
         author: None,
         diff_hunk_handle: None,
+        review_side: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,
     }

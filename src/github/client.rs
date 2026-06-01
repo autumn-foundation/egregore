@@ -19,6 +19,10 @@ use crate::github::{
     scrubber,
 };
 
+/// Maximum time the unauthenticated repo probe will wait for an anonymous
+/// rate-limit reset before exiting with `github_rate_limit_anon` (policy §2).
+const ANON_RATE_LIMIT_WAIT_CAP: Duration = Duration::from_secs(5 * 60);
+
 /// Default GitHub REST API base URL.
 pub const DEFAULT_API_BASE: &str = "https://api.github.com";
 
@@ -143,16 +147,32 @@ impl Client {
         let path = format!("/repos/{owner_repo}");
         let url = self.url(&path);
 
-        // Step 1 — unauthenticated probe.
-        self.requests.fetch_add(1, Ordering::Relaxed);
-        match classify_probe(self.request(&url, false).call(), self) {
-            ProbeStep::Ok => return Ok(()),
-            ProbeStep::AuthRejected => return Err(GithubError::AuthRejected),
-            ProbeStep::RateLimitNoToken => return Err(GithubError::RateLimitExhausted),
-            ProbeStep::NeedAuth => {
-                // Fall through to Step 2 only when a token is available.
-                if !self.has_token() {
-                    return Err(GithubError::AuthMissing);
+        // Step 1 — unauthenticated probe. When the anonymous quota is exhausted
+        // (403, remaining=0, no token) the policy says to wait until reset and
+        // retry rather than fail immediately, exiting only if the wait would
+        // exceed the cap.
+        loop {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            match classify_probe(self.request(&url, false).call(), self) {
+                ProbeStep::Ok => return Ok(()),
+                ProbeStep::AuthRejected => return Err(GithubError::AuthRejected),
+                ProbeStep::RateLimitNoToken { reset } => {
+                    // Anonymous quota exhausted, no token fallback. Wait until
+                    // reset and retry Step 1 unless that exceeds the cap.
+                    match reset_wait(reset) {
+                        Some(wait) if wait <= ANON_RATE_LIMIT_WAIT_CAP => {
+                            (self.sleep)(wait);
+                            // Retry Step 1.
+                        }
+                        _ => return Err(GithubError::RateLimitExhausted),
+                    }
+                }
+                ProbeStep::NeedAuth => {
+                    // Fall through to Step 2 only when a token is available.
+                    if !self.has_token() {
+                        return Err(GithubError::AuthMissing);
+                    }
+                    break;
                 }
             }
         }
@@ -173,10 +193,17 @@ impl Client {
 
     /// Conditionally fetches all pages of a list endpoint.
     ///
-    /// `prior_etags` maps `"<path>?page=<n>"` to a stored `ETag`; when the first
-    /// page's stored `ETag` still matches (304) the whole endpoint is treated as
-    /// unchanged and [`FetchOutcome::NotModified`] is returned without fetching
-    /// further pages.
+    /// `prior_etags` maps `"<path>?page=<n>"` to a stored `ETag`. Every stored
+    /// page is probed conditionally — a 304 on page 1 does **not** short-circuit
+    /// the endpoint, because a later page can change while page 1 stays
+    /// unchanged. Page URLs are reconstructed deterministically (`&page=<n>`)
+    /// rather than read from a `Link` header so that 304 pages (which carry no
+    /// `Link`) are still followed; a changed page's `Link` header is honoured to
+    /// discover pages added since the last run.
+    ///
+    /// Returns [`FetchOutcome::NotModified`] only when **every** probed page
+    /// returned 304; otherwise [`FetchOutcome::Modified`] with the items from the
+    /// changed pages and the union of refreshed and retained per-page `ETags`.
     ///
     /// # Errors
     ///
@@ -188,27 +215,36 @@ impl Client {
         first_path: &str,
         prior_etags: &BTreeMap<String, String>,
     ) -> GithubResult<FetchOutcome> {
+        // Highest page number we have a stored ETag for (0 on a fresh import).
+        let prefix = format!("{first_path}?page=");
+        let max_known: u32 = prior_etags
+            .keys()
+            .filter_map(|k| k.strip_prefix(&prefix))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0);
+
         let mut items = Vec::new();
         let mut etags = BTreeMap::new();
-        let mut next_url = Some(self.url(first_path));
+        let mut any_modified = false;
         let mut page = 1u32;
 
-        while let Some(url) = next_url.take() {
+        loop {
             let etag_key = format!("{first_path}?page={page}");
             let prior = prior_etags.get(&etag_key);
-            let resp = self.get_with_retry(source_class, &url, prior)?;
-            match resp {
-                ConditionalResponse::NotModified if page == 1 => {
-                    return Ok(FetchOutcome::NotModified);
-                }
+            let url = self.url(&page_path(first_path, page));
+            let mut has_link_next = false;
+            match self.get_with_retry(source_class, &url, prior)? {
                 ConditionalResponse::NotModified => {
-                    // A later page is unchanged; keep its prior etag and stop.
+                    // Unchanged page: retain its stored ETag, emit no items. No
+                    // Link header is available from a 304, so continuation
+                    // relies on `max_known`.
                     if let Some(p) = prior {
                         etags.insert(etag_key, p.clone());
                     }
-                    break;
                 }
                 ConditionalResponse::Modified { body, etag, link } => {
+                    any_modified = true;
                     let parsed: Value =
                         serde_json::from_str(&body).map_err(|_| GithubError::InvalidResponse {
                             source_class: source_class.to_owned(),
@@ -220,13 +256,24 @@ impl Client {
                     if let Some(e) = etag {
                         etags.insert(etag_key, e);
                     }
-                    next_url = link_next(link.as_deref());
-                    page += 1;
+                    has_link_next = link_next(link.as_deref()).is_some();
                 }
+            }
+
+            // Continue while more known pages remain, or the last 200 advertised
+            // a `next` page (the endpoint grew since the previous run).
+            if page < max_known || has_link_next {
+                page += 1;
+            } else {
+                break;
             }
         }
 
-        Ok(FetchOutcome::Modified { items, etags })
+        if any_modified {
+            Ok(FetchOutcome::Modified { items, etags })
+        } else {
+            Ok(FetchOutcome::NotModified)
+        }
     }
 
     /// Single GET with conditional header and transient-failure retry/backoff.
@@ -266,7 +313,14 @@ impl Client {
                 Err(ureq::Error::Status(304, _)) => {
                     return Ok(ConditionalResponse::NotModified);
                 }
-                Err(ureq::Error::Status(code @ (429 | 403), resp)) if is_rate_limited(&resp) => {
+                // 429 is always a rate-limit signal (primary or secondary), even
+                // when GitHub omits Retry-After / X-RateLimit headers; fall back
+                // to exponential backoff in that case. A 403 is only a rate-limit
+                // event when it carries a rate-limit header — otherwise it is an
+                // auth rejection handled below.
+                Err(ureq::Error::Status(code @ (429 | 403), resp))
+                    if code == 429 || is_rate_limited(&resp) =>
+                {
                     last_status = code;
                     let (_, reset) = self.record_rate_limit(&resp);
                     if attempt >= self.max_retries {
@@ -342,7 +396,11 @@ enum ProbeStep {
     Ok,
     NeedAuth,
     AuthRejected,
-    RateLimitNoToken,
+    /// Anonymous quota exhausted with no token; `reset` is the
+    /// `X-RateLimit-Reset` UNIX timestamp when known.
+    RateLimitNoToken {
+        reset: Option<u64>,
+    },
 }
 
 fn classify_probe(result: Result<ureq::Response, ureq::Error>, client: &Client) -> ProbeStep {
@@ -353,12 +411,12 @@ fn classify_probe(result: Result<ureq::Response, ureq::Error>, client: &Client) 
         }
         Err(ureq::Error::Status(404, _)) => ProbeStep::NeedAuth,
         Err(ureq::Error::Status(403, ref resp)) if is_rate_limited(resp) => {
-            client.record_rate_limit(resp);
+            let (_, reset) = client.record_rate_limit(resp);
             if client.has_token() {
                 // Anonymous IP quota exhausted but auth quota is separate.
                 ProbeStep::NeedAuth
             } else {
-                ProbeStep::RateLimitNoToken
+                ProbeStep::RateLimitNoToken { reset }
             }
         }
         Err(ureq::Error::Status(401 | 403, _)) => ProbeStep::AuthRejected,
@@ -403,6 +461,14 @@ fn reset_wait(reset: Option<u64>) -> Option<Duration> {
 fn backoff(attempt: u32, start: u64, cap: u64) -> Duration {
     let secs = start.saturating_mul(2u64.saturating_pow(attempt)).min(cap);
     Duration::from_secs(secs)
+}
+
+/// Builds the request path for page `n`, appending an explicit `page=<n>` query
+/// parameter. GitHub treats `page=1` as the default page, so this is safe for
+/// the first page and lets every stored page be probed conditionally.
+fn page_path(first_path: &str, n: u32) -> String {
+    let sep = if first_path.contains('?') { '&' } else { '?' };
+    format!("{first_path}{sep}page={n}")
 }
 
 /// Extracts the `rel="next"` URL from a `Link` header.
@@ -462,5 +528,22 @@ mod tests {
         let out = scrub_line(&format!("failed with {tok}"));
         assert!(!out.contains(&tok));
         assert!(out.contains("[REDACTED_GH_TOKEN]"));
+    }
+
+    #[test]
+    fn page_path_appends_page_param() {
+        assert_eq!(
+            page_path("/repos/o/r/issues?state=all&per_page=100", 1),
+            "/repos/o/r/issues?state=all&per_page=100&page=1"
+        );
+        assert_eq!(
+            page_path("/repos/o/r/issues?state=all&per_page=100", 3),
+            "/repos/o/r/issues?state=all&per_page=100&page=3"
+        );
+        // No existing query string → uses `?`.
+        assert_eq!(
+            page_path("/repos/o/r/labels", 2),
+            "/repos/o/r/labels?page=2"
+        );
     }
 }

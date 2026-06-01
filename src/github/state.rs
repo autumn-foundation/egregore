@@ -74,6 +74,13 @@ impl State {
     /// Loads state from `path`, returning a fresh state when the file is
     /// missing, unreadable, unparseable, or carries an unsupported
     /// `schema_version` (a partial file from a crashed run, per §5).
+    ///
+    /// The cached state is also discarded when its `source_repo` or
+    /// `api_base_url` does not match the current run: `ETags` and resource
+    /// hashes are scoped to one `(api_base, owner/repo)` pair, so reusing the
+    /// same `--state-file` across GitHub Enterprise, the default API, or a mock
+    /// `--api-base` must start fresh rather than send conditional requests with
+    /// another server's `ETags`.
     #[must_use]
     pub fn load_or_fresh(path: &Path, source_repo: &str, api_base_url: &str) -> Self {
         let fallback = || Self::fresh(source_repo, api_base_url);
@@ -81,7 +88,13 @@ impl State {
             return fallback();
         };
         match serde_json::from_str::<Self>(&raw) {
-            Ok(s) if s.schema_version == STATE_SCHEMA_VERSION && s.source_repo == source_repo => s,
+            Ok(s)
+                if s.schema_version == STATE_SCHEMA_VERSION
+                    && s.source_repo == source_repo
+                    && s.api_base_url == api_base_url =>
+            {
+                s
+            }
             _ => fallback(),
         }
     }
@@ -146,6 +159,10 @@ pub fn pull_hash(pr: &model::PullRequest) -> String {
         "draft": pr.draft,
         "head_sha": pr.head.as_ref().map(|h| &h.sha),
         "base_ref": pr.base.as_ref().map(|b| &b.ref_name),
+        // merge_commit_sha is persisted in the task body blob, so it must be in
+        // the change hash — GitHub may rewrite it after finalizing a merge while
+        // every other field is unchanged.
+        "merge_commit_sha": pr.merge_commit_sha,
     });
     blake3::hash(serde_json::to_string(&key).unwrap_or_default().as_bytes())
         .to_hex()
@@ -225,5 +242,64 @@ mod tests {
         assert!(loaded.is_unchanged("issue:1", "abc"));
         assert!(!loaded.is_unchanged("issue:1", "def"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_discards_state_from_a_different_api_base() {
+        // Reusing the same state file for the same slug but a different API base
+        // (e.g. GHE vs github.com vs a mock) must NOT reuse the other server's
+        // ETags/hashes.
+        let dir = std::env::temp_dir().join(format!("egst3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut s = State::fresh("o/r", "https://ghe.example.com/api/v3");
+        s.record_hash("issue:1".to_owned(), "abc".to_owned());
+        s.save(&path).unwrap();
+
+        // Same slug, different base → fresh (no reuse).
+        let other = State::load_or_fresh(&path, "o/r", "https://api.github.com");
+        assert!(
+            other.resource_hashes.is_empty(),
+            "must not reuse cross-base state"
+        );
+        // Same slug, same base → reused.
+        let same = State::load_or_fresh(&path, "o/r", "https://ghe.example.com/api/v3");
+        assert!(same.is_unchanged("issue:1", "abc"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn pull(n: u64) -> model::PullRequest {
+        model::PullRequest {
+            number: n,
+            title: "t".to_owned(),
+            body: None,
+            state: "closed".to_owned(),
+            merged_at: Some("2026-01-01T00:00:00Z".to_owned()),
+            draft: false,
+            labels: vec![],
+            assignees: vec![],
+            user: None,
+            milestone: None,
+            created_at: String::new(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            closed_at: None,
+            head: None,
+            base: None,
+            merge_commit_sha: None,
+            html_url: String::new(),
+        }
+    }
+
+    #[test]
+    fn pull_hash_changes_when_merge_commit_sha_changes() {
+        let mut a = pull(1);
+        let mut b = pull(1);
+        a.merge_commit_sha = Some("aaaa".to_owned());
+        b.merge_commit_sha = Some("bbbb".to_owned());
+        assert_ne!(
+            pull_hash(&a),
+            pull_hash(&b),
+            "merge_commit_sha must affect the change hash"
+        );
     }
 }

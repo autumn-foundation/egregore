@@ -362,13 +362,24 @@ fn task_and_link(
 // ── Comments / reviews → Review ─────────────────────────────────────────────────
 
 /// Emits a `Review` (`issue_comment`) plus its `REFERENCES_TASK` edge.
+///
+/// `/issues/comments` returns comments on both issues and pull-request
+/// conversations. PR conversation comments are emitted only as a `Task` under
+/// `pr:<n>` (the matching `/issues` item is discarded), so the parent edge must
+/// point at the PR `Task`. GitHub distinguishes the two via the comment's
+/// `html_url` path segment (`/pull/<n>` vs `/issues/<n>`).
 #[must_use]
 pub fn issue_comment_records(ctx: &Context<'_>, c: &model::IssueComment) -> Emitted {
     let Some(number) = model::trailing_number(&c.issue_url) else {
         return Emitted::default();
     };
+    let parent_kind = if c.html_url.contains("/pull/") {
+        "pr"
+    } else {
+        "issue"
+    };
     let native = format!("issue_comment:{number}:{}", c.id);
-    let parent = task_id_for(ctx, "issue", number);
+    let parent = task_id_for(ctx, parent_kind, number);
     let body = c.body.as_deref().map(|b| redact_lines(ctx.redact, b));
     let mut rec = review_node(
         ctx,
@@ -380,7 +391,7 @@ pub fn issue_comment_records(ctx: &Context<'_>, c: &model::IssueComment) -> Emit
         body,
         &parent,
     );
-    set_review_extra(&mut rec, None, None, None, None, None, None);
+    set_review_extra(&mut rec, None, None, None, None, None, None, None);
     edge_and_pack(rec, parent, None)
 }
 
@@ -408,6 +419,7 @@ pub fn pr_review_records(ctx: &Context<'_>, pr_number: u64, r: &model::Review) -
     set_review_extra(
         &mut rec,
         Some(&r.state.to_ascii_lowercase()),
+        None,
         None,
         None,
         None,
@@ -453,6 +465,7 @@ pub fn review_comment_records(ctx: &Context<'_>, c: &model::ReviewComment) -> Em
         c.line,
         c.start_line,
         diff.as_deref(),
+        c.side.as_deref(),
     );
 
     // File resolution for TOUCHES_FILE (AC7).
@@ -573,6 +586,7 @@ fn review_node(
     rec
 }
 
+#[allow(clippy::too_many_arguments)]
 fn set_review_extra(
     rec: &mut GraphRecord,
     review_state: Option<&str>,
@@ -581,6 +595,7 @@ fn set_review_extra(
     line: Option<u32>,
     start_line: Option<u32>,
     diff_hunk: Option<&str>,
+    side: Option<&str>,
 ) {
     if let GraphRecord::Node {
         review_state: rs,
@@ -588,6 +603,7 @@ fn set_review_extra(
         repo_relative_path,
         span,
         diff_hunk_handle,
+        review_side,
         ..
     } = rec
     {
@@ -605,6 +621,7 @@ fn set_review_extra(
             });
         }
         *diff_hunk_handle = diff_hunk.map(handle_for);
+        *review_side = side.map(str::to_owned);
     }
 }
 
@@ -907,5 +924,99 @@ mod tests {
         };
         assert!(root_irt.is_none(), "thread root has no in_reply_to_id");
         assert!(reply_irt.is_some(), "reply carries in_reply_to_id");
+    }
+
+    #[test]
+    fn review_comment_preserves_diff_side() {
+        let idx = FileIndex::new();
+        let c = ctx("o/r", &idx, &identity);
+        let comment = model::ReviewComment {
+            id: 5,
+            body: Some("on the old side".to_owned()),
+            user: None,
+            path: Some("src/lib.rs".to_owned()),
+            line: Some(3),
+            start_line: None,
+            side: Some("LEFT".to_owned()),
+            diff_hunk: None,
+            in_reply_to_id: None,
+            pull_request_url: "https://api.github.com/repos/o/r/pulls/3".to_owned(),
+            commit_id: None,
+            created_at: String::new(),
+            updated_at: "2026-01-02T00:00:00Z".to_owned(),
+            html_url: String::new(),
+        };
+        let rec = &review_comment_records(&c, &comment).records[0];
+        let GraphRecord::Node { review_side, .. } = rec else {
+            panic!("expected node");
+        };
+        assert_eq!(review_side.as_deref(), Some("LEFT"));
+    }
+
+    #[test]
+    fn pr_conversation_comment_links_to_pr_task() {
+        // A comment on a PR conversation arrives via /issues/comments but its
+        // html_url contains /pull/. Its REFERENCES_TASK edge must target the PR
+        // Task (pr:<n>), not a non-existent issue Task (issue:<n>).
+        let idx = FileIndex::new();
+        let c = ctx("o/r", &idx, &identity);
+        let pr_comment = model::IssueComment {
+            id: 77,
+            body: Some("looks good".to_owned()),
+            user: Some(model::User {
+                login: "rev".to_owned(),
+            }),
+            issue_url: "https://api.github.com/repos/o/r/issues/9".to_owned(),
+            created_at: String::new(),
+            updated_at: "2026-01-02T00:00:00Z".to_owned(),
+            html_url: "https://github.com/o/r/pull/9#issuecomment-77".to_owned(),
+        };
+        let e = issue_comment_records(&c, &pr_comment);
+        // The REFERENCES_TASK edge target must equal the PR Task id for #9.
+        let pr_task_id = task_id_for(&c, "pr", 9);
+        let issue_task_id = task_id_for(&c, "issue", 9);
+        let edge_target = e
+            .records
+            .iter()
+            .find_map(|r| match r {
+                GraphRecord::Edge { label, target, .. } if label.as_str() == "REFERENCES_TASK" => {
+                    Some(target.clone())
+                }
+                _ => None,
+            })
+            .expect("REFERENCES_TASK edge present");
+        assert_eq!(edge_target, pr_task_id, "edge targets the PR Task");
+        assert_ne!(
+            edge_target, issue_task_id,
+            "edge does not target an issue Task"
+        );
+    }
+
+    #[test]
+    fn issue_conversation_comment_links_to_issue_task() {
+        let idx = FileIndex::new();
+        let c = ctx("o/r", &idx, &identity);
+        let issue_comment = model::IssueComment {
+            id: 88,
+            body: Some("a thought".to_owned()),
+            user: None,
+            issue_url: "https://api.github.com/repos/o/r/issues/4".to_owned(),
+            created_at: String::new(),
+            updated_at: "2026-01-02T00:00:00Z".to_owned(),
+            html_url: "https://github.com/o/r/issues/4#issuecomment-88".to_owned(),
+        };
+        let e = issue_comment_records(&c, &issue_comment);
+        let issue_task_id = task_id_for(&c, "issue", 4);
+        let edge_target = e
+            .records
+            .iter()
+            .find_map(|r| match r {
+                GraphRecord::Edge { label, target, .. } if label.as_str() == "REFERENCES_TASK" => {
+                    Some(target.clone())
+                }
+                _ => None,
+            })
+            .expect("REFERENCES_TASK edge present");
+        assert_eq!(edge_target, issue_task_id, "edge targets the issue Task");
     }
 }

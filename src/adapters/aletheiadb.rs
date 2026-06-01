@@ -1184,6 +1184,7 @@ impl EmbeddedAletheiaSink {
             in_reply_to_id,
             author,
             diff_hunk_handle,
+            review_side,
             user_context,
             producer,
         } = record
@@ -1374,6 +1375,7 @@ impl EmbeddedAletheiaSink {
         {
             builder = builder.insert("diff_hunk_handle_json", json.as_str());
         }
+        builder = insert_optional(builder, "review_side", review_side.as_deref());
         if !user_context.is_empty()
             && let Ok(json) = serde_json::to_string(user_context)
         {
@@ -2256,6 +2258,11 @@ impl EmbeddedAletheiaSink {
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("diff_hunk_handle_json invalid: {e}")))?
             .map(Box::new),
+            review_side: optional_str_property(
+                record_id,
+                "review_side",
+                node.get_property("review_side"),
+            )?,
             user_context: optional_str_property(
                 record_id,
                 "user_context_json",

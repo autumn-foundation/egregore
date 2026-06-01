@@ -40,6 +40,8 @@ struct Canned {
     etag: Option<String>,
     /// When set and the request carries this `If-None-Match`, reply 304.
     not_modified_when: Option<String>,
+    /// Optional next-page path (no host); emitted as a `Link: …; rel="next"`.
+    link_next_path: Option<String>,
 }
 
 impl Canned {
@@ -49,7 +51,15 @@ impl Canned {
             body: body.to_owned(),
             etag: Some(etag.to_owned()),
             not_modified_when: Some(etag.to_owned()),
+            link_next_path: None,
         }
+    }
+
+    /// Like [`Canned::ok`] but advertises `next_path` as the next page.
+    fn ok_with_next(body: &str, etag: &str, next_path: &str) -> Self {
+        let mut c = Self::ok(body, etag);
+        c.link_next_path = Some(next_path.to_owned());
+        c
     }
 
     fn status_only(status: u16) -> Self {
@@ -58,16 +68,21 @@ impl Canned {
             body: "[]".to_owned(),
             etag: None,
             not_modified_when: None,
+            link_next_path: None,
         }
     }
 }
 
 /// Records the path of every request received, in order.
 type RequestLog = Arc<Mutex<Vec<String>>>;
+/// Shared, swappable route table so one server (one stable base URL) can serve
+/// several sequential imports with different responses.
+type SharedRoutes = Arc<Mutex<HashMap<String, Canned>>>;
 
 struct MockServer {
     base_url: String,
     requests: RequestLog,
+    routes: SharedRoutes,
     handle: Option<thread::JoinHandle<()>>,
     stop: Arc<AtomicU64>,
 }
@@ -80,9 +95,11 @@ impl MockServer {
         let addr = listener.local_addr().expect("addr");
         let base_url = format!("http://{addr}");
         let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+        let routes: SharedRoutes = Arc::new(Mutex::new(routes));
         let stop = Arc::new(AtomicU64::new(0));
 
         let req_clone = Arc::clone(&requests);
+        let routes_clone = Arc::clone(&routes);
         let stop_clone = Arc::clone(&stop);
         listener
             .set_nonblocking(true)
@@ -96,7 +113,7 @@ impl MockServer {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let _ = stream.set_nonblocking(false);
-                        handle_conn(&mut stream, &routes, &req_clone);
+                        handle_conn(&mut stream, &routes_clone, &req_clone);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(std::time::Duration::from_millis(5));
@@ -109,6 +126,7 @@ impl MockServer {
         Self {
             base_url,
             requests,
+            routes,
             handle: Some(handle),
             stop,
         }
@@ -116,6 +134,16 @@ impl MockServer {
 
     fn request_paths(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
+    }
+
+    /// Replaces the route table (for the next import against this same server).
+    fn set_routes(&self, routes: HashMap<String, Canned>) {
+        *self.routes.lock().unwrap() = routes;
+    }
+
+    /// Clears the recorded request log (to count one import's requests cleanly).
+    fn clear_requests(&self) {
+        self.requests.lock().unwrap().clear();
     }
 }
 
@@ -128,11 +156,7 @@ impl Drop for MockServer {
     }
 }
 
-fn handle_conn(
-    stream: &mut std::net::TcpStream,
-    routes: &HashMap<String, Canned>,
-    requests: &RequestLog,
-) {
+fn handle_conn(stream: &mut std::net::TcpStream, routes: &SharedRoutes, requests: &RequestLog) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
@@ -171,24 +195,46 @@ fn handle_conn(
 
     requests.lock().unwrap().push(path.clone());
 
-    let canned = routes.get(&path);
-    let response = match canned {
-        Some(c) => {
-            let send_304 = matches!((&c.not_modified_when, &if_none_match),
-                (Some(stored), Some(sent)) if stored == sent);
-            if send_304 {
-                build_response(304, "", None)
-            } else {
-                build_response(c.status, &c.body, c.etag.as_deref())
+    // GitHub treats `page=1` as the default page, so a route registered without
+    // an explicit page param also answers `…&page=1` / `…?page=1`. Normalize the
+    // first page away before lookup so single-page fixtures keep matching.
+    let lookup = normalize_first_page(&path);
+    let response = {
+        let table = routes.lock().unwrap();
+        match table.get(&lookup) {
+            Some(c) => {
+                let send_304 = matches!((&c.not_modified_when, &if_none_match),
+                    (Some(stored), Some(sent)) if stored == sent);
+                if send_304 {
+                    build_response(304, "", None, None)
+                } else {
+                    // The importer only checks for the presence of a rel="next"
+                    // link to decide whether to continue paging; the host in the
+                    // Link URL is never dereferenced, so a relative path suffices.
+                    let link = c
+                        .link_next_path
+                        .as_deref()
+                        .map(|p| format!("<http://mock{p}>; rel=\"next\""));
+                    build_response(c.status, &c.body, c.etag.as_deref(), link.as_deref())
+                }
             }
+            None => build_response(404, r#"{"message":"Not Found"}"#, None, None),
         }
-        None => build_response(404, r#"{"message":"Not Found"}"#, None),
     };
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
 }
 
-fn build_response(status: u16, body: &str, etag: Option<&str>) -> String {
+/// Strips a trailing `page=1` (the GitHub default page) from a request path so
+/// routes registered without an explicit page param still match page-1 probes.
+fn normalize_first_page(path: &str) -> String {
+    path.strip_suffix("&page=1")
+        .or_else(|| path.strip_suffix("?page=1"))
+        .unwrap_or(path)
+        .to_owned()
+}
+
+fn build_response(status: u16, body: &str, etag: Option<&str>, link: Option<&str>) -> String {
     let reason = match status {
         200 => "OK",
         304 => "Not Modified",
@@ -202,6 +248,9 @@ fn build_response(status: u16, body: &str, etag: Option<&str>) -> String {
     );
     if let Some(e) = etag {
         headers.push_str(&format!("ETag: {e}\r\n"));
+    }
+    if let Some(l) = link {
+        headers.push_str(&format!("Link: {l}\r\n"));
     }
     headers.push_str("\r\n");
     headers.push_str(body);
@@ -537,15 +586,14 @@ fn unchanged_reimport_is_byte_stable_and_creates_no_duplicates() {
 
 #[test]
 fn changed_issue_reimport_emits_only_changed_records() {
-    // First import with the canonical fixture.
+    // One server (stable base URL) serves both imports, so the persisted state
+    // is reused across runs.
     let tmp = TempDir::new().unwrap();
     let out = tmp.path().join("graph.jsonl");
     let state = tmp.path().join("state.json");
-    {
-        let server = MockServer::start(full_routes());
-        let (_, _, ok) = run_import(&server.base_url, &out, &state, &[]);
-        assert!(ok);
-    }
+    let server = MockServer::start(full_routes());
+    let (_, _, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok);
 
     // Second import: issue #2 changed (new ETag + new body + later updated_at);
     // everything else returns its prior ETag (→ 304).
@@ -573,8 +621,8 @@ fn changed_issue_reimport_emits_only_changed_records() {
         "/repos/o/r/issues?state=all&per_page=100".to_owned(),
         Canned::ok(&changed_issues, "\"issues-v2\""), // new ETag → 200 not 304
     );
+    server.set_routes(routes);
 
-    let server = MockServer::start(routes);
     let (jsonl, _, ok) = run_import(&server.base_url, &out, &state, &[]);
     assert!(ok);
 
@@ -813,27 +861,25 @@ fn unchanged_reimport_sends_only_conditional_probes() {
     let out = tmp.path().join("graph.jsonl");
     let state = tmp.path().join("state.json");
 
-    // Fresh import to populate ETags.
-    {
-        let server = MockServer::start(full_routes());
-        let (_, _, ok) = run_import(&server.base_url, &out, &state, &[]);
-        assert!(ok);
-    }
-
-    // Re-import: every endpoint returns 304. Count requests.
+    // One server so the second run reuses the persisted ETags.
     let server = MockServer::start(full_routes());
     let (_, _, ok) = run_import(&server.base_url, &out, &state, &[]);
     assert!(ok);
 
+    // Re-import: every endpoint returns 304. Count only this run's requests.
+    server.clear_requests();
+    let (_, _, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok);
+
     let paths = server.request_paths();
-    // 1 repo probe + the conditional endpoint probes; all single-page.
+    // 1 repo probe + one conditional probe per stored single-page endpoint.
     // Endpoints: issues, pulls, labels, issue comments, pr review comments.
     // (Per-PR reviews fire only when the pulls list changed; here pulls=304.)
     assert!(paths.iter().any(|p| p == "/repos/o/r"), "repo probe issued");
     assert!(
         paths
             .iter()
-            .any(|p| p == "/repos/o/r/issues?state=all&per_page=100"),
+            .any(|p| p.starts_with("/repos/o/r/issues?state=all&per_page=100")),
         "issues probe issued"
     );
     // No per-PR review fetch on an unchanged re-import.
@@ -841,4 +887,95 @@ fn unchanged_reimport_sends_only_conditional_probes() {
         !paths.iter().any(|p| p.contains("/pulls/7/reviews")),
         "no per-PR review fetch when pulls unchanged"
     );
+    // Budget: exactly one request per endpoint (no duplicate/extra page probes).
+    // 1 repo + 5 active endpoints (issues, pulls, labels, issue comments, pr
+    // review comments) = 6 total on a single-page unchanged re-import.
+    assert_eq!(paths.len(), 6, "unchanged re-import budget: got {paths:?}");
+}
+
+// ── Multi-page ETag probing: a 304 on page 1 must NOT skip a changed page 2 ───────
+
+#[test]
+fn paginated_reimport_probes_every_stored_page() {
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("graph.jsonl");
+    let state = tmp.path().join("state.json");
+
+    // Build a two-page /issues fixture. Page 1 advertises a `next` link to page 2.
+    let issue = |n: u64, updated: &str| {
+        serde_json::json!({
+            "number": n, "title": format!("Issue {n}"), "body": "b",
+            "state":"open","labels":[],"assignees":[],"user":{"login":"u"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":updated,
+            "html_url":format!("https://github.com/o/r/issues/{n}")
+        })
+    };
+    let page1_v1 = serde_json::Value::Array(vec![issue(1, "2026-01-02T00:00:00Z")]).to_string();
+    let page2_v1 = serde_json::Value::Array(vec![issue(2, "2026-01-02T00:00:00Z")]).to_string();
+
+    let page1_key = "/repos/o/r/issues?state=all&per_page=100".to_owned();
+    let page2_key = "/repos/o/r/issues?state=all&per_page=100&page=2".to_owned();
+    let next_path = "/repos/o/r/issues?state=all&per_page=100&page=2";
+
+    let mut routes = full_routes();
+    // Replace the single-page issues route with two explicit pages; page 1
+    // advertises a rel="next" link to page 2.
+    routes.remove("/repos/o/r/issues?state=all&per_page=100");
+    routes.insert(
+        page1_key.clone(),
+        Canned::ok_with_next(&page1_v1, "\"issues-p1-v1\"", next_path),
+    );
+    routes.insert(page2_key.clone(), Canned::ok(&page2_v1, "\"issues-p2-v1\""));
+
+    let server = MockServer::start(routes);
+    let (first, _, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok);
+    // Both pages' issues imported on the first run. full_routes() also has one
+    // PR (#7), so count issue Tasks specifically: #1 (page 1) + #2 (page 2).
+    let issue_tasks = |jsonl: &str| {
+        nodes_of_kind(jsonl, "Task")
+            .into_iter()
+            .filter(|t| t["source_kind"] == "github_issue")
+            .count()
+    };
+    assert_eq!(issue_tasks(&first), 2, "first import: both pages' issues");
+
+    // Second import: page 1 unchanged (same ETag → 304), page 2 CHANGED (new
+    // ETag + issue #2 updated). The importer must still probe page 2 and emit
+    // only issue #2.
+    let page2_v2 = serde_json::Value::Array(vec![issue(2, "2026-03-01T00:00:00Z")]).to_string();
+    let mut routes2 = full_routes();
+    routes2.remove("/repos/o/r/issues?state=all&per_page=100");
+    routes2.insert(
+        page1_key,
+        // Same ETag → 304 (its rel="next" cannot be read from a 304, so
+        // continuation relies on the stored page-2 ETag in state).
+        Canned::ok_with_next(&page1_v1, "\"issues-p1-v1\"", next_path),
+    );
+    routes2.insert(page2_key, Canned::ok(&page2_v2, "\"issues-p2-v2\"")); // new ETag → 200
+    server.set_routes(routes2);
+    server.clear_requests();
+
+    let (second, _, ok) = run_import(&server.base_url, &out, &state, &[]);
+    assert!(ok);
+
+    // Page 2 MUST have been probed even though page 1 returned 304.
+    let paths = server.request_paths();
+    assert!(
+        paths.iter().any(|p| p.contains("page=2")),
+        "page 2 must be probed despite page-1 304: {paths:?}"
+    );
+    // Only the changed issue (#2) re-emits a Task; issue #1 (page 1) does not.
+    // (All other endpoints return 304, so the only issue Task is #2.)
+    let issue_task_summaries: Vec<String> = nodes_of_kind(&second, "Task")
+        .into_iter()
+        .filter(|t| t["source_kind"] == "github_issue")
+        .map(|t| t["summary"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(
+        issue_task_summaries.len(),
+        1,
+        "only the changed page's issue re-emits: {issue_task_summaries:?}"
+    );
+    assert!(issue_task_summaries[0].contains("#2"));
 }

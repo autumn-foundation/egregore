@@ -446,6 +446,7 @@ fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
         in_reply_to_id: None,
         author: None,
         diff_hunk_handle: None,
+        review_side: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,
     }
@@ -552,6 +553,7 @@ fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> Grap
         in_reply_to_id: None,
         author: None,
         diff_hunk_handle: None,
+        review_side: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,
     }
@@ -859,6 +861,7 @@ pub fn build_observation_records(
         in_reply_to_id: None,
         author: None,
         diff_hunk_handle: None,
+        review_side: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };
@@ -1081,6 +1084,7 @@ pub fn build_command_evidence_records(
         in_reply_to_id: None,
         author: None,
         diff_hunk_handle: None,
+        review_side: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };
@@ -1314,6 +1318,7 @@ pub fn build_artifact_records(
         in_reply_to_id: None,
         author: None,
         diff_hunk_handle: None,
+        review_side: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };
@@ -1521,6 +1526,7 @@ pub fn build_verification_records(
         in_reply_to_id: None,
         author: None,
         diff_hunk_handle: None,
+        review_side: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };

@@ -827,6 +827,11 @@ pub enum GraphRecord {
         /// Redacted diff-hunk handle for `pr_review_comment` records.
         #[serde(skip_serializing_if = "Option::is_none")]
         diff_hunk_handle: Option<Box<OutputHandle>>,
+        /// Diff side for `pr_review_comment` records: `LEFT` (old file) or
+        /// `RIGHT` (new file). Disambiguates the source location a path/line
+        /// pair refers to. Plaintext query substrate; never redacted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        review_side: Option<String>,
         /// User-context domain fields, flattened into node JSON.
         #[serde(flatten)]
         user_context: UserContextFields,
@@ -992,6 +997,7 @@ impl GraphRecord {
             in_reply_to_id: None,
             author: None,
             diff_hunk_handle: None,
+            review_side: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1095,6 +1101,7 @@ impl GraphRecord {
             in_reply_to_id: None,
             author: None,
             diff_hunk_handle: None,
+            review_side: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1197,6 +1204,7 @@ impl GraphRecord {
             in_reply_to_id: None,
             author: None,
             diff_hunk_handle: None,
+            review_side: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
