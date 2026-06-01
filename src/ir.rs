@@ -807,6 +807,31 @@ pub enum GraphRecord {
         /// `passed`, `failed`, `errored`, `skipped`, or `inconclusive`.
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        // ── GitHub project.Review fields (docs/schema/import-github.md §6) ────
+        /// Review kind for `project.Review` records imported from GitHub:
+        /// `issue_comment`, `pr_review`, or `pr_review_comment`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        review_kind: Option<String>,
+        /// PR review summary state for `pr_review` records:
+        /// `approved`, `changes_requested`, `commented`, `dismissed`, or `pending`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        review_state: Option<String>,
+        /// Parent review-comment record ID for threaded `pr_review_comment`
+        /// records (`in_reply_to_id` chain); absent on thread roots.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        in_reply_to_id: Option<String>,
+        /// Author login for GitHub-sourced records. Plaintext query substrate
+        /// per `docs/schema/import-github.md` §8; never redacted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        author: Option<String>,
+        /// Redacted diff-hunk handle for `pr_review_comment` records.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diff_hunk_handle: Option<Box<OutputHandle>>,
+        /// Diff side for `pr_review_comment` records: `LEFT` (old file) or
+        /// `RIGHT` (new file). Disambiguates the source location a path/line
+        /// pair refers to. Plaintext query substrate; never redacted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        review_side: Option<String>,
         /// User-context domain fields, flattened into node JSON.
         #[serde(flatten)]
         user_context: UserContextFields,
@@ -967,6 +992,12 @@ impl GraphRecord {
             executed_at: None,
             verification_kind: None,
             status: None,
+            review_kind: None,
+            review_state: None,
+            in_reply_to_id: None,
+            author: None,
+            diff_hunk_handle: None,
+            review_side: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1065,6 +1096,12 @@ impl GraphRecord {
             executed_at: None,
             verification_kind: None,
             status: None,
+            review_kind: None,
+            review_state: None,
+            in_reply_to_id: None,
+            author: None,
+            diff_hunk_handle: None,
+            review_side: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1162,6 +1199,12 @@ impl GraphRecord {
             executed_at: None,
             verification_kind: None,
             status: None,
+            review_kind: None,
+            review_state: None,
+            in_reply_to_id: None,
+            author: None,
+            diff_hunk_handle: None,
+            review_side: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }

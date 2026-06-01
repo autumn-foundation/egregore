@@ -135,6 +135,15 @@ enum Commands {
         #[arg(long)]
         transaction_time: Option<String>,
     },
+    /// Import work items from an external source into project-graph JSONL.
+    ///
+    /// Documented in `docs/cli/github-import.md` and the policy in
+    /// `docs/schema/import-github.md`.
+    Import {
+        /// Import source.
+        #[command(subcommand)]
+        source: ImportSource,
+    },
     /// Link imported agent evidence to code-graph facts.
     ///
     /// Reads a code-graph JSONL (from `scan`) and an agent-evidence JSONL
@@ -198,6 +207,45 @@ enum Commands {
         /// Daemon action.
         #[command(subcommand)]
         action: DaemonAction,
+    },
+}
+
+/// Subcommands for `import`.
+#[derive(Debug, Subcommand)]
+enum ImportSource {
+    /// Import one GitHub repository's issues, pull requests, comments, and reviews.
+    ///
+    /// Local-first and explicit: fetches over the REST API, writes a JSONL
+    /// handoff plus an idempotency state file, then exits. Never runs in the
+    /// daemon, polls, subscribes to webhooks, or crawls beyond `<owner>/<repo>`.
+    ///
+    /// Auth (closed enumeration): `GH_TOKEN`, then `GITHUB_TOKEN`, then
+    /// `--token-file`, then `gh auth token`. Failures exit non-zero with a
+    /// stable `{"code":"github_..."}` diagnostic that never echoes the token.
+    Github {
+        /// `<owner>/<repo>` to import.
+        repo: String,
+        /// Output JSONL handoff path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Idempotency state file. Defaults to `<out-dir>/.github-import-state.json`.
+        #[arg(long)]
+        state_file: Option<PathBuf>,
+        /// Seeded code-graph JSONL (from `scan`) for `TOUCHES_FILE` resolution.
+        #[arg(long)]
+        code_graph: Option<PathBuf>,
+        /// Operator-managed token file (read at import time; never logged).
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// API base URL override (for testing against a local mock server).
+        #[arg(long)]
+        api_base: Option<String>,
+        /// Fixed RFC 3339 transaction time for deterministic output (tests).
+        #[arg(long)]
+        transaction_time: Option<String>,
+        /// Skip rate-limit/retry backoff sleeps (tests only).
+        #[arg(long, hide = true)]
+        no_backoff: bool,
     },
 }
 
@@ -606,6 +654,27 @@ fn run_cli(cli: Cli) -> Result<()> {
             repo_root.as_deref(),
             transaction_time.as_deref(),
         ),
+        Commands::Import { source } => match source {
+            ImportSource::Github {
+                repo,
+                out,
+                state_file,
+                code_graph,
+                token_file,
+                api_base,
+                transaction_time,
+                no_backoff,
+            } => import_github_cmd(
+                &repo,
+                &out,
+                state_file.as_deref(),
+                code_graph.as_deref(),
+                token_file.as_deref(),
+                api_base.as_deref(),
+                transaction_time.as_deref(),
+                no_backoff,
+            ),
+        },
         Commands::LinkEvidence {
             code_graph,
             evidence,
@@ -854,6 +923,100 @@ fn import_local_tasks_cmd(
         tasks_path.display()
     );
     Ok(())
+}
+
+/// Handles `eg import github <owner>/<repo>`.
+///
+/// On failure, prints a scrubbed machine-readable `{"code":"github_..."}` line
+/// to stderr and exits non-zero. The handoff JSONL and state file are written
+/// only on success, so an auth/rate-limit failure leaves no partial state
+/// (`docs/schema/import-github.md` §5).
+#[allow(clippy::too_many_arguments)]
+fn import_github_cmd(
+    repo: &str,
+    out: &Path,
+    state_file: Option<&Path>,
+    code_graph: Option<&Path>,
+    token_file: Option<&Path>,
+    api_base: Option<&str>,
+    transaction_time: Option<&str>,
+    no_backoff: bool,
+) -> Result<()> {
+    use crate::github::{
+        client::scrub_line,
+        error::GithubError,
+        import::{ImportOptions, run_import},
+        state::State,
+    };
+
+    // Validate the repo argument shape before any network work.
+    if repo.split('/').filter(|s| !s.is_empty()).count() != 2 || repo.matches('/').count() != 1 {
+        let e = GithubError::InvalidRepoArg {
+            arg: repo.to_owned(),
+        };
+        eprintln!("{}", scrub_line(&format!(r#"{{"code":"{}"}}"#, e.code())));
+        eprintln!("{}", scrub_line(&e.to_string()));
+        process::exit(1);
+    }
+
+    let api_base = api_base.map_or_else(
+        || crate::github::client::DEFAULT_API_BASE.to_owned(),
+        str::to_owned,
+    );
+
+    // Default state-file path: alongside the handoff output.
+    let default_state = out
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".github-import-state.json");
+    let state_path = state_file.map_or(default_state, Path::to_path_buf);
+
+    let prior_state = State::load_or_fresh(&state_path, repo, &api_base);
+
+    let opts = ImportOptions {
+        source_repo: repo,
+        api_base,
+        token_file,
+        code_graph,
+        transaction_time: transaction_time.map(str::to_owned),
+        no_backoff,
+    };
+
+    match run_import(&opts, prior_state) {
+        Ok(outcome) => {
+            fs::write(out, &outcome.jsonl)
+                .with_context(|| format!("failed to write handoff JSONL to {}", out.display()))?;
+            outcome
+                .state
+                .save(&state_path)
+                .with_context(|| format!("failed to write state file {}", state_path.display()))?;
+            let q = outcome
+                .summary
+                .quota_remaining
+                .map_or_else(|| "unknown".to_owned(), |v| v.to_string());
+            // Per-run summary (scrubbed) to stderr per §4.
+            eprintln!(
+                "{}",
+                scrub_line(&format!(
+                    "egregore-github-import: requests={} quota_remaining={} elapsed={:.2}s",
+                    outcome.summary.requests, q, outcome.summary.elapsed_secs
+                ))
+            );
+            println!(
+                "imported {} records from {} into {}",
+                outcome.summary.emitted_records,
+                repo,
+                out.display()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Machine-readable, token-scrubbed diagnostic; no partial state write.
+            eprintln!("{}", scrub_line(&format!(r#"{{"code":"{}"}}"#, e.code())));
+            eprintln!("{}", scrub_line(&e.to_string()));
+            process::exit(1);
+        }
+    }
 }
 
 fn import_codex_cmd(codex_path: &Path, out: &Path) -> Result<()> {

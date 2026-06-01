@@ -186,6 +186,12 @@ fn make_agent_memory_node(
         executed_at: None,
         verification_kind: None,
         status: None,
+        review_kind: None,
+        review_state: None,
+        in_reply_to_id: None,
+        author: None,
+        diff_hunk_handle: None,
+        review_side: None,
         user_context: aletheia_egregore::UserContextFields::empty(),
         producer: None,
     }

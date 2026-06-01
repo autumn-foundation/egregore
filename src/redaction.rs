@@ -197,6 +197,7 @@ fn check_sensitive_fields(record: &GraphRecord) -> Result<()> {
         patch_handle,
         title,
         body_handle,
+        diff_hunk_handle,
         assignees,
         labels,
         url,
@@ -230,6 +231,9 @@ fn check_sensitive_fields(record: &GraphRecord) -> Result<()> {
     check_field("title", title.as_deref())?;
     if let Some(h) = body_handle {
         check_field("body_handle.inline", h.inline.as_deref())?;
+    }
+    if let Some(h) = diff_hunk_handle {
+        check_field("diff_hunk_handle.inline", h.inline.as_deref())?;
     }
     check_field("url", url.as_deref())?;
     if let Some(items) = assignees {
@@ -281,6 +285,9 @@ fn check_sensitive_fields(record: &GraphRecord) -> Result<()> {
         check_marker_field("title", title.as_deref())?;
         if let Some(h) = body_handle {
             check_marker_field("body_handle.inline", h.inline.as_deref())?;
+        }
+        if let Some(h) = diff_hunk_handle {
+            check_marker_field("diff_hunk_handle.inline", h.inline.as_deref())?;
         }
         check_marker_field("url", url.as_deref())?;
         if let Some(items) = assignees {

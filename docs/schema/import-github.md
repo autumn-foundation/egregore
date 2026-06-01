@@ -279,6 +279,17 @@ as a missing state file.
 
 ## 6 - GitHub-to-Record-Shape Mapping
 
+> **Implementation status (issue #46):** the `Review` kind has since been
+> promoted from reserved. The shipped `eg import github` importer now emits
+> `Task` + `ExternalLink` per issue/PR **and** `project.Review` records for
+> issue comments (`review_kind: issue_comment`), PR review summaries
+> (`pr_review`), and PR review comments (`pr_review_comment`), wired with
+> `REFERENCES_TASK` and (for file-anchored review comments resolvable against a
+> seeded code graph) `TOUCHES_FILE` edges. The "v1 emission scope" table below
+> records the original first-slice plan; the deferral notes it contains are
+> superseded by the #46 slice. The workflow is documented in
+> [`docs/cli/github-import.md`](../cli/github-import.md).
+
 Single normative reference. The target record kinds are defined in
 [`docs/schema/project-graph.md`](project-graph.md).
 
@@ -422,8 +433,9 @@ implemented in v1:
 |----------------|-----------|----------------------|
 | Multi-repo org import | `--org <name>` | Org-scoped import expands the network boundary and rate-limit budget non-trivially; requires its own ADR |
 | Multi-repo file input | `--file <repos.txt>` | Convenience wrapper over `--org`; blocked on the same boundary review |
+| Webhook / review-agent receiver | (separate push-import surface) | A future capability where GitHub pushes events to a long-lived receiver so an agent can respond to review comments. This is a **push** surface, distinct from this **pull** importer, and is exactly the `watch mode` reserved in section 1. It requires its own ADR and network-boundary review, would carry its own auth model (App JWT + installation tokens + webhook-secret HMAC), and is a candidate consumer of a GitHub App SDK (e.g. `github-bot-sdk`). It MUST NOT be wired into this token-based pull importer. |
 
-Both slices MUST NOT be wired to the daemon process when they ship.
+Both org/file slices MUST NOT be wired to the daemon process when they ship.
 
 ---
 

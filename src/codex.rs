@@ -1598,6 +1598,12 @@ fn make_node(
         executed_at: None,
         verification_kind: None,
         status: extra.status,
+        review_kind: None,
+        review_state: None,
+        in_reply_to_id: None,
+        author: None,
+        diff_hunk_handle: None,
+        review_side: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,
     }

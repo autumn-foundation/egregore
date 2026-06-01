@@ -4,6 +4,8 @@
 # Generated egregore stores and graph snapshots
 *.jsonl
 !tests/fixtures/**/*.jsonl
+# GitHub importer idempotency state (operator-local, never committed)
+.github-import-state.json
 # Ignore all .egregore* directories (runtime data, caches, variant stores)
 # then carve out the tasks directory so project JSONL files can be tracked.
 .egregore*/
