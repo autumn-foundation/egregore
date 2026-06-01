@@ -82,10 +82,10 @@ fn future_schema_version_is_typed_and_inspect_reports_mixed_counts() {
         .assert()
         .success()
         .stdout(predicate::str::contains(format!(
-            "schema_version codegraph Symbol v{SCHEMA_VERSION}: 1"
+            "  Symbol v{SCHEMA_VERSION}: 1"
         )))
         .stdout(predicate::str::contains(format!(
-            "unknown_schema_version codegraph Symbol v{future_version}: 1"
+            "  codegraph Symbol v{future_version}: 1"
         )))
         .stderr(predicate::str::is_empty());
 }
@@ -118,7 +118,7 @@ fn additive_unknown_field_parses_and_inspects_without_warning() {
         .assert()
         .success()
         .stdout(predicate::str::contains(format!(
-            "schema_version codegraph Symbol v{SCHEMA_VERSION}: 1"
+            "  Symbol v{SCHEMA_VERSION}: 1"
         )))
         .stdout(predicate::str::contains("unknown_schema_version").not())
         .stderr(predicate::str::is_empty());

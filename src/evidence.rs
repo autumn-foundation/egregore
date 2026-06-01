@@ -1099,11 +1099,7 @@ pub fn build_artifact_records(
     }
     // Applied statuses imply a known base — unknown_base_reason is only for unverified/invalid.
     if APPLIED_STATUSES.contains(&req.patch_status.as_str())
-        && req
-            .base_commit
-            .as_deref()
-            .filter(|bc| !bc.is_empty())
-            .is_none()
+        && req.base_commit.as_deref().is_none_or(str::is_empty)
     {
         return Err(ProvenanceError::missing("base_commit"));
     }

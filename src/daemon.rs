@@ -1512,6 +1512,26 @@ impl DaemonClient {
         serde_json::from_str(&body).context("failed to parse daemon status response")
     }
 
+    /// Fetches all records from the daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon does not respond successfully or the
+    /// response cannot be parsed.
+    pub fn get_all_records(&self) -> Result<Vec<GraphRecord>> {
+        let (status, body) = self.request("GET", "/v1/records", None, CLIENT_TIMEOUT, true)?;
+        if status != 200 {
+            return Err(anyhow!(
+                "daemon get_all_records failed with HTTP {status}: {body}"
+            ));
+        }
+        let envelope: serde_json::Value =
+            serde_json::from_str(&body).context("failed to parse daemon records response")?;
+        let records = serde_json::from_value(envelope["records"].clone())
+            .context("failed to parse records from envelope")?;
+        Ok(records)
+    }
+
     /// Sends a verb query to the daemon and returns the `result.records` array.
     ///
     /// `verb` must be one of the documented verbs in `docs/schema/daemon-query.md`.
@@ -6524,6 +6544,7 @@ fn handle_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         ("POST", "/v1/agents/heartbeat") => handle_agent_heartbeat(request, state),
         ("POST", "/v1/jobs/ingest") => handle_job_ingest(request, state),
         ("POST", "/v1/admin/checkpoint") => handle_checkpoint(state),
+        ("GET", "/v1/records") => handle_get_all_records(state),
         _ if request.method == "GET" && request.path.starts_with("/v1/records/") => {
             let record_id = request.path.trim_start_matches("/v1/records/");
             handle_get_record(record_id, state)
@@ -6560,6 +6581,18 @@ fn handle_status(state: &ServerState) -> HttpResponse {
             "pressure": state.pressure.snapshot_json(),
         }),
     )
+}
+
+fn handle_get_all_records(state: &ServerState) -> HttpResponse {
+    let Ok(sink) = state.sink.read() else {
+        return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
+    };
+    let records = match sink.read_all_records() {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::error(adapter_read_error_to_api(e)),
+    };
+    drop(sink);
+    HttpResponse::json(200, json!({ "records": records }))
 }
 
 fn handle_ingest(request: &HttpRequest, state: &ServerState) -> HttpResponse {
