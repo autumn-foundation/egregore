@@ -6593,7 +6593,7 @@ fn handle_get_all_records(state: &ServerState) -> HttpResponse {
         return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
     };
     let snapshot_timestamp = chrono::Utc::now().to_rfc3339();
-    let records = match sink.read_all_records() {
+    let records = match sink.inspect_all_records() {
         Ok(r) => r,
         Err(e) => return HttpResponse::error(adapter_read_error_to_api(e)),
     };

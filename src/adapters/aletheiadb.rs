@@ -564,6 +564,66 @@ impl EmbeddedAletheiaSink {
         Ok(records)
     }
 
+    /// Reads all physical records stored in the database for inspection.
+    /// This retrieves every single node, tombstone, and edge physically stored in `AletheiaDB`
+    /// without temporal deduplication, tombstone filtering, or schema version validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a physical record cannot be read.
+    pub fn inspect_all_records(&self) -> AdapterResult<Vec<GraphRecord>> {
+        let mut records = Vec::new();
+
+        // 1. Iterate over every single physical node in AletheiaDB
+        for node_id in self.db.get_all_node_ids() {
+            let node = self
+                .db
+                .get_node(node_id)
+                .map_err(|error| read_back_error("inspect_all_records", error.to_string()))?;
+            let Some(record_id) = optional_str_property(
+                "inspect_all_records",
+                "codegraph_id",
+                node.get_property("codegraph_id"),
+            )?
+            else {
+                continue;
+            };
+
+            let record_type = optional_str_property(
+                "inspect_all_records",
+                "record_type",
+                node.get_property("record_type"),
+            )?;
+
+            if record_type.as_deref() == Some("tombstone") {
+                records.push(self.read_tombstone_record_internal(&record_id, node_id)?);
+            } else {
+                records.push(self.read_node_record_internal(&record_id, node_id)?);
+            }
+        }
+
+        // 2. Iterate over every single physical edge in AletheiaDB
+        for node_id in self.db.get_all_node_ids() {
+            for edge_id in self.db.get_outgoing_edges(node_id) {
+                let edge = self
+                    .db
+                    .get_edge(edge_id)
+                    .map_err(|error| read_back_error("inspect_all_records", error.to_string()))?;
+                let Some(codegraph_id) = optional_str_property(
+                    "inspect_all_records",
+                    "codegraph_id",
+                    edge.get_property("codegraph_id"),
+                )?
+                else {
+                    continue;
+                };
+                records.push(self.read_edge_record_internal(&codegraph_id, edge_id)?);
+            }
+        }
+
+        Ok(records)
+    }
+
     /// Reads a graph record back by stable ID.
     ///
     /// # Errors
@@ -1780,7 +1840,7 @@ impl EmbeddedAletheiaSink {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn read_node_record(
+    fn read_node_record_internal(
         &self,
         record_id: &str,
         node_id: ::aletheiadb::NodeId,
@@ -2241,11 +2301,20 @@ impl EmbeddedAletheiaSink {
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("producer_json invalid: {e}")))?,
         };
+        Ok(record)
+    }
+
+    fn read_node_record(
+        &self,
+        record_id: &str,
+        node_id: ::aletheiadb::NodeId,
+    ) -> AdapterResult<GraphRecord> {
+        let record = self.read_node_record_internal(record_id, node_id)?;
         validate_adapter_record_version(&record)?;
         Ok(record)
     }
 
-    fn read_tombstone_record(
+    fn read_tombstone_record_internal(
         &self,
         record_id: &str,
         node_id: ::aletheiadb::NodeId,
@@ -2294,11 +2363,20 @@ impl EmbeddedAletheiaSink {
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("producer_json invalid: {e}")))?,
         };
+        Ok(record)
+    }
+
+    fn read_tombstone_record(
+        &self,
+        record_id: &str,
+        node_id: ::aletheiadb::NodeId,
+    ) -> AdapterResult<GraphRecord> {
+        let record = self.read_tombstone_record_internal(record_id, node_id)?;
         validate_adapter_record_version(&record)?;
         Ok(record)
     }
 
-    fn read_edge_record(
+    fn read_edge_record_internal(
         &self,
         record_id: &str,
         edge_id: ::aletheiadb::EdgeId,
@@ -2354,6 +2432,15 @@ impl EmbeddedAletheiaSink {
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("producer_json invalid: {e}")))?,
         };
+        Ok(record)
+    }
+
+    fn read_edge_record(
+        &self,
+        record_id: &str,
+        edge_id: ::aletheiadb::EdgeId,
+    ) -> AdapterResult<GraphRecord> {
+        let record = self.read_edge_record_internal(record_id, edge_id)?;
         validate_adapter_record_version(&record)?;
         Ok(record)
     }
