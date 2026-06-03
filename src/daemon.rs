@@ -9268,6 +9268,29 @@ fn metadata_path(data_dir: &Path) -> PathBuf {
     runtime_dir(data_dir).join(METADATA_FILE)
 }
 
+/// Reads daemon metadata without staleness validation.
+///
+/// Returns `None` if the metadata file does not exist.
+/// Unlike `read_metadata`, this does not reject stale or crashed metadata.
+/// It is intended for diagnostic and repair use only.
+///
+/// # Errors
+///
+/// Returns an error if the metadata file exists but cannot be read or parsed.
+pub fn try_read_raw_metadata(data_dir: &Path) -> Result<Option<DaemonMetadata>> {
+    let path = metadata_path(data_dir);
+    reject_runtime_symlink_components(&path, "runtime file")?;
+    match fs::read_to_string(&path) {
+        Ok(contents) => {
+            let metadata = serde_json::from_str(&contents)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+            Ok(Some(metadata))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
 /// Returns the v1 runtime sidecar directory for a daemon data directory.
 #[must_use]
 pub fn runtime_dir_for_data_dir(data_dir: &Path) -> PathBuf {
@@ -9301,6 +9324,45 @@ pub fn runtime_metadata_is_stale(data_dir: &Path) -> Result<bool> {
         .open(&path)
         .with_context(|| format!("failed to open {}", path.display()))?;
     enforce_runtime_file_permissions(&path)?;
+    match file.try_lock_shared() {
+        Ok(()) => {
+            let _ = file.unlock();
+            Ok(true)
+        }
+        Err(error) if lock_error_is_contention(&error) => Ok(false),
+        Err(error) => Err(io::Error::from(error))
+            .with_context(|| format!("failed to inspect runtime lock {}", path.display())),
+    }
+}
+
+/// Returns true when metadata exists but the daemon lock is not held, WITHOUT
+/// creating the runtime directory or lock file.
+///
+/// Unlike [`runtime_metadata_is_stale`], this never opens the lock file with
+/// `create(true)`, so it is safe for the zero-mutation repair preflight/dry-run
+/// path. A missing lock file is treated as "not held" (unleased), since no
+/// process can hold a lock on a file that does not exist.
+///
+/// # Errors
+///
+/// Returns an error if the lock file exists but cannot be opened or inspected.
+pub fn runtime_metadata_is_stale_noncreating(data_dir: &Path) -> Result<bool> {
+    let metadata_path = metadata_path(data_dir);
+    reject_runtime_symlink_components(&metadata_path, "runtime file")?;
+    if !metadata_path.exists() {
+        return Ok(false);
+    }
+    let path = runtime_dir(data_dir).join(LOCK_FILE);
+    if !path.exists() {
+        // Metadata exists but no lock file: no process can hold the lease.
+        return Ok(true);
+    }
+    reject_runtime_symlink(&path, "runtime file")?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).truncate(false);
+    let file = options
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
     match file.try_lock_shared() {
         Ok(()) => {
             let _ = file.unlock();

@@ -45,6 +45,9 @@ pub mod parser;
 pub mod query;
 /// Redaction policy engine (`docs/schema/redaction.md` v1).
 pub mod redaction;
+/// Offline repair workflow for Egregore stores (issue #49).
+#[cfg(feature = "embedded-aletheiadb")]
+pub mod repair;
 /// Record schema-version compatibility checks.
 pub mod schema_version;
 /// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
