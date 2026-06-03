@@ -322,6 +322,8 @@ struct TurnData {
     turn_index: u64,
     timestamp: Option<String>,
     usage: Option<ClaudeCodeUsage>,
+    /// Text content blocks from the assistant turn, concatenated.
+    prose: Option<String>,
     tool_calls: Vec<ToolCallSlot>,
     /// Maps `tool_use_id` → index in `tool_calls` for result correlation.
     id_to_slot: HashMap<String, usize>,
@@ -362,10 +364,24 @@ fn group_events(events: Vec<(usize, ClaudeCodeEvent)>) -> GroupedEvents {
                 }
                 let turn_index = turns.len() as u64;
                 let usage = ae.usage.or_else(|| ae.message.usage.clone());
+                let prose_parts: Vec<&str> = ae
+                    .message
+                    .content
+                    .iter()
+                    .filter(|b| b.block_type == "text")
+                    .filter_map(|b| b.text.as_deref())
+                    .filter(|s| !s.trim().is_empty())
+                    .collect();
+                let prose = if prose_parts.is_empty() {
+                    None
+                } else {
+                    Some(prose_parts.join("\n"))
+                };
                 let mut turn = TurnData {
                     turn_index,
                     timestamp: ae.timestamp.clone(),
                     usage,
+                    prose,
                     tool_calls: Vec::new(),
                     id_to_slot: HashMap::new(),
                 };
@@ -759,6 +775,8 @@ fn emit_turn(
             observed_at: Some(turn_timestamp.clone()),
             turn_index: Some(turn_index),
             agent_kind: Some("claude-code".to_owned()),
+            // Redacted assistant prose stored for audit; None for tool-call-only turns.
+            text: turn.prose.as_deref().map(|p| redact(p, opts)),
             ..Default::default()
         },
     ));
@@ -898,15 +916,28 @@ fn emit_tool_action(
     // Choose a human-readable command summary for the tool call.
     let cmd_summary = if tool_name == "Bash" {
         redacted_cmd
+    } else if let Some(path) = extract_file_path(tool_name, &slot.input) {
+        // File-targeting tools: use the path as the summary.
+        path
     } else {
-        // For non-Bash tools, use the file path or a minimal description.
-        extract_file_path(tool_name, &slot.input).unwrap_or_else(|| format!("{tool_name} call"))
+        // Other tools (Grep, Glob, WebFetch, Agent, …): serialize the tool input
+        // as a compact JSON summary so real arguments are recoverable from audits.
+        let raw = serde_json::to_string(&slot.input).unwrap_or_default();
+        redact(&raw, opts)
     };
 
     let tool_kind = tool_kind_for(tool_name, &cmd);
 
+    // result_handle carries the tool output for non-Bash tools (Bash uses CommandRun.stdout_handle).
+    let tool_result_handle = if tool_name == "Bash" {
+        None
+    } else {
+        result_text.as_deref().map(|s| Box::new(output_handle(s)))
+    };
+    // Only link produced_evidence_id when a result has actually been observed.
+    let has_result = slot.result.is_some();
+
     // ── ToolCall ──────────────────────────────────────────────────────────────
-    // produced_evidence_id links to the CommandRun in the verification domain.
     graph.push(make_node(
         tool_call_id.clone(),
         NodeKind::ToolCall,
@@ -924,7 +955,8 @@ fn emit_tool_action(
             finished_at,
             status: Some(status_str.to_owned()),
             agent_kind: Some("claude-code".to_owned()),
-            produced_evidence_id: (tool_name == "Bash").then(|| cmd_run_id.clone()),
+            result_handle: tool_result_handle,
+            produced_evidence_id: (tool_name == "Bash" && has_result).then(|| cmd_run_id.clone()),
             ..Default::default()
         },
     ));
@@ -936,11 +968,14 @@ fn emit_tool_action(
         ctx,
     ));
 
-    // ── CommandRun (Bash only, verification domain) ───────────────────────────
+    // ── CommandRun (Bash only, verification domain, result required) ─────────
+    // Only emit CommandRun when a tool_result has been observed (has_result).
+    // Truncated transcripts where the Bash call has no matching tool_result must
+    // not produce command evidence, since no execution outcome is known.
     // CommandRun is placed in the verification domain so that the PRODUCED_EVIDENCE
     // edge from ToolCall satisfies the verification:v1: target-prefix constraint
     // enforced by validate_agent_memory_edge_endpoints.
-    if tool_name == "Bash" {
+    if tool_name == "Bash" && has_result {
         graph.push(make_node(
             cmd_run_id.clone(),
             NodeKind::CommandRun,
@@ -978,19 +1013,28 @@ fn emit_tool_action(
     }
 
     // ── FileEdit ──────────────────────────────────────────────────────────────
-    // Emitted for Edit/Write/MultiEdit/NotebookEdit tools when a file path is known
-    // and the tool call did not fail.
-    if !is_error
+    // Emitted for Edit/Write/MultiEdit/NotebookEdit tools when a successful result
+    // has been observed and a file path is known. Gating on has_result prevents
+    // truncated transcripts (tool_use with no matching tool_result) from recording
+    // an unconfirmed operation as a real file modification.
+    // Write creates a new file; other edit tools modify an existing file.
+    if has_result
+        && !is_error
         && matches!(
             tool_name.as_str(),
             "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
         )
         && let Some(target) = extract_file_path(tool_name, &slot.input)
     {
+        let is_write = tool_name == "Write";
         let file_edit_id =
             agent_memory_stable_id(&["node", "file_edit", turn_id, &action_idx.to_string()]);
-        let before_hash = surrogate_hash(ctx, &target, "before", &cmd_summary);
         let after_hash = surrogate_hash(ctx, &target, "after", &cmd_summary);
+        let before_hash = if is_write {
+            None
+        } else {
+            Some(surrogate_hash(ctx, &target, "before", &cmd_summary))
+        };
         graph.push(make_node(
             file_edit_id.clone(),
             NodeKind::FileEdit,
@@ -1000,8 +1044,8 @@ fn emit_tool_action(
                 observed_at: Some(action_timestamp.clone()),
                 text: Some(cmd_summary),
                 repo_relative_path: Some(target),
-                edit_kind: Some("modify".to_owned()),
-                before_hash: Some(before_hash),
+                edit_kind: Some(if is_write { "create" } else { "modify" }.to_owned()),
+                before_hash,
                 after_hash: Some(after_hash),
                 hunk_count: Some(1),
                 linked_turn_id: Some(turn_id.to_owned()),
@@ -1348,6 +1392,7 @@ struct NodeExtra {
     status: Option<String>,
     stdout_handle: Option<Box<OutputHandle>>,
     stderr_handle: Option<Box<OutputHandle>>,
+    result_handle: Option<Box<OutputHandle>>,
     /// Override the `schema_version` field (default: `AGENT_MEMORY_SCHEMA_VERSION`).
     schema_version_override: Option<u32>,
     /// Override the `domain` field (default: `DOMAIN` = `"agent_memory"`).
@@ -1425,7 +1470,7 @@ fn make_node(
         tool_kind: extra.tool_kind,
         arguments_summary: extra.arguments_summary,
         arguments_handle: extra.arguments_handle,
-        result_handle: None,
+        result_handle: extra.result_handle,
         produced_evidence_id: extra.produced_evidence_id,
         started_at: extra
             .started_at
