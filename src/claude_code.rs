@@ -231,6 +231,21 @@ impl ClaudeCodeUsage {
     }
 }
 
+/// Condensed session summary event (`type: "summary"`).
+#[derive(Debug, Clone, Default, Deserialize)]
+struct SummaryEvent {
+    /// The condensed context summary produced by the model.
+    #[serde(default)]
+    summary: Option<String>,
+    /// Event timestamp RFC 3339 (best-effort).
+    #[serde(default)]
+    timestamp: Option<String>,
+    /// Session identifier (best-effort).
+    #[serde(default)]
+    #[allow(dead_code)]
+    session_id: Option<String>,
+}
+
 /// A raw event line from a Claude Code transcript JSONL.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -241,8 +256,8 @@ enum ClaudeCodeEvent {
     Assistant(AssistantEvent),
     /// Lifecycle hook event.
     Hook(HookEvent),
-    /// Condensed session summary (treated as unknown).
-    Summary(()),
+    /// Condensed session summary — stored as a Diagnostic with summary text.
+    Summary(SummaryEvent),
     /// Any event kind not listed above — degraded to Diagnostic.
     #[serde(other)]
     Unknown,
@@ -324,6 +339,8 @@ struct TurnData {
     usage: Option<ClaudeCodeUsage>,
     /// Text content blocks from the assistant turn, concatenated.
     prose: Option<String>,
+    /// Preceding plain user-prompt text (not a tool-result block).
+    user_prompt: Option<String>,
     tool_calls: Vec<ToolCallSlot>,
     /// Maps `tool_use_id` → index in `tool_calls` for result correlation.
     id_to_slot: HashMap<String, usize>,
@@ -332,6 +349,7 @@ struct TurnData {
 struct GroupedEvents {
     turns: Vec<TurnData>,
     hook_events: Vec<HookEvent>,
+    summary_events: Vec<(usize, SummaryEvent)>,
     unknown_indices: Vec<usize>,
 }
 
@@ -349,11 +367,14 @@ const fn active_turn_mut<'a>(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn group_events(events: Vec<(usize, ClaudeCodeEvent)>) -> GroupedEvents {
     let mut turns: Vec<TurnData> = Vec::new();
     let mut current_turn: Option<TurnData> = None;
     let mut hook_events: Vec<HookEvent> = Vec::new();
+    let mut summary_events: Vec<(usize, SummaryEvent)> = Vec::new();
     let mut unknown_indices: Vec<usize> = Vec::new();
+    let mut pending_user_prompt: Option<String> = None;
 
     for (line_idx, event) in events {
         match event {
@@ -382,6 +403,7 @@ fn group_events(events: Vec<(usize, ClaudeCodeEvent)>) -> GroupedEvents {
                     timestamp: ae.timestamp.clone(),
                     usage,
                     prose,
+                    user_prompt: pending_user_prompt.take(),
                     tool_calls: Vec::new(),
                     id_to_slot: HashMap::new(),
                 };
@@ -431,16 +453,30 @@ fn group_events(events: Vec<(usize, ClaudeCodeEvent)>) -> GroupedEvents {
                         }
                     }
                 } else {
-                    // Plain human message — flush current turn.
+                    // Plain human message — flush current turn and capture prompt text.
                     if let Some(t) = current_turn.take() {
                         turns.push(t);
+                    }
+                    let text_parts: Vec<&str> = ue
+                        .message
+                        .content
+                        .iter()
+                        .filter(|b| b.block_type == "text")
+                        .filter_map(|b| b.text.as_deref())
+                        .filter(|s| !s.trim().is_empty())
+                        .collect();
+                    if !text_parts.is_empty() {
+                        pending_user_prompt = Some(text_parts.join("\n"));
                     }
                 }
             }
             ClaudeCodeEvent::Hook(he) => {
                 hook_events.push(he);
             }
-            ClaudeCodeEvent::Summary(()) | ClaudeCodeEvent::Unknown => {
+            ClaudeCodeEvent::Summary(se) => {
+                summary_events.push((line_idx, se));
+            }
+            ClaudeCodeEvent::Unknown => {
                 unknown_indices.push(line_idx);
             }
         }
@@ -453,6 +489,7 @@ fn group_events(events: Vec<(usize, ClaudeCodeEvent)>) -> GroupedEvents {
     GroupedEvents {
         turns,
         hook_events,
+        summary_events,
         unknown_indices,
     }
 }
@@ -664,6 +701,7 @@ pub fn import_claude_code(path: &Path, opts: &ImportOptions) -> Result<Graph> {
     // AgentSession/AgentRun around a single malformed-lines Diagnostic.
     if grouped.turns.is_empty()
         && grouped.hook_events.is_empty()
+        && grouped.summary_events.is_empty()
         && grouped.unknown_indices.is_empty()
     {
         return Err(crate::CodegraphError::EmptyImport {
@@ -738,6 +776,11 @@ pub fn import_claude_code(path: &Path, opts: &ImportOptions) -> Result<Graph> {
         emit_hook_diagnostic(&mut graph, i, hook, &run_id, &ctx);
     }
 
+    // ── Summary events → Diagnostic ───────────────────────────────────────────
+    for (i, (line_idx, se)) in grouped.summary_events.iter().enumerate() {
+        emit_summary_diagnostic(&mut graph, i, *line_idx, se, &run_id, &ctx);
+    }
+
     // ── Unknown event kinds → Diagnostic ─────────────────────────────────────
     for &line_idx in &grouped.unknown_indices {
         emit_unknown_event_diagnostic(&mut graph, line_idx, &run_id, &ctx);
@@ -766,6 +809,16 @@ fn emit_turn(
     let turn_id = agent_memory_stable_id(&["node", "agent_turn", run_id, &turn_index.to_string()]);
 
     // ── AgentTurn ─────────────────────────────────────────────────────────────
+    let turn_text = {
+        let user_part = turn.user_prompt.as_deref().map(|p| redact(p, opts));
+        let prose_part = turn.prose.as_deref().map(|p| redact(p, opts));
+        match (user_part, prose_part) {
+            (Some(u), Some(p)) => Some(format!("User: {u}\n\nAssistant: {p}")),
+            (Some(u), None) => Some(format!("User: {u}")),
+            (None, Some(p)) => Some(p),
+            (None, None) => None,
+        }
+    };
     graph.push(make_node(
         turn_id.clone(),
         NodeKind::AgentTurn,
@@ -775,8 +828,7 @@ fn emit_turn(
             observed_at: Some(turn_timestamp.clone()),
             turn_index: Some(turn_index),
             agent_kind: Some("claude-code".to_owned()),
-            // Redacted assistant prose stored for audit; None for tool-call-only turns.
-            text: turn.prose.as_deref().map(|p| redact(p, opts)),
+            text: turn_text,
             ..Default::default()
         },
     ));
@@ -917,8 +969,8 @@ fn emit_tool_action(
     let cmd_summary = if tool_name == "Bash" {
         redacted_cmd
     } else if let Some(path) = extract_file_path(tool_name, &slot.input) {
-        // File-targeting tools: use the path as the summary.
-        path
+        // File-targeting tools: redact and use the path as the summary.
+        redact(&path, opts)
     } else {
         // Other tools (Grep, Glob, WebFetch, Agent, …): serialize the tool input
         // as a compact JSON summary so real arguments are recoverable from audits.
@@ -1026,14 +1078,17 @@ fn emit_tool_action(
         )
         && let Some(target) = extract_file_path(tool_name, &slot.input)
     {
-        let is_write = tool_name == "Write";
         let file_edit_id =
             agent_memory_stable_id(&["node", "file_edit", turn_id, &action_idx.to_string()]);
-        let after_hash = surrogate_hash(ctx, &target, "after", &cmd_summary);
-        let before_hash = if is_write {
-            None
+        let after_hash = surrogate_hash(ctx, &target, "after", action_idx);
+        let before_hash = Some(surrogate_hash(ctx, &target, "before", action_idx));
+        let hunk_count: u32 = if tool_name == "MultiEdit" {
+            slot.input
+                .get("edits")
+                .and_then(|e| e.as_array())
+                .map_or(1, |a| u32::try_from(a.len()).unwrap_or(u32::MAX))
         } else {
-            Some(surrogate_hash(ctx, &target, "before", &cmd_summary))
+            1
         };
         graph.push(make_node(
             file_edit_id.clone(),
@@ -1044,10 +1099,10 @@ fn emit_tool_action(
                 observed_at: Some(action_timestamp.clone()),
                 text: Some(cmd_summary),
                 repo_relative_path: Some(target),
-                edit_kind: Some(if is_write { "create" } else { "modify" }.to_owned()),
+                edit_kind: Some("modify".to_owned()),
                 before_hash,
                 after_hash: Some(after_hash),
-                hunk_count: Some(1),
+                hunk_count: Some(hunk_count),
                 linked_turn_id: Some(turn_id.to_owned()),
                 agent_kind: Some("claude-code".to_owned()),
                 ..Default::default()
@@ -1217,6 +1272,51 @@ fn emit_unknown_event_diagnostic(
     ));
 }
 
+fn emit_summary_diagnostic(
+    graph: &mut Graph,
+    idx: usize,
+    line_idx: usize,
+    se: &SummaryEvent,
+    run_id: &str,
+    ctx: &ImportCtx,
+) {
+    let timestamp = se
+        .timestamp
+        .as_deref()
+        .and_then(sanitize_rfc3339)
+        .unwrap_or_else(|| ctx.default_timestamp.clone());
+    let diag_id = agent_memory_stable_id(&[
+        "node",
+        "diagnostic",
+        "summary_event",
+        &idx.to_string(),
+        run_id,
+    ]);
+    let summary_text = se.summary.as_deref().unwrap_or("(empty summary)");
+    let label = format!(
+        "Summary event at line {line_idx}: {}",
+        safe_truncate(summary_text, 120)
+    );
+    graph.push(make_node(
+        diag_id.clone(),
+        NodeKind::Diagnostic,
+        label,
+        ctx,
+        NodeExtra {
+            observed_at: Some(timestamp),
+            text: se.summary.clone(),
+            ..Default::default()
+        },
+    ));
+    graph.push(make_edge(
+        EdgeLabel::AuthoredBy,
+        diag_id,
+        run_id.to_owned(),
+        "Summary Diagnostic belongs to AgentRun",
+        ctx,
+    ));
+}
+
 fn emit_malformed_lines_diagnostic(graph: &mut Graph, count: usize, run_id: &str, ctx: &ImportCtx) {
     let diag_id = agent_memory_stable_id(&[
         "node",
@@ -1348,10 +1448,10 @@ fn sanitize_rfc3339(ts: &str) -> Option<String> {
     Some(ts.to_owned())
 }
 
-fn surrogate_hash(ctx: &ImportCtx, target: &str, phase: &str, cmd: &str) -> String {
+fn surrogate_hash(ctx: &ImportCtx, target: &str, phase: &str, action_idx: usize) -> String {
     blake3_hex(
         format!(
-            "claude-code-importer-v1\0{}\0{target}\0{phase}\0{cmd}",
+            "claude-code-importer-v1\0{}\0{target}\0{phase}\0{action_idx}",
             ctx.source_artifact_hash
         )
         .as_bytes(),
