@@ -9012,6 +9012,45 @@ pub fn runtime_metadata_is_stale(data_dir: &Path) -> Result<bool> {
     }
 }
 
+/// Returns true when metadata exists but the daemon lock is not held, WITHOUT
+/// creating the runtime directory or lock file.
+///
+/// Unlike [`runtime_metadata_is_stale`], this never opens the lock file with
+/// `create(true)`, so it is safe for the zero-mutation repair preflight/dry-run
+/// path. A missing lock file is treated as "not held" (unleased), since no
+/// process can hold a lock on a file that does not exist.
+///
+/// # Errors
+///
+/// Returns an error if the lock file exists but cannot be opened or inspected.
+pub fn runtime_metadata_is_stale_noncreating(data_dir: &Path) -> Result<bool> {
+    let metadata_path = metadata_path(data_dir);
+    reject_runtime_symlink_components(&metadata_path, "runtime file")?;
+    if !metadata_path.exists() {
+        return Ok(false);
+    }
+    let path = runtime_dir(data_dir).join(LOCK_FILE);
+    if !path.exists() {
+        // Metadata exists but no lock file: no process can hold the lease.
+        return Ok(true);
+    }
+    reject_runtime_symlink(&path, "runtime file")?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).truncate(false);
+    let file = options
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    match file.try_lock_shared() {
+        Ok(()) => {
+            let _ = file.unlock();
+            Ok(true)
+        }
+        Err(error) if lock_error_is_contention(&error) => Ok(false),
+        Err(error) => Err(io::Error::from(error))
+            .with_context(|| format!("failed to inspect runtime lock {}", path.display())),
+    }
+}
+
 const fn lock_error_is_contention(error: &FileTryLockError) -> bool {
     matches!(error, FileTryLockError::WouldBlock)
 }

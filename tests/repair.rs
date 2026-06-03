@@ -87,6 +87,72 @@ fn write_stopped_metadata(data_dir: &Path) {
     .expect("write stopped metadata");
 }
 
+/// Writes crashed metadata declaring an unsupported daemon runtime schema, with
+/// a lock file present but not held.
+fn write_unknown_schema_metadata(data_dir: &Path) {
+    let runtime_dir = runtime_dir_for_data_dir(data_dir);
+    fs::create_dir_all(&runtime_dir).expect("create runtime dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let lock_path = runtime_dir.join("egregored.lock");
+    fs::write(&lock_path, b"").expect("create lock file");
+    let metadata = serde_json::json!({
+        "schema_version": 999,
+        "pid": 99_999_u32,
+        "address": "127.0.0.1:37383",
+        "token": "test-token-future",
+        "data_dir": data_dir.to_string_lossy().as_ref(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "started_at_unix_ms": 1_000_000_u64,
+        "state": "crashed",
+        "api_version": null,
+        "transports": null,
+        "token_expires_at_unix_ms": null,
+        "daemons_index_url": null
+    });
+    let metadata_path = runtime_dir.join("egregored.json");
+    fs::write(
+        &metadata_path,
+        serde_json::to_string_pretty(&metadata).unwrap(),
+    )
+    .expect("write unknown-schema metadata");
+}
+
+/// Writes crashed metadata WITHOUT a lock file (e.g. a copied store or partial
+/// crash). No active owner can exist because no lock file is present.
+fn write_stale_metadata_without_lock(data_dir: &Path) {
+    let runtime_dir = runtime_dir_for_data_dir(data_dir);
+    fs::create_dir_all(&runtime_dir).expect("create runtime dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let metadata = serde_json::json!({
+        "schema_version": 1,
+        "pid": 99_999_u32,
+        "address": "127.0.0.1:37383",
+        "token": "test-token-nolock",
+        "data_dir": data_dir.to_string_lossy().as_ref(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "started_at_unix_ms": 1_000_000_u64,
+        "state": "crashed",
+        "api_version": null,
+        "transports": null,
+        "token_expires_at_unix_ms": null,
+        "daemons_index_url": null
+    });
+    let metadata_path = runtime_dir.join("egregored.json");
+    fs::write(
+        &metadata_path,
+        serde_json::to_string_pretty(&metadata).unwrap(),
+    )
+    .expect("write stale metadata without lock");
+}
+
 // ---------------------------------------------------------------------------
 // SPEC: AC 1 — live daemon refusal (unit)
 // ---------------------------------------------------------------------------
@@ -168,6 +234,11 @@ fn preflight_stopped_metadata_allows() {
     write_stopped_metadata(&data_dir);
 
     let report = preflight(&data_dir).expect("preflight ok");
+    assert_eq!(
+        report.ownership_verdict,
+        OwnershipVerdict::Stopped,
+        "cleanly stopped daemon metadata must report the Stopped verdict, not StaleNoOwner"
+    );
     assert!(
         report.allow,
         "stopped metadata must allow repair, verdict={:?}",
@@ -776,6 +847,164 @@ fn preflight_is_idempotent_across_multiple_calls() {
             .join("egregored.json")
             .exists(),
         "preflight must not modify metadata"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review fix: refuse unknown daemon runtime schema (do not delete newer state)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn preflight_unknown_schema_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_unknown_schema_metadata(&data_dir);
+
+    let report = preflight(&data_dir).expect("preflight ok");
+    assert!(
+        !report.allow,
+        "unknown daemon schema must refuse repair, verdict={:?}",
+        report.ownership_verdict
+    );
+    assert!(
+        report
+            .refusal_reasons
+            .contains(&RepairRefusalCode::UnsupportedRuntimeSchema),
+        "must cite unsupported_runtime_schema, got {:?}",
+        report.refusal_reasons
+    );
+}
+
+#[test]
+fn run_repair_unknown_schema_refuses_and_preserves_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_unknown_schema_metadata(&data_dir);
+
+    let report = run_repair(&data_dir, false, true).expect("must return report");
+    assert_eq!(
+        report.result,
+        RepairSessionResult::Refused,
+        "unknown schema must refuse even with --confirm"
+    );
+    assert!(
+        report
+            .refusal_reasons
+            .contains(&RepairRefusalCode::UnsupportedRuntimeSchema)
+    );
+    assert!(
+        report.changed_file_paths.is_empty(),
+        "unknown-schema refusal must change zero files"
+    );
+    assert!(
+        runtime_dir_for_data_dir(&data_dir)
+            .join("egregored.json")
+            .exists(),
+        "newer-schema metadata must not be deleted by repair"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review fix: preflight/dry-run must not create the lock file (zero mutation)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn preflight_does_not_create_lock_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_stale_metadata_without_lock(&data_dir);
+
+    let lock_path = runtime_dir_for_data_dir(&data_dir).join("egregored.lock");
+    assert!(!lock_path.exists(), "precondition: no lock file");
+
+    let report = preflight(&data_dir).expect("preflight ok");
+    assert_eq!(report.ownership_verdict, OwnershipVerdict::StaleNoOwner);
+    assert!(report.allow);
+    assert!(
+        !lock_path.exists(),
+        "zero-mutation preflight must not create the lock file"
+    );
+
+    // Dry-run must likewise not create the lock file.
+    let dry = run_repair(&data_dir, true, false).expect("dry-run ok");
+    assert_eq!(dry.result, RepairSessionResult::DryRun);
+    assert!(
+        !lock_path.exists(),
+        "zero-mutation dry-run must not create the lock file"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review fix: confirmed repair writes the recovery report and reports lock state
+// ---------------------------------------------------------------------------
+
+#[test]
+fn confirmed_repair_writes_recovery_report_and_reports_unlocked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_stale_crashed_metadata(&data_dir);
+
+    let report = run_repair(&data_dir, false, true).expect("repair ok");
+    assert_eq!(report.result, RepairSessionResult::Success);
+
+    // The recovery report file the CLI/docs promise must actually exist.
+    let report_path = runtime_dir_for_data_dir(&data_dir).join("repair-report.json");
+    assert!(
+        report_path.exists(),
+        "confirmed repair must write the recovery report to the runtime dir"
+    );
+
+    // After cleanup there is no external owner: lock_held must be false.
+    let after = report
+        .after_inspect_summary
+        .expect("success must carry after_inspect_summary");
+    assert!(
+        !after.lock_held,
+        "post-cleanup inspect summary must report lock_held=false, not a false active-lock signal"
+    );
+    assert!(
+        !after.metadata_exists,
+        "metadata must be gone after cleanup"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review fix: embedding ingest path is also gated by stale daemon metadata
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "embeddings")]
+#[test]
+fn open_with_embeddings_blocked_by_stale_crashed_metadata() {
+    use aletheia_egregore::embeddings::EmbeddingVectorMap;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = fixture_data_dir(&tmp, "store");
+    fs::create_dir_all(&data_dir).unwrap();
+    write_stale_crashed_metadata(&data_dir);
+
+    let result =
+        EmbeddedAletheiaSink::open_with_embeddings(&data_dir, EmbeddingVectorMap::new(), 1);
+    assert!(
+        result.is_err(),
+        "embedded --embed open must also be blocked by stale crashed metadata"
+    );
+    let err_msg = result.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(
+        err_msg.contains("repair") || err_msg.contains("stale"),
+        "error must mention repair or stale: {err_msg}"
+    );
+
+    // After repair, the embedding open path is unblocked.
+    run_repair(&data_dir, false, true).expect("repair ok");
+    let ok = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, EmbeddingVectorMap::new(), 1);
+    assert!(
+        ok.is_ok(),
+        "embedding open must succeed after repair clears stale metadata: {:?}",
+        ok.err().map(|e| e.to_string())
     );
 }
 

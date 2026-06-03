@@ -294,6 +294,15 @@ impl EmbeddedAletheiaSink {
             });
         }
         let data_dir = data_dir.as_ref();
+        // AC 8: block embedded opens when stale non-stopped daemon metadata exists,
+        // including the `--embed` ingest path. The operator must run
+        // `eg repair run --confirm` first to prove exclusive ownership.
+        if let Some(msg) = crate::repair::embedded_open_repair_gate(data_dir) {
+            return Err(AdapterError::Rejected {
+                record_id: "embedded-store".to_owned(),
+                message: msg,
+            });
+        }
         let lease = StoreLease::acquire(data_dir).map_err(|error| AdapterError::Rejected {
             record_id: "embedded-store".to_owned(),
             message: error.to_string(),
