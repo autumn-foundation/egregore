@@ -33,6 +33,8 @@ use crate::adapters::EmbeddedAletheiaSink;
 use crate::adapters::SemanticMatch;
 #[cfg(feature = "embedded-aletheiadb")]
 use crate::daemon::{DaemonClient, DaemonConfig};
+#[cfg(feature = "embedded-aletheiadb")]
+use crate::repair;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -217,6 +219,23 @@ enum Commands {
         /// Daemon action.
         #[command(subcommand)]
         action: DaemonAction,
+    },
+    /// Offline repair workflow for Egregore stores.
+    ///
+    /// Use `repair preflight` first to inspect ownership, then `repair run --confirm`
+    /// to perform the repair. Both commands emit machine-readable JSON to stdout.
+    ///
+    /// Documented workflow:
+    ///   1. eg repair preflight --data-dir .egregore
+    ///   2. eg daemon stop --data-dir .egregore   (if verdict is live)
+    ///   3. eg repair run --data-dir .egregore --confirm
+    ///   4. eg repair preflight --data-dir .egregore   (verify clean state)
+    ///   5. eg daemon start --data-dir .egregore
+    #[cfg(feature = "embedded-aletheiadb")]
+    Repair {
+        /// Repair action.
+        #[command(subcommand)]
+        action: RepairCliAction,
     },
 }
 
@@ -433,6 +452,44 @@ enum DaemonAction {
         /// Embedded `AletheiaDB` data directory.
         #[arg(long, default_value = ".egregore")]
         data_dir: PathBuf,
+    },
+}
+
+/// Subcommands for `repair`.
+#[cfg(feature = "embedded-aletheiadb")]
+#[derive(Debug, Subcommand)]
+enum RepairCliAction {
+    /// Inspect ownership verdict with zero mutations (the documented first step).
+    ///
+    /// Always safe to run: never creates, removes, or modifies any file.
+    /// Output is machine-readable JSON; pipe to `jq` for interactive inspection.
+    ///
+    /// Verdicts: `live` | `stopped` | `stale_no_owner` | `ambiguous`.
+    /// When `allow` is false, `refusal_reasons` contains stable codes explaining why.
+    Preflight {
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long, default_value = ".egregore")]
+        data_dir: PathBuf,
+    },
+    /// Run an offline repair session (requires `--confirm` or `--dry-run`).
+    ///
+    /// Dry-run proves zero mutations while returning the same allow/refuse verdict.
+    /// Confirmed repair removes stale metadata and writes a recovery report.
+    ///
+    /// Supported actions: `stale_metadata_cleanup`, `recovery_report_generation`.
+    /// Unsupported: graph-record deletion, store rewrite, compaction, migration.
+    Run {
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long, default_value = ".egregore")]
+        data_dir: PathBuf,
+        /// Confirm the repair: actually perform filesystem changes.
+        /// Mutually exclusive with `--dry-run`.
+        #[arg(long, conflicts_with = "dry_run")]
+        confirm: bool,
+        /// Simulate the repair: return the verdict with zero mutations.
+        /// Mutually exclusive with `--confirm`.
+        #[arg(long, conflicts_with = "confirm")]
+        dry_run: bool,
     },
 }
 
@@ -704,6 +761,8 @@ fn run_cli(cli: Cli) -> Result<()> {
         Commands::Write { kind } => write_evidence(kind),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Daemon { action } => daemon(action),
+        #[cfg(feature = "embedded-aletheiadb")]
+        Commands::Repair { action } => repair_cmd(action),
     }
 }
 
@@ -1417,6 +1476,27 @@ fn daemon(action: DaemonAction) -> Result<()> {
         DaemonAction::Stop { data_dir } => {
             crate::daemon::stop(&data_dir)?;
             println!("daemon stopped");
+            Ok(())
+        }
+    }
+}
+
+/// Handles `eg repair preflight` and `eg repair run`.
+#[cfg(feature = "embedded-aletheiadb")]
+fn repair_cmd(action: RepairCliAction) -> Result<()> {
+    match action {
+        RepairCliAction::Preflight { data_dir } => {
+            let report = repair::preflight(&data_dir)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        RepairCliAction::Run {
+            data_dir,
+            confirm,
+            dry_run,
+        } => {
+            let report = repair::run_repair(&data_dir, dry_run, confirm)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
     }

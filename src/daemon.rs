@@ -8945,6 +8945,29 @@ fn metadata_path(data_dir: &Path) -> PathBuf {
     runtime_dir(data_dir).join(METADATA_FILE)
 }
 
+/// Reads daemon metadata without staleness validation.
+///
+/// Returns `None` if the metadata file does not exist.
+/// Unlike `read_metadata`, this does not reject stale or crashed metadata.
+/// It is intended for diagnostic and repair use only.
+///
+/// # Errors
+///
+/// Returns an error if the metadata file exists but cannot be read or parsed.
+pub fn try_read_raw_metadata(data_dir: &Path) -> Result<Option<DaemonMetadata>> {
+    let path = metadata_path(data_dir);
+    reject_runtime_symlink_components(&path, "runtime file")?;
+    match fs::read_to_string(&path) {
+        Ok(contents) => {
+            let metadata = serde_json::from_str(&contents)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+            Ok(Some(metadata))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
 /// Returns the v1 runtime sidecar directory for a daemon data directory.
 #[must_use]
 pub fn runtime_dir_for_data_dir(data_dir: &Path) -> PathBuf {

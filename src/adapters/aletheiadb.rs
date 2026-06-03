@@ -213,10 +213,20 @@ impl EmbeddedAletheiaSink {
     ///
     /// # Errors
     ///
-    /// Returns an error when the store is already leased or `AletheiaDB` cannot
+    /// Returns an error when the store is already leased, stale daemon metadata
+    /// requires repair (run `eg repair run --confirm`), or `AletheiaDB` cannot
     /// open the requested data dir.
     pub fn open(data_dir: impl AsRef<Path>) -> AdapterResult<Self> {
         let data_dir = data_dir.as_ref();
+        // AC 8: block embedded opens when stale non-stopped daemon metadata exists.
+        // The operator must run `eg repair run --confirm` first to prove exclusive
+        // ownership and clean up the stale runtime state.
+        if let Some(msg) = crate::repair::embedded_open_repair_gate(data_dir) {
+            return Err(AdapterError::Rejected {
+                record_id: "embedded-store".to_owned(),
+                message: msg,
+            });
+        }
         let lease = StoreLease::acquire(data_dir).map_err(|error| AdapterError::Rejected {
             record_id: "embedded-store".to_owned(),
             message: error.to_string(),
