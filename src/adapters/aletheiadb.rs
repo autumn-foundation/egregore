@@ -24,7 +24,6 @@ use crate::{
         UserContextFields,
     },
 };
-#[cfg(feature = "embeddings")]
 use ::aletheiadb::api::transaction::WriteOps;
 
 #[cfg(feature = "embeddings")]

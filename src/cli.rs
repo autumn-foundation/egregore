@@ -3489,6 +3489,10 @@ fn decide_cmd(
     prompt_surface: String,
     prompted_to: String,
 ) -> Result<()> {
+    if out.is_none() && data_dir.is_none() {
+        anyhow::bail!("Either --out or --data-dir must be specified to write the decision records");
+    }
+
     let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
 
     let req = crate::decide::DecideRequest {

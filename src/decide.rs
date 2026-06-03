@@ -8,7 +8,7 @@
     clippy::must_use_candidate,
     clippy::manual_let_else,
     clippy::match_same_arms,
-    clippy::assigning_clones,
+    clippy::assigning_clones
 )]
 
 use anyhow::{Result, anyhow};
@@ -97,13 +97,12 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         .find(|r| r.id() == req.candidate_id)
         .ok_or_else(|| anyhow!("PromoteCandidate '{}' not found", req.candidate_id))?;
 
-    let (cand_fields, valid_time_val) = match candidate {
+    let cand_fields = match candidate {
         GraphRecord::Node {
             kind: NodeKind::PromoteCandidate,
             user_context,
-            valid_time,
             ..
-        } => (user_context, valid_time.as_deref()),
+        } => user_context,
         _ => {
             return Err(anyhow!(
                 "Record '{}' is not a PromoteCandidate",
@@ -115,7 +114,6 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
     let valid_time_str = req
         .transaction_time
         .clone()
-        .or_else(|| valid_time_val.map(str::to_owned))
         .unwrap_or_else(|| Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
 
     let proposed_rule_kind = cand_fields
@@ -341,13 +339,13 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                     scope: Some(scope),
                     approval_decision_id: Some(decision_id.clone()),
                     active_from: Some(valid_time_str.clone()),
+                    proposed_rule_kind: Some(proposed_rule_kind.to_owned()),
                     ..UserContextFields::empty()
                 };
 
                 match materialized_kind {
                     NodeKind::Preference | NodeKind::WorkflowRule => {
                         durable_fields.rule_text = Some(redact_value(&rule_text));
-                        durable_fields.proposed_rule_kind = Some(proposed_rule_kind.to_owned());
                         if materialized_kind == NodeKind::WorkflowRule {
                             durable_fields.triggers = cand_fields.triggers.clone();
                             durable_fields.action_summary =
@@ -356,7 +354,11 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                     }
                     NodeKind::NamingDecision => {
                         durable_fields.entity_kind = cand_fields.entity_kind.clone();
-                        durable_fields.canonical_name = cand_fields.canonical_name.clone();
+                        durable_fields.canonical_name = if req.outcome == "edited_then_approved" {
+                            Some(rule_text.clone())
+                        } else {
+                            cand_fields.canonical_name.clone()
+                        };
                         durable_fields.alternatives_rejected =
                             cand_fields.alternatives_rejected.clone();
                     }

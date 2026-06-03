@@ -6,7 +6,7 @@
     clippy::match_like_matches_macro,
     clippy::too_many_lines,
     clippy::doc_markdown,
-    clippy::cast_precision_loss,
+    clippy::cast_precision_loss
 )]
 
 use std::cmp::Ordering;
@@ -2121,7 +2121,7 @@ pub fn is_candidate_suppressed(records: &[GraphRecord], cand_id: &str) -> Option
 
                     let additional_count = new_obs.difference(&old_obs).count();
 
-                    if additional_count < 5 && !elapsed_ok {
+                    if additional_count < 5 || !elapsed_ok {
                         return Some("rejection_debounce".to_string());
                     }
                 }
@@ -2148,9 +2148,25 @@ pub fn pending_candidates<'a>(
             ..
         } = rec
         {
-            if let Some(cand_id) = &user_context.candidate_id {
-                if let Some(outcome) = &user_context.outcome {
-                    decisions.insert(cand_id.as_str(), outcome.as_str());
+            if let (Some(cand_id), Some(outcome)) =
+                (&user_context.candidate_id, &user_context.outcome)
+            {
+                let current_decided_at = user_context.decided_at.as_deref().unwrap_or("");
+                let insert_new = match decisions.get(cand_id.as_str()) {
+                    None => true,
+                    Some(&(_, old_decided_at)) => {
+                        if let (Ok(new_t), Ok(old_t)) = (
+                            chrono::DateTime::parse_from_rfc3339(current_decided_at),
+                            chrono::DateTime::parse_from_rfc3339(old_decided_at),
+                        ) {
+                            new_t > old_t
+                        } else {
+                            current_decided_at > old_decided_at
+                        }
+                    }
+                };
+                if insert_new {
+                    decisions.insert(cand_id.as_str(), (outcome.as_str(), current_decided_at));
                 }
             }
         }
@@ -2165,8 +2181,7 @@ pub fn pending_candidates<'a>(
         {
             let is_pending = match decisions.get(rec.id()) {
                 None => true,
-                Some(&"deferred") => true,
-                _ => false,
+                Some(&(outcome, _)) => outcome == "deferred",
             };
             if !is_pending {
                 continue;
@@ -2192,6 +2207,25 @@ pub fn active_policy<'a>(
     records: &'a [GraphRecord],
     query_scope: Option<&UserContextScope>,
 ) -> Vec<&'a GraphRecord> {
+    let approved_decisions: std::collections::BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Node {
+                kind: NodeKind::PromotionDecision,
+                user_context,
+                ..
+            } = r
+            {
+                if let Some(outcome) = &user_context.outcome {
+                    if outcome == "approved" || outcome == "edited_then_approved" {
+                        return Some(r.id());
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+
     let mut policy = Vec::new();
     for rec in records {
         if let GraphRecord::Node {
@@ -2206,6 +2240,13 @@ pub fn active_policy<'a>(
                     | NodeKind::Constraint
             ) {
                 if user_context.active_to.is_some() {
+                    continue;
+                }
+                if let Some(decision_id) = &user_context.approval_decision_id {
+                    if !approved_decisions.contains(decision_id.as_str()) {
+                        continue;
+                    }
+                } else {
                     continue;
                 }
                 if let Some(q_scope) = query_scope {

@@ -1048,3 +1048,739 @@ fn deterministic_outputs_across_5_identical_runs() {
         }
     }
 }
+
+#[test]
+fn candidate_debounce_requires_both_thresholds() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph_path = temp.path().join("debounce_thresholds.jsonl");
+
+    let old_cand_text = "Debounced preference text";
+    let old_cand_id = user_context_stable_id(&["candidate", "old_cand_id"]);
+    let mut old_cand = GraphRecord::node(
+        old_cand_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Old candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut valid_time,
+        ..
+    } = old_cand
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-06-01T12:00:00Z".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some(old_cand_text.to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            supporting_evidence: Some(vec![EvidenceLink {
+                target_record_id: Some("agent_memory:v1:obs-1".to_owned()),
+                target_domain: "agent_memory".to_owned(),
+                relation: "PROPOSED_BY".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let decision_id = user_context_stable_id(&["decision", "old_decision"]);
+    let mut decision = GraphRecord::node(
+        decision_id,
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Old decision".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = decision
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(old_cand_id.clone()),
+            outcome: Some("rejected".to_owned()),
+            decided_at: Some("2026-06-01T12:05:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    // 1. Scenario: time elapsed > 30 days (e.g. 2026-07-15T12:00:00Z) but ONLY 1 new observation (M = 1, so additional_count = 1 < 5)
+    // Both thresholds are not met (count is unmet). So it should still be suppressed!
+    let new_cand_id_1 = user_context_stable_id(&["candidate", "new_cand_1"]);
+    let mut new_cand_1 = GraphRecord::node(
+        new_cand_id_1.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "New candidate 1".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut valid_time,
+        ..
+    } = new_cand_1
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-07-15T12:00:00Z".to_owned()); // Time is OK
+        *user_context = UserContextFields {
+            proposed_rule_text: Some(old_cand_text.to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            supporting_evidence: Some(vec![
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-1".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-2".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+            ]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    // 2. Scenario: time elapsed < 30 days (e.g. 2026-06-05T12:00:00Z) but 7 observations total (6 new, so additional_count = 6 >= 5)
+    // Both thresholds are not met (time is unmet). So it should still be suppressed!
+    let new_cand_id_2 = user_context_stable_id(&["candidate", "new_cand_2"]);
+    let mut new_cand_2 = GraphRecord::node(
+        new_cand_id_2.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "New candidate 2".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut valid_time,
+        ..
+    } = new_cand_2
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-06-05T12:00:00Z".to_owned()); // Time is not OK
+        *user_context = UserContextFields {
+            proposed_rule_text: Some(old_cand_text.to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            supporting_evidence: Some(vec![
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-1".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-2".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-3".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-4".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-5".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-6".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-7".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+            ]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    // 3. Scenario: time elapsed > 30 days AND 6 new observations. Both thresholds met! It should NOT be suppressed.
+    let new_cand_id_3 = user_context_stable_id(&["candidate", "new_cand_3"]);
+    let mut new_cand_3 = GraphRecord::node(
+        new_cand_id_3.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "New candidate 3".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut valid_time,
+        ..
+    } = new_cand_3
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-07-15T12:00:00Z".to_owned()); // Time is OK
+        *user_context = UserContextFields {
+            proposed_rule_text: Some(old_cand_text.to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            supporting_evidence: Some(vec![
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-1".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-2".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-3".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-4".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-5".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-6".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-7".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+            ]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut graph = Graph::new();
+    graph.push(old_cand);
+    graph.push(decision);
+    graph.push(new_cand_1);
+    graph.push(new_cand_2);
+    graph.push(new_cand_3);
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let output = egregore()
+        .args(["query", "candidates", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let candidates = parsed["candidates"].as_array().unwrap();
+
+    let c1 = candidates
+        .iter()
+        .find(|c| c["id"].as_str() == Some(&new_cand_id_1))
+        .unwrap();
+    let c2 = candidates
+        .iter()
+        .find(|c| c["id"].as_str() == Some(&new_cand_id_2))
+        .unwrap();
+    let c3 = candidates
+        .iter()
+        .find(|c| c["id"].as_str() == Some(&new_cand_id_3))
+        .unwrap();
+
+    assert_eq!(c1["suppressed"].as_str(), Some("rejection_debounce"));
+    assert_eq!(c2["suppressed"].as_str(), Some("rejection_debounce"));
+    assert!(c3["suppressed"].is_null());
+}
+
+#[test]
+fn query_candidates_resolves_multiple_decisions_by_timestamp() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph_path = temp.path().join("multiple_decisions.jsonl");
+
+    let cand_text = "Preference with multiple decisions";
+    let cand_id = user_context_stable_id(&["candidate", "cand_mult"]);
+    let mut cand = GraphRecord::node(
+        cand_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = cand
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some(cand_text.to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    // First decision: deferred at 2026-06-01T12:00:00Z
+    let d1_id = user_context_stable_id(&["decision", "d1"]);
+    let mut d1 = GraphRecord::node(
+        d1_id,
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "D1".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = d1
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_id.clone()),
+            outcome: Some("deferred".to_owned()),
+            decided_at: Some("2026-06-01T12:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    // Second decision: approved at 2026-06-02T12:00:00Z (terminal)
+    let d2_id = user_context_stable_id(&["decision", "d2"]);
+    let mut d2 = GraphRecord::node(
+        d2_id,
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "D2".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = d2
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_id.clone()),
+            outcome: Some("approved".to_owned()),
+            decided_at: Some("2026-06-02T12:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut graph = Graph::new();
+    graph.push(cand.clone());
+    graph.push(d1);
+    graph.push(d2);
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let output = egregore()
+        .args(["query", "candidates", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let candidates = parsed["candidates"].as_array().unwrap();
+
+    // Since the latest decision is terminal ("approved"), the candidate should not be pending.
+    assert!(
+        candidates
+            .iter()
+            .all(|c| c["id"].as_str() != Some(cand_id.as_str()))
+    );
+}
+
+#[test]
+fn active_policy_excludes_unapproved_durable_records() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph_path = temp.path().join("unapproved_durable.jsonl");
+
+    // 1. Unapproved Preference record (no approval_decision_id)
+    let pref_unapproved_id = user_context_stable_id(&["preference", "pref_unapproved"]);
+    let mut pref_unapproved = GraphRecord::node(
+        pref_unapproved_id,
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Unapproved policy".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = pref_unapproved
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            rule_text: Some("Unapproved rule text".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    // 2. Preference record pointing to a missing or non-approving decision (outcome: "rejected" or "deferred")
+    let pref_deferred_id = user_context_stable_id(&["preference", "pref_deferred"]);
+    let mut pref_deferred = GraphRecord::node(
+        pref_deferred_id,
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Deferred policy".to_owned(),
+    );
+    let dec_deferred_id = user_context_stable_id(&["decision", "dec_deferred"]);
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = pref_deferred
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            rule_text: Some("Deferred rule text".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            approval_decision_id: Some(dec_deferred_id.clone()),
+            ..UserContextFields::empty()
+        };
+    }
+    let mut dec_deferred = GraphRecord::node(
+        dec_deferred_id,
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Deferred decision".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = dec_deferred
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            outcome: Some("deferred".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut graph = Graph::new();
+    graph.push(pref_unapproved);
+    graph.push(pref_deferred);
+    graph.push(dec_deferred);
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let output = egregore()
+        .args(["query", "policy", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let policies = parsed["policy"].as_array().unwrap();
+
+    // Neither of these unapproved/deferred policies should be returned.
+    assert!(policies.is_empty());
+}
+
+#[test]
+fn decide_naming_decision_and_constraint_preserves_proposed_rule_kind_and_applies_edits() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph_path = temp.path().join("policy_types.jsonl");
+
+    // 1. Naming decision candidate
+    let name_cand_id = user_context_stable_id(&["candidate", "naming_cand"]);
+    let mut name_cand = GraphRecord::node(
+        name_cand_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Naming candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut valid_time,
+        ..
+    } = name_cand
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-05-20T12:00:00Z".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("OriginalName".to_owned()),
+            proposed_rule_kind: Some("naming_decision".to_owned()),
+            entity_kind: Some("type".to_owned()),
+            canonical_name: Some("OriginalName".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    // 2. Constraint candidate
+    let const_cand_id = user_context_stable_id(&["candidate", "const_cand"]);
+    let mut const_cand = GraphRecord::node(
+        const_cand_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Constraint candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut valid_time,
+        ..
+    } = const_cand
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-05-20T12:00:00Z".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("OriginalConstraint".to_owned()),
+            proposed_rule_kind: Some("constraint".to_owned()),
+            enforcement_level: Some("blocking".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut graph = Graph::new();
+    graph.push(name_cand);
+    graph.push(const_cand);
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    // Decide naming candidate with edited_then_approved
+    let name_out_path = temp.path().join("name_out.jsonl");
+    egregore()
+        .args([
+            "decide",
+            &name_cand_id,
+            "--outcome",
+            "edited_then_approved",
+            "--edited-rule-text",
+            "EditedName",
+            "--graph",
+        ])
+        .arg(&graph_path)
+        .arg("--out")
+        .arg(&name_out_path)
+        .assert()
+        .success();
+
+    let name_content = fs::read_to_string(&name_out_path).unwrap();
+    let name_records: Vec<serde_json::Value> = name_content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    let naming_policy = name_records
+        .iter()
+        .find(|r| r["kind"] == "NamingDecision")
+        .unwrap();
+    // Point 3: proposed_rule_kind should be preserved
+    assert_eq!(
+        naming_policy["proposed_rule_kind"].as_str(),
+        Some("naming_decision")
+    );
+    // Point 5: canonical_name should be the edited one ("EditedName")
+    assert_eq!(naming_policy["canonical_name"].as_str(), Some("EditedName"));
+
+    // Point 2: Timestamp should not be backdated to candidate's 2026-05-20T12:00:00Z.
+    let decided_at_str = name_records
+        .iter()
+        .find(|r| r["kind"] == "PromotionDecision")
+        .unwrap()["decided_at"]
+        .as_str()
+        .unwrap();
+    assert!(!decided_at_str.starts_with("2026-05-20"));
+
+    // Decide constraint candidate
+    let const_out_path = temp.path().join("const_out.jsonl");
+    egregore()
+        .args(["decide", &const_cand_id, "--outcome", "approved", "--graph"])
+        .arg(&graph_path)
+        .arg("--out")
+        .arg(&const_out_path)
+        .assert()
+        .success();
+
+    let const_content = fs::read_to_string(&const_out_path).unwrap();
+    let const_records: Vec<serde_json::Value> = const_content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    let const_policy = const_records
+        .iter()
+        .find(|r| r["kind"] == "Constraint")
+        .unwrap();
+    // Point 3: proposed_rule_kind should be preserved for Constraint too
+    assert_eq!(
+        const_policy["proposed_rule_kind"].as_str(),
+        Some("constraint")
+    );
+}
+
+#[test]
+fn decide_fails_if_neither_out_nor_data_dir_specified() {
+    let (_temp, graph, cand_ids) = fixture_preference_approval_seeded();
+    let cand_1_id = &cand_ids[0];
+
+    // Running decide command without --out and without --data-dir should fail
+    egregore()
+        .args(["decide", cand_1_id, "--outcome", "approved", "--graph"])
+        .arg(&graph)
+        .assert()
+        .failure();
+}
