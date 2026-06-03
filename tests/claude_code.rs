@@ -146,7 +146,9 @@ fn records_carry_correct_importer_metadata() {
             // use "verification" and PatchArtifact nodes use "artifact".
             let valid_domains = &[DOMAIN, "artifact", "verification"];
             assert!(
-                domain.as_deref().is_some_and(|d| valid_domains.contains(&d)),
+                domain
+                    .as_deref()
+                    .is_some_and(|d| valid_domains.contains(&d)),
                 "wrong domain: {domain:?}"
             );
             assert!(

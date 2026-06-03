@@ -57,9 +57,9 @@ use serde::Deserialize;
 use crate::{
     error::Result,
     ir::{
-        AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, EdgeLabel, Graph, GraphRecord,
-        NodeKind, OutputHandle, Producer, ProducerKind, VERIFICATION_SCHEMA_VERSION,
-        agent_memory_stable_id, artifact_stable_id, verification_stable_id,
+        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, Graph, GraphRecord, NodeKind, OutputHandle,
+        Producer, ProducerKind, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
+        verification_stable_id,
     },
 };
 
@@ -882,8 +882,11 @@ fn emit_tool_action(
 
     let tool_call_id =
         agent_memory_stable_id(&["node", "tool_call", turn_id, &action_idx.to_string()]);
+    // CommandRun is emitted in the verification domain so PRODUCED_EVIDENCE
+    // edges from ToolCall can satisfy the verification:v1: target prefix
+    // requirement enforced by validate_agent_memory_edge_endpoints.
     let cmd_run_id =
-        agent_memory_stable_id(&["node", "command_run", turn_id, &action_idx.to_string()]);
+        verification_stable_id(&["node", "command_run", turn_id, &action_idx.to_string()]);
 
     let status_str = match exit_code {
         Some(0) => "succeeded",
@@ -894,7 +897,7 @@ fn emit_tool_action(
 
     // Choose a human-readable command summary for the tool call.
     let cmd_summary = if tool_name == "Bash" {
-        redacted_cmd.clone()
+        redacted_cmd
     } else {
         // For non-Bash tools, use the file path or a minimal description.
         extract_file_path(tool_name, &slot.input).unwrap_or_else(|| format!("{tool_name} call"))
@@ -903,6 +906,7 @@ fn emit_tool_action(
     let tool_kind = tool_kind_for(tool_name, &cmd);
 
     // ── ToolCall ──────────────────────────────────────────────────────────────
+    // produced_evidence_id links to the CommandRun in the verification domain.
     graph.push(make_node(
         tool_call_id.clone(),
         NodeKind::ToolCall,
@@ -920,18 +924,22 @@ fn emit_tool_action(
             finished_at,
             status: Some(status_str.to_owned()),
             agent_kind: Some("claude-code".to_owned()),
+            produced_evidence_id: (tool_name == "Bash").then(|| cmd_run_id.clone()),
             ..Default::default()
         },
     ));
     graph.push(make_edge(
         EdgeLabel::AuthoredBy,
-        tool_call_id,
+        tool_call_id.clone(),
         turn_id.to_owned(),
         "ToolCall belongs to AgentTurn",
         ctx,
     ));
 
-    // ── CommandRun (Bash only) ────────────────────────────────────────────────
+    // ── CommandRun (Bash only, verification domain) ───────────────────────────
+    // CommandRun is placed in the verification domain so that the PRODUCED_EVIDENCE
+    // edge from ToolCall satisfies the verification:v1: target-prefix constraint
+    // enforced by validate_agent_memory_edge_endpoints.
     if tool_name == "Bash" {
         graph.push(make_node(
             cmd_run_id.clone(),
@@ -947,6 +955,8 @@ fn emit_tool_action(
                 exit_code,
                 stdout_handle: result_text.as_deref().map(|s| Box::new(output_handle(s))),
                 agent_kind: Some("claude-code".to_owned()),
+                schema_version_override: Some(VERIFICATION_SCHEMA_VERSION),
+                domain_override: Some("verification"),
                 ..Default::default()
             },
         ));
@@ -955,6 +965,14 @@ fn emit_tool_action(
             cmd_run_id.clone(),
             turn_id.to_owned(),
             "CommandRun belongs to AgentTurn",
+            ctx,
+        ));
+        // ToolCall --PRODUCED_EVIDENCE--> CommandRun (verification domain)
+        graph.push(make_edge(
+            EdgeLabel::ProducedEvidence,
+            tool_call_id,
+            cmd_run_id,
+            "ToolCall produced CommandRun evidence",
             ctx,
         ));
     }
@@ -1000,97 +1018,34 @@ fn emit_tool_action(
         ));
     }
 
-    // ── PatchArtifact / Failure ───────────────────────────────────────────────
-    if tool_name == "Bash" && is_patch_command(&cmd) {
-        let failed = is_error;
-        let patch_status = if failed { "invalid" } else { "unverified" };
-        let patch_id =
-            artifact_stable_id(&["node", "patch_artifact", turn_id, &action_idx.to_string()]);
-        graph.push(make_node(
-            patch_id.clone(),
-            NodeKind::PatchArtifact,
-            format!("PatchArtifact status={patch_status} turn={turn_index}"),
-            ctx,
-            NodeExtra {
-                observed_at: Some(action_timestamp.clone()),
-                text: Some(redacted_cmd),
-                patch_status: Some(patch_status.to_owned()),
-                agent_kind: Some("claude-code".to_owned()),
-                schema_version_override: Some(ARTIFACT_SCHEMA_VERSION),
-                domain_override: Some("artifact"),
-                ..Default::default()
-            },
-        ));
-        graph.push(make_edge(
-            EdgeLabel::AuthoredBy,
-            patch_id.clone(),
-            turn_id.to_owned(),
-            "PatchArtifact belongs to AgentTurn",
-            ctx,
-        ));
-        graph.push(make_edge(
-            EdgeLabel::ProducedPatch,
-            run_id.to_owned(),
-            patch_id.clone(),
-            "AgentRun produced patch artifact",
-            ctx,
-        ));
-
-        if failed {
-            let failure_id = agent_memory_stable_id(&[
-                "node",
-                "failure",
-                "patch_invalid",
-                turn_id,
-                &action_idx.to_string(),
-            ]);
-            graph.push(make_node(
-                failure_id.clone(),
-                NodeKind::Failure,
-                format!("Failure patch_invalid turn={turn_index}"),
-                ctx,
-                NodeExtra {
-                    observed_at: Some(action_timestamp.clone()),
-                    text: Some(build_output_summary(result_text.as_deref())),
-                    failure_kind: Some("patch_invalid".to_owned()),
-                    exit_code,
-                    agent_kind: Some("claude-code".to_owned()),
-                    ..Default::default()
-                },
-            ));
-            graph.push(make_edge(
-                EdgeLabel::AuthoredBy,
-                failure_id.clone(),
-                turn_id.to_owned(),
-                "Failure belongs to AgentTurn",
-                ctx,
-            ));
-            graph.push(make_edge(
-                EdgeLabel::FailedOn,
-                failure_id,
-                patch_id,
-                "Failure describes invalid PatchArtifact",
-                ctx,
-            ));
-        }
-    } else if tool_name == "Bash" && is_error {
-        // Non-patch Bash command that failed.
+    // ── Failure ───────────────────────────────────────────────────────────────
+    // PatchArtifact is not emitted: required artifact fields (target_files,
+    // patch_bytes_hash, patch_handle, etc.) cannot be derived from a JSONL
+    // transcript. The command failure is captured by the Failure node instead.
+    // FailedOn edges are not emitted: the valid target kinds for FAILED_ON are
+    // Symbol, File, and PatchArtifact only (validate_evidence_endpoint_constraints).
+    if tool_name == "Bash" && is_error {
+        let failure_kind = if is_patch_command(&cmd) {
+            "patch_invalid"
+        } else {
+            "command_failure"
+        };
         let failure_id = agent_memory_stable_id(&[
             "node",
             "failure",
-            "command_failure",
+            failure_kind,
             turn_id,
             &action_idx.to_string(),
         ]);
         graph.push(make_node(
             failure_id.clone(),
             NodeKind::Failure,
-            format!("Failure command_failure turn={turn_index}"),
+            format!("Failure {failure_kind} turn={turn_index}"),
             ctx,
             NodeExtra {
                 observed_at: Some(action_timestamp.clone()),
                 text: Some(build_output_summary(result_text.as_deref())),
-                failure_kind: Some("command_failure".to_owned()),
+                failure_kind: Some(failure_kind.to_owned()),
                 exit_code,
                 agent_kind: Some("claude-code".to_owned()),
                 ..Default::default()
@@ -1098,16 +1053,9 @@ fn emit_tool_action(
         ));
         graph.push(make_edge(
             EdgeLabel::AuthoredBy,
-            failure_id.clone(),
+            failure_id,
             turn_id.to_owned(),
             "Failure belongs to AgentTurn",
-            ctx,
-        ));
-        graph.push(make_edge(
-            EdgeLabel::FailedOn,
-            failure_id,
-            cmd_run_id,
-            "Failure describes failed CommandRun",
             ctx,
         ));
     }
@@ -1404,6 +1352,8 @@ struct NodeExtra {
     schema_version_override: Option<u32>,
     /// Override the `domain` field (default: `DOMAIN` = `"agent_memory"`).
     domain_override: Option<&'static str>,
+    /// The ID of the `CommandRun` or `TestRun` this `ToolCall` produced (for `PRODUCED_EVIDENCE`).
+    produced_evidence_id: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1476,7 +1426,7 @@ fn make_node(
         arguments_summary: extra.arguments_summary,
         arguments_handle: extra.arguments_handle,
         result_handle: None,
-        produced_evidence_id: None,
+        produced_evidence_id: extra.produced_evidence_id,
         started_at: extra
             .started_at
             .or_else(|| Some(ctx.default_timestamp.clone())),
