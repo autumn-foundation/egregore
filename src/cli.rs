@@ -1079,14 +1079,14 @@ fn inspect(
                 data_dir.display()
             )
         })?;
-        let (records, snapshot_timestamp) = client.get_all_records().with_context(|| {
+        let (records, unknown_versions, snapshot_timestamp) = client.get_all_records().with_context(|| {
             format!(
                 "failed to inspect data-dir {}: invalid authorization token or daemon read error",
                 data_dir.display()
             )
         })?;
 
-        let counts = InspectCounts::from_records(&records, &[]);
+        let counts = InspectCounts::from_records(&records, &unknown_versions);
 
         match format {
             OutputFormat::Json => {

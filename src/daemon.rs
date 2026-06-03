@@ -1518,7 +1518,7 @@ impl DaemonClient {
     ///
     /// Returns an error if the daemon does not respond successfully or the
     /// response cannot be parsed.
-    pub fn get_all_records(&self) -> Result<(Vec<GraphRecord>, String)> {
+    pub fn get_all_records(&self) -> Result<(Vec<GraphRecord>, Vec<UnknownSchemaVersion>, String)> {
         let (status, body) =
             self.request("GET", "/v1/records", None, CLIENT_OPERATION_TIMEOUT, true)?;
         if status != 200 {
@@ -1530,11 +1530,18 @@ impl DaemonClient {
             serde_json::from_str(&body).context("failed to parse daemon records response")?;
         let records = serde_json::from_value(envelope["result"]["records"].clone())
             .context("failed to parse records from envelope")?;
+        let unknown_schema_versions =
+            if let Some(val) = envelope["result"].get("unknown_schema_versions") {
+                serde_json::from_value(val.clone())
+                    .context("failed to parse unknown_schema_versions from envelope")?
+            } else {
+                Vec::new()
+            };
         let snapshot_timestamp = envelope["result"]["snapshot_timestamp"]
             .as_str()
             .unwrap_or_default()
             .to_owned();
-        Ok((records, snapshot_timestamp))
+        Ok((records, unknown_schema_versions, snapshot_timestamp))
     }
 
     /// Sends a verb query to the daemon and returns the `result.records` array.
@@ -6593,7 +6600,7 @@ fn handle_get_all_records(state: &ServerState) -> HttpResponse {
         return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
     };
     let snapshot_timestamp = chrono::Utc::now().to_rfc3339();
-    let records = match sink.inspect_all_records() {
+    let report = match sink.inspect_all_records() {
         Ok(r) => r,
         Err(e) => return HttpResponse::error(adapter_read_error_to_api(e)),
     };
@@ -6602,7 +6609,8 @@ fn handle_get_all_records(state: &ServerState) -> HttpResponse {
         None,
         200,
         json!({
-            "records": records,
+            "records": report.records,
+            "unknown_schema_versions": report.unknown_schema_versions,
             "snapshot_timestamp": snapshot_timestamp,
         }),
     )
