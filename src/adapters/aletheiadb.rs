@@ -595,35 +595,21 @@ impl EmbeddedAletheiaSink {
                 node.get_property("record_type"),
             )?;
 
-            let version_res = Self::node_record_version_from_properties(
+            let version = Self::node_record_version_from_properties(
                 &node,
                 &record_id,
                 record_type.as_deref(),
-            );
-            let is_known = version_res
-                .as_ref()
-                .is_ok_and(crate::schema_version::is_known_record_version);
+            )?;
+            let is_known = crate::schema_version::is_known_record_version(&version);
 
             if is_known {
-                let materialized_res = if record_type.as_deref() == Some("tombstone") {
-                    self.read_tombstone_record_internal(&record_id, node_id)
+                let record = if record_type.as_deref() == Some("tombstone") {
+                    self.read_tombstone_record_internal(&record_id, node_id)?
                 } else {
-                    self.read_node_record_internal(&record_id, node_id)
+                    self.read_node_record_internal(&record_id, node_id)?
                 };
-
-                match materialized_res {
-                    Ok(record) => {
-                        report.records.push(record);
-                    }
-                    Err(_) => {
-                        if let Ok(version) = version_res {
-                            report
-                                .unknown_schema_versions
-                                .push(crate::schema_version::UnknownSchemaVersion::new(version));
-                        }
-                    }
-                }
-            } else if let Ok(version) = version_res {
+                report.records.push(record);
+            } else {
                 report
                     .unknown_schema_versions
                     .push(crate::schema_version::UnknownSchemaVersion::new(version));
@@ -646,25 +632,13 @@ impl EmbeddedAletheiaSink {
                     continue;
                 };
 
-                let version_res = Self::edge_record_version_from_properties(&edge, &codegraph_id);
-                let is_known = version_res
-                    .as_ref()
-                    .is_ok_and(crate::schema_version::is_known_record_version);
+                let version = Self::edge_record_version_from_properties(&edge, &codegraph_id)?;
+                let is_known = crate::schema_version::is_known_record_version(&version);
 
                 if is_known {
-                    match self.read_edge_record_internal(&codegraph_id, edge_id) {
-                        Ok(record) => {
-                            report.records.push(record);
-                        }
-                        Err(_) => {
-                            if let Ok(version) = version_res {
-                                report.unknown_schema_versions.push(
-                                    crate::schema_version::UnknownSchemaVersion::new(version),
-                                );
-                            }
-                        }
-                    }
-                } else if let Ok(version) = version_res {
+                    let record = self.read_edge_record_internal(&codegraph_id, edge_id)?;
+                    report.records.push(record);
+                } else {
                     report
                         .unknown_schema_versions
                         .push(crate::schema_version::UnknownSchemaVersion::new(version));
@@ -4042,5 +4016,31 @@ mod tests {
         assert_eq!(unknown.version.domain, "codegraph");
         assert_eq!(unknown.version.kind, "NewFutureKind");
         assert_eq!(unknown.version.version, 5);
+    }
+
+    #[test]
+    fn inspect_all_records_fails_on_corrupt_record_of_known_version() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("corrupt-node-store");
+        let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+        let record_id = "codegraph:v4:corrupt-node";
+        let properties = ::aletheiadb::PropertyMapBuilder::new()
+            .insert("codegraph_id", record_id)
+            .insert("record_type", "node")
+            // missing "kind", but has known schema_version
+            .insert("schema_version", i64::from(crate::ir::SCHEMA_VERSION))
+            .insert("domain", "codegraph")
+            .build();
+
+        sink.db
+            .create_node("Repository", properties)
+            .expect("should create raw node");
+
+        let res = sink.inspect_all_records();
+        assert!(
+            res.is_err(),
+            "Expected inspect_all_records to fail on corrupt record of known version, got {res:?}"
+        );
     }
 }

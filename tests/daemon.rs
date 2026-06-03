@@ -10478,6 +10478,61 @@ fn test_cli_inspect_daemon_future_schema_version() {
     assert_eq!(parsed["tombstones"], 0);
 }
 
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn test_cli_inspect_daemon_fails_on_corrupt_known_version() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("store");
+
+    // Write a corrupt node directly to AletheiaDB
+    {
+        let config = aletheiadb::config::durable_config_for_data_dir(&data_dir);
+        let db = aletheiadb::AletheiaDB::with_unified_config(config).expect("should open raw db");
+        let record_id = "codegraph:v4:corrupt-node";
+        let properties = aletheiadb::PropertyMapBuilder::new()
+            .insert("codegraph_id", record_id)
+            .insert("record_type", "node")
+            // missing "kind", but has known schema_version
+            .insert("schema_version", i64::from(SCHEMA_VERSION))
+            .insert("domain", "codegraph")
+            .build();
+
+        db.create_node("Repository", properties)
+            .expect("should create raw node");
+    } // drop db to close database and release locks
+
+    // Start daemon on the database containing the corrupt node
+    let mut daemon = start_daemon(&data_dir);
+
+    // Running eg inspect --daemon should fail because the known version record is corrupt
+    let assert_res = Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("inspect")
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert();
+
+    let output = assert_res.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Stop daemon before asserting to avoid orphaned background processes
+    daemon.stop();
+
+    assert!(
+        !output.status.success(),
+        "Expected inspect --daemon to fail, but it succeeded. stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("missing required property")
+            || stderr.contains("inspect_all_records")
+            || stderr.contains("ReadBack")
+            || stderr.contains("failed with HTTP"),
+        "stderr should mention the read/deserialization failure, got: {stderr}"
+    );
+}
+
 fn get_dir_file_times(dir: &Path) -> std::collections::BTreeMap<PathBuf, std::time::SystemTime> {
     let mut files = std::collections::BTreeMap::new();
     if let Ok(entries) = fs::read_dir(dir) {
