@@ -1592,6 +1592,47 @@ impl DaemonClient {
             .unwrap_or_default())
     }
 
+    /// Sends a verb query to the daemon and returns the raw `result` object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon rejects the request or cannot be reached.
+    pub fn query_verb_raw(
+        &self,
+        verb: &str,
+        params: &serde_json::Value,
+        as_of_valid_time: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let as_of = as_of_valid_time.map(|v| json!({ "valid_time": v }));
+        let body = json!({
+            "request_id": request_id("query", verb),
+            "agent_id": "egregore-cli",
+            "verb": verb,
+            "params": params,
+            "as_of": as_of,
+        });
+        let (status, body_str) = self.request(
+            "POST",
+            "/v1/query",
+            Some(body),
+            CLIENT_OPERATION_TIMEOUT,
+            true,
+        )?;
+        if status != 200 {
+            let envelope: serde_json::Value = serde_json::from_str(&body_str).unwrap_or_else(
+                |_| json!({ "error": { "code": "parse_error", "message": body_str } }),
+            );
+            let code = envelope["error"]["code"].as_str().unwrap_or("unknown");
+            let message = envelope["error"]["message"]
+                .as_str()
+                .unwrap_or("unknown error");
+            return Err(anyhow!("daemon query error ({code}): {message}"));
+        }
+        let envelope: serde_json::Value =
+            serde_json::from_str(&body_str).context("failed to parse daemon query response")?;
+        Ok(envelope["result"].clone())
+    }
+
     /// Requests daemon shutdown.
     ///
     /// # Errors
@@ -7962,6 +8003,272 @@ fn handle_verb_observations_for_symbol(
     )
 }
 
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::option_if_let_else)]
+fn handle_verb_criteria_for_task(
+    request_id: &str,
+    params: &serde_json::Value,
+    as_of_valid_time: Option<&str>,
+    limit: usize,
+    started: Instant,
+    budget: Option<Duration>,
+    state: &ServerState,
+) -> HttpResponse {
+    let task_id_or_handle = match params.get("task_id").and_then(serde_json::Value::as_str) {
+        Some(t) => t.to_owned(),
+        None => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::missing_field("params.task_id"),
+            );
+        }
+    };
+
+    let (mut records, snapshot) = match load_cross_domain_records(state, started, budget) {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+
+    if let Some(as_of) = as_of_valid_time {
+        let as_of_dt = match chrono::DateTime::parse_from_rfc3339(as_of) {
+            Ok(dt) => dt,
+            Err(e) => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request(format!("invalid as_of.valid_time: {e}")),
+                );
+            }
+        };
+        let retained_node_ids: BTreeSet<String> = records
+            .iter()
+            .filter_map(|r| match r {
+                GraphRecord::Node {
+                    id,
+                    temporal,
+                    valid_time,
+                    ..
+                } => {
+                    let vt_str = temporal
+                        .as_ref()
+                        .map(|t| t.valid_time.as_str())
+                        .or(valid_time.as_deref());
+                    vt_str
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .is_some_and(|vt| vt <= as_of_dt)
+                        .then(|| id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        records.retain(|r| match r {
+            GraphRecord::Node {
+                temporal,
+                valid_time,
+                ..
+            } => {
+                let vt_str = temporal
+                    .as_ref()
+                    .map(|t| t.valid_time.as_str())
+                    .or(valid_time.as_deref());
+                vt_str
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .is_some_and(|vt| vt <= as_of_dt)
+            }
+            GraphRecord::Edge {
+                source,
+                target,
+                temporal,
+                ..
+            } => temporal
+                .as_ref()
+                .map(|t| t.valid_time.as_str())
+                .map_or_else(
+                    || {
+                        retained_node_ids.contains(source.as_str())
+                            && retained_node_ids.contains(target.as_str())
+                    },
+                    |vt_str| {
+                        chrono::DateTime::parse_from_rfc3339(vt_str)
+                            .ok()
+                            .is_some_and(|vt| vt <= as_of_dt)
+                    },
+                ),
+            GraphRecord::Tombstone { .. } => false,
+        });
+    }
+
+    let resolved_task_ids = match graph_query::resolve_task_ids(&records, &task_id_or_handle) {
+        Ok(ids) => ids,
+        Err(graph_query::TaskResolveError::Unsupported { handle, message }) => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::bad_request(format!("unsupported handle '{handle}': {message}")),
+            );
+        }
+        Err(graph_query::TaskResolveError::Ambiguous { handle, candidates }) => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::bad_request(format!(
+                    "ambiguous handle '{handle}'; matched candidates: {candidates:?}"
+                )),
+            );
+        }
+    };
+
+    if resolved_task_ids.is_empty() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::not_found(format!(
+                "no records found for task handle '{task_id_or_handle}'"
+            )),
+        );
+    }
+
+    let task_id = resolved_task_ids.iter().next().unwrap();
+    let ctx = graph_query::task_evidence_context(&records, task_id);
+
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
+
+    if ctx.is_no_match() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::not_found(format!("no records found for task ID '{task_id}'")),
+        );
+    }
+
+    let mut rem = limit;
+
+    let tasks: Vec<_> = ctx
+        .tasks
+        .iter()
+        .take(rem)
+        .map(|r| context_linked_item_to_json(r))
+        .collect();
+    rem = rem.saturating_sub(tasks.len());
+
+    let acceptance_criteria: Vec<_> = ctx
+        .acceptance_criteria
+        .iter()
+        .take(rem)
+        .map(|r| {
+            let mut ac_json = context_linked_item_to_json(r);
+            if ac_json.get("status").and_then(serde_json::Value::as_str) == Some("verified") {
+                let GraphRecord::Node {
+                    verification_link_id,
+                    ..
+                } = r
+                else {
+                    return ac_json;
+                };
+                let ver_id = if let Some(v_id) = verification_link_id {
+                    Some(v_id.as_str())
+                } else {
+                    records.iter().find_map(|edge| {
+                        if let GraphRecord::Edge {
+                            label: EdgeLabel::ClosesAcceptanceCriterion,
+                            source,
+                            target,
+                            ..
+                        } = edge
+                        {
+                            if source == r.id() {
+                                Some(target.as_str())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                };
+
+                if let Some(ver_record) =
+                    ver_id.and_then(|vid| records.iter().find(|cand| cand.id() == vid))
+                {
+                    ac_json["verification_record"] = context_linked_item_to_json(ver_record);
+                }
+            }
+            ac_json
+        })
+        .collect();
+    rem = rem.saturating_sub(acceptance_criteria.len());
+
+    let source_facts: Vec<_> = ctx
+        .source_facts
+        .iter()
+        .take(rem)
+        .map(|r| context_source_fact_to_json(r))
+        .collect();
+    rem = rem.saturating_sub(source_facts.len());
+
+    let observations: Vec<_> = ctx
+        .observations
+        .iter()
+        .take(rem)
+        .map(|r| context_observation_to_json(r))
+        .collect();
+    rem = rem.saturating_sub(observations.len());
+
+    let artifacts: Vec<_> = ctx
+        .artifacts
+        .iter()
+        .take(rem)
+        .map(|r| context_linked_item_to_json(r))
+        .collect();
+    rem = rem.saturating_sub(artifacts.len());
+
+    let verification_evidence: Vec<_> = ctx
+        .verification_evidence
+        .iter()
+        .take(rem)
+        .map(|r| context_linked_item_to_json(r))
+        .collect();
+    rem = rem.saturating_sub(verification_evidence.len());
+
+    let external_links: Vec<_> = ctx
+        .external_links
+        .iter()
+        .take(rem)
+        .map(|r| context_linked_item_to_json(r))
+        .collect();
+    rem = rem.saturating_sub(external_links.len());
+
+    let unresolved: Vec<_> = ctx
+        .unresolved
+        .iter()
+        .take(rem)
+        .map(|u| {
+            json!({
+                "source_record_id": u.source_record_id,
+                "target_handle": u.target_handle,
+                "relation": u.relation,
+                "target_domain": u.target_domain,
+                "verification_status": "unresolved",
+            })
+        })
+        .collect();
+
+    HttpResponse::success(
+        Some(request_id),
+        200,
+        json!({
+            "verb": "criteria_for_task",
+            "snapshot": snapshot,
+            "task_id": task_id,
+            "tasks": tasks,
+            "acceptance_criteria": acceptance_criteria,
+            "source_facts": source_facts,
+            "observations": observations,
+            "artifacts": artifacts,
+            "verification_evidence": verification_evidence,
+            "external_links": external_links,
+            "unresolved": unresolved,
+        }),
+    )
+}
+
 // ── Main query handler ────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
@@ -8106,7 +8413,16 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             budget,
             state,
         ),
-        "drift" | "agent_sessions_for_repo" | "criteria_for_task" => HttpResponse::error_with_id(
+        "criteria_for_task" => handle_verb_criteria_for_task(
+            &request_id,
+            &params,
+            as_of_valid_time.as_deref(),
+            limit,
+            started,
+            budget,
+            state,
+        ),
+        "drift" | "agent_sessions_for_repo" => HttpResponse::error_with_id(
             &request_id,
             ApiError::new(
                 ErrorCode::NotImplemented,

@@ -429,6 +429,8 @@ fn run_import(
         .args(&args)
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
+        .env_remove("PATH")
+        .env_remove("Path")
         .output()
         .expect("run import");
     let jsonl = std::fs::read_to_string(out).unwrap_or_default();

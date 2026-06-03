@@ -374,6 +374,21 @@ enum QuerySubcommand {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// Retrieve evidence-backed context for a task.
+    Task {
+        /// Task record ID or source handle (URL, `system_native_id`, local handle).
+        id_or_handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Route the query through the running daemon (requires --data-dir, conflicts with --graph).
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, requires = "data_dir", conflicts_with = "graph")]
+        daemon: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -1688,6 +1703,9 @@ struct ContextLinkedItem<'a> {
     /// Evidence links that connect this item to the queried symbol.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     evidence_links: Vec<&'a crate::ir::EvidenceLink>,
+    /// The verification record that closed this acceptance criterion (only populated for verified ACs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_record: Option<Box<Self>>,
 }
 
 /// One unresolved evidence link target, surfaced per AC5.
@@ -1732,10 +1750,26 @@ struct ContextResponse<'a> {
     unresolved: Vec<ContextUnresolved<'a>>,
 }
 
+/// Full task context query response envelope.
+#[derive(Serialize)]
+struct TaskContextResponse<'a> {
+    ok: bool,
+    task_id: &'a str,
+    tasks: Vec<ContextLinkedItem<'a>>,
+    acceptance_criteria: Vec<ContextLinkedItem<'a>>,
+    source_facts: Vec<ContextSourceFact<'a>>,
+    observations: Vec<ContextObservation<'a>>,
+    artifacts: Vec<ContextLinkedItem<'a>>,
+    verification_evidence: Vec<ContextLinkedItem<'a>>,
+    external_links: Vec<ContextLinkedItem<'a>>,
+    unresolved: Vec<ContextUnresolved<'a>>,
+}
+
 // ---------------------------------------------------------------------------
 // query_cmd — dispatch
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
     match subcommand {
         QuerySubcommand::Symbol {
@@ -1835,6 +1869,23 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_context_cmd(&records, &name)
+        }
+        QuerySubcommand::Task {
+            id_or_handle,
+            graph,
+            data_dir,
+            #[cfg(feature = "embedded-aletheiadb")]
+            daemon,
+        } => {
+            #[cfg(feature = "embedded-aletheiadb")]
+            if daemon {
+                let dir = data_dir
+                    .as_deref()
+                    .expect("clap requires --data-dir with --daemon");
+                return query_task_via_daemon(&id_or_handle, dir);
+            }
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_task_cmd(&records, &id_or_handle)
         }
     }
 }
@@ -2546,6 +2597,195 @@ fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
+fn query_task_cmd(records: &[GraphRecord], id_or_handle: &str) -> Result<()> {
+    // Resolve task ID
+    let resolved_ids = match query::resolve_task_ids(records, id_or_handle) {
+        Ok(ids) => ids,
+        Err(query::TaskResolveError::Ambiguous { handle, candidates }) => {
+            let err_json =
+                serde_json::to_string(&query::TaskResolveError::Ambiguous { handle, candidates })?;
+            eprintln!("{err_json}");
+            std::process::exit(1);
+        }
+        Err(query::TaskResolveError::Unsupported { handle, message }) => {
+            let err_json =
+                serde_json::to_string(&query::TaskResolveError::Unsupported { handle, message })?;
+            eprintln!("{err_json}");
+            std::process::exit(1);
+        }
+    };
+
+    if resolved_ids.is_empty() {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "no_match",
+                "task_id": id_or_handle
+            }
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(2);
+    }
+
+    let task_id = resolved_ids.iter().next().unwrap();
+    let ctx = query::task_evidence_context(records, task_id);
+
+    if ctx.is_no_match() {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "no_match",
+                "task_id": id_or_handle
+            }
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(2);
+    }
+
+    let tasks: Vec<ContextLinkedItem<'_>> = ctx
+        .tasks
+        .iter()
+        .filter_map(|r| context_linked_item(r))
+        .collect();
+
+    let acceptance_criteria: Vec<ContextLinkedItem<'_>> = ctx
+        .acceptance_criteria
+        .iter()
+        .filter_map(|r| {
+            let mut ac = context_linked_item(r)?;
+            if ac.status == Some("verified") {
+                let GraphRecord::Node {
+                    verification_link_id,
+                    ..
+                } = r
+                else {
+                    return Some(ac);
+                };
+                let ver_id = verification_link_id.as_deref().or_else(|| {
+                    records.iter().find_map(|edge| {
+                        if let GraphRecord::Edge {
+                            label: EdgeLabel::ClosesAcceptanceCriterion,
+                            source,
+                            target,
+                            ..
+                        } = edge
+                        {
+                            if source == r.id() {
+                                Some(target.as_str())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                });
+
+                if let Some(ver_record) =
+                    ver_id.and_then(|vid| records.iter().find(|cand| cand.id() == vid))
+                {
+                    ac.verification_record = context_linked_item(ver_record).map(Box::new);
+                }
+            }
+            Some(ac)
+        })
+        .collect();
+
+    let source_facts: Vec<ContextSourceFact<'_>> = ctx
+        .source_facts
+        .iter()
+        .filter_map(|r| context_source_fact(r))
+        .collect();
+
+    let observations: Vec<ContextObservation<'_>> = ctx
+        .observations
+        .iter()
+        .filter_map(|r| context_observation(r))
+        .collect();
+
+    let artifacts: Vec<ContextLinkedItem<'_>> = ctx
+        .artifacts
+        .iter()
+        .filter_map(|r| context_linked_item(r))
+        .collect();
+
+    let verification_evidence: Vec<ContextLinkedItem<'_>> = ctx
+        .verification_evidence
+        .iter()
+        .filter_map(|r| context_linked_item(r))
+        .collect();
+
+    let external_links: Vec<ContextLinkedItem<'_>> = ctx
+        .external_links
+        .iter()
+        .filter_map(|r| context_linked_item(r))
+        .collect();
+
+    let unresolved: Vec<ContextUnresolved<'_>> = ctx
+        .unresolved
+        .iter()
+        .map(|u| ContextUnresolved {
+            source_record_id: &u.source_record_id,
+            target_handle: &u.target_handle,
+            relation: &u.relation,
+            target_domain: &u.target_domain,
+            verification_status: "unresolved",
+        })
+        .collect();
+
+    let response = TaskContextResponse {
+        ok: true,
+        task_id,
+        tasks,
+        acceptance_criteria,
+        source_facts,
+        observations,
+        artifacts,
+        verification_evidence,
+        external_links,
+        unresolved,
+    };
+
+    let output =
+        serde_json::to_string_pretty(&response).context("failed to serialize task context")?;
+    println!("{output}");
+    Ok(())
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn query_task_via_daemon(id_or_handle: &str, data_dir: &Path) -> Result<()> {
+    let client = DaemonClient::from_data_dir(data_dir)
+        .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
+    let params = serde_json::json!({ "task_id": id_or_handle });
+    match client.query_verb_raw("criteria_for_task", &params, None) {
+        Ok(result) => {
+            let output = serde_json::to_string_pretty(&result)
+                .context("failed to serialize task query result")?;
+            println!("{output}");
+            Ok(())
+        }
+        Err(e) => {
+            let err_msg = e.to_string();
+            if err_msg.contains("not_found") || err_msg.contains("no records found") {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "no_match",
+                        "task_id": id_or_handle
+                    }
+                });
+                println!("{}", serde_json::to_string(&envelope)?);
+                std::process::exit(2);
+            } else if err_msg.contains("ambiguous") || err_msg.contains("unsupported") {
+                eprintln!("{err_msg}");
+                std::process::exit(1);
+            }
+            Err(e)
+        }
+    }
+}
+
 fn context_source_fact(record: &GraphRecord) -> Option<ContextSourceFact<'_>> {
     let GraphRecord::Node {
         id,
@@ -2695,6 +2935,7 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         producer_session_id: producer_session_id.as_deref(),
         body_handle: body_handle.as_deref(),
         evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
+        verification_record: None,
     })
 }
 

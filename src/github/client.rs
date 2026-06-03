@@ -21,7 +21,7 @@ use crate::github::{
 
 /// Maximum time the unauthenticated repo probe will wait for an anonymous
 /// rate-limit reset before exiting with `github_rate_limit_anon` (policy §2).
-const ANON_RATE_LIMIT_WAIT_CAP: Duration = Duration::from_secs(5 * 60);
+const ANON_RATE_LIMIT_WAIT_CAP: Duration = Duration::from_mins(5);
 
 /// Default GitHub REST API base URL.
 pub const DEFAULT_API_BASE: &str = "https://api.github.com";
@@ -518,8 +518,8 @@ mod tests {
     fn backoff_caps() {
         assert_eq!(backoff(0, 5, 60), Duration::from_secs(5));
         assert_eq!(backoff(1, 5, 60), Duration::from_secs(10));
-        assert_eq!(backoff(10, 5, 60), Duration::from_secs(60));
-        assert_eq!(backoff(0, 60, 600), Duration::from_secs(60));
+        assert_eq!(backoff(10, 5, 60), Duration::from_mins(1));
+        assert_eq!(backoff(0, 60, 600), Duration::from_mins(1));
     }
 
     #[test]
