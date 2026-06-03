@@ -778,7 +778,7 @@ pub fn import_claude_code(path: &Path, opts: &ImportOptions) -> Result<Graph> {
 
     // ── Summary events → Diagnostic ───────────────────────────────────────────
     for (i, (line_idx, se)) in grouped.summary_events.iter().enumerate() {
-        emit_summary_diagnostic(&mut graph, i, *line_idx, se, &run_id, &ctx);
+        emit_summary_diagnostic(&mut graph, i, *line_idx, se, &run_id, &ctx, opts);
     }
 
     // ── Unknown event kinds → Diagnostic ─────────────────────────────────────
@@ -1279,6 +1279,7 @@ fn emit_summary_diagnostic(
     se: &SummaryEvent,
     run_id: &str,
     ctx: &ImportCtx,
+    opts: &ImportOptions,
 ) {
     let timestamp = se
         .timestamp
@@ -1292,10 +1293,11 @@ fn emit_summary_diagnostic(
         &idx.to_string(),
         run_id,
     ]);
-    let summary_text = se.summary.as_deref().unwrap_or("(empty summary)");
+    let redacted_text = se.summary.as_deref().map(|s| redact(s, opts));
+    let label_excerpt = redacted_text.as_deref().unwrap_or("(empty summary)");
     let label = format!(
         "Summary event at line {line_idx}: {}",
-        safe_truncate(summary_text, 120)
+        safe_truncate(label_excerpt, 120)
     );
     graph.push(make_node(
         diag_id.clone(),
@@ -1304,7 +1306,7 @@ fn emit_summary_diagnostic(
         ctx,
         NodeExtra {
             observed_at: Some(timestamp),
-            text: se.summary.clone(),
+            text: redacted_text,
             ..Default::default()
         },
     ));
