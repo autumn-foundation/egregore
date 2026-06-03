@@ -8162,9 +8162,7 @@ fn handle_verb_criteria_for_task(
                 else {
                     return ac_json;
                 };
-                let ver_id = if let Some(v_id) = verification_link_id {
-                    Some(v_id.as_str())
-                } else {
+                let ver_id = verification_link_id.as_deref().or_else(|| {
                     records.iter().find_map(|edge| {
                         if let GraphRecord::Edge {
                             label: EdgeLabel::ClosesAcceptanceCriterion,
@@ -8182,7 +8180,7 @@ fn handle_verb_criteria_for_task(
                             None
                         }
                     })
-                };
+                });
 
                 if let Some(ver_record) =
                     ver_id.and_then(|vid| records.iter().find(|cand| cand.id() == vid))
@@ -8227,6 +8225,14 @@ fn handle_verb_criteria_for_task(
         .collect();
     rem = rem.saturating_sub(verification_evidence.len());
 
+    let reviews: Vec<_> = ctx
+        .reviews
+        .iter()
+        .take(rem)
+        .map(|r| context_linked_item_to_json(r))
+        .collect();
+    rem = rem.saturating_sub(reviews.len());
+
     let external_links: Vec<_> = ctx
         .external_links
         .iter()
@@ -8263,6 +8269,7 @@ fn handle_verb_criteria_for_task(
             "observations": observations,
             "artifacts": artifacts,
             "verification_evidence": verification_evidence,
+            "reviews": reviews,
             "external_links": external_links,
             "unresolved": unresolved,
         }),

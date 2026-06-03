@@ -1257,12 +1257,13 @@ fn inspect(
                 data_dir.display()
             )
         })?;
-        let (records, unknown_versions, snapshot_timestamp) = client.get_all_records().with_context(|| {
-            format!(
+        let (records, unknown_versions, snapshot_timestamp) =
+            client.get_all_records().with_context(|| {
+                format!(
                 "failed to inspect data-dir {}: invalid authorization token or daemon read error",
                 data_dir.display()
             )
-        })?;
+            })?;
 
         let counts = InspectCounts::from_records(&records, &unknown_versions);
 
@@ -1706,6 +1707,8 @@ struct ContextLinkedItem<'a> {
     /// The verification record that closed this acceptance criterion (only populated for verified ACs).
     #[serde(skip_serializing_if = "Option::is_none")]
     verification_record: Option<Box<Self>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author: Option<&'a str>,
 }
 
 /// One unresolved evidence link target, surfaced per AC5.
@@ -1761,6 +1764,8 @@ struct TaskContextResponse<'a> {
     observations: Vec<ContextObservation<'a>>,
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reviews: Vec<ContextLinkedItem<'a>>,
     external_links: Vec<ContextLinkedItem<'a>>,
     unresolved: Vec<ContextUnresolved<'a>>,
 }
@@ -2716,6 +2721,12 @@ fn query_task_cmd(records: &[GraphRecord], id_or_handle: &str) -> Result<()> {
         .filter_map(|r| context_linked_item(r))
         .collect();
 
+    let reviews: Vec<ContextLinkedItem<'_>> = ctx
+        .reviews
+        .iter()
+        .filter_map(|r| context_linked_item(r))
+        .collect();
+
     let external_links: Vec<ContextLinkedItem<'_>> = ctx
         .external_links
         .iter()
@@ -2743,6 +2754,7 @@ fn query_task_cmd(records: &[GraphRecord], id_or_handle: &str) -> Result<()> {
         observations,
         artifacts,
         verification_evidence,
+        reviews,
         external_links,
         unresolved,
     };
@@ -2895,6 +2907,7 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         producer_session_id,
         body_handle,
         evidence_links,
+        author,
         ..
     } = record
     else {
@@ -2936,6 +2949,7 @@ fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
         body_handle: body_handle.as_deref(),
         evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
         verification_record: None,
+        author: author.as_deref(),
     })
 }
 

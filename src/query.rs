@@ -1183,6 +1183,8 @@ pub struct TaskEvidenceContext<'a> {
     pub artifacts: Vec<&'a GraphRecord>,
     /// Verification evidence (`Verification`, `CommandRun`, etc.) linked to the task.
     pub verification_evidence: Vec<&'a GraphRecord>,
+    /// `Review` nodes (issue comments, PR reviews, etc.) referencing the task.
+    pub reviews: Vec<&'a GraphRecord>,
     /// `ExternalLink` nodes referencing source links.
     pub external_links: Vec<&'a GraphRecord>,
     /// Evidence link targets referenced by agent-memory nodes that are absent.
@@ -1199,6 +1201,7 @@ impl TaskEvidenceContext<'_> {
             && self.observations.is_empty()
             && self.artifacts.is_empty()
             && self.verification_evidence.is_empty()
+            && self.reviews.is_empty()
             && self.external_links.is_empty()
             && self.unresolved.is_empty()
     }
@@ -1294,6 +1297,16 @@ pub fn resolve_task_ids(
     // Resolve via ExternalLink nodes
     let mut matched_links = BTreeSet::new();
 
+    // Check if handle is a GitHub short handle (owner/repo#num or #num)
+    let mut github_short_handle_matches = None;
+    if let Some(pos) = id_or_handle.find('#') {
+        let repo_part = &id_or_handle[..pos];
+        let num_part = &id_or_handle[pos + 1..];
+        if !num_part.is_empty() && num_part.chars().all(|c| c.is_ascii_digit()) {
+            github_short_handle_matches = Some((repo_part, num_part));
+        }
+    }
+
     // Local JSONL handle: convert to native ID representation
     let mut local_native_id = None;
     if let Some(pos) = id_or_handle.rfind(':') {
@@ -1315,16 +1328,36 @@ pub fn resolve_task_ids(
             id,
             url,
             system_native_id,
+            repository_remote,
             ..
         } = r
         {
-            let matches = url.as_deref().is_some_and(|u| u == id_or_handle)
+            let mut matches = url.as_deref().is_some_and(|u| u == id_or_handle)
                 || system_native_id
                     .as_deref()
                     .is_some_and(|n| n == id_or_handle)
                 || local_native_id.as_ref().is_some_and(|native_id| {
                     system_native_id.as_deref().is_some_and(|n| n == native_id)
                 });
+
+            if let (false, Some((repo_part, num_part))) = (matches, github_short_handle_matches) {
+                let native_id_matches = system_native_id.as_deref().is_some_and(|n| {
+                    n == format!("issue:{num_part}") || n == format!("pr:{num_part}")
+                });
+                if native_id_matches {
+                    if repo_part.is_empty() {
+                        matches = true;
+                    } else {
+                        let expected_remote =
+                            format!("https://github.com/{repo_part}").to_lowercase();
+                        matches = repository_remote.as_deref().is_some_and(|r| {
+                            r.to_lowercase().trim_end_matches(".git")
+                                == expected_remote.trim_end_matches(".git")
+                        });
+                    }
+                }
+            }
+
             if matches {
                 matched_links.insert(id.clone());
             }
@@ -1446,6 +1479,7 @@ pub fn task_evidence_context<'a>(
     let mut observations = BTreeSet::new();
     let mut artifacts = BTreeSet::new();
     let mut verification_evidence = BTreeSet::new();
+    let mut reviews = BTreeSet::new();
     let mut external_links = BTreeSet::new();
 
     // Local ExternalLink from Task field
@@ -1514,6 +1548,9 @@ pub fn task_evidence_context<'a>(
                             NodeKind::Verification | NodeKind::CommandRun | NodeKind::TestRun => {
                                 verification_evidence.insert(source.as_str());
                             }
+                            NodeKind::Review => {
+                                reviews.insert(source.as_str());
+                            }
                             _ => {}
                         }
                     }
@@ -1546,6 +1583,9 @@ pub fn task_evidence_context<'a>(
                     NodeKind::Verification | NodeKind::CommandRun | NodeKind::TestRun => {
                         verification_evidence.insert(id.as_str());
                     }
+                    NodeKind::Review => {
+                        reviews.insert(id.as_str());
+                    }
                     _ => {}
                 }
             }
@@ -1570,19 +1610,24 @@ pub fn task_evidence_context<'a>(
     for id in &verification_evidence {
         visited.insert(*id);
     }
+    for id in &reviews {
+        visited.insert(*id);
+    }
     for id in &external_links {
         visited.insert(*id);
     }
 
     let mut frontier: BTreeSet<&str> = visited.clone();
     let mut temporal_evidence_scanned: BTreeSet<String> = BTreeSet::new();
+    let mut evidence_links_scanned: BTreeSet<&str> = BTreeSet::new();
     let mut unresolved = Vec::new();
 
     let classify_and_insert_task = |record_id: &'a str,
                                     source_facts: &mut BTreeSet<&'a str>,
                                     observations: &mut BTreeSet<&'a str>,
                                     artifacts: &mut BTreeSet<&'a str>,
-                                    verification_evidence: &mut BTreeSet<&'a str>|
+                                    verification_evidence: &mut BTreeSet<&'a str>,
+                                    reviews: &mut BTreeSet<&'a str>|
      -> bool {
         if tombstoned_ids.contains(record_id) && !has_any_temporal_version.contains(record_id) {
             return false;
@@ -1593,6 +1638,10 @@ pub fn task_evidence_context<'a>(
         let GraphRecord::Node { kind, .. } = rec else {
             return false;
         };
+        if *kind == NodeKind::Review {
+            reviews.insert(record_id);
+            return true;
+        }
         match classify_node(*kind) {
             Some(ContextSection::SourceFact) => {
                 source_facts.insert(record_id);
@@ -1651,6 +1700,7 @@ pub fn task_evidence_context<'a>(
                             &mut observations,
                             &mut artifacts,
                             &mut verification_evidence,
+                            &mut reviews,
                         );
                         if was_classified
                             || is_bfs_relay_node(
@@ -1671,7 +1721,7 @@ pub fn task_evidence_context<'a>(
                     ..
                 } => {
                     let already_scanned = temporal.as_ref().map_or_else(
-                        || visited.contains(node_id.as_str()),
+                        || !evidence_links_scanned.insert(node_id.as_str()),
                         |t| {
                             let key = format!("{}@{}", node_id, t.git_commit);
                             !temporal_evidence_scanned.insert(key)
@@ -1699,6 +1749,7 @@ pub fn task_evidence_context<'a>(
                                         &mut observations,
                                         &mut artifacts,
                                         &mut verification_evidence,
+                                        &mut reviews,
                                     );
                                     visited.insert(target_id.as_str());
                                     if target_classified {
@@ -1781,6 +1832,7 @@ pub fn task_evidence_context<'a>(
         observations: resolve(&observations),
         artifacts: resolve(&artifacts),
         verification_evidence: resolve(&verification_evidence),
+        reviews: resolve(&reviews),
         external_links: resolve(&external_links),
         unresolved: {
             let mut u = unresolved;

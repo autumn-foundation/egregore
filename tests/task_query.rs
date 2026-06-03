@@ -32,7 +32,7 @@ fn fixture_task_query_seeded() -> (tempfile::TempDir, PathBuf, String) {
 
     // Seed: 1 Task, 2 Acceptance Criteria (one verified, one unverified),
     // 2 code handles (touched file / mentions symbol), 1 agent observation,
-    // 1 artifact, 1 verification record, 1 external link.
+    // 1 artifact, 1 verification record, 1 external link, 1 review node.
     let task_id = project_stable_id(&["task", "task_1"]);
 
     let ext_link_id = stable_id(&[
@@ -51,11 +51,13 @@ fn fixture_task_query_seeded() -> (tempfile::TempDir, PathBuf, String) {
     if let GraphRecord::Node {
         ref mut url,
         ref mut system_native_id,
+        ref mut repository_remote,
         ..
     } = ext_link
     {
         *url = Some("https://github.com/madmax983/egregore/issues/48".to_owned());
-        *system_native_id = Some("madmax983/egregore#48".to_owned());
+        *system_native_id = Some("issue:48".to_owned());
+        *repository_remote = Some("https://github.com/madmax983/egregore".to_owned());
     }
 
     let mut task = GraphRecord::node(
@@ -144,6 +146,28 @@ fn fixture_task_query_seeded() -> (tempfile::TempDir, PathBuf, String) {
         *verification_kind = Some("command_run".to_owned());
     }
 
+    // Verification record 2 (secondary evidence accessed via observation)
+    let ver_2_id = verification_stable_id(&["verification", "ver_2"]);
+    let mut ver_2 = GraphRecord::node(
+        ver_2_id.clone(),
+        NodeKind::Verification,
+        None,
+        None,
+        None,
+        "Secondary Verification".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut status,
+        ref mut verification_kind,
+        ..
+    } = ver_2
+    {
+        *schema_version = VERIFICATION_SCHEMA_VERSION;
+        *status = Some("pass".to_owned());
+        *verification_kind = Some("ci_status".to_owned());
+    }
+
     // Edge connecting AC 1 to Verification (CLOSES_ACCEPTANCE_CRITERION)
     let ac_ver_edge = GraphRecord::edge(
         EdgeLabel::ClosesAcceptanceCriterion,
@@ -201,16 +225,28 @@ fn fixture_task_query_seeded() -> (tempfile::TempDir, PathBuf, String) {
         *observed_at = Some("2026-06-03T12:00:00Z".to_owned());
         *confidence = Some("1.0".to_owned());
         *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
-        *evidence_links = Some(vec![EvidenceLink {
-            target_record_id: Some(task_id.clone()),
-            target_domain: "project".to_owned(),
-            relation: "REFERENCES_TASK".to_owned(),
-            confidence: "1.0".to_owned(),
-            as_of_commit: None,
-            target_repo_relative_path: None,
-            target_span: None,
-            target_git_commit: None,
-        }]);
+        *evidence_links = Some(vec![
+            EvidenceLink {
+                target_record_id: Some(task_id.clone()),
+                target_domain: "project".to_owned(),
+                relation: "REFERENCES_TASK".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            },
+            EvidenceLink {
+                target_record_id: Some(ver_2_id),
+                target_domain: "verification".to_owned(),
+                relation: "VALIDATED_BY".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            },
+        ]);
     }
 
     // Artifact referencing Task
@@ -242,17 +278,53 @@ fn fixture_task_query_seeded() -> (tempfile::TempDir, PathBuf, String) {
         }]);
     }
 
+    // Review node referencing Task
+    let review_id = project_stable_id(&["project", "Review", "review_1"]);
+    let mut review = GraphRecord::node(
+        review_id.clone(),
+        NodeKind::Review,
+        None,
+        None,
+        None,
+        "GitHub Issue Comment Review".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut review_kind,
+        ref mut author,
+        ref mut parent_task_id,
+        ..
+    } = review
+    {
+        *schema_version = PROJECT_SCHEMA_VERSION;
+        *review_kind = Some("issue_comment".to_owned());
+        *author = Some("charlie".to_owned());
+        *parent_task_id = Some(task_id.clone());
+    }
+
+    // Edge from Review to Task (ReferencesTask)
+    let review_edge = GraphRecord::edge(
+        EdgeLabel::ReferencesTask,
+        review_id,
+        task_id.clone(),
+        None,
+        "Review references task".to_owned(),
+    );
+
     let mut graph = Graph::new();
     graph.push(ext_link);
     graph.push(task);
     graph.push(ac_1);
     graph.push(ac_2);
     graph.push(ver);
+    graph.push(ver_2);
     graph.push(ac_ver_edge);
     graph.push(file);
     graph.push(task_file_edge);
     graph.push(obs);
     graph.push(art);
+    graph.push(review);
+    graph.push(review_edge);
 
     let jsonl = graph.to_jsonl().expect("serialize");
     fs::write(&path, jsonl).expect("write");
@@ -307,6 +379,18 @@ fn query_task_by_canonical_id_returns_structured_json() {
     // Verify artifacts are populated
     let artifacts = parsed["artifacts"].as_array().expect("artifacts");
     assert_eq!(artifacts.len(), 1);
+
+    // Verify reviews are populated
+    let reviews = parsed["reviews"].as_array().expect("reviews");
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0]["author"], "charlie");
+
+    // Verify verification evidence is populated and has 2 records
+    // (ver_1 closes ac_1, ver_2 is traversed via obs_1 evidence link)
+    let ver_ev = parsed["verification_evidence"]
+        .as_array()
+        .expect("verification evidence");
+    assert_eq!(ver_ev.len(), 2);
 }
 
 #[test]
