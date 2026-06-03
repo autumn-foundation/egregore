@@ -1,0 +1,1050 @@
+#![allow(
+    missing_docs,
+    clippy::too_many_lines,
+    clippy::redundant_clone,
+    clippy::unnecessary_unwrap
+)]
+
+use std::{fs, path::PathBuf};
+
+use aletheia_egregore::{
+    EdgeLabel, EvidenceLink, GraphRecord, NodeKind, UserContextFields, UserContextScope,
+    ir::{
+        AGENT_MEMORY_SCHEMA_VERSION, Graph, USER_CONTEXT_SCHEMA_VERSION, agent_memory_stable_id,
+        stable_id, user_context_stable_id,
+    },
+};
+use assert_cmd::Command;
+
+fn egregore() -> Command {
+    Command::cargo_bin("egregore").expect("binary should run")
+}
+
+/// Helper to generate a seeded graph JSONL fixture containing:
+/// - 3 pending preference candidates
+/// - 2 prior decisions
+/// - at least 6 supporting evidence links
+fn fixture_preference_approval_seeded() -> (tempfile::TempDir, PathBuf, Vec<String>) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("preference_approval_seeded.jsonl");
+
+    let mut graph = Graph::new();
+
+    // 1. Core Repository node
+    let repo_id = stable_id(&["node", "Repository", "egregore"]);
+    let repo = GraphRecord::node(
+        repo_id.clone(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("egregore".to_owned()),
+        "Repository egregore".to_owned(),
+    );
+    graph.push(repo);
+
+    // 2. Supporting Evidence: 6 observations across 2 sessions (sess_1, sess_2)
+    let mut obs_ids = Vec::new();
+    for i in 1..=6 {
+        let obs_id = agent_memory_stable_id(&["obs", &format!("obs_{i}")]);
+        obs_ids.push(obs_id.clone());
+        let session_id = if i <= 3 { "sess_1" } else { "sess_2" };
+        let mut obs = GraphRecord::node(
+            obs_id,
+            NodeKind::Observation,
+            None,
+            None,
+            None,
+            format!("Supporting observation {i}").to_owned(),
+        );
+        if let GraphRecord::Node {
+            ref mut text,
+            ref mut agent_id,
+            session_id: ref mut session_id_field,
+            ref mut observed_at,
+            ref mut confidence,
+            ref mut schema_version,
+            ref mut domain,
+            ..
+        } = obs
+        {
+            *text = Some(format!("Observed pattern {i}").to_owned());
+            *agent_id = Some("agent_1".to_owned());
+            *session_id_field = Some(session_id.to_owned());
+            *observed_at = Some("2026-06-03T12:00:00Z".to_owned());
+            *confidence = Some("1.0".to_owned());
+            *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+            *domain = Some("agent_memory".to_owned());
+        }
+        graph.push(obs);
+    }
+
+    // 3. Three pending candidate promotions:
+    // Candidate 1: Rust style preference
+    let cand_1_text = "Prefer match over if-let for simple options";
+    let scope_1 = UserContextScope {
+        repo: Some("egregore".to_owned()),
+        path_glob: Some("src/**/*.rs".to_owned()),
+        language: Some("rust".to_owned()),
+        lifecycle_phase: Some("pre_commit".to_owned()),
+    };
+    let cand_1_id =
+        user_context_stable_id(&["candidate", &blake3::hash(cand_1_text.as_bytes()).to_hex()]);
+    let mut cand_1 = GraphRecord::node(
+        cand_1_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Rust style promotion candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut confidence,
+        ref mut evidence_quality,
+        ref mut valid_time,
+        ref mut valid_time_source,
+        ..
+    } = cand_1
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
+        *valid_time = Some("2026-06-03T12:00:00Z".to_owned());
+        *valid_time_source = Some("inferred".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some(cand_1_text.to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(scope_1),
+            supporting_evidence: Some(vec![
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[0].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.9".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[1].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.9".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[3].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.9".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+            ]),
+            contradicting_evidence: Some(vec![]),
+            ..UserContextFields::empty()
+        };
+    }
+    graph.push(cand_1.clone());
+
+    // Connect edges for Candidate 1
+    for obs_id in &[&obs_ids[0], &obs_ids[1], &obs_ids[3]] {
+        graph.push(GraphRecord::edge(
+            EdgeLabel::ProposedBy,
+            cand_1_id.clone(),
+            (*obs_id).clone(),
+            Some("0.9".to_owned()),
+            "Candidate proposed by Observation".to_owned(),
+        ));
+    }
+
+    // Candidate 2: Workflow rule
+    let cand_2_text = "Always run cargo clippy before committing";
+    let scope_2 = UserContextScope {
+        repo: Some("egregore".to_owned()),
+        path_glob: None,
+        language: Some("rust".to_owned()),
+        lifecycle_phase: Some("pre_commit".to_owned()),
+    };
+    let cand_2_id =
+        user_context_stable_id(&["candidate", &blake3::hash(cand_2_text.as_bytes()).to_hex()]);
+    let mut cand_2 = GraphRecord::node(
+        cand_2_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Cargo clippy workflow candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut confidence,
+        ref mut evidence_quality,
+        ref mut valid_time,
+        ref mut valid_time_source,
+        ..
+    } = cand_2
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *confidence = Some("0.85".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
+        *valid_time = Some("2026-06-03T12:00:00Z".to_owned());
+        *valid_time_source = Some("inferred".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some(cand_2_text.to_owned()),
+            proposed_rule_kind: Some("workflow_rule".to_owned()),
+            scope: Some(scope_2),
+            supporting_evidence: Some(vec![
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[2].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.85".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[4].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.85".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[5].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.85".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+            ]),
+            contradicting_evidence: Some(vec![]),
+            triggers: Some(vec!["pre_commit".to_owned()]),
+            action_summary: Some("Run clippy validation".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+    graph.push(cand_2.clone());
+
+    for obs_id in &[&obs_ids[2], &obs_ids[4], &obs_ids[5]] {
+        graph.push(GraphRecord::edge(
+            EdgeLabel::ProposedBy,
+            cand_2_id.clone(),
+            (*obs_id).clone(),
+            Some("0.85".to_owned()),
+            "Candidate proposed by Observation".to_owned(),
+        ));
+    }
+
+    // Candidate 3: Constraint
+    let cand_3_text = "No unsafe code blocks allowed";
+    let scope_3 = UserContextScope {
+        repo: Some("egregore".to_owned()),
+        path_glob: Some("src/**/*.rs".to_owned()),
+        language: Some("rust".to_owned()),
+        lifecycle_phase: Some("any".to_owned()),
+    };
+    let cand_3_id =
+        user_context_stable_id(&["candidate", &blake3::hash(cand_3_text.as_bytes()).to_hex()]);
+    let mut cand_3 = GraphRecord::node(
+        cand_3_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "No unsafe code constraint candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut confidence,
+        ref mut evidence_quality,
+        ref mut valid_time,
+        ref mut valid_time_source,
+        ..
+    } = cand_3
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *confidence = Some("0.95".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
+        *valid_time = Some("2026-06-03T12:00:00Z".to_owned());
+        *valid_time_source = Some("inferred".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some(cand_3_text.to_owned()),
+            proposed_rule_kind: Some("constraint".to_owned()),
+            scope: Some(scope_3),
+            supporting_evidence: Some(vec![
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[0].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.95".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[2].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.95".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[4].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.95".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+            ]),
+            contradicting_evidence: Some(vec![]),
+            enforcement_level: Some("blocking".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+    graph.push(cand_3.clone());
+
+    for obs_id in &[&obs_ids[0], &obs_ids[2], &obs_ids[4]] {
+        graph.push(GraphRecord::edge(
+            EdgeLabel::ProposedBy,
+            cand_3_id.clone(),
+            (*obs_id).clone(),
+            Some("0.95".to_owned()),
+            "Candidate proposed by Observation".to_owned(),
+        ));
+    }
+
+    // 4. Two prior decisions (one approved Preference, one rejected Preference)
+    // Seed an approved Preference decision trace
+    let old_cand_text = "Prior approved candidate preference";
+    let old_cand_id = user_context_stable_id(&[
+        "candidate",
+        &blake3::hash(old_cand_text.as_bytes()).to_hex(),
+    ]);
+    let mut old_cand = GraphRecord::node(
+        old_cand_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Old approved candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut confidence,
+        ref mut evidence_quality,
+        ..
+    } = old_cand
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some(old_cand_text.to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            supporting_evidence: Some(vec![
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[0].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.9".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[1].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.9".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[3].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.9".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+            ]),
+            ..UserContextFields::empty()
+        };
+    }
+    graph.push(old_cand);
+
+    let prompt_1_id = user_context_stable_id(&["prompt", "prompt_old_approved"]);
+    let mut prompt_1 = GraphRecord::node(
+        prompt_1_id.clone(),
+        NodeKind::PromotionPrompt,
+        None,
+        None,
+        None,
+        "Old approved prompt".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = prompt_1
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(old_cand_id.clone()),
+            prompt_surface: Some("cli".to_owned()),
+            prompt_text: Some("Do you approve this prior preference?".to_owned()),
+            prompted_at: Some("2026-06-01T10:00:00Z".to_owned()),
+            prompted_to: Some("operator".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+    graph.push(prompt_1);
+    graph.push(GraphRecord::edge(
+        EdgeLabel::PromptedFor,
+        prompt_1_id.clone(),
+        old_cand_id.clone(),
+        None,
+        "Prompted for Candidate".to_owned(),
+    ));
+
+    let decision_1_id = user_context_stable_id(&["decision", "decision_old_approved"]);
+    let pref_1_id = user_context_stable_id(&["preference", "pref_old_approved"]);
+
+    let mut decision_1 = GraphRecord::node(
+        decision_1_id.clone(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Old approved decision".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = decision_1
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(old_cand_id.clone()),
+            prompt_id: Some(prompt_1_id),
+            outcome: Some("approved".to_owned()),
+            decided_at: Some("2026-06-01T10:05:00Z".to_owned()),
+            decided_by: Some("operator".to_owned()),
+            materialized_record_id: Some(pref_1_id.clone()),
+            ..UserContextFields::empty()
+        };
+    }
+    graph.push(decision_1);
+    graph.push(GraphRecord::edge(
+        EdgeLabel::DecidedOn,
+        decision_1_id.clone(),
+        old_cand_id,
+        None,
+        "Decided on Candidate".to_owned(),
+    ));
+
+    let mut pref_1 = GraphRecord::node(
+        pref_1_id.clone(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Old approved preference".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = pref_1
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            rule_text: Some(old_cand_text.to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            approval_decision_id: Some(decision_1_id.clone()),
+            active_from: Some("2026-06-01T10:05:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+    graph.push(pref_1);
+    graph.push(GraphRecord::edge(
+        EdgeLabel::MaterializedAs,
+        decision_1_id,
+        pref_1_id,
+        None,
+        "Materialized as Preference".to_owned(),
+    ));
+
+    // Seed a rejected Preference decision trace
+    let rejected_cand_text = "Prior rejected candidate preference";
+    let rejected_cand_id = user_context_stable_id(&[
+        "candidate",
+        &blake3::hash(rejected_cand_text.as_bytes()).to_hex(),
+    ]);
+    let mut rejected_cand = GraphRecord::node(
+        rejected_cand_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Old rejected candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut confidence,
+        ref mut evidence_quality,
+        ..
+    } = rejected_cand
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some(rejected_cand_text.to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            supporting_evidence: Some(vec![
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[0].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.9".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[1].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.9".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some(obs_ids[3].clone()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "0.9".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+            ]),
+            ..UserContextFields::empty()
+        };
+    }
+    graph.push(rejected_cand);
+
+    let prompt_2_id = user_context_stable_id(&["prompt", "prompt_old_rejected"]);
+    let mut prompt_2 = GraphRecord::node(
+        prompt_2_id.clone(),
+        NodeKind::PromotionPrompt,
+        None,
+        None,
+        None,
+        "Old rejected prompt".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = prompt_2
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(rejected_cand_id.clone()),
+            prompt_surface: Some("cli".to_owned()),
+            prompt_text: Some("Do you approve this prior rejected preference?".to_owned()),
+            prompted_at: Some("2026-06-02T10:00:00Z".to_owned()),
+            prompted_to: Some("operator".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+    graph.push(prompt_2);
+    graph.push(GraphRecord::edge(
+        EdgeLabel::PromptedFor,
+        prompt_2_id.clone(),
+        rejected_cand_id.clone(),
+        None,
+        "Prompted for Candidate".to_owned(),
+    ));
+
+    let decision_2_id = user_context_stable_id(&["decision", "decision_old_rejected"]);
+    let mut decision_2 = GraphRecord::node(
+        decision_2_id.clone(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Old rejected decision".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = decision_2
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(rejected_cand_id.clone()),
+            prompt_id: Some(prompt_2_id),
+            outcome: Some("rejected".to_owned()),
+            decided_at: Some("2026-06-02T10:05:00Z".to_owned()),
+            decided_by: Some("operator".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+    graph.push(decision_2);
+    graph.push(GraphRecord::edge(
+        EdgeLabel::DecidedOn,
+        decision_2_id,
+        rejected_cand_id,
+        None,
+        "Decided on Candidate".to_owned(),
+    ));
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    (temp, path, vec![cand_1_id, cand_2_id, cand_3_id])
+}
+
+#[test]
+fn query_pending_candidates_lists_all_unresolved_candidates() {
+    let (_temp, graph, cand_ids) = fixture_preference_approval_seeded();
+
+    let output = egregore()
+        .args(["query", "candidates", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    assert_eq!(parsed["ok"], true);
+    let candidates = parsed["candidates"].as_array().expect("candidate array");
+
+    // We expect exactly the 3 pending ones (not the already approved/rejected ones)
+    assert_eq!(candidates.len(), 3);
+
+    for id in &cand_ids {
+        assert!(candidates.iter().any(|c| c["id"].as_str() == Some(id)));
+    }
+
+    // Verify fields shown in candidates representation
+    let cand1 = candidates
+        .iter()
+        .find(|c| c["id"].as_str() == Some(&cand_ids[0]))
+        .unwrap();
+    assert_eq!(
+        cand1["proposed_rule_text"].as_str(),
+        Some("Prefer match over if-let for simple options")
+    );
+    assert_eq!(cand1["proposed_rule_kind"].as_str(), Some("preference"));
+    assert_eq!(cand1["confidence"].as_f64(), Some(0.9));
+    assert_eq!(cand1["scope"]["repo"].as_str(), Some("egregore"));
+    assert!(cand1["supporting_evidence"].as_array().unwrap().len() >= 3);
+}
+
+#[test]
+fn query_active_policy_returns_only_approved_records() {
+    let (_temp, graph, _) = fixture_preference_approval_seeded();
+
+    let output = egregore()
+        .args(["query", "policy", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    assert_eq!(parsed["ok"], true);
+    let policy = parsed["policy"].as_array().expect("policy array");
+
+    // Only 1 approved Preference node exists in active policy
+    assert_eq!(policy.len(), 1);
+    let entry = &policy[0];
+    assert_eq!(entry["kind"].as_str(), Some("Preference"));
+    assert_eq!(
+        entry["rule_text"].as_str(),
+        Some("Prior approved candidate preference")
+    );
+    assert!(entry["approval_decision_id"].as_str().is_some());
+}
+
+#[test]
+fn query_active_policy_supports_scope_filtering() {
+    let (_temp, graph, _) = fixture_preference_approval_seeded();
+
+    // Query with matching scope parameters
+    let output = egregore()
+        .args(["query", "policy", "--repo", "egregore", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(parsed["ok"], true);
+    let policy = parsed["policy"].as_array().expect("policy array");
+    // Global scope record matches any scope query
+    assert_eq!(policy.len(), 1);
+
+    // Query with mismatching scope (e.g. language python vs the global/rust)
+    let output_mismatch = egregore()
+        .args(["query", "policy", "--language", "python", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout_mismatch = String::from_utf8(output_mismatch).expect("utf8");
+    let parsed_mismatch: serde_json::Value =
+        serde_json::from_str(stdout_mismatch.trim()).expect("valid JSON");
+    assert_eq!(parsed_mismatch["ok"], true);
+    // Should still return global policy (scope is completely empty, so it matches any query)
+    assert_eq!(parsed_mismatch["policy"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn query_audit_returns_full_approval_chain_to_observations() {
+    let (_temp, graph, _) = fixture_preference_approval_seeded();
+    let pref_id = user_context_stable_id(&["preference", "pref_old_approved"]);
+
+    let output = egregore()
+        .args(["query", "audit", &pref_id, "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    assert_eq!(parsed["ok"], true);
+    let chain = parsed["audit_chain"].as_array().expect("audit chain");
+
+    // Expected chain length: 1 preference + 1 decision + 1 prompt + 1 candidate + 3 observations = 7
+    assert_eq!(chain.len(), 7);
+
+    // Verify first element is the preference
+    assert_eq!(chain[0]["kind"].as_str(), Some("Preference"));
+    assert_eq!(chain[0]["id"].as_str(), Some(pref_id.as_str()));
+
+    // Verify second is decision
+    assert_eq!(chain[1]["kind"].as_str(), Some("PromotionDecision"));
+    assert_eq!(
+        chain[1]["id"].as_str(),
+        Some(user_context_stable_id(&["decision", "decision_old_approved"]).as_str())
+    );
+
+    // Verify third is prompt
+    assert_eq!(chain[2]["kind"].as_str(), Some("PromotionPrompt"));
+    assert_eq!(
+        chain[2]["id"].as_str(),
+        Some(user_context_stable_id(&["prompt", "prompt_old_approved"]).as_str())
+    );
+
+    // Verify fourth is candidate
+    assert_eq!(chain[3]["kind"].as_str(), Some("PromoteCandidate"));
+
+    // Verify remaining are observations
+    for node in &chain[4..] {
+        assert_eq!(node["kind"].as_str(), Some("Observation"));
+    }
+}
+
+#[test]
+fn decide_workflow_supports_approve_reject_defer_expire_outcomes() {
+    let (temp, graph, cand_ids) = fixture_preference_approval_seeded();
+    let cand_1_id = &cand_ids[0]; // proposed Preference
+
+    // Decide Outcome: Approve
+    let out_jsonl = temp.path().join("outcome_approved.jsonl");
+    egregore()
+        .args(["decide", cand_1_id, "--outcome", "approved", "--graph"])
+        .arg(&graph)
+        .arg("--out")
+        .arg(&out_jsonl)
+        .assert()
+        .success();
+
+    let content = fs::read_to_string(&out_jsonl).expect("read");
+    let records: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    // Expecting Prompt + Prompt Edge + Decision + Decision Edge + Preference + Materialized Edge = 6 records
+    assert_eq!(records.len(), 6);
+
+    let decision = records
+        .iter()
+        .find(|r| r["kind"] == "PromotionDecision")
+        .unwrap();
+    assert_eq!(decision["outcome"].as_str(), Some("approved"));
+
+    let prompt = records
+        .iter()
+        .find(|r| r["kind"] == "PromotionPrompt")
+        .unwrap();
+    assert_eq!(prompt["candidate_id"].as_str(), Some(cand_1_id.as_str()));
+
+    let preference = records.iter().find(|r| r["kind"] == "Preference").unwrap();
+    assert_eq!(
+        preference["rule_text"].as_str(),
+        Some("Prefer match over if-let for simple options")
+    );
+    assert_eq!(
+        preference["approval_decision_id"].as_str(),
+        Some(decision["id"].as_str().unwrap())
+    );
+
+    // Decide Outcome: Reject (creates no active policy/preference record)
+    let out_rejected = temp.path().join("outcome_rejected.jsonl");
+    egregore()
+        .args(["decide", cand_1_id, "--outcome", "rejected", "--graph"])
+        .arg(&graph)
+        .arg("--out")
+        .arg(&out_rejected)
+        .assert()
+        .success();
+
+    let content_rej = fs::read_to_string(&out_rejected).expect("read");
+    let records_rej: Vec<serde_json::Value> = content_rej
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    // Prompt + Prompt Edge + Decision + Decision Edge = 4 records, no Preference record
+    assert_eq!(records_rej.len(), 4);
+    assert!(records_rej.iter().all(|r| r["kind"] != "Preference"));
+}
+
+#[test]
+fn decide_workflow_supports_edit_then_approve_outcome() {
+    let (temp, graph, cand_ids) = fixture_preference_approval_seeded();
+    let cand_1_id = &cand_ids[0]; // proposed Preference
+
+    let out_jsonl = temp.path().join("outcome_edited.jsonl");
+    egregore()
+        .args([
+            "decide",
+            cand_1_id,
+            "--outcome",
+            "edited_then_approved",
+            "--edited-rule-text",
+            "Prefer standard Rust match style",
+            "--graph",
+        ])
+        .arg(&graph)
+        .arg("--out")
+        .arg(&out_jsonl)
+        .assert()
+        .success();
+
+    let content = fs::read_to_string(&out_jsonl).expect("read");
+    let records: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    let decision = records
+        .iter()
+        .find(|r| r["kind"] == "PromotionDecision")
+        .unwrap();
+    assert_eq!(decision["outcome"].as_str(), Some("edited_then_approved"));
+    assert_eq!(
+        decision["edited_rule_text"].as_str(),
+        Some("Prefer standard Rust match style")
+    );
+
+    let preference = records.iter().find(|r| r["kind"] == "Preference").unwrap();
+    assert_eq!(
+        preference["rule_text"].as_str(),
+        Some("Prefer standard Rust match style")
+    );
+}
+
+#[test]
+fn candidate_suppressed_if_compatible_with_recently_rejected_candidate() {
+    // 1. Prior candidate was rejected in the seeded fixture.
+    // Let's create a new candidate that is compatible with the rejected one:
+    // "Prior rejected candidate preference" -> new candidate "Prior rejected candidate preference" (exact/compatible text)
+    let (temp, graph, _) = fixture_preference_approval_seeded();
+    let new_cand_text = "Prior rejected candidate preference";
+    let new_cand_id = user_context_stable_id(&["candidate", "new_candidate_attempt_123"]);
+    let mut new_cand = GraphRecord::node(
+        new_cand_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Compatible candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut confidence,
+        ref mut evidence_quality,
+        ref mut superseded_by,
+        ..
+    } = new_cand
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
+        *superseded_by = Some(user_context_stable_id(&[
+            "candidate",
+            &blake3::hash("Prior rejected candidate preference".as_bytes()).to_hex(),
+        ]));
+        *user_context = UserContextFields {
+            proposed_rule_text: Some(new_cand_text.to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            supporting_evidence: Some(vec![]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let content = fs::read_to_string(&graph).expect("read");
+    let mut parsed_records: Vec<GraphRecord> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    parsed_records.push(new_cand);
+    let mut new_graph = Graph::new();
+    for r in parsed_records {
+        new_graph.push(r);
+    }
+    let new_graph_path = temp.path().join("debounce_check.jsonl");
+    fs::write(&new_graph_path, new_graph.to_jsonl().unwrap()).unwrap();
+
+    // Query pending candidates on the new graph
+    let output = egregore()
+        .args(["query", "candidates", "--graph"])
+        .arg(&new_graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    let candidates = parsed["candidates"].as_array().expect("candidates");
+    let target = candidates
+        .iter()
+        .find(|c| c["id"].as_str() == Some(&new_cand_id))
+        .unwrap();
+
+    // Debounce window defaults to T = 30 days and M = 5 observations.
+    // The candidate was just decided, has 0 new observations, so it should be suppressed
+    assert_eq!(target["suppressed"].as_str(), Some("rejection_debounce"));
+}
+
+#[test]
+fn deterministic_outputs_across_5_identical_runs() {
+    let (_temp, graph, _) = fixture_preference_approval_seeded();
+
+    let mut first_policy = None;
+    for _ in 0..5 {
+        let output = egregore()
+            .args(["query", "policy", "--graph"])
+            .arg(&graph)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let stdout = String::from_utf8(output).expect("utf8");
+        if first_policy.is_none() {
+            first_policy = Some(stdout);
+        } else {
+            assert_eq!(first_policy.as_ref().unwrap(), &stdout);
+        }
+    }
+}

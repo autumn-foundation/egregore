@@ -13,6 +13,8 @@ pub mod codex;
 /// Local daemon for shared multi-agent store access.
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod daemon;
+/// Decision record generation for user-context candidates.
+pub mod decide;
 /// Semantic enrichment and embedding boundaries.
 pub mod embeddings;
 /// Error and result types.
@@ -51,6 +53,7 @@ pub mod traj;
 use std::{collections::BTreeMap, path::Path, sync::LazyLock};
 
 pub use codex::import_codex;
+pub use decide::{DecideRequest, decide_candidate};
 pub use error::{CodegraphError, Result};
 pub use history::{scan_repository_history, scan_repository_history_with_override};
 pub use ir::{
@@ -65,7 +68,10 @@ pub use ir::{
     verification_stable_id,
 };
 pub use local_project::import_local_tasks;
-pub use query::{SymbolContext, UnresolvedRef, symbol_context};
+pub use query::{
+    SymbolContext, UnresolvedRef, active_policy, audit_trail, is_candidate_suppressed,
+    pending_candidates, symbol_context,
+};
 pub use schema_version::{
     RecordLineRead, RecordReadError, RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE,
     UnknownSchemaVersion, record_version, validate_record_version,

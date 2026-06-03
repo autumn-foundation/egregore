@@ -1,11 +1,22 @@
 //! Agent-facing graph query helpers.
+#![allow(
+    clippy::uninlined_format_args,
+    clippy::manual_let_else,
+    clippy::collapsible_if,
+    clippy::match_like_matches_macro,
+    clippy::too_many_lines,
+    clippy::doc_markdown,
+    clippy::cast_precision_loss,
+)]
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use chrono::DateTime;
 
-use crate::ir::{EdgeLabel, EvidenceLink, GraphRecord, NodeKind, SemanticDriftMetadata};
+use crate::ir::{
+    EdgeLabel, EvidenceLink, GraphRecord, NodeKind, SemanticDriftMetadata, UserContextScope,
+};
 
 /// Finds a symbol record by name at a specific Git commit.
 ///
@@ -1847,4 +1858,492 @@ pub fn task_evidence_context<'a>(
             u
         },
     }
+}
+
+// ── user_context query helpers ────────────────────────────────────────────────
+
+fn scope_subset(a: &UserContextScope, b: &UserContextScope) -> bool {
+    if let Some(r) = &a.repo {
+        if Some(r) != b.repo.as_ref() {
+            return false;
+        }
+    }
+    if let Some(p) = &a.path_glob {
+        if Some(p) != b.path_glob.as_ref() {
+            return false;
+        }
+    }
+    if let Some(l) = &a.language {
+        if Some(l) != b.language.as_ref() {
+            return false;
+        }
+    }
+    if let Some(ph) = &a.lifecycle_phase {
+        if Some(ph) != b.lifecycle_phase.as_ref() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Checks if two UserContextScopes are compatible (one is subset of other or equal)
+#[must_use]
+pub fn scopes_compatible(a: &UserContextScope, b: &UserContextScope) -> bool {
+    scope_subset(a, b) || scope_subset(b, a)
+}
+
+/// Checks if a record scope matches a query scope
+#[must_use]
+pub fn scope_matches(record_scope: &UserContextScope, query_scope: &UserContextScope) -> bool {
+    if let Some(r_repo) = &record_scope.repo {
+        if Some(r_repo) != query_scope.repo.as_ref() {
+            return false;
+        }
+    }
+    if let Some(r_path) = &record_scope.path_glob {
+        if Some(r_path) != query_scope.path_glob.as_ref() {
+            return false;
+        }
+    }
+    if let Some(r_lang) = &record_scope.language {
+        if Some(r_lang) != query_scope.language.as_ref() {
+            return false;
+        }
+    }
+    if let Some(r_phase) = &record_scope.lifecycle_phase {
+        if Some(r_phase) != query_scope.lifecycle_phase.as_ref() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Calculates Jaccard token similarity between two proposed rule texts
+#[must_use]
+pub fn jaccard_similarity(s1: &str, s2: &str) -> f64 {
+    let normalize = |s: &str| -> Vec<String> {
+        s.to_lowercase()
+            .split_whitespace()
+            .map(String::from)
+            .collect()
+    };
+    let w1 = normalize(s1);
+    let w2 = normalize(s2);
+    if w1.is_empty() && w2.is_empty() {
+        return 1.0;
+    }
+    let set1: std::collections::BTreeSet<String> = w1.into_iter().collect();
+    let set2: std::collections::BTreeSet<String> = w2.into_iter().collect();
+
+    let intersection = set1.intersection(&set2).count() as f64;
+    let union = set1.union(&set2).count() as f64;
+    intersection / union
+}
+
+/// Checks if a candidate is suppressed under the rejection debounce window
+#[must_use]
+pub fn is_candidate_suppressed(records: &[GraphRecord], cand_id: &str) -> Option<String> {
+    let cand = records.iter().find(|r| r.id() == cand_id)?;
+    let (cand_text, cand_scope, superseded_by_id) = match cand {
+        GraphRecord::Node {
+            user_context,
+            superseded_by,
+            ..
+        } => {
+            let text = user_context.proposed_rule_text.as_deref()?;
+            let scope = user_context.scope.as_ref()?;
+            (text, scope, superseded_by.as_deref())
+        }
+        _ => return None,
+    };
+
+    if let Some(old_id) = superseded_by_id {
+        if let Some(old_rec) = records.iter().find(|r| r.id() == old_id) {
+            let decision = records.iter().find(|r| {
+                if let GraphRecord::Node {
+                    kind: NodeKind::PromotionDecision,
+                    user_context,
+                    ..
+                } = r
+                {
+                    user_context.candidate_id.as_deref() == Some(old_id)
+                } else {
+                    false
+                }
+            });
+            if let Some(GraphRecord::Node {
+                user_context: decision_fields,
+                ..
+            }) = decision
+            {
+                if decision_fields.outcome.as_deref() == Some("rejected") {
+                    let decided_at_str = decision_fields.decided_at.as_deref()?;
+                    let current_time_str = match cand {
+                        GraphRecord::Node { valid_time, .. } => valid_time.as_deref(),
+                        _ => None,
+                    }
+                    .unwrap_or("");
+
+                    let elapsed_ok = if let Ok(decided_at) =
+                        chrono::DateTime::parse_from_rfc3339(decided_at_str)
+                        && let Ok(current_time) =
+                            chrono::DateTime::parse_from_rfc3339(current_time_str)
+                    {
+                        current_time.signed_duration_since(decided_at) >= chrono::Duration::days(30)
+                    } else {
+                        false
+                    };
+
+                    let old_obs: std::collections::BTreeSet<&str> = match old_rec {
+                        GraphRecord::Node { user_context, .. } => user_context
+                            .supporting_evidence
+                            .as_deref()
+                            .map(|v| {
+                                v.iter()
+                                    .filter_map(|l| l.target_record_id.as_deref())
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        _ => std::collections::BTreeSet::new(),
+                    };
+
+                    let new_obs: std::collections::BTreeSet<&str> = match cand {
+                        GraphRecord::Node { user_context, .. } => user_context
+                            .supporting_evidence
+                            .as_deref()
+                            .map(|v| {
+                                v.iter()
+                                    .filter_map(|l| l.target_record_id.as_deref())
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        _ => std::collections::BTreeSet::new(),
+                    };
+
+                    let additional_count = new_obs.difference(&old_obs).count();
+
+                    if additional_count < 5 && !elapsed_ok {
+                        return Some("rejection_debounce".to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    for old_rec in records {
+        let (old_id, old_text, old_scope) = match old_rec {
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::PromoteCandidate,
+                user_context,
+                ..
+            } => {
+                if let Some(text) = &user_context.proposed_rule_text
+                    && let Some(scope) = &user_context.scope
+                {
+                    (id.as_str(), text.as_str(), scope)
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        if old_id == cand_id {
+            continue;
+        }
+        if jaccard_similarity(cand_text, old_text) >= 0.6
+            && scopes_compatible(cand_scope, old_scope)
+        {
+            let decision = records.iter().find(|r| {
+                if let GraphRecord::Node {
+                    kind: NodeKind::PromotionDecision,
+                    user_context,
+                    ..
+                } = r
+                {
+                    user_context.candidate_id.as_deref() == Some(old_id)
+                } else {
+                    false
+                }
+            });
+            if let Some(GraphRecord::Node {
+                user_context: decision_fields,
+                ..
+            }) = decision
+            {
+                if decision_fields.outcome.as_deref() == Some("rejected") {
+                    let decided_at_str = decision_fields.decided_at.as_deref()?;
+                    let current_time_str = match cand {
+                        GraphRecord::Node { valid_time, .. } => valid_time.as_deref(),
+                        _ => None,
+                    }
+                    .unwrap_or("");
+
+                    let elapsed_ok = if let Ok(decided_at) =
+                        chrono::DateTime::parse_from_rfc3339(decided_at_str)
+                        && let Ok(current_time) =
+                            chrono::DateTime::parse_from_rfc3339(current_time_str)
+                    {
+                        current_time.signed_duration_since(decided_at) >= chrono::Duration::days(30)
+                    } else {
+                        false
+                    };
+
+                    let old_obs: std::collections::BTreeSet<&str> = {
+                        match old_rec {
+                            GraphRecord::Node { user_context, .. } => user_context
+                                .supporting_evidence
+                                .as_deref()
+                                .map(|v| {
+                                    v.iter()
+                                        .filter_map(|l| l.target_record_id.as_deref())
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            _ => std::collections::BTreeSet::new(),
+                        }
+                    };
+
+                    let new_obs: std::collections::BTreeSet<&str> = {
+                        match cand {
+                            GraphRecord::Node { user_context, .. } => user_context
+                                .supporting_evidence
+                                .as_deref()
+                                .map(|v| {
+                                    v.iter()
+                                        .filter_map(|l| l.target_record_id.as_deref())
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            _ => std::collections::BTreeSet::new(),
+                        }
+                    };
+
+                    let additional_count = new_obs.difference(&old_obs).count();
+
+                    if additional_count < 5 && !elapsed_ok {
+                        return Some("rejection_debounce".to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Returns a list of pending candidates (those without a decision, or whose decision is deferred)
+#[must_use]
+pub fn pending_candidates<'a>(
+    records: &'a [GraphRecord],
+    query_scope: Option<&UserContextScope>,
+) -> Vec<&'a GraphRecord> {
+    let mut candidates = Vec::new();
+
+    let mut decisions = std::collections::BTreeMap::new();
+    for rec in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::PromotionDecision,
+            user_context,
+            ..
+        } = rec
+        {
+            if let Some(cand_id) = &user_context.candidate_id {
+                if let Some(outcome) = &user_context.outcome {
+                    decisions.insert(cand_id.as_str(), outcome.as_str());
+                }
+            }
+        }
+    }
+
+    for rec in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::PromoteCandidate,
+            user_context,
+            ..
+        } = rec
+        {
+            let is_pending = match decisions.get(rec.id()) {
+                None => true,
+                Some(&"deferred") => true,
+                _ => false,
+            };
+            if !is_pending {
+                continue;
+            }
+            if let Some(q_scope) = query_scope {
+                if let Some(r_scope) = &user_context.scope {
+                    if !scope_matches(r_scope, q_scope) {
+                        continue;
+                    }
+                }
+            }
+            candidates.push(rec);
+        }
+    }
+
+    candidates.sort_by_key(|c| c.id());
+    candidates
+}
+
+/// Returns active policy records matching the query scope
+#[must_use]
+pub fn active_policy<'a>(
+    records: &'a [GraphRecord],
+    query_scope: Option<&UserContextScope>,
+) -> Vec<&'a GraphRecord> {
+    let mut policy = Vec::new();
+    for rec in records {
+        if let GraphRecord::Node {
+            kind, user_context, ..
+        } = rec
+        {
+            if matches!(
+                kind,
+                NodeKind::Preference
+                    | NodeKind::WorkflowRule
+                    | NodeKind::NamingDecision
+                    | NodeKind::Constraint
+            ) {
+                if user_context.active_to.is_some() {
+                    continue;
+                }
+                if let Some(q_scope) = query_scope {
+                    if let Some(r_scope) = &user_context.scope {
+                        if !scope_matches(r_scope, q_scope) {
+                            continue;
+                        }
+                    }
+                }
+                policy.push(rec);
+            }
+        }
+    }
+    policy.sort_by_key(|p| p.id());
+    policy
+}
+
+/// Traces the approval chain back to supporting observations
+///
+/// # Errors
+///
+/// Returns an error if any hop in the chain is missing, stale, or ambiguous.
+pub fn audit_trail<'a>(
+    records: &'a [GraphRecord],
+    durable_id: &str,
+) -> std::result::Result<Vec<&'a GraphRecord>, String> {
+    let mut chain = Vec::new();
+
+    let durable = records
+        .iter()
+        .find(|r| r.id() == durable_id)
+        .ok_or_else(|| format!("Durable record '{}' not found", durable_id))?;
+
+    let kind = match durable {
+        GraphRecord::Node { kind, .. } => *kind,
+        _ => return Err(format!("Durable record '{}' is not a node", durable_id)),
+    };
+    if !matches!(
+        kind,
+        NodeKind::Preference
+            | NodeKind::WorkflowRule
+            | NodeKind::NamingDecision
+            | NodeKind::Constraint
+    ) {
+        return Err(format!(
+            "Record '{}' is not a durable user-context policy node",
+            durable_id
+        ));
+    }
+    chain.push(durable);
+
+    let user_context = match durable {
+        GraphRecord::Node { user_context, .. } => user_context,
+        _ => unreachable!(),
+    };
+
+    let decision_id = user_context
+        .approval_decision_id
+        .as_deref()
+        .ok_or_else(|| format!("Durable record '{}' lacks approval_decision_id", durable_id))?;
+
+    let decision = records
+        .iter()
+        .find(|r| r.id() == decision_id)
+        .ok_or_else(|| {
+            format!(
+                "Approval decision '{}' not found for durable record '{}'",
+                decision_id, durable_id
+            )
+        })?;
+    chain.push(decision);
+
+    let decision_fields = match decision {
+        GraphRecord::Node { user_context, .. } => user_context,
+        _ => return Err(format!("Decision '{}' is not a node", decision_id)),
+    };
+    let prompt_id = decision_fields
+        .prompt_id
+        .as_deref()
+        .ok_or_else(|| format!("Decision '{}' lacks prompt_id", decision_id))?;
+    let prompt = records
+        .iter()
+        .find(|r| r.id() == prompt_id)
+        .ok_or_else(|| {
+            format!(
+                "PromotionPrompt '{}' not found for decision '{}'",
+                prompt_id, decision_id
+            )
+        })?;
+    chain.push(prompt);
+
+    let prompt_fields = match prompt {
+        GraphRecord::Node { user_context, .. } => user_context,
+        _ => return Err(format!("Prompt '{}' is not a node", prompt_id)),
+    };
+    let candidate_id = prompt_fields
+        .candidate_id
+        .as_deref()
+        .ok_or_else(|| format!("Prompt '{}' lacks candidate_id", prompt_id))?;
+    let candidate = records
+        .iter()
+        .find(|r| r.id() == candidate_id)
+        .ok_or_else(|| {
+            format!(
+                "PromoteCandidate '{}' not found for prompt '{}'",
+                candidate_id, prompt_id
+            )
+        })?;
+    chain.push(candidate);
+
+    let candidate_fields = match candidate {
+        GraphRecord::Node { user_context, .. } => user_context,
+        _ => return Err(format!("Candidate '{}' is not a node", candidate_id)),
+    };
+    let supporting = candidate_fields
+        .supporting_evidence
+        .as_deref()
+        .ok_or_else(|| format!("Candidate '{}' lacks supporting_evidence", candidate_id))?;
+
+    let mut obs_nodes = Vec::new();
+    for link in supporting {
+        let obs_id = link.target_record_id.as_deref().ok_or_else(|| {
+            format!(
+                "Candidate '{}' supporting evidence link lacks target_record_id",
+                candidate_id
+            )
+        })?;
+        let obs = records.iter().find(|r| r.id() == obs_id).ok_or_else(|| {
+            format!(
+                "Supporting observation '{}' not found for candidate '{}'",
+                obs_id, candidate_id
+            )
+        })?;
+        obs_nodes.push(obs);
+    }
+
+    obs_nodes.sort_by_key(|o| o.id());
+    chain.extend(obs_nodes);
+
+    Ok(chain)
 }

@@ -218,6 +218,38 @@ enum Commands {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Record an operator decision for a promotion candidate.
+    Decide {
+        /// Candidate ID to decide on.
+        candidate_id: String,
+        /// Outcome of the decision.
+        #[arg(long)]
+        outcome: String,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Graph JSONL path.
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Output JSONL path for the generated decision records.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Edited rule text (required if outcome is `edited_then_approved`).
+        #[arg(long)]
+        edited_rule_text: Option<String>,
+        /// Rationale for the decision.
+        #[arg(long)]
+        rationale: Option<String>,
+        /// Operator who decided.
+        #[arg(long, default_value = "operator")]
+        decided_by: String,
+        /// Surface where prompt was shown.
+        #[arg(long, default_value = "cli")]
+        prompt_surface: String,
+        /// Operator the prompt was shown to.
+        #[arg(long, default_value = "operator")]
+        prompted_to: String,
+    },
 }
 
 /// Subcommands for `import`.
@@ -388,6 +420,56 @@ enum QuerySubcommand {
         #[cfg(feature = "embedded-aletheiadb")]
         #[arg(long, requires = "data_dir", conflicts_with = "graph")]
         daemon: bool,
+    },
+    /// List pending promotion candidates.
+    Candidates {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// List active approved policies (`Preference`, `WorkflowRule`, `NamingDecision`, `Constraint`).
+    Policy {
+        /// Optional repository filter.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Optional path glob filter.
+        #[arg(long)]
+        path_glob: Option<String>,
+        /// Optional language filter.
+        #[arg(long)]
+        language: Option<String>,
+        /// Optional lifecycle phase filter.
+        #[arg(long)]
+        lifecycle_phase: Option<String>,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Trace the audit trail back from durable policies to observations.
+    Audit {
+        /// Durable policy record ID.
+        id: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
 }
 
@@ -634,6 +716,7 @@ pub fn run() -> Result<()> {
     run_cli(Cli::parse())
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Scan {
@@ -719,6 +802,29 @@ fn run_cli(cli: Cli) -> Result<()> {
         Commands::Write { kind } => write_evidence(kind),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Daemon { action } => daemon(action),
+        Commands::Decide {
+            candidate_id,
+            outcome,
+            data_dir,
+            graph,
+            out,
+            edited_rule_text,
+            rationale,
+            decided_by,
+            prompt_surface,
+            prompted_to,
+        } => decide_cmd(
+            candidate_id,
+            outcome,
+            data_dir,
+            graph,
+            out,
+            edited_rule_text,
+            rationale,
+            decided_by,
+            prompt_surface,
+            prompted_to,
+        ),
     }
 }
 
@@ -1891,6 +1997,41 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_task_cmd(&records, &id_or_handle)
+        }
+        QuerySubcommand::Candidates {
+            graph,
+            data_dir,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_candidates_cmd(&records, format)
+        }
+        QuerySubcommand::Policy {
+            repo,
+            path_glob,
+            language,
+            lifecycle_phase,
+            graph,
+            data_dir,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let scope = crate::UserContextScope {
+                repo,
+                path_glob,
+                language,
+                lifecycle_phase,
+            };
+            query_policy_cmd(&records, &scope, format)
+        }
+        QuerySubcommand::Audit {
+            id,
+            graph,
+            data_dir,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_audit_cmd(&records, &id, format)
         }
     }
 }
@@ -3176,7 +3317,231 @@ impl InspectCounts {
     }
 }
 
-// ---------------------------------------------------------------------------
+fn query_candidates_cmd(records: &[GraphRecord], format: OutputFormat) -> Result<()> {
+    let list = crate::query::pending_candidates(records, None);
+    let mut cli_candidates = Vec::new();
+    for rec in list {
+        if let GraphRecord::Node {
+            id,
+            user_context,
+            confidence,
+            ..
+        } = rec
+        {
+            let suppressed = crate::query::is_candidate_suppressed(records, id);
+            cli_candidates.push(serde_json::json!({
+                "id": id,
+                "proposed_rule_text": user_context.proposed_rule_text,
+                "proposed_rule_kind": user_context.proposed_rule_kind,
+                "confidence": confidence.as_deref().and_then(|c| c.parse::<f64>().ok()),
+                "scope": user_context.scope,
+                "supporting_evidence": user_context.supporting_evidence,
+                "suppressed": suppressed,
+            }));
+        }
+    }
+
+    match format {
+        OutputFormat::Json => {
+            let out = serde_json::json!({
+                "ok": true,
+                "candidates": cli_candidates,
+            });
+            println!("{}", serde_json::to_string(&out)?);
+        }
+        OutputFormat::Text => {
+            for c in cli_candidates {
+                let id = c["id"].as_str().unwrap_or("");
+                let rule_text = c["proposed_rule_text"].as_str().unwrap_or("");
+                let kind = c["proposed_rule_kind"].as_str().unwrap_or("");
+                let conf = c["confidence"].as_f64().unwrap_or(0.0);
+                let supp_str = c["suppressed"]
+                    .as_str()
+                    .map(|s| format!(" [suppressed: {s}]"))
+                    .unwrap_or_default();
+                println!("{id}: [{kind}] {rule_text} (confidence: {conf}){supp_str}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn query_policy_cmd(
+    records: &[GraphRecord],
+    scope: &crate::UserContextScope,
+    format: OutputFormat,
+) -> Result<()> {
+    let scope_filter = if scope.repo.is_none()
+        && scope.path_glob.is_none()
+        && scope.language.is_none()
+        && scope.lifecycle_phase.is_none()
+    {
+        None
+    } else {
+        Some(scope)
+    };
+
+    let list = crate::query::active_policy(records, scope_filter);
+    let mut cli_policy = Vec::new();
+    for rec in list {
+        if let GraphRecord::Node {
+            id,
+            kind,
+            user_context,
+            ..
+        } = rec
+        {
+            cli_policy.push(serde_json::json!({
+                "id": id,
+                "kind": kind.as_str(),
+                "rule_text": user_context.rule_text,
+                "constraint_text": user_context.constraint_text,
+                "canonical_name": user_context.canonical_name,
+                "entity_kind": user_context.entity_kind,
+                "approval_decision_id": user_context.approval_decision_id,
+                "scope": user_context.scope,
+                "active_from": user_context.active_from,
+                "triggers": user_context.triggers,
+                "action_summary": user_context.action_summary,
+                "alternatives_rejected": user_context.alternatives_rejected,
+                "enforcement_level": user_context.enforcement_level,
+            }));
+        }
+    }
+
+    match format {
+        OutputFormat::Json => {
+            let out = serde_json::json!({
+                "ok": true,
+                "policy": cli_policy,
+            });
+            println!("{}", serde_json::to_string(&out)?);
+        }
+        OutputFormat::Text => {
+            for p in cli_policy {
+                let id = p["id"].as_str().unwrap_or("");
+                let kind = p["kind"].as_str().unwrap_or("");
+                let body = p["rule_text"]
+                    .as_str()
+                    .or_else(|| p["constraint_text"].as_str())
+                    .or_else(|| p["canonical_name"].as_str())
+                    .unwrap_or("");
+                println!("{id}: [{kind}] {body}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn query_audit_cmd(records: &[GraphRecord], durable_id: &str, format: OutputFormat) -> Result<()> {
+    match crate::query::audit_trail(records, durable_id) {
+        Ok(chain) => {
+            match format {
+                OutputFormat::Json => {
+                    let out = serde_json::json!({
+                        "ok": true,
+                        "audit_chain": chain,
+                    });
+                    println!("{}", serde_json::to_string(&out)?);
+                }
+                OutputFormat::Text => {
+                    println!("Audit trail for policy record: {durable_id}");
+                    for (i, rec) in chain.iter().enumerate() {
+                        if let GraphRecord::Node { id, kind, .. } = rec {
+                            println!("  Step {i}: [{kind:?}] {id}");
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            match format {
+                OutputFormat::Json => {
+                    let out = serde_json::json!({
+                        "ok": false,
+                        "error": {
+                            "code": "audit_trail_failed",
+                            "message": e,
+                        }
+                    });
+                    println!("{}", serde_json::to_string(&out)?);
+                }
+                OutputFormat::Text => {
+                    eprintln!("error: audit trail failed: {e}");
+                }
+            }
+            anyhow::bail!("audit trail failed: {e}")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+fn decide_cmd(
+    candidate_id: String,
+    outcome: String,
+    data_dir: Option<PathBuf>,
+    graph: Option<PathBuf>,
+    out: Option<PathBuf>,
+    edited_rule_text: Option<String>,
+    rationale: Option<String>,
+    decided_by: String,
+    prompt_surface: String,
+    prompted_to: String,
+) -> Result<()> {
+    let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+
+    let req = crate::decide::DecideRequest {
+        candidate_id,
+        outcome,
+        edited_rule_text,
+        rationale,
+        decided_by,
+        prompt_surface,
+        prompted_to,
+        transaction_time: None,
+    };
+
+    let generated = crate::decide::decide_candidate(&records, &req)?;
+
+    if let Some(out_path) = out {
+        let mut lines = String::new();
+        for rec in &generated {
+            let json = serde_json::to_string(rec)?;
+            lines.push_str(&json);
+            lines.push('\n');
+        }
+        fs::write(&out_path, lines).with_context(|| {
+            format!("failed to write decision records to {}", out_path.display())
+        })?;
+    }
+
+    if let Some(dir) = data_dir {
+        #[cfg(feature = "embedded-aletheiadb")]
+        {
+            let mut sink = EmbeddedAletheiaSink::open_unleased(&dir)
+                .with_context(|| format!("failed to open embedded store {}", dir.display()))?;
+            let report = ingest_records(&generated, &mut sink);
+            if !report.is_success() {
+                for failure in &report.failures {
+                    eprintln!("{}: {}", failure.record_id, failure.message);
+                }
+                anyhow::bail!("failed to write decision records to store");
+            }
+            sink.persist_indexes()
+                .with_context(|| format!("failed to persist embedded store {}", dir.display()))?;
+        }
+        #[cfg(not(feature = "embedded-aletheiadb"))]
+        {
+            let _ = dir;
+            anyhow::bail!("--data-dir requires the embedded-aletheiadb feature");
+        }
+    }
+
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------------------------------------
 // AC7: Semantic query JSON output contract conformance
 //
 // This test module locks the stable field names for `eg query semantic --format
