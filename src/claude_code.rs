@@ -57,8 +57,9 @@ use serde::Deserialize;
 use crate::{
     error::Result,
     ir::{
-        AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, Graph, GraphRecord, NodeKind, OutputHandle,
-        Producer, ProducerKind, agent_memory_stable_id,
+        AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, EdgeLabel, Graph, GraphRecord,
+        NodeKind, OutputHandle, Producer, ProducerKind, VERIFICATION_SCHEMA_VERSION,
+        agent_memory_stable_id, artifact_stable_id, verification_stable_id,
     },
 };
 
@@ -537,7 +538,7 @@ fn tool_kind_for(tool_name: &str, cmd: &str) -> &'static str {
         "Read" | "NotebookRead" => "file_read",
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => "file_edit",
         "WebFetch" | "WebSearch" => "network_request",
-        "Grep" | "GlobSearch" => "search",
+        "Grep" | "Glob" | "GlobSearch" => "search",
         _ => "other",
     }
 }
@@ -575,8 +576,14 @@ fn claude_code_producer() -> Producer {
         egregore_git: None,
         producer_kind: ProducerKind::ClaudeCodeImporter,
         producer_components: BTreeMap::from([
-            ("importer_schema_version".to_owned(), IMPORTER_VERSION.to_owned()),
-            ("source_format_version".to_owned(), SOURCE_FORMAT_VERSION.to_owned()),
+            (
+                "importer_schema_version".to_owned(),
+                IMPORTER_VERSION.to_owned(),
+            ),
+            (
+                "source_format_version".to_owned(),
+                SOURCE_FORMAT_VERSION.to_owned(),
+            ),
         ]),
         producer_started_at: IMPORTER_STARTED_AT.clone(),
     }
@@ -852,9 +859,10 @@ fn emit_tool_action(
     // exit_code is Some(0) on success, None on failure (actual exit code is not
     // available from the is_error boolean alone — synthesising 1 would be misleading).
     let is_error = slot.result.as_ref().is_some_and(|r| r.is_error);
-    let exit_code: Option<i64> = slot.result.as_ref().and_then(|r| {
-        if r.is_error { None } else { Some(0) }
-    });
+    let exit_code: Option<i64> = slot
+        .result
+        .as_ref()
+        .and_then(|r| if r.is_error { None } else { Some(0) });
     let result_text = slot
         .result
         .as_ref()
@@ -880,6 +888,7 @@ fn emit_tool_action(
     let status_str = match exit_code {
         Some(0) => "succeeded",
         Some(_) => "failed",
+        None if is_error => "failed",
         None => "unknown",
     };
 
@@ -922,38 +931,43 @@ fn emit_tool_action(
         ctx,
     ));
 
-    // ── CommandRun ────────────────────────────────────────────────────────────
-    graph.push(make_node(
-        cmd_run_id.clone(),
-        NodeKind::CommandRun,
-        format!(
-            "CommandRun exit={} turn={turn_index}",
-            exit_code.map_or_else(|| "?".to_owned(), |c| c.to_string())
-        ),
-        ctx,
-        NodeExtra {
-            observed_at: Some(action_timestamp.clone()),
-            text: Some(cmd_summary.clone()),
-            exit_code,
-            stdout_handle: result_text.as_deref().map(|s| Box::new(output_handle(s))),
-            agent_kind: Some("claude-code".to_owned()),
-            ..Default::default()
-        },
-    ));
-    graph.push(make_edge(
-        EdgeLabel::AuthoredBy,
-        cmd_run_id.clone(),
-        turn_id.to_owned(),
-        "CommandRun belongs to AgentTurn",
-        ctx,
-    ));
+    // ── CommandRun (Bash only) ────────────────────────────────────────────────
+    if tool_name == "Bash" {
+        graph.push(make_node(
+            cmd_run_id.clone(),
+            NodeKind::CommandRun,
+            format!(
+                "CommandRun exit={} turn={turn_index}",
+                exit_code.map_or_else(|| "?".to_owned(), |c| c.to_string())
+            ),
+            ctx,
+            NodeExtra {
+                observed_at: Some(action_timestamp.clone()),
+                text: Some(cmd_summary.clone()),
+                exit_code,
+                stdout_handle: result_text.as_deref().map(|s| Box::new(output_handle(s))),
+                agent_kind: Some("claude-code".to_owned()),
+                ..Default::default()
+            },
+        ));
+        graph.push(make_edge(
+            EdgeLabel::AuthoredBy,
+            cmd_run_id.clone(),
+            turn_id.to_owned(),
+            "CommandRun belongs to AgentTurn",
+            ctx,
+        ));
+    }
 
     // ── FileEdit ──────────────────────────────────────────────────────────────
-    // Emitted for Edit/Write/MultiEdit/NotebookEdit tools when a file path is known.
-    if matches!(
-        tool_name.as_str(),
-        "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
-    ) && let Some(target) = extract_file_path(tool_name, &slot.input)
+    // Emitted for Edit/Write/MultiEdit/NotebookEdit tools when a file path is known
+    // and the tool call did not fail.
+    if !is_error
+        && matches!(
+            tool_name.as_str(),
+            "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
+        )
+        && let Some(target) = extract_file_path(tool_name, &slot.input)
     {
         let file_edit_id =
             agent_memory_stable_id(&["node", "file_edit", turn_id, &action_idx.to_string()]);
@@ -991,7 +1005,7 @@ fn emit_tool_action(
         let failed = is_error;
         let patch_status = if failed { "invalid" } else { "unverified" };
         let patch_id =
-            agent_memory_stable_id(&["node", "patch_artifact", turn_id, &action_idx.to_string()]);
+            artifact_stable_id(&["node", "patch_artifact", turn_id, &action_idx.to_string()]);
         graph.push(make_node(
             patch_id.clone(),
             NodeKind::PatchArtifact,
@@ -1002,6 +1016,8 @@ fn emit_tool_action(
                 text: Some(redacted_cmd),
                 patch_status: Some(patch_status.to_owned()),
                 agent_kind: Some("claude-code".to_owned()),
+                schema_version_override: Some(ARTIFACT_SCHEMA_VERSION),
+                domain_override: Some("artifact"),
                 ..Default::default()
             },
         ));
@@ -1100,7 +1116,7 @@ fn emit_tool_action(
     // Trust rule: prose alone never promotes to Verification.
     if tool_name == "Bash" && is_test_command(&cmd) && exit_code == Some(0) {
         let verification_id =
-            agent_memory_stable_id(&["node", "verification", turn_id, &action_idx.to_string()]);
+            verification_stable_id(&["node", "verification", turn_id, &action_idx.to_string()]);
         graph.push(make_node(
             verification_id.clone(),
             NodeKind::Verification,
@@ -1111,6 +1127,8 @@ fn emit_tool_action(
                 text: Some(build_output_summary(result_text.as_deref())),
                 exit_code,
                 agent_kind: Some("claude-code".to_owned()),
+                schema_version_override: Some(VERIFICATION_SCHEMA_VERSION),
+                domain_override: Some("verification"),
                 ..Default::default()
             },
         ));
@@ -1382,6 +1400,10 @@ struct NodeExtra {
     status: Option<String>,
     stdout_handle: Option<Box<OutputHandle>>,
     stderr_handle: Option<Box<OutputHandle>>,
+    /// Override the `schema_version` field (default: `AGENT_MEMORY_SCHEMA_VERSION`).
+    schema_version_override: Option<u32>,
+    /// Override the `domain` field (default: `DOMAIN` = `"agent_memory"`).
+    domain_override: Option<&'static str>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1400,7 +1422,9 @@ fn make_node(
     GraphRecord::Node {
         id,
         kind,
-        schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+        schema_version: extra
+            .schema_version_override
+            .unwrap_or(AGENT_MEMORY_SCHEMA_VERSION),
         repo_relative_path: extra.repo_relative_path,
         span: None,
         name,
@@ -1426,7 +1450,7 @@ fn make_node(
         )),
         redaction_policy_version: ctx.redaction_policy_version.clone(),
         summary,
-        domain: Some(DOMAIN.to_owned()),
+        domain: Some(extra.domain_override.unwrap_or(DOMAIN).to_owned()),
         importer_id: Some(IMPORTER_ID.to_owned()),
         importer_version: Some(IMPORTER_VERSION.to_owned()),
         source_artifact_path: Some(ctx.source_artifact_path.clone()),

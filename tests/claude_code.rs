@@ -142,7 +142,13 @@ fn records_carry_correct_importer_metadata() {
                 Some(IMPORTER_VERSION),
                 "wrong importer_version"
             );
-            assert_eq!(domain.as_deref(), Some(DOMAIN), "wrong domain");
+            // Domain is "agent_memory" for most nodes, but Verification nodes
+            // use "verification" and PatchArtifact nodes use "artifact".
+            let valid_domains = &[DOMAIN, "artifact", "verification"];
+            assert!(
+                domain.as_deref().is_some_and(|d| valid_domains.contains(&d)),
+                "wrong domain: {domain:?}"
+            );
             assert!(
                 source_artifact_hash.is_some(),
                 "source_artifact_hash must be present"
