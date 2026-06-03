@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use crate::embeddings::{EmbeddingVectorKey, EmbeddingVectorMap};
 use crate::{
     adapters::{
-        AdapterError, AdapterResult, ExpectedRecordState, GraphSink,
+        AdapterError, AdapterResult, ExpectedRecordState, GraphSink, InspectStoreReport,
         validate_adapter_record_version,
     },
     daemon::StoreLease,
@@ -564,6 +564,152 @@ impl EmbeddedAletheiaSink {
         Ok(records)
     }
 
+    /// Reads all physical records stored in the database for inspection.
+    /// This retrieves every single node, tombstone, and edge physically stored in `AletheiaDB`
+    /// without temporal deduplication, tombstone filtering, or schema version validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a physical record cannot be read.
+    pub fn inspect_all_records(&self) -> AdapterResult<InspectStoreReport> {
+        let mut report = InspectStoreReport::default();
+
+        // 1. Iterate over every single physical node in AletheiaDB
+        for node_id in self.db.get_all_node_ids() {
+            let node = self
+                .db
+                .get_node(node_id)
+                .map_err(|error| read_back_error("inspect_all_records", error.to_string()))?;
+            let Some(record_id) = optional_str_property(
+                "inspect_all_records",
+                "codegraph_id",
+                node.get_property("codegraph_id"),
+            )?
+            else {
+                continue;
+            };
+
+            let record_type = optional_str_property(
+                "inspect_all_records",
+                "record_type",
+                node.get_property("record_type"),
+            )?;
+
+            let version = Self::node_record_version_from_properties(
+                &node,
+                &record_id,
+                record_type.as_deref(),
+            )?;
+            let is_known = crate::schema_version::is_known_record_version(&version);
+
+            if is_known {
+                let record = if record_type.as_deref() == Some("tombstone") {
+                    self.read_tombstone_record_internal(&record_id, node_id)?
+                } else {
+                    self.read_node_record_internal(&record_id, node_id)?
+                };
+                report.records.push(record);
+            } else {
+                report
+                    .unknown_schema_versions
+                    .push(crate::schema_version::UnknownSchemaVersion::new(version));
+            }
+        }
+
+        // 2. Iterate over every single physical edge in AletheiaDB
+        for node_id in self.db.get_all_node_ids() {
+            for edge_id in self.db.get_outgoing_edges(node_id) {
+                let edge = self
+                    .db
+                    .get_edge(edge_id)
+                    .map_err(|error| read_back_error("inspect_all_records", error.to_string()))?;
+                let Some(codegraph_id) = optional_str_property(
+                    "inspect_all_records",
+                    "codegraph_id",
+                    edge.get_property("codegraph_id"),
+                )?
+                else {
+                    continue;
+                };
+
+                let version = Self::edge_record_version_from_properties(&edge, &codegraph_id)?;
+                let is_known = crate::schema_version::is_known_record_version(&version);
+
+                if is_known {
+                    let record = self.read_edge_record_internal(&codegraph_id, edge_id)?;
+                    report.records.push(record);
+                } else {
+                    report
+                        .unknown_schema_versions
+                        .push(crate::schema_version::UnknownSchemaVersion::new(version));
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    fn node_record_version_from_properties(
+        node: &::aletheiadb::Node,
+        record_id: &str,
+        record_type: Option<&str>,
+    ) -> AdapterResult<crate::schema_version::RecordVersion> {
+        let schema_version = required_u32_property(
+            record_id,
+            "schema_version",
+            node.get_property("schema_version"),
+        )?;
+
+        if record_type == Some("tombstone") {
+            let deleted_id =
+                optional_str_property(record_id, "deleted_id", node.get_property("deleted_id"))?;
+            let domain = crate::schema_version::domain_from_record_id(record_id)
+                .or_else(|| {
+                    deleted_id
+                        .as_ref()
+                        .and_then(|d| crate::schema_version::domain_from_record_id(d))
+                })
+                .unwrap_or_else(|| "codegraph".to_owned());
+            Ok(crate::schema_version::RecordVersion::new(
+                domain,
+                "Tombstone",
+                schema_version,
+            ))
+        } else {
+            let kind = required_str_property(record_id, "kind", node.get_property("kind"))?;
+            let domain = optional_str_property(record_id, "domain", node.get_property("domain"))?;
+            let domain = domain
+                .map(|d| crate::schema_version::normalize_domain_name(&d))
+                .or_else(|| crate::schema_version::domain_from_record_id(record_id))
+                .unwrap_or_else(|| crate::schema_version::domain_for_node_kind(&kind).to_owned());
+            Ok(crate::schema_version::RecordVersion::new(
+                domain,
+                kind,
+                schema_version,
+            ))
+        }
+    }
+
+    fn edge_record_version_from_properties(
+        edge: &::aletheiadb::Edge,
+        record_id: &str,
+    ) -> AdapterResult<crate::schema_version::RecordVersion> {
+        let label = required_str_property(record_id, "label", edge.get_property("label"))?;
+        let schema_version = required_u32_property(
+            record_id,
+            "schema_version",
+            edge.get_property("schema_version"),
+        )?;
+
+        let domain = crate::schema_version::domain_from_record_id(record_id)
+            .unwrap_or_else(|| crate::schema_version::domain_for_edge_label(&label).to_owned());
+        Ok(crate::schema_version::RecordVersion::new(
+            domain,
+            label,
+            schema_version,
+        ))
+    }
+
     /// Reads a graph record back by stable ID.
     ///
     /// # Errors
@@ -620,8 +766,13 @@ impl EmbeddedAletheiaSink {
         count
     }
 
-    #[cfg(test)]
-    pub(crate) fn force_latest_node_schema_version_for_test(
+    /// Forces the schema version of the latest node for a given record ID.
+    /// Used only for testing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node cannot be found or if updating the node fails.
+    pub fn force_latest_node_schema_version_for_test(
         &self,
         record_id: &str,
         schema_version: u32,
@@ -1791,7 +1942,7 @@ impl EmbeddedAletheiaSink {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn read_node_record(
+    fn read_node_record_internal(
         &self,
         record_id: &str,
         node_id: ::aletheiadb::NodeId,
@@ -2283,11 +2434,20 @@ impl EmbeddedAletheiaSink {
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("producer_json invalid: {e}")))?,
         };
+        Ok(record)
+    }
+
+    fn read_node_record(
+        &self,
+        record_id: &str,
+        node_id: ::aletheiadb::NodeId,
+    ) -> AdapterResult<GraphRecord> {
+        let record = self.read_node_record_internal(record_id, node_id)?;
         validate_adapter_record_version(&record)?;
         Ok(record)
     }
 
-    fn read_tombstone_record(
+    fn read_tombstone_record_internal(
         &self,
         record_id: &str,
         node_id: ::aletheiadb::NodeId,
@@ -2336,11 +2496,20 @@ impl EmbeddedAletheiaSink {
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("producer_json invalid: {e}")))?,
         };
+        Ok(record)
+    }
+
+    fn read_tombstone_record(
+        &self,
+        record_id: &str,
+        node_id: ::aletheiadb::NodeId,
+    ) -> AdapterResult<GraphRecord> {
+        let record = self.read_tombstone_record_internal(record_id, node_id)?;
         validate_adapter_record_version(&record)?;
         Ok(record)
     }
 
-    fn read_edge_record(
+    fn read_edge_record_internal(
         &self,
         record_id: &str,
         edge_id: ::aletheiadb::EdgeId,
@@ -2396,6 +2565,15 @@ impl EmbeddedAletheiaSink {
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("producer_json invalid: {e}")))?,
         };
+        Ok(record)
+    }
+
+    fn read_edge_record(
+        &self,
+        record_id: &str,
+        edge_id: ::aletheiadb::EdgeId,
+    ) -> AdapterResult<GraphRecord> {
+        let record = self.read_edge_record_internal(record_id, edge_id)?;
         validate_adapter_record_version(&record)?;
         Ok(record)
     }
@@ -3854,6 +4032,62 @@ mod tests {
         }
         panic!(
             "node {record_id} with valid_time {valid_time} observed_at {observed_at} should exist"
+        );
+    }
+
+    #[test]
+    fn inspect_all_records_tolerates_future_node_kind() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("future-kind-store");
+        let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+        let record_id = "codegraph:v5:future-kind-repo";
+        let properties = ::aletheiadb::PropertyMapBuilder::new()
+            .insert("codegraph_id", record_id)
+            .insert("record_type", "node")
+            .insert("kind", "NewFutureKind")
+            .insert("schema_version", 5i64)
+            .insert("domain", "codegraph")
+            .build();
+
+        sink.db
+            .create_node("Repository", properties)
+            .expect("should create raw node");
+
+        let report = sink
+            .inspect_all_records()
+            .expect("inspect_all_records should succeed");
+        assert_eq!(report.records.len(), 0);
+        assert_eq!(report.unknown_schema_versions.len(), 1);
+        let unknown = &report.unknown_schema_versions[0];
+        assert_eq!(unknown.version.domain, "codegraph");
+        assert_eq!(unknown.version.kind, "NewFutureKind");
+        assert_eq!(unknown.version.version, 5);
+    }
+
+    #[test]
+    fn inspect_all_records_fails_on_corrupt_record_of_known_version() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("corrupt-node-store");
+        let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+        let record_id = "codegraph:v4:corrupt-node";
+        let properties = ::aletheiadb::PropertyMapBuilder::new()
+            .insert("codegraph_id", record_id)
+            .insert("record_type", "node")
+            // missing "kind", but has known schema_version
+            .insert("schema_version", i64::from(crate::ir::SCHEMA_VERSION))
+            .insert("domain", "codegraph")
+            .build();
+
+        sink.db
+            .create_node("Repository", properties)
+            .expect("should create raw node");
+
+        let res = sink.inspect_all_records();
+        assert!(
+            res.is_err(),
+            "Expected inspect_all_records to fail on corrupt record of known version, got {res:?}"
         );
     }
 }

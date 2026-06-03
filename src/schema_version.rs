@@ -57,7 +57,7 @@ pub struct UnknownSchemaVersion {
 }
 
 impl UnknownSchemaVersion {
-    fn new(version: RecordVersion) -> Self {
+    pub(crate) fn new(version: RecordVersion) -> Self {
         Self {
             code: UNKNOWN_SCHEMA_VERSION_CODE.to_owned(),
             version,
@@ -279,14 +279,14 @@ fn json_error(error: &serde_json::Error) -> RecordReadError {
     }
 }
 
-fn normalize_domain_name(domain: &str) -> String {
+pub(crate) fn normalize_domain_name(domain: &str) -> String {
     match domain {
         "code_graph" => Domain::CodeGraph.as_str().to_owned(),
         other => other.to_owned(),
     }
 }
 
-fn domain_from_record_id(id: &str) -> Option<String> {
+pub(crate) fn domain_from_record_id(id: &str) -> Option<String> {
     let prefix = id.split_once(":v").map_or(id, |(prefix, _)| prefix);
     match prefix {
         "codegraph" | "code_graph" => Some(Domain::CodeGraph.as_str().to_owned()),
@@ -300,7 +300,7 @@ fn domain_from_record_id(id: &str) -> Option<String> {
     }
 }
 
-fn domain_for_node_kind(kind: &str) -> &'static str {
+pub(crate) fn domain_for_node_kind(kind: &str) -> &'static str {
     match kind {
         "SemanticDrift" | "EmbeddingModel" | "EmbeddingVector" => Domain::Semantic.as_str(),
         "PromoteCandidate" | "PromotionPrompt" | "PromotionDecision" | "Preference"
@@ -324,7 +324,7 @@ fn domain_for_node_kind(kind: &str) -> &'static str {
     }
 }
 
-fn domain_for_edge_label(label: &str) -> &'static str {
+pub(crate) fn domain_for_edge_label(label: &str) -> &'static str {
     match EdgeLabel::from_relation(label) {
         Some(EdgeLabel::DriftsFrom | EdgeLabel::DriftsPrior | EdgeLabel::MeasuredBy) => {
             Domain::Semantic.as_str()

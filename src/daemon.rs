@@ -1512,6 +1512,38 @@ impl DaemonClient {
         serde_json::from_str(&body).context("failed to parse daemon status response")
     }
 
+    /// Fetches all records from the daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon does not respond successfully or the
+    /// response cannot be parsed.
+    pub fn get_all_records(&self) -> Result<(Vec<GraphRecord>, Vec<UnknownSchemaVersion>, String)> {
+        let (status, body) =
+            self.request("GET", "/v1/records", None, CLIENT_OPERATION_TIMEOUT, true)?;
+        if status != 200 {
+            return Err(anyhow!(
+                "daemon get_all_records failed with HTTP {status}: {body}"
+            ));
+        }
+        let envelope: serde_json::Value =
+            serde_json::from_str(&body).context("failed to parse daemon records response")?;
+        let records = serde_json::from_value(envelope["result"]["records"].clone())
+            .context("failed to parse records from envelope")?;
+        let unknown_schema_versions =
+            if let Some(val) = envelope["result"].get("unknown_schema_versions") {
+                serde_json::from_value(val.clone())
+                    .context("failed to parse unknown_schema_versions from envelope")?
+            } else {
+                Vec::new()
+            };
+        let snapshot_timestamp = envelope["result"]["snapshot_timestamp"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        Ok((records, unknown_schema_versions, snapshot_timestamp))
+    }
+
     /// Sends a verb query to the daemon and returns the `result.records` array.
     ///
     /// `verb` must be one of the documented verbs in `docs/schema/daemon-query.md`.
@@ -6524,6 +6556,7 @@ fn handle_request(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         ("POST", "/v1/agents/heartbeat") => handle_agent_heartbeat(request, state),
         ("POST", "/v1/jobs/ingest") => handle_job_ingest(request, state),
         ("POST", "/v1/admin/checkpoint") => handle_checkpoint(state),
+        ("GET", "/v1/records") => handle_get_all_records(state),
         _ if request.method == "GET" && request.path.starts_with("/v1/records/") => {
             let record_id = request.path.trim_start_matches("/v1/records/");
             handle_get_record(record_id, state)
@@ -6558,6 +6591,27 @@ fn handle_status(state: &ServerState) -> HttpResponse {
             "agents": agents,
             "idempotency_store_size": idempotency_store_size,
             "pressure": state.pressure.snapshot_json(),
+        }),
+    )
+}
+
+fn handle_get_all_records(state: &ServerState) -> HttpResponse {
+    let Ok(sink) = state.sink.read() else {
+        return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
+    };
+    let snapshot_timestamp = chrono::Utc::now().to_rfc3339();
+    let report = match sink.inspect_all_records() {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::error(adapter_read_error_to_api(e)),
+    };
+    drop(sink);
+    HttpResponse::success(
+        None,
+        200,
+        json!({
+            "records": report.records,
+            "unknown_schema_versions": report.unknown_schema_versions,
+            "snapshot_timestamp": snapshot_timestamp,
         }),
     )
 }

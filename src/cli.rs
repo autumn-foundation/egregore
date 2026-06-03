@@ -74,10 +74,20 @@ enum Commands {
         #[arg(long)]
         repo_id_override: Option<String>,
     },
-    /// Inspect a graph JSONL file.
+    /// Inspect a graph JSONL file or a running daemon.
     Inspect {
         /// Graph JSONL path to inspect.
-        graph: PathBuf,
+        graph: Option<PathBuf>,
+        /// Route the inspection through the running daemon (requires --data-dir, conflicts with graph).
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, requires = "data_dir", conflicts_with = "graph")]
+        daemon: bool,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long, conflicts_with = "graph")]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "text")]
+        format: OutputFormat,
     },
     /// Ingest graph JSONL through a storage adapter.
     Ingest {
@@ -621,7 +631,17 @@ fn run_cli(cli: Cli) -> Result<()> {
             out,
             repo_id_override,
         } => scan_history(&repo_path, &out, repo_id_override.as_deref()),
-        Commands::Inspect { graph } => inspect(&graph),
+        Commands::Inspect {
+            graph,
+            #[cfg(feature = "embedded-aletheiadb")]
+            daemon,
+            data_dir,
+            format,
+        } => {
+            #[cfg(not(feature = "embedded-aletheiadb"))]
+            let daemon = false;
+            inspect(graph.as_deref(), daemon, data_dir.as_deref(), format)
+        }
         Commands::Ingest {
             graph,
             adapter,
@@ -1133,21 +1153,62 @@ fn scan_history(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) ->
     Ok(())
 }
 
-fn inspect(graph: &Path) -> Result<()> {
-    let jsonl = fs::read_to_string(graph)
-        .with_context(|| format!("failed to read graph JSONL from {}", graph.display()))?;
-    let counts = InspectCounts::from_jsonl(&jsonl)?;
+fn print_counts_text(counts: &InspectCounts) {
     println!("records: {}", counts.records);
     println!("nodes: {}", counts.nodes);
     println!("edges: {}", counts.edges);
     println!("tombstones: {}", counts.tombstones);
     println!("diagnostics: {}", counts.diagnostics);
+
+    // Group counts by domain category
+    let mut domain_groups: BTreeMap<&str, Vec<(&RecordVersion, usize)>> = BTreeMap::new();
     for (version, count) in &counts.schema_versions {
-        println!("schema_version {version}: {count}");
+        domain_groups
+            .entry(version.domain.as_str())
+            .or_default()
+            .push((version, *count));
     }
-    for (version, count) in &counts.unknown_schema_versions {
-        println!("unknown_schema_version {version}: {count}");
+
+    let ordered_domains = vec![
+        ("codegraph", "Deterministic Source Facts (codegraph)"),
+        ("semantic", "Derived Measurements (semantic)"),
+        ("agent_memory", "Agent-Authored Claims (agent_memory)"),
+        ("project", "Project/Work State (project)"),
+        ("artifact", "Artifacts (artifact)"),
+        ("verification", "Verification Evidence (verification)"),
+        ("user_context", "User Context (user_context)"),
+    ];
+
+    for (dom_name, category) in ordered_domains {
+        if let Some(mut items) = domain_groups.remove(dom_name) {
+            println!("{category}:");
+            items.sort_by_key(|(v, _)| (&v.kind, v.version));
+            for (version, count) in items {
+                println!("  {} v{}: {}", version.kind, version.version, count);
+            }
+        }
     }
+
+    for (dom_name, mut items) in domain_groups {
+        println!("{dom_name} (unknown domain):");
+        items.sort_by_key(|(v, _)| (&v.kind, v.version));
+        for (version, count) in items {
+            println!("  {} v{}: {}", version.kind, version.version, count);
+        }
+    }
+
+    if !counts.unknown_schema_versions.is_empty() {
+        println!("unknown schema versions:");
+        let mut unknown_items: Vec<_> = counts.unknown_schema_versions.iter().collect();
+        unknown_items.sort_by_key(|(v, _)| (&v.domain, &v.kind, v.version));
+        for (version, count) in unknown_items {
+            println!(
+                "  {} {} v{}: {}",
+                version.domain, version.kind, version.version, count
+            );
+        }
+    }
+
     for repo in &counts.repositories {
         println!("repository: {} ({})", repo.id, repo.identity_summary);
     }
@@ -1156,6 +1217,71 @@ fn inspect(graph: &Path) -> Result<()> {
     }
     for (version, count) in &counts.egregore_versions {
         println!("egregore_version {version}: {count}");
+    }
+}
+
+fn inspect(
+    graph: Option<&Path>,
+    daemon: bool,
+    data_dir: Option<&Path>,
+    format: OutputFormat,
+) -> Result<()> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    if daemon {
+        let default_path = PathBuf::from(".egregore");
+        let data_dir = data_dir.unwrap_or(&default_path);
+        let client = DaemonClient::from_data_dir(data_dir).with_context(|| {
+            format!(
+                "failed to inspect data-dir {}: daemon metadata is missing or invalid",
+                data_dir.display()
+            )
+        })?;
+        client.health().with_context(|| {
+            format!(
+                "failed to inspect data-dir {}: daemon is not running or unresponsive",
+                data_dir.display()
+            )
+        })?;
+        let (records, unknown_versions, snapshot_timestamp) = client.get_all_records().with_context(|| {
+            format!(
+                "failed to inspect data-dir {}: invalid authorization token or daemon read error",
+                data_dir.display()
+            )
+        })?;
+
+        let counts = InspectCounts::from_records(&records, &unknown_versions);
+
+        match format {
+            OutputFormat::Json => {
+                let json_val = counts.to_json(&snapshot_timestamp);
+                println!("{}", serde_json::to_string_pretty(&json_val)?);
+            }
+            OutputFormat::Text => {
+                print_counts_text(&counts);
+            }
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    if daemon {
+        anyhow::bail!("daemon inspection requires 'embedded-aletheiadb' feature");
+    }
+
+    let graph = graph.ok_or_else(|| anyhow::anyhow!("graph file path or --daemon is required"))?;
+    let jsonl = fs::read_to_string(graph)
+        .with_context(|| format!("failed to read graph JSONL from {}", graph.display()))?;
+    let counts = InspectCounts::from_jsonl(&jsonl)?;
+    let snapshot_timestamp = chrono::Utc::now().to_rfc3339();
+
+    match format {
+        OutputFormat::Json => {
+            let json_val = counts.to_json(&snapshot_timestamp);
+            println!("{}", serde_json::to_string_pretty(&json_val)?);
+        }
+        OutputFormat::Text => {
+            print_counts_text(&counts);
+        }
     }
     Ok(())
 }
@@ -2625,7 +2751,20 @@ impl PrintText for SemanticResult<'_> {
 
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+fn domain_category(domain: &str) -> &'static str {
+    match domain {
+        "codegraph" => "Deterministic Source Facts",
+        "semantic" => "Derived Measurements",
+        "agent_memory" => "Agent-Authored Claims",
+        "project" => "Project/Work State",
+        "artifact" => "Artifacts",
+        "verification" => "Verification Evidence",
+        "user_context" => "User Context",
+        _ => "Unknown Domain",
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct RepositorySummary {
     id: String,
     identity_summary: String,
@@ -2648,23 +2787,32 @@ struct InspectCounts {
 }
 
 impl InspectCounts {
-    fn from_jsonl(jsonl: &str) -> Result<Self> {
+    fn from_records(
+        records: &[GraphRecord],
+        unknown_schema_versions: &[crate::schema_version::UnknownSchemaVersion],
+    ) -> Self {
         let mut counts = Self::default();
-        let report = crate::adapters::records_from_jsonl_report(jsonl)?;
-        for unknown in report.unknown_schema_versions {
+        for unknown in unknown_schema_versions {
             counts.records += 1;
             *counts
                 .unknown_schema_versions
-                .entry(unknown.version)
+                .entry(unknown.version.clone())
                 .or_default() += 1;
         }
-        for record in report.records {
+        for record in records {
             counts.records += 1;
+            if let Err(unknown) = crate::schema_version::validate_record_version(record) {
+                *counts
+                    .unknown_schema_versions
+                    .entry(unknown.version.clone())
+                    .or_default() += 1;
+                continue;
+            }
             *counts
                 .schema_versions
-                .entry(record_version(&record))
+                .entry(record_version(record))
                 .or_default() += 1;
-            match &record {
+            match record {
                 GraphRecord::Node {
                     id,
                     kind,
@@ -2717,7 +2865,59 @@ impl InspectCounts {
             *counts.producer_kinds.entry(kind_key).or_default() += 1;
             *counts.egregore_versions.entry(version_key).or_default() += 1;
         }
-        Ok(counts)
+        counts
+    }
+
+    fn from_jsonl(jsonl: &str) -> Result<Self> {
+        let report = crate::adapters::records_from_jsonl_report(jsonl)?;
+        Ok(Self::from_records(
+            &report.records,
+            &report.unknown_schema_versions,
+        ))
+    }
+
+    fn to_json(&self, snapshot_timestamp: &str) -> serde_json::Value {
+        let mut schema_versions_obj = serde_json::Map::new();
+        for (version, count) in &self.schema_versions {
+            let key = format!("{}:{}:{}", version.domain, version.kind, version.version);
+            schema_versions_obj.insert(key, serde_json::Value::from(*count));
+        }
+
+        let mut unknown_schema_versions_obj = serde_json::Map::new();
+        for (version, count) in &self.unknown_schema_versions {
+            let key = format!("{}:{}:{}", version.domain, version.kind, version.version);
+            unknown_schema_versions_obj.insert(key, serde_json::Value::from(*count));
+        }
+
+        let mut structured_counts = serde_json::Map::new();
+        for (version, count) in &self.schema_versions {
+            let category = domain_category(&version.domain);
+            let category_obj = structured_counts
+                .entry(category.to_owned())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let serde_json::Value::Object(map) = category_obj {
+                let key = format!("{} v{}", version.kind, version.version);
+                map.insert(key, serde_json::Value::from(*count));
+            }
+        }
+
+        serde_json::json!({
+            "snapshot_timestamp": snapshot_timestamp,
+            "records": self.records,
+            "nodes": self.nodes,
+            "edges": self.edges,
+            "tombstones": self.tombstones,
+            "diagnostics": self.diagnostics,
+            "domain_counts": structured_counts,
+            "schema_versions": schema_versions_obj,
+            "unknown_schema_versions": unknown_schema_versions_obj,
+            "repositories": self.repositories.iter().map(|r| serde_json::json!({
+                "id": r.id,
+                "identity_summary": r.identity_summary
+            })).collect::<Vec<_>>(),
+            "producer_kinds": self.producer_kinds,
+            "egregore_versions": self.egregore_versions
+        })
     }
 }
 

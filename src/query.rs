@@ -459,13 +459,9 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             return false;
         };
         match classify_node(*kind) {
-            Some(ContextSection::SourceFact) => {
-                if seed_ids.contains(record_id) {
-                    source_facts.insert(record_id);
-                    true
-                } else {
-                    false
-                }
+            Some(ContextSection::SourceFact) if seed_ids.contains(record_id) => {
+                source_facts.insert(record_id);
+                true
             }
             Some(ContextSection::Observation) => {
                 observations.insert(record_id);
@@ -483,7 +479,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
                 verification_evidence.insert(record_id);
                 true
             }
-            None => false,
+            Some(ContextSection::SourceFact) | None => false,
         }
     };
 

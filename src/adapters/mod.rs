@@ -142,9 +142,20 @@ pub struct IngestFailure {
     pub message: String,
 }
 
+use serde::{Deserialize, Serialize};
+
 /// Version-aware JSONL read report used by inspect-style commands.
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub struct JsonlRecordReport {
+    /// Records whose `(domain, kind, schema_version)` tuple is known.
+    pub records: Vec<GraphRecord>,
+    /// Unknown-version records that were rejected before concrete deserialization.
+    pub unknown_schema_versions: Vec<UnknownSchemaVersion>,
+}
+
+/// Version-aware store inspection report returned by the daemon.
+#[derive(Debug, Clone, Eq, PartialEq, Default, Serialize, Deserialize)]
+pub struct InspectStoreReport {
     /// Records whose `(domain, kind, schema_version)` tuple is known.
     pub records: Vec<GraphRecord>,
     /// Unknown-version records that were rejected before concrete deserialization.

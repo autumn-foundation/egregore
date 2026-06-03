@@ -10051,3 +10051,500 @@ fn observations_for_symbol_returns_cross_domain_context() {
 
     daemon.stop();
 }
+
+#[test]
+fn test_daemon_inspect_get_records_endpoint() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // 1. Authorized GET /v1/records should return a valid 200 OK with empty records array initially
+    let response = http_request(
+        &metadata.address,
+        &format!(
+            "GET /v1/records HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            metadata.token
+        ),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "GET /v1/records should succeed, got {response}"
+    );
+    let json = response_json(&response);
+    assert!(
+        json["result"]["records"].is_array(),
+        "should return records array"
+    );
+    assert_eq!(json["result"]["records"].as_array().unwrap().len(), 0);
+    assert!(
+        json["result"]["snapshot_timestamp"].is_string(),
+        "should return snapshot timestamp"
+    );
+
+    // 2. Unauthorized GET /v1/records (wrong token) should fail with 401
+    let response_unauth = http_request(
+        &metadata.address,
+        "GET /v1/records HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer bad-token\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response_unauth.starts_with("HTTP/1.1 401"),
+        "GET /v1/records unauthorized should fail with 401"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn test_cli_inspect_text_and_json_format() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph_path = temp.path().join("graph.jsonl");
+
+    // Write a mixed fixture with at least two schema-version tuples and records across multiple domains
+    let record1 = GraphRecord::node(
+        "codegraph:v3:test-repo".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "test repo".to_owned(),
+    );
+    let mut record2 = GraphRecord::node(
+        "agent_memory:v1:obs-1".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        Some("obs1".to_owned()),
+        "agent memory observation".to_owned(),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut record2 {
+        *schema_version = 1;
+    }
+    // Write them to a JSONL file
+    let jsonl = serde_json::to_string(&record1).unwrap()
+        + "\n"
+        + &serde_json::to_string(&record2).unwrap()
+        + "\n";
+    fs::write(&graph_path, jsonl).unwrap();
+
+    // Run eg inspect on the JSONL file and assert the domain-grouped output
+    let inspect_output = Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("inspect")
+        .arg(&graph_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let inspect_str = String::from_utf8(inspect_output).unwrap();
+
+    // Verify it clearly groups and labels under our new taxonomy
+    assert!(inspect_str.contains("Deterministic Source Facts (codegraph)"));
+    assert!(inspect_str.contains("Agent-Authored Claims (agent_memory)"));
+    assert!(inspect_str.contains("records: 2"));
+
+    // Run eg inspect --format json and assert structured JSON schema
+    let inspect_json_output = Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("inspect")
+        .arg(&graph_path)
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let inspect_json_str = String::from_utf8(inspect_json_output).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&inspect_json_str).unwrap();
+
+    assert_eq!(parsed["records"], 2);
+    assert!(
+        parsed["snapshot_timestamp"].is_string(),
+        "must contain snapshot timestamp"
+    );
+    assert!(
+        parsed["schema_versions"].is_object(),
+        "schema_versions must be object"
+    );
+
+    // Ensure no narrative comment or raw secrets exist in output
+    assert!(!inspect_json_str.contains("agent memory observation"));
+}
+
+#[test]
+fn test_cli_inspect_daemon() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("graph.jsonl");
+
+    let record1 = GraphRecord::node(
+        "codegraph:v3:test-repo".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "test repo".to_owned(),
+    );
+    let mut record2 = GraphRecord::node(
+        "agent_memory:v1:obs-1".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        Some("obs1".to_owned()),
+        "agent memory observation".to_owned(),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut record2 {
+        *schema_version = 1;
+    }
+    let jsonl = serde_json::to_string(&record1).unwrap()
+        + "\n"
+        + &serde_json::to_string(&record2).unwrap()
+        + "\n";
+    fs::write(&graph_path, jsonl).unwrap();
+
+    // Ingest the mixed fixture through the embedded adapter first
+    Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("embedded")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let mut daemon = start_daemon(&data_dir);
+
+    // Inspect via daemon
+    let inspect_daemon_output = Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("inspect")
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let inspect_daemon_str = String::from_utf8(inspect_daemon_output).unwrap();
+
+    assert!(inspect_daemon_str.contains("records: 2"));
+    assert!(inspect_daemon_str.contains("Deterministic Source Facts (codegraph)"));
+    assert!(inspect_daemon_str.contains("Agent-Authored Claims (agent_memory)"));
+
+    daemon.stop();
+}
+
+#[test]
+fn test_cli_inspect_daemon_errors() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("store");
+
+    // Case 1: Missing Daemon (not running, metadata missing)
+    Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("inspect")
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("daemon not running")
+                .or(predicate::str::contains("no daemon metadata found"))
+                .or(predicate::str::contains(
+                    "daemon metadata is missing or invalid",
+                )),
+        );
+
+    // Case 2: Stale/stopped daemon
+    let runtime_dir = runtime_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::write(
+        runtime_dir.join("egregored.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "pid": 999_992,
+            "address": "127.0.0.1:37383",
+            "token": "stopped-stale-token",
+            "data_dir": data_dir,
+            "version": env!("CARGO_PKG_VERSION"),
+            "started_at_unix_ms": 0_u64,
+            "state": "stopped"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("inspect")
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("daemon metadata is stale")
+                .or(predicate::str::contains("daemon not running"))
+                .or(predicate::str::contains(
+                    "daemon metadata is missing or invalid",
+                )),
+        );
+}
+
+#[test]
+fn test_cli_inspect_daemon_readonly() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("store");
+    let graph_path = temp.path().join("graph.jsonl");
+
+    let record1 = GraphRecord::node(
+        "codegraph:v3:test-repo".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "test repo".to_owned(),
+    );
+    let jsonl = serde_json::to_string(&record1).unwrap() + "\n";
+    fs::write(&graph_path, jsonl).unwrap();
+
+    let mut daemon = start_daemon(&data_dir);
+
+    // Ingest the mixed fixture through the daemon
+    Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("ingest")
+        .arg(&graph_path)
+        .arg("--adapter")
+        .arg("daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--idempotency-key")
+        .arg("mixed-ingest-readonly")
+        .assert()
+        .success();
+
+    // Get list of files in data_dir
+    let before_files = get_dir_file_times(&data_dir);
+
+    // Inspect via daemon
+    Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("inspect")
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let after_files = get_dir_file_times(&data_dir);
+    assert_eq!(
+        before_files, after_files,
+        "inspecting live daemon store must be strictly read-only"
+    );
+
+    daemon.stop();
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn test_cli_inspect_daemon_future_schema_version() {
+    use aletheia_egregore::{GraphRecord, NodeKind, SCHEMA_VERSION};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("store");
+
+    // Construct a Repository node record that has a future/unknown schema version
+    let record = GraphRecord::node(
+        "codegraph:v5:test-repo".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo".to_owned()),
+        "test repo".to_owned(),
+    );
+    let mut record_val = serde_json::to_value(&record).unwrap();
+    let future_version = SCHEMA_VERSION + 1;
+    record_val["schema_version"] = serde_json::Value::from(future_version);
+
+    let mock_response = serde_json::json!({
+        "ok": true,
+        "result": {
+            "records": [record_val],
+            "snapshot_timestamp": "2026-06-01T00:00:00Z"
+        }
+    });
+
+    // Spawn mock daemon server
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock daemon listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("should get address")
+        .to_string();
+
+    // Acquire store lease to hold the lock on egregored.lock (preventing metadata from being stale)
+    let _lease = StoreLease::acquire(&data_dir).expect("should acquire store lease");
+
+    // Write fake egregored.json metadata
+    let runtime_path = runtime_dir(&data_dir);
+    fs::create_dir_all(&runtime_path).expect("should create runtime dir");
+    let metadata_path = runtime_path.join("egregored.json");
+
+    let metadata = serde_json::json!({
+        "schema_version": 1,
+        "pid": std::process::id(),
+        "address": address,
+        "token": "mock-token",
+        "data_dir": data_dir,
+        "version": "0.1.0",
+        "started_at_unix_ms": 1_716_300_000_000_u64,
+        "state": "running"
+    });
+    fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap())
+        .expect("should write metadata");
+
+    let data_dir_canonical = fs::create_dir_all(&data_dir)
+        .and_then(|()| data_dir.canonicalize())
+        .unwrap_or_else(|_| data_dir.clone());
+    let store_identity = data_dir_canonical.to_string_lossy().into_owned();
+
+    let _mock_thread = thread::spawn(move || {
+        for _ in 0..10 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+
+            let mut request_bytes = [0; 4096];
+            let read_bytes = match stream.read(&mut request_bytes) {
+                Ok(n) if n > 0 => n,
+                _ => continue,
+            };
+            let request_str = String::from_utf8_lossy(&request_bytes[..read_bytes]);
+
+            let response_body = if request_str.contains("GET /v1/health") {
+                serde_json::json!({
+                    "status": "ok",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "data_dir": store_identity
+                })
+            } else if request_str.contains("GET /v1/records") {
+                mock_response.clone()
+            } else {
+                serde_json::json!({ "error": "not found" })
+            };
+
+            let body_str = serde_json::to_string(&response_body).unwrap();
+            let response_str = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body_str.len(),
+                body_str
+            );
+
+            let _ = stream.write_all(response_str.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    // 4. Inspect via daemon with JSON format
+    let inspect_output = Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("inspect")
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let inspect_str = String::from_utf8(inspect_output).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&inspect_str).unwrap();
+
+    // The record must be counted under unknown_schema_versions, not schema_versions
+    assert_eq!(parsed["records"], 1);
+    let unknown_key = format!("codegraph:Repository:{future_version}");
+    assert_eq!(parsed["unknown_schema_versions"][unknown_key], 1);
+    assert_eq!(parsed["schema_versions"].as_object().unwrap().len(), 0);
+    // Ensure it's not counted as nodes, edges, or tombstones!
+    assert_eq!(parsed["nodes"], 0);
+    assert_eq!(parsed["edges"], 0);
+    assert_eq!(parsed["tombstones"], 0);
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn test_cli_inspect_daemon_fails_on_corrupt_known_version() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("store");
+
+    // Write a corrupt node directly to AletheiaDB
+    {
+        let config = aletheiadb::config::durable_config_for_data_dir(&data_dir);
+        let db = aletheiadb::AletheiaDB::with_unified_config(config).expect("should open raw db");
+        let record_id = "codegraph:v4:corrupt-node";
+        let properties = aletheiadb::PropertyMapBuilder::new()
+            .insert("codegraph_id", record_id)
+            .insert("record_type", "node")
+            // missing "kind", but has known schema_version
+            .insert("schema_version", i64::from(SCHEMA_VERSION))
+            .insert("domain", "codegraph")
+            .build();
+
+        db.create_node("Repository", properties)
+            .expect("should create raw node");
+    } // drop db to close database and release locks
+
+    // Start daemon on the database containing the corrupt node
+    let mut daemon = start_daemon(&data_dir);
+
+    // Running eg inspect --daemon should fail because the known version record is corrupt
+    let assert_res = Command::cargo_bin("egregore")
+        .unwrap()
+        .arg("inspect")
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert();
+
+    let output = assert_res.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Stop daemon before asserting to avoid orphaned background processes
+    daemon.stop();
+
+    assert!(
+        !output.status.success(),
+        "Expected inspect --daemon to fail, but it succeeded. stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("missing required property")
+            || stderr.contains("inspect_all_records")
+            || stderr.contains("ReadBack")
+            || stderr.contains("failed with HTTP"),
+        "stderr should mention the read/deserialization failure, got: {stderr}"
+    );
+}
+
+fn get_dir_file_times(dir: &Path) -> std::collections::BTreeMap<PathBuf, std::time::SystemTime> {
+    let mut files = std::collections::BTreeMap::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let _ = path
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|mtime| files.insert(path, mtime));
+            }
+        }
+    }
+    files
+}
