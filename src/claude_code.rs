@@ -164,12 +164,41 @@ struct MessageEnvelope {
     #[allow(dead_code)]
     role: String,
     /// Content blocks (`text`, `tool_use`, `tool_result`).
-    #[serde(default)]
+    ///
+    /// Claude Code transcripts may represent user prompts as a bare string
+    /// rather than a block array; the custom deserializer normalises both forms.
+    #[serde(default, deserialize_with = "deserialize_content_blocks")]
     content: Vec<ContentBlock>,
     /// Token usage when carried inside the message object (best-effort; some
     /// Claude Code versions embed usage here rather than at the event top level).
     #[serde(default)]
     usage: Option<ClaudeCodeUsage>,
+}
+
+/// Deserialise `content` from either a JSON string or a `ContentBlock` array.
+///
+/// A bare string is normalised to a single `text` block so the rest of the
+/// importer can treat both forms uniformly.
+fn deserialize_content_blocks<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<ContentBlock>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(s) => Ok(vec![ContentBlock {
+            block_type: "text".to_owned(),
+            text: Some(s),
+            id: None,
+            tool_use_id: None,
+            name: None,
+            input: None,
+            content: None,
+            is_error: false,
+        }]),
+        other => serde_json::from_value(other).map_err(serde::de::Error::custom),
+    }
 }
 
 /// Token usage metadata for an assistant event (best-effort tier).
@@ -275,7 +304,10 @@ struct ToolCallSlot {
     tool_name: String,
     input: serde_json::Value,
     result: Option<ToolCallResult>,
-    event_timestamp: Option<String>,
+    /// Timestamp from the assistant event that issued the tool call (`started_at`).
+    start_timestamp: Option<String>,
+    /// Timestamp from the user event that delivered the tool result (`finished_at`).
+    result_timestamp: Option<String>,
 }
 
 /// The result of a tool call (from the matching `tool_result` block).
@@ -347,7 +379,8 @@ fn group_events(events: Vec<(usize, ClaudeCodeEvent)>) -> GroupedEvents {
                             tool_name: block.name.clone().unwrap_or_default(),
                             input: block.input.clone().unwrap_or(serde_json::Value::Null),
                             result: None,
-                            event_timestamp: ae.timestamp.clone(),
+                            start_timestamp: ae.timestamp.clone(),
+                            result_timestamp: None,
                         });
                     }
                 }
@@ -374,7 +407,7 @@ fn group_events(events: Vec<(usize, ClaudeCodeEvent)>) -> GroupedEvents {
                                         is_error: block.is_error,
                                     });
                                     active.tool_calls[slot_idx]
-                                        .event_timestamp
+                                        .result_timestamp
                                         .clone_from(&ue.timestamp);
                                 }
                             }
@@ -444,9 +477,18 @@ fn extract_bash_command(input: &serde_json::Value) -> String {
 }
 
 /// Extract the file path from a file tool's `input` JSON.
-fn extract_file_path(input: &serde_json::Value) -> Option<String> {
+///
+/// `NotebookEdit` and `NotebookRead` use `notebook_path`; all other file tools
+/// use `file_path`. Falls back to `file_path` for notebook tools as a safety net.
+fn extract_file_path(tool_name: &str, input: &serde_json::Value) -> Option<String> {
+    let primary_key = if matches!(tool_name, "NotebookEdit" | "NotebookRead") {
+        "notebook_path"
+    } else {
+        "file_path"
+    };
     input
-        .get("file_path")
+        .get(primary_key)
+        .or_else(|| input.get("file_path"))
         .and_then(|v| v.as_str())
         .map(str::to_owned)
 }
@@ -807,7 +849,12 @@ fn emit_tool_action(
         String::new()
     };
 
-    let exit_code: Option<i64> = slot.result.as_ref().map(|r| i64::from(r.is_error));
+    // exit_code is Some(0) on success, None on failure (actual exit code is not
+    // available from the is_error boolean alone — synthesising 1 would be misleading).
+    let is_error = slot.result.as_ref().is_some_and(|r| r.is_error);
+    let exit_code: Option<i64> = slot.result.as_ref().and_then(|r| {
+        if r.is_error { None } else { Some(0) }
+    });
     let result_text = slot
         .result
         .as_ref()
@@ -815,10 +862,15 @@ fn emit_tool_action(
         .map(|s| redact(s, opts));
 
     let action_timestamp = slot
-        .event_timestamp
+        .start_timestamp
         .as_deref()
         .and_then(sanitize_rfc3339)
         .unwrap_or_else(|| ctx.default_timestamp.clone());
+    let finished_at = slot
+        .result_timestamp
+        .as_deref()
+        .and_then(sanitize_rfc3339)
+        .or_else(|| slot.result.as_ref().map(|_| action_timestamp.clone()));
 
     let tool_call_id =
         agent_memory_stable_id(&["node", "tool_call", turn_id, &action_idx.to_string()]);
@@ -836,7 +888,7 @@ fn emit_tool_action(
         redacted_cmd.clone()
     } else {
         // For non-Bash tools, use the file path or a minimal description.
-        extract_file_path(&slot.input).unwrap_or_else(|| format!("{tool_name} call"))
+        extract_file_path(tool_name, &slot.input).unwrap_or_else(|| format!("{tool_name} call"))
     };
 
     let tool_kind = tool_kind_for(tool_name, &cmd);
@@ -856,8 +908,7 @@ fn emit_tool_action(
             arguments_summary: Some(cmd_summary.clone()),
             arguments_handle: Some(Box::new(output_handle(&cmd_summary))),
             started_at: Some(action_timestamp.clone()),
-            finished_at: matches!(status_str, "succeeded" | "failed")
-                .then(|| action_timestamp.clone()),
+            finished_at,
             status: Some(status_str.to_owned()),
             agent_kind: Some("claude-code".to_owned()),
             ..Default::default()
@@ -902,7 +953,7 @@ fn emit_tool_action(
     if matches!(
         tool_name.as_str(),
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
-    ) && let Some(target) = extract_file_path(&slot.input)
+    ) && let Some(target) = extract_file_path(tool_name, &slot.input)
     {
         let file_edit_id =
             agent_memory_stable_id(&["node", "file_edit", turn_id, &action_idx.to_string()]);
@@ -937,7 +988,7 @@ fn emit_tool_action(
 
     // ── PatchArtifact / Failure ───────────────────────────────────────────────
     if tool_name == "Bash" && is_patch_command(&cmd) {
-        let failed = exit_code.is_some_and(|c| c != 0);
+        let failed = is_error;
         let patch_status = if failed { "invalid" } else { "unverified" };
         let patch_id =
             agent_memory_stable_id(&["node", "patch_artifact", turn_id, &action_idx.to_string()]);
@@ -1006,7 +1057,7 @@ fn emit_tool_action(
                 ctx,
             ));
         }
-    } else if tool_name == "Bash" && exit_code.is_some_and(|c| c != 0) {
+    } else if tool_name == "Bash" && is_error {
         // Non-patch Bash command that failed.
         let failure_id = agent_memory_stable_id(&[
             "node",
@@ -1018,10 +1069,7 @@ fn emit_tool_action(
         graph.push(make_node(
             failure_id.clone(),
             NodeKind::Failure,
-            format!(
-                "Failure command_failure exit={} turn={turn_index}",
-                exit_code.unwrap_or(-1)
-            ),
+            format!("Failure command_failure turn={turn_index}"),
             ctx,
             NodeExtra {
                 observed_at: Some(action_timestamp.clone()),
