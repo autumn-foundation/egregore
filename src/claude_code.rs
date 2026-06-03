@@ -48,8 +48,9 @@
 //! [`crate::redaction::redact_value`]. Pass-through requires an explicit
 //! [`ImportOptions::passthrough`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::LazyLock;
 
 use serde::Deserialize;
 
@@ -57,7 +58,7 @@ use crate::{
     error::Result,
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, Graph, GraphRecord, NodeKind, OutputHandle,
-        agent_memory_stable_id,
+        Producer, ProducerKind, agent_memory_stable_id,
     },
 };
 
@@ -71,12 +72,15 @@ pub const IMPORTER_VERSION: &str = "0.1.0";
 pub const DOMAIN: &str = "agent_memory";
 
 /// Pinned Claude Code format version this importer targets.
-#[allow(dead_code)]
 pub const SOURCE_FORMAT_VERSION: &str = "claude-code-1.0";
 /// Timestamp used when no timestamp is available.
 const DEFAULT_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 /// Maximum bytes to inline in a handle field.
 const INLINE_PAYLOAD_CEILING: u64 = 16 * 1024;
+
+/// Wall-clock time captured when the first import in this process begins.
+static IMPORTER_STARTED_AT: LazyLock<String> =
+    LazyLock::new(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
 
 // ── Import options ────────────────────────────────────────────────────────────
 
@@ -162,6 +166,10 @@ struct MessageEnvelope {
     /// Content blocks (`text`, `tool_use`, `tool_result`).
     #[serde(default)]
     content: Vec<ContentBlock>,
+    /// Token usage when carried inside the message object (best-effort; some
+    /// Claude Code versions embed usage here rather than at the event top level).
+    #[serde(default)]
+    usage: Option<ClaudeCodeUsage>,
 }
 
 /// Token usage metadata for an assistant event (best-effort tier).
@@ -187,6 +195,9 @@ impl ClaudeCodeUsage {
     }
     fn cache_creation(&self) -> u64 {
         self.cache_creation_input_tokens.unwrap_or(0)
+    }
+    fn cache_read(&self) -> u64 {
+        self.cache_read_input_tokens.unwrap_or(0)
     }
 }
 
@@ -317,10 +328,11 @@ fn group_events(events: Vec<(usize, ClaudeCodeEvent)>) -> GroupedEvents {
                     turns.push(t);
                 }
                 let turn_index = turns.len() as u64;
+                let usage = ae.usage.or_else(|| ae.message.usage.clone());
                 let mut turn = TurnData {
                     turn_index,
                     timestamp: ae.timestamp.clone(),
-                    usage: ae.usage,
+                    usage,
                     tool_calls: Vec::new(),
                     id_to_slot: HashMap::new(),
                 };
@@ -515,6 +527,19 @@ fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 /// agent-memory records.
 ///
 /// Every node record carries `domain`, `importer_id`, `importer_version`,
+fn claude_code_producer() -> Producer {
+    Producer {
+        egregore_version: env!("CARGO_PKG_VERSION").to_owned(),
+        egregore_git: None,
+        producer_kind: ProducerKind::ClaudeCodeImporter,
+        producer_components: BTreeMap::from([
+            ("importer_schema_version".to_owned(), IMPORTER_VERSION.to_owned()),
+            ("source_format_version".to_owned(), SOURCE_FORMAT_VERSION.to_owned()),
+        ]),
+        producer_started_at: IMPORTER_STARTED_AT.clone(),
+    }
+}
+
 /// `source_artifact_path`, and `source_artifact_hash` (BLAKE3 of raw bytes).
 /// Free-text fields are passed through `opts.redact` before storage.
 ///
@@ -568,11 +593,13 @@ pub fn import_claude_code(path: &Path, opts: &ImportOptions) -> Result<Graph> {
 
     let grouped = group_events(parsed);
 
-    // Reject truly empty or fully malformed files.
+    // Reject empty or fully-malformed files (no parseable events at all).
+    // A file where every line fails JSON parsing leaves all grouped collections
+    // empty; that must be treated as EmptyImport rather than emitting a bare
+    // AgentSession/AgentRun around a single malformed-lines Diagnostic.
     if grouped.turns.is_empty()
         && grouped.hook_events.is_empty()
         && grouped.unknown_indices.is_empty()
-        && malformed_count == 0
     {
         return Err(crate::CodegraphError::EmptyImport {
             path: path.to_path_buf(),
@@ -651,7 +678,7 @@ pub fn import_claude_code(path: &Path, opts: &ImportOptions) -> Result<Graph> {
         emit_unknown_event_diagnostic(&mut graph, line_idx, &run_id, &ctx);
     }
 
-    Ok(graph)
+    Ok(graph.stamp_producer(&claude_code_producer()))
 }
 
 // ── Turn emission ─────────────────────────────────────────────────────────────
@@ -694,9 +721,12 @@ fn emit_turn(
         ctx,
     ));
 
-    // ── CostUsage (best-effort: emit only when at least one non-zero token count) ──
+    // ── CostUsage (best-effort: emit when any token count is non-zero) ──────────
     if let Some(usage) = &turn.usage
-        && (usage.input() > 0 || usage.output() > 0 || usage.cache_creation() > 0)
+        && (usage.input() > 0
+            || usage.output() > 0
+            || usage.cache_creation() > 0
+            || usage.cache_read() > 0)
     {
         emit_cost_usage(graph, turn_index, &turn_id, usage, &turn_timestamp, ctx);
     }
@@ -1539,6 +1569,7 @@ mod unit_tests {
                             content: None,
                             is_error: false,
                         }],
+                        usage: None,
                     },
                     timestamp: Some("2025-01-01T00:00:00Z".to_owned()),
                     session_id: None,
@@ -1559,6 +1590,7 @@ mod unit_tests {
                             content: None,
                             is_error: false,
                         }],
+                        usage: None,
                     },
                     usage: None,
                     timestamp: Some("2025-01-01T00:00:01Z".to_owned()),
@@ -1583,6 +1615,7 @@ mod unit_tests {
                             }])),
                             is_error: false,
                         }],
+                        usage: None,
                     },
                     timestamp: Some("2025-01-01T00:00:02Z".to_owned()),
                     session_id: None,
@@ -1620,6 +1653,7 @@ mod unit_tests {
                         content: None,
                         is_error: false,
                     }],
+                    usage: None,
                 },
                 usage: None,
                 timestamp: Some("2025-01-01T00:00:07Z".to_owned()),
