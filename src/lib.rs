@@ -6,6 +6,8 @@
 
 /// Graph ingestion adapters.
 pub mod adapters;
+/// Claude Code transcript JSONL importer (M4 agent-memory source, issue #52).
+pub mod claude_code;
 /// Command-line interface.
 pub mod cli;
 /// Codex session/rollout JSONL importer (M3 agent-memory source).
@@ -53,6 +55,7 @@ pub mod traj;
 
 use std::{collections::BTreeMap, path::Path, sync::LazyLock};
 
+pub use claude_code::import_claude_code;
 pub use codex::import_codex;
 pub use error::{CodegraphError, Result};
 pub use history::{scan_repository_history, scan_repository_history_with_override};
