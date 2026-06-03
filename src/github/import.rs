@@ -387,8 +387,7 @@ fn blake3_hash_value(value: &Value) -> String {
 fn now_unix_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis())
 }
 
 #[cfg(test)]
