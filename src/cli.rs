@@ -247,6 +247,20 @@ enum Commands {
         #[command(subcommand)]
         action: RepairCliAction,
     },
+    /// Start an MCP stdio server exposing read-only evidence-query tools.
+    ///
+    /// Processes JSON-RPC 2.0 messages from stdin (one per line) and writes
+    /// responses to stdout.  Tools: `inspect_store`, `symbol_context`,
+    /// `task_evidence`.  Requires a running `eg daemon`.
+    ///
+    /// Configure as an MCP server in Claude Code:
+    ///   `eg mcp --data-dir .egregore`
+    #[cfg(feature = "embedded-aletheiadb")]
+    Mcp {
+        /// `AletheiaDB` data directory (default: `.egregore`).
+        #[arg(long, default_value = ".egregore")]
+        data_dir: PathBuf,
+    },
 }
 
 /// Subcommands for `import`.
@@ -792,6 +806,8 @@ fn run_cli(cli: Cli) -> Result<()> {
         Commands::Daemon { action } => daemon(action),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Repair { action } => repair_cmd(action),
+        #[cfg(feature = "embedded-aletheiadb")]
+        Commands::Mcp { data_dir } => crate::mcp::run_stdio(&data_dir),
     }
 }
 
