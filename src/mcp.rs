@@ -122,6 +122,8 @@ pub fn handle_message(line: &str, data_dir: &Path) -> Option<Value> {
             Ok(v) => ("result", v),
             Err(err) => ("error", err),
         },
+        // ping is a standard MCP utility — must reply with an empty result.
+        "ping" => ("result", json!({})),
         _ => (
             "error",
             json!({ "code": METHOD_NOT_FOUND, "message": format!("Method not found: {method}") }),
@@ -512,16 +514,16 @@ fn dispatch_tool_call(params: &Value, default_data_dir: &Path) -> Result<Value, 
         "inspect_store" => run_inspect_store(&args, default_data_dir),
         "symbol_context" => run_symbol_context(&args, default_data_dir),
         "task_evidence" => run_task_evidence(&args, default_data_dir),
-        other => json!({
-            "ok": false,
-            "error": {
-                "code": "unsupported_tool",
+        // Unknown tool: return a JSON-RPC protocol error, not a tool-level error.
+        other => {
+            return Err(json!({
+                "code": INVALID_PARAMS,
                 "message": format!(
-                    "Tool '{other}' is not in the Egregore read-only slice. \
+                    "Tool '{other}' is not registered. \
                      Available: inspect_store, symbol_context, task_evidence."
                 )
-            }
-        }),
+            }));
+        }
     };
 
     Ok(wrap_tool_result(&payload))
@@ -710,6 +712,7 @@ fn record_to_linked_item(record: &GraphRecord) -> Option<Value> {
         patch_status,
         patch_bytes_hash,
         patch_bytes_size,
+        patch_handle,
         target_files,
         validation_summary,
         base_commit,
@@ -718,6 +721,9 @@ fn record_to_linked_item(record: &GraphRecord) -> Option<Value> {
         evidence_links,
         url,
         system_native_id,
+        body_handle,
+        stdout_handle,
+        stderr_handle,
         ..
     } = record
     else {
@@ -755,15 +761,19 @@ fn record_to_linked_item(record: &GraphRecord) -> Option<Value> {
         "evidence_quality": evidence_quality,
         "source_artifact_path": source_artifact_path,
         "source_artifact_hash": source_artifact_hash,
+        "stdout_handle": stdout_handle,
+        "stderr_handle": stderr_handle,
         "repo_relative_path": repo_relative_path,
         "edit_kind": edit_kind,
         "patch_status": patch_status,
+        "patch_handle": patch_handle,
         "patch_bytes_hash": patch_bytes_hash,
         "patch_bytes_size": patch_bytes_size,
         "target_files": target_files,
         "validation_summary": redacted_validation,
         "base_commit": base_commit,
         "producer_session_id": producer_session_id,
+        "body_handle": body_handle,
         "author": author,
         "url": url,
         "system_native_id": system_native_id,
