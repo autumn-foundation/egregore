@@ -1895,23 +1895,25 @@ pub fn scopes_compatible(a: &UserContextScope, b: &UserContextScope) -> bool {
 /// Checks if a record scope matches a query scope
 #[must_use]
 pub fn scope_matches(record_scope: &UserContextScope, query_scope: &UserContextScope) -> bool {
-    if let Some(r_repo) = &record_scope.repo {
-        if Some(r_repo) != query_scope.repo.as_ref() {
+    if let (Some(r_repo), Some(q_repo)) = (&record_scope.repo, &query_scope.repo) {
+        if r_repo != q_repo {
             return false;
         }
     }
-    if let Some(r_path) = &record_scope.path_glob {
-        if Some(r_path) != query_scope.path_glob.as_ref() {
+    if let (Some(r_path), Some(q_path)) = (&record_scope.path_glob, &query_scope.path_glob) {
+        if r_path != q_path {
             return false;
         }
     }
-    if let Some(r_lang) = &record_scope.language {
-        if Some(r_lang) != query_scope.language.as_ref() {
+    if let (Some(r_lang), Some(q_lang)) = (&record_scope.language, &query_scope.language) {
+        if r_lang != q_lang {
             return false;
         }
     }
-    if let Some(r_phase) = &record_scope.lifecycle_phase {
-        if Some(r_phase) != query_scope.lifecycle_phase.as_ref() {
+    if let (Some(r_phase), Some(q_phase)) =
+        (&record_scope.lifecycle_phase, &query_scope.lifecycle_phase)
+    {
+        if r_phase != q_phase {
             return false;
         }
     }
@@ -1940,6 +1942,41 @@ pub fn jaccard_similarity(s1: &str, s2: &str) -> f64 {
     intersection / union
 }
 
+fn latest_decision_for_candidate<'a>(
+    records: &'a [GraphRecord],
+    candidate_id: &str,
+) -> Option<&'a GraphRecord> {
+    records
+        .iter()
+        .filter(|r| {
+            if let GraphRecord::Node {
+                kind: NodeKind::PromotionDecision,
+                user_context,
+                ..
+            } = r
+            {
+                user_context.candidate_id.as_deref() == Some(candidate_id)
+            } else {
+                false
+            }
+        })
+        .max_by(|a, b| {
+            let a_time = match a {
+                GraphRecord::Node { user_context, .. } => {
+                    user_context.decided_at.as_deref().unwrap_or("")
+                }
+                _ => "",
+            };
+            let b_time = match b {
+                GraphRecord::Node { user_context, .. } => {
+                    user_context.decided_at.as_deref().unwrap_or("")
+                }
+                _ => "",
+            };
+            a_time.cmp(b_time)
+        })
+}
+
 /// Checks if a candidate is suppressed under the rejection debounce window
 #[must_use]
 pub fn is_candidate_suppressed(records: &[GraphRecord], cand_id: &str) -> Option<String> {
@@ -1959,18 +1996,7 @@ pub fn is_candidate_suppressed(records: &[GraphRecord], cand_id: &str) -> Option
 
     if let Some(old_id) = superseded_by_id {
         if let Some(old_rec) = records.iter().find(|r| r.id() == old_id) {
-            let decision = records.iter().find(|r| {
-                if let GraphRecord::Node {
-                    kind: NodeKind::PromotionDecision,
-                    user_context,
-                    ..
-                } = r
-                {
-                    user_context.candidate_id.as_deref() == Some(old_id)
-                } else {
-                    false
-                }
-            });
+            let decision = latest_decision_for_candidate(records, old_id);
             if let Some(GraphRecord::Node {
                 user_context: decision_fields,
                 ..
@@ -2022,7 +2048,7 @@ pub fn is_candidate_suppressed(records: &[GraphRecord], cand_id: &str) -> Option
 
                     let additional_count = new_obs.difference(&old_obs).count();
 
-                    if additional_count < 5 && !elapsed_ok {
+                    if additional_count < 5 || !elapsed_ok {
                         return Some("rejection_debounce".to_string());
                     }
                 }
@@ -2054,18 +2080,7 @@ pub fn is_candidate_suppressed(records: &[GraphRecord], cand_id: &str) -> Option
         if jaccard_similarity(cand_text, old_text) >= 0.6
             && scopes_compatible(cand_scope, old_scope)
         {
-            let decision = records.iter().find(|r| {
-                if let GraphRecord::Node {
-                    kind: NodeKind::PromotionDecision,
-                    user_context,
-                    ..
-                } = r
-                {
-                    user_context.candidate_id.as_deref() == Some(old_id)
-                } else {
-                    false
-                }
-            });
+            let decision = latest_decision_for_candidate(records, old_id);
             if let Some(GraphRecord::Node {
                 user_context: decision_fields,
                 ..
@@ -2226,7 +2241,29 @@ pub fn active_policy<'a>(
         })
         .collect();
 
-    let mut policy = Vec::new();
+    let revoked_ids: std::collections::BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Node {
+                kind, user_context, ..
+            } = r
+            {
+                if matches!(
+                    kind,
+                    NodeKind::Preference
+                        | NodeKind::WorkflowRule
+                        | NodeKind::NamingDecision
+                        | NodeKind::Constraint
+                ) && user_context.active_to.is_some()
+                {
+                    return Some(r.id());
+                }
+            }
+            None
+        })
+        .collect();
+
+    let mut policy_map = std::collections::BTreeMap::new();
     for rec in records {
         if let GraphRecord::Node {
             kind, user_context, ..
@@ -2239,6 +2276,9 @@ pub fn active_policy<'a>(
                     | NodeKind::NamingDecision
                     | NodeKind::Constraint
             ) {
+                if revoked_ids.contains(rec.id()) {
+                    continue;
+                }
                 if user_context.active_to.is_some() {
                     continue;
                 }
@@ -2256,10 +2296,11 @@ pub fn active_policy<'a>(
                         }
                     }
                 }
-                policy.push(rec);
+                policy_map.insert(rec.id(), rec);
             }
         }
     }
+    let mut policy: Vec<&'a GraphRecord> = policy_map.into_values().collect();
     policy.sort_by_key(|p| p.id());
     policy
 }

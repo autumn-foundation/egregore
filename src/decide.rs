@@ -122,6 +122,38 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         .ok_or_else(|| anyhow!("Candidate lacks proposed_rule_kind"))?;
 
     // 2. Validate request parameters
+    let allowed_outcomes = [
+        "approved",
+        "rejected",
+        "deferred",
+        "expired",
+        "edited_then_approved",
+    ];
+    if !allowed_outcomes.contains(&req.outcome.as_str()) {
+        return Err(anyhow!(
+            "Invalid outcome '{}'. Allowed values are: approved, rejected, deferred, expired, edited_then_approved",
+            req.outcome
+        ));
+    }
+
+    if (req.outcome == "approved" || req.outcome == "edited_then_approved")
+        && proposed_rule_kind == "workflow_rule"
+    {
+        let triggers_ok = cand_fields
+            .triggers
+            .as_ref()
+            .is_some_and(|t| !t.is_empty() && t.iter().all(|s| !s.trim().is_empty()));
+        let action_summary_ok = cand_fields
+            .action_summary
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
+        if !triggers_ok || !action_summary_ok {
+            return Err(anyhow!(
+                "Approved workflow_rule candidate must carry triggers and an action_summary"
+            ));
+        }
+    }
+
     if req.outcome == "edited_then_approved" {
         if req.edited_rule_text.is_none() {
             return Err(anyhow!(
