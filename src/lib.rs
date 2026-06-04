@@ -39,6 +39,9 @@ pub mod languages;
 pub mod link_evidence;
 /// Local project/task JSONL importer (issue #42).
 pub mod local_project;
+/// MCP server exposing read-only evidence-query tools (issue #53).
+#[cfg(feature = "embedded-aletheiadb")]
+pub mod mcp;
 /// Parser orchestration.
 pub mod parser;
 /// Agent-facing graph query helpers.
