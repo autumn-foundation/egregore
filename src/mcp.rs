@@ -43,6 +43,7 @@ use serde_json::{Value, json};
 use crate::{
     GraphRecord, NodeKind,
     daemon::DaemonClient,
+    ir::EdgeLabel,
     query,
     schema_version::{UnknownSchemaVersion, record_version, validate_record_version},
 };
@@ -374,7 +375,46 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
     let acceptance_criteria: Vec<Value> = ctx
         .acceptance_criteria
         .iter()
-        .filter_map(|r| record_to_linked_item(r))
+        .filter_map(|r| {
+            let mut item = record_to_linked_item(r)?;
+            // For verified ACs, attach the closing verification record so the
+            // evidence that closed it is visible without a second tool call.
+            if item["status"].as_str() == Some("verified") {
+                let GraphRecord::Node {
+                    verification_link_id,
+                    ..
+                } = r
+                else {
+                    return Some(item);
+                };
+                let ver_id = verification_link_id.as_deref().or_else(|| {
+                    records.iter().find_map(|edge| {
+                        if let GraphRecord::Edge {
+                            label: EdgeLabel::ClosesAcceptanceCriterion,
+                            source,
+                            target,
+                            ..
+                        } = edge
+                        {
+                            if source == r.id() {
+                                Some(target.as_str())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                });
+                if let Some(ver) = ver_id
+                    .and_then(|vid| records.iter().find(|c| c.id() == vid))
+                    .and_then(|rec| record_to_linked_item(rec))
+                {
+                    item["verification_record"] = ver;
+                }
+            }
+            Some(item)
+        })
         .collect();
     let source_facts: Vec<Value> = ctx
         .source_facts
@@ -692,6 +732,16 @@ fn record_to_observation(record: &GraphRecord) -> Option<Value> {
     }))
 }
 
+/// Returns only citation metadata from an OutputHandle, stripping any inlined payload.
+fn output_handle_citation(h: &crate::ir::OutputHandle) -> Value {
+    json!({ "hash": h.hash, "bytes": h.bytes })
+}
+
+/// Returns only citation metadata from a PatchHandle, stripping any inlined bytes.
+fn patch_handle_citation(h: &crate::ir::PatchHandle) -> Value {
+    json!({ "path": h.path })
+}
+
 fn record_to_linked_item(record: &GraphRecord) -> Option<Value> {
     let GraphRecord::Node {
         id,
@@ -761,19 +811,19 @@ fn record_to_linked_item(record: &GraphRecord) -> Option<Value> {
         "evidence_quality": evidence_quality,
         "source_artifact_path": source_artifact_path,
         "source_artifact_hash": source_artifact_hash,
-        "stdout_handle": stdout_handle,
-        "stderr_handle": stderr_handle,
+        "stdout_handle": stdout_handle.as_deref().map(output_handle_citation),
+        "stderr_handle": stderr_handle.as_deref().map(output_handle_citation),
         "repo_relative_path": repo_relative_path,
         "edit_kind": edit_kind,
         "patch_status": patch_status,
-        "patch_handle": patch_handle,
+        "patch_handle": patch_handle.as_deref().map(patch_handle_citation),
         "patch_bytes_hash": patch_bytes_hash,
         "patch_bytes_size": patch_bytes_size,
         "target_files": target_files,
         "validation_summary": redacted_validation,
         "base_commit": base_commit,
         "producer_session_id": producer_session_id,
-        "body_handle": body_handle,
+        "body_handle": body_handle.as_deref().map(output_handle_citation),
         "author": author,
         "url": url,
         "system_native_id": system_native_id,
