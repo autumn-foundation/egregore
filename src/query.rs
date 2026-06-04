@@ -2222,7 +2222,7 @@ pub fn active_policy<'a>(
     records: &'a [GraphRecord],
     query_scope: Option<&UserContextScope>,
 ) -> Vec<&'a GraphRecord> {
-    let approved_decisions: std::collections::BTreeSet<&str> = records
+    let approved_decisions: std::collections::BTreeMap<&str, &str> = records
         .iter()
         .filter_map(|r| {
             if let GraphRecord::Node {
@@ -2232,8 +2232,10 @@ pub fn active_policy<'a>(
             } = r
             {
                 if let Some(outcome) = &user_context.outcome {
-                    if outcome == "approved" || outcome == "edited_then_approved" {
-                        return Some(r.id());
+                    if (outcome == "approved" || outcome == "edited_then_approved")
+                        && let Some(mat_id) = &user_context.materialized_record_id
+                    {
+                        return Some((r.id(), mat_id.as_str()));
                     }
                 }
             }
@@ -2283,7 +2285,11 @@ pub fn active_policy<'a>(
                     continue;
                 }
                 if let Some(decision_id) = &user_context.approval_decision_id {
-                    if !approved_decisions.contains(decision_id.as_str()) {
+                    if let Some(&mat_id) = approved_decisions.get(decision_id.as_str()) {
+                        if mat_id != rec.id() {
+                            continue;
+                        }
+                    } else {
                         continue;
                     }
                 } else {
@@ -2361,9 +2367,38 @@ pub fn audit_trail<'a>(
     chain.push(decision);
 
     let decision_fields = match decision {
-        GraphRecord::Node { user_context, .. } => user_context,
-        _ => return Err(format!("Decision '{}' is not a node", decision_id)),
+        GraphRecord::Node {
+            kind: NodeKind::PromotionDecision,
+            user_context,
+            ..
+        } => user_context,
+        _ => {
+            return Err(format!(
+                "Decision '{}' is not a PromotionDecision node",
+                decision_id
+            ));
+        }
     };
+    let outcome = decision_fields
+        .outcome
+        .as_deref()
+        .ok_or_else(|| format!("Decision '{}' lacks outcome", decision_id))?;
+    if outcome != "approved" && outcome != "edited_then_approved" {
+        return Err(format!(
+            "Decision '{}' has non-approving outcome '{}'",
+            decision_id, outcome
+        ));
+    }
+    let mat_id = decision_fields
+        .materialized_record_id
+        .as_deref()
+        .ok_or_else(|| format!("Decision '{}' lacks materialized_record_id", decision_id))?;
+    if mat_id != durable_id {
+        return Err(format!(
+            "Decision '{}' targets materialized record '{}', expected '{}'",
+            decision_id, mat_id, durable_id
+        ));
+    }
     let prompt_id = decision_fields
         .prompt_id
         .as_deref()

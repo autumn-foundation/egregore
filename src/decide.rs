@@ -136,21 +136,69 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         ));
     }
 
-    if (req.outcome == "approved" || req.outcome == "edited_then_approved")
-        && proposed_rule_kind == "workflow_rule"
-    {
-        let triggers_ok = cand_fields
-            .triggers
-            .as_ref()
-            .is_some_and(|t| !t.is_empty() && t.iter().all(|s| !s.trim().is_empty()));
-        let action_summary_ok = cand_fields
-            .action_summary
-            .as_ref()
-            .is_some_and(|s| !s.trim().is_empty());
-        if !triggers_ok || !action_summary_ok {
-            return Err(anyhow!(
-                "Approved workflow_rule candidate must carry triggers and an action_summary"
-            ));
+    let allowed_prompt_surfaces = ["cli", "mcp", "web", "other"];
+    if !allowed_prompt_surfaces.contains(&req.prompt_surface.as_str()) {
+        return Err(anyhow!(
+            "Invalid prompt_surface '{}'. Allowed values are: cli, mcp, web, other",
+            req.prompt_surface
+        ));
+    }
+
+    if req.outcome == "approved" || req.outcome == "edited_then_approved" {
+        if proposed_rule_kind == "workflow_rule" {
+            let triggers_ok = cand_fields
+                .triggers
+                .as_ref()
+                .is_some_and(|t| !t.is_empty() && t.iter().all(|s| !s.trim().is_empty()));
+            let action_summary_ok = cand_fields
+                .action_summary
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty());
+            if !triggers_ok || !action_summary_ok {
+                return Err(anyhow!(
+                    "Approved workflow_rule candidate must carry triggers and an action_summary"
+                ));
+            }
+        }
+
+        if proposed_rule_kind == "naming_decision" {
+            let entity_kind_ok = cand_fields.entity_kind.as_ref().is_some_and(|k| {
+                matches!(
+                    k.as_str(),
+                    "crate" | "module" | "type" | "function" | "field" | "feature" | "other"
+                )
+            });
+            if !entity_kind_ok {
+                return Err(anyhow!(
+                    "Approved naming_decision candidate must carry a valid entity_kind ('crate', 'module', 'type', 'function', 'field', 'feature', 'other')"
+                ));
+            }
+
+            let canonical_name_ok = if req.outcome == "edited_then_approved" {
+                true
+            } else {
+                cand_fields
+                    .canonical_name
+                    .as_ref()
+                    .is_some_and(|n| !n.trim().is_empty())
+            };
+            if !canonical_name_ok {
+                return Err(anyhow!(
+                    "Approved naming_decision candidate must carry a non-empty canonical_name"
+                ));
+            }
+        }
+
+        if proposed_rule_kind == "constraint" {
+            let enforcement_level_ok = cand_fields
+                .enforcement_level
+                .as_ref()
+                .is_some_and(|l| matches!(l.as_str(), "advisory" | "blocking"));
+            if !enforcement_level_ok {
+                return Err(anyhow!(
+                    "Approved constraint candidate must carry a valid enforcement_level ('advisory' or 'blocking')"
+                ));
+            }
         }
     }
 
@@ -276,6 +324,34 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                 })?
                 .clone();
 
+            let is_policy_kind = match &original_record {
+                GraphRecord::Node { kind, .. } => matches!(
+                    kind,
+                    NodeKind::Preference
+                        | NodeKind::WorkflowRule
+                        | NodeKind::NamingDecision
+                        | NodeKind::Constraint
+                ),
+                _ => false,
+            };
+            if !is_policy_kind {
+                return Err(anyhow!(
+                    "Revocation target '{}' is not a durable policy record",
+                    target_durable_id
+                ));
+            }
+
+            let is_active = match &original_record {
+                GraphRecord::Node { user_context, .. } => user_context.active_to.is_none(),
+                _ => false,
+            };
+            if !is_active {
+                return Err(anyhow!(
+                    "Revocation target '{}' is already inactive/revoked",
+                    target_durable_id
+                ));
+            }
+
             if let GraphRecord::Node {
                 ref mut user_context,
                 ..
@@ -318,7 +394,11 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                 }
                 NodeKind::NamingDecision => {
                     let entity_kind = cand_fields.entity_kind.as_deref().unwrap_or("other");
-                    let canonical_name = cand_fields.canonical_name.as_deref().unwrap_or("");
+                    let canonical_name = if req.outcome == "edited_then_approved" {
+                        &rule_text
+                    } else {
+                        cand_fields.canonical_name.as_deref().unwrap_or("")
+                    };
                     blake3_hash_parts(&[
                         entity_kind,
                         canonical_name,
@@ -391,8 +471,12 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                         } else {
                             cand_fields.canonical_name.clone()
                         };
-                        durable_fields.alternatives_rejected =
-                            cand_fields.alternatives_rejected.clone();
+                        durable_fields.alternatives_rejected = Some(
+                            cand_fields
+                                .alternatives_rejected
+                                .clone()
+                                .unwrap_or_default(),
+                        );
                     }
                     NodeKind::Constraint => {
                         durable_fields.constraint_text = Some(redact_value(&rule_text));
