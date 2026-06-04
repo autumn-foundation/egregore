@@ -2422,6 +2422,16 @@ pub fn audit_trail<'a>(
         .candidate_id
         .as_deref()
         .ok_or_else(|| format!("Prompt '{}' lacks candidate_id", prompt_id))?;
+    let decision_candidate_id = decision_fields
+        .candidate_id
+        .as_deref()
+        .ok_or_else(|| format!("Decision '{}' lacks candidate_id", decision_id))?;
+    if decision_candidate_id != candidate_id {
+        return Err(format!(
+            "Decision '{}' targets candidate '{}', but prompt '{}' targets candidate '{}'",
+            decision_id, decision_candidate_id, prompt_id, candidate_id
+        ));
+    }
     let candidate = records
         .iter()
         .find(|r| r.id() == candidate_id)

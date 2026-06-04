@@ -146,17 +146,23 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
 
     if req.outcome == "approved" || req.outcome == "edited_then_approved" {
         if proposed_rule_kind == "workflow_rule" {
-            let triggers_ok = cand_fields
-                .triggers
-                .as_ref()
-                .is_some_and(|t| !t.is_empty() && t.iter().all(|s| !s.trim().is_empty()));
+            let allowed_triggers = [
+                "pre_commit",
+                "pre_pr",
+                "pre_merge",
+                "pre_command",
+                "post_command",
+            ];
+            let triggers_ok = cand_fields.triggers.as_ref().is_some_and(|t| {
+                !t.is_empty() && t.iter().all(|s| allowed_triggers.contains(&s.as_str()))
+            });
             let action_summary_ok = cand_fields
                 .action_summary
                 .as_ref()
                 .is_some_and(|s| !s.trim().is_empty());
             if !triggers_ok || !action_summary_ok {
                 return Err(anyhow!(
-                    "Approved workflow_rule candidate must carry triggers and an action_summary"
+                    "Approved workflow_rule candidate must carry valid triggers and an action_summary"
                 ));
             }
         }
@@ -203,9 +209,10 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
     }
 
     if req.outcome == "edited_then_approved" {
-        if req.edited_rule_text.is_none() {
+        let is_empty = req.edited_rule_text.as_ref().is_none_or(|s| s.trim().is_empty());
+        if is_empty {
             return Err(anyhow!(
-                "edited_rule_text is required when outcome is edited_then_approved"
+                "non-empty edited_rule_text is required when outcome is edited_then_approved"
             ));
         }
         if proposed_rule_kind == "revocation" {
@@ -292,10 +299,14 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                 .ok_or_else(|| anyhow!("Candidate proposed_rule_text is missing"))?
         };
 
-        let scope = cand_fields
-            .scope
-            .clone()
-            .unwrap_or_else(UserContextScope::default);
+        let redacted_rule_text = redact_value(&rule_text);
+
+        let scope = cand_fields.scope.clone().ok_or_else(|| {
+            anyhow!(
+                "PromoteCandidate '{}' lacks required scope",
+                req.candidate_id
+            )
+        })?;
 
         if proposed_rule_kind == "revocation" {
             // Find target record to revoke.
@@ -386,12 +397,16 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
             };
 
             let materialized_hash = match materialized_kind {
-                NodeKind::Preference => {
-                    blake3_hash_parts(&[&rule_text, &canonical_scope(&scope), &decision_id])
-                }
-                NodeKind::WorkflowRule => {
-                    blake3_hash_parts(&[&rule_text, &canonical_scope(&scope), &decision_id])
-                }
+                NodeKind::Preference => blake3_hash_parts(&[
+                    &redacted_rule_text,
+                    &canonical_scope(&scope),
+                    &decision_id,
+                ]),
+                NodeKind::WorkflowRule => blake3_hash_parts(&[
+                    &redacted_rule_text,
+                    &canonical_scope(&scope),
+                    &decision_id,
+                ]),
                 NodeKind::NamingDecision => {
                     let entity_kind = cand_fields.entity_kind.as_deref().unwrap_or("other");
                     let canonical_name = if req.outcome == "edited_then_approved" {
@@ -406,9 +421,11 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                         &decision_id,
                     ])
                 }
-                NodeKind::Constraint => {
-                    blake3_hash_parts(&[&rule_text, &canonical_scope(&scope), &decision_id])
-                }
+                NodeKind::Constraint => blake3_hash_parts(&[
+                    &redacted_rule_text,
+                    &canonical_scope(&scope),
+                    &decision_id,
+                ]),
                 _ => unreachable!(),
             };
 
@@ -457,7 +474,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
 
                 match materialized_kind {
                     NodeKind::Preference | NodeKind::WorkflowRule => {
-                        durable_fields.rule_text = Some(redact_value(&rule_text));
+                        durable_fields.rule_text = Some(redacted_rule_text);
                         if materialized_kind == NodeKind::WorkflowRule {
                             durable_fields.triggers = cand_fields.triggers.clone();
                             durable_fields.action_summary =
@@ -479,7 +496,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                         );
                     }
                     NodeKind::Constraint => {
-                        durable_fields.constraint_text = Some(redact_value(&rule_text));
+                        durable_fields.constraint_text = Some(redacted_rule_text);
                         durable_fields.enforcement_level = cand_fields.enforcement_level.clone();
                     }
                     _ => unreachable!(),
