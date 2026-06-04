@@ -131,6 +131,16 @@ enum Commands {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Import a Claude Code transcript JSONL into agent-memory JSONL.
+    ///
+    /// Documented in `docs/cli/claude-code-import.md`.
+    ImportClaudeCode {
+        /// Path to the Claude Code session transcript JSONL file.
+        transcript_path: PathBuf,
+        /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Import local project/task JSONL into project-graph JSONL.
     ImportLocalTasks {
         /// Directory containing `.jsonl` task files, or path to a single `.jsonl` file.
@@ -735,6 +745,10 @@ fn run_cli(cli: Cli) -> Result<()> {
         ),
         Commands::ImportTraj { traj_path, out } => import_traj_cmd(&traj_path, &out),
         Commands::ImportCodex { codex_path, out } => import_codex_cmd(&codex_path, &out),
+        Commands::ImportClaudeCode {
+            transcript_path,
+            out,
+        } => import_claude_code_cmd(&transcript_path, &out),
         Commands::ImportLocalTasks {
             tasks_path,
             out,
@@ -1125,6 +1139,27 @@ fn import_codex_cmd(codex_path: &Path, out: &Path) -> Result<()> {
         "imported {} records from {}",
         graph.records().len(),
         codex_path.display()
+    );
+    Ok(())
+}
+
+fn import_claude_code_cmd(transcript_path: &Path, out: &Path) -> Result<()> {
+    let opts = crate::claude_code::ImportOptions::default();
+    let graph =
+        crate::claude_code::import_claude_code(transcript_path, &opts).with_context(|| {
+            format!(
+                "failed to import Claude Code transcript from {}",
+                transcript_path.display()
+            )
+        })?;
+    let jsonl = graph
+        .to_jsonl()
+        .context("failed to serialize agent-memory JSONL")?;
+    fs::write(out, jsonl).with_context(|| format!("failed to write JSONL to {}", out.display()))?;
+    println!(
+        "imported {} records from {}",
+        graph.records().len(),
+        transcript_path.display()
     );
     Ok(())
 }
