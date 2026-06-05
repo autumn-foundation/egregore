@@ -15,7 +15,7 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 
 use crate::{
-    EdgeLabel, GraphRecord, NodeKind, UserContextFields, UserContextScope,
+    GraphRecord, NodeKind, UserContextFields, UserContextScope,
     ir::{USER_CONTEXT_SCHEMA_VERSION, user_context_stable_id},
     redaction::redact_value,
 };
@@ -67,27 +67,6 @@ pub struct DecideRequest {
     pub transaction_time: Option<String>,
 }
 
-/// Helper to construct a user-context edge record.
-pub fn user_context_edge(
-    label: EdgeLabel,
-    source: &str,
-    target: &str,
-    confidence: Option<String>,
-    summary: &str,
-) -> GraphRecord {
-    GraphRecord::Edge {
-        id: user_context_stable_id(&["edge", label.as_str(), source, target]),
-        schema_version: USER_CONTEXT_SCHEMA_VERSION,
-        label,
-        source: source.to_owned(),
-        target: target.to_owned(),
-        confidence,
-        temporal: None,
-        summary: summary.to_owned(),
-        producer: None,
-    }
-}
-
 /// Processes a decision request against a slice of graph records.
 /// Returns the list of new/updated records to write.
 pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<Vec<GraphRecord>> {
@@ -110,6 +89,37 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
             ));
         }
     };
+
+    // Refuse decisions for suppressed candidates
+    if let Some(suppressed_reason) =
+        crate::query::is_candidate_suppressed(records, &req.candidate_id)
+    {
+        return Err(anyhow!(
+            "Cannot decide candidate '{}': {}",
+            req.candidate_id,
+            suppressed_reason
+        ));
+    }
+
+    // Reject new decisions after terminal outcomes
+    if let Some(GraphRecord::Node {
+        user_context:
+            UserContextFields {
+                outcome: Some(outcome),
+                ..
+            },
+        ..
+    }) = crate::query::latest_decision_for_candidate(records, &req.candidate_id)
+    {
+        let terminal_outcomes = ["approved", "edited_then_approved", "rejected", "expired"];
+        if terminal_outcomes.contains(&outcome.as_str()) {
+            return Err(anyhow!(
+                "Cannot decide candidate '{}' because it already has a terminal decision outcome: '{}'",
+                req.candidate_id,
+                outcome
+            ));
+        }
+    }
 
     let valid_time_str = req
         .transaction_time
@@ -209,7 +219,10 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
     }
 
     if req.outcome == "edited_then_approved" {
-        let is_empty = req.edited_rule_text.as_ref().is_none_or(|s| s.trim().is_empty());
+        let is_empty = req
+            .edited_rule_text
+            .as_ref()
+            .is_none_or(|s| s.trim().is_empty());
         if is_empty {
             return Err(anyhow!(
                 "non-empty edited_rule_text is required when outcome is edited_then_approved"
@@ -262,21 +275,13 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         };
     }
 
-    let prompt_edge = user_context_edge(
-        EdgeLabel::PromptedFor,
-        &prompt_id,
-        &req.candidate_id,
-        None,
-        "Prompt prompted for PromoteCandidate",
-    );
-
     // 4. Generate PromotionDecision
     let decided_at = valid_time_str.clone();
     let decision_hash =
         blake3_hash_parts(&[&req.candidate_id, &prompt_id, &decided_at, &req.outcome]);
     let decision_id = user_context_stable_id(&["decision", &decision_hash]);
 
-    let mut generated_records = vec![prompt_node, prompt_edge];
+    let mut generated_records = vec![prompt_node];
 
     let mut decision_fields = UserContextFields {
         candidate_id: Some(req.candidate_id.clone()),
@@ -371,16 +376,9 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                 user_context.active_to = Some(decided_at);
             }
 
-            decision_fields.materialized_record_id = Some(target_durable_id.clone());
+            decision_fields.materialized_record_id = Some(target_durable_id);
 
             generated_records.push(original_record);
-            generated_records.push(user_context_edge(
-                EdgeLabel::RevokedBy,
-                &target_durable_id,
-                &decision_id,
-                None,
-                "Durable record revoked by Decision",
-            ));
         } else {
             // Materialize a new durable record
             let materialized_kind = match proposed_rule_kind {
@@ -505,24 +503,17 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                 *user_context = durable_fields;
             }
 
-            decision_fields.materialized_record_id = Some(materialized_id.clone());
+            decision_fields.materialized_record_id = Some(materialized_id);
             if req.outcome == "edited_then_approved" {
                 decision_fields.edited_rule_text = Some(redact_value(&rule_text));
             }
 
             generated_records.push(materialized_node);
-            generated_records.push(user_context_edge(
-                EdgeLabel::MaterializedAs,
-                &decision_id,
-                &materialized_id,
-                None,
-                "Decision materialized durable user-context record",
-            ));
         }
     }
 
     let mut decision_node = GraphRecord::node(
-        decision_id.clone(),
+        decision_id,
         NodeKind::PromotionDecision,
         None,
         None,
@@ -545,16 +536,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         *user_context = decision_fields;
     }
 
-    let decision_edge = user_context_edge(
-        EdgeLabel::DecidedOn,
-        &decision_id,
-        &req.candidate_id,
-        None,
-        "Decision decided on PromoteCandidate",
-    );
-
     generated_records.push(decision_node);
-    generated_records.push(decision_edge);
 
     Ok(generated_records)
 }

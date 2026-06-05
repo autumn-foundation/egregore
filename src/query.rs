@@ -1942,7 +1942,9 @@ pub fn jaccard_similarity(s1: &str, s2: &str) -> f64 {
     intersection / union
 }
 
-fn latest_decision_for_candidate<'a>(
+/// Returns the latest decision node for the given candidate ID.
+#[must_use]
+pub fn latest_decision_for_candidate<'a>(
     records: &'a [GraphRecord],
     candidate_id: &str,
 ) -> Option<&'a GraphRecord> {
@@ -2415,8 +2417,17 @@ pub fn audit_trail<'a>(
     chain.push(prompt);
 
     let prompt_fields = match prompt {
-        GraphRecord::Node { user_context, .. } => user_context,
-        _ => return Err(format!("Prompt '{}' is not a node", prompt_id)),
+        GraphRecord::Node {
+            kind: NodeKind::PromotionPrompt,
+            user_context,
+            ..
+        } => user_context,
+        _ => {
+            return Err(format!(
+                "Prompt '{}' is not a PromotionPrompt node",
+                prompt_id
+            ));
+        }
     };
     let candidate_id = prompt_fields
         .candidate_id
@@ -2444,8 +2455,17 @@ pub fn audit_trail<'a>(
     chain.push(candidate);
 
     let candidate_fields = match candidate {
-        GraphRecord::Node { user_context, .. } => user_context,
-        _ => return Err(format!("Candidate '{}' is not a node", candidate_id)),
+        GraphRecord::Node {
+            kind: NodeKind::PromoteCandidate,
+            user_context,
+            ..
+        } => user_context,
+        _ => {
+            return Err(format!(
+                "Candidate '{}' is not a PromoteCandidate node",
+                candidate_id
+            ));
+        }
     };
     let supporting = candidate_fields
         .supporting_evidence

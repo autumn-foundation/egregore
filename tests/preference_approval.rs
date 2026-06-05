@@ -851,8 +851,8 @@ fn decide_workflow_supports_approve_reject_defer_expire_outcomes() {
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
 
-    // Expecting Prompt + Prompt Edge + Decision + Decision Edge + Preference + Materialized Edge = 6 records
-    assert_eq!(records.len(), 6);
+    // Expecting Prompt + Decision + Preference = 3 records
+    assert_eq!(records.len(), 3);
 
     let decision = records
         .iter()
@@ -893,8 +893,8 @@ fn decide_workflow_supports_approve_reject_defer_expire_outcomes() {
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
 
-    // Prompt + Prompt Edge + Decision + Decision Edge = 4 records, no Preference record
-    assert_eq!(records_rej.len(), 4);
+    // Prompt + Decision = 2 records, no Preference record
+    assert_eq!(records_rej.len(), 2);
     assert!(records_rej.iter().all(|r| r["kind"] != "Preference"));
 }
 
@@ -3252,4 +3252,492 @@ fn decide_preference_hashes_redacted_rule_text() {
     } else {
         panic!("Missing expected nodes");
     }
+}
+
+#[test]
+fn decide_fails_if_candidate_suppressed_by_debounce() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph_path = temp.path().join("debounce_graph.jsonl");
+
+    let old_cand_id = user_context_stable_id(&["candidate", "old_cand"]);
+    let new_cand_id = user_context_stable_id(&["candidate", "new_cand"]);
+
+    let mut old_cand = GraphRecord::node(
+        old_cand_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Old Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = old_cand
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("Rule text".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut new_cand = GraphRecord::node(
+        new_cand_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "New Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut superseded_by,
+        ref mut valid_time,
+        ..
+    } = new_cand
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-06-05T12:00:00Z".to_owned());
+        *superseded_by = Some(old_cand_id.clone());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("Rule text".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    // Reject old_cand to seed the rejection decision
+    let mut decision = GraphRecord::node(
+        user_context_stable_id(&["decision", "old_decision"]),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Rejected decision".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = decision
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(old_cand_id.clone()),
+            outcome: Some("rejected".to_owned()),
+            decided_at: Some("2026-06-05T10:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut graph = Graph::new();
+    graph.push(old_cand);
+    graph.push(new_cand);
+    graph.push(decision);
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    // Try to decide on new_cand (should fail because it's suppressed)
+    let out_path = temp.path().join("out.jsonl");
+    egregore()
+        .args(["decide", &new_cand_id, "--outcome", "approved", "--graph"])
+        .arg(&graph_path)
+        .arg("--out")
+        .arg(&out_path)
+        .assert()
+        .failure();
+}
+
+#[test]
+fn decide_fails_if_candidate_already_has_terminal_decision() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph_path = temp.path().join("terminal_decision_graph.jsonl");
+
+    let cand_id = user_context_stable_id(&["candidate", "my_cand"]);
+    let mut cand = GraphRecord::node(
+        cand_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = cand
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("Rule text".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    // Prior approved decision
+    let mut decision = GraphRecord::node(
+        user_context_stable_id(&["decision", "prior_dec"]),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Approved decision".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = decision
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_id.clone()),
+            outcome: Some("approved".to_owned()),
+            decided_at: Some("2026-06-05T10:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut graph = Graph::new();
+    graph.push(cand);
+    graph.push(decision);
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    // Trying to run decide on it again must fail
+    let out_path = temp.path().join("out.jsonl");
+    egregore()
+        .args(["decide", &cand_id, "--outcome", "approved", "--graph"])
+        .arg(&graph_path)
+        .arg("--out")
+        .arg(&out_path)
+        .assert()
+        .failure();
+}
+
+#[test]
+fn audit_trail_fails_if_prompt_hop_is_not_promotion_prompt() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph_path = temp.path().join("mismatch_prompt_kind.jsonl");
+
+    let policy_id = user_context_stable_id(&["preference", "my_policy"]);
+    let dec_id = user_context_stable_id(&["decision", "dec_id"]);
+    let prompt_id = user_context_stable_id(&["prompt", "prompt_id"]);
+    let cand_id = user_context_stable_id(&["candidate", "cand_id"]);
+
+    let mut policy = GraphRecord::node(
+        policy_id.clone(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Rule text".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = policy
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            rule_text: Some("Rule text".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            approval_decision_id: Some(dec_id.clone()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut decision = GraphRecord::node(
+        dec_id,
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Approved decision".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = decision
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            outcome: Some("approved".to_owned()),
+            candidate_id: Some(cand_id.clone()),
+            materialized_record_id: Some(policy_id.clone()),
+            prompt_id: Some(prompt_id.clone()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    // Injected prompt node is NOT PromotionPrompt (e.g. Constraint node instead)
+    let mut prompt = GraphRecord::node(
+        prompt_id,
+        NodeKind::Constraint,
+        None,
+        None,
+        None,
+        "Constraint".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = prompt
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_id.clone()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let obs_id = agent_memory_stable_id(&["obs", "my_obs"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Obs text".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *domain = Some("agent_memory".to_owned());
+    }
+
+    let mut candidate = GraphRecord::node(
+        cand_id,
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("Rule text".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            supporting_evidence: Some(vec![EvidenceLink {
+                target_record_id: Some(obs_id.clone()),
+                target_domain: "agent_memory".to_owned(),
+                relation: "PROPOSED_BY".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut graph = Graph::new();
+    graph.push(policy);
+    graph.push(decision);
+    graph.push(prompt);
+    graph.push(candidate);
+    graph.push(obs);
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    egregore()
+        .args(["query", "audit", &policy_id, "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .failure();
+}
+
+#[test]
+fn audit_trail_fails_if_candidate_hop_is_not_promote_candidate() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph_path = temp.path().join("mismatch_cand_kind.jsonl");
+
+    let policy_id = user_context_stable_id(&["preference", "my_policy"]);
+    let dec_id = user_context_stable_id(&["decision", "dec_id"]);
+    let prompt_id = user_context_stable_id(&["prompt", "prompt_id"]);
+    let cand_id = user_context_stable_id(&["candidate", "cand_id"]);
+
+    let mut policy = GraphRecord::node(
+        policy_id.clone(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Rule text".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = policy
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            rule_text: Some("Rule text".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            approval_decision_id: Some(dec_id.clone()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut decision = GraphRecord::node(
+        dec_id,
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Approved decision".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = decision
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            outcome: Some("approved".to_owned()),
+            candidate_id: Some(cand_id.clone()),
+            materialized_record_id: Some(policy_id.clone()),
+            prompt_id: Some(prompt_id.clone()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut prompt = GraphRecord::node(
+        prompt_id,
+        NodeKind::PromotionPrompt,
+        None,
+        None,
+        None,
+        "Prompt".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = prompt
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_id.clone()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let obs_id = agent_memory_stable_id(&["obs", "my_obs"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Obs text".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *domain = Some("agent_memory".to_owned());
+    }
+
+    // Injected candidate is NOT PromoteCandidate (e.g. Preference instead)
+    let mut candidate = GraphRecord::node(
+        cand_id,
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Preference Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("Rule text".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            supporting_evidence: Some(vec![EvidenceLink {
+                target_record_id: Some(obs_id.clone()),
+                target_domain: "agent_memory".to_owned(),
+                relation: "PROPOSED_BY".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut graph = Graph::new();
+    graph.push(policy);
+    graph.push(decision);
+    graph.push(prompt);
+    graph.push(candidate);
+    graph.push(obs);
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    egregore()
+        .args(["query", "audit", &policy_id, "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .failure();
 }
