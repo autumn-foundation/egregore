@@ -1975,7 +1975,14 @@ pub fn latest_decision_for_candidate<'a>(
                 }
                 _ => "",
             };
-            a_time.cmp(b_time)
+            if let (Ok(a_t), Ok(b_t)) = (
+                chrono::DateTime::parse_from_rfc3339(a_time),
+                chrono::DateTime::parse_from_rfc3339(b_time),
+            ) {
+                a_t.cmp(&b_t)
+            } else {
+                a_time.cmp(b_time)
+            }
         })
 }
 

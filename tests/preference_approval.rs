@@ -3741,3 +3741,250 @@ fn audit_trail_fails_if_candidate_hop_is_not_promote_candidate() {
         .assert()
         .failure();
 }
+
+#[test]
+fn test_latest_decision_compares_non_utc_timestamps_correctly() {
+    let cand_id = "my_candidate";
+    let mut dec_1 = GraphRecord::node(
+        "decision_1".to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision 1".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = dec_1
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_id.to_owned()),
+            outcome: Some("rejected".to_owned()),
+            decided_at: Some("2026-06-02T00:30:00+02:00".to_owned()), // June 1, 22:30 UTC
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut dec_2 = GraphRecord::node(
+        "decision_2".to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision 2".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = dec_2
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_id.to_owned()),
+            outcome: Some("approved".to_owned()),
+            decided_at: Some("2026-06-01T23:00:00Z".to_owned()), // June 1, 23:00 UTC (newer)
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![dec_1, dec_2];
+    let latest =
+        aletheia_egregore::query::latest_decision_for_candidate(&records, cand_id).unwrap();
+    assert_eq!(latest.id(), "decision_2");
+}
+
+#[test]
+fn test_decide_collapses_same_id_revocation_targets() {
+    use aletheia_egregore::decide::{DecideRequest, decide_candidate};
+
+    let target_id = user_context_stable_id(&["preference", "target_policy"]);
+    let cand_id = "revocation_candidate";
+
+    // 1. Initial active target policy
+    let mut policy_active = GraphRecord::node(
+        target_id.clone(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Active preference".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = policy_active
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            rule_text: Some("Clean rule text".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    // 2. Later record showing it was already revoked/inactive
+    let mut policy_revoked = GraphRecord::node(
+        target_id.clone(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Revoked preference".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = policy_revoked
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            rule_text: Some("Clean rule text".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            active_to: Some("2026-06-04T12:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    // 3. Candidate node proposing revocation
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("Clean rule text".to_owned()),
+            proposed_rule_kind: Some("revocation".to_owned()),
+            scope: Some(UserContextScope::default()),
+            contradicting_evidence: Some(vec![EvidenceLink {
+                target_record_id: Some(target_id.clone()),
+                target_domain: "user_context".to_owned(),
+                relation: "CONTRADICTS".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![policy_active, policy_revoked, candidate];
+
+    let req = DecideRequest {
+        candidate_id: cand_id.to_owned(),
+        outcome: "approved".to_owned(),
+        decided_by: "agent_1".to_owned(),
+        rationale: Some("Revoking it again".to_owned()),
+        prompt_surface: "cli".to_owned(),
+        prompted_to: "operator".to_owned(),
+        edited_rule_text: None,
+        transaction_time: Some("2026-06-05T12:00:00Z".to_owned()),
+    };
+
+    let result = decide_candidate(&records, &req);
+    assert!(result.is_err());
+    let err_msg = result.err().unwrap().to_string();
+    assert!(err_msg.contains("already inactive/revoked"));
+}
+
+#[test]
+fn test_decide_stamps_redacted_outputs_with_policy_version() {
+    use aletheia_egregore::decide::{DecideRequest, decide_candidate};
+
+    let cand_id = "secret_candidate";
+
+    // 1. Candidate node proposing preference rule with a secret (API Key format)
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate with secret".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some(
+                "Use API Key: sk-12345678901234567890123456789012 for tests".to_owned(),
+            ),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![candidate];
+
+    let req = DecideRequest {
+        candidate_id: cand_id.to_owned(),
+        outcome: "approved".to_owned(),
+        decided_by: "agent_1".to_owned(),
+        rationale: Some("Rationale with secret: sk-00000000000000000000000000000000".to_owned()),
+        prompt_surface: "cli".to_owned(),
+        prompted_to: "operator".to_owned(),
+        edited_rule_text: None,
+        transaction_time: Some("2026-06-05T12:00:00Z".to_owned()),
+    };
+
+    let result = decide_candidate(&records, &req).unwrap();
+
+    let mut preference_checked = false;
+    let mut decision_checked = false;
+
+    for rec in result {
+        if let GraphRecord::Node {
+            kind,
+            redaction_policy_version,
+            ..
+        } = rec
+        {
+            if kind == NodeKind::Preference {
+                assert_eq!(redaction_policy_version, Some("v1".to_owned()));
+                preference_checked = true;
+            } else if kind == NodeKind::PromotionDecision {
+                assert_eq!(redaction_policy_version, Some("v1".to_owned()));
+                decision_checked = true;
+            }
+        }
+    }
+
+    assert!(preference_checked);
+    assert!(decision_checked);
+}

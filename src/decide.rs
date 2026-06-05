@@ -258,6 +258,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         ref mut valid_time,
         ref mut valid_time_source,
         ref mut user_context,
+        ref mut redaction_policy_version,
         ..
     } = prompt_node
     {
@@ -265,10 +266,14 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         *domain = Some("user_context".to_owned());
         *valid_time = Some(valid_time_str.clone());
         *valid_time_source = Some("inferred_from_transaction_time".to_owned());
+        let redacted_prompt_text = redact_value(&prompt_text);
+        if crate::redaction::is_redacted(&redacted_prompt_text) {
+            *redaction_policy_version = Some(crate::redaction::REDACTION_POLICY_VERSION.to_owned());
+        }
         *user_context = UserContextFields {
             candidate_id: Some(req.candidate_id.clone()),
             prompt_surface: Some(req.prompt_surface.clone()),
-            prompt_text: Some(redact_value(&prompt_text)),
+            prompt_text: Some(redacted_prompt_text),
             prompted_at: Some(prompted_at),
             prompted_to: Some(req.prompted_to.clone()),
             ..UserContextFields::empty()
@@ -334,7 +339,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
 
             let mut original_record = records
                 .iter()
-                .find(|r| r.id() == target_durable_id)
+                .rfind(|r| r.id() == target_durable_id)
                 .ok_or_else(|| {
                     anyhow!("Durable record '{}' to revoke not found", target_durable_id)
                 })?
@@ -448,12 +453,14 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                 format!("Materialized durable {:?}", materialized_kind),
             );
 
+            let mut rule_has_redaction = crate::redaction::is_redacted(&redacted_rule_text);
             if let GraphRecord::Node {
                 ref mut schema_version,
                 ref mut domain,
                 ref mut valid_time,
                 ref mut valid_time_source,
                 ref mut user_context,
+                ref mut redaction_policy_version,
                 ..
             } = materialized_node
             {
@@ -475,8 +482,15 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                         durable_fields.rule_text = Some(redacted_rule_text);
                         if materialized_kind == NodeKind::WorkflowRule {
                             durable_fields.triggers = cand_fields.triggers.clone();
-                            durable_fields.action_summary =
+                            let redacted_action =
                                 cand_fields.action_summary.as_ref().map(|s| redact_value(s));
+                            if redacted_action
+                                .as_ref()
+                                .is_some_and(|s| crate::redaction::is_redacted(s))
+                            {
+                                rule_has_redaction = true;
+                            }
+                            durable_fields.action_summary = redacted_action;
                         }
                     }
                     NodeKind::NamingDecision => {
@@ -501,6 +515,10 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                 }
 
                 *user_context = durable_fields;
+                if rule_has_redaction {
+                    *redaction_policy_version =
+                        Some(crate::redaction::REDACTION_POLICY_VERSION.to_owned());
+                }
             }
 
             decision_fields.materialized_record_id = Some(materialized_id);
@@ -511,6 +529,15 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
             generated_records.push(materialized_node);
         }
     }
+
+    let decision_has_redaction = decision_fields
+        .decision_rationale
+        .as_deref()
+        .is_some_and(crate::redaction::is_redacted)
+        || decision_fields
+            .edited_rule_text
+            .as_deref()
+            .is_some_and(crate::redaction::is_redacted);
 
     let mut decision_node = GraphRecord::node(
         decision_id,
@@ -526,6 +553,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         ref mut valid_time,
         ref mut valid_time_source,
         ref mut user_context,
+        ref mut redaction_policy_version,
         ..
     } = decision_node
     {
@@ -534,6 +562,9 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         *valid_time = Some(valid_time_str);
         *valid_time_source = Some("inferred_from_transaction_time".to_owned());
         *user_context = decision_fields;
+        if decision_has_redaction {
+            *redaction_policy_version = Some(crate::redaction::REDACTION_POLICY_VERSION.to_owned());
+        }
     }
 
     generated_records.push(decision_node);
