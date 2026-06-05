@@ -1,8 +1,8 @@
 //! MCP server for Egregore read-only tools — issue #53.
 //!
-//! Implements the Model Context Protocol (JSON-RPC 2.0 over stdio) and exposes
-//! three read-only tools backed by the existing daemon query, symbol-context, and
-//! task-evidence contracts:
+//! Implements the Model Context Protocol using the [`rmcp`] crate and exposes
+//! three read-only tools backed by the existing daemon query, symbol-context,
+//! and task-evidence contracts:
 //!
 //! - **`inspect_store`** — store-inspection summary (record counts, domain breakdown).
 //! - **`symbol_context`** — evidence-backed symbol context, trust-separated by domain.
@@ -13,9 +13,9 @@
 //!
 //! ## Transport
 //!
-//! [`run_stdio`] processes newline-delimited JSON-RPC 2.0 messages from stdin and
-//! writes responses to stdout. One message per line; one response per request.
-//! Notifications (no `id` field) produce no response.
+//! [`run_stdio`] starts the rmcp stdio server and blocks until the client
+//! disconnects. All JSON-RPC 2.0 framing (initialize, ping, tools/list,
+//! tools/call) is handled by rmcp.
 //!
 //! ## Daemon discovery
 //!
@@ -34,10 +34,18 @@
 
 use std::{
     collections::BTreeMap,
-    io::{BufRead, Write as _},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
+use anyhow::Context as _;
+use rmcp::{
+    ServerHandler, ServiceExt,
+    handler::server::wrapper::Parameters,
+    model::{Implementation, ServerCapabilities, ServerInfo},
+    tool, tool_handler, tool_router,
+};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
@@ -48,90 +56,179 @@ use crate::{
     schema_version::{UnknownSchemaVersion, record_version, validate_record_version},
 };
 
-// ── Protocol constants ────────────────────────────────────────────────────────
+// ── Tool parameter types ──────────────────────────────────────────────────────
 
-const PROTOCOL_VERSION: &str = "2024-11-05";
-const SERVER_NAME: &str = "egregore";
+/// Parameters for the `inspect_store` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InspectStoreArgs {
+    /// `AletheiaDB` data directory (default: `.egregore`).
+    pub data_dir: Option<String>,
+}
 
-// ── JSON-RPC error codes ──────────────────────────────────────────────────────
+/// Parameters for the `symbol_context` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SymbolContextArgs {
+    /// Exact symbol name to look up.
+    pub symbol_name: String,
+    /// `AletheiaDB` data directory (default: `.egregore`).
+    pub data_dir: Option<String>,
+}
 
-const PARSE_ERROR: i64 = -32700;
-const METHOD_NOT_FOUND: i64 = -32601;
-const INVALID_PARAMS: i64 = -32602;
+/// Parameters for the `task_evidence` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaskEvidenceArgs {
+    /// Task record ID, `GitHub` URL, `GitHub` short handle, or local JSONL handle.
+    pub id_or_handle: String,
+    /// `AletheiaDB` data directory (default: `.egregore`).
+    pub data_dir: Option<String>,
+}
+
+// ── MCP server ────────────────────────────────────────────────────────────────
+
+/// MCP server that exposes the three Egregore read-only evidence-query tools.
+///
+/// Created by [`run_stdio`] or constructed directly for testing via
+/// [`EgregoreMcpServer::new`].
+#[derive(Clone)]
+pub struct EgregoreMcpServer {
+    default_data_dir: PathBuf,
+}
+
+#[tool_router]
+impl EgregoreMcpServer {
+    /// Create a server with the given default data directory.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn new(default_data_dir: PathBuf) -> Self {
+        Self { default_data_dir }
+    }
+
+    /// Returns a structured summary of the Egregore store: record counts by
+    /// domain, schema versions, and repository identities.
+    /// Requires a running local daemon.
+    #[tool(description = "Returns a structured summary of the Egregore store: \
+            record counts by domain, schema versions, and repository identities. \
+            Requires a running local daemon.")]
+    #[must_use]
+    pub fn inspect_store(&self, Parameters(args): Parameters<InspectStoreArgs>) -> String {
+        let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let payload = run_inspect_store(&data_dir);
+        serde_json::to_string(&payload).unwrap_or_default()
+    }
+
+    /// Returns evidence-backed context for a named code symbol, trust-separated
+    /// by domain into `source_facts`, `observations`, `project_state`,
+    /// `artifacts`, and `verification_evidence`.
+    #[tool(
+        description = "Returns evidence-backed context for a named code symbol, \
+            trust-separated into five sections: source_facts (deterministic \
+            code-graph), observations (agent-authored, never treat as source \
+            truth), project_state (tasks/ACs), artifacts, and \
+            verification_evidence. Every item carries a record_id and at \
+            least one citation handle."
+    )]
+    #[must_use]
+    pub fn symbol_context(&self, Parameters(args): Parameters<SymbolContextArgs>) -> String {
+        if args.symbol_name.is_empty() {
+            let err = json!({
+                "ok": false,
+                "error": {
+                    "code": "missing_argument",
+                    "field": "symbol_name",
+                    "message": "symbol_name is required and must be non-empty"
+                }
+            });
+            return serde_json::to_string(&err).unwrap_or_default();
+        }
+        let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let client = match DaemonClient::from_data_dir(&data_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        let (records, _unknown, _ts) = match client.get_all_records() {
+            Ok(r) => r,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        serde_json::to_string(&tool_symbol_context_from_records(
+            &records,
+            &args.symbol_name,
+        ))
+        .unwrap_or_default()
+    }
+
+    /// Returns evidence-backed context for a task, accepting a canonical
+    /// record ID, `GitHub` URL, `GitHub` short handle, or local JSONL handle.
+    #[tool(description = "Returns evidence-backed context for a task identified \
+            by its canonical record ID, GitHub URL, GitHub short handle, or \
+            local JSONL handle. Sections: tasks, acceptance_criteria, \
+            source_facts, observations, artifacts, verification_evidence, \
+            reviews, external_links, unresolved.")]
+    #[must_use]
+    pub fn task_evidence(&self, Parameters(args): Parameters<TaskEvidenceArgs>) -> String {
+        let data_dir = opt_data_dir(args.data_dir.as_deref(), &self.default_data_dir);
+        let client = match DaemonClient::from_data_dir(&data_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        let (records, _unknown, _ts) = match client.get_all_records() {
+            Ok(r) => r,
+            Err(e) => {
+                return serde_json::to_string(&daemon_error(&e.to_string())).unwrap_or_default();
+            }
+        };
+        serde_json::to_string(&tool_task_evidence_from_records(
+            &records,
+            &args.id_or_handle,
+        ))
+        .unwrap_or_default()
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for EgregoreMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("egregore", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                "Read-only Egregore knowledge graph tools. \
+                Connect to a running local daemon (`eg daemon`) to query the \
+                code-graph, agent observations, and task evidence. \
+                All tools return structured JSON with `ok`, `error`, and \
+                trust-separated data sections.",
+            )
+    }
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Runs the MCP stdio server, processing JSON-RPC 2.0 messages from stdin.
+/// Starts the MCP stdio server using the rmcp transport layer.
 ///
-/// Blocks until stdin is closed. Each non-empty line is treated as one message.
-/// Responses are written to stdout, one JSON object per line.
+/// Blocks until the client disconnects. All MCP JSON-RPC 2.0 framing,
+/// initialize, ping, tools/list, and tools/call routing is handled by rmcp.
 ///
 /// # Errors
 ///
-/// Returns an error if stdin/stdout IO fails.
+/// Returns an error if the tokio runtime cannot be created or if the
+/// transport encounters an unrecoverable IO error.
 pub fn run_stdio(default_data_dir: &Path) -> anyhow::Result<()> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(response) = handle_message(&line, default_data_dir) {
-            let encoded = serde_json::to_string(&response)?;
-            writeln!(stdout, "{encoded}")?;
-            stdout.flush()?;
-        }
-    }
-    Ok(())
-}
-
-/// Processes a single JSON-RPC 2.0 message line.
-///
-/// Returns `Some(response)` for requests that require a reply.
-/// Returns `None` for notifications (no `id` field) and silently-ignored inputs.
-///
-/// This function is `pub` so tests can call it without going through the stdio
-/// transport.
-#[must_use]
-pub fn handle_message(line: &str, data_dir: &Path) -> Option<Value> {
-    let msg: Value = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(_) => {
-            return Some(json!({
-                "jsonrpc": "2.0",
-                "id": Value::Null,
-                "error": { "code": PARSE_ERROR, "message": "Parse error" }
-            }));
-        }
-    };
-
-    // Notifications have no `id` — do not reply.
-    let id = match msg.get("id") {
-        Some(id) => id.clone(),
-        None => return None,
-    };
-
-    let method = msg["method"].as_str().unwrap_or("");
-    let params = msg.get("params").cloned().unwrap_or(Value::Null);
-
-    let (result_key, result_val) = match method {
-        "initialize" => ("result", initialize_result()),
-        "tools/list" => ("result", tools_list_result()),
-        "tools/call" => match dispatch_tool_call(&params, data_dir) {
-            Ok(v) => ("result", v),
-            Err(err) => ("error", err),
-        },
-        // ping is a standard MCP utility — must reply with an empty result.
-        "ping" => ("result", json!({})),
-        _ => (
-            "error",
-            json!({ "code": METHOD_NOT_FOUND, "message": format!("Method not found: {method}") }),
-        ),
-    };
-
-    Some(json!({ "jsonrpc": "2.0", "id": id, result_key: result_val }))
+    let server = EgregoreMcpServer::new(default_data_dir.to_path_buf());
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    rt.block_on(async move {
+        server
+            .serve(rmcp::transport::stdio())
+            .await
+            .context("MCP transport error")?
+            .waiting()
+            .await
+            .map(|_| ())
+            .context("MCP server error")
+    })
 }
 
 /// Builds a structured store-inspection summary from a record slice.
@@ -228,7 +325,6 @@ pub fn tool_inspect_store_from_records(
         }
     }
 
-    // Serialize domain_counts as a JSON object keyed by category string.
     let mut domain_counts_val = serde_json::Map::new();
     for (category, counts) in &domain_counts {
         let mut cat_map = serde_json::Map::new();
@@ -327,6 +423,7 @@ pub fn tool_symbol_context_from_records(records: &[GraphRecord], symbol_name: &s
 /// - `ambiguous_handle` — the handle matched more than one task
 /// - `unsupported_handle` — the handle format is unrecognized
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &str) -> Value {
     let resolved_ids = match query::resolve_task_ids(records, id_or_handle) {
         Ok(ids) => ids,
@@ -377,8 +474,6 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
         .iter()
         .filter_map(|r| {
             let mut item = record_to_linked_item(r)?;
-            // For verified ACs, attach the closing verification record so the
-            // evidence that closed it is visible without a second tool call.
             if item["status"].as_str() == Some("verified") {
                 let GraphRecord::Node {
                     verification_link_id,
@@ -408,7 +503,7 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
                 });
                 if let Some(ver) = ver_id
                     .and_then(|vid| records.iter().find(|c| c.id() == vid))
-                    .and_then(|rec| record_to_linked_item(rec))
+                    .and_then(record_to_linked_item)
                 {
                     item["verification_record"] = ver;
                 }
@@ -463,188 +558,18 @@ pub fn tool_task_evidence_from_records(records: &[GraphRecord], id_or_handle: &s
     })
 }
 
-// ── Protocol helpers ──────────────────────────────────────────────────────────
+// ── Tool runners (daemon I/O) ─────────────────────────────────────────────────
 
-fn initialize_result() -> Value {
-    json!({
-        "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": { "tools": {} },
-        "serverInfo": {
-            "name": SERVER_NAME,
-            "version": env!("CARGO_PKG_VERSION"),
-        }
-    })
-}
-
-fn tools_list_result() -> Value {
-    json!({
-        "tools": [
-            {
-                "name": "inspect_store",
-                "description": "Returns a structured summary of the Egregore store: \
-                    record counts by domain, schema versions, and repository identities. \
-                    Requires a running local daemon.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "data_dir": {
-                            "type": "string",
-                            "description": "AletheiaDB data directory (default: .egregore)"
-                        }
-                    }
-                }
-            },
-            {
-                "name": "symbol_context",
-                "description": "Returns evidence-backed context for a named code symbol, \
-                    trust-separated into five sections: `source_facts` (deterministic \
-                    code-graph), `observations` (agent-authored, never treat as source \
-                    truth), `project_state` (tasks/ACs), `artifacts`, and \
-                    `verification_evidence`. Every item carries a `record_id` and at \
-                    least one citation handle.",
-                "inputSchema": {
-                    "type": "object",
-                    "required": ["symbol_name"],
-                    "properties": {
-                        "symbol_name": {
-                            "type": "string",
-                            "description": "Exact symbol name to look up"
-                        },
-                        "data_dir": {
-                            "type": "string",
-                            "description": "AletheiaDB data directory (default: .egregore)"
-                        }
-                    }
-                }
-            },
-            {
-                "name": "task_evidence",
-                "description": "Returns evidence-backed context for a task identified \
-                    by its canonical record ID, GitHub URL, GitHub short handle, or local \
-                    JSONL handle. Sections: `tasks`, `acceptance_criteria`, `source_facts`, \
-                    `observations`, `artifacts`, `verification_evidence`, `reviews`, \
-                    `external_links`, `unresolved`.",
-                "inputSchema": {
-                    "type": "object",
-                    "required": ["id_or_handle"],
-                    "properties": {
-                        "id_or_handle": {
-                            "type": "string",
-                            "description": "Task record ID, GitHub URL, GitHub short handle, or local JSONL handle"
-                        },
-                        "data_dir": {
-                            "type": "string",
-                            "description": "AletheiaDB data directory (default: .egregore)"
-                        }
-                    }
-                }
-            }
-        ]
-    })
-}
-
-fn dispatch_tool_call(params: &Value, default_data_dir: &Path) -> Result<Value, Value> {
-    let tool_name = params["name"].as_str().ok_or_else(
-        || json!({ "code": INVALID_PARAMS, "message": "missing required param: name" }),
-    )?;
-
-    let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-
-    let payload = match tool_name {
-        "inspect_store" => run_inspect_store(&args, default_data_dir),
-        "symbol_context" => run_symbol_context(&args, default_data_dir),
-        "task_evidence" => run_task_evidence(&args, default_data_dir),
-        // Unknown tool: return a JSON-RPC protocol error, not a tool-level error.
-        other => {
-            return Err(json!({
-                "code": INVALID_PARAMS,
-                "message": format!(
-                    "Tool '{other}' is not registered. \
-                     Available: inspect_store, symbol_context, task_evidence."
-                )
-            }));
-        }
-    };
-
-    Ok(wrap_tool_result(&payload))
-}
-
-// ── Tool runners ──────────────────────────────────────────────────────────────
-
-fn run_inspect_store(args: &Value, default_data_dir: &Path) -> Value {
-    let data_dir = resolve_data_dir(args, default_data_dir);
-
-    let client = match DaemonClient::from_data_dir(&data_dir) {
+fn run_inspect_store(data_dir: &Path) -> Value {
+    let client = match DaemonClient::from_data_dir(data_dir) {
         Ok(c) => c,
         Err(e) => return daemon_error(&e.to_string()),
     };
-
     let (records, unknown_versions, snapshot_timestamp) = match client.get_all_records() {
         Ok(r) => r,
         Err(e) => return daemon_error(&e.to_string()),
     };
-
     tool_inspect_store_from_records(&records, &unknown_versions, &snapshot_timestamp)
-}
-
-fn run_symbol_context(args: &Value, default_data_dir: &Path) -> Value {
-    let symbol_name = match args["symbol_name"].as_str() {
-        Some(s) if !s.is_empty() => s.to_owned(),
-        _ => {
-            return json!({
-                "ok": false,
-                "error": {
-                    "code": "missing_argument",
-                    "field": "symbol_name",
-                    "message": "symbol_name is required"
-                }
-            });
-        }
-    };
-
-    let data_dir = resolve_data_dir(args, default_data_dir);
-
-    let client = match DaemonClient::from_data_dir(&data_dir) {
-        Ok(c) => c,
-        Err(e) => return daemon_error(&e.to_string()),
-    };
-
-    let (records, _unknown, _ts) = match client.get_all_records() {
-        Ok(r) => r,
-        Err(e) => return daemon_error(&e.to_string()),
-    };
-
-    tool_symbol_context_from_records(&records, &symbol_name)
-}
-
-fn run_task_evidence(args: &Value, default_data_dir: &Path) -> Value {
-    let id_or_handle = match args["id_or_handle"].as_str() {
-        Some(s) if !s.is_empty() => s.to_owned(),
-        _ => {
-            return json!({
-                "ok": false,
-                "error": {
-                    "code": "missing_argument",
-                    "field": "id_or_handle",
-                    "message": "id_or_handle is required"
-                }
-            });
-        }
-    };
-
-    let data_dir = resolve_data_dir(args, default_data_dir);
-
-    let client = match DaemonClient::from_data_dir(&data_dir) {
-        Ok(c) => c,
-        Err(e) => return daemon_error(&e.to_string()),
-    };
-
-    let (records, _unknown, _ts) = match client.get_all_records() {
-        Ok(r) => r,
-        Err(e) => return daemon_error(&e.to_string()),
-    };
-
-    tool_task_evidence_from_records(&records, &id_or_handle)
 }
 
 // ── Record → JSON helpers ─────────────────────────────────────────────────────
@@ -702,7 +627,6 @@ fn record_to_observation(record: &GraphRecord) -> Option<Value> {
         (Some(a), None) => Some(a.to_owned()),
         _ => None,
     };
-    // Serialize evidence_links, redacting raw token fields
     let links: Vec<Value> = evidence_links
         .as_deref()
         .unwrap_or(&[])
@@ -732,12 +656,12 @@ fn record_to_observation(record: &GraphRecord) -> Option<Value> {
     }))
 }
 
-/// Returns only citation metadata from an OutputHandle, stripping any inlined payload.
+/// Returns only citation metadata from an `OutputHandle`, stripping any inlined payload.
 fn output_handle_citation(h: &crate::ir::OutputHandle) -> Value {
     json!({ "hash": h.hash, "bytes": h.bytes })
 }
 
-/// Returns only citation metadata from a PatchHandle, stripping any inlined bytes.
+/// Returns only citation metadata from a `PatchHandle`, stripping any inlined bytes.
 fn patch_handle_citation(h: &crate::ir::PatchHandle) -> Value {
     json!({ "path": h.path })
 }
@@ -779,8 +703,6 @@ fn record_to_linked_item(record: &GraphRecord) -> Option<Value> {
     else {
         return None;
     };
-    // Redact validation_summary per AC6 (may contain raw patch output)
-    // Keep only a hash/handle reference when populated.
     let redacted_validation = validation_summary
         .as_deref()
         .map(|s| if s.is_empty() { s } else { "<summarized>" });
@@ -879,21 +801,10 @@ fn daemon_error(msg: &str) -> Value {
     })
 }
 
-fn wrap_tool_result(payload: &Value) -> Value {
-    let is_error = payload.get("ok").and_then(Value::as_bool) == Some(false);
-    let text = serde_json::to_string(payload).unwrap_or_default();
-    json!({
-        "content": [{ "type": "text", "text": text }],
-        "isError": is_error,
-    })
-}
+// ── Argument helpers ──────────────────────────────────────────────────────────
 
-// ── Argument helpers ─────────────────────────────────────────────────────────
-
-fn resolve_data_dir(args: &Value, default: &Path) -> std::path::PathBuf {
-    args["data_dir"]
-        .as_str()
-        .map_or_else(|| default.to_path_buf(), std::path::PathBuf::from)
+fn opt_data_dir(data_dir: Option<&str>, default: &Path) -> PathBuf {
+    data_dir.map_or_else(|| default.to_path_buf(), PathBuf::from)
 }
 
 // ── Domain category mapping (matches the existing CLI inspect output) ─────────
