@@ -203,6 +203,21 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                     "Approved naming_decision candidate must carry a non-empty canonical_name"
                 ));
             }
+            if req.outcome == "approved" {
+                let prop_text = cand_fields
+                    .proposed_rule_text
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim();
+                let canon_name = cand_fields.canonical_name.as_deref().unwrap_or("").trim();
+                if prop_text != canon_name {
+                    return Err(anyhow!(
+                        "Approved naming_decision candidate proposed_rule_text ('{}') must match canonical_name ('{}')",
+                        prop_text,
+                        canon_name
+                    ));
+                }
+            }
         }
 
         if proposed_rule_kind == "constraint" {
@@ -451,14 +466,9 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                         .entity_kind
                         .as_deref()
                         .unwrap_or("other");
-                    let canonical_name = if req.outcome == "edited_then_approved" {
-                        &redacted_rule_text
-                    } else {
-                        updated_cand_fields.canonical_name.as_deref().unwrap_or("")
-                    };
                     blake3_hash_parts(&[
                         entity_kind,
-                        canonical_name,
+                        &redacted_rule_text,
                         &canonical_scope(&scope),
                         &decision_id,
                     ])
@@ -536,14 +546,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                     }
                     NodeKind::NamingDecision => {
                         durable_fields.entity_kind = updated_cand_fields.entity_kind.clone();
-                        let canonical = if req.outcome == "edited_then_approved" {
-                            redacted_rule_text
-                        } else {
-                            updated_cand_fields
-                                .canonical_name
-                                .clone()
-                                .unwrap_or_default()
-                        };
+                        let canonical = redacted_rule_text;
                         if crate::redaction::is_redacted(&canonical) {
                             rule_has_redaction = true;
                         }

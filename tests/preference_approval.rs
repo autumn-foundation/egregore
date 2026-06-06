@@ -4660,3 +4660,110 @@ fn test_decide_naming_hash_uses_redacted_edited_name() {
         panic!("naming_node is not a node");
     }
 }
+
+#[test]
+fn test_decide_naming_decision_plain_approved_requires_matching_fields() {
+    use aletheia_egregore::decide::{DecideRequest, decide_candidate};
+
+    let cand_id = "cand_naming_mismatch";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("MismatchText".to_owned()),
+            proposed_rule_kind: Some("naming_decision".to_owned()),
+            entity_kind: Some("function".to_owned()),
+            canonical_name: Some("OtherName".to_owned()), // MISMATCH
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![candidate];
+    let req = DecideRequest {
+        candidate_id: cand_id.to_owned(),
+        outcome: "approved".to_owned(),
+        edited_rule_text: None,
+        rationale: None,
+        decided_by: "operator".to_owned(),
+        prompt_surface: "cli".to_owned(),
+        prompted_to: "operator".to_owned(),
+        transaction_time: Some("2026-06-05T12:00:00.000Z".to_owned()),
+    };
+
+    let result = decide_candidate(&records, &req);
+    assert!(result.is_err());
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("must match canonical_name")
+    );
+}
+
+#[test]
+fn test_decide_cmd_fails_for_invalid_candidate() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph_path = temp.path().join("invalid_candidate.jsonl");
+    let store_path = temp.path().join("store");
+
+    // Create a candidate with NO supporting observations
+    let cand_id = user_context_stable_id(&["candidate", "invalid_cand"]);
+    let mut cand = GraphRecord::node(
+        cand_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Invalid candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut valid_time,
+        ref mut valid_time_source,
+        ..
+    } = cand
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-06-01T12:00:00Z".to_owned());
+        *valid_time_source = Some("inferred_from_transaction_time".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            supporting_evidence: Some(vec![]), // Empty! Less than 5.
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut graph = Graph::new();
+    graph.push(cand);
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    // Call egregore decide, writing to store_path. It should fail candidate validation.
+    egregore()
+        .args(["decide", &cand_id, "--outcome", "approved", "--graph"])
+        .arg(&graph_path)
+        .arg("--data-dir")
+        .arg(&store_path)
+        .assert()
+        .failure();
+}

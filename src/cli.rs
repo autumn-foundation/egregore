@@ -3629,7 +3629,7 @@ fn decide_cmd(
     if let Some(dir) = data_dir {
         #[cfg(feature = "embedded-aletheiadb")]
         {
-            let mut sink = EmbeddedAletheiaSink::open_unleased(&dir)
+            let mut sink = EmbeddedAletheiaSink::open(&dir)
                 .with_context(|| format!("failed to open embedded store {}", dir.display()))?;
             let edges = crate::decide::synthesize_user_context_edges(&records, &generated);
 
@@ -3639,6 +3639,9 @@ fn decide_cmd(
                 seen_ids.insert(g.id().to_owned());
             }
             if let Some(cand) = records.iter().find(|r| r.id() == req.candidate_id) {
+                crate::daemon::validate_promote_candidate_for_cli(cand, &records, &sink)
+                    .context("Candidate validation failed")?;
+
                 if seen_ids.insert(cand.id().to_owned()) {
                     source_records_to_persist.push(cand.clone());
                 }
@@ -3650,6 +3653,20 @@ fn decide_cmd(
                                 && let Some(evidence_rec) =
                                     records.iter().find(|r| r.id() == *ref_id)
                             {
+                                if let GraphRecord::Node {
+                                    kind,
+                                    evidence_links,
+                                    ..
+                                } = evidence_rec
+                                    && *kind == NodeKind::Observation
+                                    && evidence_links
+                                        .as_deref()
+                                        .is_none_or(<[EvidenceLink]>::is_empty)
+                                {
+                                    anyhow::bail!(
+                                        "Observation '{ref_id}' must have at least one evidence link"
+                                    );
+                                }
                                 source_records_to_persist.push(evidence_rec.clone());
                             }
                         }
@@ -3666,6 +3683,16 @@ fn decide_cmd(
                         }
                     }
                 }
+            }
+
+            for rec in &source_records_to_persist {
+                crate::redaction::validate_record(rec).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Redaction check failed for source record '{}': {}",
+                        rec.id(),
+                        e
+                    )
+                })?;
             }
 
             let mut all_records = generated;

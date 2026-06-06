@@ -3702,6 +3702,51 @@ fn validate_promote_candidate(
     Ok(edges)
 }
 
+pub(crate) fn validate_promote_candidate_for_cli(
+    candidate: &GraphRecord,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> Result<()> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        schema_version,
+        domain,
+        confidence,
+        superseded_by,
+        evidence_quality,
+        valid_time,
+        valid_time_source,
+        user_context,
+        ..
+    } = candidate
+    else {
+        return Err(anyhow!("Candidate is not a node record"));
+    };
+    validate_user_context_node_base(
+        id,
+        *kind,
+        *schema_version,
+        domain.as_deref(),
+        valid_time.as_deref(),
+        valid_time_source.as_deref(),
+    )
+    .map_err(|e| anyhow!("validation failed: {}", e.message))?;
+
+    validate_promote_candidate(
+        id,
+        confidence.as_deref(),
+        superseded_by.as_deref(),
+        evidence_quality.as_deref(),
+        user_context,
+        records,
+        sink,
+    )
+    .map_err(|e| anyhow!("validation failed: {}", e.message))?;
+
+    Ok(())
+}
+
 fn require_scope(scope: Option<&UserContextScope>, field: &'static str) -> WriteResult<()> {
     let scope = scope.ok_or_else(|| ApiError::missing_field(field))?;
     if let Some(lifecycle_phase) = scope.lifecycle_phase.as_deref() {
