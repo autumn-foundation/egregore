@@ -130,7 +130,7 @@ pub struct SearchHit {
     pub span: Option<SourceSpan>,
 }
 
-#[cfg(feature = "embedded-aletheiadb")]
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
 impl From<&crate::adapters::SemanticMatch> for SearchHit {
     fn from(m: &crate::adapters::SemanticMatch) -> Self {
         Self {
@@ -206,9 +206,13 @@ pub fn hit_matches_expected(hit: &SearchHit, expected: &[ExpectedTarget]) -> boo
         if !path_matches {
             return false;
         }
-        exp.symbol_name
-            .as_deref()
-            .is_none_or(|sym| hit.name.as_deref() == Some(sym))
+        exp.symbol_name.as_deref().is_none_or(|sym| {
+            hit.name.as_deref() == Some(sym)
+                || hit
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| n.ends_with(&format!("::{sym}")))
+        })
     })
 }
 

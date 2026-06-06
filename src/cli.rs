@@ -2386,7 +2386,7 @@ fn eval_semantic_cmd(
             .embedding;
 
         let matches = sink
-            .semantic_search(&query_vector, top_k)
+            .semantic_search(&query_vector, top_k.max(3))
             .with_context(|| {
                 format!(
                     "semantic search failed for query {} — was the store ingested with --embed?",

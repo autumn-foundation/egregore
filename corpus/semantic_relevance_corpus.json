@@ -439,9 +439,19 @@
     {
       "id": "q028",
       "text": "which module manages HTTP request routing and response handling",
-      "class": "ambiguous",
-      "expected": [],
-      "rg_substitute": null
+      "class": "architecture",
+      "expected": [
+        {
+          "repo_relative_path": "src/daemon.rs",
+          "symbol_name": null,
+          "note": "daemon.rs implements the loopback HTTP server: handle_request routes incoming requests and HttpResponse constructs the reply"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "handle_request",
+        "note": "rg 'handle_request' finds the routing function; 'HTTP request routing and response handling' cannot be answered by rg without knowing the function name",
+        "rg_can_answer_semantic_intent": false
+      }
     },
     {
       "id": "q029",
