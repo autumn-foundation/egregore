@@ -3729,9 +3729,39 @@ fn decide_cmd(
                         }
                     }
                 }
+
+                // Trace and copy superseded rejection lineage recursively
+                let mut queue = vec![req.candidate_id.clone()];
+                while let Some(cid) = queue.pop() {
+                    if let Some(GraphRecord::Node { superseded_by: Some(rej_id), .. }) = records.iter().find(|r| r.id() == cid)
+                        && seen_ids.insert(rej_id.clone())
+                    {
+                        if let Some(rej_cand) = records.iter().find(|r| r.id() == *rej_id) {
+                            source_records_to_persist.push(rej_cand.clone());
+                            queue.push(rej_id.clone());
+                        }
+                        // Find any rejection decisions targeting this superseded candidate
+                        for r in &records {
+                            if let GraphRecord::Node {
+                                kind: NodeKind::PromotionDecision,
+                                user_context,
+                                ..
+                            } = r
+                                && user_context.candidate_id.as_deref() == Some(rej_id)
+                                && user_context.outcome.as_deref() == Some("rejected")
+                                && seen_ids.insert(r.id().to_owned())
+                            {
+                                source_records_to_persist.push(r.clone());
+                            }
+                        }
+                    }
+                }
             }
 
             for rec in &source_records_to_persist {
+                crate::daemon::validate_agent_memory_record_for_cli(rec, &records, &sink)
+                    .context("Copied evidence record validation failed")?;
+
                 crate::redaction::validate_record(rec).map_err(|e| {
                     anyhow::anyhow!(
                         "Redaction check failed for source record '{}': {}",

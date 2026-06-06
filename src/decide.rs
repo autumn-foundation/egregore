@@ -468,6 +468,15 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                 ));
             }
 
+            // Verify that the revocation target has a valid approval chain back to observations:
+            crate::query::audit_trail(records, &target_durable_id).map_err(|e| {
+                anyhow!(
+                    "Revocation target '{}' has no valid approval chain: {}",
+                    target_durable_id,
+                    e
+                )
+            })?;
+
             if let GraphRecord::Node {
                 ref mut user_context,
                 ..

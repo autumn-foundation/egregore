@@ -3747,6 +3747,130 @@ pub(crate) fn validate_promote_candidate_for_cli(
     Ok(edges)
 }
 
+/// Validates an agent-memory record copied during CLI decision workflow
+/// against daemon-level agent memory node/edge validation rules.
+///
+/// # Errors
+///
+/// Returns an error if validation fails.
+#[allow(clippy::too_many_lines)]
+pub fn validate_agent_memory_record_for_cli(
+    record: &GraphRecord,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> Result<()> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        schema_version,
+        evidence_links,
+        name,
+        confidence,
+        text,
+        agent_id,
+        agent_kind,
+        session_id,
+        observed_at,
+        ingested_at,
+        ..
+    } = record
+    else {
+        return Ok(());
+    };
+
+    if id.starts_with("agent_memory:v1:") {
+        if !AGENT_MEMORY_NODE_KINDS.contains(kind) {
+            anyhow::bail!(
+                "node kind '{}' is not permitted under the agent_memory:v1: namespace; use codegraph: IDs for code-graph nodes",
+                kind.as_str()
+            );
+        }
+        if *schema_version != AGENT_MEMORY_SCHEMA_VERSION {
+            anyhow::bail!(
+                "agent-memory node '{id}' has schema_version {schema_version} but only version {AGENT_MEMORY_SCHEMA_VERSION} is accepted"
+            );
+        }
+        let links = evidence_links.as_deref().unwrap_or(&[]);
+        if *kind == NodeKind::Observation && links.is_empty() {
+            anyhow::bail!("evidence_links (Observation requires at least one evidence link)");
+        }
+        let session_fields_required = *kind != NodeKind::Agent;
+        let required: &[(&str, bool)] = &[
+            ("agent_id", agent_id.as_ref().is_some_and(|s| !s.is_empty())),
+            (
+                "agent_kind",
+                agent_kind.as_ref().is_some_and(|s| !s.is_empty()),
+            ),
+            (
+                "session_id",
+                !session_fields_required || session_id.as_ref().is_some_and(|s| !s.is_empty()),
+            ),
+            (
+                "observed_at",
+                !session_fields_required || observed_at.as_ref().is_some_and(|s| !s.is_empty()),
+            ),
+            (
+                "ingested_at",
+                !session_fields_required || ingested_at.as_ref().is_some_and(|s| !s.is_empty()),
+            ),
+        ];
+        for (field, present) in required {
+            if !*present {
+                anyhow::bail!(
+                    "{} (required for agent-memory {} nodes)",
+                    field,
+                    kind.as_str()
+                );
+            }
+        }
+        if let Some(ak) = agent_kind.as_deref().filter(|s| !s.is_empty())
+            && !VALID_AGENT_KINDS.contains(&ak)
+        {
+            anyhow::bail!(
+                "agent_kind '{ak}' is not a recognized value; expected one of: {}",
+                VALID_AGENT_KINDS.join(", ")
+            );
+        }
+        for (ts_field, ts_val) in [
+            ("observed_at", observed_at.as_deref()),
+            ("ingested_at", ingested_at.as_deref()),
+        ] {
+            if let Some(ts) = ts_val.filter(|s| !s.is_empty())
+                && DateTime::parse_from_rfc3339(ts).is_err()
+            {
+                anyhow::bail!("{ts_field} '{ts}' is not a valid RFC 3339 timestamp");
+            }
+        }
+        if *kind == NodeKind::Observation && confidence.as_ref().is_none_or(String::is_empty) {
+            anyhow::bail!("confidence (required for Observation nodes)");
+        }
+        if matches!(kind, NodeKind::ToolCall | NodeKind::FileEdit)
+            && confidence.as_ref().is_some_and(|s| !s.is_empty())
+        {
+            anyhow::bail!("{} nodes must not carry confidence", kind.as_str());
+        }
+        if let Some(conf_str) = confidence.as_deref().filter(|s| !s.is_empty()) {
+            let conf_val: f64 = conf_str.parse().map_err(|_| {
+                anyhow::anyhow!("confidence '{conf_str}' must be a numeric float string")
+            })?;
+            if !(0.0..=1.0).contains(&conf_val) {
+                anyhow::bail!("confidence '{conf_str}' must be in the range [0.0, 1.0]");
+            }
+        }
+        if *kind == NodeKind::Observation && text.as_ref().is_none_or(String::is_empty) {
+            anyhow::bail!("text (required for Observation nodes)");
+        }
+        if matches!(kind, NodeKind::Agent | NodeKind::AgentSession)
+            && name.as_ref().is_none_or(String::is_empty)
+        {
+            anyhow::bail!("name (required for {} nodes)", kind.as_str());
+        }
+        validate_agent_action_record(record, records, sink)
+            .map_err(|e| anyhow!("validation failed: {}", e.message))?;
+    }
+    Ok(())
+}
+
 fn require_scope(scope: Option<&UserContextScope>, field: &'static str) -> WriteResult<()> {
     let scope = scope.ok_or_else(|| ApiError::missing_field(field))?;
     if let Some(lifecycle_phase) = scope.lifecycle_phase.as_deref() {

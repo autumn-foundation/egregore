@@ -2383,6 +2383,40 @@ pub fn audit_trail<'a>(
             decision_id, mat_id, durable_id
         ));
     }
+    let decided_at = decision_fields.decided_at.as_deref();
+    let active_from = user_context.active_from.as_deref();
+
+    if decided_at.is_some() || active_from.is_some() {
+        let decided_at_str = decided_at.ok_or_else(|| {
+            format!(
+                "Decision '{}' lacks decided_at, but durable record has active_from",
+                decision_id
+            )
+        })?;
+        let active_from_str = active_from.ok_or_else(|| {
+            format!(
+                "Durable record '{}' lacks active_from, but decision has decided_at",
+                durable_id
+            )
+        })?;
+
+        let decided_at_parsed = chrono::DateTime::parse_from_rfc3339(decided_at_str)
+            .map_err(|e| format!("Decision '{}' has invalid decided_at: {}", decision_id, e))?;
+        let active_from_parsed =
+            chrono::DateTime::parse_from_rfc3339(active_from_str).map_err(|e| {
+                format!(
+                    "Durable record '{}' has invalid active_from: {}",
+                    durable_id, e
+                )
+            })?;
+
+        if decided_at_parsed != active_from_parsed {
+            return Err(format!(
+                "Durable record '{}' active_from '{}' does not match decision '{}' decided_at '{}'",
+                durable_id, active_from_str, decision_id, decided_at_str
+            ));
+        }
+    }
     let prompt_id = decision_fields
         .prompt_id
         .as_deref()

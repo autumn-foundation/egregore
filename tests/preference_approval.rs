@@ -2,7 +2,8 @@
     missing_docs,
     clippy::too_many_lines,
     clippy::redundant_clone,
-    clippy::unnecessary_unwrap
+    clippy::unnecessary_unwrap,
+    clippy::similar_names
 )]
 
 use std::{fs, path::PathBuf};
@@ -1922,6 +1923,7 @@ fn query_policy_broad_scope_match_includes_specific_records() {
             rule_text: Some("Broad scope rule text".to_owned()),
             proposed_rule_kind: Some("preference".to_owned()),
             approval_decision_id: Some(dec_id.clone()),
+            active_from: Some("2026-06-01T12:00:00Z".to_owned()),
             scope: Some(UserContextScope {
                 repo: Some("egregore".to_owned()),
                 language: Some("rust".to_owned()),
@@ -5195,4 +5197,519 @@ fn test_active_policy_requires_valid_approval_chain() {
     let records = vec![policy, decision];
     let active = active_policy(&records, None);
     assert!(active.is_empty());
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn test_copied_evidence_record_validation() {
+    use aletheia_egregore::daemon::validate_agent_memory_record_for_cli;
+
+    let obs_id = "agent_memory:v1:obs-invalid".to_owned();
+    let mut observation = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation node".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut agent_id,
+        ref mut agent_kind,
+        ref mut session_id,
+        ref mut observed_at,
+        ref mut ingested_at,
+        ..
+    } = observation
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *domain = Some("agent_memory".to_owned());
+        *agent_id = Some("agent_1".to_owned());
+        *agent_kind = Some("claude-code".to_owned());
+        *session_id = Some("session_1".to_owned());
+        *observed_at = Some("2026-06-01T12:00:00Z".to_owned());
+        *ingested_at = Some("2026-06-01T12:00:00Z".to_owned());
+    }
+
+    let records = vec![observation.clone()];
+    let temp = tempfile::tempdir().unwrap();
+    let sink = aletheia_egregore::adapters::EmbeddedAletheiaSink::open(temp.path()).unwrap();
+
+    let result = validate_agent_memory_record_for_cli(&observation, &records, &sink);
+    assert!(result.is_err());
+    let err_msg = result.err().unwrap().to_string();
+    assert!(
+        err_msg.contains("confidence")
+            || err_msg.contains("text")
+            || err_msg.contains("evidence_links")
+    );
+}
+
+#[test]
+fn test_decide_revocation_requires_approved_policy() {
+    use aletheia_egregore::decide::{DecideRequest, decide_candidate};
+
+    let target_id = "target_policy_unapproved";
+    let target = GraphRecord::node(
+        target_id.to_owned(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Unapproved preference".to_owned(),
+    );
+
+    let cand_id = "cand_revoke_unapproved";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Revocation candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("revocation".to_owned()),
+            scope: Some(UserContextScope::default()),
+            contradicting_evidence: Some(vec![EvidenceLink {
+                target_record_id: Some(target_id.to_owned()),
+                target_domain: "user_context".to_owned(),
+                relation: "REVOKES".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![target, candidate];
+    let req = DecideRequest {
+        candidate_id: cand_id.to_owned(),
+        outcome: "approved".to_owned(),
+        edited_rule_text: None,
+        rationale: None,
+        decided_by: "operator".to_owned(),
+        prompt_surface: "cli".to_owned(),
+        prompted_to: "operator".to_owned(),
+        transaction_time: Some("2026-06-05T12:00:00.000Z".to_owned()),
+    };
+
+    let result = decide_candidate(&records, &req);
+    assert!(result.is_err());
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("has no valid approval chain")
+    );
+}
+
+#[test]
+fn test_audit_trail_validates_active_from_match() {
+    use aletheia_egregore::query::audit_trail;
+
+    let policy_id = "pref_mismatched_active_from";
+    let mut policy = GraphRecord::node(
+        policy_id.to_owned(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Preference node".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut user_context,
+        ..
+    } = policy
+    {
+        *user_context = UserContextFields {
+            rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            approval_decision_id: Some("decision_mismatch".to_owned()),
+            active_from: Some("2026-06-01T12:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut decision = GraphRecord::node(
+        "decision_mismatch".to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision node".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut user_context,
+        ..
+    } = decision
+    {
+        *user_context = UserContextFields {
+            outcome: Some("approved".to_owned()),
+            materialized_record_id: Some(policy_id.to_owned()),
+            decided_at: Some("2026-06-01T12:05:00Z".to_owned()),
+            prompt_id: Some("prompt_mismatch".to_owned()),
+            candidate_id: Some("cand_mismatch".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut prompt = GraphRecord::node(
+        "prompt_mismatch".to_owned(),
+        NodeKind::PromotionPrompt,
+        None,
+        None,
+        None,
+        "Prompt node".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut user_context,
+        ..
+    } = prompt
+    {
+        *user_context = UserContextFields {
+            candidate_id: Some("cand_mismatch".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut candidate = GraphRecord::node(
+        "cand_mismatch".to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate node".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            supporting_evidence: Some(vec![EvidenceLink {
+                target_record_id: Some("obs_mismatch".to_owned()),
+                target_domain: "agent_memory".to_owned(),
+                relation: "PROPOSED_BY".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut obs = GraphRecord::node(
+        "obs_mismatch".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation node".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *domain = Some("agent_memory".to_owned());
+    }
+
+    let records = vec![policy, decision, prompt, candidate, obs];
+    let result = audit_trail(&records, policy_id);
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("does not match decision"));
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn test_decide_copies_superseded_rejection_lineage() {
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("lineage.jsonl");
+    let db_path = temp.path().join("store");
+
+    let cand_a_id = user_context_stable_id(&["candidate", "cand_a"]);
+    let cand_b_id = user_context_stable_id(&["candidate", "cand_b"]);
+
+    let mut cand_a = GraphRecord::node(
+        cand_a_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate A".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut confidence,
+        ref mut evidence_quality,
+        ref mut valid_time,
+        ref mut valid_time_source,
+        ..
+    } = cand_a
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
+        *valid_time = Some("2026-06-01T12:00:00Z".to_owned());
+        *valid_time_source = Some("inferred_from_transaction_time".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("RuleText A".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            supporting_evidence: Some(vec![EvidenceLink {
+                target_record_id: Some("agent_memory:v1:obs-1".to_owned()),
+                target_domain: "agent_memory".to_owned(),
+                relation: "PROPOSED_BY".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]),
+            contradicting_evidence: Some(vec![]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let dec_a_id = user_context_stable_id(&["decision", "dec_a"]);
+    let mut dec_a = GraphRecord::node(
+        dec_a_id.clone(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision A".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = dec_a
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            outcome: Some("rejected".to_owned()),
+            candidate_id: Some(cand_a_id.clone()),
+            decided_at: Some("2026-06-01T12:00:00Z".to_owned()),
+            decided_by: Some("operator".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut cand_b = GraphRecord::node(
+        cand_b_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate B".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut superseded_by,
+        ref mut user_context,
+        ref mut valid_time,
+        ref mut valid_time_source,
+        ref mut confidence,
+        ref mut evidence_quality,
+        ..
+    } = cand_b
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *superseded_by = Some(cand_a_id.clone());
+        *valid_time = Some("2026-07-05T12:00:00Z".to_owned());
+        *valid_time_source = Some("inferred_from_transaction_time".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("RuleText B".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            supporting_evidence: Some(vec![
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-1".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-2".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-3".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-4".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-5".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-6".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+            ]),
+            contradicting_evidence: Some(vec![]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut observations = Vec::new();
+    for i in 1..=6 {
+        let obs_id = format!("agent_memory:v1:obs-{i}");
+        let mut o = GraphRecord::node(
+            obs_id.clone(),
+            NodeKind::Observation,
+            None,
+            None,
+            None,
+            format!("Observation node {i}").to_owned(),
+        );
+        if let GraphRecord::Node {
+            ref mut schema_version,
+            ref mut domain,
+            ref mut text,
+            ref mut confidence,
+            ref mut agent_id,
+            ref mut agent_kind,
+            ref mut session_id,
+            ref mut observed_at,
+            ref mut ingested_at,
+            ref mut evidence_links,
+            ..
+        } = o
+        {
+            *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+            *domain = Some("agent_memory".to_owned());
+            *text = Some(format!("Observed pattern {i}").to_owned());
+            *confidence = Some("1.0".to_owned());
+            *agent_id = Some("agent_1".to_owned());
+            *agent_kind = Some("claude-code".to_owned());
+            *session_id = Some(if i <= 3 {
+                "session_1".to_owned()
+            } else {
+                "session_2".to_owned()
+            });
+            *observed_at = Some("2026-06-01T12:00:00Z".to_owned());
+            *ingested_at = Some("2026-06-01T12:00:00Z".to_owned());
+            *evidence_links = Some(vec![EvidenceLink {
+                target_record_id: Some("codegraph:v1:rust:symbol:1".to_owned()),
+                target_domain: "codegraph".to_owned(),
+                relation: "OBSERVES".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]);
+        }
+        observations.push(o);
+    }
+
+    let mut graph = Graph::new();
+    graph.push(cand_a);
+    graph.push(dec_a);
+    graph.push(cand_b);
+    for o in observations {
+        graph.push(o);
+    }
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    egregore()
+        .args([
+            "decide",
+            &cand_b_id,
+            "--outcome",
+            "approved",
+            "--graph",
+            graph_path.to_str().unwrap(),
+            "--data-dir",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let sink = aletheia_egregore::adapters::EmbeddedAletheiaSink::open(&db_path).unwrap();
+    let records = sink.read_all_records().unwrap();
+
+    assert!(records.iter().any(|r| r.id() == cand_a_id));
+    assert!(records.iter().any(|r| r.id() == cand_b_id));
+    assert!(records.iter().any(|r| r.id() == dec_a_id));
+    for i in 1..=6 {
+        assert!(
+            records
+                .iter()
+                .any(|r| r.id() == format!("agent_memory:v1:obs-{i}"))
+        );
+    }
 }
