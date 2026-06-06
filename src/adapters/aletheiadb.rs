@@ -32,6 +32,7 @@ const SEMANTIC_INITIAL_CANDIDATE_MULTIPLIER: usize = 8;
 const SEMANTIC_MAX_CANDIDATE_MULTIPLIER: usize = 64;
 
 /// A single result from a semantic similarity search.
+#[cfg(feature = "embeddings")]
 #[derive(Debug, Clone)]
 pub struct SemanticMatch {
     /// Stable codegraph record ID.
@@ -1669,6 +1670,7 @@ impl EmbeddedAletheiaSink {
         Ok(())
     }
 
+    #[cfg(feature = "embeddings")]
     fn node_id_for_observation(
         &self,
         record_id: &str,
@@ -3073,6 +3075,7 @@ fn insert_optional(
     }
 }
 
+#[cfg(feature = "embeddings")]
 fn span_from_properties<'a, F>(get: F) -> Option<SourceSpan>
 where
     F: Fn(&str) -> Option<&'a ::aletheiadb::PropertyValue>,
