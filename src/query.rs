@@ -2571,6 +2571,8 @@ pub fn audit_trail<'a>(
         .as_deref()
         .ok_or_else(|| format!("Candidate '{}' lacks supporting_evidence", candidate_id))?;
 
+    let mut unique_supporting_targets = std::collections::BTreeSet::new();
+    let mut sessions = std::collections::BTreeSet::new();
     let mut obs_nodes = Vec::new();
     for link in supporting {
         if link.target_domain != "agent_memory" {
@@ -2597,8 +2599,10 @@ pub fn audit_trail<'a>(
                 obs_id, candidate_id
             )
         })?;
-        match obs {
-            GraphRecord::Node { kind, .. } => {
+        let session_id = match obs {
+            GraphRecord::Node {
+                kind, session_id, ..
+            } => {
                 if !matches!(
                     kind,
                     NodeKind::Observation | NodeKind::AgentTurn | NodeKind::Decision
@@ -2608,12 +2612,35 @@ pub fn audit_trail<'a>(
                         obs_id, kind
                     ));
                 }
+                session_id.as_deref()
             }
             _ => {
                 return Err(format!("Supporting evidence '{}' is not a node", obs_id));
             }
+        };
+        if unique_supporting_targets.insert(obs_id.to_owned()) {
+            if let Some(sess) = session_id
+                && !sess.is_empty()
+            {
+                sessions.insert(sess.to_owned());
+            }
+            obs_nodes.push(obs);
         }
-        obs_nodes.push(obs);
+    }
+
+    if unique_supporting_targets.len() < 3 {
+        return Err(format!(
+            "Candidate '{}' has {} unique supporting observations; at least 3 are required",
+            candidate_id,
+            unique_supporting_targets.len()
+        ));
+    }
+    if sessions.len() < 2 {
+        return Err(format!(
+            "Candidate '{}' has evidence from {} distinct sessions; at least 2 are required",
+            candidate_id,
+            sessions.len()
+        ));
     }
 
     obs_nodes.sort_by_key(|o| o.id());

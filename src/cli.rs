@@ -3720,11 +3720,25 @@ fn decide_cmd(
                     if let Some(evidence) = &user_context.contradicting_evidence {
                         for link in evidence {
                             if let Some(ref_id) = &link.target_record_id
-                                && seen_ids.insert(ref_id.clone())
                                 && let Some(evidence_rec) =
                                     records.iter().find(|r| r.id() == *ref_id)
                             {
-                                source_records_to_persist.push(evidence_rec.clone());
+                                // If this is a revocation candidate, also recursively trace and persist
+                                // the revoked target policy's complete approval chain.
+                                if user_context.proposed_rule_kind.as_deref() == Some("revocation")
+                                    && let Ok(target_chain) =
+                                        crate::query::audit_trail(&records, ref_id)
+                                {
+                                    for chain_rec in target_chain {
+                                        if seen_ids.insert(chain_rec.id().to_owned()) {
+                                            source_records_to_persist.push(chain_rec.clone());
+                                        }
+                                    }
+                                }
+
+                                if seen_ids.insert(ref_id.clone()) {
+                                    source_records_to_persist.push(evidence_rec.clone());
+                                }
                             }
                         }
                     }
@@ -3733,7 +3747,10 @@ fn decide_cmd(
                 // Trace and copy superseded rejection lineage recursively
                 let mut queue = vec![req.candidate_id.clone()];
                 while let Some(cid) = queue.pop() {
-                    if let Some(GraphRecord::Node { superseded_by: Some(rej_id), .. }) = records.iter().find(|r| r.id() == cid)
+                    if let Some(GraphRecord::Node {
+                        superseded_by: Some(rej_id),
+                        ..
+                    }) = records.iter().find(|r| r.id() == cid)
                         && seen_ids.insert(rej_id.clone())
                     {
                         if let Some(rej_cand) = records.iter().find(|r| r.id() == *rej_id) {

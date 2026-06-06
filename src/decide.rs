@@ -101,18 +101,18 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         ));
     }
 
-    // Reject new decisions after terminal outcomes
-    if let Some(GraphRecord::Node {
-        user_context:
-            UserContextFields {
-                outcome: Some(outcome),
-                ..
-            },
-        ..
-    }) = crate::query::latest_decision_for_candidate(records, &req.candidate_id)
-    {
-        let terminal_outcomes = ["approved", "edited_then_approved", "rejected", "expired"];
-        if terminal_outcomes.contains(&outcome.as_str()) {
+    // Reject new decisions if any prior decision has a terminal outcome
+    let terminal_outcomes = ["approved", "edited_then_approved", "rejected", "expired"];
+    for rec in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::PromotionDecision,
+            user_context,
+            ..
+        } = rec
+            && user_context.candidate_id.as_deref() == Some(req.candidate_id.as_str())
+            && let Some(outcome) = &user_context.outcome
+            && terminal_outcomes.contains(&outcome.as_str())
+        {
             return Err(anyhow!(
                 "Cannot decide candidate '{}' because it already has a terminal decision outcome: '{}'",
                 req.candidate_id,
