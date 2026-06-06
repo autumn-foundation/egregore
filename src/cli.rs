@@ -223,6 +223,26 @@ enum Commands {
         #[command(subcommand)]
         kind: WriteKind,
     },
+    /// Run the semantic code search relevance evaluation against a corpus file.
+    ///
+    /// Requires a pre-built embedded store (`eg ingest --adapter embedded`).
+    /// Exits 0 if top-3 recall meets the threshold, 1 with a diagnostic if missed.
+    EvalSemantic {
+        /// Path to the semantic relevance corpus JSON file.
+        corpus: PathBuf,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Number of top results to retrieve per query.
+        #[arg(long, default_value = "3")]
+        top_k: usize,
+        /// Minimum top-3 recall fraction required to pass (0.0–1.0, default 0.80).
+        #[arg(long, default_value = "0.8", value_parser = parse_threshold)]
+        threshold: f64,
+        /// Minimum cosine score for an ambiguous-query result to count as a false positive (0.0–1.0, default 0.50).
+        #[arg(long, default_value = "0.5", value_parser = parse_threshold)]
+        fp_threshold: f64,
+    },
     /// Manage the local Egregore daemon.
     #[cfg(feature = "embedded-aletheiadb")]
     Daemon {
@@ -715,6 +735,7 @@ pub fn run() -> Result<()> {
     run_cli(Cli::parse())
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Scan {
@@ -802,6 +823,21 @@ fn run_cli(cli: Cli) -> Result<()> {
         } => link_evidence_cmd(&code_graph, &evidence, &out),
         Commands::Query { subcommand } => query_cmd(subcommand),
         Commands::Write { kind } => write_evidence(kind),
+        Commands::EvalSemantic {
+            corpus,
+            data_dir,
+            top_k,
+            threshold,
+            fp_threshold,
+        } => {
+            #[cfg(feature = "embeddings")]
+            return eval_semantic_cmd(&corpus, &data_dir, top_k, threshold, fp_threshold);
+            #[cfg(not(feature = "embeddings"))]
+            {
+                let _ = (corpus, data_dir, top_k, threshold, fp_threshold);
+                anyhow::bail!("eval-semantic requires the 'embeddings' feature")
+            }
+        }
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Daemon { action } => daemon(action),
         #[cfg(feature = "embedded-aletheiadb")]
@@ -2294,6 +2330,99 @@ fn query_semantic(query: &str, data_dir: &Path, limit: usize, format: OutputForm
     for m in matches {
         print_result(&SemanticResult::from(&m), format)?;
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// eval-semantic command
+// ---------------------------------------------------------------------------
+
+/// Runs the semantic relevance corpus evaluation against an embedded store.
+///
+/// Reads each query from the corpus, embeds it with the default model, runs
+/// semantic search, computes aggregate metrics, and prints the report.
+fn parse_threshold(s: &str) -> std::result::Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid number"))?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("threshold must be between 0.0 and 1.0, got {v}"))
+    }
+}
+
+/// Exits 1 with a diagnostic if the top-3 recall threshold is missed.
+#[cfg(feature = "embeddings")]
+#[allow(clippy::too_many_lines)]
+fn eval_semantic_cmd(
+    corpus_path: &Path,
+    data_dir: &Path,
+    top_k: usize,
+    threshold: f64,
+    fp_threshold: f64,
+) -> Result<()> {
+    use crate::embeddings::{
+        DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_NAME, aletheia_embeddings,
+    };
+    use crate::semantic_eval::{
+        SearchHit, SemanticRelevanceCorpus, build_report, evaluate_query, format_diagnostic,
+        print_report,
+    };
+
+    validate_existing_embedded_store(data_dir)?;
+
+    let corpus = SemanticRelevanceCorpus::from_json_file(corpus_path)?;
+
+    let embedder = aletheia_embeddings::EmbedderBuilder::new()
+        .model_architecture(DEFAULT_EMBEDDING_MODEL_ARCHITECTURE)
+        .model_id(Some(DEFAULT_EMBEDDING_MODEL_NAME))
+        .from_pretrained_hf()
+        .context("failed to load embedding model")?;
+
+    let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+        .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+
+    let mut results = Vec::new();
+    for query in &corpus.queries {
+        let embed_data = rt
+            .block_on(aletheia_embeddings::embed_query(
+                &[query.text.as_str()],
+                &embedder,
+                None,
+            ))
+            .with_context(|| format!("failed to embed query {}", query.id))?;
+
+        let query_vector = aletheia_embeddings::embed_data_to_dense_iter(embed_data, Some(1))
+            .next()
+            .with_context(|| format!("no embedding returned for query {}", query.id))?
+            .with_context(|| format!("embedding result not dense for query {}", query.id))?
+            .embedding;
+
+        let matches = sink
+            .semantic_search(&query_vector, top_k.max(3))
+            .with_context(|| {
+                format!(
+                    "semantic search failed for query {} — was the store ingested with --embed?",
+                    query.id
+                )
+            })?;
+
+        let hits: Vec<SearchHit> = matches.iter().map(SearchHit::from).collect();
+        #[allow(clippy::cast_possible_truncation)]
+        results.push(evaluate_query(query, &hits, fp_threshold as f32));
+    }
+
+    let report = build_report(results, threshold);
+    print_report(&report, std::io::stdout())?;
+
+    if !report.passed {
+        eprintln!("{}", format_diagnostic(&report));
+        process::exit(1);
+    }
+
     Ok(())
 }
 

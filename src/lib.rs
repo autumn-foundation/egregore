@@ -53,6 +53,8 @@ pub mod redaction;
 pub mod repair;
 /// Record schema-version compatibility checks.
 pub mod schema_version;
+/// Semantic search relevance evaluation harness (issue #58).
+pub mod semantic_eval;
 /// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
 pub mod traj;
 
