@@ -1406,6 +1406,8 @@ fn inspect(
     data_dir: Option<&Path>,
     format: OutputFormat,
 ) -> Result<()> {
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    let _ = data_dir;
     #[cfg(feature = "embedded-aletheiadb")]
     if daemon {
         let default_path = PathBuf::from(".egregore");
@@ -3580,6 +3582,7 @@ fn decide_cmd(
     #[cfg(feature = "embedded-aletheiadb")]
     let mut sink_opt = None;
 
+    #[allow(unused_mut)]
     let mut records = if let Some(path) = &graph {
         load_records_from_jsonl(path)?
     } else if let Some(dir) = &data_dir {
@@ -3626,10 +3629,10 @@ fn decide_cmd(
 
             if !db_records.is_empty() {
                 let mut map = std::collections::HashMap::new();
-                for r in records {
+                for r in db_records {
                     map.insert(r.id().to_owned(), r);
                 }
-                for r in db_records {
+                for r in records {
                     map.insert(r.id().to_owned(), r);
                 }
                 records = map.into_values().collect();

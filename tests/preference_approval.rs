@@ -1932,6 +1932,76 @@ fn query_policy_broad_scope_match_includes_specific_records() {
         };
     }
 
+    let cand_id = user_context_stable_id(&["candidate", "cand_broad"]);
+    let prompt_id = user_context_stable_id(&["prompt", "prompt_broad"]);
+
+    let mut candidate = GraphRecord::node(
+        cand_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate node".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("Broad scope rule text".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope {
+                repo: Some("egregore".to_owned()),
+                language: Some("rust".to_owned()),
+                path_glob: Some("src/**/*.rs".to_owned()),
+                lifecycle_phase: None,
+            }),
+            supporting_evidence: Some(vec![EvidenceLink {
+                target_record_id: Some("agent_memory:v1:obs-broad".to_owned()),
+                target_domain: "agent_memory".to_owned(),
+                relation: "PROPOSED_BY".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut prompt = GraphRecord::node(
+        prompt_id.clone(),
+        NodeKind::PromotionPrompt,
+        None,
+        None,
+        None,
+        "Prompt node".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = prompt
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_id.clone()),
+            prompt_surface: Some("cli".to_owned()),
+            prompted_to: Some("operator".to_owned()),
+            prompt_text: Some("prompt".to_owned()),
+            prompted_at: Some("2026-06-01T12:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
     let mut decision = GraphRecord::node(
         dec_id,
         NodeKind::PromotionDecision,
@@ -1952,13 +2022,38 @@ fn query_policy_broad_scope_match_includes_specific_records() {
         *user_context = UserContextFields {
             outcome: Some("approved".to_owned()),
             materialized_record_id: Some(pref_id.clone()),
+            prompt_id: Some(prompt_id),
+            candidate_id: Some(cand_id),
+            decided_at: Some("2026-06-01T12:00:00Z".to_owned()),
+            decided_by: Some("operator".to_owned()),
             ..UserContextFields::empty()
         };
+    }
+
+    let mut observation = GraphRecord::node(
+        "agent_memory:v1:obs-broad".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation node".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ..
+    } = observation
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *domain = Some("agent_memory".to_owned());
     }
 
     let mut graph = Graph::new();
     graph.push(pref);
     graph.push(decision);
+    graph.push(prompt);
+    graph.push(candidate);
+    graph.push(observation);
     fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
 
     // Query with broad filter --repo egregore, omitting language and path
@@ -4907,4 +5002,197 @@ fn test_decide_redacts_candidate_action_summary() {
     } else {
         panic!("Not a node");
     }
+}
+
+#[test]
+fn test_decide_revocation_rejects_if_any_copy_revoked() {
+    use aletheia_egregore::decide::{DecideRequest, decide_candidate};
+
+    let target_id = "target_policy_revocation_copies";
+    let active_copy = GraphRecord::node(
+        target_id.to_owned(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Active preference".to_owned(),
+    );
+    let mut revoked_copy = GraphRecord::node(
+        target_id.to_owned(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Revoked preference".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut user_context,
+        ..
+    } = revoked_copy
+    {
+        user_context.active_to = Some("2026-06-01T12:00:00Z".to_owned());
+    }
+
+    let cand_id = "cand_revoke_copies";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Revocation candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("revocation".to_owned()),
+            scope: Some(UserContextScope::default()),
+            contradicting_evidence: Some(vec![EvidenceLink {
+                target_record_id: Some(target_id.to_owned()),
+                target_domain: "user_context".to_owned(),
+                relation: "REVOKES".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![revoked_copy, active_copy, candidate];
+    let req = DecideRequest {
+        candidate_id: cand_id.to_owned(),
+        outcome: "approved".to_owned(),
+        edited_rule_text: None,
+        rationale: None,
+        decided_by: "operator".to_owned(),
+        prompt_surface: "cli".to_owned(),
+        prompted_to: "operator".to_owned(),
+        transaction_time: Some("2026-06-05T12:00:00.000Z".to_owned()),
+    };
+
+    let result = decide_candidate(&records, &req);
+    assert!(result.is_err());
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("is already inactive/revoked")
+    );
+}
+
+#[test]
+fn test_decide_fails_for_empty_proposed_rule_body() {
+    use aletheia_egregore::decide::{DecideRequest, decide_candidate};
+
+    let cand_id = "cand_empty_proposed_body";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate with empty proposed body".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some(" \t\n ".to_owned()), // Whitespace only
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![candidate];
+    let req = DecideRequest {
+        candidate_id: cand_id.to_owned(),
+        outcome: "approved".to_owned(),
+        edited_rule_text: None,
+        rationale: None,
+        decided_by: "operator".to_owned(),
+        prompt_surface: "cli".to_owned(),
+        prompted_to: "operator".to_owned(),
+        transaction_time: Some("2026-06-05T12:00:00.000Z".to_owned()),
+    };
+
+    let result = decide_candidate(&records, &req);
+    assert!(result.is_err());
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("cannot be empty or whitespace-only")
+    );
+}
+
+#[test]
+fn test_active_policy_requires_valid_approval_chain() {
+    use aletheia_egregore::query::active_policy;
+
+    let policy_id = "preference_invalid_chain";
+    let mut policy = GraphRecord::node(
+        policy_id.to_owned(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Preference node".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut user_context,
+        ..
+    } = policy
+    {
+        *user_context = UserContextFields {
+            rule_text: Some("PreferenceText".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            approval_decision_id: Some("decision_invalid".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut decision = GraphRecord::node(
+        "decision_invalid".to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision node".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut user_context,
+        ..
+    } = decision
+    {
+        *user_context = UserContextFields {
+            outcome: Some("rejected".to_owned()),
+            materialized_record_id: Some(policy_id.to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![policy, decision];
+    let active = active_policy(&records, None);
+    assert!(active.is_empty());
 }

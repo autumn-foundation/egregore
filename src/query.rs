@@ -2233,27 +2233,6 @@ pub fn active_policy<'a>(
     records: &'a [GraphRecord],
     query_scope: Option<&UserContextScope>,
 ) -> Vec<&'a GraphRecord> {
-    let approved_decisions: std::collections::BTreeMap<&str, &str> = records
-        .iter()
-        .filter_map(|r| {
-            if let GraphRecord::Node {
-                kind: NodeKind::PromotionDecision,
-                user_context,
-                ..
-            } = r
-            {
-                if let Some(outcome) = &user_context.outcome {
-                    if (outcome == "approved" || outcome == "edited_then_approved")
-                        && let Some(mat_id) = &user_context.materialized_record_id
-                    {
-                        return Some((r.id(), mat_id.as_str()));
-                    }
-                }
-            }
-            None
-        })
-        .collect();
-
     let revoked_ids: std::collections::BTreeSet<&str> = records
         .iter()
         .filter_map(|r| {
@@ -2295,15 +2274,7 @@ pub fn active_policy<'a>(
                 if user_context.active_to.is_some() {
                     continue;
                 }
-                if let Some(decision_id) = &user_context.approval_decision_id {
-                    if let Some(&mat_id) = approved_decisions.get(decision_id.as_str()) {
-                        if mat_id != rec.id() {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
-                } else {
+                if audit_trail(records, rec.id()).is_err() {
                     continue;
                 }
                 if let Some(q_scope) = query_scope {
@@ -2549,11 +2520,11 @@ pub fn audit_trail<'a>(
                     ));
                 }
             } else {
-                let cand_name = candidate_fields.canonical_name.as_deref().unwrap_or("");
+                let cand_name = candidate_fields.proposed_rule_text.as_deref().unwrap_or("");
                 let redacted_cand_name = redact_value(cand_name);
                 if durable_name != redacted_cand_name {
                     return Err(format!(
-                        "Durable record canonical_name '{}' does not match candidate canonical_name '{}' (redacted: '{}')",
+                        "Durable record canonical_name '{}' does not match candidate proposed_rule_text '{}' (redacted: '{}')",
                         durable_name, cand_name, redacted_cand_name
                     ));
                 }

@@ -365,10 +365,16 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         let rule_text = if req.outcome == "edited_then_approved" {
             req.edited_rule_text.clone().unwrap()
         } else {
-            updated_cand_fields
+            let text = updated_cand_fields
                 .proposed_rule_text
                 .clone()
-                .ok_or_else(|| anyhow!("Candidate proposed_rule_text is missing"))?
+                .ok_or_else(|| anyhow!("Candidate proposed_rule_text is missing"))?;
+            if text.trim().is_empty() {
+                return Err(anyhow!(
+                    "Candidate proposed_rule_text cannot be empty or whitespace-only"
+                ));
+            }
+            text
         };
 
         let redacted_rule_text = redact_value(&rule_text);
@@ -402,11 +408,46 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                     anyhow!("Revocation candidate does not specify target record to revoke")
                 })?;
 
-            let mut original_record = records
+            let target_copies: Vec<&GraphRecord> = records
                 .iter()
-                .rfind(|r| r.id() == target_durable_id)
+                .filter(|r| r.id() == target_durable_id)
+                .collect();
+            if target_copies.is_empty() {
+                return Err(anyhow!(
+                    "Durable record '{}' to revoke not found",
+                    target_durable_id
+                ));
+            }
+
+            let already_revoked = target_copies.iter().any(|r| {
+                if let GraphRecord::Node { user_context, .. } = r {
+                    user_context.active_to.is_some()
+                } else {
+                    false
+                }
+            });
+            if already_revoked {
+                return Err(anyhow!(
+                    "Revocation target '{}' is already inactive/revoked",
+                    target_durable_id
+                ));
+            }
+
+            let mut original_record = target_copies
+                .iter()
+                .copied()
+                .find(|r| {
+                    if let GraphRecord::Node { user_context, .. } = r {
+                        user_context.active_to.is_none()
+                    } else {
+                        false
+                    }
+                })
                 .ok_or_else(|| {
-                    anyhow!("Durable record '{}' to revoke not found", target_durable_id)
+                    anyhow!(
+                        "No active copy of durable record '{}' found to revoke",
+                        target_durable_id
+                    )
                 })?
                 .clone();
 
@@ -423,17 +464,6 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
             if !is_policy_kind {
                 return Err(anyhow!(
                     "Revocation target '{}' is not a durable policy record",
-                    target_durable_id
-                ));
-            }
-
-            let is_active = match &original_record {
-                GraphRecord::Node { user_context, .. } => user_context.active_to.is_none(),
-                _ => false,
-            };
-            if !is_active {
-                return Err(anyhow!(
-                    "Revocation target '{}' is already inactive/revoked",
                     target_durable_id
                 ));
             }
