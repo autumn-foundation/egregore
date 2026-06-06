@@ -375,7 +375,7 @@ fn evaluate_query_records_first_hit_rank() {
         make_hit("src/query.rs", None, 0.8),        // not a hit
         make_hit("src/adapters/mod.rs", None, 0.7), // hit at rank 3
     ];
-    let eval = evaluate_query(&query, &results);
+    let eval = evaluate_query(&query, &results, 0.5);
     assert!(!eval.top1_hit, "not a top-1 hit");
     assert!(eval.top3_hit, "is a top-3 hit");
     assert!(
@@ -396,7 +396,8 @@ fn evaluate_query_ambiguous_never_counts_as_hit() {
     };
     // Even if a result happens to match something, ambiguous queries don't count as hits
     let results = vec![make_hit("src/lib.rs", None, 0.9)];
-    let eval = evaluate_query(&query, &results);
+    // threshold 0.5: score 0.9 exceeds it, so this is a false positive
+    let eval = evaluate_query(&query, &results, 0.5);
     assert!(!eval.top1_hit, "ambiguous queries never count as top-1 hit");
     assert!(!eval.top3_hit, "ambiguous queries never count as top-3 hit");
     assert!(

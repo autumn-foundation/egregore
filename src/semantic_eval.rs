@@ -218,10 +218,17 @@ pub fn hit_matches_expected(hit: &SearchHit, expected: &[ExpectedTarget]) -> boo
 
 /// Evaluates one query's top-k results against its reviewed expected targets.
 ///
-/// Ambiguous queries are never counted as hits; if they return any result,
-/// the result is flagged as a false positive.
+/// Ambiguous queries are never counted as hits. An ambiguous query is a false
+/// positive only when at least one returned result exceeds `fp_score_threshold`
+/// — this prevents HNSW from making the count saturate at `ambiguous_count`
+/// when every query unconditionally returns `top_k` candidates regardless of
+/// similarity.
 #[must_use]
-pub fn evaluate_query(query: &CorpusQuery, results: &[SearchHit]) -> QueryEvalResult {
+pub fn evaluate_query(
+    query: &CorpusQuery,
+    results: &[SearchHit],
+    fp_score_threshold: f32,
+) -> QueryEvalResult {
     let is_ambiguous = query.class == QueryClass::Ambiguous;
 
     let (top1_hit, top3_hit, reciprocal_rank) = if is_ambiguous {
@@ -247,7 +254,7 @@ pub fn evaluate_query(query: &CorpusQuery, results: &[SearchHit]) -> QueryEvalRe
         (top1, top3, rr)
     };
 
-    let is_false_positive = is_ambiguous && !results.is_empty();
+    let is_false_positive = is_ambiguous && results.iter().any(|h| h.score >= fp_score_threshold);
 
     QueryEvalResult {
         query_id: query.id.clone(),

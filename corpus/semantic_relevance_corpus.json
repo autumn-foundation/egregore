@@ -147,6 +147,11 @@
           "repo_relative_path": "src/ir.rs",
           "symbol_name": null,
           "note": "ir.rs defines the GraphRecord intermediate representation produced by parsing; 'structured representation' and 'symbol extraction' are synonyms for what IR means"
+        },
+        {
+          "repo_relative_path": "src/languages/rust.rs",
+          "symbol_name": null,
+          "note": "rust.rs is where tree-sitter dispatches to extract_function and extract_named_symbol — the actual source-tree parsing and symbol extraction logic"
         }
       ],
       "rg_substitute": {
@@ -418,9 +423,24 @@
     {
       "id": "q025",
       "text": "which file handles network authentication and authorization for remote services",
-      "class": "ambiguous",
-      "expected": [],
-      "rg_substitute": null
+      "class": "architecture",
+      "expected": [
+        {
+          "repo_relative_path": "src/github/auth.rs",
+          "symbol_name": null,
+          "note": "auth.rs resolves GitHub tokens from env vars, token files, and gh CLI — the closed auth enumeration for remote service access"
+        },
+        {
+          "repo_relative_path": "src/github/client.rs",
+          "symbol_name": null,
+          "note": "client.rs conditionally attaches Authorization: Bearer headers to outbound GitHub REST requests"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "resolve_token",
+        "note": "rg 'resolve_token' finds the auth entry point; 'network authentication for remote services' cannot be answered by rg without knowing the function name",
+        "rg_can_answer_semantic_intent": false
+      }
     },
     {
       "id": "q026",
@@ -463,6 +483,30 @@
     {
       "id": "q030",
       "text": "how does concurrent write coordination prevent data races across threads",
+      "class": "architecture",
+      "expected": [
+        {
+          "repo_relative_path": "src/daemon.rs",
+          "symbol_name": null,
+          "note": "daemon.rs coordinates concurrent writes via an exclusive StoreLease, Arc<RwLock<EmbeddedAletheiaSink>>, and a bounded mpsc::sync_channel write queue"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "StoreLease",
+        "note": "rg 'StoreLease' finds the lease type; 'concurrent write coordination' cannot be answered by rg without knowing the synchronization mechanism",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q031",
+      "text": "how does the application manage plugin and extension lifecycle registration",
+      "class": "ambiguous",
+      "expected": [],
+      "rg_substitute": null
+    },
+    {
+      "id": "q032",
+      "text": "which module implements the web frontend rendering and client-side routing",
       "class": "ambiguous",
       "expected": [],
       "rg_substitute": null

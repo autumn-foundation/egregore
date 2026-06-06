@@ -236,9 +236,12 @@ enum Commands {
         /// Number of top results to retrieve per query.
         #[arg(long, default_value = "3")]
         top_k: usize,
-        /// Minimum top-3 recall fraction required to pass (default 0.80).
-        #[arg(long, default_value = "0.8")]
+        /// Minimum top-3 recall fraction required to pass (0.0–1.0, default 0.80).
+        #[arg(long, default_value = "0.8", value_parser = parse_threshold)]
         threshold: f64,
+        /// Minimum cosine score for an ambiguous-query result to count as a false positive (0.0–1.0, default 0.50).
+        #[arg(long, default_value = "0.5", value_parser = parse_threshold)]
+        fp_threshold: f64,
     },
     /// Manage the local Egregore daemon.
     #[cfg(feature = "embedded-aletheiadb")]
@@ -825,12 +828,13 @@ fn run_cli(cli: Cli) -> Result<()> {
             data_dir,
             top_k,
             threshold,
+            fp_threshold,
         } => {
             #[cfg(feature = "embeddings")]
-            return eval_semantic_cmd(&corpus, &data_dir, top_k, threshold);
+            return eval_semantic_cmd(&corpus, &data_dir, top_k, threshold, fp_threshold);
             #[cfg(not(feature = "embeddings"))]
             {
-                let _ = (corpus, data_dir, top_k, threshold);
+                let _ = (corpus, data_dir, top_k, threshold, fp_threshold);
                 anyhow::bail!("eval-semantic requires the 'embeddings' feature")
             }
         }
@@ -2337,6 +2341,17 @@ fn query_semantic(query: &str, data_dir: &Path, limit: usize, format: OutputForm
 ///
 /// Reads each query from the corpus, embeds it with the default model, runs
 /// semantic search, computes aggregate metrics, and prints the report.
+fn parse_threshold(s: &str) -> std::result::Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid number"))?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("threshold must be between 0.0 and 1.0, got {v}"))
+    }
+}
+
 /// Exits 1 with a diagnostic if the top-3 recall threshold is missed.
 #[cfg(feature = "embeddings")]
 #[allow(clippy::too_many_lines)]
@@ -2345,6 +2360,7 @@ fn eval_semantic_cmd(
     data_dir: &Path,
     top_k: usize,
     threshold: f64,
+    fp_threshold: f64,
 ) -> Result<()> {
     use crate::embeddings::{
         DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_NAME, aletheia_embeddings,
@@ -2395,7 +2411,8 @@ fn eval_semantic_cmd(
             })?;
 
         let hits: Vec<SearchHit> = matches.iter().map(SearchHit::from).collect();
-        results.push(evaluate_query(query, &hits));
+        #[allow(clippy::cast_possible_truncation)]
+        results.push(evaluate_query(query, &hits, fp_threshold as f32));
     }
 
     let report = build_report(results, threshold);
