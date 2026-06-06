@@ -4058,7 +4058,9 @@ fn test_decide_stamps_naming_edited_with_redaction() {
 
 #[test]
 fn test_decide_synthesizes_edges_for_embedded_write() {
-    use aletheia_egregore::decide::{DecideRequest, decide_candidate, synthesize_user_context_edges};
+    use aletheia_egregore::decide::{
+        DecideRequest, decide_candidate, synthesize_user_context_edges,
+    };
 
     let cand_id = "edge_candidate";
 
@@ -4109,7 +4111,13 @@ fn test_decide_synthesizes_edges_for_embedded_write() {
     let mut materialized_as = false;
 
     for edge in edges {
-        if let GraphRecord::Edge { label, source, target, .. } = edge {
+        if let GraphRecord::Edge {
+            label,
+            source,
+            target,
+            ..
+        } = edge
+        {
             match label {
                 aletheia_egregore::ir::EdgeLabel::PromptedFor => {
                     assert_eq!(target, cand_id);
@@ -4120,7 +4128,10 @@ fn test_decide_synthesizes_edges_for_embedded_write() {
                     decided_on = true;
                 }
                 aletheia_egregore::ir::EdgeLabel::MaterializedAs => {
-                    assert_eq!(source, "user_context:v1:c089f862e6fab45ed12e38ae62308ded4ad27f8e1b1daf3943f3b0c727be0a82");
+                    assert_eq!(
+                        source,
+                        "user_context:v1:c089f862e6fab45ed12e38ae62308ded4ad27f8e1b1daf3943f3b0c727be0a82"
+                    );
                     materialized_as = true;
                 }
                 _ => {}
@@ -4244,32 +4255,408 @@ fn test_decide_rejects_non_agent_evidence_in_audit() {
         *domain = Some("user_context".to_owned());
         *user_context = UserContextFields {
             approval_decision_id: Some(decision_id.to_owned()),
+            rule_text: Some("MyRule".to_owned()),
             ..UserContextFields::empty()
         };
     }
 
-    let records = vec![candidate.clone(), prompt.clone(), decision.clone(), preference.clone()];
+    let records = vec![
+        candidate.clone(),
+        prompt.clone(),
+        decision.clone(),
+        preference.clone(),
+    ];
     let result = audit_trail(&records, "some_preference");
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("target domain"));
 
     // Fix domain, but keep relation wrong
-    if let GraphRecord::Node { ref mut user_context, .. } = candidate {
-        user_context.supporting_evidence.as_mut().unwrap()[0].target_domain = "agent_memory".to_owned();
+    if let GraphRecord::Node {
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        user_context.supporting_evidence.as_mut().unwrap()[0].target_domain =
+            "agent_memory".to_owned();
         user_context.supporting_evidence.as_mut().unwrap()[0].relation = "OBSERVES".to_owned(); // WRONG! should be PROPOSED_BY
     }
-    let records = vec![candidate.clone(), prompt.clone(), decision.clone(), preference.clone()];
+    let records = vec![
+        candidate.clone(),
+        prompt.clone(),
+        decision.clone(),
+        preference.clone(),
+    ];
     let result = audit_trail(&records, "some_preference");
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("relation"));
 
     // Fix relation, but make target kind wrong (e.g. referencing a Preference instead of Observation/AgentTurn/Decision)
-    if let GraphRecord::Node { ref mut user_context, .. } = candidate {
+    if let GraphRecord::Node {
+        ref mut user_context,
+        ..
+    } = candidate
+    {
         user_context.supporting_evidence.as_mut().unwrap()[0].relation = "PROPOSED_BY".to_owned();
-        user_context.supporting_evidence.as_mut().unwrap()[0].target_record_id = Some("some_preference".to_owned()); // WRONG kind!
+        user_context.supporting_evidence.as_mut().unwrap()[0].target_record_id =
+            Some("some_preference".to_owned()); // WRONG kind!
     }
     let records = vec![candidate, prompt, decision, preference];
     let result = audit_trail(&records, "some_preference");
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("invalid node kind"));
+}
+
+#[test]
+fn test_scoped_policy_query_excludes_missing_scopes() {
+    use aletheia_egregore::query::active_policy;
+
+    let mut preference = GraphRecord::node(
+        "pref_no_scope".to_owned(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Pref".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = preference
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            approval_decision_id: Some("dec_1".to_owned()),
+            scope: None, // Missing scope!
+            rule_text: Some("Clean text".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut decision = GraphRecord::node(
+        "dec_1".to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = decision
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            outcome: Some("approved".to_owned()),
+            materialized_record_id: Some("pref_no_scope".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![preference, decision];
+    let query_scope = UserContextScope {
+        repo: Some("myrepo".to_owned()),
+        ..UserContextScope::default()
+    };
+
+    // Scoped query: should exclude the preference since it lacks a scope
+    let results = active_policy(&records, Some(&query_scope));
+    assert!(results.is_empty());
+}
+
+#[test]
+fn test_audit_trail_verifies_candidate_body_and_kind() {
+    use aletheia_egregore::query::audit_trail;
+
+    let cand_id = "candidate_1";
+    let decision_id = "decision_1";
+    let prompt_id = "prompt_1";
+
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("Secret: ghp_123456789012345678901234567890123456".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            supporting_evidence: Some(vec![]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut prompt = GraphRecord::node(
+        prompt_id.to_owned(),
+        NodeKind::PromotionPrompt,
+        None,
+        None,
+        None,
+        "Prompt".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = prompt
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_id.to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut decision = GraphRecord::node(
+        decision_id.to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = decision
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_id.to_owned()),
+            prompt_id: Some(prompt_id.to_owned()),
+            outcome: Some("approved".to_owned()),
+            materialized_record_id: Some("pref_1".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut preference = GraphRecord::node(
+        "pref_1".to_owned(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Preference".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = preference
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            approval_decision_id: Some(decision_id.to_owned()),
+            // Durable record rule_text has mismatched/wrong body (not matching redacted candidate proposed_rule_text)
+            rule_text: Some("MismatchedText".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![
+        candidate.clone(),
+        prompt.clone(),
+        decision.clone(),
+        preference.clone(),
+    ];
+    let result = audit_trail(&records, "pref_1");
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("does not match"));
+
+    // Fix body but change candidate's proposed_rule_kind to mismatch the durable kind (Constraint)
+    let mut bad_kind_preference = preference.clone();
+    if let GraphRecord::Node { user_context, .. } = &mut bad_kind_preference {
+        let cand_text = match &candidate {
+            GraphRecord::Node { user_context, .. } => {
+                user_context.proposed_rule_text.as_deref().unwrap()
+            }
+            _ => unreachable!(),
+        };
+        user_context.rule_text = Some(aletheia_egregore::redaction::redact_value(cand_text));
+    }
+    let mut bad_kind_candidate = candidate.clone();
+    if let GraphRecord::Node {
+        ref mut user_context,
+        ..
+    } = bad_kind_candidate
+    {
+        user_context.proposed_rule_kind = Some("constraint".to_owned()); // WRONG kind (constraint vs Preference)
+    }
+    let records = vec![
+        bad_kind_candidate,
+        prompt.clone(),
+        decision.clone(),
+        bad_kind_preference,
+    ];
+    let result = audit_trail(&records, "pref_1");
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("proposed rule kind"));
+}
+
+#[test]
+fn test_decide_normalizes_and_redacts_candidate_body() {
+    use aletheia_egregore::decide::{DecideRequest, decide_candidate};
+
+    let cand_id = "candidate_secret";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("Secret: ghp_123456789012345678901234567890123456".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![candidate];
+    let req = DecideRequest {
+        candidate_id: cand_id.to_owned(),
+        outcome: "approved".to_owned(),
+        edited_rule_text: None,
+        rationale: None,
+        decided_by: "operator".to_owned(),
+        prompt_surface: "cli".to_owned(),
+        prompted_to: "operator".to_owned(),
+        transaction_time: Some("2026-06-05T12:00:00.000Z".to_owned()),
+    };
+
+    let generated = decide_candidate(&records, &req).unwrap();
+
+    // The generated vector should contain the updated candidate node which is redacted!
+    let updated_cand = generated
+        .iter()
+        .find(|r| r.id() == cand_id)
+        .expect("updated candidate not found in generated records");
+
+    if let GraphRecord::Node {
+        user_context,
+        redaction_policy_version,
+        ..
+    } = updated_cand
+    {
+        let text = user_context.proposed_rule_text.as_deref().unwrap();
+        assert!(text.contains("<REDACTED:api_token:"));
+        assert_eq!(redaction_policy_version.as_deref(), Some("v1"));
+    } else {
+        panic!("updated_cand is not a node");
+    }
+}
+
+#[test]
+fn test_decide_naming_hash_uses_redacted_edited_name() {
+    use aletheia_egregore::decide::{DecideRequest, decide_candidate};
+
+    let cand_id = "cand_naming";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("OldName".to_owned()),
+            proposed_rule_kind: Some("naming_decision".to_owned()),
+            entity_kind: Some("function".to_owned()),
+            canonical_name: Some("OldName".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![candidate];
+    let req = DecideRequest {
+        candidate_id: cand_id.to_owned(),
+        outcome: "edited_then_approved".to_owned(),
+        edited_rule_text: Some("SecretToken: ghp_123456789012345678901234567890123456".to_owned()),
+        rationale: None,
+        decided_by: "operator".to_owned(),
+        prompt_surface: "cli".to_owned(),
+        prompted_to: "operator".to_owned(),
+        transaction_time: Some("2026-06-05T12:00:00.000Z".to_owned()),
+    };
+
+    let generated = decide_candidate(&records, &req).unwrap();
+
+    // Find the materialized naming decision node
+    let naming_node = generated
+        .iter()
+        .find(|r| {
+            if let GraphRecord::Node { kind, .. } = r {
+                *kind == NodeKind::NamingDecision
+            } else {
+                false
+            }
+        })
+        .expect("materialized naming decision not found");
+
+    if let GraphRecord::Node {
+        id, user_context, ..
+    } = naming_node
+    {
+        let name = user_context.canonical_name.as_deref().unwrap();
+        assert!(name.contains("<REDACTED:api_token:"));
+
+        let approval_dec_id = user_context.approval_decision_id.as_deref().unwrap();
+        let mut hasher = blake3::Hasher::new();
+        for part in &["function", name, "", approval_dec_id] {
+            hasher.update(part.as_bytes());
+            hasher.update(b"\0");
+        }
+        let hash = hasher.finalize().to_hex().to_string();
+        let expected_id = user_context_stable_id(&["naming_decision", &hash]);
+        assert_eq!(id, &expected_id);
+    } else {
+        panic!("naming_node is not a node");
+    }
 }

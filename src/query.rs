@@ -17,7 +17,7 @@ use chrono::DateTime;
 use crate::ir::{
     EdgeLabel, EvidenceLink, GraphRecord, NodeKind, SemanticDriftMetadata, UserContextScope,
 };
-
+use crate::redaction::redact_value;
 /// Finds a symbol record by name at a specific Git commit.
 ///
 /// `commit` may be a full SHA or a unique prefix from the caller's graph.
@@ -2215,6 +2215,8 @@ pub fn pending_candidates<'a>(
                     if !scope_matches(r_scope, q_scope) {
                         continue;
                     }
+                } else {
+                    continue;
                 }
             }
             candidates.push(rec);
@@ -2309,6 +2311,8 @@ pub fn active_policy<'a>(
                         if !scope_matches(r_scope, q_scope) {
                             continue;
                         }
+                    } else {
+                        continue;
                     }
                 }
                 policy_map.insert(rec.id(), rec);
@@ -2474,6 +2478,89 @@ pub fn audit_trail<'a>(
             ));
         }
     };
+
+    // Perform candidate-kind/body consistency checks
+    let expected_kind = match kind {
+        NodeKind::Preference => "preference",
+        NodeKind::WorkflowRule => "workflow_rule",
+        NodeKind::NamingDecision => "naming_decision",
+        NodeKind::Constraint => "constraint",
+        _ => unreachable!(),
+    };
+    if candidate_fields.proposed_rule_kind.as_deref() != Some(expected_kind) {
+        return Err(format!(
+            "Candidate '{}' proposed rule kind '{:?}' does not match durable policy kind '{:?}'",
+            candidate_id, candidate_fields.proposed_rule_kind, kind
+        ));
+    }
+
+    let is_edited = outcome == "edited_then_approved";
+    match kind {
+        NodeKind::Preference | NodeKind::WorkflowRule => {
+            let durable_text = user_context.rule_text.as_deref().unwrap_or("");
+            if is_edited {
+                let edited_text = decision_fields.edited_rule_text.as_deref().unwrap_or("");
+                if durable_text != edited_text {
+                    return Err(format!(
+                        "Durable record rule_text '{}' does not match decision edited_rule_text '{}'",
+                        durable_text, edited_text
+                    ));
+                }
+            } else {
+                let cand_text = candidate_fields.proposed_rule_text.as_deref().unwrap_or("");
+                let redacted_cand_text = redact_value(cand_text);
+                if durable_text != redacted_cand_text {
+                    return Err(format!(
+                        "Durable record rule_text '{}' does not match candidate proposed_rule_text '{}' (redacted: '{}')",
+                        durable_text, cand_text, redacted_cand_text
+                    ));
+                }
+            }
+        }
+        NodeKind::Constraint => {
+            let durable_text = user_context.constraint_text.as_deref().unwrap_or("");
+            if is_edited {
+                let edited_text = decision_fields.edited_rule_text.as_deref().unwrap_or("");
+                if durable_text != edited_text {
+                    return Err(format!(
+                        "Durable record constraint_text '{}' does not match decision edited_rule_text '{}'",
+                        durable_text, edited_text
+                    ));
+                }
+            } else {
+                let cand_text = candidate_fields.proposed_rule_text.as_deref().unwrap_or("");
+                let redacted_cand_text = redact_value(cand_text);
+                if durable_text != redacted_cand_text {
+                    return Err(format!(
+                        "Durable record constraint_text '{}' does not match candidate proposed_rule_text '{}' (redacted: '{}')",
+                        durable_text, cand_text, redacted_cand_text
+                    ));
+                }
+            }
+        }
+        NodeKind::NamingDecision => {
+            let durable_name = user_context.canonical_name.as_deref().unwrap_or("");
+            if is_edited {
+                let edited_name = decision_fields.edited_rule_text.as_deref().unwrap_or("");
+                if durable_name != edited_name {
+                    return Err(format!(
+                        "Durable record canonical_name '{}' does not match decision edited_rule_text '{}'",
+                        durable_name, edited_name
+                    ));
+                }
+            } else {
+                let cand_name = candidate_fields.canonical_name.as_deref().unwrap_or("");
+                let redacted_cand_name = redact_value(cand_name);
+                if durable_name != redacted_cand_name {
+                    return Err(format!(
+                        "Durable record canonical_name '{}' does not match candidate canonical_name '{}' (redacted: '{}')",
+                        durable_name, cand_name, redacted_cand_name
+                    ));
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
     let supporting = candidate_fields
         .supporting_evidence
         .as_deref()
@@ -2507,7 +2594,10 @@ pub fn audit_trail<'a>(
         })?;
         match obs {
             GraphRecord::Node { kind, .. } => {
-                if !matches!(kind, NodeKind::Observation | NodeKind::AgentTurn | NodeKind::Decision) {
+                if !matches!(
+                    kind,
+                    NodeKind::Observation | NodeKind::AgentTurn | NodeKind::Decision
+                ) {
                     return Err(format!(
                         "Supporting evidence '{}' has invalid node kind '{:?}' (must be Observation, AgentTurn, or Decision)",
                         obs_id, kind
@@ -2515,10 +2605,7 @@ pub fn audit_trail<'a>(
                 }
             }
             _ => {
-                return Err(format!(
-                    "Supporting evidence '{}' is not a node",
-                    obs_id
-                ));
+                return Err(format!("Supporting evidence '{}' is not a node", obs_id));
             }
         }
         obs_nodes.push(obs);

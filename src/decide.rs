@@ -300,10 +300,43 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
 
     // 5. Materialize or Revoke if approved
     if req.outcome == "approved" || req.outcome == "edited_then_approved" {
+        let mut updated_candidate = candidate.clone();
+        let mut redacted_any = false;
+        if let GraphRecord::Node {
+            user_context,
+            redaction_policy_version,
+            ..
+        } = &mut updated_candidate
+        {
+            if let Some(text) = &user_context.proposed_rule_text {
+                let redacted_text = redact_value(text);
+                if crate::redaction::is_redacted(&redacted_text) {
+                    redacted_any = true;
+                }
+                user_context.proposed_rule_text = Some(redacted_text);
+            }
+            if let Some(name) = &user_context.canonical_name {
+                let redacted_name = redact_value(name);
+                if crate::redaction::is_redacted(&redacted_name) {
+                    redacted_any = true;
+                }
+                user_context.canonical_name = Some(redacted_name);
+            }
+            if redacted_any {
+                *redaction_policy_version =
+                    Some(crate::redaction::REDACTION_POLICY_VERSION.to_owned());
+            }
+        }
+
+        let updated_cand_fields = match &updated_candidate {
+            GraphRecord::Node { user_context, .. } => user_context,
+            _ => unreachable!(),
+        };
+
         let rule_text = if req.outcome == "edited_then_approved" {
             req.edited_rule_text.clone().unwrap()
         } else {
-            cand_fields
+            updated_cand_fields
                 .proposed_rule_text
                 .clone()
                 .ok_or_else(|| anyhow!("Candidate proposed_rule_text is missing"))?
@@ -311,7 +344,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
 
         let redacted_rule_text = redact_value(&rule_text);
 
-        let scope = cand_fields.scope.clone().ok_or_else(|| {
+        let scope = updated_cand_fields.scope.clone().ok_or_else(|| {
             anyhow!(
                 "PromoteCandidate '{}' lacks required scope",
                 req.candidate_id
@@ -321,17 +354,20 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         if proposed_rule_kind == "revocation" {
             // Find target record to revoke.
             // In revocation candidates, the evidence link or contradicts links back to the durable record.
-            let target_durable_id = cand_fields
+            let target_durable_id = updated_cand_fields
                 .contradicting_evidence
                 .as_deref()
                 .and_then(|v| v.first().and_then(|l| l.target_record_id.clone()))
                 .or_else(|| {
                     // Fall back to matches in supporting evidence
-                    cand_fields.supporting_evidence.as_deref().and_then(|v| {
-                        v.iter()
-                            .find(|l| l.target_domain == "user_context")
-                            .and_then(|l| l.target_record_id.clone())
-                    })
+                    updated_cand_fields
+                        .supporting_evidence
+                        .as_deref()
+                        .and_then(|v| {
+                            v.iter()
+                                .find(|l| l.target_domain == "user_context")
+                                .and_then(|l| l.target_record_id.clone())
+                        })
                 })
                 .ok_or_else(|| {
                     anyhow!("Revocation candidate does not specify target record to revoke")
@@ -411,11 +447,14 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                     &decision_id,
                 ]),
                 NodeKind::NamingDecision => {
-                    let entity_kind = cand_fields.entity_kind.as_deref().unwrap_or("other");
+                    let entity_kind = updated_cand_fields
+                        .entity_kind
+                        .as_deref()
+                        .unwrap_or("other");
                     let canonical_name = if req.outcome == "edited_then_approved" {
-                        &rule_text
+                        &redacted_rule_text
                     } else {
-                        cand_fields.canonical_name.as_deref().unwrap_or("")
+                        updated_cand_fields.canonical_name.as_deref().unwrap_or("")
                     };
                     blake3_hash_parts(&[
                         entity_kind,
@@ -481,9 +520,11 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                     NodeKind::Preference | NodeKind::WorkflowRule => {
                         durable_fields.rule_text = Some(redacted_rule_text);
                         if materialized_kind == NodeKind::WorkflowRule {
-                            durable_fields.triggers = cand_fields.triggers.clone();
-                            let redacted_action =
-                                cand_fields.action_summary.as_ref().map(|s| redact_value(s));
+                            durable_fields.triggers = updated_cand_fields.triggers.clone();
+                            let redacted_action = updated_cand_fields
+                                .action_summary
+                                .as_ref()
+                                .map(|s| redact_value(s));
                             if redacted_action
                                 .as_ref()
                                 .is_some_and(|s| crate::redaction::is_redacted(s))
@@ -494,18 +535,21 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                         }
                     }
                     NodeKind::NamingDecision => {
-                        durable_fields.entity_kind = cand_fields.entity_kind.clone();
+                        durable_fields.entity_kind = updated_cand_fields.entity_kind.clone();
                         let canonical = if req.outcome == "edited_then_approved" {
                             redacted_rule_text
                         } else {
-                            cand_fields.canonical_name.clone().unwrap_or_default()
+                            updated_cand_fields
+                                .canonical_name
+                                .clone()
+                                .unwrap_or_default()
                         };
                         if crate::redaction::is_redacted(&canonical) {
                             rule_has_redaction = true;
                         }
                         durable_fields.canonical_name = Some(canonical);
                         durable_fields.alternatives_rejected = Some(
-                            cand_fields
+                            updated_cand_fields
                                 .alternatives_rejected
                                 .clone()
                                 .unwrap_or_default(),
@@ -513,7 +557,8 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                     }
                     NodeKind::Constraint => {
                         durable_fields.constraint_text = Some(redacted_rule_text);
-                        durable_fields.enforcement_level = cand_fields.enforcement_level.clone();
+                        durable_fields.enforcement_level =
+                            updated_cand_fields.enforcement_level.clone();
                     }
                     _ => unreachable!(),
                 }
@@ -531,6 +576,10 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
             }
 
             generated_records.push(materialized_node);
+        }
+
+        if redacted_any {
+            generated_records.push(updated_candidate);
         }
     }
 
@@ -589,7 +638,13 @@ pub fn synthesize_user_context_edges(
     let mut materialized_id = None;
 
     for rec in generated {
-        if let GraphRecord::Node { id, kind, user_context, .. } = rec {
+        if let GraphRecord::Node {
+            id,
+            kind,
+            user_context,
+            ..
+        } = rec
+        {
             match kind {
                 NodeKind::PromotionPrompt => {
                     prompt_id = Some(id.clone());
@@ -638,7 +693,9 @@ pub fn synthesize_user_context_edges(
             let out_ref = outcome.as_deref().unwrap_or("");
             if out_ref == "approved" || out_ref == "edited_then_approved" {
                 let is_revocation = records.iter().any(|r| match r {
-                    GraphRecord::Node { id, user_context, .. } if id == c_id => {
+                    GraphRecord::Node {
+                        id, user_context, ..
+                    } if id == c_id => {
                         user_context.proposed_rule_kind.as_deref() == Some("revocation")
                     }
                     _ => false,
@@ -658,7 +715,8 @@ pub fn synthesize_user_context_edges(
                         producer: None,
                     });
                 } else {
-                    let edge_id = user_context_stable_id(&["edge", "MATERIALIZED_AS", &d_id, &mat_id]);
+                    let edge_id =
+                        user_context_stable_id(&["edge", "MATERIALIZED_AS", &d_id, &mat_id]);
                     edges.push(GraphRecord::Edge {
                         id: edge_id,
                         schema_version: USER_CONTEXT_SCHEMA_VERSION,
@@ -667,7 +725,8 @@ pub fn synthesize_user_context_edges(
                         target: mat_id,
                         confidence: None,
                         temporal: None,
-                        summary: "PromotionDecision materialized durable user-context record".to_owned(),
+                        summary: "PromotionDecision materialized durable user-context record"
+                            .to_owned(),
                         producer: None,
                     });
                 }

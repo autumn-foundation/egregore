@@ -3556,7 +3556,11 @@ fn query_audit_cmd(records: &[GraphRecord], durable_id: &str, format: OutputForm
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines
+)]
 fn decide_cmd(
     candidate_id: String,
     outcome: String,
@@ -3573,8 +3577,29 @@ fn decide_cmd(
         anyhow::bail!("Either --out or --data-dir must be specified to write the decision records");
     }
 
-    let query_source_dir = if graph.is_some() { None } else { data_dir.as_deref() };
-    let records = load_query_records(graph.as_deref(), query_source_dir)?;
+    let query_source_dir = if graph.is_some() {
+        None
+    } else {
+        data_dir.as_deref()
+    };
+    let mut records = load_query_records(graph.as_deref(), query_source_dir)?;
+
+    if graph.is_some()
+        && let Some(dir) = &data_dir
+    {
+        let store_exists = fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some());
+        if store_exists {
+            let db_records = load_records_from_db(dir)?;
+            let mut map = std::collections::HashMap::new();
+            for r in records {
+                map.insert(r.id().to_owned(), r);
+            }
+            for r in db_records {
+                map.insert(r.id().to_owned(), r);
+            }
+            records = map.into_values().collect();
+        }
+    }
 
     let req = crate::decide::DecideRequest {
         candidate_id,
@@ -3607,8 +3632,45 @@ fn decide_cmd(
             let mut sink = EmbeddedAletheiaSink::open_unleased(&dir)
                 .with_context(|| format!("failed to open embedded store {}", dir.display()))?;
             let edges = crate::decide::synthesize_user_context_edges(&records, &generated);
+
+            let mut source_records_to_persist = Vec::new();
+            let mut seen_ids = std::collections::HashSet::new();
+            for g in &generated {
+                seen_ids.insert(g.id().to_owned());
+            }
+            if let Some(cand) = records.iter().find(|r| r.id() == req.candidate_id) {
+                if seen_ids.insert(cand.id().to_owned()) {
+                    source_records_to_persist.push(cand.clone());
+                }
+                if let GraphRecord::Node { user_context, .. } = cand {
+                    if let Some(evidence) = &user_context.supporting_evidence {
+                        for link in evidence {
+                            if let Some(ref_id) = &link.target_record_id
+                                && seen_ids.insert(ref_id.clone())
+                                && let Some(evidence_rec) =
+                                    records.iter().find(|r| r.id() == *ref_id)
+                            {
+                                source_records_to_persist.push(evidence_rec.clone());
+                            }
+                        }
+                    }
+                    if let Some(evidence) = &user_context.contradicting_evidence {
+                        for link in evidence {
+                            if let Some(ref_id) = &link.target_record_id
+                                && seen_ids.insert(ref_id.clone())
+                                && let Some(evidence_rec) =
+                                    records.iter().find(|r| r.id() == *ref_id)
+                            {
+                                source_records_to_persist.push(evidence_rec.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
             let mut all_records = generated;
             all_records.extend(edges);
+            all_records.extend(source_records_to_persist);
             let report = ingest_records(&all_records, &mut sink);
             if !report.is_success() {
                 for failure in &report.failures {
