@@ -154,6 +154,13 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         ));
     }
 
+    if req.prompted_to.trim().is_empty() {
+        return Err(anyhow!("prompted_to cannot be empty or whitespace-only"));
+    }
+    if req.decided_by.trim().is_empty() {
+        return Err(anyhow!("decided_by cannot be empty or whitespace-only"));
+    }
+
     if req.outcome == "approved" || req.outcome == "edited_then_approved" {
         if proposed_rule_kind == "workflow_rule" {
             let allowed_triggers = [
@@ -336,6 +343,13 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                     redacted_any = true;
                 }
                 user_context.canonical_name = Some(redacted_name);
+            }
+            if let Some(action) = &user_context.action_summary {
+                let redacted_action = redact_value(action);
+                if crate::redaction::is_redacted(&redacted_action) {
+                    redacted_any = true;
+                }
+                user_context.action_summary = Some(redacted_action);
             }
             if redacted_any {
                 *redaction_policy_version =

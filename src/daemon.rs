@@ -3706,7 +3706,7 @@ pub(crate) fn validate_promote_candidate_for_cli(
     candidate: &GraphRecord,
     records: &[GraphRecord],
     sink: &EmbeddedAletheiaSink,
-) -> Result<()> {
+) -> Result<Vec<GraphRecord>> {
     let GraphRecord::Node {
         id,
         kind,
@@ -3733,7 +3733,7 @@ pub(crate) fn validate_promote_candidate_for_cli(
     )
     .map_err(|e| anyhow!("validation failed: {}", e.message))?;
 
-    validate_promote_candidate(
+    let edges = validate_promote_candidate(
         id,
         confidence.as_deref(),
         superseded_by.as_deref(),
@@ -3744,7 +3744,7 @@ pub(crate) fn validate_promote_candidate_for_cli(
     )
     .map_err(|e| anyhow!("validation failed: {}", e.message))?;
 
-    Ok(())
+    Ok(edges)
 }
 
 fn require_scope(scope: Option<&UserContextScope>, field: &'static str) -> WriteResult<()> {

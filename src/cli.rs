@@ -3577,27 +3577,68 @@ fn decide_cmd(
         anyhow::bail!("Either --out or --data-dir must be specified to write the decision records");
     }
 
-    let query_source_dir = if graph.is_some() {
-        None
+    #[cfg(feature = "embedded-aletheiadb")]
+    let mut sink_opt = None;
+
+    let mut records = if let Some(path) = &graph {
+        load_records_from_jsonl(path)?
+    } else if let Some(dir) = &data_dir {
+        #[cfg(feature = "embedded-aletheiadb")]
+        {
+            validate_existing_embedded_store(dir)?;
+            let sink = EmbeddedAletheiaSink::open(dir)
+                .with_context(|| format!("failed to open embedded store {}", dir.display()))?;
+            let db_recs = sink
+                .read_all_records()
+                .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+            sink_opt = Some(sink);
+            db_recs
+        }
+        #[cfg(not(feature = "embedded-aletheiadb"))]
+        {
+            let _ = dir;
+            anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+        }
     } else {
-        data_dir.as_deref()
+        anyhow::bail!("provide --graph <path> or --data-dir <path>");
     };
-    let mut records = load_query_records(graph.as_deref(), query_source_dir)?;
 
     if graph.is_some()
         && let Some(dir) = &data_dir
     {
-        let store_exists = fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some());
-        if store_exists {
-            let db_records = load_records_from_db(dir)?;
-            let mut map = std::collections::HashMap::new();
-            for r in records {
-                map.insert(r.id().to_owned(), r);
+        #[cfg(feature = "embedded-aletheiadb")]
+        {
+            let sink = if let Some(s) = sink_opt.take() {
+                s
+            } else {
+                EmbeddedAletheiaSink::open(dir)
+                    .with_context(|| format!("failed to open embedded store {}", dir.display()))?
+            };
+
+            let store_exists = fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some());
+            let db_records = if store_exists {
+                sink.read_all_records()
+                    .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?
+            } else {
+                Vec::new()
+            };
+            sink_opt = Some(sink);
+
+            if !db_records.is_empty() {
+                let mut map = std::collections::HashMap::new();
+                for r in records {
+                    map.insert(r.id().to_owned(), r);
+                }
+                for r in db_records {
+                    map.insert(r.id().to_owned(), r);
+                }
+                records = map.into_values().collect();
             }
-            for r in db_records {
-                map.insert(r.id().to_owned(), r);
-            }
-            records = map.into_values().collect();
+        }
+        #[cfg(not(feature = "embedded-aletheiadb"))]
+        {
+            let _ = dir;
+            anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
         }
     }
 
@@ -3629,8 +3670,7 @@ fn decide_cmd(
     if let Some(dir) = data_dir {
         #[cfg(feature = "embedded-aletheiadb")]
         {
-            let mut sink = EmbeddedAletheiaSink::open(&dir)
-                .with_context(|| format!("failed to open embedded store {}", dir.display()))?;
+            let mut sink = sink_opt.take().unwrap();
             let edges = crate::decide::synthesize_user_context_edges(&records, &generated);
 
             let mut source_records_to_persist = Vec::new();
@@ -3638,9 +3678,12 @@ fn decide_cmd(
             for g in &generated {
                 seen_ids.insert(g.id().to_owned());
             }
+            let mut validation_edges = Vec::new();
             if let Some(cand) = records.iter().find(|r| r.id() == req.candidate_id) {
-                crate::daemon::validate_promote_candidate_for_cli(cand, &records, &sink)
-                    .context("Candidate validation failed")?;
+                let val_edges =
+                    crate::daemon::validate_promote_candidate_for_cli(cand, &records, &sink)
+                        .context("Candidate validation failed")?;
+                validation_edges = val_edges;
 
                 if seen_ids.insert(cand.id().to_owned()) {
                     source_records_to_persist.push(cand.clone());
@@ -3697,6 +3740,7 @@ fn decide_cmd(
 
             let mut all_records = generated;
             all_records.extend(edges);
+            all_records.extend(validation_edges);
             all_records.extend(source_records_to_persist);
             let report = ingest_records(&all_records, &mut sink);
             if !report.is_success() {

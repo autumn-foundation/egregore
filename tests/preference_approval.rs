@@ -4767,3 +4767,144 @@ fn test_decide_cmd_fails_for_invalid_candidate() {
         .assert()
         .failure();
 }
+
+#[test]
+fn test_decide_fails_for_empty_operator_fields() {
+    use aletheia_egregore::decide::{DecideRequest, decide_candidate};
+
+    let cand_id = "cand_op_validation";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![candidate];
+
+    // Empty prompted_to
+    let req_empty_prompted = DecideRequest {
+        candidate_id: cand_id.to_owned(),
+        outcome: "approved".to_owned(),
+        edited_rule_text: None,
+        rationale: None,
+        decided_by: "operator".to_owned(),
+        prompt_surface: "cli".to_owned(),
+        prompted_to: " ".to_owned(), // Empty/whitespace
+        transaction_time: Some("2026-06-05T12:00:00.000Z".to_owned()),
+    };
+    let result = decide_candidate(&records, &req_empty_prompted);
+    assert!(result.is_err());
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("prompted_to cannot be empty")
+    );
+
+    // Empty decided_by
+    let req_empty_decided = DecideRequest {
+        candidate_id: cand_id.to_owned(),
+        outcome: "approved".to_owned(),
+        edited_rule_text: None,
+        rationale: None,
+        decided_by: " \t ".to_owned(), // Empty/whitespace
+        prompt_surface: "cli".to_owned(),
+        prompted_to: "operator".to_owned(),
+        transaction_time: Some("2026-06-05T12:00:00.000Z".to_owned()),
+    };
+    let result = decide_candidate(&records, &req_empty_decided);
+    assert!(result.is_err());
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("decided_by cannot be empty")
+    );
+}
+
+#[test]
+fn test_decide_redacts_candidate_action_summary() {
+    use aletheia_egregore::decide::{DecideRequest, decide_candidate};
+
+    let cand_id = "cand_action_redaction";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("workflow_rule".to_owned()),
+            scope: Some(UserContextScope::default()),
+            triggers: Some(vec!["pre_commit".to_owned()]),
+            action_summary: Some("Execute task using key ghp_12345678901234567890".to_owned()), // Contains secret
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![candidate];
+    let req = DecideRequest {
+        candidate_id: cand_id.to_owned(),
+        outcome: "approved".to_owned(),
+        edited_rule_text: None,
+        rationale: None,
+        decided_by: "operator".to_owned(),
+        prompt_surface: "cli".to_owned(),
+        prompted_to: "operator".to_owned(),
+        transaction_time: Some("2026-06-05T12:00:00.000Z".to_owned()),
+    };
+
+    let generated = decide_candidate(&records, &req).unwrap();
+
+    // Find the updated PromoteCandidate record in generated
+    let updated_cand = generated
+        .iter()
+        .find(|r| r.id() == cand_id)
+        .expect("updated candidate should be emitted");
+    if let GraphRecord::Node {
+        user_context,
+        redaction_policy_version,
+        ..
+    } = updated_cand
+    {
+        let action = user_context.action_summary.as_deref().unwrap();
+        assert!(action.contains("api_token:"));
+        assert!(!action.contains("ghp_12345678901234567890"));
+        assert_eq!(redaction_policy_version.as_deref(), Some("v1"));
+    } else {
+        panic!("Not a node");
+    }
+}
