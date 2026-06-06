@@ -124,7 +124,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
     let valid_time_str = req
         .transaction_time
         .clone()
-        .unwrap_or_else(|| Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        .unwrap_or_else(|| Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
 
     let proposed_rule_kind = cand_fields
         .proposed_rule_kind
@@ -495,11 +495,15 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                     }
                     NodeKind::NamingDecision => {
                         durable_fields.entity_kind = cand_fields.entity_kind.clone();
-                        durable_fields.canonical_name = if req.outcome == "edited_then_approved" {
-                            Some(rule_text.clone())
+                        let canonical = if req.outcome == "edited_then_approved" {
+                            redacted_rule_text
                         } else {
-                            cand_fields.canonical_name.clone()
+                            cand_fields.canonical_name.clone().unwrap_or_default()
                         };
+                        if crate::redaction::is_redacted(&canonical) {
+                            rule_has_redaction = true;
+                        }
+                        durable_fields.canonical_name = Some(canonical);
                         durable_fields.alternatives_rejected = Some(
                             cand_fields
                                 .alternatives_rejected
@@ -570,4 +574,106 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
     generated_records.push(decision_node);
 
     Ok(generated_records)
+}
+
+/// Synthesize user-context edges for direct write to an embedded store.
+pub fn synthesize_user_context_edges(
+    records: &[GraphRecord],
+    generated: &[GraphRecord],
+) -> Vec<GraphRecord> {
+    let mut edges = Vec::new();
+    let mut prompt_id = None;
+    let mut decision_id = None;
+    let mut candidate_id = None;
+    let mut outcome = None;
+    let mut materialized_id = None;
+
+    for rec in generated {
+        if let GraphRecord::Node { id, kind, user_context, .. } = rec {
+            match kind {
+                NodeKind::PromotionPrompt => {
+                    prompt_id = Some(id.clone());
+                    candidate_id = user_context.candidate_id.clone();
+                }
+                NodeKind::PromotionDecision => {
+                    decision_id = Some(id.clone());
+                    outcome = user_context.outcome.clone();
+                    materialized_id = user_context.materialized_record_id.clone();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let (Some(p_id), Some(c_id)) = (prompt_id, &candidate_id) {
+        let edge_id = user_context_stable_id(&["edge", "PROMPTED_FOR", &p_id, c_id]);
+        edges.push(GraphRecord::Edge {
+            id: edge_id,
+            schema_version: USER_CONTEXT_SCHEMA_VERSION,
+            label: crate::ir::EdgeLabel::PromptedFor,
+            source: p_id,
+            target: c_id.clone(),
+            confidence: None,
+            temporal: None,
+            summary: "PromotionPrompt prompted for PromoteCandidate".to_owned(),
+            producer: None,
+        });
+    }
+
+    if let (Some(d_id), Some(c_id)) = (decision_id, &candidate_id) {
+        let edge_id = user_context_stable_id(&["edge", "DECIDED_ON", &d_id, c_id]);
+        edges.push(GraphRecord::Edge {
+            id: edge_id,
+            schema_version: USER_CONTEXT_SCHEMA_VERSION,
+            label: crate::ir::EdgeLabel::DecidedOn,
+            source: d_id.clone(),
+            target: c_id.clone(),
+            confidence: None,
+            temporal: None,
+            summary: "PromotionDecision decided on PromoteCandidate".to_owned(),
+            producer: None,
+        });
+
+        if let Some(mat_id) = materialized_id {
+            let out_ref = outcome.as_deref().unwrap_or("");
+            if out_ref == "approved" || out_ref == "edited_then_approved" {
+                let is_revocation = records.iter().any(|r| match r {
+                    GraphRecord::Node { id, user_context, .. } if id == c_id => {
+                        user_context.proposed_rule_kind.as_deref() == Some("revocation")
+                    }
+                    _ => false,
+                });
+
+                if is_revocation {
+                    let edge_id = user_context_stable_id(&["edge", "REVOKED_BY", &mat_id, &d_id]);
+                    edges.push(GraphRecord::Edge {
+                        id: edge_id,
+                        schema_version: USER_CONTEXT_SCHEMA_VERSION,
+                        label: crate::ir::EdgeLabel::RevokedBy,
+                        source: mat_id,
+                        target: d_id,
+                        confidence: None,
+                        temporal: None,
+                        summary: "PromotionDecision revoked durable user-context record".to_owned(),
+                        producer: None,
+                    });
+                } else {
+                    let edge_id = user_context_stable_id(&["edge", "MATERIALIZED_AS", &d_id, &mat_id]);
+                    edges.push(GraphRecord::Edge {
+                        id: edge_id,
+                        schema_version: USER_CONTEXT_SCHEMA_VERSION,
+                        label: crate::ir::EdgeLabel::MaterializedAs,
+                        source: d_id,
+                        target: mat_id,
+                        confidence: None,
+                        temporal: None,
+                        summary: "PromotionDecision materialized durable user-context record".to_owned(),
+                        producer: None,
+                    });
+                }
+            }
+        }
+    }
+
+    edges
 }

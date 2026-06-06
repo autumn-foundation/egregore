@@ -2481,6 +2481,18 @@ pub fn audit_trail<'a>(
 
     let mut obs_nodes = Vec::new();
     for link in supporting {
+        if link.target_domain != "agent_memory" {
+            return Err(format!(
+                "Candidate '{}' supporting evidence target domain '{}' is invalid (must be 'agent_memory')",
+                candidate_id, link.target_domain
+            ));
+        }
+        if link.relation != "PROPOSED_BY" {
+            return Err(format!(
+                "Candidate '{}' supporting evidence relation '{}' is invalid (must be 'PROPOSED_BY')",
+                candidate_id, link.relation
+            ));
+        }
         let obs_id = link.target_record_id.as_deref().ok_or_else(|| {
             format!(
                 "Candidate '{}' supporting evidence link lacks target_record_id",
@@ -2493,6 +2505,22 @@ pub fn audit_trail<'a>(
                 obs_id, candidate_id
             )
         })?;
+        match obs {
+            GraphRecord::Node { kind, .. } => {
+                if !matches!(kind, NodeKind::Observation | NodeKind::AgentTurn | NodeKind::Decision) {
+                    return Err(format!(
+                        "Supporting evidence '{}' has invalid node kind '{:?}' (must be Observation, AgentTurn, or Decision)",
+                        obs_id, kind
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "Supporting evidence '{}' is not a node",
+                    obs_id
+                ));
+            }
+        }
         obs_nodes.push(obs);
     }
 

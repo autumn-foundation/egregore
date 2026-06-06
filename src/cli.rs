@@ -3573,7 +3573,8 @@ fn decide_cmd(
         anyhow::bail!("Either --out or --data-dir must be specified to write the decision records");
     }
 
-    let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+    let query_source_dir = if graph.is_some() { None } else { data_dir.as_deref() };
+    let records = load_query_records(graph.as_deref(), query_source_dir)?;
 
     let req = crate::decide::DecideRequest {
         candidate_id,
@@ -3605,7 +3606,10 @@ fn decide_cmd(
         {
             let mut sink = EmbeddedAletheiaSink::open_unleased(&dir)
                 .with_context(|| format!("failed to open embedded store {}", dir.display()))?;
-            let report = ingest_records(&generated, &mut sink);
+            let edges = crate::decide::synthesize_user_context_edges(&records, &generated);
+            let mut all_records = generated;
+            all_records.extend(edges);
+            let report = ingest_records(&all_records, &mut sink);
             if !report.is_success() {
                 for failure in &report.failures {
                     eprintln!("{}: {}", failure.record_id, failure.message);
