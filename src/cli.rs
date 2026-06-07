@@ -410,6 +410,9 @@ enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory.
         #[arg(long)]
         data_dir: PathBuf,
+        /// Route the query through the running daemon instead of opening the store directly.
+        #[arg(long)]
+        daemon: bool,
         /// Maximum number of results (default 10).
         #[arg(long, default_value_t = 10)]
         limit: usize,
@@ -2031,9 +2034,16 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         QuerySubcommand::Semantic {
             query,
             data_dir,
+            daemon,
             limit,
             format,
-        } => query_semantic(&query, &data_dir, limit, format),
+        } => {
+            if daemon {
+                query_semantic_via_daemon(&query, &data_dir, limit, format)
+            } else {
+                query_semantic(&query, &data_dir, limit, format)
+            }
+        }
         QuerySubcommand::Context {
             name,
             graph,
@@ -2289,14 +2299,17 @@ fn generate_embeddings(
     Ok((map, dimensions))
 }
 
-/// Semantic similarity search against an embedded store.
+/// Embeds a natural-language query into a dense vector using the default local
+/// model. Shared by the embedded and daemon-backed semantic search paths so
+/// both produce identical query vectors (and therefore identical rankings).
+///
+/// The model is loaded from the local Hugging Face cache; no remote embedding
+/// service is contacted at query time.
 #[cfg(feature = "embeddings")]
-fn query_semantic(query: &str, data_dir: &Path, limit: usize, format: OutputFormat) -> Result<()> {
+fn embed_query_text(query: &str) -> Result<Vec<f32>> {
     use crate::embeddings::{
         DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_NAME, aletheia_embeddings,
     };
-
-    validate_existing_embedded_store(data_dir)?;
 
     let embedder = aletheia_embeddings::EmbedderBuilder::new()
         .model_architecture(DEFAULT_EMBEDDING_MODEL_ARCHITECTURE)
@@ -2309,11 +2322,19 @@ fn query_semantic(query: &str, data_dir: &Path, limit: usize, format: OutputForm
         .block_on(aletheia_embeddings::embed_query(&[query], &embedder, None))
         .context("failed to embed query")?;
 
-    let query_vector = aletheia_embeddings::embed_data_to_dense_iter(embed_data, Some(1))
+    aletheia_embeddings::embed_data_to_dense_iter(embed_data, Some(1))
         .next()
         .context("no embedding returned for query")?
-        .context("embedding result was not dense")?
-        .embedding;
+        .context("embedding result was not dense")
+        .map(|dense| dense.embedding)
+}
+
+/// Semantic similarity search against an embedded store.
+#[cfg(feature = "embeddings")]
+fn query_semantic(query: &str, data_dir: &Path, limit: usize, format: OutputFormat) -> Result<()> {
+    validate_existing_embedded_store(data_dir)?;
+
+    let query_vector = embed_query_text(query)?;
 
     let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
         .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
@@ -2329,6 +2350,62 @@ fn query_semantic(query: &str, data_dir: &Path, limit: usize, format: OutputForm
 
     for m in matches {
         print_result(&SemanticResult::from(&m), format)?;
+    }
+    Ok(())
+}
+
+/// Semantic similarity search routed through the running daemon (issue #59).
+///
+/// Connects to the daemon first (so a missing or stale daemon fails fast,
+/// before the model is loaded), embeds the query locally, then dispatches the
+/// `semantic_search` verb. Results are the same retrieval-lead rows the
+/// embedded path emits; the daemon owns the shared store, token, and snapshot.
+#[cfg(feature = "embeddings")]
+fn query_semantic_via_daemon(
+    query: &str,
+    data_dir: &Path,
+    limit: usize,
+    format: OutputFormat,
+) -> Result<()> {
+    let client = DaemonClient::from_data_dir(data_dir)
+        .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
+
+    let query_vector = embed_query_text(query)?;
+    let params = serde_json::json!({
+        "query_vector": query_vector,
+        "limit": limit as u64,
+    });
+    let records = client.query_verb("semantic_search", &params, None)?;
+
+    if records.is_empty() {
+        eprintln!("no results — store may not have embeddings (re-run ingest with --embed)");
+        std::process::exit(2);
+    }
+
+    for rec in &records {
+        print_daemon_semantic_record(rec, format)?;
+    }
+    Ok(())
+}
+
+/// Prints a daemon semantic result row (`serde_json::Value`) in the requested
+/// format. JSON output forwards the row verbatim; text output renders the
+/// bounded handle fields only.
+#[cfg(feature = "embeddings")]
+fn print_daemon_semantic_record(rec: &serde_json::Value, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string(rec)?),
+        OutputFormat::Text => {
+            let record_id = rec["record_id"].as_str().unwrap_or("(unknown)");
+            let score = rec["score"].as_f64().unwrap_or(0.0);
+            let path = rec["repo_relative_path"].as_str().unwrap_or("(unknown)");
+            let line = rec["span"]["start_line"].as_u64();
+            let location = line.map_or_else(
+                || path.to_owned(),
+                |start_line| format!("{path}:{start_line}"),
+            );
+            println!("{record_id} score={score:.4} @ {location}");
+        }
     }
     Ok(())
 }
