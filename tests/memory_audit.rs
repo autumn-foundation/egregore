@@ -1,0 +1,655 @@
+#![allow(missing_docs)]
+
+//! End-to-end tests for `eg query memory` — the memory evidence audit query
+//! (issue #64). The audit starts from one agent-authored memory claim and
+//! returns its provenance, supporting / contradicting / superseding evidence,
+//! related code and project handles, and verification evidence — never raw
+//! payloads, and never an agent claim presented as source truth.
+
+use std::{fs, path::PathBuf};
+
+use aletheia_egregore::{
+    EdgeLabel, EvidenceLink, GraphRecord, NodeKind, SourceSpan,
+    ir::{
+        AGENT_MEMORY_SCHEMA_VERSION, Graph, OutputHandle, PROJECT_SCHEMA_VERSION,
+        VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id, project_stable_id, stable_id,
+        verification_stable_id,
+    },
+};
+use assert_cmd::Command;
+
+fn egregore() -> Command {
+    Command::cargo_bin("egregore").expect("binary should run")
+}
+
+const fn span(start_line: usize, end_line: usize) -> SourceSpan {
+    SourceSpan {
+        start_byte: 0,
+        end_byte: 100,
+        start_line,
+        end_line,
+    }
+}
+
+/// Sentinel payloads that must NEVER appear in audit output (AC9).
+const RAW_STDOUT_SENTINEL: &str = "RAW_STDOUT_SHOULD_NOT_LEAK";
+const RAW_PATCH_SENTINEL: &str = "RAW_PATCH_SHOULD_NOT_LEAK";
+
+struct Fixture {
+    _temp: tempfile::TempDir,
+    graph: PathBuf,
+    claim_id: String,
+    contra_id: String,
+    decision_id: String,
+    stale_id: String,
+    source_artifact_path: String,
+}
+
+/// Seeds a graph JSONL fixture exercising every record class named in AC1:
+/// one verified observation (the claim), one unverified observation
+/// (contradicting), one decision (superseding), a contradiction, a
+/// supersession, a verification record, a task + acceptance criterion, a code
+/// file + symbol handle, a source artifact handle, and protected/redacted
+/// payloads.
+#[allow(clippy::too_many_lines)]
+fn seed() -> Fixture {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("memory_audit_seeded.jsonl");
+
+    let mut graph = Graph::new();
+
+    // ── Agent + session provenance ──────────────────────────────────────────
+    let agent_id = agent_memory_stable_id(&["node", "agent", "agent_1"]);
+    let mut agent = GraphRecord::node(
+        agent_id.clone(),
+        NodeKind::Agent,
+        None,
+        None,
+        Some("agent_1".to_owned()),
+        "Agent agent_1".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        agent_id: ref mut aid,
+        ..
+    } = agent
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *aid = Some("agent_1".to_owned());
+    }
+
+    let session_id = agent_memory_stable_id(&["node", "agent_session", "agent_1", "sess_1"]);
+    let mut session = GraphRecord::node(
+        session_id.clone(),
+        NodeKind::AgentSession,
+        None,
+        None,
+        Some("sess_1".to_owned()),
+        "Session sess_1 for agent agent_1".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        session_id: ref mut sid,
+        ..
+    } = session
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *sid = Some("sess_1".to_owned());
+    }
+
+    // ── Code handles ────────────────────────────────────────────────────────
+    let file_id = stable_id(&["node", "File", "src/lib.rs"]);
+    let file = GraphRecord::syntax_node(
+        file_id.clone(),
+        NodeKind::File,
+        "src/lib.rs".to_owned(),
+        span(1, 100),
+        "lib.rs".to_owned(),
+        "rust",
+        "Source file lib.rs".to_owned(),
+    );
+
+    let symbol_id = stable_id(&["node", "Symbol", "src/lib.rs", "foo"]);
+    let symbol = GraphRecord::syntax_node(
+        symbol_id.clone(),
+        NodeKind::Symbol,
+        "src/lib.rs".to_owned(),
+        span(10, 20),
+        "foo".to_owned(),
+        "rust",
+        "Symbol foo".to_owned(),
+    );
+
+    // ── Project handles ─────────────────────────────────────────────────────
+    let task_id = project_stable_id(&["task", "task_64"]);
+    let mut task = GraphRecord::node(
+        task_id.clone(),
+        NodeKind::Task,
+        None,
+        None,
+        Some("Expose memory evidence audit".to_owned()),
+        "Task #64".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut title,
+        ref mut schema_version,
+        ..
+    } = task
+    {
+        *title = Some("Expose memory evidence audit".to_owned());
+        *schema_version = PROJECT_SCHEMA_VERSION;
+    }
+
+    let ac_id = project_stable_id(&["acceptance_criterion", "ac_64_1"]);
+    let mut ac = GraphRecord::node(
+        ac_id.clone(),
+        NodeKind::AcceptanceCriterion,
+        None,
+        None,
+        Some("Audit returns deterministic JSON".to_owned()),
+        "AC 1".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut status,
+        ref mut parent_task_id,
+        ref mut schema_version,
+        ..
+    } = ac
+    {
+        *status = Some("verified".to_owned());
+        *parent_task_id = Some(task_id.clone());
+        *schema_version = PROJECT_SCHEMA_VERSION;
+    }
+
+    // ── Verification evidence (makes the claim "verified") ──────────────────
+    let ver_id = verification_stable_id(&["verification", "ver_64"]);
+    let mut ver = GraphRecord::node(
+        ver_id.clone(),
+        NodeKind::Verification,
+        None,
+        None,
+        None,
+        "Verification pass".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut status,
+        ref mut verification_kind,
+        ..
+    } = ver
+    {
+        *schema_version = VERIFICATION_SCHEMA_VERSION;
+        *status = Some("pass".to_owned());
+        *verification_kind = Some("command_run".to_owned());
+    }
+
+    // ── Protected command evidence (raw stdout must not leak) ───────────────
+    let cmd_id = verification_stable_id(&["command_evidence", "cmd_64"]);
+    let mut cmd = GraphRecord::node(
+        cmd_id.clone(),
+        NodeKind::CommandEvidence,
+        None,
+        None,
+        None,
+        "cargo test command evidence".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut stdout_handle,
+        ref mut evidence_quality,
+        ref mut source_artifact_path,
+        ..
+    } = cmd
+    {
+        *schema_version = VERIFICATION_SCHEMA_VERSION;
+        *stdout_handle = Some(Box::new(OutputHandle {
+            inline: Some(RAW_STDOUT_SENTINEL.to_owned()),
+            hash: "blake3:stdouthash".to_owned(),
+            bytes: 4096,
+        }));
+        *evidence_quality = Some("verbatim".to_owned());
+        *source_artifact_path = Some("ci/test.sh".to_owned());
+    }
+
+    // ── Protected patch artifact (raw patch bytes must not leak) ────────────
+    let patch_id = agent_memory_stable_id(&["artifact", "patch_64"]);
+    let mut patch_artifact = GraphRecord::node(
+        patch_id.clone(),
+        NodeKind::PatchArtifact,
+        None,
+        None,
+        None,
+        "Patch artifact for foo".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut patch_status,
+        ref mut patch_bytes_hash,
+        ref mut patch_handle,
+        ..
+    } = patch_artifact
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *patch_status = Some("valid".to_owned());
+        *patch_bytes_hash = Some("blake3:patchhash".to_owned());
+        *patch_handle = Some(Box::new(aletheia_egregore::ir::PatchHandle {
+            path: "protected/patch_64.patch".to_owned(),
+            inline: Some(RAW_PATCH_SENTINEL.to_owned()),
+        }));
+    }
+
+    // ── The memory claim: a verified Observation ────────────────────────────
+    let claim_id = agent_memory_stable_id(&["obs", "claim_64"]);
+    let missing_target = format!("agent_memory:v1:{}", "0".repeat(64));
+    let source_artifact_path = "trajectories/run-1.traj".to_owned();
+    let mut claim = GraphRecord::node(
+        claim_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Refactored foo for clarity".to_owned(),
+    );
+    let decision_id = agent_memory_stable_id(&["decision", "dec_64"]);
+    if let GraphRecord::Node {
+        ref mut text,
+        agent_id: ref mut aid,
+        ref mut agent_kind,
+        session_id: ref mut sid,
+        ref mut observed_at,
+        ref mut ingested_at,
+        ref mut confidence,
+        ref mut source_handle,
+        source_artifact_path: ref mut sap,
+        ref mut source_artifact_hash,
+        ref mut redaction_policy_version,
+        ref mut superseded_by,
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = claim
+    {
+        *text = Some("Refactored foo; secret was <REDACTED:secret:abcd1234>".to_owned());
+        *aid = Some("agent_1".to_owned());
+        *agent_kind = Some("claude-code".to_owned());
+        *sid = Some("sess_1".to_owned());
+        *observed_at = Some("2026-06-03T12:00:00Z".to_owned());
+        *ingested_at = Some("2026-06-03T12:00:01Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *source_handle = Some("src/lib.rs:sha256:deadbeef".to_owned());
+        *sap = Some(source_artifact_path.clone());
+        *source_artifact_hash = Some("blake3:trajhash1".to_owned());
+        *redaction_policy_version = Some("1".to_owned());
+        *superseded_by = Some(decision_id.clone());
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![
+            link(&file_id, "codegraph", "OBSERVES"),
+            link(&symbol_id, "codegraph", "MENTIONS_SYMBOL"),
+            link(&ver_id, "verification", "VALIDATED_BY"),
+            link(&cmd_id, "verification", "HAS_EVIDENCE"),
+            link(&task_id, "project", "REFERENCES_TASK"),
+            link(&patch_id, "artifact", "PRODUCED_PATCH"),
+            // Unresolved: target does not exist in the store (AC6).
+            link(&missing_target, "agent_memory", "RELATES_TO"),
+        ]);
+    }
+
+    // ── Contradicting record: an UNVERIFIED Observation ─────────────────────
+    let contra_id = agent_memory_stable_id(&["obs", "contra_64"]);
+    let mut contra = GraphRecord::node(
+        contra_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "foo refactor introduced a regression".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut text,
+        agent_id: ref mut aid,
+        session_id: ref mut sid,
+        ref mut observed_at,
+        ref mut confidence,
+        ref mut source_handle,
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = contra
+    {
+        *text = Some("foo refactor introduced a regression".to_owned());
+        *aid = Some("agent_2".to_owned());
+        *sid = Some("sess_2".to_owned());
+        *observed_at = Some("2026-06-04T09:00:00Z".to_owned());
+        *confidence = Some("0.6".to_owned());
+        *source_handle = Some("trajectories/run-2.traj".to_owned());
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        // Only cites code — no verification backing, so it is UNVERIFIED.
+        *evidence_links = Some(vec![link(&file_id, "codegraph", "OBSERVES")]);
+    }
+
+    // ── Superseding record: a verified Decision ─────────────────────────────
+    let mut decision = GraphRecord::node(
+        decision_id.clone(),
+        NodeKind::Decision,
+        None,
+        None,
+        None,
+        "Adopt foo refactor as the canonical implementation".to_owned(),
+    );
+    if let GraphRecord::Node {
+        agent_id: ref mut aid,
+        session_id: ref mut sid,
+        ref mut observed_at,
+        ref mut confidence,
+        ref mut source_handle,
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = decision
+    {
+        *aid = Some("agent_1".to_owned());
+        *sid = Some("sess_1".to_owned());
+        *observed_at = Some("2026-06-05T09:00:00Z".to_owned());
+        *confidence = Some("0.95".to_owned());
+        *source_handle = Some("trajectories/run-3.traj".to_owned());
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![link(&ver_id, "verification", "VALIDATED_BY")]);
+    }
+
+    // ── Edges ───────────────────────────────────────────────────────────────
+    let authored_by = GraphRecord::edge(
+        EdgeLabel::AuthoredBy,
+        claim_id.clone(),
+        session_id.clone(),
+        None,
+        "claim authored by session".to_owned(),
+    );
+    let session_of = GraphRecord::edge(
+        EdgeLabel::SessionOf,
+        session_id,
+        agent_id,
+        None,
+        "session of agent".to_owned(),
+    );
+    let contradicts = GraphRecord::edge(
+        EdgeLabel::Contradicts,
+        contra_id.clone(),
+        claim_id.clone(),
+        Some("0.6".to_owned()),
+        "contra contradicts claim".to_owned(),
+    );
+    let supersedes = GraphRecord::edge(
+        EdgeLabel::Supersedes,
+        decision_id.clone(),
+        claim_id.clone(),
+        None,
+        "decision supersedes claim".to_owned(),
+    );
+    let closes = GraphRecord::edge(
+        EdgeLabel::ClosesAcceptanceCriterion,
+        ac_id,
+        ver_id,
+        None,
+        "AC closed by verification".to_owned(),
+    );
+
+    // ── A tombstoned (stale) memory id ──────────────────────────────────────
+    let stale_id = agent_memory_stable_id(&["obs", "stale_64"]);
+    let tombstone = GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &stale_id]),
+        schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+        deleted_id: stale_id.clone(),
+        summary: "deleted stale observation".to_owned(),
+        producer: None,
+    };
+
+    graph.push(agent);
+    graph.push(session);
+    graph.push(file);
+    graph.push(symbol);
+    graph.push(task);
+    graph.push(ac);
+    graph.push(ver);
+    graph.push(cmd);
+    graph.push(patch_artifact);
+    graph.push(claim);
+    graph.push(contra);
+    graph.push(decision);
+    graph.push(authored_by);
+    graph.push(session_of);
+    graph.push(contradicts);
+    graph.push(supersedes);
+    graph.push(closes);
+    graph.push(tombstone);
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    Fixture {
+        _temp: temp,
+        graph: path,
+        claim_id,
+        contra_id,
+        decision_id,
+        stale_id,
+        source_artifact_path,
+    }
+}
+
+fn link(target: &str, domain: &str, relation: &str) -> EvidenceLink {
+    EvidenceLink {
+        target_record_id: Some(target.to_owned()),
+        target_domain: domain.to_owned(),
+        relation: relation.to_owned(),
+        confidence: "1.0".to_owned(),
+        as_of_commit: None,
+        target_repo_relative_path: None,
+        target_span: None,
+        target_git_commit: None,
+    }
+}
+
+fn run_audit(fx: &Fixture, extra: &[&str]) -> (i32, String, String) {
+    let args = vec!["query", "memory", fx.claim_id.as_str(), "--graph"];
+    let assert = egregore().args(&args).arg(&fx.graph).args(extra).assert();
+    let output = assert.get_output().clone();
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8(output.stdout).expect("utf8"),
+        String::from_utf8(output.stderr).expect("utf8"),
+    )
+}
+
+#[test]
+fn audit_by_canonical_id_separates_trust_classes() {
+    let fx = seed();
+    let (code, stdout, _stderr) = run_audit(&fx, &[]);
+    assert_eq!(code, 0, "stdout={stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["memory_id"], fx.claim_id);
+
+    // Memory claim is present and tagged as an agent-authored claim — never
+    // source truth (AC3).
+    let claim = v["memory_claim"].as_array().expect("claim array");
+    assert_eq!(claim.len(), 1);
+    assert_eq!(claim[0]["record_id"], fx.claim_id);
+    assert_eq!(claim[0]["trust_class"], "agent_authored");
+
+    // Direct provenance carries citable handles (AC3, AC4).
+    let provenance = &v["direct_provenance"];
+    assert_eq!(provenance["agent_id"], "agent_1");
+    assert_eq!(provenance["session_id"], "sess_1");
+    assert_eq!(provenance["source_handle"], "src/lib.rs:sha256:deadbeef");
+
+    // Related code handles (AC3): file + symbol, tagged source_fact.
+    let code_handles = v["related_code_handles"].as_array().expect("code handles");
+    assert!(
+        code_handles
+            .iter()
+            .any(|h| h["repo_relative_path"] == "src/lib.rs")
+    );
+    assert!(
+        code_handles
+            .iter()
+            .all(|h| h["trust_class"] == "source_fact")
+    );
+
+    // Related project handles (AC3): the task.
+    let projects = v["related_project_handles"].as_array().expect("project");
+    assert!(projects.iter().any(|h| h["kind"] == "Task"));
+
+    // Verification evidence (AC3): the Verification record.
+    let ver = v["verification_evidence"].as_array().expect("verification");
+    assert!(ver.iter().any(|h| h["kind"] == "Verification"));
+
+    // Contradicting evidence (AC3, AC7): the unverified observation, separate.
+    let contra = v["contradicting_evidence"].as_array().expect("contra");
+    assert_eq!(contra.len(), 1);
+    assert_eq!(contra[0]["record_id"], fx.contra_id);
+
+    // Superseding record (AC7): the decision, as a separate audit item.
+    let sup = v["superseding_records"].as_array().expect("superseding");
+    assert!(sup.iter().any(|h| h["record_id"] == fx.decision_id));
+
+    // Unresolved evidence link surfaced as a diagnostic with its source handle (AC6).
+    let diags = v["diagnostics"].as_array().expect("diagnostics");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d["code"] == "unresolved_evidence_link"),
+        "diagnostics={diags:?}"
+    );
+
+    // Pagination block present and deterministic (AC8).
+    assert_eq!(v["page"]["has_more"], false);
+}
+
+#[test]
+fn audit_never_emits_raw_payloads() {
+    let fx = seed();
+    let (code, stdout, _stderr) = run_audit(&fx, &[]);
+    assert_eq!(code, 0);
+    assert!(
+        !stdout.contains(RAW_STDOUT_SENTINEL),
+        "raw stdout leaked: {stdout}"
+    );
+    assert!(
+        !stdout.contains(RAW_PATCH_SENTINEL),
+        "raw patch leaked: {stdout}"
+    );
+    // Protected payloads are still acknowledged via diagnostics carrying hashes.
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let diags = v["diagnostics"].as_array().expect("diagnostics");
+    assert!(diags.iter().any(|d| d["code"] == "protected_payload"));
+}
+
+#[test]
+fn audit_resolves_source_artifact_handle() {
+    let fx = seed();
+    let output = egregore()
+        .args(["query", "memory", &fx.source_artifact_path, "--graph"])
+        .arg(&fx.graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["memory_id"], fx.claim_id);
+}
+
+#[test]
+fn audit_verified_only_excludes_unverified_observations() {
+    let fx = seed();
+    let (code, stdout, _stderr) = run_audit(&fx, &["--verified-only"]);
+    assert_eq!(code, 0, "stdout={stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    // The unverified contradicting observation is excluded from its section …
+    let contra = v["contradicting_evidence"].as_array().expect("contra");
+    assert!(contra.is_empty(), "unverified contra should be excluded");
+
+    // … but reported in `excluded`, never silently dropped (AC5).
+    let excluded = v["excluded"].as_array().expect("excluded");
+    assert!(
+        excluded
+            .iter()
+            .any(|e| e["record_id"] == fx.contra_id && e["reason"] == "unverified_observation"),
+        "excluded={excluded:?}"
+    );
+
+    // The verified superseding decision survives the filter.
+    let sup = v["superseding_records"].as_array().expect("superseding");
+    assert!(sup.iter().any(|h| h["record_id"] == fx.decision_id));
+}
+
+#[test]
+fn audit_unsupported_handle_exits_1() {
+    let fx = seed();
+    let assert = egregore()
+        .args(["query", "memory", "agent_memory:v1:nothex", "--graph"])
+        .arg(&fx.graph)
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("utf8");
+    assert!(stderr.contains("Unsupported"), "stderr={stderr}");
+}
+
+#[test]
+fn audit_ambiguous_handle_exits_1() {
+    // The fixture's Agent authored two claims (the verified observation and the
+    // decision), so resolving by the Agent's canonical ID is ambiguous (AC2).
+    let fx = seed();
+    let agent_id = agent_memory_stable_id(&["node", "agent", "agent_1"]);
+    let assert = egregore()
+        .args(["query", "memory", &agent_id, "--graph"])
+        .arg(&fx.graph)
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("utf8");
+    assert!(stderr.contains("Ambiguous"), "stderr={stderr}");
+}
+
+#[test]
+fn audit_missing_handle_exits_2() {
+    let fx = seed();
+    let absent = format!("agent_memory:v1:{}", "a".repeat(64));
+    let assert = egregore()
+        .args(["query", "memory", &absent, "--graph"])
+        .arg(&fx.graph)
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "no_match");
+}
+
+#[test]
+fn audit_stale_handle_reports_stale_diagnostic() {
+    let fx = seed();
+    let assert = egregore()
+        .args(["query", "memory", &fx.stale_id, "--graph"])
+        .arg(&fx.graph)
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "stale_handle");
+    assert_eq!(v["error"]["memory_handle"], fx.stale_id);
+}
+
+#[test]
+fn audit_is_deterministic_across_runs() {
+    let fx = seed();
+    let (_c0, first, _e0) = run_audit(&fx, &[]);
+    for _ in 0..4 {
+        let (_c, again, _e) = run_audit(&fx, &[]);
+        assert_eq!(first, again, "audit output is not deterministic");
+    }
+}

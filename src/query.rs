@@ -1,7 +1,7 @@
 //! Agent-facing graph query helpers.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::DateTime;
 
@@ -1847,4 +1847,600 @@ pub fn task_evidence_context<'a>(
             u
         },
     }
+}
+
+// ── Memory Evidence Audit Queries (Issue #64) ──────────────────────────────────
+
+/// Error returned when resolving a memory record ID or source/session handle.
+///
+/// Mirrors [`TaskResolveError`]: `Ambiguous` and `Unsupported` are the two
+/// machine-readable, non-network failure modes. "Missing" (no match) and
+/// "stale" (tombstoned) handles are surfaced by the CLI layer as `no_match` /
+/// `stale_handle` envelopes, since both are about store state rather than the
+/// handle's syntax.
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum MemoryResolveError {
+    /// The handle resolves to more than one distinct memory claim.
+    Ambiguous {
+        /// The query handle.
+        handle: String,
+        /// The list of matched memory record IDs (canonical-sorted).
+        candidates: Vec<String>,
+    },
+    /// The handle is empty or a malformed canonical agent-memory ID.
+    Unsupported {
+        /// The query handle.
+        handle: String,
+        /// Why the handle is unsupported.
+        message: String,
+    },
+}
+
+/// One stable, machine-readable diagnostic emitted by a memory audit.
+///
+/// Every diagnostic carries the original source handle so an operator can
+/// follow it without the audit inferring a replacement (AC6).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MemoryAuditDiagnostic {
+    /// Stable diagnostic code (e.g. `unresolved_evidence_link`).
+    pub code: String,
+    /// Record ID of the node that carries the issue.
+    pub source_record_id: String,
+    /// Original handle (record ID, path, or hash) — never an inferred value.
+    pub target_handle: String,
+    /// Relation that produced the handle, when applicable.
+    pub relation: String,
+    /// Target domain string, when applicable.
+    pub target_domain: String,
+}
+
+/// One evidence record reached from the audited memory claim, with the
+/// relation (edge label / evidence-link relation) that connected it.
+#[derive(Debug, Clone)]
+pub struct MemoryEvidenceItem<'a> {
+    /// The reached graph record.
+    pub record: &'a GraphRecord,
+    /// The relation that connected it to the claim (e.g. `CONTRADICTS`).
+    pub relation: String,
+}
+
+/// Structured memory evidence audit returned by [`memory_audit_context`].
+///
+/// Sections keep trust classes separate so an agent-authored claim is never
+/// presented as source truth or proof by itself (AC3). Every section is
+/// canonically ordered by record ID for determinism (AC8).
+#[derive(Debug, Default, Clone)]
+pub struct MemoryAuditContext<'a> {
+    /// The queried memory record ID.
+    pub memory_id: String,
+    /// The agent-authored claim node(s) under audit.
+    pub memory_claim: Vec<&'a GraphRecord>,
+    /// `AgentSession` provenance node(s) linked via `AUTHORED_BY`.
+    pub agent_sessions: Vec<&'a GraphRecord>,
+    /// `Agent` provenance node(s) linked via `SESSION_OF`.
+    pub agents: Vec<&'a GraphRecord>,
+    /// Supporting evidence that is neither code, project, nor verification
+    /// (artifacts, command evidence, other supporting memory).
+    pub supporting_evidence: Vec<MemoryEvidenceItem<'a>>,
+    /// Records connected to the claim via `CONTRADICTS` (either direction).
+    pub contradicting_evidence: Vec<MemoryEvidenceItem<'a>>,
+    /// Records that supersede the claim (`SUPERSEDES` / `superseded_by`).
+    pub superseding_records: Vec<MemoryEvidenceItem<'a>>,
+    /// Code-graph `File` / `Symbol` handles cited by the claim.
+    pub related_code_handles: Vec<MemoryEvidenceItem<'a>>,
+    /// Project-domain `Task` / `AcceptanceCriterion` handles cited by the claim.
+    pub related_project_handles: Vec<MemoryEvidenceItem<'a>>,
+    /// Verification-domain evidence cited by the claim.
+    pub verification_evidence: Vec<MemoryEvidenceItem<'a>>,
+    /// Stable diagnostics (unresolved links, triple-only targets, etc.).
+    pub diagnostics: Vec<MemoryAuditDiagnostic>,
+    /// Records excluded by `--verified-only`, reported rather than dropped (AC5).
+    pub excluded: Vec<MemoryEvidenceItem<'a>>,
+}
+
+impl MemoryAuditContext<'_> {
+    /// Returns `true` when no claim matching the queried ID exists in the store.
+    #[must_use]
+    pub const fn is_no_match(&self) -> bool {
+        self.memory_claim.is_empty()
+    }
+}
+
+const fn is_verification_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Verification
+            | NodeKind::CommandEvidence
+            | NodeKind::TestRun
+            | NodeKind::CommandRun
+            | NodeKind::CIStatus
+            | NodeKind::BenchmarkRun
+            | NodeKind::CoverageReport
+            | NodeKind::ProofResult
+    )
+}
+
+const fn is_codegraph_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::File
+            | NodeKind::Symbol
+            | NodeKind::Module
+            | NodeKind::Import
+            | NodeKind::Commit
+            | NodeKind::Change
+            | NodeKind::Repository
+    )
+}
+
+const fn is_project_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Task
+            | NodeKind::AcceptanceCriterion
+            | NodeKind::LocalTask
+            | NodeKind::GitHubIssue
+            | NodeKind::PR
+            | NodeKind::Review
+            | NodeKind::ExternalLink
+            | NodeKind::Product
+            | NodeKind::Project
+            | NodeKind::Plan
+    )
+}
+
+/// An agent-authored claim shape eligible for the memory audit subject and for
+/// the unverified-observation exclusion filter.
+const fn is_agent_claim_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Observation | NodeKind::Decision | NodeKind::Failure
+    )
+}
+
+const fn record_node_kind(record: &GraphRecord) -> Option<NodeKind> {
+    match record {
+        GraphRecord::Node { kind, .. } => Some(*kind),
+        _ => None,
+    }
+}
+
+/// A claim is **verified** when it cites at least one present verification-domain
+/// record through an evidence link (`VALIDATED_BY`, `HAS_EVIDENCE`,
+/// `PRODUCED_EVIDENCE`) or an equivalent outgoing edge. This is a structural,
+/// non-inferential rule over existing contracts — not a truth judgement.
+fn is_verified_claim(
+    record: &GraphRecord,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+    edges_from: &BTreeMap<&str, Vec<(&EdgeLabel, &str)>>,
+) -> bool {
+    if let GraphRecord::Node {
+        evidence_links: Some(links),
+        ..
+    } = record
+    {
+        for link in links {
+            let backed = matches!(
+                link.relation.as_str(),
+                "VALIDATED_BY" | "HAS_EVIDENCE" | "PRODUCED_EVIDENCE"
+            ) || link.target_domain == "verification";
+            if backed
+                && let Some(target_id) = link.target_record_id.as_deref()
+                && let Some(target) = by_id.get(target_id)
+                && record_node_kind(target).is_some_and(is_verification_kind)
+            {
+                return true;
+            }
+        }
+    }
+    if let Some(out) = edges_from.get(record.id()) {
+        for (label, target) in out {
+            let backed = matches!(
+                label,
+                EdgeLabel::ValidatedBy | EdgeLabel::HasEvidence | EdgeLabel::ProducedEvidence
+            );
+            if backed
+                && let Some(target) = by_id.get(*target)
+                && record_node_kind(target).is_some_and(is_verification_kind)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Resolves a memory record ID or source/session handle to canonical claim IDs.
+///
+/// Supported handle types (AC2):
+/// 1. A canonical memory record ID (`agent_memory:v1:<64-hex>`). When it names
+///    an `AgentSession` or `Agent`, every claim authored in that scope is
+///    collected.
+/// 2. A source artifact / session handle: a string matching a claim node's
+///    `source_handle`, `source_artifact_path`, `source_artifact_hash`, or
+///    `session_id`.
+///
+/// # Errors
+///
+/// Returns [`MemoryResolveError::Unsupported`] for an empty or malformed
+/// canonical ID, and [`MemoryResolveError::Ambiguous`] when the handle resolves
+/// to more than one distinct claim.
+pub fn resolve_memory_ids(
+    records: &[GraphRecord],
+    handle: &str,
+) -> Result<BTreeSet<String>, MemoryResolveError> {
+    if handle.is_empty() {
+        return Err(MemoryResolveError::Unsupported {
+            handle: handle.to_owned(),
+            message: "handle cannot be empty".to_owned(),
+        });
+    }
+
+    let mut matched: BTreeSet<String> = BTreeSet::new();
+
+    if let Some(rest) = handle.strip_prefix("agent_memory:v1:") {
+        let is_valid = rest.len() == 64 && rest.chars().all(|c| c.is_ascii_hexdigit());
+        if !is_valid {
+            return Err(MemoryResolveError::Unsupported {
+                handle: handle.to_owned(),
+                message: "malformed canonical agent-memory ID".to_owned(),
+            });
+        }
+        // Find the node carrying this ID.
+        let mut subject_kind = None;
+        let mut subject_name = None;
+        for r in records {
+            if let GraphRecord::Node { id, kind, name, .. } = r
+                && id == handle
+            {
+                subject_kind = Some(*kind);
+                subject_name.clone_from(name);
+            }
+        }
+        match subject_kind {
+            Some(kind) if is_agent_claim_kind(kind) => {
+                matched.insert(handle.to_owned());
+            }
+            Some(NodeKind::AgentSession) => {
+                let session_name = subject_name.as_deref();
+                for r in records {
+                    if let GraphRecord::Node {
+                        id,
+                        kind,
+                        session_id: Some(sid),
+                        ..
+                    } = r
+                        && is_agent_claim_kind(*kind)
+                        && Some(sid.as_str()) == session_name
+                    {
+                        matched.insert(id.clone());
+                    }
+                }
+            }
+            Some(NodeKind::Agent) => {
+                let agent_name = subject_name.as_deref();
+                for r in records {
+                    if let GraphRecord::Node {
+                        id,
+                        kind,
+                        agent_id: Some(aid),
+                        ..
+                    } = r
+                        && is_agent_claim_kind(*kind)
+                        && Some(aid.as_str()) == agent_name
+                    {
+                        matched.insert(id.clone());
+                    }
+                }
+            }
+            // Present but not an auditable claim, or absent entirely: leave the
+            // set empty so the caller emits a `no_match` envelope.
+            _ => {}
+        }
+    } else {
+        // Source artifact / session handle.
+        for r in records {
+            if let GraphRecord::Node {
+                id,
+                kind,
+                session_id,
+                source_handle,
+                source_artifact_path,
+                source_artifact_hash,
+                ..
+            } = r
+                && is_agent_claim_kind(*kind)
+                && (source_handle.as_deref() == Some(handle)
+                    || source_artifact_path.as_deref() == Some(handle)
+                    || source_artifact_hash.as_deref() == Some(handle)
+                    || session_id.as_deref() == Some(handle))
+            {
+                matched.insert(id.clone());
+            }
+        }
+    }
+
+    if matched.len() > 1 {
+        return Err(MemoryResolveError::Ambiguous {
+            handle: handle.to_owned(),
+            candidates: matched.into_iter().collect(),
+        });
+    }
+
+    Ok(matched)
+}
+
+/// Section a reached evidence record belongs to.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AuditSection {
+    Supporting,
+    Code,
+    Project,
+    Verification,
+}
+
+const fn classify_audit_target(kind: NodeKind) -> AuditSection {
+    if is_verification_kind(kind) {
+        AuditSection::Verification
+    } else if is_codegraph_kind(kind) {
+        AuditSection::Code
+    } else if is_project_kind(kind) {
+        AuditSection::Project
+    } else {
+        AuditSection::Supporting
+    }
+}
+
+/// Builds the evidence audit for a resolved memory claim ID.
+///
+/// The traversal reads only existing contracts (evidence links + cross-domain
+/// edges) and never reads raw transcript bodies or infers replacements for
+/// missing handles (AC6, AC11). When `verified_only` is set, unverified
+/// agent-authored records are moved out of their sections into `excluded`
+/// rather than silently dropped (AC5).
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn memory_audit_context<'a>(
+    records: &'a [GraphRecord],
+    memory_id: &str,
+    verified_only: bool,
+) -> MemoryAuditContext<'a> {
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+
+    // Outgoing edges keyed by source ID, for verification detection.
+    let mut edges_from: BTreeMap<&str, Vec<(&EdgeLabel, &str)>> = BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Edge {
+            label,
+            source,
+            target,
+            ..
+        } = r
+        {
+            edges_from
+                .entry(source.as_str())
+                .or_default()
+                .push((label, target.as_str()));
+        }
+    }
+
+    let claim_nodes: Vec<&GraphRecord> = records
+        .iter()
+        .filter(|r| matches!(r, GraphRecord::Node { id, .. } if id == memory_id))
+        .collect();
+
+    let mut ctx = MemoryAuditContext {
+        memory_id: memory_id.to_owned(),
+        memory_claim: claim_nodes.clone(),
+        ..Default::default()
+    };
+
+    if claim_nodes.is_empty() {
+        return ctx;
+    }
+
+    // Dedupe maps keyed by record ID; relation is the first one observed.
+    let mut supporting: BTreeMap<&str, MemoryEvidenceItem<'a>> = BTreeMap::new();
+    let mut contradicting: BTreeMap<&str, MemoryEvidenceItem<'a>> = BTreeMap::new();
+    let mut superseding: BTreeMap<&str, MemoryEvidenceItem<'a>> = BTreeMap::new();
+    let mut code: BTreeMap<&str, MemoryEvidenceItem<'a>> = BTreeMap::new();
+    let mut project: BTreeMap<&str, MemoryEvidenceItem<'a>> = BTreeMap::new();
+    let mut verification: BTreeMap<&str, MemoryEvidenceItem<'a>> = BTreeMap::new();
+    let mut sessions: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
+    let mut agents: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
+    let mut diagnostics: Vec<MemoryAuditDiagnostic> = Vec::new();
+
+    let mut place = |target: &'a GraphRecord, relation: &str| {
+        let Some(kind) = record_node_kind(target) else {
+            return;
+        };
+        let item = MemoryEvidenceItem {
+            record: target,
+            relation: relation.to_owned(),
+        };
+        match classify_audit_target(kind) {
+            AuditSection::Verification => {
+                verification.entry(target.id()).or_insert(item);
+            }
+            AuditSection::Code => {
+                code.entry(target.id()).or_insert(item);
+            }
+            AuditSection::Project => {
+                project.entry(target.id()).or_insert(item);
+            }
+            AuditSection::Supporting => {
+                supporting.entry(target.id()).or_insert(item);
+            }
+        }
+    };
+
+    for claim in &claim_nodes {
+        // 1) Denormalized evidence links on the claim node.
+        if let GraphRecord::Node {
+            evidence_links: Some(links),
+            superseded_by,
+            ..
+        } = claim
+        {
+            for link in links {
+                if let Some(target_id) = link.target_record_id.as_deref() {
+                    match by_id.get(target_id) {
+                        Some(target) => place(target, &link.relation),
+                        None => diagnostics.push(MemoryAuditDiagnostic {
+                            code: "unresolved_evidence_link".to_owned(),
+                            source_record_id: memory_id.to_owned(),
+                            target_handle: target_id.to_owned(),
+                            relation: link.relation.clone(),
+                            target_domain: link.target_domain.clone(),
+                        }),
+                    }
+                } else {
+                    // Triple-only target: do not resolve heuristically (AC6).
+                    let handle = link
+                        .target_repo_relative_path
+                        .clone()
+                        .unwrap_or_else(|| "<triple>".to_owned());
+                    diagnostics.push(MemoryAuditDiagnostic {
+                        code: "evidence_target_unresolved".to_owned(),
+                        source_record_id: memory_id.to_owned(),
+                        target_handle: handle,
+                        relation: link.relation.clone(),
+                        target_domain: link.target_domain.clone(),
+                    });
+                }
+            }
+            // 2) Supersession declared inline on the claim.
+            if let Some(sup_id) = superseded_by
+                && let Some(target) = by_id.get(sup_id.as_str())
+            {
+                superseding
+                    .entry(target.id())
+                    .or_insert_with(|| MemoryEvidenceItem {
+                        record: target,
+                        relation: "SUPERSEDED_BY".to_owned(),
+                    });
+            }
+        }
+
+        // 3) Edges touching the claim node.
+        for r in records {
+            let GraphRecord::Edge {
+                label,
+                source,
+                target,
+                ..
+            } = r
+            else {
+                continue;
+            };
+            let claim_id = claim.id();
+            if source == claim_id {
+                let Some(other) = by_id.get(target.as_str()) else {
+                    continue;
+                };
+                match label {
+                    EdgeLabel::Contradicts => {
+                        contradicting
+                            .entry(other.id())
+                            .or_insert_with(|| MemoryEvidenceItem {
+                                record: other,
+                                relation: "CONTRADICTS".to_owned(),
+                            });
+                    }
+                    EdgeLabel::AuthoredBy => {
+                        sessions.entry(other.id()).or_insert(*other);
+                    }
+                    EdgeLabel::HasEvidence
+                    | EdgeLabel::ValidatedBy
+                    | EdgeLabel::Observes
+                    | EdgeLabel::MentionsSymbol
+                    | EdgeLabel::TouchedFile
+                    | EdgeLabel::FailedOn
+                    | EdgeLabel::ReferencesTask
+                    | EdgeLabel::ExplainsChange
+                    | EdgeLabel::ProducedPatch
+                    | EdgeLabel::ProducedEvidence => place(other, label.as_str()),
+                    _ => {}
+                }
+            } else if target == claim_id {
+                let Some(other) = by_id.get(source.as_str()) else {
+                    continue;
+                };
+                match label {
+                    EdgeLabel::Contradicts => {
+                        contradicting
+                            .entry(other.id())
+                            .or_insert_with(|| MemoryEvidenceItem {
+                                record: other,
+                                relation: "CONTRADICTS".to_owned(),
+                            });
+                    }
+                    EdgeLabel::Supersedes => {
+                        superseding
+                            .entry(other.id())
+                            .or_insert_with(|| MemoryEvidenceItem {
+                                record: other,
+                                relation: "SUPERSEDES".to_owned(),
+                            });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Resolve Agent provenance from each session via SESSION_OF.
+    let session_ids: Vec<&str> = sessions.keys().copied().collect();
+    for sid in session_ids {
+        if let Some(out) = edges_from.get(sid) {
+            for (label, target) in out {
+                if matches!(label, EdgeLabel::SessionOf)
+                    && let Some(agent) = by_id.get(*target)
+                {
+                    agents.entry(agent.id()).or_insert(*agent);
+                }
+            }
+        }
+    }
+
+    // verified-only filter: move unverified agent-authored records to `excluded`.
+    let mut excluded: BTreeMap<&str, MemoryEvidenceItem<'a>> = BTreeMap::new();
+    if verified_only {
+        for map in [&mut contradicting, &mut superseding, &mut supporting] {
+            let drop_ids: Vec<&str> = map
+                .iter()
+                .filter(|(_, item)| {
+                    record_node_kind(item.record).is_some_and(is_agent_claim_kind)
+                        && !is_verified_claim(item.record, &by_id, &edges_from)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            for id in drop_ids {
+                if let Some(item) = map.remove(id) {
+                    excluded.entry(id).or_insert(item);
+                }
+            }
+        }
+    }
+
+    diagnostics.sort_by(|a, b| {
+        a.code
+            .cmp(&b.code)
+            .then_with(|| a.source_record_id.cmp(&b.source_record_id))
+            .then_with(|| a.target_handle.cmp(&b.target_handle))
+            .then_with(|| a.relation.cmp(&b.relation))
+    });
+    diagnostics.dedup();
+
+    ctx.agent_sessions = sessions.into_values().collect();
+    ctx.agents = agents.into_values().collect();
+    ctx.supporting_evidence = supporting.into_values().collect();
+    ctx.contradicting_evidence = contradicting.into_values().collect();
+    ctx.superseding_records = superseding.into_values().collect();
+    ctx.related_code_handles = code.into_values().collect();
+    ctx.related_project_handles = project.into_values().collect();
+    ctx.verification_evidence = verification.into_values().collect();
+    ctx.excluded = excluded.into_values().collect();
+    ctx.diagnostics = diagnostics;
+    ctx
 }
