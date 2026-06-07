@@ -273,6 +273,12 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                     target_id
                 )
             })?;
+            if session_id_str.is_empty() {
+                return Err(anyhow!(
+                    "supporting_evidence.session_id is required for evidence target '{}'",
+                    target_id
+                ));
+            }
             if unique_supporting_targets.insert(target_id) {
                 sessions.insert(session_id_str.to_owned());
             }
@@ -364,6 +370,24 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
             if target_kind != NodeKind::PromoteCandidate {
                 return Err(anyhow!(
                     "superseded candidate '{}' is not a PromoteCandidate node",
+                    rejected_id
+                ));
+            }
+            let has_rejection = records.iter().any(|r| match r {
+                GraphRecord::Node {
+                    kind: NodeKind::PromotionDecision,
+                    user_context,
+                    ..
+                } => {
+                    user_context.candidate_id.as_deref() == Some(rejected_id)
+                        && user_context.outcome.as_deref() == Some("rejected")
+                }
+                _ => false,
+            });
+            if !has_rejection {
+                return Err(anyhow!(
+                    "PromoteCandidate '{}' superseded_by '{}' must reference a rejected candidate",
+                    req.candidate_id,
                     rejected_id
                 ));
             }
