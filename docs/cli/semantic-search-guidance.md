@@ -4,6 +4,23 @@
 
 Use semantic search when you need to find code by **meaning** rather than by exact names — when you know the concept but not the symbol or file name.
 
+## Embedded vs. Daemon-Backed (`--daemon`)
+
+`eg query semantic` has two transports over the **same** ranking behavior:
+
+- **Embedded (default):** `eg query semantic "<query>" --data-dir .egregore` opens the store directly. Best for one-off, exclusive work where no daemon is running.
+- **Daemon-backed:** `eg query semantic "<query>" --daemon --data-dir .egregore` routes the query through the running Egregore daemon. Prefer this in **multi-agent** operation: the daemon is the one shared local owner of the store, so the query honors daemon discovery, token checks, and a consistent snapshot instead of bypassing them with a direct read.
+
+Both embed the query text locally with the same model and run the same vector search, so for a fixed store and query they return the **same top-k record IDs in the same order** (scores agree within a tight tolerance). The daemon path sends only the resulting query vector to the daemon — no embedding model is loaded daemon-side, no remote service is contacted, and there is no background indexing.
+
+Daemon-backed results are still **retrieval leads, not proof**: each row carries a `record_id`, `score`, `repo_relative_path`, and `span` (omitted when the node has none), and nothing else. They are not verification evidence, task completion, source truth beyond deterministic code facts, or agent memory.
+
+Stable diagnostics make failures actionable rather than silent: a missing daemon or stale runtime metadata is reported by daemon discovery before the query runs; an un-embedded store returns `missing_semantic_index`; a mismatched vector returns `incompatible_embedding_dimension`; an empty result is a clean no-match, never a fallback to a direct embedded read. The full verb contract is in [`docs/schema/daemon-query.md`](../schema/daemon-query.md).
+
+### Relationship to issue #58 (relevance gate)
+
+This workflow makes daemon-backed semantic search **available and deterministic** — it does not decide whether the results are *good enough to trust*. Issue **#58** owns relevance calibration: the checked-in corpus and the `eg eval-semantic` top-3 recall gate measure retrieval quality. Use the corpus gate to judge accuracy; use this guidance to choose the transport and to remember that a high score is a lead to confirm, not an answer.
+
 ### Good use cases
 
 - **Concept terms absent from symbol names**: "where does the tool measure similarity between code versions" finds `cosine_distance` even though "measure similarity" appears nowhere in the function name.
@@ -25,6 +42,10 @@ Use `eg query symbol <name>` when:
 
 - You know the symbol name and want the graph record handle and provenance.
 - You need the span (line range) for a specific function or struct.
+
+Use `eg query file <path>` when:
+
+- You know the file and want every symbol it defines, with record handles — a structural listing, not a ranked approximation.
 
 ## How to Run the Relevance Corpus
 

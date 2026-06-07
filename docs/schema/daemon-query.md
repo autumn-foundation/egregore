@@ -112,10 +112,12 @@ Error responses follow the standard envelope in
 
 | Code                    | HTTP | When |
 |-------------------------|------|------|
-| `missing_field`         | 400  | `verb` is absent or blank |
-| `bad_request`           | 400  | Unknown verb, or required `params` field missing |
+| `missing_field`         | 400  | `verb` is absent or blank; or `semantic_search` called without `params.query_vector` |
+| `bad_request`           | 400  | Unknown verb, or required `params` field missing or malformed |
 | `ambiguous_commit_prefix` | 400 | `symbol_at_commit` prefix matches > 1 commit |
-| `not_implemented`       | 501  | Reserved verb, or `as_of.transaction_time` / `as_of.since` set |
+| `missing_semantic_index` | 422 | `semantic_search` against a store with no embedding index (re-ingest with `--embed`) |
+| `incompatible_embedding_dimension` | 422 | `semantic_search` query vector width disagrees with the store's index |
+| `not_implemented`       | 501  | Reserved verb; `as_of.transaction_time` / `as_of.since` set; or `semantic_search` on a daemon built without the `embeddings` feature |
 | `query_timeout`         | 408  | Budget `timeout_ms` elapsed |
 | `internal_error`        | 500  | Store read failed |
 
@@ -130,6 +132,7 @@ Error responses follow the standard envelope in
 | `symbol_at_commit`      | implemented | `name: string`, `commit: string` | Prefix-safe commit lookup |
 | `file_defines`          | implemented | `repo_relative_path: string`  | Symbols defined in a file |
 | `drift_top_n`           | implemented | `limit?: u64` (default 10, max 100) | SemanticDrift records ranked by score |
+| `semantic_search`       | implemented | `query_vector: [f32]`, `limit?: u64` (default 10, max 100) | Natural-language code search over the shared store's embedding index. Requires the `embeddings` feature. |
 | `drift`                 | reserved    | same as `drift_top_n`         | Reserved for issue #10; returns `not_implemented` until wired. |
 | `observations_for_symbol` | reserved  | —                             | Returns `not_implemented` |
 | `agent_sessions_for_repo` | reserved  | —                             | Returns `not_implemented` |
@@ -308,22 +311,99 @@ Coordination: issue #15 updates this response shape. Issue #10's future
 
 ---
 
-## 7 — CLI mapping
+### `semantic_search`
 
-`eg query symbol`, `eg query file`, and `eg query drift` dispatch through the
-daemon when `--daemon` is given:
+Natural-language code search over the shared store's embedding index, routed
+through the daemon (issue #59). The daemon performs the same vector similarity
+search the embedded `eg query semantic` path uses; the **client supplies the
+query embedding vector**. No embedding model is loaded daemon-side, no remote
+embedding service is contacted, and there is no background indexing — the verb
+reuses the existing semantic ingest/query behavior. The embedding provider,
+vector model, and ranking algorithm are unchanged (issues #58, #15 own those).
 
-```sh
-eg query symbol nested::Widget --daemon --data-dir .egregore
-eg query file src/lib.rs       --daemon --data-dir .egregore
-eg query drift                 --daemon --data-dir .egregore
-eg query symbol nested::Widget --daemon --data-dir .egregore --at abc1234
-eg query symbol nested::Widget --daemon --data-dir .egregore --as-of 2026-05-01T00:00:00Z
+**Params:**
+```json
+{ "query_vector": [0.0123, -0.0481, ...], "limit": 10 }
 ```
 
-`--daemon` requires `--data-dir` (clap enforces this). Output format matches
-the non-daemon path: one JSON object per line, sorted by `(span.start_line,
-record_id)`.
+| Field          | Type    | Required | Notes |
+|----------------|---------|----------|-------|
+| `query_vector` | [number]| yes      | Dense query embedding. Non-empty; all entries finite. Width must equal the store's index dimensionality. |
+| `limit`        | u64     | no       | Result ceiling. Default 10, capped at 100; further bounded by `budget.max_results`. |
+
+To obtain `query_vector`, embed the query text with the same default local
+model used by ingest (`sentence-transformers/all-MiniLM-L6-v2`). The
+`eg query semantic --daemon` CLI does this for you.
+
+**Record shape** (parity with `eg query semantic`):
+```json
+{
+  "record_id":          "codegraph:v4:...",
+  "name":               "nested::Widget::new",
+  "repo_relative_path": "src/lib.rs",
+  "score":              0.83,
+  "span":               { "start_line": 5, "end_line": 12, "start_byte": 80, "end_byte": 240 }
+}
+```
+
+`record_id` and `score` are always present. `name`, `repo_relative_path`, and
+`span` are omitted when the underlying node lacks them — the same documented
+absent-span rule as the embedded semantic CLI contract. Rows are bounded
+**retrieval leads**, not proof: they carry record IDs, scores, repo-relative
+paths, and spans only. They are never raw transcript text, command output,
+patch hunks, issue/comment bodies, environment values, tokens, or protected
+artifact payloads, and they are not classified as verification evidence, task
+completion, or agent memory. Confirm a lead with `eg query symbol`,
+`eg query context`, or by reading the source.
+
+**Determinism:** for a fixed store and fixed `query_vector`, results are
+order-stable across repeated runs and match the embedded `eg query semantic`
+top-k for the same store, after canonical ordering. Daemon and embedded read
+the same persisted index, so scores agree within a tight tolerance (≤ 1e-4).
+
+**Diagnostics:**
+
+| Condition | Code | HTTP |
+|-----------|------|------|
+| `params.query_vector` absent | `missing_field` | 400 |
+| `query_vector` not an array / empty / non-finite; `limit` not an integer | `bad_request` | 400 |
+| Store has no embedding index | `missing_semantic_index` | 422 |
+| `query_vector` width ≠ index dimensionality | `incompatible_embedding_dimension` | 422 |
+| Budget `timeout_ms` elapsed | `query_timeout` | 408 |
+| Missing/invalid bearer token | `unauthorized` | 401 |
+| Daemon built without the `embeddings` feature | `not_implemented` | 501 |
+
+A **no-match** is a successful empty result (`ok:true`, `records: []`,
+`page.returned: 0`), never a silent fallback to direct embedded reads or raw
+store internals. Missing-daemon and stale-runtime-metadata conditions are
+surfaced by the shared discovery contract in
+[`daemon-runtime.md`](daemon-runtime.md) before the verb is dispatched.
+
+When to reach for this verb vs. structural reads is covered in
+[`docs/cli/semantic-search-guidance.md`](../cli/semantic-search-guidance.md),
+including how this slice relates to issue #58's relevance gate.
+
+---
+
+## 7 — CLI mapping
+
+`eg query symbol`, `eg query file`, `eg query drift`, and `eg query semantic`
+dispatch through the daemon when `--daemon` is given:
+
+```sh
+eg query symbol nested::Widget       --daemon --data-dir .egregore
+eg query file src/lib.rs             --daemon --data-dir .egregore
+eg query drift                       --daemon --data-dir .egregore
+eg query semantic "where is the parser" --daemon --data-dir .egregore
+eg query symbol nested::Widget       --daemon --data-dir .egregore --at abc1234
+eg query symbol nested::Widget       --daemon --data-dir .egregore --as-of 2026-05-01T00:00:00Z
+```
+
+For `symbol`/`file`/`drift`, `--daemon` requires `--data-dir` (clap enforces
+this). `eg query semantic` always takes `--data-dir`; adding `--daemon` routes
+the query through the daemon. `eg query semantic --daemon` embeds the query
+text locally, then sends only the resulting vector to the daemon. Output format
+matches the non-daemon path: one JSON object per line.
 
 ---
 
