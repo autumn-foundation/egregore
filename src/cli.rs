@@ -1972,16 +1972,19 @@ struct TaskContextResponse<'a> {
 /// The agent-authored memory claim under audit.
 ///
 /// Tagged `trust_class: "agent_authored"` so it is never presented as source
-/// truth or proof by itself (AC3). `text` is the post-redaction claim body —
-/// a bounded summary, never raw transcript text.
+/// truth or proof by itself (AC3). The raw `text` body is never emitted — for a
+/// `Failure` or imported claim it may hold a command-output excerpt — only the
+/// bounded `summary`, a `text_hash` handle, and redaction metadata (AC9).
 #[derive(Serialize)]
 struct AuditClaim<'a> {
     record_id: &'a str,
     kind: &'static str,
     trust_class: &'static str,
     summary: &'a str,
+    /// BLAKE3 hash of the post-redaction body, so the body is citable as a
+    /// handle without emitting its bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<&'a str>,
+    text_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     confidence: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3344,12 +3347,15 @@ fn audit_claim(record: &GraphRecord) -> Option<AuditClaim<'_>> {
     };
     let redacted = redaction_policy_version.is_some()
         || text.as_deref().is_some_and(|t| t.contains("<REDACTED:"));
+    let text_hash = text
+        .as_deref()
+        .map(|t| format!("blake3:{}", blake3::hash(t.as_bytes()).to_hex()));
     Some(AuditClaim {
         record_id: id,
         kind: kind.as_str(),
         trust_class: "agent_authored",
         summary,
-        text: text.as_deref(),
+        text_hash,
         confidence: confidence.as_deref(),
         superseded_by: superseded_by.as_deref(),
         redacted,
@@ -3611,14 +3617,14 @@ fn query_memory_cmd(
 
     let memory_id = resolved.iter().next().expect("non-empty");
 
-    // A resolved ID that is also tombstoned is stale, not auditable (AC6).
+    // A tombstone for the resolved ID means the record was deleted. Like every
+    // other query path, a current-state tombstone wins even when an incremental
+    // graph still carries the original node (no restore is inferred): report
+    // `stale_handle` rather than auditing a deleted claim (AC6).
     let is_tombstoned = records
         .iter()
         .any(|r| matches!(r, GraphRecord::Tombstone { deleted_id, .. } if deleted_id == memory_id));
-    let claim_present = records
-        .iter()
-        .any(|r| matches!(r, GraphRecord::Node { id, .. } if id == memory_id));
-    if is_tombstoned && !claim_present {
+    if is_tombstoned {
         let envelope = serde_json::json!({
             "ok": false,
             "error": { "code": "stale_handle", "memory_handle": memory_id },

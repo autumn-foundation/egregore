@@ -2065,6 +2065,7 @@ fn is_verified_claim(
 /// Returns [`MemoryResolveError::Unsupported`] for an empty or malformed
 /// canonical ID, and [`MemoryResolveError::Ambiguous`] when the handle resolves
 /// to more than one distinct claim.
+#[allow(clippy::too_many_lines)]
 pub fn resolve_memory_ids(
     records: &[GraphRecord],
     handle: &str,
@@ -2089,12 +2090,23 @@ pub fn resolve_memory_ids(
         // Find the node carrying this ID.
         let mut subject_kind = None;
         let mut subject_name = None;
+        let mut subject_session_id = None;
+        let mut subject_agent_id = None;
         for r in records {
-            if let GraphRecord::Node { id, kind, name, .. } = r
+            if let GraphRecord::Node {
+                id,
+                kind,
+                name,
+                session_id,
+                agent_id,
+                ..
+            } = r
                 && id == handle
             {
                 subject_kind = Some(*kind);
                 subject_name.clone_from(name);
+                subject_session_id.clone_from(session_id);
+                subject_agent_id.clone_from(agent_id);
             }
         }
         match subject_kind {
@@ -2102,7 +2114,10 @@ pub fn resolve_memory_ids(
                 matched.insert(handle.to_owned());
             }
             Some(NodeKind::AgentSession) => {
-                let session_name = subject_name.as_deref();
+                // Prefer the session node's `session_id` field; imported session
+                // nodes (e.g. Codex) keep a human summary in `name` while claims
+                // store the real key in `session_id`. Fall back to `name`.
+                let session_key = subject_session_id.as_deref().or(subject_name.as_deref());
                 for r in records {
                     if let GraphRecord::Node {
                         id,
@@ -2111,14 +2126,15 @@ pub fn resolve_memory_ids(
                         ..
                     } = r
                         && is_agent_claim_kind(*kind)
-                        && Some(sid.as_str()) == session_name
+                        && Some(sid.as_str()) == session_key
                     {
                         matched.insert(id.clone());
                     }
                 }
             }
             Some(NodeKind::Agent) => {
-                let agent_name = subject_name.as_deref();
+                // Prefer the agent node's `agent_id` field; fall back to `name`.
+                let agent_key = subject_agent_id.as_deref().or(subject_name.as_deref());
                 for r in records {
                     if let GraphRecord::Node {
                         id,
@@ -2127,7 +2143,7 @@ pub fn resolve_memory_ids(
                         ..
                     } = r
                         && is_agent_claim_kind(*kind)
-                        && Some(aid.as_str()) == agent_name
+                        && Some(aid.as_str()) == agent_key
                     {
                         matched.insert(id.clone());
                     }
@@ -2160,6 +2176,11 @@ pub fn resolve_memory_ids(
         }
     }
 
+    // A single audit covers one claim. A scope handle (Agent / AgentSession ID,
+    // or a session_id shared by several claims) that resolves to more than one
+    // claim is reported as a stable `Ambiguous` diagnostic listing the candidate
+    // claim IDs, so the operator can re-query a specific one. This keeps the
+    // single-claim audit contract honest rather than silently picking one.
     if matched.len() > 1 {
         return Err(MemoryResolveError::Ambiguous {
             handle: handle.to_owned(),
@@ -2285,6 +2306,19 @@ pub fn memory_audit_context<'a>(
             for link in links {
                 if let Some(target_id) = link.target_record_id.as_deref() {
                     match by_id.get(target_id) {
+                        // A denormalized `CONTRADICTS` evidence link must reach the
+                        // contradicting section, same as a `CONTRADICTS` graph edge;
+                        // otherwise a JSONL/embedded record that retained only the
+                        // denormalized link would mis-report a contradiction as
+                        // generic support.
+                        Some(target) if link.relation == "CONTRADICTS" => {
+                            contradicting.entry(target.id()).or_insert_with(|| {
+                                MemoryEvidenceItem {
+                                    record: target,
+                                    relation: "CONTRADICTS".to_owned(),
+                                }
+                            });
+                        }
                         Some(target) => place(target, &link.relation),
                         None => diagnostics.push(MemoryAuditDiagnostic {
                             code: "unresolved_evidence_link".to_owned(),

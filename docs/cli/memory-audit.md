@@ -22,9 +22,14 @@ Reads from either a JSONL file (`--graph`) or an embedded AletheiaDB store
 
 `<ID_OR_HANDLE>` accepts two handle types (AC2):
 
-1. **Canonical memory record ID** — `agent_memory:v1:<64-hex>`. When the ID
-   names an `AgentSession` or `Agent`, every claim authored in that scope is
-   collected.
+1. **Canonical memory record ID** — `agent_memory:v1:<64-hex>` naming an
+   auditable claim (`Observation`, `Decision`, `Failure`). When the ID instead
+   names an `AgentSession` or `Agent`, it is treated as a **scope handle**: it
+   resolves to the claims authored in that scope (matched on the session node's
+   `session_id` / agent node's `agent_id` field, falling back to `name`). One
+   audit covers one claim, so a scope that resolves to a single claim audits it
+   directly, and a scope with multiple claims returns an `Ambiguous` diagnostic
+   listing the candidate claim IDs to re-query.
 2. **Source artifact / session handle** — a string matching a claim's
    `source_handle`, `source_artifact_path`, `source_artifact_hash`, or
    `session_id` (e.g. `trajectories/run-1.traj`).
@@ -75,11 +80,12 @@ silently disappearing (AC5).
 ### Safety: no raw payloads
 
 Output never includes raw transcript text, raw command output, patch hunks, issue
-bodies, PR comments, environment values, or bearer tokens (AC9). Protected
-payloads (command output, patch bytes, task bodies) are referenced by **hash
-only**, flagged with `"protected": true` on the item, and surfaced as
-`protected_payload` diagnostics. Post-redaction claim text and `<REDACTED:...>`
-markers are bounded summaries and are allowed.
+bodies, PR comments, environment values, or bearer tokens (AC9). The claim's raw
+`text` body is never emitted (a `Failure` keeps a command-output excerpt there);
+the audit exposes only the bounded `summary`, a `text_hash` handle, and a
+`redacted` flag. Protected payloads (command output, patch bytes, task bodies) are
+referenced by **hash only**, flagged with `"protected": true` on the item, and
+surfaced as `protected_payload` diagnostics.
 
 ### Diagnostic codes
 
@@ -125,7 +131,7 @@ eg query memory trajectories/run-1.traj --graph graph.jsonl --verified-only
       "kind": "Observation",
       "trust_class": "agent_authored",
       "summary": "Refactored foo",
-      "text": "Refactored foo; <REDACTED:secret:ab12>",
+      "text_hash": "blake3:9f2c...",
       "confidence": "0.9",
       "redacted": true
     }

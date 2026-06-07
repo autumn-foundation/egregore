@@ -34,6 +34,8 @@ const fn span(start_line: usize, end_line: usize) -> SourceSpan {
 /// Sentinel payloads that must NEVER appear in audit output (AC9).
 const RAW_STDOUT_SENTINEL: &str = "RAW_STDOUT_SHOULD_NOT_LEAK";
 const RAW_PATCH_SENTINEL: &str = "RAW_PATCH_SHOULD_NOT_LEAK";
+/// The claim body must be referenced by hash, never copied verbatim (AC9).
+const RAW_CLAIM_TEXT_SENTINEL: &str = "RAW_CLAIM_TEXT_SHOULD_NOT_LEAK";
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -269,7 +271,9 @@ fn seed() -> Fixture {
         ..
     } = claim
     {
-        *text = Some("Refactored foo; secret was <REDACTED:secret:abcd1234>".to_owned());
+        *text = Some(format!(
+            "Refactored foo; {RAW_CLAIM_TEXT_SENTINEL} <REDACTED:secret:abcd1234>"
+        ));
         *aid = Some("agent_1".to_owned());
         *agent_kind = Some("claude-code".to_owned());
         *sid = Some("sess_1".to_owned());
@@ -539,8 +543,24 @@ fn audit_never_emits_raw_payloads() {
         !stdout.contains(RAW_PATCH_SENTINEL),
         "raw patch leaked: {stdout}"
     );
-    // Protected payloads are still acknowledged via diagnostics carrying hashes.
+    // The claim's raw text body is never copied verbatim — only hashed.
+    assert!(
+        !stdout.contains(RAW_CLAIM_TEXT_SENTINEL),
+        "raw claim text leaked: {stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let claim = &v["memory_claim"][0];
+    assert!(
+        claim.get("text").is_none(),
+        "raw text field must not be present"
+    );
+    assert!(
+        claim["text_hash"]
+            .as_str()
+            .is_some_and(|h| h.starts_with("blake3:")),
+        "claim body must be referenced by a blake3 hash handle"
+    );
+    // Protected payloads are still acknowledged via diagnostics carrying hashes.
     let diags = v["diagnostics"].as_array().expect("diagnostics");
     assert!(diags.iter().any(|d| d["code"] == "protected_payload"));
 }
@@ -652,4 +672,202 @@ fn audit_is_deterministic_across_runs() {
         let (_c, again, _e) = run_audit(&fx, &[]);
         assert_eq!(first, again, "audit output is not deterministic");
     }
+}
+
+/// Writes a small graph fixture and returns its path.
+fn write_graph(records: Vec<GraphRecord>) -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("graph.jsonl");
+    let mut graph = Graph::new();
+    for r in records {
+        graph.push(r);
+    }
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+    (temp, path)
+}
+
+fn audit_json(graph: &std::path::Path, handle: &str) -> serde_json::Value {
+    let output = egregore()
+        .args(["query", "memory", handle, "--graph"])
+        .arg(graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_str(String::from_utf8(output).expect("utf8").trim()).expect("valid JSON")
+}
+
+/// A denormalized `CONTRADICTS` evidence link (no graph edge) must land its
+/// target in `contradicting_evidence`, never generic `supporting_evidence`.
+#[test]
+fn audit_denormalized_contradicts_link_routes_to_contradicting() {
+    let claim_id = agent_memory_stable_id(&["obs", "claim_d"]);
+    let contra_id = agent_memory_stable_id(&["obs", "contra_d"]);
+
+    let mut claim = GraphRecord::node(
+        claim_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "claim".to_owned(),
+    );
+    if let GraphRecord::Node {
+        agent_id: ref mut aid,
+        session_id: ref mut sid,
+        ref mut source_handle,
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = claim
+    {
+        *aid = Some("a".to_owned());
+        *sid = Some("s".to_owned());
+        *source_handle = Some("trajectories/run.traj".to_owned());
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        // The contradiction exists ONLY as a denormalized evidence link.
+        *evidence_links = Some(vec![link(&contra_id, "agent_memory", "CONTRADICTS")]);
+    }
+
+    let mut contra = GraphRecord::node(
+        contra_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "contradicting claim".to_owned(),
+    );
+    if let GraphRecord::Node {
+        agent_id: ref mut aid,
+        session_id: ref mut sid,
+        ref mut source_handle,
+        ref mut schema_version,
+        ..
+    } = contra
+    {
+        *aid = Some("b".to_owned());
+        *sid = Some("s2".to_owned());
+        *source_handle = Some("trajectories/run2.traj".to_owned());
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+    }
+
+    let (_t, graph) = write_graph(vec![claim, contra]);
+    let v = audit_json(&graph, &claim_id);
+
+    let contradicting = v["contradicting_evidence"].as_array().expect("contra");
+    assert!(
+        contradicting.iter().any(|h| h["record_id"] == contra_id),
+        "denormalized CONTRADICTS link not routed to contradicting_evidence: {v}"
+    );
+    let supporting = v["supporting_evidence"].as_array().expect("support");
+    assert!(
+        !supporting.iter().any(|h| h["record_id"] == contra_id),
+        "contradiction must not appear as supporting evidence"
+    );
+}
+
+/// An `AgentSession` canonical ID resolves its scoped claim via the session
+/// node's `session_id` field even when `name` holds a human summary.
+#[test]
+fn audit_session_scope_resolves_by_session_id_field() {
+    let session_id_node = agent_memory_stable_id(&["node", "agent_session", "a", "real-key"]);
+    let claim_id = agent_memory_stable_id(&["obs", "claim_s"]);
+
+    let mut session = GraphRecord::node(
+        session_id_node.clone(),
+        NodeKind::AgentSession,
+        None,
+        None,
+        // `name` is a human summary, NOT the session key.
+        Some("Codex session: refactor sweep".to_owned()),
+        "session".to_owned(),
+    );
+    if let GraphRecord::Node {
+        session_id: ref mut sid,
+        ref mut schema_version,
+        ..
+    } = session
+    {
+        *sid = Some("real-key".to_owned());
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+    }
+
+    let mut claim = GraphRecord::node(
+        claim_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "claim".to_owned(),
+    );
+    if let GraphRecord::Node {
+        agent_id: ref mut aid,
+        session_id: ref mut sid,
+        ref mut source_handle,
+        ref mut schema_version,
+        ..
+    } = claim
+    {
+        *aid = Some("a".to_owned());
+        *sid = Some("real-key".to_owned());
+        *source_handle = Some("trajectories/run.traj".to_owned());
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+    }
+
+    let (_t, graph) = write_graph(vec![session, claim]);
+    let v = audit_json(&graph, &session_id_node);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["memory_id"], claim_id);
+}
+
+/// A resolved memory ID that is tombstoned is stale even when the original
+/// node is still present in an incremental graph.
+#[test]
+fn audit_stale_when_node_and_tombstone_both_present() {
+    let claim_id = agent_memory_stable_id(&["obs", "claim_t"]);
+    let mut claim = GraphRecord::node(
+        claim_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "claim".to_owned(),
+    );
+    if let GraphRecord::Node {
+        agent_id: ref mut aid,
+        session_id: ref mut sid,
+        ref mut source_handle,
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = claim
+    {
+        *aid = Some("a".to_owned());
+        *sid = Some("s".to_owned());
+        *source_handle = Some("trajectories/run.traj".to_owned());
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![link(
+            &stable_id(&["node", "File", "src/lib.rs"]),
+            "codegraph",
+            "OBSERVES",
+        )]);
+    }
+    let tombstone = GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &claim_id]),
+        schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+        deleted_id: claim_id.clone(),
+        summary: "deleted".to_owned(),
+        producer: None,
+    };
+
+    let (_t, graph) = write_graph(vec![claim, tombstone]);
+    let assert = egregore()
+        .args(["query", "memory", &claim_id, "--graph"])
+        .arg(&graph)
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["error"]["code"], "stale_handle", "{v}");
 }
