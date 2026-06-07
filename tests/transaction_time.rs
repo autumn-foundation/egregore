@@ -316,6 +316,80 @@ fn tx_as_of_output_excludes_raw_bodies() {
     );
 }
 
+// ── AC2: a later tombstone does not erase the prior transaction-time view ────
+// Exercised against the library directly so the test can use a current-state
+// tombstone (which carries no transaction-time stamp of its own).
+
+#[test]
+fn tx_as_of_ignores_later_tombstone() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "widget"]);
+    let v1 = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        span(1, 5),
+        "widget".to_owned(),
+        "widget v1".to_owned(),
+    )
+    .with_node_time(V1_VT, "author_provided", V1_TX)
+    .with_transaction_time(V1_TX);
+    // A later current-state deletion of the same symbol.
+    let tombstone = GraphRecord::Tombstone {
+        id: "tombstone:codegraph:v4:widget".to_owned(),
+        schema_version: 4,
+        deleted_id: sym_id,
+        summary: "widget removed".to_owned(),
+        producer: None,
+    };
+    let records = vec![v1, tombstone];
+
+    // Querying before the deletion still returns the symbol the store knew then.
+    let result = symbol_as_of_transaction_time(&records, "widget", "2026-01-02T00:00:00Z", None)
+        .expect("query ok");
+    assert_eq!(
+        result.records.len(),
+        1,
+        "later tombstone must not erase the prior transaction-time view"
+    );
+    let expected_id = stable_id(&["node", "Symbol", "src/lib.rs", "widget"]);
+    assert_eq!(result.records[0].id(), expected_id.as_str());
+}
+
+// ── AC6: a matched record lacking transaction metadata is excluded, not
+//        silently treated as current state (library-level check).
+
+#[test]
+fn tx_as_of_excludes_record_without_transaction_metadata() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    // A symbol carrying a git-commit valid time but NO transaction-time stamp.
+    let sym = GraphRecord::symbol(
+        stable_id(&["node", "Symbol", "src/lib.rs", "widget"]),
+        "fn",
+        "src/lib.rs".to_owned(),
+        span(1, 5),
+        "widget".to_owned(),
+        "widget".to_owned(),
+    );
+    let records = vec![sym];
+
+    let result = symbol_as_of_transaction_time(&records, "widget", "2026-01-02T00:00:00Z", None)
+        .expect("query ok");
+    assert!(
+        result.records.is_empty(),
+        "record without transaction metadata must be excluded (no current-state fallback)"
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "missing_transaction_metadata"),
+        "missing metadata must be reported as a diagnostic"
+    );
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 fn diagnostic_codes(env: &Value) -> Vec<String> {
