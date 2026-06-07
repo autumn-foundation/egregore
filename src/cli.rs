@@ -455,6 +455,31 @@ enum QuerySubcommand {
         #[arg(long, requires = "data_dir", conflicts_with = "graph")]
         daemon: bool,
     },
+    /// Audit the evidence behind one agent-authored memory claim.
+    ///
+    /// Starts from a memory record and returns its provenance, supporting,
+    /// contradicting, and superseding evidence, related code and project
+    /// handles, and verification evidence — separated by trust class so an
+    /// agent-authored claim is never presented as source truth. Output never
+    /// includes raw transcript text, command output, or protected payloads;
+    /// only bounded summaries, hashes, handles, and redaction markers.
+    ///
+    /// "No evidence found" is not evidence that the claim is true.
+    ///
+    /// Documented in `docs/cli/memory-audit.md`.
+    Memory {
+        /// Memory record ID (`agent_memory:v1:...`) or source artifact/session handle.
+        id_or_handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Exclude unverified observations; report each as an `excluded` diagnostic.
+        #[arg(long)]
+        verified_only: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -1941,6 +1966,182 @@ struct TaskContextResponse<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// memory evidence audit (issue #64)
+// ---------------------------------------------------------------------------
+
+/// The agent-authored memory claim under audit.
+///
+/// Tagged `trust_class: "agent_authored"` so it is never presented as source
+/// truth or proof by itself (AC3). The raw `text` body is never emitted — for a
+/// `Failure` or imported claim it may hold a command-output excerpt — only the
+/// bounded `summary`, a `text_hash` handle, and redaction metadata (AC9).
+#[derive(Serialize)]
+struct AuditClaim<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    trust_class: &'static str,
+    /// A redaction-safe structured label. The stored summary embeds a prefix of
+    /// the observation text, so it is never forwarded verbatim — only this label
+    /// and `summary_hash` are emitted (AC9).
+    summary: String,
+    /// BLAKE3 hash of the stored summary, citable without emitting its bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_hash: Option<String>,
+    /// BLAKE3 hash of the post-redaction body, so the body is citable as a
+    /// handle without emitting its bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<&'a str>,
+    /// True when the claim carries a redaction marker or policy version.
+    redacted: bool,
+}
+
+/// Direct provenance for the claim. Every field is a citable handle (AC4).
+#[derive(Serialize)]
+struct AuditProvenance<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance_handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingested_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_handle: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_artifact_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_artifact_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redaction_policy_version: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    agent_session_ids: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    agent_ids: Vec<&'a str>,
+}
+
+/// One safe, bounded evidence item. Carries only record IDs, hashes, handles,
+/// spans, and redaction markers — never raw payloads (AC9).
+#[derive(Serialize)]
+struct AuditItem<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    trust_class: &'static str,
+    /// Relation that connected this item to the claim (e.g. `CONTRADICTS`).
+    relation: String,
+    /// A non-empty citable handle, guaranteeing AC4 for every item.
+    citable_handle: String,
+    /// A redaction-safe label. For agent-authored items (whose stored summary
+    /// embeds observation text) this is synthesized from typed fields; the
+    /// original is exposed only via `summary_hash` (AC9).
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_artifact_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_artifact_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stdout_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stderr_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    patch_status: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    patch_bytes_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_handle_hash: Option<&'a str>,
+    /// BLAKE3 hash handle for a `Review` record's protected diff hunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff_hunk_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<&'a str>,
+    /// True when a protected raw payload (patch bytes, command output, body) is
+    /// referenced by hash but withheld from this response (AC9).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    protected: bool,
+}
+
+/// One stable, machine-readable audit diagnostic (AC6).
+#[derive(Serialize)]
+struct AuditDiagnostic<'a> {
+    code: &'a str,
+    source_record_id: &'a str,
+    target_handle: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    relation: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    target_domain: &'a str,
+}
+
+/// One record excluded by `--verified-only`, reported not dropped (AC5).
+#[derive(Serialize)]
+struct AuditExcluded<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_handle: Option<&'a str>,
+}
+
+/// Deterministic pagination block (AC8). v1 returns full pages only.
+#[derive(Serialize)]
+struct AuditPage {
+    cursor: Option<()>,
+    has_more: bool,
+    returned: usize,
+}
+
+/// Full memory evidence audit response envelope.
+#[derive(Serialize)]
+struct MemoryAuditResponse<'a> {
+    ok: bool,
+    memory_id: &'a str,
+    verified_only: bool,
+    memory_claim: Vec<AuditClaim<'a>>,
+    direct_provenance: AuditProvenance<'a>,
+    supporting_evidence: Vec<AuditItem<'a>>,
+    contradicting_evidence: Vec<AuditItem<'a>>,
+    superseding_records: Vec<AuditItem<'a>>,
+    related_code_handles: Vec<AuditItem<'a>>,
+    related_project_handles: Vec<AuditItem<'a>>,
+    verification_evidence: Vec<AuditItem<'a>>,
+    diagnostics: Vec<AuditDiagnostic<'a>>,
+    excluded: Vec<AuditExcluded<'a>>,
+    page: AuditPage,
+}
+
+// ---------------------------------------------------------------------------
 // query_cmd — dispatch
 // ---------------------------------------------------------------------------
 
@@ -2068,6 +2269,15 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_task_cmd(&records, &id_or_handle)
+        }
+        QuerySubcommand::Memory {
+            id_or_handle,
+            graph,
+            data_dir,
+            verified_only,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_memory_cmd(&records, &id_or_handle, verified_only)
         }
     }
 }
@@ -3098,6 +3308,602 @@ fn query_task_cmd(records: &[GraphRecord], id_or_handle: &str) -> Result<()> {
 
     let output =
         serde_json::to_string_pretty(&response).context("failed to serialize task context")?;
+    println!("{output}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// query memory — memory evidence audit (issue #64)
+// ---------------------------------------------------------------------------
+
+/// Maps a node kind to its trust class so an agent claim is never labelled as
+/// source truth (AC3).
+fn trust_class_for(record: &GraphRecord) -> &'static str {
+    let Some(kind) = record.node_kind_name() else {
+        return "other";
+    };
+    match kind {
+        "Observation" | "Decision" | "Failure" | "Lesson" => "agent_authored",
+        "Verification" | "CommandEvidence" | "CommandRun" | "TestRun" | "CIStatus"
+        | "BenchmarkRun" | "CoverageReport" | "ProofResult" => "verification_evidence",
+        "File" | "Symbol" | "Module" | "Import" | "Commit" | "Change" | "Repository" => {
+            "source_fact"
+        }
+        "Task"
+        | "AcceptanceCriterion"
+        | "LocalTask"
+        | "GitHubIssue"
+        | "PR"
+        | "Review"
+        | "ExternalLink"
+        | "Product"
+        | "Project"
+        | "Plan" => "project_state",
+        "Artifact" | "PatchArtifact" | "FileEdit" => "artifact",
+        _ => "other",
+    }
+}
+
+/// Returns a redaction-safe summary plus an optional hash of the stored one.
+///
+/// For agent-authored records the stored summary embeds a prefix of the
+/// observation text (see `build_observation_records`), so it is never forwarded
+/// verbatim. We synthesize a structured label from typed fields and expose the
+/// original only as a BLAKE3 hash (AC9). Structured records (code, verification,
+/// project, artifact) keep their templated summary, which carries no free text.
+fn safe_summary(record: &GraphRecord) -> (String, Option<String>) {
+    let GraphRecord::Node {
+        kind,
+        summary,
+        agent_id,
+        session_id,
+        ..
+    } = record
+    else {
+        return (String::new(), None);
+    };
+    if trust_class_for(record) == "agent_authored" {
+        let who = match (agent_id.as_deref(), session_id.as_deref()) {
+            (Some(a), Some(s)) => format!("{a}:{s}"),
+            (Some(a), None) => a.to_owned(),
+            _ => "unknown".to_owned(),
+        };
+        let label = format!("{} by {who}", kind.as_str());
+        let hash = format!("blake3:{}", blake3::hash(summary.as_bytes()).to_hex());
+        (label, Some(hash))
+    } else {
+        (summary.clone(), None)
+    }
+}
+
+/// Builds the claim view, never presenting it as source truth (AC3).
+fn audit_claim(record: &GraphRecord) -> Option<AuditClaim<'_>> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        text,
+        confidence,
+        superseded_by,
+        redaction_policy_version,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    let redacted = redaction_policy_version.is_some()
+        || text.as_deref().is_some_and(|t| t.contains("<REDACTED:"));
+    let text_hash = text
+        .as_deref()
+        .map(|t| format!("blake3:{}", blake3::hash(t.as_bytes()).to_hex()));
+    let (summary, summary_hash) = safe_summary(record);
+    Some(AuditClaim {
+        record_id: id,
+        kind: kind.as_str(),
+        trust_class: "agent_authored",
+        summary,
+        summary_hash,
+        text_hash,
+        confidence: confidence.as_deref(),
+        superseded_by: superseded_by.as_deref(),
+        redacted,
+    })
+}
+
+/// Computes a non-empty citable handle for an item, guaranteeing AC4.
+fn citable_handle(record: &GraphRecord) -> String {
+    let GraphRecord::Node {
+        repo_relative_path,
+        span,
+        source_artifact_path,
+        source_artifact_hash,
+        stdout_handle,
+        stderr_handle,
+        patch_bytes_hash,
+        body_handle,
+        url,
+        source_handle,
+        agent_id,
+        session_id,
+        verification_kind,
+        title,
+        name,
+        id,
+        ..
+    } = record
+    else {
+        return record.id().to_owned();
+    };
+    if let Some(path) = repo_relative_path.as_deref() {
+        return span.map_or_else(
+            || path.to_owned(),
+            |s| format!("{path}:{}-{}", s.start_line, s.end_line),
+        );
+    }
+    if let Some(p) = source_artifact_path.as_deref() {
+        return p.to_owned();
+    }
+    if let Some(h) = source_artifact_hash.as_deref() {
+        return h.to_owned();
+    }
+    if let Some(h) = stdout_handle.as_ref().map(|o| o.hash.as_str()) {
+        return h.to_owned();
+    }
+    if let Some(h) = stderr_handle.as_ref().map(|o| o.hash.as_str()) {
+        return h.to_owned();
+    }
+    if let Some(h) = patch_bytes_hash.as_deref() {
+        return h.to_owned();
+    }
+    if let Some(h) = body_handle.as_ref().map(|o| o.hash.as_str()) {
+        return h.to_owned();
+    }
+    if let Some(u) = url.as_deref() {
+        return u.to_owned();
+    }
+    if let Some(s) = source_handle.as_deref() {
+        return s.to_owned();
+    }
+    match (agent_id.as_deref(), session_id.as_deref()) {
+        (Some(a), Some(s)) => return format!("{a}:{s}"),
+        (Some(a), None) => return a.to_owned(),
+        _ => {}
+    }
+    if let Some(v) = verification_kind.as_deref() {
+        return v.to_owned();
+    }
+    title
+        .as_deref()
+        .or(name.as_deref())
+        .map_or_else(|| id.clone(), ToOwned::to_owned)
+}
+
+/// Serializes one evidence item to a bounded, payload-free view (AC9).
+#[allow(clippy::too_many_lines)]
+fn audit_item<'a>(item: &query::MemoryEvidenceItem<'a>) -> AuditItem<'a> {
+    let record = item.record;
+    let handle = citable_handle(record);
+    let trust = trust_class_for(record);
+    let (summary, summary_hash) = safe_summary(record);
+    let GraphRecord::Node {
+        id,
+        kind,
+        name,
+        title,
+        repo_relative_path,
+        span,
+        status,
+        verification_kind,
+        exit_code,
+        source_artifact_path,
+        source_artifact_hash,
+        stdout_handle,
+        stderr_handle,
+        patch_status,
+        patch_bytes_hash,
+        body_handle,
+        author,
+        agent_id,
+        session_id,
+        observed_at,
+        confidence,
+        patch_handle,
+        diff_hunk_handle,
+        arguments_handle,
+        result_handle,
+        ..
+    } = record
+    else {
+        // Edges/tombstones never reach here; produce a minimal safe item.
+        return AuditItem {
+            record_id: record.id(),
+            kind: "Unknown",
+            trust_class: "other",
+            relation: item.relation.clone(),
+            citable_handle: handle,
+            summary,
+            summary_hash,
+            name: None,
+            title: None,
+            repo_relative_path: None,
+            span: None,
+            status: None,
+            verification_kind: None,
+            exit_code: None,
+            source_artifact_path: None,
+            source_artifact_hash: None,
+            stdout_hash: None,
+            stderr_hash: None,
+            patch_status: None,
+            patch_bytes_hash: None,
+            body_handle_hash: None,
+            diff_hunk_hash: None,
+            author: None,
+            agent_id: None,
+            session_id: None,
+            observed_at: None,
+            confidence: None,
+            protected: false,
+        };
+    };
+    let protected = patch_handle.is_some()
+        || stdout_handle.as_ref().is_some_and(|o| o.bytes > 0)
+        || stderr_handle.as_ref().is_some_and(|o| o.bytes > 0)
+        || body_handle.is_some()
+        || diff_hunk_handle.is_some()
+        || arguments_handle.is_some()
+        || result_handle.is_some();
+    AuditItem {
+        record_id: id,
+        kind: kind.as_str(),
+        trust_class: trust,
+        relation: item.relation.clone(),
+        citable_handle: handle,
+        summary,
+        summary_hash,
+        name: name.as_deref(),
+        title: title.as_deref(),
+        repo_relative_path: repo_relative_path.as_deref(),
+        span: *span,
+        status: status.as_deref(),
+        verification_kind: verification_kind.as_deref(),
+        exit_code: *exit_code,
+        source_artifact_path: source_artifact_path.as_deref(),
+        source_artifact_hash: source_artifact_hash.as_deref(),
+        stdout_hash: stdout_handle.as_ref().map(|o| o.hash.as_str()),
+        stderr_hash: stderr_handle.as_ref().map(|o| o.hash.as_str()),
+        patch_status: patch_status.as_deref(),
+        patch_bytes_hash: patch_bytes_hash.as_deref(),
+        body_handle_hash: body_handle.as_ref().map(|o| o.hash.as_str()),
+        diff_hunk_hash: diff_hunk_handle.as_ref().map(|o| o.hash.as_str()),
+        author: author.as_deref(),
+        agent_id: agent_id.as_deref(),
+        session_id: session_id.as_deref(),
+        observed_at: observed_at.as_deref(),
+        confidence: confidence.as_deref(),
+        protected,
+    }
+}
+
+/// Emits a `protected_payload` diagnostic for each withheld raw payload (AC6).
+fn protected_payload_diagnostics<'a>(record: &'a GraphRecord, out: &mut Vec<AuditDiagnostic<'a>>) {
+    let GraphRecord::Node {
+        id,
+        stdout_handle,
+        stderr_handle,
+        patch_bytes_hash,
+        patch_handle,
+        body_handle,
+        diff_hunk_handle,
+        arguments_handle,
+        result_handle,
+        ..
+    } = record
+    else {
+        return;
+    };
+    if let Some(o) = stdout_handle.as_ref().filter(|o| o.bytes > 0) {
+        out.push(AuditDiagnostic {
+            code: "protected_payload",
+            source_record_id: id,
+            target_handle: &o.hash,
+            relation: "stdout",
+            target_domain: "verification",
+        });
+    }
+    if let Some(o) = stderr_handle.as_ref().filter(|o| o.bytes > 0) {
+        out.push(AuditDiagnostic {
+            code: "protected_payload",
+            source_record_id: id,
+            target_handle: &o.hash,
+            relation: "stderr",
+            target_domain: "verification",
+        });
+    }
+    if patch_handle.is_some()
+        && let Some(h) = patch_bytes_hash.as_deref()
+    {
+        out.push(AuditDiagnostic {
+            code: "protected_payload",
+            source_record_id: id,
+            target_handle: h,
+            relation: "patch_bytes",
+            target_domain: "artifact",
+        });
+    }
+    if let Some(o) = body_handle.as_ref() {
+        out.push(AuditDiagnostic {
+            code: "protected_payload",
+            source_record_id: id,
+            target_handle: &o.hash,
+            relation: "body",
+            target_domain: "project",
+        });
+    }
+    if let Some(o) = diff_hunk_handle.as_ref() {
+        out.push(AuditDiagnostic {
+            code: "protected_payload",
+            source_record_id: id,
+            target_handle: &o.hash,
+            relation: "diff_hunk",
+            target_domain: "project",
+        });
+    }
+    if let Some(o) = arguments_handle.as_ref() {
+        out.push(AuditDiagnostic {
+            code: "protected_payload",
+            source_record_id: id,
+            target_handle: &o.hash,
+            relation: "tool_arguments",
+            target_domain: "agent_memory",
+        });
+    }
+    if let Some(o) = result_handle.as_ref() {
+        out.push(AuditDiagnostic {
+            code: "protected_payload",
+            source_record_id: id,
+            target_handle: &o.hash,
+            relation: "tool_result",
+            target_domain: "agent_memory",
+        });
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn query_memory_cmd(
+    records: &[GraphRecord],
+    id_or_handle: &str,
+    verified_only: bool,
+) -> Result<()> {
+    let resolved = match query::resolve_memory_ids(records, id_or_handle) {
+        Ok(res) => res,
+        Err(
+            err @ (query::MemoryResolveError::Ambiguous { .. }
+            | query::MemoryResolveError::Unsupported { .. }),
+        ) => {
+            eprintln!("{}", serde_json::to_string(&err)?);
+            std::process::exit(1);
+        }
+    };
+
+    if resolved.matched.is_empty() {
+        // The handle named only deleted records — either the canonical ID is a
+        // tombstone target, or a source/session handle matched a now-tombstoned
+        // claim (`tombstoned_only`). Either way it is stale, not missing (AC6).
+        let is_tombstoned = resolved.tombstoned_only
+            || records.iter().any(|r| {
+                matches!(r, GraphRecord::Tombstone { deleted_id, .. } if deleted_id == id_or_handle)
+            });
+        let code = if is_tombstoned {
+            "stale_handle"
+        } else {
+            "no_match"
+        };
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": { "code": code, "memory_handle": id_or_handle },
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(2);
+    }
+
+    // `resolve_memory_ids` has already dropped tombstoned (deleted) IDs, so a
+    // resolved ID is always a live claim.
+    let memory_id = resolved.matched.iter().next().expect("non-empty");
+
+    let ctx = query::memory_audit_context(records, memory_id, verified_only);
+    if ctx.is_no_match() {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": { "code": "no_match", "memory_handle": id_or_handle },
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(2);
+    }
+
+    let memory_claim: Vec<AuditClaim<'_>> = ctx
+        .memory_claim
+        .iter()
+        .filter_map(|r| audit_claim(r))
+        .collect();
+
+    // Direct provenance from the first claim node.
+    let provenance = ctx.memory_claim.first().map_or_else(
+        || AuditProvenance {
+            provenance_handle: None,
+            agent_id: None,
+            agent_kind: None,
+            session_id: None,
+            observed_at: None,
+            ingested_at: None,
+            source_handle: None,
+            source_artifact_path: None,
+            source_artifact_hash: None,
+            redaction_policy_version: None,
+            agent_session_ids: Vec::new(),
+            agent_ids: Vec::new(),
+        },
+        |claim| {
+            let GraphRecord::Node {
+                agent_id,
+                agent_kind,
+                session_id,
+                observed_at,
+                ingested_at,
+                source_handle,
+                source_artifact_path,
+                source_artifact_hash,
+                redaction_policy_version,
+                ..
+            } = claim
+            else {
+                unreachable!("claim is a node");
+            };
+            let provenance_handle = match (agent_id.as_deref(), session_id.as_deref()) {
+                (Some(a), Some(s)) => Some(format!("{a}:{s}")),
+                (Some(a), None) => Some(a.to_owned()),
+                _ => None,
+            };
+            AuditProvenance {
+                provenance_handle,
+                agent_id: agent_id.as_deref(),
+                agent_kind: agent_kind.as_deref(),
+                session_id: session_id.as_deref(),
+                observed_at: observed_at.as_deref(),
+                ingested_at: ingested_at.as_deref(),
+                source_handle: source_handle.as_deref(),
+                source_artifact_path: source_artifact_path.as_deref(),
+                source_artifact_hash: source_artifact_hash.as_deref(),
+                redaction_policy_version: redaction_policy_version.as_deref(),
+                agent_session_ids: ctx.agent_sessions.iter().map(|r| r.id()).collect(),
+                agent_ids: ctx.agents.iter().map(|r| r.id()).collect(),
+            }
+        },
+    );
+
+    let supporting_evidence: Vec<AuditItem<'_>> =
+        ctx.supporting_evidence.iter().map(audit_item).collect();
+    let contradicting_evidence: Vec<AuditItem<'_>> =
+        ctx.contradicting_evidence.iter().map(audit_item).collect();
+    let superseding_records: Vec<AuditItem<'_>> =
+        ctx.superseding_records.iter().map(audit_item).collect();
+    let related_code_handles: Vec<AuditItem<'_>> =
+        ctx.related_code_handles.iter().map(audit_item).collect();
+    let related_project_handles: Vec<AuditItem<'_>> =
+        ctx.related_project_handles.iter().map(audit_item).collect();
+    let verification_evidence: Vec<AuditItem<'_>> =
+        ctx.verification_evidence.iter().map(audit_item).collect();
+
+    // Diagnostics: context (unresolved links) + protected payloads + redaction.
+    let mut diagnostics: Vec<AuditDiagnostic<'_>> = ctx
+        .diagnostics
+        .iter()
+        .map(|d| AuditDiagnostic {
+            code: &d.code,
+            source_record_id: &d.source_record_id,
+            target_handle: &d.target_handle,
+            relation: &d.relation,
+            target_domain: &d.target_domain,
+        })
+        .collect();
+    for claim in &ctx.memory_claim {
+        protected_payload_diagnostics(claim, &mut diagnostics);
+        if let GraphRecord::Node {
+            id,
+            redaction_policy_version: Some(ver),
+            ..
+        } = claim
+        {
+            diagnostics.push(AuditDiagnostic {
+                code: "redacted_payload",
+                source_record_id: id,
+                target_handle: ver,
+                relation: "redaction_policy_version",
+                target_domain: "agent_memory",
+            });
+        }
+    }
+    for item in ctx
+        .supporting_evidence
+        .iter()
+        .chain(&ctx.contradicting_evidence)
+        .chain(&ctx.superseding_records)
+        .chain(&ctx.related_project_handles)
+        .chain(&ctx.verification_evidence)
+    {
+        protected_payload_diagnostics(item.record, &mut diagnostics);
+    }
+    diagnostics.sort_by(|a, b| {
+        a.code
+            .cmp(b.code)
+            .then_with(|| a.source_record_id.cmp(b.source_record_id))
+            .then_with(|| a.target_handle.cmp(b.target_handle))
+            .then_with(|| a.relation.cmp(b.relation))
+            .then_with(|| a.target_domain.cmp(b.target_domain))
+    });
+    // Keep `target_domain` in the dedup key: two unresolved links sharing source,
+    // handle, and relation but pointing at different domains are distinct
+    // unresolved facts and must both be surfaced (AC6).
+    diagnostics.dedup_by(|a, b| {
+        a.code == b.code
+            && a.source_record_id == b.source_record_id
+            && a.target_handle == b.target_handle
+            && a.relation == b.relation
+            && a.target_domain == b.target_domain
+    });
+
+    let excluded: Vec<AuditExcluded<'_>> = ctx
+        .excluded
+        .iter()
+        .filter_map(|item| {
+            let GraphRecord::Node {
+                id,
+                kind,
+                source_handle,
+                ..
+            } = item.record
+            else {
+                return None;
+            };
+            Some(AuditExcluded {
+                record_id: id,
+                kind: kind.as_str(),
+                reason: "unverified_observation",
+                source_handle: source_handle.as_deref(),
+            })
+        })
+        .collect();
+
+    let returned = memory_claim.len()
+        + supporting_evidence.len()
+        + contradicting_evidence.len()
+        + superseding_records.len()
+        + related_code_handles.len()
+        + related_project_handles.len()
+        + verification_evidence.len();
+
+    let response = MemoryAuditResponse {
+        ok: true,
+        memory_id,
+        verified_only,
+        memory_claim,
+        direct_provenance: provenance,
+        supporting_evidence,
+        contradicting_evidence,
+        superseding_records,
+        related_code_handles,
+        related_project_handles,
+        verification_evidence,
+        diagnostics,
+        excluded,
+        page: AuditPage {
+            cursor: None,
+            has_more: false,
+            returned,
+        },
+    };
+
+    let output =
+        serde_json::to_string_pretty(&response).context("failed to serialize memory audit")?;
     println!("{output}");
     Ok(())
 }
