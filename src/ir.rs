@@ -1348,6 +1348,23 @@ impl GraphRecord {
         self
     }
 
+    /// Stamps an explicit store `transaction_time` (RFC 3339) on a node record.
+    ///
+    /// The transaction-time axis records *when the store first committed* the
+    /// fact, independent of `valid_time` (when the fact was true). Used by
+    /// transaction-time queries (`--tx-as-of` / `as_of.transaction_time`) per
+    /// `docs/schema/temporal-selectors.md`.
+    #[must_use]
+    pub fn with_transaction_time(mut self, tx_time: impl Into<String>) -> Self {
+        if let Self::Node {
+            transaction_time, ..
+        } = &mut self
+        {
+            *transaction_time = Some(tx_time.into());
+        }
+        self
+    }
+
     /// Stamps the redaction policy version on a node record.
     ///
     /// Called by importers after applying the v1 redaction policy; see

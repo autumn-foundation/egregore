@@ -173,11 +173,15 @@ fn cli_rejects_as_of_and_at_together() {
 }
 
 // ---------------------------------------------------------------------------
-// (d) --tx-as-of returns a not_implemented error envelope
+// (d) --tx-as-of is implemented (issue #66): it no longer returns
+//     not_implemented. Records lacking transaction-time metadata are excluded
+//     with a machine-readable diagnostic rather than a silent current-state
+//     fallback. (The history fixture carries git-commit valid times but no
+//     transaction-time stamps.)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn tx_as_of_returns_not_implemented_envelope() {
+fn tx_as_of_is_implemented_and_reports_missing_metadata() {
     let (_temp, graph) = fixture_temporal_graph();
 
     let output = CargoCommand::cargo_bin("egregore")
@@ -187,7 +191,7 @@ fn tx_as_of_returns_not_implemented_envelope() {
         .arg(&graph)
         .args(["--tx-as-of", "2026-01-02T00:00:00Z"])
         .assert()
-        .failure()
+        .success()
         .get_output()
         .stdout
         .clone();
@@ -195,14 +199,26 @@ fn tx_as_of_returns_not_implemented_envelope() {
     let stdout = String::from_utf8(output).expect("utf8 stdout");
     let envelope: Value =
         serde_json::from_str(stdout.trim()).expect("--tx-as-of output must be valid JSON");
-    assert_eq!(envelope["ok"], false, "envelope.ok must be false");
-    assert_eq!(
+    assert_eq!(envelope["ok"], true, "envelope.ok must be true");
+    assert_ne!(
         envelope["error"]["code"], "not_implemented",
-        "envelope.error.code must be not_implemented"
+        "--tx-as-of must no longer be reserved"
     );
+    // No row has a resolvable transaction time → empty records + diagnostics.
+    assert_eq!(
+        envelope["records"].as_array().map(Vec::len),
+        Some(0),
+        "history fixture rows lack transaction-time metadata; none should be returned"
+    );
+    let codes: Vec<&str> = envelope["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .filter_map(|d| d["code"].as_str())
+        .collect();
     assert!(
-        envelope["error"]["message"].as_str().is_some(),
-        "envelope.error.message must be present"
+        codes.contains(&"missing_transaction_metadata"),
+        "missing transaction metadata must be reported, got {codes:?}"
     );
 }
 

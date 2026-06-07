@@ -65,8 +65,16 @@ All three fields are optional. Behaviour per field:
 | Field              | Status      | Effect |
 |--------------------|-------------|--------|
 | `valid_time`       | implemented | Restricts symbol results to records whose valid-time is ≤ the given instant |
-| `transaction_time` | reserved    | Always returns HTTP 501 `not_implemented` |
+| `transaction_time` | implemented for `symbol_by_name` (issue #66) | Returns, per stable record ID, the version the store knew at or before the instant. On any other verb → HTTP 501 `not_implemented` |
 | `since`            | reserved    | Always returns HTTP 501 `not_implemented` |
+
+When `transaction_time` is set on `symbol_by_name`, the result adds a `tx_as_of`
+echo and a `diagnostics` array (see [`temporal-selectors.md`](temporal-selectors.md)
+for the diagnostic codes), and each record carries `domain`, `trust_class`,
+`valid_time`, `valid_time_source`, and `transaction_time` handles in addition to
+the base symbol shape. Setting both `valid_time` and `transaction_time` applies
+both axes independently. A malformed `transaction_time` returns HTTP 400
+`bad_request` (field `as_of.transaction_time`), never a silent current-state read.
 
 ### `budget` object
 
@@ -117,7 +125,7 @@ Error responses follow the standard envelope in
 | `ambiguous_commit_prefix` | 400 | `symbol_at_commit` prefix matches > 1 commit |
 | `missing_semantic_index` | 422 | `semantic_search` against a store with no embedding index (re-ingest with `--embed`) |
 | `incompatible_embedding_dimension` | 422 | `semantic_search` query vector width disagrees with the store's index |
-| `not_implemented`       | 501  | Reserved verb; `as_of.transaction_time` / `as_of.since` set; or `semantic_search` on a daemon built without the `embeddings` feature |
+| `not_implemented`       | 501  | Reserved verb; `as_of.transaction_time` set on a verb other than `symbol_by_name`; `as_of.since` set; or `semantic_search` on a daemon built without the `embeddings` feature |
 | `query_timeout`         | 408  | Budget `timeout_ms` elapsed |
 | `internal_error`        | 500  | Store read failed |
 
@@ -183,6 +191,13 @@ Optional `kind` filter (only `"Symbol"` is valid in v1).
 
 When `as_of.valid_time` is set, returns the single record whose valid-time is
 closest to and not after the instant.
+
+When `as_of.transaction_time` is set (issue #66), returns — per stable record ID —
+the version the store knew at or before the instant, excluding later corrections,
+supersessions, and re-imports. Combine with `as_of.valid_time` to ask "what was
+true at valid time V, as known by transaction time T." The row set is byte-equal
+(after canonical ordering) to `eg query symbol <name> --tx-as-of <T> --graph
+<same JSONL>`.
 
 **Params:**
 ```json

@@ -1669,6 +1669,51 @@ impl DaemonClient {
         Ok(envelope["result"].clone())
     }
 
+    /// Sends a verb query with a full `as_of` selector object and returns the
+    /// raw `result` object.
+    ///
+    /// Unlike [`Self::query_verb_raw`], the caller supplies the entire `as_of`
+    /// object (e.g. `{ "transaction_time": "...", "valid_time": "..." }`), so
+    /// the transaction-time axis can be exercised.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon rejects the request or cannot be reached.
+    pub fn query_verb_raw_with_as_of(
+        &self,
+        verb: &str,
+        params: &serde_json::Value,
+        as_of: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let body = json!({
+            "request_id": request_id("query", verb),
+            "agent_id": "egregore-cli",
+            "verb": verb,
+            "params": params,
+            "as_of": as_of,
+        });
+        let (status, body_str) = self.request(
+            "POST",
+            "/v1/query",
+            Some(body),
+            CLIENT_OPERATION_TIMEOUT,
+            true,
+        )?;
+        if status != 200 {
+            let envelope: serde_json::Value = serde_json::from_str(&body_str).unwrap_or_else(
+                |_| json!({ "error": { "code": "parse_error", "message": body_str } }),
+            );
+            let code = envelope["error"]["code"].as_str().unwrap_or("unknown");
+            let message = envelope["error"]["message"]
+                .as_str()
+                .unwrap_or("unknown error");
+            return Err(anyhow!("daemon query error ({code}): {message}"));
+        }
+        let envelope: serde_json::Value =
+            serde_json::from_str(&body_str).context("failed to parse daemon query response")?;
+        Ok(envelope["result"].clone())
+    }
+
     /// Requests daemon shutdown.
     ///
     /// # Errors
@@ -6870,6 +6915,122 @@ fn tombstoned_ids_in(records: &[GraphRecord]) -> BTreeSet<&str> {
         .collect()
 }
 
+/// Builds the `symbol_by_name` response for a transaction-time query (issue #66).
+///
+/// Reuses [`graph_query::symbol_as_of_transaction_time`] so the daemon row set
+/// is byte-equal (after canonical ordering) to `eg query symbol --tx-as-of`.
+/// Each row carries the redaction-safe handles required by AC5: record ID,
+/// schema version, trust/domain class, valid-time fields, the transaction-time
+/// handle, and a citable source handle (`repo_relative_path` + `span`).
+#[allow(clippy::too_many_arguments)]
+fn symbol_by_name_tx_response(
+    request_id: &str,
+    name: &str,
+    kind_filter: Option<&str>,
+    tx_as_of: &str,
+    as_of_valid_time: Option<&str>,
+    limit: usize,
+    records: &[GraphRecord],
+    snapshot: &str,
+    view_handle: &str,
+) -> HttpResponse {
+    // kind_filter only recognises "Symbol" in v1; anything else → empty result.
+    if kind_filter.is_some_and(|kf| kf != "Symbol") {
+        return HttpResponse::success(
+            Some(request_id),
+            200,
+            json!({
+                "verb": "symbol_by_name",
+                "snapshot": snapshot,
+                "tx_as_of": tx_as_of,
+                "records": [],
+                "diagnostics": [],
+                "page": { "cursor": serde_json::Value::Null, "has_more": false, "returned": 0 },
+            }),
+        );
+    }
+
+    let result =
+        match graph_query::symbol_as_of_transaction_time(records, name, tx_as_of, as_of_valid_time)
+        {
+            Ok(r) => r,
+            Err(err) => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request_field(err.message, "as_of.transaction_time"),
+                );
+            }
+        };
+
+    let rows: Vec<serde_json::Value> = result
+        .records
+        .iter()
+        .filter_map(|r| symbol_node_to_tx_query_json(r))
+        .take(limit)
+        .collect();
+    let diagnostics: Vec<serde_json::Value> = result
+        .diagnostics
+        .iter()
+        .map(|d| json!({ "code": d.code, "message": d.message }))
+        .collect();
+    let returned = rows.len() as u64;
+
+    HttpResponse::success(
+        Some(request_id),
+        200,
+        json!({
+            "verb": "symbol_by_name",
+            "snapshot": snapshot,
+            "tx_as_of": view_handle,
+            "records": rows,
+            "diagnostics": diagnostics,
+            "page": { "cursor": serde_json::Value::Null, "has_more": false, "returned": returned },
+        }),
+    )
+}
+
+/// Like [`symbol_node_to_query_json`] but adds the transaction-time query
+/// handles (issue #66 AC5): `domain`, `trust_class`, `valid_time`,
+/// `valid_time_source`, and `transaction_time`.
+fn symbol_node_to_tx_query_json(record: &GraphRecord) -> Option<serde_json::Value> {
+    let mut obj = symbol_node_to_query_json(record)?;
+    let GraphRecord::Node {
+        kind: NodeKind::Symbol,
+        temporal,
+        valid_time,
+        valid_time_source,
+        domain,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    let map = obj.as_object_mut()?;
+    let domain_str = domain
+        .as_deref()
+        .unwrap_or_else(|| crate::schema_version::domain_for_node_kind("Symbol"));
+    map.insert("domain".to_owned(), json!(domain_str));
+    map.insert("trust_class".to_owned(), json!("source_fact"));
+    if let Some(vt) = temporal
+        .as_ref()
+        .map(|t| t.valid_time.as_str())
+        .or(valid_time.as_deref())
+    {
+        map.insert("valid_time".to_owned(), json!(vt));
+    }
+    if let Some(vts) = temporal
+        .as_ref()
+        .and_then(|t| t.valid_time_source.as_deref())
+        .or(valid_time_source.as_deref())
+    {
+        map.insert("valid_time_source".to_owned(), json!(vts));
+    }
+    if let Some(tt) = graph_query::record_transaction_time(record) {
+        map.insert("transaction_time".to_owned(), json!(tt));
+    }
+    Some(obj)
+}
+
 /// Converts a `Symbol` node to the query JSON shape that matches CLI `eg query symbol`.
 /// Returns `None` when the record is not a Symbol or has no name.
 fn symbol_node_to_query_json(record: &GraphRecord) -> Option<serde_json::Value> {
@@ -7109,6 +7270,7 @@ fn handle_verb_symbol_by_name(
     request_id: &str,
     params: &serde_json::Value,
     as_of_valid_time: Option<&str>,
+    as_of_transaction_time: Option<&str>,
     limit: usize,
     started: Instant,
     budget: Option<Duration>,
@@ -7130,6 +7292,23 @@ fn handle_verb_symbol_by_name(
         Ok(r) => r,
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
+
+    // Transaction-time axis (issue #66): when present, dispatch to the shared
+    // transaction-time query so the daemon and the CLI fixture produce the same
+    // prior-view row set. Honours an optional valid-time axis simultaneously.
+    if let Some(tx_as_of) = as_of_transaction_time {
+        return symbol_by_name_tx_response(
+            request_id,
+            &name,
+            kind_filter.as_deref(),
+            tx_as_of,
+            as_of_valid_time,
+            limit,
+            &records,
+            &snapshot,
+            tx_as_of,
+        );
+    }
 
     let result_records: Vec<serde_json::Value> = if let Some(as_of) = as_of_valid_time {
         match graph_query::symbol_as_of_valid_time(&records, &name, as_of) {
@@ -8481,14 +8660,18 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         None => return HttpResponse::error(ApiError::missing_field("request_id")),
     };
 
-    // Check temporal reservations before any verb dispatch
+    // Check temporal reservations before any verb dispatch. The transaction-time
+    // axis (issue #66) is implemented for `symbol_by_name`; `since` (range
+    // queries) is still reserved.
     if let Some(as_of) = &query.as_of {
-        if as_of.transaction_time.is_some() {
+        if as_of.transaction_time.is_some()
+            && non_empty(query.verb.as_deref()) != Some("symbol_by_name")
+        {
             return HttpResponse::error_with_id(
                 &request_id,
                 ApiError::new(
                     ErrorCode::NotImplemented,
-                    "as_of.transaction_time is reserved; transaction-time axis is not yet wired up",
+                    "as_of.transaction_time is supported only for the 'symbol_by_name' verb",
                 ),
             );
         }
@@ -8519,6 +8702,11 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
         .as_of
         .as_ref()
         .and_then(|a| a.valid_time.as_deref())
+        .map(str::to_owned);
+    let as_of_transaction_time = query
+        .as_of
+        .as_ref()
+        .and_then(|a| a.transaction_time.as_deref())
         .map(str::to_owned);
 
     let (limit, timeout_ms) =
@@ -8566,6 +8754,7 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             &request_id,
             &params,
             as_of_valid_time.as_deref(),
+            as_of_transaction_time.as_deref(),
             limit,
             started,
             budget,

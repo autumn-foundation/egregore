@@ -2159,17 +2159,26 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             tx_as_of,
             format,
         } => {
-            if tx_as_of.is_some() {
-                let envelope = serde_json::json!({
-                    "ok": false,
-                    "error": {
-                        "code": "not_implemented",
-                        "message": "--tx-as-of: transaction-time queries are reserved and not yet \
-                                    implemented for JSONL queries; see docs/schema/temporal-selectors.md"
-                    }
-                });
-                println!("{}", serde_json::to_string(&envelope)?);
-                std::process::exit(1);
+            if let Some(tx) = tx_as_of.as_deref() {
+                // --at keys the valid-time axis to a commit; combining it with a
+                // transaction-time selector is an unsupported workflow (AC6).
+                if at.is_some() {
+                    print_tx_error(
+                        "unsupported_combination",
+                        "--at cannot be combined with --tx-as-of; use --as-of for the \
+                         valid-time axis alongside --tx-as-of",
+                    )?;
+                    std::process::exit(1);
+                }
+                #[cfg(feature = "embedded-aletheiadb")]
+                if daemon {
+                    let dir = data_dir
+                        .as_deref()
+                        .expect("clap requires --data-dir with --daemon");
+                    return query_symbol_tx_via_daemon(&name, dir, tx, as_of.as_deref(), format);
+                }
+                let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+                return query_symbol_tx_as_of(&records, &name, tx, as_of.as_deref(), format);
             }
             #[cfg(feature = "embedded-aletheiadb")]
             if daemon {
@@ -2812,6 +2821,214 @@ fn query_symbol_as_of(
         Ok(Some(record)) => {
             if let Some(result) = symbol_result(record, name) {
                 print_result(&result, format)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// query symbol --tx-as-of <instant> (issue #66)
+// ---------------------------------------------------------------------------
+
+/// A single transaction-time query result row.
+///
+/// Carries only redaction-safe handles (AC8): record ID, schema version, trust
+/// and domain class, valid-time fields, the transaction-time handle, and a
+/// citable source handle (`repo_relative_path` + `span`). No summaries, bodies,
+/// or raw payloads are emitted.
+#[derive(Serialize)]
+struct TxSymbolRow<'a> {
+    record_id: &'a str,
+    schema_version: u32,
+    name: &'a str,
+    kind: &'static str,
+    domain: &'a str,
+    trust_class: &'static str,
+    repo_relative_path: Option<&'a str>,
+    span: Option<SourceSpan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_commit: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid_time: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid_time_source: Option<&'a str>,
+    transaction_time: &'a str,
+}
+
+/// Response envelope for `eg query symbol --tx-as-of`.
+#[derive(Serialize)]
+struct TxSymbolEnvelope<'a> {
+    ok: bool,
+    verb: &'static str,
+    name: &'a str,
+    tx_as_of: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    as_of: Option<&'a str>,
+    snapshot: &'a str,
+    records: Vec<TxSymbolRow<'a>>,
+    diagnostics: Vec<query::TxDiagnostic>,
+    page: TxPage,
+}
+
+#[derive(Serialize)]
+struct TxPage {
+    cursor: Option<()>,
+    has_more: bool,
+    returned: usize,
+}
+
+/// Builds a redaction-safe result row from a selected Symbol record.
+fn tx_symbol_row(record: &GraphRecord) -> Option<TxSymbolRow<'_>> {
+    let GraphRecord::Node {
+        id,
+        kind: NodeKind::Symbol,
+        schema_version,
+        name,
+        repo_relative_path,
+        span,
+        temporal,
+        valid_time,
+        valid_time_source,
+        domain,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    // Prefer the explicit node `domain` field; otherwise fall back to the
+    // kind-derived domain (a `'static str`).
+    let domain_str = domain
+        .as_deref()
+        .unwrap_or_else(|| crate::schema_version::domain_for_node_kind("Symbol"));
+    Some(TxSymbolRow {
+        record_id: id,
+        schema_version: *schema_version,
+        name: name.as_deref().unwrap_or(""),
+        kind: "Symbol",
+        domain: domain_str,
+        trust_class: trust_class_for(record),
+        repo_relative_path: repo_relative_path.as_deref(),
+        span: *span,
+        git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+        valid_time: temporal
+            .as_ref()
+            .map(|t| t.valid_time.as_str())
+            .or(valid_time.as_deref()),
+        valid_time_source: temporal
+            .as_ref()
+            .and_then(|t| t.valid_time_source.as_deref())
+            .or(valid_time_source.as_deref()),
+        transaction_time: query::record_transaction_time(record).unwrap_or(""),
+    })
+}
+
+/// Prints a `{ "ok": false, "error": { code, message } }` envelope to stdout.
+fn print_tx_error(code: &str, message: &str) -> Result<()> {
+    let envelope = serde_json::json!({
+        "ok": false,
+        "error": { "code": code, "message": message }
+    });
+    println!("{}", serde_json::to_string(&envelope)?);
+    Ok(())
+}
+
+fn query_symbol_tx_as_of(
+    records: &[GraphRecord],
+    name: &str,
+    tx_as_of: &str,
+    as_of: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    match query::symbol_as_of_transaction_time(records, name, tx_as_of, as_of) {
+        Err(err) => {
+            print_tx_error(&err.code, &err.message)?;
+            std::process::exit(1);
+        }
+        Ok(result) => {
+            let rows: Vec<TxSymbolRow<'_>> = result
+                .records
+                .iter()
+                .filter_map(|r| tx_symbol_row(r))
+                .collect();
+            let envelope = TxSymbolEnvelope {
+                ok: true,
+                verb: "symbol",
+                name,
+                tx_as_of,
+                as_of,
+                // The view's transaction-time handle is the requested instant.
+                snapshot: tx_as_of,
+                page: TxPage {
+                    cursor: None,
+                    has_more: false,
+                    returned: rows.len(),
+                },
+                records: rows,
+                diagnostics: result.diagnostics,
+            };
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string(&envelope)?);
+                }
+                OutputFormat::Text => {
+                    for row in &envelope.records {
+                        let path = row.repo_relative_path.unwrap_or("(unknown)");
+                        let line = row.span.map_or(0, |s| s.start_line);
+                        println!(
+                            "{} (Symbol) @ {path}:{line} tx={}",
+                            row.name, row.transaction_time
+                        );
+                    }
+                    for diag in &envelope.diagnostics {
+                        println!("# {}: {}", diag.code, diag.message);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn query_symbol_tx_via_daemon(
+    name: &str,
+    data_dir: &Path,
+    tx_as_of: &str,
+    as_of: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let client = DaemonClient::from_data_dir(data_dir)
+        .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
+    let mut as_of_obj = serde_json::Map::new();
+    as_of_obj.insert("transaction_time".to_owned(), serde_json::json!(tx_as_of));
+    if let Some(vt) = as_of {
+        as_of_obj.insert("valid_time".to_owned(), serde_json::json!(vt));
+    }
+    let as_of_value = serde_json::Value::Object(as_of_obj);
+    let result = client.query_verb_raw_with_as_of(
+        "symbol_by_name",
+        &serde_json::json!({ "name": name }),
+        Some(&as_of_value),
+    )?;
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string(&result)?);
+        }
+        OutputFormat::Text => {
+            if let Some(records) = result.get("records").and_then(|r| r.as_array()) {
+                for rec in records {
+                    let name = rec.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let path = rec
+                        .get("repo_relative_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(unknown)");
+                    let tx = rec
+                        .get("transaction_time")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    println!("{name} (Symbol) @ {path} tx={tx}");
+                }
             }
         }
     }

@@ -1145,6 +1145,303 @@ pub fn symbol_as_of_valid_time<'records>(
     Ok(best.map(|(r, _)| r))
 }
 
+// ── Transaction-time queries (Issue #66) ───────────────────────────────────────
+
+/// A machine-readable diagnostic emitted by a transaction-time query.
+///
+/// Diagnostics never silently change the result set; they explain edge cases
+/// (empty views, excluded rows, out-of-range instants) so callers can tell a
+/// real "prior view" apart from a missing-metadata or out-of-range condition.
+/// See issue #66 AC6.
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TxDiagnostic {
+    /// Stable machine-readable code (e.g. `before_first_transaction`).
+    pub code: String,
+    /// Human-readable explanation. Never contains raw record bodies.
+    pub message: String,
+}
+
+/// Error that aborts a transaction-time query before any rows are produced.
+///
+/// Distinct from [`TxDiagnostic`]: an error means the query itself was
+/// malformed (e.g. an unparseable timestamp), so no result set exists.
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TxQueryError {
+    /// Stable machine-readable code (e.g. `invalid_timestamp`).
+    pub code: String,
+    /// Human-readable explanation.
+    pub message: String,
+}
+
+/// Outcome of a transaction-time symbol query.
+#[derive(Debug, Default)]
+pub struct TxSymbolQuery<'r> {
+    /// Selected records: one per stable record ID, the latest version the store
+    /// knew at the requested transaction time (further constrained by valid time
+    /// when a valid-time instant is also supplied). Sorted by record ID for
+    /// deterministic output (AC7).
+    pub records: Vec<&'r GraphRecord>,
+    /// Machine-readable diagnostics for this query (AC6). Sorted and deduplicated.
+    pub diagnostics: Vec<TxDiagnostic>,
+}
+
+/// Best-candidate tuple tracked per stable record ID while resolving a
+/// transaction-time query: the record, its parsed transaction time, and its
+/// parsed valid time (present only when a valid-time axis is requested).
+type TxCandidate<'r> = (
+    &'r GraphRecord,
+    DateTime<chrono::FixedOffset>,
+    Option<DateTime<chrono::FixedOffset>>,
+);
+
+/// Resolves the transaction-time handle of a record from its body fields.
+///
+/// Priority order:
+/// 1. explicit `transaction_time` (project-domain mutations, seeded fixtures),
+/// 2. `ingested_at` (agent-memory / verification commit time),
+/// 3. `valid_time` when `valid_time_source == "inferred_from_transaction_time"`
+///    (current-tree scans set `valid_time` to the scan's wall-clock instant,
+///    which *is* the transaction time).
+///
+/// Returns `None` when no transaction-time stamp can be resolved. Callers MUST
+/// treat `None` as *missing metadata*, never as a current-state record — a
+/// transaction-time query must not silently fall back to current state (AC6).
+#[must_use]
+pub fn record_transaction_time(record: &GraphRecord) -> Option<&str> {
+    let GraphRecord::Node {
+        transaction_time,
+        ingested_at,
+        valid_time,
+        valid_time_source,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    if let Some(tt) = transaction_time.as_deref() {
+        return Some(tt);
+    }
+    if let Some(ia) = ingested_at.as_deref() {
+        return Some(ia);
+    }
+    if valid_time_source.as_deref() == Some("inferred_from_transaction_time") {
+        return valid_time.as_deref();
+    }
+    None
+}
+
+/// Resolves the valid-time of a node from the history temporal block or the
+/// current-tree node-level field.
+#[must_use]
+fn node_valid_time(record: &GraphRecord) -> Option<&str> {
+    let GraphRecord::Node {
+        temporal,
+        valid_time,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    temporal
+        .as_ref()
+        .map(|t| t.valid_time.as_str())
+        .or(valid_time.as_deref())
+}
+
+/// Finds symbol records as the store knew them at a transaction-time instant.
+///
+/// Returns, per stable record ID, the version whose transaction time is the
+/// latest at or before `tx_as_of`. Records committed after `tx_as_of` (later
+/// corrections, supersessions, re-imports) are excluded, so the result is the
+/// *prior graph view* — what Egregore knew then, not the current state.
+///
+/// When `as_of_valid_time` is also supplied, both axes are applied
+/// independently (issue #66 AC4): first restrict to versions known by
+/// `tx_as_of` (transaction axis), then, within those, return the version whose
+/// `valid_time` is the most recent at or before `as_of_valid_time` (valid
+/// axis). This answers "what was true at valid time V, as known by transaction
+/// time T."
+///
+/// Tombstones are intentionally ignored on the transaction-time path: a
+/// current-state tombstone marks a *later* deletion whose transaction time is
+/// not recorded on the tombstone itself, so it must not erase a historical
+/// view that predates the deletion (AC2).
+///
+/// # Errors
+///
+/// Returns [`TxQueryError`] with code `invalid_timestamp` when `tx_as_of` or
+/// `as_of_valid_time` is not a valid RFC 3339 instant.
+#[allow(clippy::too_many_lines)]
+pub fn symbol_as_of_transaction_time<'r>(
+    records: &'r [GraphRecord],
+    symbol_name: &str,
+    tx_as_of: &str,
+    as_of_valid_time: Option<&str>,
+) -> Result<TxSymbolQuery<'r>, TxQueryError> {
+    let tx_instant = DateTime::parse_from_rfc3339(tx_as_of).map_err(|e| TxQueryError {
+        code: "invalid_timestamp".to_owned(),
+        message: format!("invalid --tx-as-of timestamp '{tx_as_of}': {e}"),
+    })?;
+    let vt_requested = match as_of_valid_time {
+        Some(v) => Some(DateTime::parse_from_rfc3339(v).map_err(|e| TxQueryError {
+            code: "invalid_timestamp".to_owned(),
+            message: format!("invalid --as-of timestamp '{v}': {e}"),
+        })?),
+        None => None,
+    };
+
+    let mut diagnostics: Vec<TxDiagnostic> = Vec::new();
+
+    // All Symbol nodes carrying the queried name.
+    let named: Vec<&GraphRecord> = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                GraphRecord::Node {
+                    kind: NodeKind::Symbol,
+                    name,
+                    ..
+                } if name.as_deref() == Some(symbol_name)
+            )
+        })
+        .collect();
+
+    if named.is_empty() {
+        diagnostics.push(TxDiagnostic {
+            code: "no_named_symbol".to_owned(),
+            message: format!("no Symbol named '{symbol_name}' exists in the store"),
+        });
+        return Ok(TxSymbolQuery {
+            records: Vec::new(),
+            diagnostics,
+        });
+    }
+
+    // Track the earliest/latest known transaction time across all named
+    // versions so we can report before-first / after-latest conditions.
+    let mut min_tx: Option<DateTime<chrono::FixedOffset>> = None;
+    let mut max_tx: Option<DateTime<chrono::FixedOffset>> = None;
+
+    // Best candidate per stable record ID.
+    // Comparison key: (valid_time, transaction_time) when a valid-time axis is
+    // requested; (transaction_time,) otherwise.
+    let mut best: BTreeMap<&str, TxCandidate<'r>> = BTreeMap::new();
+
+    for record in &named {
+        let Some(tt_str) = record_transaction_time(record) else {
+            diagnostics.push(TxDiagnostic {
+                code: "missing_transaction_metadata".to_owned(),
+                message: format!(
+                    "record '{}' has no transaction-time metadata; excluded (no current-state fallback)",
+                    record.id()
+                ),
+            });
+            continue;
+        };
+        let Ok(tt) = DateTime::parse_from_rfc3339(tt_str) else {
+            diagnostics.push(TxDiagnostic {
+                code: "invalid_record_transaction_time".to_owned(),
+                message: format!(
+                    "record '{}' has an unparseable transaction_time '{tt_str}'; excluded",
+                    record.id()
+                ),
+            });
+            continue;
+        };
+
+        min_tx = Some(min_tx.map_or(tt, |m| m.min(tt)));
+        max_tx = Some(max_tx.map_or(tt, |m| m.max(tt)));
+
+        // Transaction axis: exclude anything committed after the instant.
+        if tt > tx_instant {
+            continue;
+        }
+
+        // Valid axis (when requested): exclude versions not yet true at V.
+        let vt = if let Some(vt_req) = vt_requested {
+            let Some(vt_str) = node_valid_time(record) else {
+                diagnostics.push(TxDiagnostic {
+                    code: "missing_valid_time".to_owned(),
+                    message: format!(
+                        "record '{}' has no valid_time but --as-of was supplied; excluded",
+                        record.id()
+                    ),
+                });
+                continue;
+            };
+            let Ok(vt) = DateTime::parse_from_rfc3339(vt_str) else {
+                diagnostics.push(TxDiagnostic {
+                    code: "invalid_record_valid_time".to_owned(),
+                    message: format!(
+                        "record '{}' has an unparseable valid_time '{vt_str}'; excluded",
+                        record.id()
+                    ),
+                });
+                continue;
+            };
+            if vt > vt_req {
+                continue;
+            }
+            Some(vt)
+        } else {
+            None
+        };
+
+        let key = record.id();
+        let replace = match best.get(key) {
+            None => true,
+            Some((_, prev_transaction, prev_valid)) => match (vt, prev_valid) {
+                // Valid-time axis requested: prefer most-recent valid_time,
+                // tie-break on most-recent transaction_time.
+                (Some(cur_vt), Some(prev)) => {
+                    cur_vt > *prev || (cur_vt == *prev && tt > *prev_transaction)
+                }
+                // No valid-time axis: prefer most-recent transaction_time.
+                _ => tt > *prev_transaction,
+            },
+        };
+        if replace {
+            best.insert(key, (record, tt, vt));
+        }
+    }
+
+    // Out-of-range diagnostics (do not change the result set, only annotate it).
+    if let Some(min) = min_tx
+        && tx_instant < min
+    {
+        diagnostics.push(TxDiagnostic {
+            code: "before_first_transaction".to_owned(),
+            message: format!(
+                "tx-as-of '{tx_as_of}' precedes the earliest known transaction ('{}'); empty view",
+                min.to_rfc3339()
+            ),
+        });
+    }
+    if let Some(max) = max_tx
+        && tx_instant >= max
+    {
+        diagnostics.push(TxDiagnostic {
+            code: "after_latest_transaction".to_owned(),
+            message: format!(
+                "tx-as-of '{tx_as_of}' is at or after the latest known transaction ('{}'); view reflects all known history",
+                max.to_rfc3339()
+            ),
+        });
+    }
+
+    let mut selected: Vec<&GraphRecord> = best.into_values().map(|(r, _, _)| r).collect();
+    selected.sort_by(|a, b| a.id().cmp(b.id()));
+
+    diagnostics.sort_by(|a, b| a.code.cmp(&b.code).then_with(|| a.message.cmp(&b.message)));
+    diagnostics.dedup();
+
+    Ok(TxSymbolQuery {
+        records: selected,
+        diagnostics,
+    })
+}
+
 // ── Task Evidence Queries (Issue #48) ──────────────────────────────────────────
 
 /// Error returned when resolving a task ID or handle.
