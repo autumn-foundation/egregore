@@ -150,6 +150,54 @@ fn make_candidate_valid_in_graph(candidate: &mut GraphRecord, graph: &mut Graph)
     }
 }
 
+fn make_prompt_valid(prompt: &mut GraphRecord, candidate_id: &str) {
+    if let GraphRecord::Node {
+        schema_version,
+        domain,
+        user_context,
+        ..
+    } = prompt
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(candidate_id.to_owned()),
+            prompt_surface: Some("cli".to_owned()),
+            prompt_text: Some("PromptText".to_owned()),
+            prompted_at: Some("2026-06-01T12:00:00Z".to_owned()),
+            prompted_to: Some("operator".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+}
+
+fn make_decision_valid(
+    decision: &mut GraphRecord,
+    candidate_id: &str,
+    prompt_id: &str,
+    materialized_id: &str,
+) {
+    if let GraphRecord::Node {
+        schema_version,
+        domain,
+        user_context,
+        ..
+    } = decision
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(candidate_id.to_owned()),
+            prompt_id: Some(prompt_id.to_owned()),
+            outcome: Some("approved".to_owned()),
+            materialized_record_id: Some(materialized_id.to_owned()),
+            decided_at: Some("2026-06-01T12:00:00Z".to_owned()),
+            decided_by: Some("operator".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+}
+
 /// Helper to generate a seeded graph JSONL fixture containing:
 /// - 3 pending preference candidates
 /// - 2 prior decisions
@@ -538,6 +586,7 @@ fn fixture_preference_approval_seeded() -> (tempfile::TempDir, PathBuf, Vec<Stri
                     target_git_commit: None,
                 },
             ]),
+            contradicting_evidence: Some(vec![]),
             ..UserContextFields::empty()
         };
     }
@@ -716,6 +765,7 @@ fn fixture_preference_approval_seeded() -> (tempfile::TempDir, PathBuf, Vec<Stri
                     target_git_commit: None,
                 },
             ]),
+            contradicting_evidence: Some(vec![]),
             ..UserContextFields::empty()
         };
     }
@@ -4521,6 +4571,10 @@ fn test_decide_rejects_non_agent_evidence_in_audit() {
         *domain = Some("user_context".to_owned());
         *user_context = UserContextFields {
             candidate_id: Some(cand_id.to_owned()),
+            prompt_surface: Some("cli".to_owned()),
+            prompt_text: Some("PromptText".to_owned()),
+            prompted_at: Some("2026-06-05T12:00:00Z".to_owned()),
+            prompted_to: Some("operator".to_owned()),
             ..UserContextFields::empty()
         };
     }
@@ -4548,6 +4602,7 @@ fn test_decide_rejects_non_agent_evidence_in_audit() {
             outcome: Some("approved".to_owned()),
             materialized_record_id: Some("some_preference".to_owned()),
             decided_at: Some("2026-06-05T12:00:00Z".to_owned()),
+            decided_by: Some("operator".to_owned()),
             ..UserContextFields::empty()
         };
     }
@@ -4572,6 +4627,8 @@ fn test_decide_rejects_non_agent_evidence_in_audit() {
         *user_context = UserContextFields {
             approval_decision_id: Some(decision_id.to_owned()),
             rule_text: Some("MyRule".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
             active_from: Some("2026-06-05T12:00:00Z".to_owned()),
             ..UserContextFields::empty()
         };
@@ -4745,6 +4802,10 @@ fn test_audit_trail_verifies_candidate_body_and_kind() {
         *domain = Some("user_context".to_owned());
         *user_context = UserContextFields {
             candidate_id: Some(cand_id.to_owned()),
+            prompt_surface: Some("cli".to_owned()),
+            prompt_text: Some("PromptText".to_owned()),
+            prompted_at: Some("2026-06-05T12:00:00Z".to_owned()),
+            prompted_to: Some("operator".to_owned()),
             ..UserContextFields::empty()
         };
     }
@@ -4772,6 +4833,7 @@ fn test_audit_trail_verifies_candidate_body_and_kind() {
             outcome: Some("approved".to_owned()),
             materialized_record_id: Some("pref_1".to_owned()),
             decided_at: Some("2026-06-05T12:00:00Z".to_owned()),
+            decided_by: Some("operator".to_owned()),
             ..UserContextFields::empty()
         };
     }
@@ -4795,8 +4857,9 @@ fn test_audit_trail_verifies_candidate_body_and_kind() {
         *domain = Some("user_context".to_owned());
         *user_context = UserContextFields {
             approval_decision_id: Some(decision_id.to_owned()),
-            // Durable record rule_text has mismatched/wrong body (not matching redacted candidate proposed_rule_text)
             rule_text: Some("MismatchedText".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
             active_from: Some("2026-06-05T12:00:00Z".to_owned()),
             ..UserContextFields::empty()
         };
@@ -5607,19 +5670,9 @@ fn test_audit_trail_validates_active_from_match() {
         None,
         "Decision node".to_owned(),
     );
-    if let GraphRecord::Node {
-        ref mut user_context,
-        ..
-    } = decision
-    {
-        *user_context = UserContextFields {
-            outcome: Some("approved".to_owned()),
-            materialized_record_id: Some(policy_id.to_owned()),
-            decided_at: Some("2026-06-01T12:05:00Z".to_owned()),
-            prompt_id: Some("prompt_mismatch".to_owned()),
-            candidate_id: Some("cand_mismatch".to_owned()),
-            ..UserContextFields::empty()
-        };
+    make_decision_valid(&mut decision, "cand_mismatch", "prompt_mismatch", policy_id);
+    if let GraphRecord::Node { user_context, .. } = &mut decision {
+        user_context.decided_at = Some("2026-06-01T12:05:00Z".to_owned());
     }
 
     let mut prompt = GraphRecord::node(
@@ -5630,16 +5683,7 @@ fn test_audit_trail_validates_active_from_match() {
         None,
         "Prompt node".to_owned(),
     );
-    if let GraphRecord::Node {
-        ref mut user_context,
-        ..
-    } = prompt
-    {
-        *user_context = UserContextFields {
-            candidate_id: Some("cand_mismatch".to_owned()),
-            ..UserContextFields::empty()
-        };
-    }
+    make_prompt_valid(&mut prompt, "cand_mismatch");
 
     let mut candidate = GraphRecord::node(
         "cand_mismatch".to_owned(),
@@ -5649,48 +5693,14 @@ fn test_audit_trail_validates_active_from_match() {
         None,
         "Candidate node".to_owned(),
     );
-    if let GraphRecord::Node {
-        ref mut user_context,
-        ..
-    } = candidate
-    {
-        *user_context = UserContextFields {
-            proposed_rule_text: Some("RuleText".to_owned()),
-            proposed_rule_kind: Some("preference".to_owned()),
-            scope: Some(UserContextScope::default()),
-            supporting_evidence: Some(vec![EvidenceLink {
-                target_record_id: Some("obs_mismatch".to_owned()),
-                target_domain: "agent_memory".to_owned(),
-                relation: "PROPOSED_BY".to_owned(),
-                confidence: "1.0".to_owned(),
-                as_of_commit: None,
-                target_repo_relative_path: None,
-                target_span: None,
-                target_git_commit: None,
-            }]),
-            ..UserContextFields::empty()
-        };
-    }
+    let mut records = Vec::new();
+    make_candidate_valid(&mut candidate, &mut records);
 
-    let mut obs = GraphRecord::node(
-        "obs_mismatch".to_owned(),
-        NodeKind::Observation,
-        None,
-        None,
-        None,
-        "Observation node".to_owned(),
-    );
-    if let GraphRecord::Node {
-        ref mut schema_version,
-        ref mut domain,
-        ..
-    } = obs
-    {
-        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
-        *domain = Some("agent_memory".to_owned());
-    }
+    records.push(policy.clone());
+    records.push(decision);
+    records.push(prompt);
+    records.push(candidate);
 
-    let records = vec![policy.clone(), decision, prompt, candidate, obs];
     let result = audit_trail(&records, &policy);
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("does not match decision"));
@@ -6090,20 +6100,7 @@ fn test_audit_trail_threshold_validation() {
         None,
         "Decision node".to_owned(),
     );
-    if let GraphRecord::Node {
-        ref mut user_context,
-        ..
-    } = decision
-    {
-        *user_context = UserContextFields {
-            outcome: Some("approved".to_owned()),
-            materialized_record_id: Some(policy_id.to_owned()),
-            decided_at: Some("2026-06-01T12:00:00Z".to_owned()),
-            prompt_id: Some("prompt_1".to_owned()),
-            candidate_id: Some("cand_1".to_owned()),
-            ..UserContextFields::empty()
-        };
-    }
+    make_decision_valid(&mut decision, "cand_1", "prompt_1", policy_id);
 
     let mut prompt = GraphRecord::node(
         "prompt_1".to_owned(),
@@ -6113,16 +6110,7 @@ fn test_audit_trail_threshold_validation() {
         None,
         "Prompt node".to_owned(),
     );
-    if let GraphRecord::Node {
-        ref mut user_context,
-        ..
-    } = prompt
-    {
-        *user_context = UserContextFields {
-            candidate_id: Some("cand_1".to_owned()),
-            ..UserContextFields::empty()
-        };
-    }
+    make_prompt_valid(&mut prompt, "cand_1");
 
     let make_obs = |id: &str, session: &str| {
         let mut obs = GraphRecord::node(
@@ -7333,24 +7321,7 @@ fn test_audit_trail_validates_candidate_metadata() {
         None,
         "Decision".to_owned(),
     );
-    if let GraphRecord::Node {
-        ref mut schema_version,
-        ref mut domain,
-        ref mut user_context,
-        ..
-    } = dec
-    {
-        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
-        *domain = Some("user_context".to_owned());
-        *user_context = UserContextFields {
-            candidate_id: Some(cand_id.to_owned()),
-            prompt_id: Some(prompt_id.to_owned()),
-            outcome: Some("approved".to_owned()),
-            decided_at: Some("2026-06-01T12:00:00Z".to_owned()),
-            materialized_record_id: Some(pref_id.to_owned()),
-            ..UserContextFields::empty()
-        };
-    }
+    make_decision_valid(&mut dec, cand_id, prompt_id, pref_id);
 
     let mut prompt = GraphRecord::node(
         prompt_id.to_owned(),
@@ -7360,20 +7331,7 @@ fn test_audit_trail_validates_candidate_metadata() {
         None,
         "Prompt".to_owned(),
     );
-    if let GraphRecord::Node {
-        ref mut schema_version,
-        ref mut domain,
-        ref mut user_context,
-        ..
-    } = prompt
-    {
-        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
-        *domain = Some("user_context".to_owned());
-        *user_context = UserContextFields {
-            candidate_id: Some(cand_id.to_owned()),
-            ..UserContextFields::empty()
-        };
-    }
+    make_prompt_valid(&mut prompt, cand_id);
 
     let mut pref = GraphRecord::node(
         pref_id.to_owned(),
@@ -7493,24 +7451,7 @@ fn test_audit_trail_fails_for_empty_session_id() {
         None,
         "Decision".to_owned(),
     );
-    if let GraphRecord::Node {
-        ref mut schema_version,
-        ref mut domain,
-        ref mut user_context,
-        ..
-    } = dec
-    {
-        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
-        *domain = Some("user_context".to_owned());
-        *user_context = UserContextFields {
-            candidate_id: Some(cand_id.to_owned()),
-            prompt_id: Some(prompt_id.to_owned()),
-            outcome: Some("approved".to_owned()),
-            decided_at: Some("2026-06-01T12:00:00Z".to_owned()),
-            materialized_record_id: Some(pref_id.to_owned()),
-            ..UserContextFields::empty()
-        };
-    }
+    make_decision_valid(&mut dec, cand_id, prompt_id, pref_id);
 
     let mut prompt = GraphRecord::node(
         prompt_id.to_owned(),
@@ -7520,20 +7461,7 @@ fn test_audit_trail_fails_for_empty_session_id() {
         None,
         "Prompt".to_owned(),
     );
-    if let GraphRecord::Node {
-        ref mut schema_version,
-        ref mut domain,
-        ref mut user_context,
-        ..
-    } = prompt
-    {
-        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
-        *domain = Some("user_context".to_owned());
-        *user_context = UserContextFields {
-            candidate_id: Some(cand_id.to_owned()),
-            ..UserContextFields::empty()
-        };
-    }
+    make_prompt_valid(&mut prompt, cand_id);
 
     let mut pref = GraphRecord::node(
         pref_id.to_owned(),
@@ -7638,7 +7566,6 @@ fn test_decide_rightmost_resolution_prefers_redacted() {
     // Push both, raw first, redacted second
     records.push(cand_raw);
     records.push(cand_red);
-
 
     let req = DecideRequest {
         candidate_id: cand_id.to_owned(),
@@ -7751,4 +7678,389 @@ fn test_cli_decide_copies_references_for_redacted_candidate() {
             Some("<REDACTED:api_token:ddbde35135f9>")
         );
     }
+}
+
+#[test]
+fn test_audit_trail_fails_for_missing_candidate_contradicting_evidence() {
+    use aletheia_egregore::query::audit_trail;
+
+    let cand_id = "cand_missing_contradicting";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    let pref_id = "pref_missing_contra";
+    let dec_id = "dec_missing_contra";
+    let prompt_id = "prompt_missing_contra";
+
+    let mut dec = GraphRecord::node(
+        dec_id.to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision".to_owned(),
+    );
+    make_decision_valid(&mut dec, cand_id, prompt_id, pref_id);
+
+    let mut prompt = GraphRecord::node(
+        prompt_id.to_owned(),
+        NodeKind::PromotionPrompt,
+        None,
+        None,
+        None,
+        "Prompt".to_owned(),
+    );
+    make_prompt_valid(&mut prompt, cand_id);
+
+    let mut pref = GraphRecord::node(
+        pref_id.to_owned(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Preference".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        domain,
+        user_context,
+        ..
+    } = &mut pref
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            approval_decision_id: Some(dec_id.to_owned()),
+            active_from: Some("2026-06-01T12:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut records = vec![dec, prompt, pref];
+    make_candidate_valid(&mut candidate, &mut records);
+
+    if let GraphRecord::Node { user_context, .. } = &mut candidate {
+        user_context.scope = Some(UserContextScope::default());
+        user_context.contradicting_evidence = None;
+    }
+    records.push(candidate);
+
+    let result = audit_trail(&records, &records[2]);
+    assert!(result.is_err());
+    let err_msg = result.err().unwrap();
+    assert!(err_msg.contains("lacks contradicting_evidence"));
+}
+
+#[test]
+fn test_audit_trail_fails_for_missing_durable_scope() {
+    use aletheia_egregore::query::audit_trail;
+
+    let cand_id = "cand_missing_scope";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    let pref_id = "pref_missing_scope";
+    let dec_id = "dec_missing_scope";
+    let prompt_id = "prompt_missing_scope";
+
+    let mut dec = GraphRecord::node(
+        dec_id.to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision".to_owned(),
+    );
+    make_decision_valid(&mut dec, cand_id, prompt_id, pref_id);
+
+    let mut prompt = GraphRecord::node(
+        prompt_id.to_owned(),
+        NodeKind::PromotionPrompt,
+        None,
+        None,
+        None,
+        "Prompt".to_owned(),
+    );
+    make_prompt_valid(&mut prompt, cand_id);
+
+    let mut pref = GraphRecord::node(
+        pref_id.to_owned(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Preference".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        domain,
+        user_context,
+        ..
+    } = &mut pref
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: None, // Missing scope!
+            approval_decision_id: Some(dec_id.to_owned()),
+            active_from: Some("2026-06-01T12:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut records = vec![dec, prompt, pref];
+    make_candidate_valid(&mut candidate, &mut records);
+    records.push(candidate);
+
+    let result = audit_trail(&records, &records[2]);
+    assert!(result.is_err());
+    let err_msg = result.err().unwrap();
+    assert!(err_msg.contains("lacks scope"));
+}
+
+#[test]
+fn test_audit_trail_fails_for_invalid_prompt_metadata() {
+    use aletheia_egregore::query::audit_trail;
+
+    let cand_id = "cand_invalid_prompt";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    let pref_id = "pref_invalid_prompt";
+    let dec_id = "dec_invalid_prompt";
+    let prompt_id = "prompt_invalid_prompt";
+
+    let mut dec = GraphRecord::node(
+        dec_id.to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision".to_owned(),
+    );
+    make_decision_valid(&mut dec, cand_id, prompt_id, pref_id);
+
+    let mut prompt = GraphRecord::node(
+        prompt_id.to_owned(),
+        NodeKind::PromotionPrompt,
+        None,
+        None,
+        None,
+        "Prompt".to_owned(),
+    );
+    make_prompt_valid(&mut prompt, cand_id);
+    if let GraphRecord::Node { user_context, .. } = &mut prompt {
+        user_context.prompt_surface = Some("invalid_surface".to_owned());
+    }
+
+    let mut pref = GraphRecord::node(
+        pref_id.to_owned(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Preference".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        domain,
+        user_context,
+        ..
+    } = &mut pref
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            approval_decision_id: Some(dec_id.to_owned()),
+            active_from: Some("2026-06-01T12:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut records = vec![dec, prompt, pref];
+    make_candidate_valid(&mut candidate, &mut records);
+    records.push(candidate);
+
+    let result = audit_trail(&records, &records[2]);
+    assert!(result.is_err());
+    let err_msg = result.err().unwrap();
+    assert!(err_msg.contains("prompt_surface 'invalid_surface' is invalid"));
+}
+
+#[test]
+fn test_audit_trail_fails_for_missing_decision_approver() {
+    use aletheia_egregore::query::audit_trail;
+
+    let cand_id = "cand_missing_approver";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    let pref_id = "pref_missing_approver";
+    let dec_id = "dec_missing_approver";
+    let prompt_id = "prompt_missing_approver";
+
+    let mut dec = GraphRecord::node(
+        dec_id.to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision".to_owned(),
+    );
+    make_decision_valid(&mut dec, cand_id, prompt_id, pref_id);
+    if let GraphRecord::Node { user_context, .. } = &mut dec {
+        user_context.decided_by = None;
+    }
+
+    let mut prompt = GraphRecord::node(
+        prompt_id.to_owned(),
+        NodeKind::PromotionPrompt,
+        None,
+        None,
+        None,
+        "Prompt".to_owned(),
+    );
+    make_prompt_valid(&mut prompt, cand_id);
+
+    let mut pref = GraphRecord::node(
+        pref_id.to_owned(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Preference".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        domain,
+        user_context,
+        ..
+    } = &mut pref
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            approval_decision_id: Some(dec_id.to_owned()),
+            active_from: Some("2026-06-01T12:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut records = vec![dec, prompt, pref];
+    make_candidate_valid(&mut candidate, &mut records);
+    records.push(candidate);
+
+    let result = audit_trail(&records, &records[2]);
+    assert!(result.is_err());
+    let err_msg = result.err().unwrap();
+    assert!(err_msg.contains("lacks decided_by"));
+}
+
+#[test]
+fn test_audit_trail_fails_for_missing_durable_kind_specific_fields() {
+    use aletheia_egregore::query::audit_trail;
+
+    let cand_id = "cand_missing_kind_fields";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    let wf_id = "wf_missing_kind_fields";
+    let dec_id = "dec_wf";
+    let prompt_id = "prompt_wf";
+
+    let mut dec = GraphRecord::node(
+        dec_id.to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision".to_owned(),
+    );
+    make_decision_valid(&mut dec, cand_id, prompt_id, wf_id);
+
+    let mut prompt = GraphRecord::node(
+        prompt_id.to_owned(),
+        NodeKind::PromotionPrompt,
+        None,
+        None,
+        None,
+        "Prompt".to_owned(),
+    );
+    make_prompt_valid(&mut prompt, cand_id);
+
+    let mut wf = GraphRecord::node(
+        wf_id.to_owned(),
+        NodeKind::WorkflowRule,
+        None,
+        None,
+        None,
+        "WorkflowRule".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        domain,
+        user_context,
+        ..
+    } = &mut wf
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("workflow_rule".to_owned()),
+            scope: Some(UserContextScope::default()),
+            approval_decision_id: Some(dec_id.to_owned()),
+            active_from: Some("2026-06-01T12:00:00Z".to_owned()),
+            // missing triggers and action_summary!
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut records = vec![dec, prompt, wf];
+    make_candidate_valid(&mut candidate, &mut records);
+    if let GraphRecord::Node { user_context, .. } = &mut candidate {
+        user_context.proposed_rule_kind = Some("workflow_rule".to_owned());
+    }
+    records.push(candidate);
+
+    let result = audit_trail(&records, &records[2]);
+    assert!(result.is_err());
+    let err_msg = result.err().unwrap();
+    assert!(err_msg.contains("lacks triggers"));
 }

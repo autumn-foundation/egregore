@@ -2276,6 +2276,145 @@ pub fn active_policy<'a>(
     policy
 }
 
+fn validate_scope(
+    scope: Option<&UserContextScope>,
+    field_name: &str,
+) -> std::result::Result<(), String> {
+    let scope = scope.ok_or_else(|| format!("{} lacks scope", field_name))?;
+    if let Some(lifecycle_phase) = scope.lifecycle_phase.as_deref() {
+        if !["pre_commit", "pre_pr", "pre_merge", "runtime", "any"].contains(&lifecycle_phase) {
+            return Err(format!(
+                "{} has invalid lifecycle_phase '{}'",
+                field_name, lifecycle_phase
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_durable_fields(
+    kind: NodeKind,
+    user_context: &crate::ir::UserContextFields,
+    durable_id: &str,
+) -> std::result::Result<(), String> {
+    match kind {
+        NodeKind::Preference => {
+            if user_context.proposed_rule_kind.as_deref() != Some("preference") {
+                return Err(format!(
+                    "Durable record '{}' proposed_rule_kind must be 'preference'",
+                    durable_id
+                ));
+            }
+            let text = user_context.rule_text.as_deref().unwrap_or("");
+            if text.is_empty() {
+                return Err(format!("Durable record '{}' lacks rule_text", durable_id));
+            }
+        }
+        NodeKind::WorkflowRule => {
+            if user_context.proposed_rule_kind.as_deref() != Some("workflow_rule") {
+                return Err(format!(
+                    "Durable record '{}' proposed_rule_kind must be 'workflow_rule'",
+                    durable_id
+                ));
+            }
+            let text = user_context.rule_text.as_deref().unwrap_or("");
+            if text.is_empty() {
+                return Err(format!("Durable record '{}' lacks rule_text", durable_id));
+            }
+            let triggers = user_context
+                .triggers
+                .as_ref()
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| format!("Durable record '{}' lacks triggers", durable_id))?;
+            for trigger in triggers {
+                if trigger.is_empty() {
+                    return Err(format!(
+                        "Durable record '{}' has empty trigger entry",
+                        durable_id
+                    ));
+                }
+                if ![
+                    "pre_commit",
+                    "pre_pr",
+                    "pre_merge",
+                    "pre_command",
+                    "post_command",
+                ]
+                .contains(&trigger.as_str())
+                {
+                    return Err(format!(
+                        "Durable record '{}' trigger '{}' is invalid",
+                        durable_id, trigger
+                    ));
+                }
+            }
+            let action_summary = user_context.action_summary.as_deref().unwrap_or("");
+            if action_summary.is_empty() {
+                return Err(format!(
+                    "Durable record '{}' lacks action_summary",
+                    durable_id
+                ));
+            }
+        }
+        NodeKind::NamingDecision => {
+            if user_context.proposed_rule_kind.as_deref() != Some("naming_decision") {
+                return Err(format!(
+                    "Durable record '{}' proposed_rule_kind must be 'naming_decision'",
+                    durable_id
+                ));
+            }
+            let entity_kind = user_context.entity_kind.as_deref().unwrap_or("");
+            if ![
+                "crate", "module", "type", "function", "field", "feature", "other",
+            ]
+            .contains(&entity_kind)
+            {
+                return Err(format!(
+                    "Durable record '{}' entity_kind '{}' is invalid",
+                    durable_id, entity_kind
+                ));
+            }
+            let name = user_context.canonical_name.as_deref().unwrap_or("");
+            if name.is_empty() {
+                return Err(format!(
+                    "Durable record '{}' lacks canonical_name",
+                    durable_id
+                ));
+            }
+            if user_context.alternatives_rejected.is_none() {
+                return Err(format!(
+                    "Durable record '{}' lacks alternatives_rejected",
+                    durable_id
+                ));
+            }
+        }
+        NodeKind::Constraint => {
+            if user_context.proposed_rule_kind.as_deref() != Some("constraint") {
+                return Err(format!(
+                    "Durable record '{}' proposed_rule_kind must be 'constraint'",
+                    durable_id
+                ));
+            }
+            let text = user_context.constraint_text.as_deref().unwrap_or("");
+            if text.is_empty() {
+                return Err(format!(
+                    "Durable record '{}' lacks constraint_text",
+                    durable_id
+                ));
+            }
+            let level = user_context.enforcement_level.as_deref().unwrap_or("");
+            if !["advisory", "blocking"].contains(&level) {
+                return Err(format!(
+                    "Durable record '{}' enforcement_level '{}' is invalid",
+                    durable_id, level
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Traces the approval chain back to supporting observations
 ///
 /// # Errors
@@ -2311,6 +2450,12 @@ pub fn audit_trail<'a>(
         _ => unreachable!(),
     };
 
+    validate_scope(
+        user_context.scope.as_ref(),
+        &format!("Durable record '{}'", durable_id),
+    )?;
+    validate_durable_fields(kind, user_context, durable_id)?;
+
     let decision_id = user_context
         .approval_decision_id
         .as_deref()
@@ -2340,6 +2485,13 @@ pub fn audit_trail<'a>(
             ));
         }
     };
+    let decided_by = decision_fields
+        .decided_by
+        .as_deref()
+        .ok_or_else(|| format!("Decision '{}' lacks decided_by", decision_id))?;
+    if decided_by.is_empty() {
+        return Err(format!("Decision '{}' has empty decided_by", decision_id));
+    }
     let outcome = decision_fields
         .outcome
         .as_deref()
@@ -2416,6 +2568,36 @@ pub fn audit_trail<'a>(
         .candidate_id
         .as_deref()
         .ok_or_else(|| format!("Prompt '{}' lacks candidate_id", prompt_id))?;
+    let surface = prompt_fields
+        .prompt_surface
+        .as_deref()
+        .ok_or_else(|| format!("Prompt '{}' lacks prompt_surface", prompt_id))?;
+    if !["cli", "mcp", "web", "other"].contains(&surface) {
+        return Err(format!(
+            "Prompt '{}' prompt_surface '{}' is invalid",
+            prompt_id, surface
+        ));
+    }
+    let prompt_text = prompt_fields
+        .prompt_text
+        .as_deref()
+        .ok_or_else(|| format!("Prompt '{}' lacks prompt_text", prompt_id))?;
+    if prompt_text.is_empty() {
+        return Err(format!("Prompt '{}' has empty prompt_text", prompt_id));
+    }
+    let prompted_at = prompt_fields
+        .prompted_at
+        .as_deref()
+        .ok_or_else(|| format!("Prompt '{}' lacks prompted_at", prompt_id))?;
+    chrono::DateTime::parse_from_rfc3339(prompted_at)
+        .map_err(|e| format!("Prompt '{}' has invalid prompted_at: {}", prompt_id, e))?;
+    let prompted_to = prompt_fields
+        .prompted_to
+        .as_deref()
+        .ok_or_else(|| format!("Prompt '{}' lacks prompted_to", prompt_id))?;
+    if prompted_to.is_empty() {
+        return Err(format!("Prompt '{}' has empty prompted_to", prompt_id));
+    }
     let decision_candidate_id = decision_fields
         .candidate_id
         .as_deref()
@@ -2480,6 +2662,21 @@ pub fn audit_trail<'a>(
             candidate_id, eq_str
         ));
     }
+
+    validate_scope(
+        candidate_fields.scope.as_ref(),
+        &format!("PromoteCandidate '{}'", candidate_id),
+    )?;
+
+    let _contradicting = candidate_fields
+        .contradicting_evidence
+        .as_ref()
+        .ok_or_else(|| {
+            format!(
+                "PromoteCandidate '{}' lacks contradicting_evidence",
+                candidate_id
+            )
+        })?;
 
     // Perform candidate-kind/body consistency checks
     let expected_kind = match kind {
