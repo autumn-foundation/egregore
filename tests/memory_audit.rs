@@ -1242,3 +1242,139 @@ fn audit_agent_summary_is_not_emitted_verbatim() {
         "agent-authored item should carry a summary_hash: {contra_item}"
     );
 }
+
+/// A tombstoned `AgentSession` scope handle is stale even when a live claim
+/// shares its session key.
+#[test]
+fn audit_tombstoned_scope_handle_is_stale() {
+    let session_node = agent_memory_stable_id(&["session", "deleted"]);
+    let claim_id = agent_memory_stable_id(&["obs", "claim_scope"]);
+    let mut session = agent_node(&session_node, NodeKind::AgentSession, Some("sess"));
+    if let GraphRecord::Node {
+        session_id: ref mut sid,
+        ..
+    } = session
+    {
+        *sid = Some("k".to_owned());
+    }
+    let mut claim = mk_obs(&claim_id, "run.traj", vec![]);
+    if let GraphRecord::Node {
+        session_id: ref mut sid,
+        ..
+    } = claim
+    {
+        *sid = Some("k".to_owned());
+    }
+    let tombstone = GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &session_node]),
+        schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+        deleted_id: session_node.clone(),
+        summary: "deleted".to_owned(),
+        producer: None,
+    };
+
+    let (_t, graph) = write_graph(vec![session, claim, tombstone]);
+    let assert = egregore()
+        .args(["query", "memory", &session_node, "--graph"])
+        .arg(&graph)
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["error"]["code"], "stale_handle", "{v}");
+}
+
+/// A reverse denormalized `SUPERSEDES` link on a newer record (no edge) still
+/// surfaces that record in `superseding_records`.
+#[test]
+fn audit_reverse_supersedes_link_is_surfaced() {
+    let old_id = agent_memory_stable_id(&["obs", "old"]);
+    let new_id = agent_memory_stable_id(&["decision", "new"]);
+    let old_claim = mk_obs(&old_id, "run.traj", vec![]);
+    let mut newer = agent_node(&new_id, NodeKind::Decision, None);
+    if let GraphRecord::Node {
+        ref mut evidence_links,
+        ..
+    } = newer
+    {
+        *evidence_links = Some(vec![link(&old_id, "agent_memory", "SUPERSEDES")]);
+    }
+
+    let (_t, graph) = write_graph(vec![old_claim, newer]);
+    let v = audit_json(&graph, &old_id);
+    let sup = v["superseding_records"].as_array().expect("superseding");
+    assert!(
+        sup.iter().any(|h| h["record_id"] == new_id),
+        "reverse SUPERSEDES link not surfaced: {v}"
+    );
+}
+
+/// An edge-only evidence target that is absent is surfaced as a diagnostic, not
+/// silently skipped.
+#[test]
+fn audit_edge_only_missing_target_is_diagnosed() {
+    let claim_id = agent_memory_stable_id(&["obs", "claim_edge"]);
+    let missing = verification_stable_id(&["verification", "gone"]);
+    let claim = mk_obs(&claim_id, "run.traj", vec![]);
+    let edge = GraphRecord::edge(
+        EdgeLabel::HasEvidence,
+        claim_id.clone(),
+        missing.clone(),
+        None,
+        "has-evidence".to_owned(),
+    );
+
+    let (_t, graph) = write_graph(vec![claim, edge]);
+    let v = audit_json(&graph, &claim_id);
+    let diags = v["diagnostics"].as_array().expect("diagnostics");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d["code"] == "unresolved_evidence_link" && d["target_handle"] == missing),
+        "edge-only missing target not diagnosed: {v}"
+    );
+}
+
+/// A cited `ToolCall`'s arguments/result handles are reported as protected
+/// payloads by hash.
+#[test]
+fn audit_toolcall_handles_are_protected() {
+    let claim_id = agent_memory_stable_id(&["obs", "claim_tc"]);
+    let tool_id = agent_memory_stable_id(&["toolcall", "tc"]);
+    let claim = mk_obs(
+        &claim_id,
+        "run.traj",
+        vec![link(&tool_id, "agent_memory", "RELATES_TO")],
+    );
+    let mut tool = agent_node(&tool_id, NodeKind::ToolCall, None);
+    if let GraphRecord::Node {
+        ref mut arguments_handle,
+        ..
+    } = tool
+    {
+        *arguments_handle = Some(Box::new(OutputHandle {
+            inline: None,
+            hash: "blake3:argshash".to_owned(),
+            bytes: 128,
+        }));
+    }
+
+    let (_t, graph) = write_graph(vec![claim, tool]);
+    let v = audit_json(&graph, &claim_id);
+    let support = v["supporting_evidence"].as_array().expect("support");
+    let tc = support
+        .iter()
+        .find(|h| h["record_id"] == tool_id)
+        .expect("toolcall surfaced");
+    assert_eq!(
+        tc["protected"], true,
+        "ToolCall should be marked protected: {v}"
+    );
+    let diags = v["diagnostics"].as_array().expect("diagnostics");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d["code"] == "protected_payload" && d["relation"] == "tool_arguments"),
+        "ToolCall arguments handle not surfaced as protected_payload: {v}"
+    );
+}

@@ -2056,6 +2056,29 @@ fn is_verified_claim(
     false
 }
 
+/// Pushes an `unresolved_evidence_link` (absent) or `stale_evidence_target`
+/// (tombstoned) diagnostic for an edge whose target is not live.
+fn push_missing_target(
+    diagnostics: &mut Vec<MemoryAuditDiagnostic>,
+    memory_id: &str,
+    target: &str,
+    tombstoned: &BTreeSet<&str>,
+    relation: &str,
+) {
+    let code = if tombstoned.contains(target) {
+        "stale_evidence_target"
+    } else {
+        "unresolved_evidence_link"
+    };
+    diagnostics.push(MemoryAuditDiagnostic {
+        code: code.to_owned(),
+        source_record_id: memory_id.to_owned(),
+        target_handle: target.to_owned(),
+        relation: relation.to_owned(),
+        target_domain: String::new(),
+    });
+}
+
 /// The outcome of resolving a memory handle to live claim IDs.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct MemoryResolution {
@@ -2211,6 +2234,17 @@ pub fn resolve_memory_ids(
             _ => None,
         })
         .collect();
+
+    // If the queried canonical ID is itself tombstoned — a deleted claim, or a
+    // deleted Agent/AgentSession scope node — the handle names a deleted record
+    // and is stale, regardless of whether live claims share its scope key.
+    if tombstoned.contains(handle) {
+        return Ok(MemoryResolution {
+            matched: BTreeSet::new(),
+            tombstoned_only: true,
+        });
+    }
+
     let had_any_match = !matched.is_empty();
     matched.retain(|id| !tombstoned.contains(id.as_str()));
     let tombstoned_only = had_any_match && matched.is_empty();
@@ -2460,38 +2494,61 @@ pub fn memory_audit_context<'a>(
             };
             let claim_id = claim.id();
             if source == claim_id {
+                // AUTHORED_BY provenance is resolved by the chain walk below;
+                // code-internal and other labels are not claim evidence.
+                let is_evidence = matches!(
+                    label,
+                    EdgeLabel::Contradicts
+                        | EdgeLabel::HasEvidence
+                        | EdgeLabel::ValidatedBy
+                        | EdgeLabel::Observes
+                        | EdgeLabel::MentionsSymbol
+                        | EdgeLabel::TouchedFile
+                        | EdgeLabel::FailedOn
+                        | EdgeLabel::ReferencesTask
+                        | EdgeLabel::ExplainsChange
+                        | EdgeLabel::ProducedPatch
+                        | EdgeLabel::ProducedEvidence
+                        | EdgeLabel::RelatesTo
+                );
+                if !is_evidence {
+                    continue;
+                }
                 let Some(other) = present(target) else {
+                    // Edge-only evidence whose target is absent or tombstoned is
+                    // surfaced as a diagnostic, like a denormalized link, instead
+                    // of silently disappearing.
+                    push_missing_target(
+                        &mut diagnostics,
+                        memory_id,
+                        target,
+                        &tombstoned,
+                        label.as_str(),
+                    );
                     continue;
                 };
-                match label {
-                    EdgeLabel::Contradicts => {
-                        contradicting
-                            .entry(other.id())
-                            .or_insert_with(|| MemoryEvidenceItem {
-                                record: other,
-                                relation: "CONTRADICTS".to_owned(),
-                            });
-                    }
-                    // AUTHORED_BY provenance is resolved by the chain walk below,
-                    // since imported records may route claim → turn → run → session.
-                    EdgeLabel::HasEvidence
-                    | EdgeLabel::ValidatedBy
-                    | EdgeLabel::Observes
-                    | EdgeLabel::MentionsSymbol
-                    | EdgeLabel::TouchedFile
-                    | EdgeLabel::FailedOn
-                    | EdgeLabel::ReferencesTask
-                    | EdgeLabel::ExplainsChange
-                    | EdgeLabel::ProducedPatch
-                    | EdgeLabel::ProducedEvidence
-                    // A direct RELATES_TO edge is the edge-only counterpart of a
-                    // denormalized RELATES_TO evidence link; surface its target as
-                    // weak supporting/related evidence rather than dropping it.
-                    | EdgeLabel::RelatesTo => place(other, label.as_str()),
-                    _ => {}
+                if matches!(label, EdgeLabel::Contradicts) {
+                    contradicting
+                        .entry(other.id())
+                        .or_insert_with(|| MemoryEvidenceItem {
+                            record: other,
+                            relation: "CONTRADICTS".to_owned(),
+                        });
+                } else {
+                    place(other, label.as_str());
                 }
             } else if target == claim_id {
+                if !matches!(label, EdgeLabel::Contradicts | EdgeLabel::Supersedes) {
+                    continue;
+                }
                 let Some(other) = present(source) else {
+                    push_missing_target(
+                        &mut diagnostics,
+                        memory_id,
+                        source,
+                        &tombstoned,
+                        label.as_str(),
+                    );
                     continue;
                 };
                 match label {
@@ -2513,6 +2570,48 @@ pub fn memory_audit_context<'a>(
                     }
                     _ => {}
                 }
+            }
+        }
+    }
+
+    // Reverse denormalized links: a newer record may declare the relationship on
+    // itself (`SUPERSEDES`/`CONTRADICTS` -> audited claim) without a retained
+    // edge. Scan live records' evidence_links for entries targeting the claim so
+    // the superseding/contradicting record is not omitted in edge-stripped stores.
+    for r in records {
+        let GraphRecord::Node {
+            id: src_id,
+            evidence_links: Some(links),
+            ..
+        } = r
+        else {
+            continue;
+        };
+        if src_id == memory_id || tombstoned.contains(src_id.as_str()) {
+            continue;
+        }
+        for link in links {
+            if link.target_record_id.as_deref() != Some(memory_id) {
+                continue;
+            }
+            match link.relation.as_str() {
+                "SUPERSEDES" => {
+                    superseding
+                        .entry(src_id)
+                        .or_insert_with(|| MemoryEvidenceItem {
+                            record: r,
+                            relation: "SUPERSEDES".to_owned(),
+                        });
+                }
+                "CONTRADICTS" => {
+                    contradicting
+                        .entry(src_id)
+                        .or_insert_with(|| MemoryEvidenceItem {
+                            record: r,
+                            relation: "CONTRADICTS".to_owned(),
+                        });
+                }
+                _ => {}
             }
         }
     }

@@ -3478,6 +3478,7 @@ fn citable_handle(record: &GraphRecord) -> String {
 }
 
 /// Serializes one evidence item to a bounded, payload-free view (AC9).
+#[allow(clippy::too_many_lines)]
 fn audit_item<'a>(item: &query::MemoryEvidenceItem<'a>) -> AuditItem<'a> {
     let record = item.record;
     let handle = citable_handle(record);
@@ -3507,6 +3508,8 @@ fn audit_item<'a>(item: &query::MemoryEvidenceItem<'a>) -> AuditItem<'a> {
         confidence,
         patch_handle,
         diff_hunk_handle,
+        arguments_handle,
+        result_handle,
         ..
     } = record
     else {
@@ -3546,7 +3549,9 @@ fn audit_item<'a>(item: &query::MemoryEvidenceItem<'a>) -> AuditItem<'a> {
         || stdout_handle.as_ref().is_some_and(|o| o.bytes > 0)
         || stderr_handle.as_ref().is_some_and(|o| o.bytes > 0)
         || body_handle.is_some()
-        || diff_hunk_handle.is_some();
+        || diff_hunk_handle.is_some()
+        || arguments_handle.is_some()
+        || result_handle.is_some();
     AuditItem {
         record_id: id,
         kind: kind.as_str(),
@@ -3589,6 +3594,8 @@ fn protected_payload_diagnostics<'a>(record: &'a GraphRecord, out: &mut Vec<Audi
         patch_handle,
         body_handle,
         diff_hunk_handle,
+        arguments_handle,
+        result_handle,
         ..
     } = record
     else {
@@ -3639,6 +3646,24 @@ fn protected_payload_diagnostics<'a>(record: &'a GraphRecord, out: &mut Vec<Audi
             target_handle: &o.hash,
             relation: "diff_hunk",
             target_domain: "project",
+        });
+    }
+    if let Some(o) = arguments_handle.as_ref() {
+        out.push(AuditDiagnostic {
+            code: "protected_payload",
+            source_record_id: id,
+            target_handle: &o.hash,
+            relation: "tool_arguments",
+            target_domain: "agent_memory",
+        });
+    }
+    if let Some(o) = result_handle.as_ref() {
+        out.push(AuditDiagnostic {
+            code: "protected_payload",
+            source_record_id: id,
+            target_handle: &o.hash,
+            relation: "tool_result",
+            target_domain: "agent_memory",
         });
     }
 }
