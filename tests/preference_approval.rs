@@ -73,6 +73,9 @@ fn make_candidate_valid(candidate: &mut GraphRecord, records: &mut Vec<GraphReco
             target_git_commit: None,
         },
     ]);
+    if user_context.contradicting_evidence.is_none() {
+        user_context.contradicting_evidence = Some(vec![]);
+    }
 
     let make_obs = |id: String, session: &str| {
         let mut obs = GraphRecord::node(
@@ -2077,11 +2080,15 @@ fn query_policy_broad_scope_match_includes_specific_records() {
         ref mut schema_version,
         ref mut domain,
         ref mut user_context,
+        ref mut confidence,
+        ref mut evidence_quality,
         ..
     } = candidate
     {
         *schema_version = USER_CONTEXT_SCHEMA_VERSION;
         *domain = Some("user_context".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
         *user_context = UserContextFields {
             proposed_rule_text: Some("Broad scope rule text".to_owned()),
             proposed_rule_kind: Some("preference".to_owned()),
@@ -2091,6 +2098,7 @@ fn query_policy_broad_scope_match_includes_specific_records() {
                 path_glob: Some("src/**/*.rs".to_owned()),
                 lifecycle_phase: None,
             }),
+            contradicting_evidence: Some(vec![]),
             supporting_evidence: Some(vec![
                 EvidenceLink {
                     target_record_id: Some("agent_memory:v1:obs-broad-1".to_owned()),
@@ -4466,15 +4474,20 @@ fn test_decide_rejects_non_agent_evidence_in_audit() {
         ref mut schema_version,
         ref mut domain,
         ref mut user_context,
+        ref mut confidence,
+        ref mut evidence_quality,
         ..
     } = candidate
     {
         *schema_version = USER_CONTEXT_SCHEMA_VERSION;
         *domain = Some("user_context".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
         *user_context = UserContextFields {
             proposed_rule_text: Some("MyRule".to_owned()),
             proposed_rule_kind: Some("preference".to_owned()),
             scope: Some(UserContextScope::default()),
+            contradicting_evidence: Some(vec![]),
             supporting_evidence: Some(vec![EvidenceLink {
                 target_record_id: Some("some_preference".to_owned()),
                 target_domain: "user_context".to_owned(), // WRONG! should be agent_memory
@@ -4694,15 +4707,20 @@ fn test_audit_trail_verifies_candidate_body_and_kind() {
         ref mut schema_version,
         ref mut domain,
         ref mut user_context,
+        ref mut confidence,
+        ref mut evidence_quality,
         ..
     } = candidate
     {
         *schema_version = USER_CONTEXT_SCHEMA_VERSION;
         *domain = Some("user_context".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
         *user_context = UserContextFields {
             proposed_rule_text: Some("Secret: ghp_123456789012345678901234567890123456".to_owned()),
             proposed_rule_kind: Some("preference".to_owned()),
             scope: Some(UserContextScope::default()),
+            contradicting_evidence: Some(vec![]),
             supporting_evidence: Some(vec![]),
             ..UserContextFields::empty()
         };
@@ -6146,15 +6164,20 @@ fn test_audit_trail_threshold_validation() {
         ref mut schema_version,
         ref mut domain,
         ref mut user_context,
+        ref mut confidence,
+        ref mut evidence_quality,
         ..
     } = candidate
     {
         *schema_version = USER_CONTEXT_SCHEMA_VERSION;
         *domain = Some("user_context".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
         *user_context = UserContextFields {
             proposed_rule_text: Some("RuleText".to_owned()),
             proposed_rule_kind: Some("preference".to_owned()),
             scope: Some(UserContextScope::default()),
+            contradicting_evidence: Some(vec![]),
             supporting_evidence: Some(vec![
                 EvidenceLink {
                     target_record_id: Some("agent_memory:v1:obs-1".to_owned()),
@@ -7036,4 +7059,361 @@ fn test_decide_fails_if_supporting_evidence_has_empty_session_id() {
     assert!(result.is_err());
     let err_msg = result.err().unwrap().to_string();
     assert!(err_msg.contains("supporting_evidence.session_id is required"));
+}
+
+#[test]
+fn test_decide_fails_if_contradicting_evidence_is_missing() {
+    use aletheia_egregore::decide::{DecideRequest, decide_candidate};
+
+    let cand_id = "cand_missing_contr";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut confidence,
+        ref mut evidence_quality,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("Prefer matches".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope {
+                repo: Some("egregore".to_owned()),
+                path_glob: Some("src/**/*.rs".to_owned()),
+                language: Some("rust".to_owned()),
+                lifecycle_phase: Some("pre_commit".to_owned()),
+            }),
+            contradicting_evidence: None,
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut records = Vec::new();
+    make_candidate_valid(&mut candidate, &mut records);
+    if let GraphRecord::Node {
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        user_context.contradicting_evidence = None;
+    }
+    records.push(candidate);
+
+    let req = DecideRequest {
+        candidate_id: cand_id.to_owned(),
+        outcome: "approved".to_owned(),
+        edited_rule_text: None,
+        rationale: None,
+        decided_by: "operator".to_owned(),
+        prompt_surface: "cli".to_owned(),
+        prompted_to: "operator".to_owned(),
+        transaction_time: Some("2026-06-05T12:00:00.000Z".to_owned()),
+    };
+
+    let result = decide_candidate(&records, &req);
+    assert!(result.is_err());
+    let err_msg = result.err().unwrap().to_string();
+    assert!(err_msg.contains("contradicting_evidence"));
+}
+
+#[test]
+fn test_decide_fails_if_edited_then_approved_lacks_proposed_rule_text() {
+    use aletheia_egregore::decide::{DecideRequest, decide_candidate};
+
+    let cand_id = "cand_missing_rule_text";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut confidence,
+        ref mut evidence_quality,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *evidence_quality = Some("verbatim".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: None,
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope {
+                repo: Some("egregore".to_owned()),
+                path_glob: Some("src/**/*.rs".to_owned()),
+                language: Some("rust".to_owned()),
+                lifecycle_phase: Some("pre_commit".to_owned()),
+            }),
+            contradicting_evidence: Some(vec![]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut records = Vec::new();
+    make_candidate_valid(&mut candidate, &mut records);
+    if let GraphRecord::Node {
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        user_context.proposed_rule_text = None;
+    }
+    records.push(candidate);
+
+    let req = DecideRequest {
+        candidate_id: cand_id.to_owned(),
+        outcome: "edited_then_approved".to_owned(),
+        edited_rule_text: Some("Edited Rule Text".to_owned()),
+        rationale: None,
+        decided_by: "operator".to_owned(),
+        prompt_surface: "cli".to_owned(),
+        prompted_to: "operator".to_owned(),
+        transaction_time: Some("2026-06-05T12:00:00.000Z".to_owned()),
+    };
+
+    let result = decide_candidate(&records, &req);
+    assert!(result.is_err());
+    let err_msg = result.err().unwrap().to_string();
+    assert!(err_msg.contains("proposed_rule_text"));
+}
+
+#[test]
+fn test_pending_candidates_excludes_any_terminal_decision() {
+    use aletheia_egregore::query::pending_candidates;
+
+    let cand_id = "cand_terminal_dec";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("Rule text".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let dec1_id = "decision_1";
+    let mut dec1 = GraphRecord::node(
+        dec1_id.to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision 1".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = dec1
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_id.to_owned()),
+            outcome: Some("rejected".to_owned()),
+            decided_at: Some("2026-06-01T12:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let dec2_id = "decision_2";
+    let mut dec2 = GraphRecord::node(
+        dec2_id.to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision 2".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = dec2
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_id.to_owned()),
+            outcome: Some("deferred".to_owned()),
+            decided_at: Some("2026-06-02T12:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let records = vec![candidate, dec1, dec2];
+    let pending = pending_candidates(&records, None);
+    assert!(
+        pending.is_empty(),
+        "Candidate should be excluded from pending list because it has a terminal decision"
+    );
+}
+
+#[test]
+fn test_audit_trail_validates_candidate_metadata() {
+    use aletheia_egregore::query::audit_trail;
+
+    let cand_id = "cand_audit_validation";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut confidence,
+        ref mut evidence_quality,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *confidence = None;
+        *evidence_quality = Some("verbatim".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let pref_id = "pref_audit";
+    let dec_id = "dec_audit";
+    let prompt_id = "prompt_audit";
+
+    let mut dec = GraphRecord::node(
+        dec_id.to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = dec
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_id.to_owned()),
+            prompt_id: Some(prompt_id.to_owned()),
+            outcome: Some("approved".to_owned()),
+            decided_at: Some("2026-06-01T12:00:00Z".to_owned()),
+            materialized_record_id: Some(pref_id.to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut prompt = GraphRecord::node(
+        prompt_id.to_owned(),
+        NodeKind::PromotionPrompt,
+        None,
+        None,
+        None,
+        "Prompt".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = prompt
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_id.to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut pref = GraphRecord::node(
+        pref_id.to_owned(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Preference".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ..
+    } = pref
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            approval_decision_id: Some(dec_id.to_owned()),
+            active_from: Some("2026-06-01T12:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut records = vec![dec, prompt, pref];
+    make_candidate_valid(&mut candidate, &mut records);
+    if let GraphRecord::Node {
+        ref mut confidence, ..
+    } = candidate
+    {
+        *confidence = None;
+    }
+    records.push(candidate);
+
+    let result = audit_trail(&records, &records[2]);
+    assert!(result.is_err());
+    let err_msg = result.err().unwrap();
+    assert!(err_msg.contains("confidence"));
 }

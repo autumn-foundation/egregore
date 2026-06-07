@@ -2164,35 +2164,20 @@ pub fn pending_candidates<'a>(
 ) -> Vec<&'a GraphRecord> {
     let mut candidates = Vec::new();
 
-    let mut decisions = std::collections::BTreeMap::new();
+    let mut terminal_candidates = std::collections::BTreeSet::new();
+    let terminal_outcomes = ["approved", "edited_then_approved", "rejected", "expired"];
+
     for rec in records {
         if let GraphRecord::Node {
             kind: NodeKind::PromotionDecision,
             user_context,
             ..
         } = rec
-        {
-            if let (Some(cand_id), Some(outcome)) =
+            && let (Some(cand_id), Some(outcome)) =
                 (&user_context.candidate_id, &user_context.outcome)
-            {
-                let current_decided_at = user_context.decided_at.as_deref().unwrap_or("");
-                let insert_new = match decisions.get(cand_id.as_str()) {
-                    None => true,
-                    Some(&(_, old_decided_at)) => {
-                        if let (Ok(new_t), Ok(old_t)) = (
-                            chrono::DateTime::parse_from_rfc3339(current_decided_at),
-                            chrono::DateTime::parse_from_rfc3339(old_decided_at),
-                        ) {
-                            new_t > old_t
-                        } else {
-                            current_decided_at > old_decided_at
-                        }
-                    }
-                };
-                if insert_new {
-                    decisions.insert(cand_id.as_str(), (outcome.as_str(), current_decided_at));
-                }
-            }
+            && terminal_outcomes.contains(&outcome.as_str())
+        {
+            terminal_candidates.insert(cand_id.clone());
         }
     }
 
@@ -2203,11 +2188,7 @@ pub fn pending_candidates<'a>(
             ..
         } = rec
         {
-            let is_pending = match decisions.get(rec.id()) {
-                None => true,
-                Some(&(outcome, _)) => outcome == "deferred",
-            };
-            if !is_pending {
+            if terminal_candidates.contains(rec.id()) {
                 continue;
             }
             if let Some(q_scope) = query_scope {
@@ -2456,12 +2437,18 @@ pub fn audit_trail<'a>(
         })?;
     chain.push(candidate);
 
-    let candidate_fields = match candidate {
+    let (candidate_fields, cand_confidence, cand_evidence_quality) = match candidate {
         GraphRecord::Node {
             kind: NodeKind::PromoteCandidate,
             user_context,
+            confidence,
+            evidence_quality,
             ..
-        } => user_context,
+        } => (
+            user_context,
+            confidence.as_deref(),
+            evidence_quality.as_deref(),
+        ),
         _ => {
             return Err(format!(
                 "Candidate '{}' is not a PromoteCandidate node",
@@ -2469,6 +2456,30 @@ pub fn audit_trail<'a>(
             ));
         }
     };
+
+    let conf_str = cand_confidence
+        .ok_or_else(|| format!("PromoteCandidate '{}' lacks confidence", candidate_id))?;
+    let conf_val: f64 = conf_str.parse().map_err(|_| {
+        format!(
+            "PromoteCandidate '{}' confidence '{}' must be a numeric float string",
+            candidate_id, conf_str
+        )
+    })?;
+    if !(0.0..=1.0).contains(&conf_val) {
+        return Err(format!(
+            "PromoteCandidate '{}' confidence '{}' must be in the range [0.0, 1.0]",
+            candidate_id, conf_str
+        ));
+    }
+
+    let eq_str = cand_evidence_quality
+        .ok_or_else(|| format!("PromoteCandidate '{}' lacks evidence_quality", candidate_id))?;
+    if !["verbatim", "summarized", "referenced_only"].contains(&eq_str) {
+        return Err(format!(
+            "PromoteCandidate '{}' evidence_quality '{}' is invalid (must be verbatim, summarized, or referenced_only)",
+            candidate_id, eq_str
+        ));
+    }
 
     // Perform candidate-kind/body consistency checks
     let expected_kind = match kind {

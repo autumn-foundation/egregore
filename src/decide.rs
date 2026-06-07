@@ -177,6 +177,16 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
 
     if req.outcome == "approved" || req.outcome == "edited_then_approved" {
         // Validate PromoteCandidate metadata and evidence offline
+        let proposed_text = cand_fields
+            .proposed_rule_text
+            .as_deref()
+            .ok_or_else(|| anyhow!("PromoteCandidate.proposed_rule_text (required)"))?;
+        if proposed_text.trim().is_empty() {
+            return Err(anyhow!(
+                "PromoteCandidate.proposed_rule_text cannot be empty or whitespace-only"
+            ));
+        }
+
         let conf_str =
             cand_confidence.ok_or_else(|| anyhow!("PromoteCandidate.confidence (required)"))?;
         let conf_val: f64 = conf_str.parse().map_err(|_| {
@@ -299,57 +309,59 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
             ));
         }
 
-        if proposed_rule_kind == "revocation" {
-            let contradicting = cand_fields.contradicting_evidence.as_deref().ok_or_else(|| {
-                anyhow!("PromoteCandidate.contradicting_evidence is required for revocation candidates")
+        let contradicting = cand_fields
+            .contradicting_evidence
+            .as_ref()
+            .ok_or_else(|| anyhow!("PromoteCandidate.contradicting_evidence (required)"))?;
+        if proposed_rule_kind == "revocation" && contradicting.is_empty() {
+            return Err(anyhow!(
+                "PromoteCandidate.contradicting_evidence is required for revocation candidates"
+            ));
+        }
+        for link in contradicting {
+            if link.target_domain != "user_context" || link.relation != "CONTRADICTS" {
+                return Err(anyhow!(
+                    "PromoteCandidate.contradicting_evidence for '{}' must use target_domain 'user_context' and relation CONTRADICTS",
+                    req.candidate_id
+                ));
+            }
+            let conf_val: f64 = link.confidence.parse().map_err(|_| {
+                anyhow!("PromoteCandidate.contradicting_evidence[].confidence '{}' must be a numeric float string", link.confidence)
             })?;
-            for link in contradicting {
-                if link.target_domain != "user_context" || link.relation != "CONTRADICTS" {
+            if !(0.0..=1.0).contains(&conf_val) {
+                return Err(anyhow!(
+                    "PromoteCandidate.contradicting_evidence[].confidence '{}' must be in the range [0.0, 1.0]",
+                    link.confidence
+                ));
+            }
+            let target_id = link.target_record_id.as_deref().ok_or_else(|| {
+                anyhow!("PromoteCandidate.contradicting_evidence[].target_record_id is required")
+            })?;
+            let target_node = records
+                .iter()
+                .find(|r| r.id() == target_id)
+                .ok_or_else(|| anyhow!("evidence target '{}' not found", target_id))?;
+            let target_kind = match target_node {
+                GraphRecord::Node { kind, .. } => *kind,
+                _ => {
                     return Err(anyhow!(
-                        "PromoteCandidate.contradicting_evidence for '{}' must use target_domain 'user_context' and relation CONTRADICTS",
-                        req.candidate_id
+                        "evidence target '{}' is not a node record",
+                        target_id
                     ));
                 }
-                let conf_val: f64 = link.confidence.parse().map_err(|_| {
-                    anyhow!("PromoteCandidate.contradicting_evidence[].confidence '{}' must be a numeric float string", link.confidence)
-                })?;
-                if !(0.0..=1.0).contains(&conf_val) {
-                    return Err(anyhow!(
-                        "PromoteCandidate.contradicting_evidence[].confidence '{}' must be in the range [0.0, 1.0]",
-                        link.confidence
-                    ));
-                }
-                let target_id = link.target_record_id.as_deref().ok_or_else(|| {
-                    anyhow!(
-                        "PromoteCandidate.contradicting_evidence[].target_record_id is required"
-                    )
-                })?;
-                let target_node = records
-                    .iter()
-                    .find(|r| r.id() == target_id)
-                    .ok_or_else(|| anyhow!("evidence target '{}' not found", target_id))?;
-                let target_kind = match target_node {
-                    GraphRecord::Node { kind, .. } => *kind,
-                    _ => {
-                        return Err(anyhow!(
-                            "evidence target '{}' is not a node record",
-                            target_id
-                        ));
-                    }
-                };
-                let allowed_target_kinds = [
-                    NodeKind::Preference,
-                    NodeKind::WorkflowRule,
-                    NodeKind::NamingDecision,
-                    NodeKind::Constraint,
-                ];
-                if !allowed_target_kinds.contains(&target_kind) {
-                    return Err(anyhow!(
-                        "PromoteCandidate.contradicting_evidence target '{}' must be a Preference, WorkflowRule, NamingDecision, or Constraint, got {}",
-                        target_id,
-                        target_kind.as_str()
-                    ));
-                }
+            };
+            let allowed_target_kinds = [
+                NodeKind::Preference,
+                NodeKind::WorkflowRule,
+                NodeKind::NamingDecision,
+                NodeKind::Constraint,
+            ];
+            if !allowed_target_kinds.contains(&target_kind) {
+                return Err(anyhow!(
+                    "PromoteCandidate.contradicting_evidence target '{}' must be a Preference, WorkflowRule, NamingDecision, or Constraint, got {}",
+                    target_id,
+                    target_kind.as_str()
+                ));
             }
         }
 
