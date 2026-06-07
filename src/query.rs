@@ -2274,7 +2274,7 @@ pub fn active_policy<'a>(
                 if user_context.active_to.is_some() {
                     continue;
                 }
-                if audit_trail(records, rec.id()).is_err() {
+                if audit_trail(records, rec).is_err() {
                     continue;
                 }
                 if let Some(q_scope) = query_scope {
@@ -2302,15 +2302,11 @@ pub fn active_policy<'a>(
 /// Returns an error if any hop in the chain is missing, stale, or ambiguous.
 pub fn audit_trail<'a>(
     records: &'a [GraphRecord],
-    durable_id: &str,
+    durable: &'a GraphRecord,
 ) -> std::result::Result<Vec<&'a GraphRecord>, String> {
     let mut chain = Vec::new();
 
-    let durable = records
-        .iter()
-        .find(|r| r.id() == durable_id)
-        .ok_or_else(|| format!("Durable record '{}' not found", durable_id))?;
-
+    let durable_id = durable.id();
     let kind = match durable {
         GraphRecord::Node { kind, .. } => *kind,
         _ => return Err(format!("Durable record '{}' is not a node", durable_id)),
@@ -2386,36 +2382,26 @@ pub fn audit_trail<'a>(
     let decided_at = decision_fields.decided_at.as_deref();
     let active_from = user_context.active_from.as_deref();
 
-    if decided_at.is_some() || active_from.is_some() {
-        let decided_at_str = decided_at.ok_or_else(|| {
+    let decided_at_str =
+        decided_at.ok_or_else(|| format!("Decision '{}' lacks decided_at", decision_id))?;
+    let active_from_str =
+        active_from.ok_or_else(|| format!("Durable record '{}' lacks active_from", durable_id))?;
+
+    let decided_at_parsed = chrono::DateTime::parse_from_rfc3339(decided_at_str)
+        .map_err(|e| format!("Decision '{}' has invalid decided_at: {}", decision_id, e))?;
+    let active_from_parsed =
+        chrono::DateTime::parse_from_rfc3339(active_from_str).map_err(|e| {
             format!(
-                "Decision '{}' lacks decided_at, but durable record has active_from",
-                decision_id
-            )
-        })?;
-        let active_from_str = active_from.ok_or_else(|| {
-            format!(
-                "Durable record '{}' lacks active_from, but decision has decided_at",
-                durable_id
+                "Durable record '{}' has invalid active_from: {}",
+                durable_id, e
             )
         })?;
 
-        let decided_at_parsed = chrono::DateTime::parse_from_rfc3339(decided_at_str)
-            .map_err(|e| format!("Decision '{}' has invalid decided_at: {}", decision_id, e))?;
-        let active_from_parsed =
-            chrono::DateTime::parse_from_rfc3339(active_from_str).map_err(|e| {
-                format!(
-                    "Durable record '{}' has invalid active_from: {}",
-                    durable_id, e
-                )
-            })?;
-
-        if decided_at_parsed != active_from_parsed {
-            return Err(format!(
-                "Durable record '{}' active_from '{}' does not match decision '{}' decided_at '{}'",
-                durable_id, active_from_str, decision_id, decided_at_str
-            ));
-        }
+    if decided_at_parsed != active_from_parsed {
+        return Err(format!(
+            "Durable record '{}' active_from '{}' does not match decision '{}' decided_at '{}'",
+            durable_id, active_from_str, decision_id, decided_at_str
+        ));
     }
     let prompt_id = decision_fields
         .prompt_id

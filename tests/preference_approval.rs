@@ -4395,6 +4395,7 @@ fn test_decide_rejects_non_agent_evidence_in_audit() {
             prompt_id: Some(prompt_id.to_owned()),
             outcome: Some("approved".to_owned()),
             materialized_record_id: Some("some_preference".to_owned()),
+            decided_at: Some("2026-06-05T12:00:00Z".to_owned()),
             ..UserContextFields::empty()
         };
     }
@@ -4419,6 +4420,7 @@ fn test_decide_rejects_non_agent_evidence_in_audit() {
         *user_context = UserContextFields {
             approval_decision_id: Some(decision_id.to_owned()),
             rule_text: Some("MyRule".to_owned()),
+            active_from: Some("2026-06-05T12:00:00Z".to_owned()),
             ..UserContextFields::empty()
         };
     }
@@ -4429,7 +4431,7 @@ fn test_decide_rejects_non_agent_evidence_in_audit() {
         decision.clone(),
         preference.clone(),
     ];
-    let result = audit_trail(&records, "some_preference");
+    let result = audit_trail(&records, &preference);
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("target domain"));
 
@@ -4449,7 +4451,7 @@ fn test_decide_rejects_non_agent_evidence_in_audit() {
         decision.clone(),
         preference.clone(),
     ];
-    let result = audit_trail(&records, "some_preference");
+    let result = audit_trail(&records, &preference);
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("relation"));
 
@@ -4463,8 +4465,8 @@ fn test_decide_rejects_non_agent_evidence_in_audit() {
         user_context.supporting_evidence.as_mut().unwrap()[0].target_record_id =
             Some("some_preference".to_owned()); // WRONG kind!
     }
-    let records = vec![candidate, prompt, decision, preference];
-    let result = audit_trail(&records, "some_preference");
+    let records = vec![candidate, prompt, decision, preference.clone()];
+    let result = audit_trail(&records, &preference);
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("invalid node kind"));
 }
@@ -4612,6 +4614,7 @@ fn test_audit_trail_verifies_candidate_body_and_kind() {
             prompt_id: Some(prompt_id.to_owned()),
             outcome: Some("approved".to_owned()),
             materialized_record_id: Some("pref_1".to_owned()),
+            decided_at: Some("2026-06-05T12:00:00Z".to_owned()),
             ..UserContextFields::empty()
         };
     }
@@ -4637,6 +4640,7 @@ fn test_audit_trail_verifies_candidate_body_and_kind() {
             approval_decision_id: Some(decision_id.to_owned()),
             // Durable record rule_text has mismatched/wrong body (not matching redacted candidate proposed_rule_text)
             rule_text: Some("MismatchedText".to_owned()),
+            active_from: Some("2026-06-05T12:00:00Z".to_owned()),
             ..UserContextFields::empty()
         };
     }
@@ -4647,7 +4651,7 @@ fn test_audit_trail_verifies_candidate_body_and_kind() {
         decision.clone(),
         preference.clone(),
     ];
-    let result = audit_trail(&records, "pref_1");
+    let result = audit_trail(&records, &preference);
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("does not match"));
 
@@ -4674,9 +4678,9 @@ fn test_audit_trail_verifies_candidate_body_and_kind() {
         bad_kind_candidate,
         prompt.clone(),
         decision.clone(),
-        bad_kind_preference,
+        bad_kind_preference.clone(),
     ];
-    let result = audit_trail(&records, "pref_1");
+    let result = audit_trail(&records, &bad_kind_preference);
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("proposed rule kind"));
 }
@@ -5505,8 +5509,8 @@ fn test_audit_trail_validates_active_from_match() {
         *domain = Some("agent_memory".to_owned());
     }
 
-    let records = vec![policy, decision, prompt, candidate, obs];
-    let result = audit_trail(&records, policy_id);
+    let records = vec![policy.clone(), decision, prompt, candidate, obs];
+    let result = audit_trail(&records, &policy);
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("does not match decision"));
 }
@@ -5550,17 +5554,71 @@ fn test_decide_copies_superseded_rejection_lineage() {
             proposed_rule_text: Some("RuleText A".to_owned()),
             proposed_rule_kind: Some("preference".to_owned()),
             scope: Some(UserContextScope::default()),
-            supporting_evidence: Some(vec![EvidenceLink {
-                target_record_id: Some("agent_memory:v1:obs-1".to_owned()),
-                target_domain: "agent_memory".to_owned(),
-                relation: "PROPOSED_BY".to_owned(),
-                confidence: "1.0".to_owned(),
-                as_of_commit: None,
-                target_repo_relative_path: None,
-                target_span: None,
-                target_git_commit: None,
-            }]),
+            supporting_evidence: Some(vec![
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-1".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-2".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-3".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+            ]),
             contradicting_evidence: Some(vec![]),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let prompt_a_id = user_context_stable_id(&["prompt", "prompt_a"]);
+    let mut prompt_a = GraphRecord::node(
+        prompt_a_id.clone(),
+        NodeKind::PromotionPrompt,
+        None,
+        None,
+        None,
+        "Prompt A".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut valid_time,
+        ref mut valid_time_source,
+        ..
+    } = prompt_a
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-06-01T12:00:00Z".to_owned());
+        *valid_time_source = Some("inferred_from_transaction_time".to_owned());
+        *user_context = UserContextFields {
+            candidate_id: Some(cand_a_id.clone()),
+            prompt_surface: Some("cli".to_owned()),
+            prompt_text: Some("Do you approve?".to_owned()),
+            prompted_at: Some("2026-06-01T12:00:00Z".to_owned()),
+            prompted_to: Some("operator".to_owned()),
             ..UserContextFields::empty()
         };
     }
@@ -5578,14 +5636,19 @@ fn test_decide_copies_superseded_rejection_lineage() {
         ref mut schema_version,
         ref mut domain,
         ref mut user_context,
+        ref mut valid_time,
+        ref mut valid_time_source,
         ..
     } = dec_a
     {
         *schema_version = USER_CONTEXT_SCHEMA_VERSION;
         *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-06-01T12:00:00Z".to_owned());
+        *valid_time_source = Some("inferred_from_transaction_time".to_owned());
         *user_context = UserContextFields {
             outcome: Some("rejected".to_owned()),
             candidate_id: Some(cand_a_id.clone()),
+            prompt_id: Some(prompt_a_id.clone()),
             decided_at: Some("2026-06-01T12:00:00Z".to_owned()),
             decided_by: Some("operator".to_owned()),
             ..UserContextFields::empty()
@@ -5684,6 +5747,26 @@ fn test_decide_copies_superseded_rejection_lineage() {
                     target_span: None,
                     target_git_commit: None,
                 },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-7".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("agent_memory:v1:obs-8".to_owned()),
+                    target_domain: "agent_memory".to_owned(),
+                    relation: "PROPOSED_BY".to_owned(),
+                    confidence: "1.0".to_owned(),
+                    as_of_commit: None,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
             ]),
             contradicting_evidence: Some(vec![]),
             ..UserContextFields::empty()
@@ -5691,7 +5774,7 @@ fn test_decide_copies_superseded_rejection_lineage() {
     }
 
     let mut observations = Vec::new();
-    for i in 1..=6 {
+    for i in 1..=8 {
         let obs_id = format!("agent_memory:v1:obs-{i}");
         let mut o = GraphRecord::node(
             obs_id.clone(),
@@ -5721,7 +5804,7 @@ fn test_decide_copies_superseded_rejection_lineage() {
             *confidence = Some("1.0".to_owned());
             *agent_id = Some("agent_1".to_owned());
             *agent_kind = Some("claude-code".to_owned());
-            *session_id = Some(if i <= 3 {
+            *session_id = Some(if i == 1 || i == 2 {
                 "session_1".to_owned()
             } else {
                 "session_2".to_owned()
@@ -5742,8 +5825,18 @@ fn test_decide_copies_superseded_rejection_lineage() {
         observations.push(o);
     }
 
+    let mock_symbol = GraphRecord::node(
+        "codegraph:v1:rust:symbol:1".to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("my_symbol".to_owned()),
+        "mock symbol".to_owned(),
+    );
     let mut graph = Graph::new();
+    graph.push(mock_symbol);
     graph.push(cand_a);
+    graph.push(prompt_a);
     graph.push(dec_a);
     graph.push(cand_b);
     for o in observations {
@@ -5933,7 +6026,7 @@ fn test_audit_trail_threshold_validation() {
         obs1.clone(),
         obs3.clone(),
     ];
-    let res = audit_trail(&records, policy_id);
+    let res = audit_trail(&records, &policy);
     assert!(res.is_err());
     assert!(
         res.err()
@@ -5990,7 +6083,7 @@ fn test_audit_trail_threshold_validation() {
         obs2.clone(),
         obs_dup,
     ];
-    let res = audit_trail(&records, policy_id);
+    let res = audit_trail(&records, &policy);
     assert!(res.is_err());
     assert!(
         res.err()
@@ -6037,8 +6130,16 @@ fn test_audit_trail_threshold_validation() {
             },
         ]);
     }
-    let records = vec![policy, decision, prompt, candidate, obs1, obs2, obs3];
-    let res = audit_trail(&records, policy_id);
+    let records = vec![
+        policy.clone(),
+        decision,
+        prompt,
+        candidate,
+        obs1,
+        obs2,
+        obs3,
+    ];
+    let res = audit_trail(&records, &policy);
     assert!(res.is_ok());
 }
 
@@ -6170,11 +6271,15 @@ fn test_decide_copies_revocation_target_approval_chain() {
         ref mut schema_version,
         ref mut domain,
         ref mut user_context,
+        ref mut valid_time,
+        ref mut valid_time_source,
         ..
     } = target_pref
     {
         *schema_version = USER_CONTEXT_SCHEMA_VERSION;
         *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-06-01T12:00:00Z".to_owned());
+        *valid_time_source = Some("inferred_from_transaction_time".to_owned());
         *user_context = UserContextFields {
             rule_text: Some("TargetRuleText".to_owned()),
             proposed_rule_kind: Some("preference".to_owned()),
@@ -6197,15 +6302,20 @@ fn test_decide_copies_revocation_target_approval_chain() {
         ref mut schema_version,
         ref mut domain,
         ref mut user_context,
+        ref mut valid_time,
+        ref mut valid_time_source,
         ..
     } = target_dec
     {
         *schema_version = USER_CONTEXT_SCHEMA_VERSION;
         *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-06-01T12:00:00Z".to_owned());
+        *valid_time_source = Some("inferred_from_transaction_time".to_owned());
         *user_context = UserContextFields {
             outcome: Some("approved".to_owned()),
             materialized_record_id: Some(target_pref_id.clone()),
             decided_at: Some("2026-06-01T12:00:00Z".to_owned()),
+            decided_by: Some("operator".to_owned()),
             prompt_id: Some(target_prompt_id.clone()),
             candidate_id: Some(target_cand_id.clone()),
             ..UserContextFields::empty()
@@ -6224,13 +6334,21 @@ fn test_decide_copies_revocation_target_approval_chain() {
         ref mut schema_version,
         ref mut domain,
         ref mut user_context,
+        ref mut valid_time,
+        ref mut valid_time_source,
         ..
     } = target_prompt
     {
         *schema_version = USER_CONTEXT_SCHEMA_VERSION;
         *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-06-01T12:00:00Z".to_owned());
+        *valid_time_source = Some("inferred_from_transaction_time".to_owned());
         *user_context = UserContextFields {
             candidate_id: Some(target_cand_id.clone()),
+            prompt_surface: Some("cli".to_owned()),
+            prompt_text: Some("Target Prompt Text".to_owned()),
+            prompted_at: Some("2026-06-01T12:00:00Z".to_owned()),
+            prompted_to: Some("operator".to_owned()),
             ..UserContextFields::empty()
         };
     }
@@ -6264,6 +6382,7 @@ fn test_decide_copies_revocation_target_approval_chain() {
             proposed_rule_text: Some("TargetRuleText".to_owned()),
             proposed_rule_kind: Some("preference".to_owned()),
             scope: Some(UserContextScope::default()),
+            contradicting_evidence: Some(vec![]),
             supporting_evidence: Some(vec![
                 EvidenceLink {
                     target_record_id: Some("agent_memory:v1:target-obs-1".to_owned()),
@@ -6429,7 +6548,16 @@ fn test_decide_copies_revocation_target_approval_chain() {
     let revoke_obs2 = make_obs("agent_memory:v1:revoke-obs-2", "session_3");
     let revoke_obs3 = make_obs("agent_memory:v1:revoke-obs-3", "session_4");
 
+    let mock_symbol = GraphRecord::node(
+        "codegraph:v1:rust:symbol:1".to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("my_symbol".to_owned()),
+        "mock symbol".to_owned(),
+    );
     let mut graph = Graph::new();
+    graph.push(mock_symbol);
     graph.push(target_pref.clone());
     graph.push(target_dec.clone());
     graph.push(target_prompt.clone());

@@ -3516,7 +3516,11 @@ fn query_policy_cmd(
 }
 
 fn query_audit_cmd(records: &[GraphRecord], durable_id: &str, format: OutputFormat) -> Result<()> {
-    match crate::query::audit_trail(records, durable_id) {
+    let durable = records
+        .iter()
+        .find(|r| r.id() == durable_id)
+        .ok_or_else(|| anyhow::anyhow!("Durable record '{durable_id}' not found"))?;
+    match crate::query::audit_trail(records, durable) {
         Ok(chain) => {
             match format {
                 OutputFormat::Json => {
@@ -3628,14 +3632,13 @@ fn decide_cmd(
             sink_opt = Some(sink);
 
             if !db_records.is_empty() {
-                let mut map = std::collections::HashMap::new();
-                for r in db_records {
-                    map.insert(r.id().to_owned(), r);
-                }
+                let mut merged = db_records;
                 for r in records {
-                    map.insert(r.id().to_owned(), r);
+                    if !merged.contains(&r) {
+                        merged.push(r);
+                    }
                 }
-                records = map.into_values().collect();
+                records = merged;
             }
         }
         #[cfg(not(feature = "embedded-aletheiadb"))]
@@ -3726,8 +3729,10 @@ fn decide_cmd(
                                 // If this is a revocation candidate, also recursively trace and persist
                                 // the revoked target policy's complete approval chain.
                                 if user_context.proposed_rule_kind.as_deref() == Some("revocation")
+                                    && let Some(target_rec) =
+                                        records.iter().find(|r| r.id() == *ref_id)
                                     && let Ok(target_chain) =
-                                        crate::query::audit_trail(&records, ref_id)
+                                        crate::query::audit_trail(&records, target_rec)
                                 {
                                     for chain_rec in target_chain {
                                         if seen_ids.insert(chain_rec.id().to_owned()) {
@@ -3776,8 +3781,13 @@ fn decide_cmd(
             }
 
             for rec in &source_records_to_persist {
-                crate::daemon::validate_agent_memory_record_for_cli(rec, &records, &sink)
-                    .context("Copied evidence record validation failed")?;
+                if rec.id().starts_with("agent_memory:v1:") {
+                    crate::daemon::validate_agent_memory_record_for_cli(rec, &records, &sink)
+                        .context("Copied evidence record validation failed")?;
+                } else if rec.id().starts_with("user_context:v1:") {
+                    crate::daemon::validate_user_context_record_for_cli(rec, &records, &sink)
+                        .context("Copied user-context record validation failed")?;
+                }
 
                 crate::redaction::validate_record(rec).map_err(|e| {
                     anyhow::anyhow!(

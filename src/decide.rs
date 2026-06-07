@@ -124,7 +124,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
     let valid_time_str = req
         .transaction_time
         .clone()
-        .unwrap_or_else(|| Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        .unwrap_or_else(|| Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true));
 
     let proposed_rule_kind = cand_fields
         .proposed_rule_kind
@@ -469,7 +469,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
             }
 
             // Verify that the revocation target has a valid approval chain back to observations:
-            crate::query::audit_trail(records, &target_durable_id).map_err(|e| {
+            crate::query::audit_trail(records, &original_record).map_err(|e| {
                 anyhow!(
                     "Revocation target '{}' has no valid approval chain: {}",
                     target_durable_id,
