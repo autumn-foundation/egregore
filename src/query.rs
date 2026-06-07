@@ -2013,6 +2013,7 @@ fn is_verified_claim(
     record: &GraphRecord,
     by_id: &BTreeMap<&str, &GraphRecord>,
     edges_from: &BTreeMap<&str, Vec<(&EdgeLabel, &str)>>,
+    tombstoned: &BTreeSet<&str>,
 ) -> bool {
     if let GraphRecord::Node {
         evidence_links: Some(links),
@@ -2020,12 +2021,16 @@ fn is_verified_claim(
     } = record
     {
         for link in links {
+            // A backing relation is required; a generic link (e.g. RELATES_TO)
+            // that merely happens to point at a verification record does not make
+            // the claim verified. Tombstoned targets are treated as absent.
             let backed = matches!(
                 link.relation.as_str(),
                 "VALIDATED_BY" | "HAS_EVIDENCE" | "PRODUCED_EVIDENCE"
-            ) || link.target_domain == "verification";
+            );
             if backed
                 && let Some(target_id) = link.target_record_id.as_deref()
+                && !tombstoned.contains(target_id)
                 && let Some(target) = by_id.get(target_id)
                 && record_node_kind(target).is_some_and(is_verification_kind)
             {
@@ -2040,6 +2045,7 @@ fn is_verified_claim(
                 EdgeLabel::ValidatedBy | EdgeLabel::HasEvidence | EdgeLabel::ProducedEvidence
             );
             if backed
+                && !tombstoned.contains(*target)
                 && let Some(target) = by_id.get(*target)
                 && record_node_kind(target).is_some_and(is_verification_kind)
             {
@@ -2054,11 +2060,15 @@ fn is_verified_claim(
 ///
 /// Supported handle types (AC2):
 /// 1. A canonical memory record ID (`agent_memory:v1:<64-hex>`). When it names
-///    an `AgentSession` or `Agent`, every claim authored in that scope is
-///    collected.
+///    an `AgentSession` or `Agent`, it is a scope handle resolving to the claims
+///    authored in that scope; a scope with more than one claim returns
+///    `Ambiguous` with the candidate IDs (one audit covers one claim).
 /// 2. A source artifact / session handle: a string matching a claim node's
 ///    `source_handle`, `source_artifact_path`, `source_artifact_hash`, or
 ///    `session_id`.
+///
+/// Tombstoned (deleted) claims are excluded from the result so they neither make
+/// a live handle ambiguous nor get audited as current state.
 ///
 /// # Errors
 ///
@@ -2176,6 +2186,19 @@ pub fn resolve_memory_ids(
         }
     }
 
+    // Tombstoned (deleted) claims are not part of the current state, so they must
+    // not make a live handle ambiguous. Drop them before counting; a handle that
+    // matches only tombstoned claims falls through to the caller's stale/no_match
+    // handling.
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    matched.retain(|id| !tombstoned.contains(id.as_str()));
+
     // A single audit covers one claim. A scope handle (Agent / AgentSession ID,
     // or a session_id shared by several claims) that resolves to more than one
     // claim is reported as a stable `Ambiguous` diagnostic listing the candidate
@@ -2245,6 +2268,24 @@ pub fn memory_audit_context<'a>(
         }
     }
 
+    // Tombstoned IDs are deleted for current-state reads: treat their nodes as
+    // absent everywhere in the traversal so a deleted evidence/provenance record
+    // is never surfaced as live support (AC6).
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let present = |id: &str| -> Option<&'a GraphRecord> {
+        if tombstoned.contains(id) {
+            None
+        } else {
+            by_id.get(id).copied()
+        }
+    };
+
     let claim_nodes: Vec<&GraphRecord> = records
         .iter()
         .filter(|r| matches!(r, GraphRecord::Node { id, .. } if id == memory_id))
@@ -2299,36 +2340,11 @@ pub fn memory_audit_context<'a>(
         // 1) Denormalized evidence links on the claim node.
         if let GraphRecord::Node {
             evidence_links: Some(links),
-            superseded_by,
             ..
         } = claim
         {
             for link in links {
-                if let Some(target_id) = link.target_record_id.as_deref() {
-                    match by_id.get(target_id) {
-                        // A denormalized `CONTRADICTS` evidence link must reach the
-                        // contradicting section, same as a `CONTRADICTS` graph edge;
-                        // otherwise a JSONL/embedded record that retained only the
-                        // denormalized link would mis-report a contradiction as
-                        // generic support.
-                        Some(target) if link.relation == "CONTRADICTS" => {
-                            contradicting.entry(target.id()).or_insert_with(|| {
-                                MemoryEvidenceItem {
-                                    record: target,
-                                    relation: "CONTRADICTS".to_owned(),
-                                }
-                            });
-                        }
-                        Some(target) => place(target, &link.relation),
-                        None => diagnostics.push(MemoryAuditDiagnostic {
-                            code: "unresolved_evidence_link".to_owned(),
-                            source_record_id: memory_id.to_owned(),
-                            target_handle: target_id.to_owned(),
-                            relation: link.relation.clone(),
-                            target_domain: link.target_domain.clone(),
-                        }),
-                    }
-                } else {
+                let Some(target_id) = link.target_record_id.as_deref() else {
                     // Triple-only target: do not resolve heuristically (AC6).
                     let handle = link
                         .target_repo_relative_path
@@ -2341,18 +2357,74 @@ pub fn memory_audit_context<'a>(
                         relation: link.relation.clone(),
                         target_domain: link.target_domain.clone(),
                     });
+                    continue;
+                };
+                // A tombstoned target is stale for current-state reads; an absent
+                // target is unresolved. Either way it is surfaced, not placed.
+                let code = if tombstoned.contains(target_id) {
+                    "stale_evidence_target"
+                } else if by_id.contains_key(target_id) {
+                    ""
+                } else {
+                    "unresolved_evidence_link"
+                };
+                if !code.is_empty() {
+                    diagnostics.push(MemoryAuditDiagnostic {
+                        code: code.to_owned(),
+                        source_record_id: memory_id.to_owned(),
+                        target_handle: target_id.to_owned(),
+                        relation: link.relation.clone(),
+                        target_domain: link.target_domain.clone(),
+                    });
+                    continue;
+                }
+                let Some(target) = present(target_id) else {
+                    continue;
+                };
+                // A denormalized `CONTRADICTS` evidence link must reach the
+                // contradicting section, same as a `CONTRADICTS` graph edge,
+                // so a record that retained only the denormalized link does not
+                // mis-report a contradiction as generic support.
+                if link.relation == "CONTRADICTS" {
+                    contradicting
+                        .entry(target.id())
+                        .or_insert_with(|| MemoryEvidenceItem {
+                            record: target,
+                            relation: "CONTRADICTS".to_owned(),
+                        });
+                } else {
+                    place(target, &link.relation);
                 }
             }
-            // 2) Supersession declared inline on the claim.
-            if let Some(sup_id) = superseded_by
-                && let Some(target) = by_id.get(sup_id.as_str())
-            {
+        }
+
+        // 2) Supersession declared inline on the claim — read even when the
+        // claim carries no `evidence_links` (a common stale-claim shape).
+        if let GraphRecord::Node {
+            superseded_by: Some(sup_id),
+            ..
+        } = claim
+        {
+            if let Some(target) = present(sup_id) {
                 superseding
                     .entry(target.id())
                     .or_insert_with(|| MemoryEvidenceItem {
                         record: target,
                         relation: "SUPERSEDED_BY".to_owned(),
                     });
+            } else {
+                let code = if tombstoned.contains(sup_id.as_str()) {
+                    "stale_evidence_target"
+                } else {
+                    "unresolved_evidence_link"
+                };
+                diagnostics.push(MemoryAuditDiagnostic {
+                    code: code.to_owned(),
+                    source_record_id: memory_id.to_owned(),
+                    target_handle: sup_id.clone(),
+                    relation: "SUPERSEDED_BY".to_owned(),
+                    target_domain: "agent_memory".to_owned(),
+                });
             }
         }
 
@@ -2369,7 +2441,7 @@ pub fn memory_audit_context<'a>(
             };
             let claim_id = claim.id();
             if source == claim_id {
-                let Some(other) = by_id.get(target.as_str()) else {
+                let Some(other) = present(target) else {
                     continue;
                 };
                 match label {
@@ -2381,9 +2453,8 @@ pub fn memory_audit_context<'a>(
                                 relation: "CONTRADICTS".to_owned(),
                             });
                     }
-                    EdgeLabel::AuthoredBy => {
-                        sessions.entry(other.id()).or_insert(*other);
-                    }
+                    // AUTHORED_BY provenance is resolved by the chain walk below,
+                    // since imported records may route claim → turn → run → session.
                     EdgeLabel::HasEvidence
                     | EdgeLabel::ValidatedBy
                     | EdgeLabel::Observes
@@ -2397,7 +2468,7 @@ pub fn memory_audit_context<'a>(
                     _ => {}
                 }
             } else if target == claim_id {
-                let Some(other) = by_id.get(source.as_str()) else {
+                let Some(other) = present(source) else {
                     continue;
                 };
                 match label {
@@ -2423,15 +2494,39 @@ pub fn memory_audit_context<'a>(
         }
     }
 
-    // Resolve Agent provenance from each session via SESSION_OF.
-    let session_ids: Vec<&str> = sessions.keys().copied().collect();
-    for sid in session_ids {
-        if let Some(out) = edges_from.get(sid) {
+    // Resolve session/agent provenance by walking the AUTHORED_BY / SESSION_OF
+    // chain from each claim. Imported records commonly route a claim through an
+    // AgentTurn and AgentRun before reaching the AgentSession, with SESSION_OF on
+    // the session→agent edge, so the immediate AUTHORED_BY target is not always
+    // the session. The walk classifies every reached node by kind; intermediate
+    // turns/runs are traversed but never labelled as a session.
+    {
+        let mut visited: BTreeSet<&str> = BTreeSet::new();
+        let mut frontier: Vec<&str> = claim_nodes.iter().map(|c| c.id()).collect();
+        while let Some(id) = frontier.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let Some(out) = edges_from.get(id) else {
+                continue;
+            };
             for (label, target) in out {
-                if matches!(label, EdgeLabel::SessionOf)
-                    && let Some(agent) = by_id.get(*target)
-                {
-                    agents.entry(agent.id()).or_insert(*agent);
+                if !matches!(label, EdgeLabel::AuthoredBy | EdgeLabel::SessionOf) {
+                    continue;
+                }
+                if !visited.contains(*target) {
+                    frontier.push(*target);
+                }
+                if let Some(node) = present(target) {
+                    match record_node_kind(node) {
+                        Some(NodeKind::AgentSession) => {
+                            sessions.entry(node.id()).or_insert(node);
+                        }
+                        Some(NodeKind::Agent) => {
+                            agents.entry(node.id()).or_insert(node);
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -2445,7 +2540,7 @@ pub fn memory_audit_context<'a>(
                 .iter()
                 .filter(|(_, item)| {
                     record_node_kind(item.record).is_some_and(is_agent_claim_kind)
-                        && !is_verified_claim(item.record, &by_id, &edges_from)
+                        && !is_verified_claim(item.record, &by_id, &edges_from, &tombstoned)
                 })
                 .map(|(id, _)| *id)
                 .collect();

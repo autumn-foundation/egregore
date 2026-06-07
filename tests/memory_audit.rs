@@ -871,3 +871,256 @@ fn audit_stale_when_node_and_tombstone_both_present() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["error"]["code"], "stale_handle", "{v}");
 }
+
+/// Builds an agent-memory node stamped with the agent-memory schema version.
+fn agent_node(id: &str, kind: NodeKind, name: Option<&str>) -> GraphRecord {
+    let mut n = GraphRecord::node(
+        id.to_owned(),
+        kind,
+        None,
+        None,
+        name.map(ToOwned::to_owned),
+        "node".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ..
+    } = n
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+    }
+    n
+}
+
+/// Builds an `Observation` claim node with provenance and evidence links.
+fn mk_obs(id: &str, source_handle: &str, links: Vec<EvidenceLink>) -> GraphRecord {
+    let mut n = GraphRecord::node(
+        id.to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "obs".to_owned(),
+    );
+    if let GraphRecord::Node {
+        agent_id: ref mut a,
+        session_id: ref mut s,
+        source_handle: ref mut sh,
+        schema_version: ref mut sv,
+        evidence_links: ref mut el,
+        ..
+    } = n
+    {
+        *a = Some("a".to_owned());
+        *s = Some("s".to_owned());
+        *sh = Some(source_handle.to_owned());
+        *sv = AGENT_MEMORY_SCHEMA_VERSION;
+        if !links.is_empty() {
+            *el = Some(links);
+        }
+    }
+    n
+}
+
+/// `superseded_by` is read even when the claim carries no `evidence_links`.
+#[test]
+fn audit_reads_superseded_by_without_evidence_links() {
+    let claim_id = agent_memory_stable_id(&["obs", "claim_sup"]);
+    let decision_id = agent_memory_stable_id(&["decision", "dec_sup"]);
+
+    let mut claim = mk_obs(&claim_id, "trajectories/run.traj", vec![]);
+    if let GraphRecord::Node {
+        ref mut superseded_by,
+        ..
+    } = claim
+    {
+        *superseded_by = Some(decision_id.clone());
+    }
+    let decision = agent_node(&decision_id, NodeKind::Decision, None);
+
+    let (_t, graph) = write_graph(vec![claim, decision]);
+    let v = audit_json(&graph, &claim_id);
+    let sup = v["superseding_records"].as_array().expect("superseding");
+    assert!(
+        sup.iter().any(|h| h["record_id"] == decision_id),
+        "superseded_by not read without evidence_links: {v}"
+    );
+}
+
+/// A live source handle that also matches a tombstoned claim is not ambiguous.
+#[test]
+fn audit_live_handle_not_ambiguous_with_tombstoned_twin() {
+    let live_id = agent_memory_stable_id(&["obs", "live"]);
+    let dead_id = agent_memory_stable_id(&["obs", "dead"]);
+    let live = mk_obs(&live_id, "shared.traj", vec![]);
+    let dead = mk_obs(&dead_id, "shared.traj", vec![]);
+    let tombstone = GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &dead_id]),
+        schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+        deleted_id: dead_id.clone(),
+        summary: "deleted".to_owned(),
+        producer: None,
+    };
+
+    let (_t, graph) = write_graph(vec![live, dead, tombstone]);
+    let v = audit_json(&graph, "shared.traj");
+    assert_eq!(v["ok"], true, "live handle should not be ambiguous: {v}");
+    assert_eq!(v["memory_id"], live_id);
+}
+
+/// A `--verified-only` claim backed only by a generic `RELATES_TO` link to a
+/// verification record is treated as unverified and excluded.
+#[test]
+fn audit_verified_only_requires_backing_relation() {
+    let claim_id = agent_memory_stable_id(&["obs", "claim_b"]);
+    let contra_id = agent_memory_stable_id(&["obs", "contra_b"]);
+    let ver_id = verification_stable_id(&["verification", "ver_b"]);
+
+    let claim = mk_obs(&claim_id, "run.traj", vec![]);
+    // The contradicting obs only RELATES_TO a verification record — not backing.
+    let contra = mk_obs(
+        &contra_id,
+        "run2.traj",
+        vec![link(&ver_id, "verification", "RELATES_TO")],
+    );
+    let mut ver = GraphRecord::node(
+        ver_id,
+        NodeKind::Verification,
+        None,
+        None,
+        None,
+        "ver".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut status,
+        ..
+    } = ver
+    {
+        *schema_version = VERIFICATION_SCHEMA_VERSION;
+        *status = Some("pass".to_owned());
+    }
+    let contradicts = GraphRecord::edge(
+        EdgeLabel::Contradicts,
+        contra_id.clone(),
+        claim_id.clone(),
+        None,
+        "c".to_owned(),
+    );
+
+    let (_t, graph) = write_graph(vec![claim, contra, ver, contradicts]);
+    let output = egregore()
+        .args(["query", "memory", &claim_id, "--graph"])
+        .arg(&graph)
+        .args(["--verified-only"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output).unwrap().trim()).expect("json");
+    let excluded = v["excluded"].as_array().expect("excluded");
+    assert!(
+        excluded.iter().any(|e| e["record_id"] == contra_id),
+        "RELATES_TO to a verification record must not count as verified: {v}"
+    );
+}
+
+/// An evidence link to a tombstoned target is reported stale, not surfaced as
+/// live verification evidence.
+#[test]
+fn audit_tombstoned_evidence_target_is_stale() {
+    let claim_id = agent_memory_stable_id(&["obs", "claim_te"]);
+    let ver_id = verification_stable_id(&["verification", "ver_te"]);
+    let claim = mk_obs(
+        &claim_id,
+        "run.traj",
+        vec![link(&ver_id, "verification", "VALIDATED_BY")],
+    );
+    let mut ver = GraphRecord::node(
+        ver_id.clone(),
+        NodeKind::Verification,
+        None,
+        None,
+        None,
+        "ver".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut status,
+        ..
+    } = ver
+    {
+        *schema_version = VERIFICATION_SCHEMA_VERSION;
+        *status = Some("pass".to_owned());
+    }
+    let tombstone = GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &ver_id]),
+        schema_version: VERIFICATION_SCHEMA_VERSION,
+        deleted_id: ver_id.clone(),
+        summary: "deleted".to_owned(),
+        producer: None,
+    };
+
+    let (_t, graph) = write_graph(vec![claim, ver, tombstone]);
+    let v = audit_json(&graph, &claim_id);
+    let ver_ev = v["verification_evidence"].as_array().expect("ver");
+    assert!(
+        !ver_ev.iter().any(|h| h["record_id"] == ver_id),
+        "tombstoned evidence must not appear as live verification: {v}"
+    );
+    let diags = v["diagnostics"].as_array().expect("diagnostics");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d["code"] == "stale_evidence_target" && d["target_handle"] == ver_id),
+        "tombstoned target should be reported stale: {v}"
+    );
+}
+
+/// Provenance is resolved through an `AUTHORED_BY` → `AgentRun` → `SESSION_OF`
+/// chain, surfacing the real `AgentSession` rather than an intermediate turn.
+#[test]
+fn audit_resolves_authored_by_chain_to_session() {
+    let claim_id = agent_memory_stable_id(&["obs", "claim_ch"]);
+    let turn_id = agent_memory_stable_id(&["turn", "t"]);
+    let run_id = agent_memory_stable_id(&["run", "r"]);
+    let session_node = agent_memory_stable_id(&["session", "real"]);
+
+    let claim = mk_obs(&claim_id, "run.traj", vec![]);
+    let turn = agent_node(&turn_id, NodeKind::AgentTurn, None);
+    let run = agent_node(&run_id, NodeKind::AgentRun, None);
+    let session = agent_node(&session_node, NodeKind::AgentSession, Some("sess"));
+    let e1 = GraphRecord::edge(
+        EdgeLabel::AuthoredBy,
+        claim_id.clone(),
+        turn_id.clone(),
+        None,
+        "claim->turn".to_owned(),
+    );
+    let e2 = GraphRecord::edge(
+        EdgeLabel::AuthoredBy,
+        turn_id,
+        run_id.clone(),
+        None,
+        "turn->run".to_owned(),
+    );
+    let e3 = GraphRecord::edge(
+        EdgeLabel::SessionOf,
+        run_id,
+        session_node.clone(),
+        None,
+        "run->session".to_owned(),
+    );
+
+    let (_t, graph) = write_graph(vec![claim, turn, run, session, e1, e2, e3]);
+    let v = audit_json(&graph, &claim_id);
+    let sessions = v["direct_provenance"]["agent_session_ids"]
+        .as_array()
+        .expect("agent_session_ids");
+    assert!(
+        sessions.iter().any(|s| s == &session_node),
+        "real AgentSession not surfaced from AUTHORED_BY chain: {v}"
+    );
+}

@@ -2062,6 +2062,9 @@ struct AuditItem<'a> {
     patch_bytes_hash: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body_handle_hash: Option<&'a str>,
+    /// BLAKE3 hash handle for a `Review` record's protected diff hunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff_hunk_hash: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     author: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3459,6 +3462,7 @@ fn audit_item<'a>(item: &query::MemoryEvidenceItem<'a>) -> AuditItem<'a> {
         observed_at,
         confidence,
         patch_handle,
+        diff_hunk_handle,
         ..
     } = record
     else {
@@ -3484,6 +3488,7 @@ fn audit_item<'a>(item: &query::MemoryEvidenceItem<'a>) -> AuditItem<'a> {
             patch_status: None,
             patch_bytes_hash: None,
             body_handle_hash: None,
+            diff_hunk_hash: None,
             author: None,
             agent_id: None,
             session_id: None,
@@ -3495,7 +3500,8 @@ fn audit_item<'a>(item: &query::MemoryEvidenceItem<'a>) -> AuditItem<'a> {
     let protected = patch_handle.is_some()
         || stdout_handle.as_ref().is_some_and(|o| o.bytes > 0)
         || stderr_handle.as_ref().is_some_and(|o| o.bytes > 0)
-        || body_handle.is_some();
+        || body_handle.is_some()
+        || diff_hunk_handle.is_some();
     AuditItem {
         record_id: id,
         kind: kind.as_str(),
@@ -3517,6 +3523,7 @@ fn audit_item<'a>(item: &query::MemoryEvidenceItem<'a>) -> AuditItem<'a> {
         patch_status: patch_status.as_deref(),
         patch_bytes_hash: patch_bytes_hash.as_deref(),
         body_handle_hash: body_handle.as_ref().map(|o| o.hash.as_str()),
+        diff_hunk_hash: diff_hunk_handle.as_ref().map(|o| o.hash.as_str()),
         author: author.as_deref(),
         agent_id: agent_id.as_deref(),
         session_id: session_id.as_deref(),
@@ -3535,6 +3542,7 @@ fn protected_payload_diagnostics<'a>(record: &'a GraphRecord, out: &mut Vec<Audi
         patch_bytes_hash,
         patch_handle,
         body_handle,
+        diff_hunk_handle,
         ..
     } = record
     else {
@@ -3578,6 +3586,15 @@ fn protected_payload_diagnostics<'a>(record: &'a GraphRecord, out: &mut Vec<Audi
             target_domain: "project",
         });
     }
+    if let Some(o) = diff_hunk_handle.as_ref() {
+        out.push(AuditDiagnostic {
+            code: "protected_payload",
+            source_record_id: id,
+            target_handle: &o.hash,
+            relation: "diff_hunk",
+            target_domain: "project",
+        });
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3615,23 +3632,10 @@ fn query_memory_cmd(
         std::process::exit(2);
     }
 
+    // `resolve_memory_ids` has already dropped tombstoned (deleted) IDs, so a
+    // resolved ID is always a live claim. A handle that named only deleted
+    // records resolved to empty and was reported as `stale_handle` above.
     let memory_id = resolved.iter().next().expect("non-empty");
-
-    // A tombstone for the resolved ID means the record was deleted. Like every
-    // other query path, a current-state tombstone wins even when an incremental
-    // graph still carries the original node (no restore is inferred): report
-    // `stale_handle` rather than auditing a deleted claim (AC6).
-    let is_tombstoned = records
-        .iter()
-        .any(|r| matches!(r, GraphRecord::Tombstone { deleted_id, .. } if deleted_id == memory_id));
-    if is_tombstoned {
-        let envelope = serde_json::json!({
-            "ok": false,
-            "error": { "code": "stale_handle", "memory_handle": memory_id },
-        });
-        println!("{}", serde_json::to_string(&envelope)?);
-        std::process::exit(2);
-    }
 
     let ctx = query::memory_audit_context(records, memory_id, verified_only);
     if ctx.is_no_match() {
@@ -3761,12 +3765,17 @@ fn query_memory_cmd(
             .then_with(|| a.source_record_id.cmp(b.source_record_id))
             .then_with(|| a.target_handle.cmp(b.target_handle))
             .then_with(|| a.relation.cmp(b.relation))
+            .then_with(|| a.target_domain.cmp(b.target_domain))
     });
+    // Keep `target_domain` in the dedup key: two unresolved links sharing source,
+    // handle, and relation but pointing at different domains are distinct
+    // unresolved facts and must both be surfaced (AC6).
     diagnostics.dedup_by(|a, b| {
         a.code == b.code
             && a.source_record_id == b.source_record_id
             && a.target_handle == b.target_handle
             && a.relation == b.relation
+            && a.target_domain == b.target_domain
     });
 
     let excluded: Vec<AuditExcluded<'_>> = ctx

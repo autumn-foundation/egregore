@@ -84,15 +84,17 @@ bodies, PR comments, environment values, or bearer tokens (AC9). The claim's raw
 `text` body is never emitted (a `Failure` keeps a command-output excerpt there);
 the audit exposes only the bounded `summary`, a `text_hash` handle, and a
 `redacted` flag. Protected payloads (command output, patch bytes, task bodies) are
-referenced by **hash only**, flagged with `"protected": true` on the item, and
-surfaced as `protected_payload` diagnostics.
+referenced by **hash only** (command output, patch bytes, task bodies, and PR
+review diff hunks), flagged with `"protected": true` on the item, and surfaced as
+`protected_payload` diagnostics.
 
 ### Diagnostic codes
 
 | Code | Meaning |
 |------|---------|
-| `unresolved_evidence_link` | An `evidence_links` target ID is absent from the store. |
+| `unresolved_evidence_link` | An `evidence_links` (or `superseded_by`) target ID is absent from the store. |
 | `evidence_target_unresolved` | An evidence link supplied only a triple, not a record ID; not resolved heuristically. |
+| `stale_evidence_target` | An evidence (or supersession) target exists only as a tombstone; treated as deleted, not surfaced as live evidence. |
 | `protected_payload` | A raw payload (stdout/stderr/patch/body) is withheld; the hash is the handle. |
 | `redacted_payload` | The claim carries a redaction policy version. |
 
