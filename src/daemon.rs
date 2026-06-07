@@ -5055,7 +5055,7 @@ fn lookup_record(
     records: &[GraphRecord],
     sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<Option<GraphRecord>> {
-    if let Some(record) = records.iter().find(|record| record.id() == id) {
+    if let Some(record) = records.iter().rfind(|record| record.id() == id) {
         return Ok(Some(record.clone()));
     }
     sink.read_back(id)
@@ -5900,7 +5900,7 @@ fn lookup_node_kind(
     batch: &[GraphRecord],
     sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<Option<NodeKind>> {
-    for r in batch {
+    for r in batch.iter().rev() {
         if r.id() == id {
             return Ok(if let GraphRecord::Node { kind, .. } = r {
                 Some(*kind)

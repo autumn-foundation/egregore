@@ -1989,7 +1989,7 @@ pub fn latest_decision_for_candidate<'a>(
 /// Checks if a candidate is suppressed under the rejection debounce window
 #[must_use]
 pub fn is_candidate_suppressed(records: &[GraphRecord], cand_id: &str) -> Option<String> {
-    let cand = records.iter().find(|r| r.id() == cand_id)?;
+    let cand = records.iter().rfind(|r| r.id() == cand_id)?;
     let (cand_text, cand_scope, superseded_by_id) = match cand {
         GraphRecord::Node {
             user_context,
@@ -2004,7 +2004,7 @@ pub fn is_candidate_suppressed(records: &[GraphRecord], cand_id: &str) -> Option
     };
 
     if let Some(old_id) = superseded_by_id {
-        if let Some(old_rec) = records.iter().find(|r| r.id() == old_id) {
+        if let Some(old_rec) = records.iter().rfind(|r| r.id() == old_id) {
             let decision = latest_decision_for_candidate(records, old_id);
             if let Some(GraphRecord::Node {
                 user_context: decision_fields,
@@ -2318,7 +2318,7 @@ pub fn audit_trail<'a>(
 
     let decision = records
         .iter()
-        .find(|r| r.id() == decision_id)
+        .rfind(|r| r.id() == decision_id)
         .ok_or_else(|| {
             format!(
                 "Approval decision '{}' not found for durable record '{}'",
@@ -2390,7 +2390,7 @@ pub fn audit_trail<'a>(
         .ok_or_else(|| format!("Decision '{}' lacks prompt_id", decision_id))?;
     let prompt = records
         .iter()
-        .find(|r| r.id() == prompt_id)
+        .rfind(|r| r.id() == prompt_id)
         .ok_or_else(|| {
             format!(
                 "PromotionPrompt '{}' not found for decision '{}'",
@@ -2428,7 +2428,7 @@ pub fn audit_trail<'a>(
     }
     let candidate = records
         .iter()
-        .find(|r| r.id() == candidate_id)
+        .rfind(|r| r.id() == candidate_id)
         .ok_or_else(|| {
             format!(
                 "PromoteCandidate '{}' not found for prompt '{}'",
@@ -2602,7 +2602,7 @@ pub fn audit_trail<'a>(
                 candidate_id
             )
         })?;
-        let obs = records.iter().find(|r| r.id() == obs_id).ok_or_else(|| {
+        let obs = records.iter().rfind(|r| r.id() == obs_id).ok_or_else(|| {
             format!(
                 "Supporting observation '{}' not found for candidate '{}'",
                 obs_id, candidate_id
@@ -2627,12 +2627,20 @@ pub fn audit_trail<'a>(
                 return Err(format!("Supporting evidence '{}' is not a node", obs_id));
             }
         };
+        let sess = session_id.ok_or_else(|| {
+            format!(
+                "supporting_evidence.session_id is required for evidence target '{}' in candidate '{}'",
+                obs_id, candidate_id
+            )
+        })?;
+        if sess.is_empty() {
+            return Err(format!(
+                "supporting_evidence.session_id is required for evidence target '{}' in candidate '{}'",
+                obs_id, candidate_id
+            ));
+        }
         if unique_supporting_targets.insert(obs_id.to_owned()) {
-            if let Some(sess) = session_id
-                && !sess.is_empty()
-            {
-                sessions.insert(sess.to_owned());
-            }
+            sessions.insert(sess.to_owned());
             obs_nodes.push(obs);
         }
     }

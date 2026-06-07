@@ -2711,7 +2711,7 @@ fn resolve_drift_target<'a>(
         repo_relative_path,
         name,
         ..
-    }) = records.iter().find(|r| r.id() == target_id)
+    }) = records.iter().rfind(|r| r.id() == target_id)
     {
         return (repo_relative_path.as_deref(), name.as_deref());
     }
@@ -2911,7 +2911,7 @@ fn query_task_cmd(records: &[GraphRecord], id_or_handle: &str) -> Result<()> {
                 });
 
                 if let Some(ver_record) =
-                    ver_id.and_then(|vid| records.iter().find(|cand| cand.id() == vid))
+                    ver_id.and_then(|vid| records.iter().rfind(|cand| cand.id() == vid))
                 {
                     ac.verification_record = context_linked_item(ver_record).map(Box::new);
                 }
@@ -3518,7 +3518,7 @@ fn query_policy_cmd(
 fn query_audit_cmd(records: &[GraphRecord], durable_id: &str, format: OutputFormat) -> Result<()> {
     let durable = records
         .iter()
-        .find(|r| r.id() == durable_id)
+        .rfind(|r| r.id() == durable_id)
         .ok_or_else(|| anyhow::anyhow!("Durable record '{durable_id}' not found"))?;
     match crate::query::audit_trail(records, durable) {
         Ok(chain) => {
@@ -3685,15 +3685,14 @@ fn decide_cmd(
                 seen_ids.insert(g.id().to_owned());
             }
             let mut validation_edges = Vec::new();
-            if let Some(cand) = records.iter().find(|r| r.id() == req.candidate_id) {
+            if let Some(cand) = records.iter().rfind(|r| r.id() == req.candidate_id) {
                 let val_edges =
                     crate::daemon::validate_promote_candidate_for_cli(cand, &records, &sink)
                         .context("Candidate validation failed")?;
                 validation_edges = val_edges;
 
-                if seen_ids.insert(cand.id().to_owned()) {
-                    source_records_to_persist.push(cand.clone());
-                }
+                source_records_to_persist.push(cand.clone());
+                seen_ids.insert(cand.id().to_owned());
             }
 
             let mut idx = 0;
@@ -3716,7 +3715,7 @@ fn decide_cmd(
                                     if let Some(ref_id) = &link.target_record_id
                                         && seen_ids.insert(ref_id.clone())
                                         && let Some(evidence_rec) =
-                                            records.iter().find(|r| r.id() == *ref_id)
+                                            records.iter().rfind(|r| r.id() == *ref_id)
                                     {
                                         if let GraphRecord::Node {
                                             kind: ev_kind,
@@ -3742,7 +3741,7 @@ fn decide_cmd(
                                         if user_context.proposed_rule_kind.as_deref()
                                             == Some("revocation")
                                             && let Some(target_rec) =
-                                                records.iter().find(|r| r.id() == *ref_id)
+                                                records.iter().rfind(|r| r.id() == *ref_id)
                                             && let Ok(target_chain) =
                                                 crate::query::audit_trail(&records, target_rec)
                                         {
@@ -3755,7 +3754,7 @@ fn decide_cmd(
                                         }
                                         if seen_ids.insert(ref_id.clone())
                                             && let Some(evidence_rec) =
-                                                records.iter().find(|r| r.id() == *ref_id)
+                                                records.iter().rfind(|r| r.id() == *ref_id)
                                         {
                                             source_records_to_persist.push(evidence_rec.clone());
                                         }
@@ -3765,7 +3764,7 @@ fn decide_cmd(
                             if let Some(rej_id) = superseded_by {
                                 if seen_ids.insert(rej_id.clone())
                                     && let Some(rej_cand) =
-                                        records.iter().find(|r| r.id() == *rej_id)
+                                        records.iter().rfind(|r| r.id() == *rej_id)
                                 {
                                     source_records_to_persist.push(rej_cand.clone());
                                 }
@@ -3787,7 +3786,7 @@ fn decide_cmd(
                         NodeKind::PromotionDecision => {
                             if let Some(p_id) = &user_context.prompt_id
                                 && seen_ids.insert(p_id.clone())
-                                && let Some(prompt_rec) = records.iter().find(|r| r.id() == *p_id)
+                                && let Some(prompt_rec) = records.iter().rfind(|r| r.id() == *p_id)
                             {
                                 source_records_to_persist.push(prompt_rec.clone());
                             }
@@ -3798,7 +3797,7 @@ fn decide_cmd(
                                     if let Some(target_id) = &ev_link.target_record_id
                                         && seen_ids.insert(target_id.clone())
                                         && let Some(target_rec) =
-                                            records.iter().find(|r| r.id() == *target_id)
+                                            records.iter().rfind(|r| r.id() == *target_id)
                                     {
                                         source_records_to_persist.push(target_rec.clone());
                                     }
@@ -3810,8 +3809,13 @@ fn decide_cmd(
                 }
             }
 
+            let generated_ids: std::collections::HashSet<String> =
+                generated.iter().map(|g| g.id().to_owned()).collect();
             let mut copied_synthesized_edges = Vec::new();
             for rec in &source_records_to_persist {
+                if generated_ids.contains(rec.id()) {
+                    continue;
+                }
                 if rec.id().starts_with("agent_memory:v1:") {
                     crate::daemon::validate_agent_memory_record_for_cli(rec, &records, &sink)
                         .context("Copied evidence record validation failed")?;
@@ -3946,7 +3950,11 @@ fn decide_cmd(
                 }
             }
 
-            all_records.extend(source_records_to_persist);
+            let source_records_filtered: Vec<GraphRecord> = source_records_to_persist
+                .into_iter()
+                .filter(|r| !generated_ids.contains(r.id()))
+                .collect();
+            all_records.extend(source_records_filtered);
             let report = ingest_records(&all_records, &mut sink);
             if !report.is_success() {
                 for failure in &report.failures {

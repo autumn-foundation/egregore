@@ -73,7 +73,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
     // 1. Locate PromoteCandidate
     let candidate = records
         .iter()
-        .find(|r| r.id() == req.candidate_id)
+        .rfind(|r| r.id() == req.candidate_id)
         .ok_or_else(|| anyhow!("PromoteCandidate '{}' not found", req.candidate_id))?;
 
     let cand_fields = match candidate {
@@ -119,6 +119,16 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
                 outcome
             ));
         }
+    }
+
+    if let Some(time_str) = &req.transaction_time
+        && let Err(e) = chrono::DateTime::parse_from_rfc3339(time_str)
+    {
+        return Err(anyhow!(
+            "Invalid transaction_time format '{}': {}",
+            time_str,
+            e
+        ));
     }
 
     let valid_time_str = req
@@ -255,7 +265,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
             })?;
             let target_node = records
                 .iter()
-                .find(|r| r.id() == target_id)
+                .rfind(|r| r.id() == target_id)
                 .ok_or_else(|| anyhow!("supporting evidence target '{}' not found", target_id))?;
             let (target_kind, target_session_id) = match target_node {
                 GraphRecord::Node {
@@ -339,7 +349,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
             })?;
             let target_node = records
                 .iter()
-                .find(|r| r.id() == target_id)
+                .rfind(|r| r.id() == target_id)
                 .ok_or_else(|| anyhow!("evidence target '{}' not found", target_id))?;
             let target_kind = match target_node {
                 GraphRecord::Node { kind, .. } => *kind,
@@ -368,7 +378,7 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         if let Some(rejected_id) = cand_superseded_by {
             let rejected_node = records
                 .iter()
-                .find(|r| r.id() == rejected_id)
+                .rfind(|r| r.id() == rejected_id)
                 .ok_or_else(|| anyhow!("superseded candidate '{}' not found", rejected_id))?;
             let target_kind = match rejected_node {
                 GraphRecord::Node { kind, .. } => *kind,
