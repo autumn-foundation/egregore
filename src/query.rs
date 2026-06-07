@@ -2573,6 +2573,18 @@ pub fn audit_trail<'a>(
                 candidate_id, link.relation
             ));
         }
+        let conf_val: f64 = link.confidence.parse().map_err(|_| {
+            format!(
+                "Candidate '{}' supporting evidence link confidence '{}' must be a numeric float string",
+                candidate_id, link.confidence
+            )
+        })?;
+        if !(0.0..=1.0).contains(&conf_val) {
+            return Err(format!(
+                "Candidate '{}' supporting evidence link confidence '{}' must be in the range [0.0, 1.0]",
+                candidate_id, link.confidence
+            ));
+        }
         let obs_id = link.target_record_id.as_deref().ok_or_else(|| {
             format!(
                 "Candidate '{}' supporting evidence link lacks target_record_id",

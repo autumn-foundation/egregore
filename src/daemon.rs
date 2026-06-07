@@ -3374,8 +3374,12 @@ const USER_CONTEXT_PROPOSED_BY_TARGET_KINDS: &[NodeKind] = &[
     NodeKind::Decision,
 ];
 
-const USER_CONTEXT_CONTRADICTS_TARGET_KINDS: &[NodeKind] =
-    &[NodeKind::Preference, NodeKind::WorkflowRule];
+const USER_CONTEXT_CONTRADICTS_TARGET_KINDS: &[NodeKind] = &[
+    NodeKind::Preference,
+    NodeKind::WorkflowRule,
+    NodeKind::NamingDecision,
+    NodeKind::Constraint,
+];
 
 const USER_CONTEXT_NAMING_ENTITY_KINDS: &[&str] = &[
     "crate", "module", "type", "function", "field", "feature", "other",
@@ -4163,8 +4167,8 @@ fn validate_contradicting_evidence_link(
             Ok(target_id.to_owned())
         }
         Some(kind) => Err(ApiError::bad_request(format!(
-            "PromoteCandidate.contradicting_evidence target '{target_id}' must be a Preference \
-             or WorkflowRule, got {}",
+            "PromoteCandidate.contradicting_evidence target '{target_id}' must be a Preference, \
+             WorkflowRule, NamingDecision, or Constraint, got {}",
             kind.as_str()
         ))),
         None => Err(ApiError::new(

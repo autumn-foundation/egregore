@@ -21,6 +21,132 @@ fn egregore() -> Command {
     Command::cargo_bin("egregore").expect("binary should run")
 }
 
+fn make_candidate_valid(candidate: &mut GraphRecord, records: &mut Vec<GraphRecord>) {
+    let (cand_id, user_context) = match candidate {
+        GraphRecord::Node {
+            id,
+            confidence,
+            evidence_quality,
+            user_context,
+            ..
+        } => {
+            *confidence = Some("0.9".to_owned());
+            *evidence_quality = Some("verbatim".to_owned());
+            (id.clone(), user_context)
+        }
+        _ => panic!("Not a node"),
+    };
+
+    let obs1_id = format!("agent_memory:v1:{cand_id}-obs-1");
+    let obs2_id = format!("agent_memory:v1:{cand_id}-obs-2");
+    let obs3_id = format!("agent_memory:v1:{cand_id}-obs-3");
+
+    user_context.supporting_evidence = Some(vec![
+        EvidenceLink {
+            target_record_id: Some(obs1_id.clone()),
+            target_domain: "agent_memory".to_owned(),
+            relation: "PROPOSED_BY".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        },
+        EvidenceLink {
+            target_record_id: Some(obs2_id.clone()),
+            target_domain: "agent_memory".to_owned(),
+            relation: "PROPOSED_BY".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        },
+        EvidenceLink {
+            target_record_id: Some(obs3_id.clone()),
+            target_domain: "agent_memory".to_owned(),
+            relation: "PROPOSED_BY".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        },
+    ]);
+
+    let make_obs = |id: String, session: &str| {
+        let mut obs = GraphRecord::node(
+            id,
+            NodeKind::Observation,
+            None,
+            None,
+            None,
+            "Target Obs".to_owned(),
+        );
+        if let GraphRecord::Node {
+            schema_version,
+            domain,
+            session_id,
+            evidence_links,
+            agent_id,
+            agent_kind,
+            observed_at,
+            ingested_at,
+            confidence,
+            text,
+            ..
+        } = &mut obs
+        {
+            *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+            *domain = Some("agent_memory".to_owned());
+            *session_id = Some(session.to_owned());
+            *agent_id = Some("agent_1".to_owned());
+            *agent_kind = Some("claude-code".to_owned());
+            *observed_at = Some("2026-06-01T12:00:00Z".to_owned());
+            *ingested_at = Some("2026-06-01T12:00:00Z".to_owned());
+            *confidence = Some("1.0".to_owned());
+            *text = Some("Target Observation Text".to_owned());
+            *evidence_links = Some(vec![EvidenceLink {
+                target_record_id: Some("codegraph:v1:rust:symbol:1".to_owned()),
+                target_domain: "codegraph".to_owned(),
+                relation: "OBSERVES".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]);
+        }
+        obs
+    };
+
+    let obs1 = make_obs(obs1_id, "session_1");
+    let obs2 = make_obs(obs2_id, "session_1");
+    let obs3 = make_obs(obs3_id, "session_2");
+
+    let mock_symbol = GraphRecord::node(
+        "codegraph:v1:rust:symbol:1".to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("my_symbol".to_owned()),
+        "mock symbol".to_owned(),
+    );
+
+    records.push(mock_symbol);
+    records.push(obs1);
+    records.push(obs2);
+    records.push(obs3);
+}
+
+fn make_candidate_valid_in_graph(candidate: &mut GraphRecord, graph: &mut Graph) {
+    let mut records = Vec::new();
+    make_candidate_valid(candidate, &mut records);
+    for r in records {
+        graph.push(r);
+    }
+}
+
 /// Helper to generate a seeded graph JSONL fixture containing:
 /// - 3 pending preference candidates
 /// - 2 prior decisions
@@ -1695,6 +1821,8 @@ fn decide_naming_decision_and_constraint_preserves_proposed_rule_kind_and_applie
     }
 
     let mut graph = Graph::new();
+    make_candidate_valid_in_graph(&mut name_cand, &mut graph);
+    make_candidate_valid_in_graph(&mut const_cand, &mut graph);
     graph.push(name_cand);
     graph.push(const_cand);
     fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
@@ -2501,6 +2629,7 @@ fn decide_naming_decision_preserves_edited_canonical_name_hash() {
     }
 
     let mut graph = Graph::new();
+    make_candidate_valid_in_graph(&mut cand, &mut graph);
     graph.push(cand);
     fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
 
@@ -2715,6 +2844,7 @@ fn decide_naming_decision_defaults_alternatives_rejected_to_empty_array() {
     }
 
     let mut graph = Graph::new();
+    make_candidate_valid_in_graph(&mut cand, &mut graph);
     graph.push(cand);
     fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
 
@@ -3345,6 +3475,7 @@ fn decide_preference_hashes_redacted_rule_text() {
     }
 
     let mut graph = Graph::new();
+    make_candidate_valid_in_graph(&mut cand, &mut graph);
     graph.push(cand);
     fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
 
@@ -4060,7 +4191,9 @@ fn test_decide_collapses_same_id_revocation_targets() {
         };
     }
 
-    let records = vec![policy_active, policy_revoked, candidate];
+    let mut records = vec![policy_active, policy_revoked];
+    make_candidate_valid(&mut candidate, &mut records);
+    records.push(candidate.clone());
 
     let req = DecideRequest {
         candidate_id: cand_id.to_owned(),
@@ -4113,7 +4246,9 @@ fn test_decide_stamps_redacted_outputs_with_policy_version() {
         };
     }
 
-    let records = vec![candidate];
+    let mut records = Vec::new();
+    make_candidate_valid(&mut candidate, &mut records);
+    records.push(candidate.clone());
 
     let req = DecideRequest {
         candidate_id: cand_id.to_owned(),
@@ -4186,7 +4321,9 @@ fn test_decide_stamps_naming_edited_with_redaction() {
         };
     }
 
-    let records = vec![candidate];
+    let mut records = Vec::new();
+    make_candidate_valid(&mut candidate, &mut records);
+    records.push(candidate.clone());
 
     let req = DecideRequest {
         candidate_id: cand_id.to_owned(),
@@ -4253,7 +4390,9 @@ fn test_decide_synthesizes_edges_for_embedded_write() {
         };
     }
 
-    let records = vec![candidate];
+    let mut records = Vec::new();
+    make_candidate_valid(&mut candidate, &mut records);
+    records.push(candidate.clone());
 
     let req = DecideRequest {
         candidate_id: cand_id.to_owned(),
@@ -4715,7 +4854,9 @@ fn test_decide_normalizes_and_redacts_candidate_body() {
         };
     }
 
-    let records = vec![candidate];
+    let mut records = Vec::new();
+    make_candidate_valid(&mut candidate, &mut records);
+    records.push(candidate.clone());
     let req = DecideRequest {
         candidate_id: cand_id.to_owned(),
         outcome: "approved".to_owned(),
@@ -4781,7 +4922,9 @@ fn test_decide_naming_hash_uses_redacted_edited_name() {
         };
     }
 
-    let records = vec![candidate];
+    let mut records = Vec::new();
+    make_candidate_valid(&mut candidate, &mut records);
+    records.push(candidate.clone());
     let req = DecideRequest {
         candidate_id: cand_id.to_owned(),
         outcome: "edited_then_approved".to_owned(),
@@ -4855,12 +4998,19 @@ fn test_decide_naming_decision_plain_approved_requires_matching_fields() {
             proposed_rule_kind: Some("naming_decision".to_owned()),
             entity_kind: Some("function".to_owned()),
             canonical_name: Some("OtherName".to_owned()), // MISMATCH
-            scope: Some(UserContextScope::default()),
+            scope: Some(UserContextScope {
+                repo: Some("egregore".to_owned()),
+                path_glob: Some("src/**/*.rs".to_owned()),
+                language: Some("rust".to_owned()),
+                lifecycle_phase: Some("pre_commit".to_owned()),
+            }),
             ..UserContextFields::empty()
         };
     }
 
-    let records = vec![candidate];
+    let mut records = Vec::new();
+    make_candidate_valid(&mut candidate, &mut records);
+    records.push(candidate);
     let req = DecideRequest {
         candidate_id: cand_id.to_owned(),
         outcome: "approved".to_owned(),
@@ -5042,7 +5192,9 @@ fn test_decide_redacts_candidate_action_summary() {
         };
     }
 
-    let records = vec![candidate];
+    let mut records = Vec::new();
+    make_candidate_valid(&mut candidate, &mut records);
+    records.push(candidate.clone());
     let req = DecideRequest {
         candidate_id: cand_id.to_owned(),
         outcome: "approved".to_owned(),
@@ -5130,7 +5282,7 @@ fn test_decide_revocation_rejects_if_any_copy_revoked() {
             contradicting_evidence: Some(vec![EvidenceLink {
                 target_record_id: Some(target_id.to_owned()),
                 target_domain: "user_context".to_owned(),
-                relation: "REVOKES".to_owned(),
+                relation: "CONTRADICTS".to_owned(),
                 confidence: "1.0".to_owned(),
                 as_of_commit: None,
                 target_repo_relative_path: None,
@@ -5141,7 +5293,9 @@ fn test_decide_revocation_rejects_if_any_copy_revoked() {
         };
     }
 
-    let records = vec![revoked_copy, active_copy, candidate];
+    let mut records = vec![revoked_copy, active_copy];
+    make_candidate_valid(&mut candidate, &mut records);
+    records.push(candidate);
     let req = DecideRequest {
         candidate_id: cand_id.to_owned(),
         outcome: "approved".to_owned(),
@@ -5189,12 +5343,19 @@ fn test_decide_fails_for_empty_proposed_rule_body() {
         *user_context = UserContextFields {
             proposed_rule_text: Some(" \t\n ".to_owned()), // Whitespace only
             proposed_rule_kind: Some("preference".to_owned()),
-            scope: Some(UserContextScope::default()),
+            scope: Some(UserContextScope {
+                repo: Some("egregore".to_owned()),
+                path_glob: Some("src/**/*.rs".to_owned()),
+                language: Some("rust".to_owned()),
+                lifecycle_phase: Some("pre_commit".to_owned()),
+            }),
             ..UserContextFields::empty()
         };
     }
 
-    let records = vec![candidate];
+    let mut records = Vec::new();
+    make_candidate_valid(&mut candidate, &mut records);
+    records.push(candidate);
     let req = DecideRequest {
         candidate_id: cand_id.to_owned(),
         outcome: "approved".to_owned(),
@@ -5356,7 +5517,7 @@ fn test_decide_revocation_requires_approved_policy() {
             contradicting_evidence: Some(vec![EvidenceLink {
                 target_record_id: Some(target_id.to_owned()),
                 target_domain: "user_context".to_owned(),
-                relation: "REVOKES".to_owned(),
+                relation: "CONTRADICTS".to_owned(),
                 confidence: "1.0".to_owned(),
                 as_of_commit: None,
                 target_repo_relative_path: None,
@@ -5367,7 +5528,9 @@ fn test_decide_revocation_requires_approved_policy() {
         };
     }
 
-    let records = vec![target, candidate];
+    let mut records = vec![target];
+    make_candidate_valid(&mut candidate, &mut records);
+    records.push(candidate);
     let req = DecideRequest {
         candidate_id: cand_id.to_owned(),
         outcome: "approved".to_owned(),

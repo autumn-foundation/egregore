@@ -126,6 +126,20 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
         .clone()
         .unwrap_or_else(|| Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true));
 
+    let (cand_confidence, cand_evidence_quality, cand_superseded_by) = match candidate {
+        GraphRecord::Node {
+            confidence,
+            evidence_quality,
+            superseded_by,
+            ..
+        } => (
+            confidence.as_deref(),
+            evidence_quality.as_deref(),
+            superseded_by.as_deref(),
+        ),
+        _ => unreachable!(),
+    };
+
     let proposed_rule_kind = cand_fields
         .proposed_rule_kind
         .as_deref()
@@ -162,6 +176,199 @@ pub fn decide_candidate(records: &[GraphRecord], req: &DecideRequest) -> Result<
     }
 
     if req.outcome == "approved" || req.outcome == "edited_then_approved" {
+        // Validate PromoteCandidate metadata and evidence offline
+        let conf_str =
+            cand_confidence.ok_or_else(|| anyhow!("PromoteCandidate.confidence (required)"))?;
+        let conf_val: f64 = conf_str.parse().map_err(|_| {
+            anyhow!(
+                "PromoteCandidate.confidence '{}' must be a numeric float string",
+                conf_str
+            )
+        })?;
+        if !(0.0..=1.0).contains(&conf_val) {
+            return Err(anyhow!(
+                "PromoteCandidate.confidence '{}' must be in the range [0.0, 1.0]",
+                conf_str
+            ));
+        }
+
+        let eq_str = cand_evidence_quality
+            .ok_or_else(|| anyhow!("PromoteCandidate.evidence_quality (required)"))?;
+        if !["verbatim", "summarized", "referenced_only"].contains(&eq_str) {
+            return Err(anyhow!(
+                "Invalid PromoteCandidate.evidence_quality '{}'. Allowed values are: verbatim, summarized, referenced_only",
+                eq_str
+            ));
+        }
+
+        let scope = cand_fields.scope.as_ref().ok_or_else(|| {
+            anyhow!(
+                "PromoteCandidate '{}' lacks required scope",
+                req.candidate_id
+            )
+        })?;
+        if let Some(lifecycle_phase) = scope
+            .lifecycle_phase
+            .as_deref()
+            .filter(|&p| !["pre_commit", "pre_pr", "pre_merge", "runtime", "any"].contains(&p))
+        {
+            return Err(anyhow!(
+                "Invalid scope.lifecycle_phase '{}'. Allowed values are: pre_commit, pre_pr, pre_merge, runtime, any",
+                lifecycle_phase
+            ));
+        }
+
+        let supporting = cand_fields
+            .supporting_evidence
+            .as_deref()
+            .ok_or_else(|| anyhow!("PromoteCandidate.supporting_evidence (required)"))?;
+        let mut unique_supporting_targets = std::collections::BTreeSet::new();
+        let mut sessions = std::collections::BTreeSet::new();
+        for link in supporting {
+            if link.target_domain != "agent_memory" || link.relation != "PROPOSED_BY" {
+                return Err(anyhow!(
+                    "PromoteCandidate '{}' supporting_evidence must use target_domain 'agent_memory' and relation PROPOSED_BY",
+                    req.candidate_id
+                ));
+            }
+            let conf_val: f64 = link.confidence.parse().map_err(|_| {
+                anyhow!("PromoteCandidate.supporting_evidence[].confidence '{}' must be a numeric float string", link.confidence)
+            })?;
+            if !(0.0..=1.0).contains(&conf_val) {
+                return Err(anyhow!(
+                    "PromoteCandidate.supporting_evidence[].confidence '{}' must be in the range [0.0, 1.0]",
+                    link.confidence
+                ));
+            }
+            let target_id = link.target_record_id.as_deref().ok_or_else(|| {
+                anyhow!("PromoteCandidate.supporting_evidence[].target_record_id is required")
+            })?;
+            let target_node = records
+                .iter()
+                .find(|r| r.id() == target_id)
+                .ok_or_else(|| anyhow!("supporting evidence target '{}' not found", target_id))?;
+            let (target_kind, target_session_id) = match target_node {
+                GraphRecord::Node {
+                    kind, session_id, ..
+                } => (*kind, session_id.as_deref()),
+                _ => {
+                    return Err(anyhow!(
+                        "supporting evidence target '{}' is not a node record",
+                        target_id
+                    ));
+                }
+            };
+            if !matches!(
+                target_kind,
+                NodeKind::Observation | NodeKind::AgentTurn | NodeKind::Decision
+            ) {
+                return Err(anyhow!(
+                    "supporting evidence target '{}' must be an Observation, AgentTurn, or Decision",
+                    target_id
+                ));
+            }
+            let session_id_str = target_session_id.ok_or_else(|| {
+                anyhow!(
+                    "supporting_evidence.session_id is required for evidence target '{}'",
+                    target_id
+                )
+            })?;
+            if unique_supporting_targets.insert(target_id) {
+                sessions.insert(session_id_str.to_owned());
+            }
+        }
+
+        if unique_supporting_targets.len() < 3 {
+            return Err(anyhow!(
+                "PromoteCandidate '{}' has {} unique supporting observations; at least 3 are required",
+                req.candidate_id,
+                unique_supporting_targets.len()
+            ));
+        }
+        if sessions.len() < 2 {
+            return Err(anyhow!(
+                "PromoteCandidate '{}' has evidence from {} distinct sessions; at least 2 are required",
+                req.candidate_id,
+                sessions.len()
+            ));
+        }
+
+        if proposed_rule_kind == "revocation" {
+            let contradicting = cand_fields.contradicting_evidence.as_deref().ok_or_else(|| {
+                anyhow!("PromoteCandidate.contradicting_evidence is required for revocation candidates")
+            })?;
+            for link in contradicting {
+                if link.target_domain != "user_context" || link.relation != "CONTRADICTS" {
+                    return Err(anyhow!(
+                        "PromoteCandidate.contradicting_evidence for '{}' must use target_domain 'user_context' and relation CONTRADICTS",
+                        req.candidate_id
+                    ));
+                }
+                let conf_val: f64 = link.confidence.parse().map_err(|_| {
+                    anyhow!("PromoteCandidate.contradicting_evidence[].confidence '{}' must be a numeric float string", link.confidence)
+                })?;
+                if !(0.0..=1.0).contains(&conf_val) {
+                    return Err(anyhow!(
+                        "PromoteCandidate.contradicting_evidence[].confidence '{}' must be in the range [0.0, 1.0]",
+                        link.confidence
+                    ));
+                }
+                let target_id = link.target_record_id.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "PromoteCandidate.contradicting_evidence[].target_record_id is required"
+                    )
+                })?;
+                let target_node = records
+                    .iter()
+                    .find(|r| r.id() == target_id)
+                    .ok_or_else(|| anyhow!("evidence target '{}' not found", target_id))?;
+                let target_kind = match target_node {
+                    GraphRecord::Node { kind, .. } => *kind,
+                    _ => {
+                        return Err(anyhow!(
+                            "evidence target '{}' is not a node record",
+                            target_id
+                        ));
+                    }
+                };
+                let allowed_target_kinds = [
+                    NodeKind::Preference,
+                    NodeKind::WorkflowRule,
+                    NodeKind::NamingDecision,
+                    NodeKind::Constraint,
+                ];
+                if !allowed_target_kinds.contains(&target_kind) {
+                    return Err(anyhow!(
+                        "PromoteCandidate.contradicting_evidence target '{}' must be a Preference, WorkflowRule, NamingDecision, or Constraint, got {}",
+                        target_id,
+                        target_kind.as_str()
+                    ));
+                }
+            }
+        }
+
+        if let Some(rejected_id) = cand_superseded_by {
+            let rejected_node = records
+                .iter()
+                .find(|r| r.id() == rejected_id)
+                .ok_or_else(|| anyhow!("superseded candidate '{}' not found", rejected_id))?;
+            let target_kind = match rejected_node {
+                GraphRecord::Node { kind, .. } => *kind,
+                _ => {
+                    return Err(anyhow!(
+                        "superseded candidate '{}' is not a node record",
+                        rejected_id
+                    ));
+                }
+            };
+            if target_kind != NodeKind::PromoteCandidate {
+                return Err(anyhow!(
+                    "superseded candidate '{}' is not a PromoteCandidate node",
+                    rejected_id
+                ));
+            }
+        }
+
         if proposed_rule_kind == "workflow_rule" {
             let allowed_triggers = [
                 "pre_commit",
