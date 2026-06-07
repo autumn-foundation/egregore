@@ -1980,7 +1980,13 @@ struct AuditClaim<'a> {
     record_id: &'a str,
     kind: &'static str,
     trust_class: &'static str,
-    summary: &'a str,
+    /// A redaction-safe structured label. The stored summary embeds a prefix of
+    /// the observation text, so it is never forwarded verbatim — only this label
+    /// and `summary_hash` are emitted (AC9).
+    summary: String,
+    /// BLAKE3 hash of the stored summary, citable without emitting its bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_hash: Option<String>,
     /// BLAKE3 hash of the post-redaction body, so the body is citable as a
     /// handle without emitting its bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2033,7 +2039,12 @@ struct AuditItem<'a> {
     relation: String,
     /// A non-empty citable handle, guaranteeing AC4 for every item.
     citable_handle: String,
-    summary: &'a str,
+    /// A redaction-safe label. For agent-authored items (whose stored summary
+    /// embeds observation text) this is synthesized from typed fields; the
+    /// original is exposed only via `summary_hash` (AC9).
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3333,12 +3344,43 @@ fn trust_class_for(record: &GraphRecord) -> &'static str {
     }
 }
 
+/// Returns a redaction-safe summary plus an optional hash of the stored one.
+///
+/// For agent-authored records the stored summary embeds a prefix of the
+/// observation text (see `build_observation_records`), so it is never forwarded
+/// verbatim. We synthesize a structured label from typed fields and expose the
+/// original only as a BLAKE3 hash (AC9). Structured records (code, verification,
+/// project, artifact) keep their templated summary, which carries no free text.
+fn safe_summary(record: &GraphRecord) -> (String, Option<String>) {
+    let GraphRecord::Node {
+        kind,
+        summary,
+        agent_id,
+        session_id,
+        ..
+    } = record
+    else {
+        return (String::new(), None);
+    };
+    if trust_class_for(record) == "agent_authored" {
+        let who = match (agent_id.as_deref(), session_id.as_deref()) {
+            (Some(a), Some(s)) => format!("{a}:{s}"),
+            (Some(a), None) => a.to_owned(),
+            _ => "unknown".to_owned(),
+        };
+        let label = format!("{} by {who}", kind.as_str());
+        let hash = format!("blake3:{}", blake3::hash(summary.as_bytes()).to_hex());
+        (label, Some(hash))
+    } else {
+        (summary.clone(), None)
+    }
+}
+
 /// Builds the claim view, never presenting it as source truth (AC3).
 fn audit_claim(record: &GraphRecord) -> Option<AuditClaim<'_>> {
     let GraphRecord::Node {
         id,
         kind,
-        summary,
         text,
         confidence,
         superseded_by,
@@ -3353,11 +3395,13 @@ fn audit_claim(record: &GraphRecord) -> Option<AuditClaim<'_>> {
     let text_hash = text
         .as_deref()
         .map(|t| format!("blake3:{}", blake3::hash(t.as_bytes()).to_hex()));
+    let (summary, summary_hash) = safe_summary(record);
     Some(AuditClaim {
         record_id: id,
         kind: kind.as_str(),
         trust_class: "agent_authored",
         summary,
+        summary_hash,
         text_hash,
         confidence: confidence.as_deref(),
         superseded_by: superseded_by.as_deref(),
@@ -3438,10 +3482,10 @@ fn audit_item<'a>(item: &query::MemoryEvidenceItem<'a>) -> AuditItem<'a> {
     let record = item.record;
     let handle = citable_handle(record);
     let trust = trust_class_for(record);
+    let (summary, summary_hash) = safe_summary(record);
     let GraphRecord::Node {
         id,
         kind,
-        summary,
         name,
         title,
         repo_relative_path,
@@ -3473,7 +3517,8 @@ fn audit_item<'a>(item: &query::MemoryEvidenceItem<'a>) -> AuditItem<'a> {
             trust_class: "other",
             relation: item.relation.clone(),
             citable_handle: handle,
-            summary: "",
+            summary,
+            summary_hash,
             name: None,
             title: None,
             repo_relative_path: None,
@@ -3509,6 +3554,7 @@ fn audit_item<'a>(item: &query::MemoryEvidenceItem<'a>) -> AuditItem<'a> {
         relation: item.relation.clone(),
         citable_handle: handle,
         summary,
+        summary_hash,
         name: name.as_deref(),
         title: title.as_deref(),
         repo_relative_path: repo_relative_path.as_deref(),
@@ -3604,7 +3650,7 @@ fn query_memory_cmd(
     verified_only: bool,
 ) -> Result<()> {
     let resolved = match query::resolve_memory_ids(records, id_or_handle) {
-        Ok(ids) => ids,
+        Ok(res) => res,
         Err(
             err @ (query::MemoryResolveError::Ambiguous { .. }
             | query::MemoryResolveError::Unsupported { .. }),
@@ -3614,11 +3660,14 @@ fn query_memory_cmd(
         }
     };
 
-    if resolved.is_empty() {
-        // Stale handle: the ID exists only as a tombstone (deleted record) (AC6).
-        let is_tombstoned = records.iter().any(|r| {
-            matches!(r, GraphRecord::Tombstone { deleted_id, .. } if deleted_id == id_or_handle)
-        });
+    if resolved.matched.is_empty() {
+        // The handle named only deleted records — either the canonical ID is a
+        // tombstone target, or a source/session handle matched a now-tombstoned
+        // claim (`tombstoned_only`). Either way it is stale, not missing (AC6).
+        let is_tombstoned = resolved.tombstoned_only
+            || records.iter().any(|r| {
+                matches!(r, GraphRecord::Tombstone { deleted_id, .. } if deleted_id == id_or_handle)
+            });
         let code = if is_tombstoned {
             "stale_handle"
         } else {
@@ -3633,9 +3682,8 @@ fn query_memory_cmd(
     }
 
     // `resolve_memory_ids` has already dropped tombstoned (deleted) IDs, so a
-    // resolved ID is always a live claim. A handle that named only deleted
-    // records resolved to empty and was reported as `stale_handle` above.
-    let memory_id = resolved.iter().next().expect("non-empty");
+    // resolved ID is always a live claim.
+    let memory_id = resolved.matched.iter().next().expect("non-empty");
 
     let ctx = query::memory_audit_context(records, memory_id, verified_only);
     if ctx.is_no_match() {

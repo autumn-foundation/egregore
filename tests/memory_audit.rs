@@ -1124,3 +1124,121 @@ fn audit_resolves_authored_by_chain_to_session() {
         "real AgentSession not surfaced from AUTHORED_BY chain: {v}"
     );
 }
+
+/// A direct `RELATES_TO` edge (no denormalized link) surfaces its target as
+/// related evidence rather than dropping it.
+#[test]
+fn audit_direct_relates_to_edge_is_surfaced() {
+    let claim_id = agent_memory_stable_id(&["obs", "claim_rel"]);
+    let ver_id = verification_stable_id(&["verification", "ver_rel"]);
+    let claim = mk_obs(&claim_id, "run.traj", vec![]);
+    let mut ver = GraphRecord::node(
+        ver_id.clone(),
+        NodeKind::Verification,
+        None,
+        None,
+        None,
+        "Verification pass".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut status,
+        ..
+    } = ver
+    {
+        *schema_version = VERIFICATION_SCHEMA_VERSION;
+        *status = Some("pass".to_owned());
+    }
+    let edge = GraphRecord::edge(
+        EdgeLabel::RelatesTo,
+        claim_id.clone(),
+        ver_id.clone(),
+        None,
+        "relates".to_owned(),
+    );
+
+    let (_t, graph) = write_graph(vec![claim, ver, edge]);
+    let v = audit_json(&graph, &claim_id);
+    let ver_ev = v["verification_evidence"].as_array().expect("ver");
+    assert!(
+        ver_ev.iter().any(|h| h["record_id"] == ver_id),
+        "direct RELATES_TO edge target not surfaced: {v}"
+    );
+}
+
+/// A source/session handle that matches only a tombstoned claim reports
+/// `stale_handle`, not `no_match`.
+#[test]
+fn audit_source_handle_for_deleted_claim_is_stale() {
+    let dead_id = agent_memory_stable_id(&["obs", "dead_src"]);
+    let dead = mk_obs(&dead_id, "only-dead.traj", vec![]);
+    let tombstone = GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &dead_id]),
+        schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+        deleted_id: dead_id.clone(),
+        summary: "deleted".to_owned(),
+        producer: None,
+    };
+
+    let (_t, graph) = write_graph(vec![dead, tombstone]);
+    let assert = egregore()
+        .args(["query", "memory", "only-dead.traj", "--graph"])
+        .arg(&graph)
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["error"]["code"], "stale_handle", "{v}");
+}
+
+/// An agent-authored evidence item never forwards its stored summary verbatim
+/// (the importer embeds a text prefix there); it is synthesized + hashed.
+#[test]
+fn audit_agent_summary_is_not_emitted_verbatim() {
+    const SUMMARY_SENTINEL: &str = "SUMMARY_SNIPPET_SHOULD_NOT_LEAK";
+    let claim_id = agent_memory_stable_id(&["obs", "claim_sum"]);
+    let contra_id = agent_memory_stable_id(&["obs", "contra_sum"]);
+    let claim = mk_obs(&claim_id, "run.traj", vec![]);
+    let mut contra = mk_obs(&contra_id, "run2.traj", vec![]);
+    if let GraphRecord::Node {
+        ref mut summary, ..
+    } = contra
+    {
+        *summary = format!("Observation by a in s: {SUMMARY_SENTINEL}");
+    }
+    let edge = GraphRecord::edge(
+        EdgeLabel::Contradicts,
+        contra_id.clone(),
+        claim_id.clone(),
+        None,
+        "c".to_owned(),
+    );
+
+    let (_t, graph) = write_graph(vec![claim, contra, edge]);
+    let output = egregore()
+        .args(["query", "memory", &claim_id, "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8");
+    assert!(
+        !stdout.contains(SUMMARY_SENTINEL),
+        "agent summary snippet leaked: {stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let contra_item = v["contradicting_evidence"]
+        .as_array()
+        .expect("contra")
+        .iter()
+        .find(|h| h["record_id"] == contra_id)
+        .expect("contra item present");
+    assert!(
+        contra_item["summary_hash"]
+            .as_str()
+            .is_some_and(|h| h.starts_with("blake3:")),
+        "agent-authored item should carry a summary_hash: {contra_item}"
+    );
+}

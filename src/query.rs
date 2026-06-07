@@ -2056,7 +2056,18 @@ fn is_verified_claim(
     false
 }
 
-/// Resolves a memory record ID or source/session handle to canonical claim IDs.
+/// The outcome of resolving a memory handle to live claim IDs.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct MemoryResolution {
+    /// Live (non-tombstoned) claim IDs the handle resolved to.
+    pub matched: BTreeSet<String>,
+    /// True when the handle matched at least one claim but every match was
+    /// tombstoned (deleted), so the caller should report `stale_handle` rather
+    /// than `no_match`.
+    pub tombstoned_only: bool,
+}
+
+/// Resolves a memory record ID or source/session handle to live claim IDs.
 ///
 /// Supported handle types (AC2):
 /// 1. A canonical memory record ID (`agent_memory:v1:<64-hex>`). When it names
@@ -2067,19 +2078,22 @@ fn is_verified_claim(
 ///    `source_handle`, `source_artifact_path`, `source_artifact_hash`, or
 ///    `session_id`.
 ///
-/// Tombstoned (deleted) claims are excluded from the result so they neither make
-/// a live handle ambiguous nor get audited as current state.
+/// Tombstoned (deleted) claims are excluded from `matched` so they neither make
+/// a live handle ambiguous nor get audited as current state. When every match
+/// was tombstoned, `tombstoned_only` is set so the caller can report
+/// `stale_handle` even for a source/session handle (whose text is not the
+/// deleted record ID).
 ///
 /// # Errors
 ///
 /// Returns [`MemoryResolveError::Unsupported`] for an empty or malformed
 /// canonical ID, and [`MemoryResolveError::Ambiguous`] when the handle resolves
-/// to more than one distinct claim.
+/// to more than one distinct live claim.
 #[allow(clippy::too_many_lines)]
 pub fn resolve_memory_ids(
     records: &[GraphRecord],
     handle: &str,
-) -> Result<BTreeSet<String>, MemoryResolveError> {
+) -> Result<MemoryResolution, MemoryResolveError> {
     if handle.is_empty() {
         return Err(MemoryResolveError::Unsupported {
             handle: handle.to_owned(),
@@ -2187,9 +2201,9 @@ pub fn resolve_memory_ids(
     }
 
     // Tombstoned (deleted) claims are not part of the current state, so they must
-    // not make a live handle ambiguous. Drop them before counting; a handle that
-    // matches only tombstoned claims falls through to the caller's stale/no_match
-    // handling.
+    // not make a live handle ambiguous. Drop them before counting, but remember
+    // whether the handle matched anything at all so a handle that pointed only at
+    // deleted claims is reported as `stale_handle`, not `no_match`.
     let tombstoned: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| match r {
@@ -2197,7 +2211,9 @@ pub fn resolve_memory_ids(
             _ => None,
         })
         .collect();
+    let had_any_match = !matched.is_empty();
     matched.retain(|id| !tombstoned.contains(id.as_str()));
+    let tombstoned_only = had_any_match && matched.is_empty();
 
     // A single audit covers one claim. A scope handle (Agent / AgentSession ID,
     // or a session_id shared by several claims) that resolves to more than one
@@ -2211,7 +2227,10 @@ pub fn resolve_memory_ids(
         });
     }
 
-    Ok(matched)
+    Ok(MemoryResolution {
+        matched,
+        tombstoned_only,
+    })
 }
 
 /// Section a reached evidence record belongs to.
@@ -2464,7 +2483,11 @@ pub fn memory_audit_context<'a>(
                     | EdgeLabel::ReferencesTask
                     | EdgeLabel::ExplainsChange
                     | EdgeLabel::ProducedPatch
-                    | EdgeLabel::ProducedEvidence => place(other, label.as_str()),
+                    | EdgeLabel::ProducedEvidence
+                    // A direct RELATES_TO edge is the edge-only counterpart of a
+                    // denormalized RELATES_TO evidence link; surface its target as
+                    // weak supporting/related evidence rather than dropping it.
+                    | EdgeLabel::RelatesTo => place(other, label.as_str()),
                     _ => {}
                 }
             } else if target == claim_id {

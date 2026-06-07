@@ -82,11 +82,14 @@ silently disappearing (AC5).
 Output never includes raw transcript text, raw command output, patch hunks, issue
 bodies, PR comments, environment values, or bearer tokens (AC9). The claim's raw
 `text` body is never emitted (a `Failure` keeps a command-output excerpt there);
-the audit exposes only the bounded `summary`, a `text_hash` handle, and a
-`redacted` flag. Protected payloads (command output, patch bytes, task bodies) are
-referenced by **hash only** (command output, patch bytes, task bodies, and PR
-review diff hunks), flagged with `"protected": true` on the item, and surfaced as
-`protected_payload` diagnostics.
+it is exposed only as a `text_hash`. Agent-authored records (the claim and any
+memory evidence items) also never forward their **stored** summary verbatim —
+the importer embeds a prefix of the observation text there — so it is replaced by
+a synthesized label (`"<Kind> by <agent>:<session>"`) plus a `summary_hash`.
+Structured records (code, verification, project, artifact) keep their templated
+summary. Protected payloads (command output, patch bytes, task bodies, and PR
+review diff hunks) are referenced by **hash only**, flagged with
+`"protected": true` on the item, and surfaced as `protected_payload` diagnostics.
 
 ### Diagnostic codes
 
@@ -132,7 +135,8 @@ eg query memory trajectories/run-1.traj --graph graph.jsonl --verified-only
       "record_id": "agent_memory:v1:aaaa...",
       "kind": "Observation",
       "trust_class": "agent_authored",
-      "summary": "Refactored foo",
+      "summary": "Observation by agent_1:sess_1",
+      "summary_hash": "blake3:1a2b...",
       "text_hash": "blake3:9f2c...",
       "confidence": "0.9",
       "redacted": true
