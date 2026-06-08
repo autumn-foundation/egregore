@@ -1192,6 +1192,9 @@ type TxCandidate<'r> = (
     &'r GraphRecord,
     DateTime<chrono::FixedOffset>,
     Option<DateTime<chrono::FixedOffset>>,
+    // Deterministic tie-break rank for equal transaction (and valid) times:
+    // commit topological rank for history records, input order otherwise.
+    usize,
 );
 
 /// Resolves the transaction-time handle of a record from its body fields.
@@ -1256,6 +1259,141 @@ fn node_valid_time(record: &GraphRecord) -> Option<&str> {
         .or(valid_time.as_deref())
 }
 
+/// Returns the Git commit SHA of a history-replay (temporal) record.
+#[must_use]
+const fn node_git_commit(record: &GraphRecord) -> Option<&str> {
+    if let GraphRecord::Node {
+        temporal: Some(t), ..
+    } = record
+    {
+        Some(t.git_commit.as_str())
+    } else {
+        None
+    }
+}
+
+/// Deterministic ordering of history commits derived from the Git commit DAG
+/// carried on temporal records (`git_commit` + `git_parent_commits`).
+///
+/// Git commit timestamps are only second-resolution and batch-created commits
+/// frequently collide, so a timestamp comparison alone cannot order two commits
+/// made in the same second. This reconstructs the parent topology and assigns
+/// each commit a `rank` (its longest ancestor-chain length), so a descendant
+/// always outranks its ancestors regardless of identical timestamps.
+///
+/// It also assigns each commit a `component` id: disjoint commit graphs — for
+/// example, `scan-history` output from two different repositories sharing one
+/// store — never connect through parent links, so component membership scopes
+/// "active commit" comparisons to a single repository's history stream.
+#[derive(Default)]
+struct CommitOrder {
+    /// Commit SHA → longest ancestor-chain length (topological rank).
+    rank: BTreeMap<String, usize>,
+    /// Commit SHA → connected-component id (a representative SHA index).
+    component: BTreeMap<String, usize>,
+}
+
+impl CommitOrder {
+    fn build(records: &[GraphRecord]) -> Self {
+        // Union-find root lookup with path halving.
+        fn find(uf: &mut [usize], mut x: usize) -> usize {
+            while uf[x] != x {
+                uf[x] = uf[uf[x]];
+                x = uf[x];
+            }
+            x
+        }
+        // Longest chain over commits that are themselves present in the store
+        // (absent shallow-boundary parents anchor at 0).
+        fn rank_of(
+            sha: &str,
+            parents: &BTreeMap<String, Vec<String>>,
+            memo: &mut BTreeMap<String, usize>,
+            stack: &mut BTreeSet<String>,
+        ) -> usize {
+            if let Some(&r) = memo.get(sha) {
+                return r;
+            }
+            if !stack.insert(sha.to_owned()) {
+                return 0; // cycle guard (not expected in a Git history)
+            }
+            let mut best = 0;
+            if let Some(ps) = parents.get(sha) {
+                for p in ps {
+                    if parents.contains_key(p) {
+                        best = best.max(rank_of(p, parents, memo, stack) + 1);
+                    }
+                }
+            }
+            stack.remove(sha);
+            memo.insert(sha.to_owned(), best);
+            best
+        }
+
+        // commit → deduplicated parent SHAs, for every commit observed as a
+        // temporal record's `git_commit`.
+        let mut parents: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for record in records {
+            if let GraphRecord::Node {
+                temporal: Some(t), ..
+            } = record
+            {
+                let entry = parents.entry(t.git_commit.clone()).or_default();
+                for parent in &t.git_parent_commits {
+                    if !entry.contains(parent) {
+                        entry.push(parent.clone());
+                    }
+                }
+            }
+        }
+
+        // Intern every SHA seen (commit or parent) into a dense index for a
+        // union-find over the commit graph.
+        let mut id: BTreeMap<String, usize> = BTreeMap::new();
+        for (commit, ps) in &parents {
+            let next = id.len();
+            id.entry(commit.clone()).or_insert(next);
+            for p in ps {
+                let next = id.len();
+                id.entry(p.clone()).or_insert(next);
+            }
+        }
+        let mut uf: Vec<usize> = (0..id.len()).collect();
+        for (commit, ps) in &parents {
+            let c = id[commit];
+            for p in ps {
+                let pi = id[p];
+                let rc = find(&mut uf, c);
+                let rp = find(&mut uf, pi);
+                if rc != rp {
+                    // Deterministic: lower index becomes the root.
+                    let (root, child) = if rc <= rp { (rc, rp) } else { (rp, rc) };
+                    uf[child] = root;
+                }
+            }
+        }
+
+        // Topological rank + per-commit component id.
+        let mut rank: BTreeMap<String, usize> = BTreeMap::new();
+        let mut stack: BTreeSet<String> = BTreeSet::new();
+        let mut component: BTreeMap<String, usize> = BTreeMap::new();
+        for commit in parents.keys() {
+            rank_of(commit, &parents, &mut rank, &mut stack);
+            component.insert(commit.clone(), find(&mut uf, id[commit]));
+        }
+
+        Self { rank, component }
+    }
+
+    fn rank(&self, sha: &str) -> usize {
+        self.rank.get(sha).copied().unwrap_or(0)
+    }
+
+    fn component(&self, sha: &str) -> Option<usize> {
+        self.component.get(sha).copied()
+    }
+}
+
 /// Finds symbol records as the store knew them at a transaction-time instant.
 ///
 /// Returns, per stable record ID, the version whose transaction time is the
@@ -1300,6 +1438,11 @@ pub fn symbol_as_of_transaction_time<'r>(
 
     let mut diagnostics: Vec<TxDiagnostic> = Vec::new();
 
+    // Deterministic commit ordering (topological rank + per-repository
+    // component) used to break same-second/equal-transaction ties and to scope
+    // history-removal detection to the queried symbol's own repository.
+    let commit_order = CommitOrder::build(records);
+
     // All Symbol nodes carrying the queried name.
     let named: Vec<&GraphRecord> = records
         .iter()
@@ -1337,7 +1480,12 @@ pub fn symbol_as_of_transaction_time<'r>(
     // requested; (transaction_time,) otherwise.
     let mut best: BTreeMap<&str, TxCandidate<'r>> = BTreeMap::new();
 
-    for record in &named {
+    for (named_idx, record) in named.iter().enumerate() {
+        // Deterministic tie-break for equal transaction (and valid) times:
+        // history records order by commit topological rank (a descendant
+        // outranks its ancestor even within the same second); non-history
+        // records fall back to input order (later-written wins on a tie).
+        let tie = node_git_commit(record).map_or(named_idx, |c| commit_order.rank(c));
         let Some(tt_str) = record_transaction_time(record) else {
             diagnostics.push(TxDiagnostic {
                 code: "missing_transaction_metadata".to_owned(),
@@ -1400,18 +1548,20 @@ pub fn symbol_as_of_transaction_time<'r>(
         let key = record.id();
         let replace = match best.get(key) {
             None => true,
-            Some((_, prev_transaction, prev_valid)) => match (vt, prev_valid) {
-                // Valid-time axis requested: prefer most-recent valid_time,
-                // tie-break on most-recent transaction_time.
+            Some((_, prev_transaction, prev_valid, prev_tie)) => match (vt, prev_valid) {
+                // Valid-time axis requested: prefer most-recent valid_time, then
+                // most-recent transaction_time, then the commit/input tie-break.
                 (Some(cur_vt), Some(prev)) => {
-                    cur_vt > *prev || (cur_vt == *prev && tt > *prev_transaction)
+                    (cur_vt, tt, tie) > (*prev, *prev_transaction, *prev_tie)
                 }
-                // No valid-time axis: prefer most-recent transaction_time.
-                _ => tt > *prev_transaction,
+                // No valid-time axis: prefer most-recent transaction_time, then
+                // the commit/input tie-break so equal stamps resolve to the
+                // later version rather than the first one seen.
+                _ => (tt, tie) > (*prev_transaction, *prev_tie),
             },
         };
         if replace {
-            best.insert(key, (record, tt, vt));
+            best.insert(key, (record, tt, vt, tie));
         }
     }
 
@@ -1509,7 +1659,7 @@ pub fn symbol_as_of_transaction_time<'r>(
             true
         })
     };
-    let mut selected: Vec<&GraphRecord> = best.values().map(|(r, _, _)| *r).collect();
+    let mut selected: Vec<&GraphRecord> = best.values().map(|(r, _, _, _)| *r).collect();
     selected.retain(|r| {
         let GraphRecord::Node {
             superseded_by: Some(target),
@@ -1544,6 +1694,13 @@ pub fn symbol_as_of_transaction_time<'r>(
     // a row selected because `valid_time <= V` was genuinely true at V, so a
     // later removal (a transaction-axis fact) must not erase it. Removal
     // detection is therefore skipped whenever `--as-of` is supplied.
+    //
+    // Same-second commits and multi-repository stores: the "active commit" is
+    // compared by the composite key `(observed_at, commit topological rank)`,
+    // so a descendant always beats an ancestor that shares its second, and the
+    // comparison is scoped to the queried symbol's own commit-graph component
+    // (its repository), so a later commit in a *different* repository in the
+    // same store never makes this symbol look removed.
     let is_temporal = |r: &GraphRecord| -> bool {
         matches!(
             r,
@@ -1556,31 +1713,47 @@ pub fn symbol_as_of_transaction_time<'r>(
             }
         )
     };
-    let observed_le = |r: &GraphRecord| -> Option<DateTime<chrono::FixedOffset>> {
-        if !is_temporal(r) {
-            return None;
-        }
-        record_transaction_time(r)
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .filter(|tt| *tt <= tx_instant)
-    };
-    let active_commit_tx = records.iter().filter_map(observed_le).max();
-    let named_temporal_latest = named.iter().copied().filter_map(observed_le).max();
-    if vt_requested.is_none()
-        && let (Some(active), Some(name_latest)) = (active_commit_tx, named_temporal_latest)
-        && name_latest < active
-    {
-        let removed = selected.iter().any(|r| is_temporal(r));
-        selected.retain(|r| !is_temporal(r));
-        if removed {
-            diagnostics.push(TxDiagnostic {
-                code: "absent_at_transaction".to_owned(),
-                message: format!(
-                    "symbol '{symbol_name}' was absent at the commit active at '{tx_as_of}' (last seen '{}', active commit '{}'); excluded",
-                    name_latest.to_rfc3339(),
-                    active.to_rfc3339()
-                ),
-            });
+    if vt_requested.is_none() {
+        // The queried symbol's repository = the commit-graph component of any of
+        // its temporal versions (all of a symbol's history shares one component).
+        let symbol_component = named
+            .iter()
+            .filter_map(|r| node_git_commit(r))
+            .find_map(|c| commit_order.component(c));
+
+        if let Some(component) = symbol_component {
+            // Composite commit key, restricted to the symbol's repository and to
+            // commits the store knew by the requested instant.
+            let commit_key = |r: &GraphRecord| -> Option<(DateTime<chrono::FixedOffset>, usize)> {
+                let commit = node_git_commit(r)?;
+                if commit_order.component(commit) != Some(component) {
+                    return None;
+                }
+                let observed = record_transaction_time(r)
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())?;
+                if observed > tx_instant {
+                    return None;
+                }
+                Some((observed, commit_order.rank(commit)))
+            };
+            let active = records.iter().filter_map(&commit_key).max();
+            let name_latest = named.iter().filter_map(|r| commit_key(r)).max();
+            if let (Some(active), Some(name_latest)) = (active, name_latest)
+                && name_latest < active
+            {
+                let removed = selected.iter().any(|r| is_temporal(r));
+                selected.retain(|r| !is_temporal(r));
+                if removed {
+                    diagnostics.push(TxDiagnostic {
+                        code: "absent_at_transaction".to_owned(),
+                        message: format!(
+                            "symbol '{symbol_name}' was absent at the commit active at '{tx_as_of}' (last seen '{}', active commit '{}'); excluded",
+                            name_latest.0.to_rfc3339(),
+                            active.0.to_rfc3339()
+                        ),
+                    });
+                }
+            }
         }
     }
 

@@ -687,18 +687,33 @@ fn tx_as_of_excludes_removed_history_symbol() {
     let gone_id = stable_id(&["node", "Symbol", "src/lib.rs", "gone"]);
     let kept_id = stable_id(&["node", "Symbol", "src/lib.rs", "kept"]);
     let mut records = Vec::new();
-    for (commit, date) in [
-        ("c1c1c1c1", "2026-01-01T00:00:00Z"),
-        ("c2c2c2c2", "2026-01-02T00:00:00Z"),
+    // Linear history c1 ← c2 ← c3 (parent links scope the repository).
+    for (commit, parents, date) in [
+        ("c1c1c1c1", &[][..], "2026-01-01T00:00:00Z"),
+        ("c2c2c2c2", &["c1c1c1c1"][..], "2026-01-02T00:00:00Z"),
     ] {
-        records.push(history_symbol(&gone_id, "gone", "src/lib.rs", commit, date));
+        records.push(history_symbol(
+            &gone_id,
+            "gone",
+            "src/lib.rs",
+            commit,
+            parents,
+            date,
+        ));
     }
-    for (commit, date) in [
-        ("c1c1c1c1", "2026-01-01T00:00:00Z"),
-        ("c2c2c2c2", "2026-01-02T00:00:00Z"),
-        ("c3c3c3c3", "2026-01-03T00:00:00Z"),
+    for (commit, parents, date) in [
+        ("c1c1c1c1", &[][..], "2026-01-01T00:00:00Z"),
+        ("c2c2c2c2", &["c1c1c1c1"][..], "2026-01-02T00:00:00Z"),
+        ("c3c3c3c3", &["c2c2c2c2"][..], "2026-01-03T00:00:00Z"),
     ] {
-        records.push(history_symbol(&kept_id, "kept", "src/lib.rs", commit, date));
+        records.push(history_symbol(
+            &kept_id,
+            "kept",
+            "src/lib.rs",
+            commit,
+            parents,
+            date,
+        ));
     }
 
     // At c2 (before removal) `gone` is still live.
@@ -739,18 +754,32 @@ fn tx_as_of_history_removal_respects_valid_time_axis() {
     let gone_id = stable_id(&["node", "Symbol", "src/lib.rs", "gone"]);
     let kept_id = stable_id(&["node", "Symbol", "src/lib.rs", "kept"]);
     let mut records = Vec::new();
-    for (commit, date) in [
-        ("c1c1c1c1", "2026-01-01T00:00:00Z"),
-        ("c2c2c2c2", "2026-01-02T00:00:00Z"),
+    for (commit, parents, date) in [
+        ("c1c1c1c1", &[][..], "2026-01-01T00:00:00Z"),
+        ("c2c2c2c2", &["c1c1c1c1"][..], "2026-01-02T00:00:00Z"),
     ] {
-        records.push(history_symbol(&gone_id, "gone", "src/lib.rs", commit, date));
+        records.push(history_symbol(
+            &gone_id,
+            "gone",
+            "src/lib.rs",
+            commit,
+            parents,
+            date,
+        ));
     }
-    for (commit, date) in [
-        ("c1c1c1c1", "2026-01-01T00:00:00Z"),
-        ("c2c2c2c2", "2026-01-02T00:00:00Z"),
-        ("c3c3c3c3", "2026-01-03T00:00:00Z"),
+    for (commit, parents, date) in [
+        ("c1c1c1c1", &[][..], "2026-01-01T00:00:00Z"),
+        ("c2c2c2c2", &["c1c1c1c1"][..], "2026-01-02T00:00:00Z"),
+        ("c3c3c3c3", &["c2c2c2c2"][..], "2026-01-03T00:00:00Z"),
     ] {
-        records.push(history_symbol(&kept_id, "kept", "src/lib.rs", commit, date));
+        records.push(history_symbol(
+            &kept_id,
+            "kept",
+            "src/lib.rs",
+            commit,
+            parents,
+            date,
+        ));
     }
 
     // Known by 2026-01-04 (after the removal commit c3), but asking what was TRUE
@@ -769,9 +798,185 @@ fn tx_as_of_history_removal_respects_valid_time_axis() {
     );
 }
 
+// ── Same-second commits: removal must still be detected (#1564) ──────────────
+// Git commit timestamps are second-resolution; a removal commit can share its
+// second with the prior commit. Commit topology (parent links) must break the
+// tie so the later commit still counts as active.
+
+#[test]
+fn tx_as_of_detects_removal_across_same_second_commits() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    let gone_id = stable_id(&["node", "Symbol", "src/lib.rs", "gone"]);
+    let kept_id = stable_id(&["node", "Symbol", "src/lib.rs", "kept"]);
+    // c2 (last commit holding `gone`) and c3 (its removal commit) share a second.
+    let same_second = "2026-01-02T00:00:00Z";
+    let mut records = vec![
+        history_symbol(
+            &gone_id,
+            "gone",
+            "src/lib.rs",
+            "c1c1c1c1",
+            &[],
+            "2026-01-01T00:00:00Z",
+        ),
+        history_symbol(
+            &gone_id,
+            "gone",
+            "src/lib.rs",
+            "c2c2c2c2",
+            &["c1c1c1c1"],
+            same_second,
+        ),
+        history_symbol(
+            &kept_id,
+            "kept",
+            "src/lib.rs",
+            "c1c1c1c1",
+            &[],
+            "2026-01-01T00:00:00Z",
+        ),
+        history_symbol(
+            &kept_id,
+            "kept",
+            "src/lib.rs",
+            "c2c2c2c2",
+            &["c1c1c1c1"],
+            same_second,
+        ),
+        history_symbol(
+            &kept_id,
+            "kept",
+            "src/lib.rs",
+            "c3c3c3c3",
+            &["c2c2c2c2"],
+            same_second,
+        ),
+    ];
+    records.reverse(); // order independence
+
+    let after = symbol_as_of_transaction_time(&records, "gone", "2026-01-02T00:00:01Z", None)
+        .expect("query ok");
+    assert!(
+        after.records.is_empty(),
+        "removal at a same-second child commit must still be detected, got {:?}",
+        after.records.len()
+    );
+    assert!(
+        after
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "absent_at_transaction"),
+        "same-second removal must be reported"
+    );
+}
+
+// ── Multi-repository store: scope removal to the symbol's repo (#1562) ────────
+// A later commit in a different repository sharing the store must not make a
+// symbol from another repository look removed.
+
+#[test]
+fn tx_as_of_scopes_removal_to_symbol_repository() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    let alpha = stable_id(&["node", "Symbol", "a/lib.rs", "alpha"]);
+    let beta = stable_id(&["node", "Symbol", "b/lib.rs", "beta"]);
+    // Repo A: a1 ← a2, alpha lives through a2 (latest 01-02).
+    // Repo B: b1 ← b2, a later commit b2 at 01-05 — disjoint commit graph.
+    let records = vec![
+        history_symbol(
+            &alpha,
+            "alpha",
+            "a/lib.rs",
+            "a1a1a1a1",
+            &[],
+            "2026-01-01T00:00:00Z",
+        ),
+        history_symbol(
+            &alpha,
+            "alpha",
+            "a/lib.rs",
+            "a2a2a2a2",
+            &["a1a1a1a1"],
+            "2026-01-02T00:00:00Z",
+        ),
+        history_symbol(
+            &beta,
+            "beta",
+            "b/lib.rs",
+            "b1b1b1b1",
+            &[],
+            "2026-01-04T00:00:00Z",
+        ),
+        history_symbol(
+            &beta,
+            "beta",
+            "b/lib.rs",
+            "b2b2b2b2",
+            &["b1b1b1b1"],
+            "2026-01-05T00:00:00Z",
+        ),
+    ];
+
+    // Query alpha after repo B's latest commit: alpha's own repo has no newer
+    // commit, so it must NOT be reported as removed.
+    let result = symbol_as_of_transaction_time(&records, "alpha", "2026-01-06T00:00:00Z", None)
+        .expect("query ok");
+    assert_eq!(
+        result.records.len(),
+        1,
+        "a later commit in another repository must not remove this symbol, got diagnostics {:?}",
+        result.diagnostics
+    );
+}
+
+// ── Equal transaction-time tie-break prefers the later version (#1410) ────────
+
+#[test]
+fn tx_as_of_equal_transaction_time_prefers_later_commit() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    let id = stable_id(&["node", "Symbol", "src/lib.rs", "widget"]);
+    // Two versions of the same symbol committed in the same second; c2 is c1's
+    // child, so it is the later (correct) version.
+    let same_second = "2026-01-02T00:00:00Z";
+    let records = vec![
+        history_symbol(&id, "widget", "src/lib.rs", "c1c1c1c1", &[], same_second),
+        history_symbol(
+            &id,
+            "widget",
+            "src/lib.rs",
+            "c2c2c2c2",
+            &["c1c1c1c1"],
+            same_second,
+        ),
+    ];
+
+    let result = symbol_as_of_transaction_time(&records, "widget", "2026-01-03T00:00:00Z", None)
+        .expect("query ok");
+    assert_eq!(result.records.len(), 1);
+    let commit = match result.records[0] {
+        GraphRecord::Node {
+            temporal: Some(t), ..
+        } => t.git_commit.as_str(),
+        _ => panic!("expected a temporal node"),
+    };
+    assert_eq!(
+        commit, "c2c2c2c2",
+        "equal-transaction-time tie must resolve to the later (child) commit"
+    );
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-fn history_symbol(id: &str, name: &str, path: &str, commit: &str, date: &str) -> GraphRecord {
+fn history_symbol(
+    id: &str,
+    name: &str,
+    path: &str,
+    commit: &str,
+    parents: &[&str],
+    date: &str,
+) -> GraphRecord {
     GraphRecord::symbol(
         id.to_owned(),
         "fn",
@@ -782,7 +987,7 @@ fn history_symbol(id: &str, name: &str, path: &str, commit: &str, date: &str) ->
     )
     .with_temporal(TemporalMetadata {
         git_commit: commit.to_owned(),
-        git_parent_commits: vec![],
+        git_parent_commits: parents.iter().map(|p| (*p).to_owned()).collect(),
         valid_time: date.to_owned(),
         author_time: None,
         observed_at: date.to_owned(),

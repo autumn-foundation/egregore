@@ -129,6 +129,36 @@ A `--tx-as-of` query can only return versions the store actually **retained**:
   reported as `missing_transaction_metadata`.) The `--graph <jsonl>` path
   likewise preserves every written line.
 
+#### History removal, commit ordering, and multi-repository stores
+
+`scan-history` emits a full symbol snapshot at every commit, so a symbol that is
+present at a commit always has a version stamped there. A `--tx-as-of` query
+therefore treats a queried symbol as **removed** when its latest snapshot known
+by the instant predates the *active commit* — the latest commit the store knew by
+then. Removed symbols are excluded with an `absent_at_transaction` diagnostic.
+
+Two properties make this robust:
+
+- **Same-second commits.** Git commit timestamps are only second-resolution and
+  batch-created commits frequently share a second, so a timestamp comparison
+  alone cannot order them. The active commit is compared by the composite key
+  `(committer date, commit topological rank)`, where the rank is derived from the
+  `git_parent_commits` DAG carried on each record. A descendant always outranks
+  its ancestors, so a removal made in a same-second child commit is still
+  detected. The same `(time, rank)` key breaks equal-`transaction_time` ties when
+  selecting the latest version of a single stable ID (the later/child version
+  wins); non-history records fall back to input order.
+- **Multiple repositories in one store.** Removal detection is scoped to the
+  queried symbol's own **commit-graph component**. Disjoint histories — for
+  example, `scan-history` output from two repositories sharing one store — never
+  connect through parent links, so a later commit in one repository never makes a
+  symbol from another repository look removed.
+
+Removal detection applies to the transaction axis only. When `--as-of` (a
+valid-time instant) is also supplied, the query asks "what was true at valid time
+V, as known by T"; a row that was genuinely true at V is returned even if the
+symbol was later removed.
+
 ### Response envelope
 
 `--tx-as-of` returns a single JSON object (not bare JSONL rows):

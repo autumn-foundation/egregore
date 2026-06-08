@@ -620,16 +620,32 @@ impl EmbeddedAletheiaSink {
     /// Returns an error if a physical record cannot be read.
     pub fn read_all_records_including_superseded(&self) -> AdapterResult<Vec<GraphRecord>> {
         let mut records = self.read_all_records()?;
+        let active_tombstoned = self.active_deleted_ids()?;
 
-        // Storage IDs already represented: latest non-temporal, every temporal
-        // snapshot, and tombstones. Project nodes are emitted in full by
-        // read_all_records and excluded below by their `project:v1:` prefix.
+        // The exact set of *node* storage IDs that read_all_records already
+        // emitted, so the sweep below adds only the physical node observations it
+        // did NOT surface:
+        //   * superseded non-temporal versions (a re-ingest advanced the
+        //     current-state index but left the prior node in the store),
+        //   * active-tombstoned non-temporal nodes (read_all_records omits them,
+        //     but a transaction-time view that predates the deletion must still
+        //     see the pre-delete node — the tx resolver ignores tombstones), and
+        //   * non-latest temporal observations of the same commit (the commit
+        //     index keeps one candidate per commit; earlier observations carry a
+        //     distinct `observed_at` a prior tx view may target).
+        // Project nodes are emitted in full by read_all_records and skipped below
+        // by their `project:v1:` prefix.
         let mut emitted: BTreeSet<::aletheiadb::NodeId> = BTreeSet::new();
-        emitted.extend(self.node_lookup.non_temporal.values().copied());
         for commits in self.node_lookup.by_commit.values() {
             emitted.extend(commits.values().map(|candidate| candidate.storage_id));
         }
-        emitted.extend(self.tombstone_ids.values().copied());
+        for (record_id, &node_id) in &self.node_lookup.non_temporal {
+            // read_all_records emits the current-state node only when it is not
+            // actively tombstoned; mirror that so tombstoned nodes are re-added.
+            if !active_tombstoned.contains(record_id.as_str()) {
+                emitted.insert(node_id);
+            }
+        }
 
         for node_id in self.db.get_all_node_ids() {
             if emitted.contains(&node_id) {
@@ -646,10 +662,8 @@ impl EmbeddedAletheiaSink {
             else {
                 continue;
             };
-            // Only superseded non-temporal node records: temporal snapshots carry
-            // a `git_commit` property and are emitted via the commit index;
-            // project nodes are emitted in full by read_all_records; edges and
-            // tombstones are not node records.
+            // Node records only (tombstones and edges are not "node"); project
+            // nodes are already emitted in full.
             if optional_str_property(
                 "read_all_records_including_superseded",
                 "record_type",
@@ -657,10 +671,8 @@ impl EmbeddedAletheiaSink {
             )?
             .as_deref()
                 != Some("node")
+                || record_id.starts_with("project:v1:")
             {
-                continue;
-            }
-            if node.get_property("git_commit").is_some() || record_id.starts_with("project:v1:") {
                 continue;
             }
             records.push(self.read_node_record(&record_id, node_id)?);
@@ -3635,6 +3647,50 @@ mod tests {
             tx_stamps.contains("2026-01-01T00:00:00Z")
                 && tx_stamps.contains("2026-01-03T00:00:00Z"),
             "both prior and current transaction times must be present, got {tx_stamps:?}"
+        );
+    }
+
+    #[test]
+    fn history_inclusive_read_surfaces_tombstoned_non_temporal_node() {
+        // Issue #66 (#628): an active tombstone hides a non-temporal node from the
+        // current-state read, but a transaction-time view that predates the
+        // deletion must still see the pre-delete node (the tx resolver ignores
+        // tombstones).
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("tombstoned-history-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+        let symbol = current_symbol_record(&symbol_id, "live", 20)
+            .with_transaction_time("2026-01-01T00:00:00Z");
+        let tombstone = GraphRecord::Tombstone {
+            id: stable_id(&["tombstone", &symbol_id]),
+            schema_version: crate::ir::SCHEMA_VERSION,
+            deleted_id: symbol_id.clone(),
+            summary: "deleted".to_owned(),
+            producer: None,
+        };
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&symbol).expect("symbol should write");
+        sink.write_record(&tombstone)
+            .expect("tombstone should write");
+
+        let node_present = |records: &[GraphRecord]| {
+            records
+                .iter()
+                .any(|r| matches!(r, GraphRecord::Node { id, .. } if id == &symbol_id))
+        };
+
+        let current = sink.read_all_records().expect("current read");
+        assert!(
+            !node_present(&current),
+            "current-state read hides the tombstoned node"
+        );
+
+        let history = sink
+            .read_all_records_including_superseded()
+            .expect("history read");
+        assert!(
+            node_present(&history),
+            "history-inclusive read must surface the pre-delete node for prior tx views"
         );
     }
 
