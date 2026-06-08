@@ -563,6 +563,64 @@ fn tx_as_of_supersession_respects_valid_time_axis() {
     assert_eq!(record_path(result.records[0]), Some("src/old.rs"));
 }
 
+// ── AC2: rename-style supersession (replacement has a different name) ────────
+
+#[test]
+fn tx_as_of_excludes_superseded_symbol_renamed_replacement() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    // old_widget is renamed to new_widget: the replacement carries a different
+    // name, so it never matches a query for "old_widget" — but once it is
+    // effective by the instant, the stale old-name row must still be dropped.
+    let new_id = stable_id(&["node", "Symbol", "src/lib.rs", "new_widget"]);
+    let old = GraphRecord::symbol(
+        stable_id(&["node", "Symbol", "src/lib.rs", "old_widget"]),
+        "fn",
+        "src/lib.rs".to_owned(),
+        span(1, 5),
+        "old_widget".to_owned(),
+        "old".to_owned(),
+    )
+    .with_node_time(V1_VT, "author_provided", V1_TX)
+    .with_transaction_time(V1_TX)
+    .with_superseded_by(new_id.clone());
+    let new = GraphRecord::symbol(
+        new_id,
+        "fn",
+        "src/lib.rs".to_owned(),
+        span(1, 5),
+        "new_widget".to_owned(),
+        "new".to_owned(),
+    )
+    .with_node_time(V2_VT, "author_provided", V2_TX)
+    .with_transaction_time(V2_TX);
+    let records = vec![old, new];
+
+    // After the rename is known, querying the old name yields an empty view plus
+    // a superseded diagnostic — not the stale row.
+    let after = symbol_as_of_transaction_time(&records, "old_widget", "2026-01-04T00:00:00Z", None)
+        .expect("query ok");
+    assert!(
+        after.records.is_empty(),
+        "renamed-away symbol must not be returned once the replacement is effective"
+    );
+    assert!(
+        after.diagnostics.iter().any(|d| d.code == "superseded"),
+        "must report the supersession, got {:?}",
+        after.diagnostics
+    );
+
+    // Before the rename is known, the old name is still the live view.
+    let before =
+        symbol_as_of_transaction_time(&records, "old_widget", "2026-01-02T00:00:00Z", None)
+            .expect("query ok");
+    assert_eq!(
+        before.records.len(),
+        1,
+        "old name is live before the rename"
+    );
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 fn record_path(r: &GraphRecord) -> Option<&str> {

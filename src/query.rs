@@ -1449,13 +1449,38 @@ pub fn symbol_as_of_transaction_time<'r>(
         }
     };
     // Cross-id supersession (AC2): a Symbol carrying `superseded_by` is dropped
-    // once its replacement is also present in the *selected* view — i.e. the
-    // replacement passed every requested axis (transaction time, and valid time
-    // when supplied). Checking the selected set rather than mere transaction-time
-    // knownness keeps two-axis correctness: if the replacement's `valid_time` is
-    // after the requested `--as-of`, it is absent from the view and the older row
-    // that was true at that valid time is retained.
-    let selected_ids: BTreeSet<&str> = best.keys().copied().collect();
+    // once its replacement is *effective in the requested view* — the target
+    // record (under any name, so renames count) has a version satisfying every
+    // requested axis: transaction time ≤ `tx_as_of`, and valid time ≤ the
+    // requested `--as-of` when supplied. Two-axis correctness: if the
+    // replacement's `valid_time` is after the requested `--as-of`, it is not yet
+    // effective and the older row that was true at that valid time is retained.
+    let replacement_effective = |target: &str| -> bool {
+        records.iter().any(|r| {
+            if r.id() != target {
+                return false;
+            }
+            let Some(tt) =
+                record_transaction_time(r).and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            else {
+                return false;
+            };
+            if tt > tx_instant {
+                return false;
+            }
+            if let Some(vt_req) = vt_requested {
+                let Some(vt) =
+                    node_valid_time(r).and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                else {
+                    return false;
+                };
+                if vt > vt_req {
+                    return false;
+                }
+            }
+            true
+        })
+    };
     let mut selected: Vec<&GraphRecord> = best.values().map(|(r, _, _)| *r).collect();
     selected.retain(|r| {
         let GraphRecord::Node {
@@ -1465,11 +1490,11 @@ pub fn symbol_as_of_transaction_time<'r>(
         else {
             return true;
         };
-        if selected_ids.contains(target.as_str()) {
+        if replacement_effective(target.as_str()) {
             diagnostics.push(TxDiagnostic {
                 code: "superseded".to_owned(),
                 message: format!(
-                    "record '{}' is superseded by '{target}', which is present in the view; excluded",
+                    "record '{}' is superseded by '{target}', which is effective in the view; excluded",
                     r.id()
                 ),
             });
