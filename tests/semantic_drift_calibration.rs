@@ -1,4 +1,5 @@
 #![allow(missing_docs)]
+#![cfg(feature = "embeddings")]
 
 use assert_cmd::Command;
 use std::fs;

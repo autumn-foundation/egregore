@@ -604,7 +604,24 @@ pub fn normalize_code(code: &str) -> String {
             in_string = true;
             result.push(c);
         } else if c == '\'' {
-            in_char = true;
+            // Check if this is likely a character literal rather than a lifetime.
+            // A character literal starts with ' and has a closing ' on the same line within 10 characters,
+            // without containing any newlines or spaces (except literal space ' ').
+            let mut is_char_lit = false;
+            let mut j = i + 1;
+            while j < chars.len() && j <= i + 10 && chars[j] != '\n' {
+                if chars[j] == '\'' {
+                    is_char_lit = true;
+                    break;
+                }
+                if chars[j].is_whitespace() && (j != i + 1 || chars.get(i + 2) != Some(&'\'')) {
+                    break;
+                }
+                j += 1;
+            }
+            if is_char_lit {
+                in_char = true;
+            }
             result.push(c);
         } else {
             result.push(c);
@@ -631,13 +648,28 @@ pub fn normalize_code(code: &str) -> String {
 /// Normalizes file content by removing `use` import declarations, comments, and collapsing whitespace.
 #[must_use]
 pub fn normalize_file_code(code: &str) -> String {
-    let stripped_imports: Vec<&str> = code
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            !trimmed.starts_with("use ") && !trimmed.is_empty()
-        })
-        .collect();
-    let content_without_imports = stripped_imports.join("\n");
-    normalize_code(&content_without_imports)
+    let mut import_lines = Vec::new();
+    let mut other_lines = Vec::new();
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("use ") {
+            import_lines.push(trimmed);
+        } else {
+            other_lines.push(line);
+        }
+    }
+    // Sort imports to ignore reordering
+    import_lines.sort_unstable();
+
+    // Join sorted imports and other lines
+    let mut combined = import_lines.join("\n");
+    if !combined.is_empty() {
+        combined.push('\n');
+    }
+    combined.push_str(&other_lines.join("\n"));
+
+    normalize_code(&combined)
 }

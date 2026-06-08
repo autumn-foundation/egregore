@@ -3180,10 +3180,35 @@ fn eval_drift_cmd(corpus_path: &Path, threshold: f64) -> Result<()> {
     {
         let scenario_record_ids: HashSet<&str> =
             scenario_records.iter().map(GraphRecord::id).collect();
+        let scenario_commits: HashSet<String> = scenario_records
+            .iter()
+            .filter_map(|r| {
+                if let GraphRecord::Node {
+                    temporal: Some(t), ..
+                } = r
+                {
+                    Some(t.git_commit.clone())
+                } else if let GraphRecord::Edge {
+                    temporal: Some(t), ..
+                } = r
+                {
+                    Some(t.git_commit.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         let scenario_candidate_vectors: Vec<CandidateVector> = candidate_vectors
             .iter()
-            .filter(|cv| scenario_record_ids.contains(cv.candidate.record_id.as_str()))
+            .filter(|cv| {
+                scenario_record_ids.contains(cv.candidate.record_id.as_str())
+                    && cv
+                        .candidate
+                        .temporal
+                        .as_ref()
+                        .is_none_or(|t| scenario_commits.contains(&t.git_commit))
+            })
             .cloned()
             .collect();
 
@@ -3934,8 +3959,19 @@ fn resolve_drift_target<'a>(
         name,
         span,
         ..
-    }) = records.iter().rfind(|r| r.id() == target_id)
-    {
+    }) = records.iter().rfind(|r| {
+        if r.id() != target_id {
+            return false;
+        }
+        if let GraphRecord::Node {
+            temporal: Some(t), ..
+        } = r
+        {
+            t.git_commit == drift.after_git_commit
+        } else {
+            true
+        }
+    }) {
         return (repo_relative_path.as_deref(), name.as_deref(), *span);
     }
     (drift_path, drift_name, None)
