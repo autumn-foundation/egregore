@@ -1239,6 +1239,77 @@ fn tx_as_of_same_name_same_repo_prunes_only_the_removed_stable_id() {
     );
 }
 
+// ── Forks sharing an ancestor: a sibling-branch commit is not a descendant ─────
+// Two forks that share Git ancestry land in one connected component, but a later
+// commit on one fork is not a descendant of a live symbol on the other and must
+// not make it look removed.
+
+#[test]
+fn tx_as_of_fork_sharing_ancestor_keeps_live_symbol() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    // Shared ancestor c0; two forks diverge from it. `foo` lives on fork B
+    // (c0 ← b1) and is still present at its tip b1. Fork A (c0 ← a1) has a later
+    // commit but never contained `foo`. c0 connects both forks into one component,
+    // yet a1 is NOT a descendant of b1.
+    let foo = stable_id(&["node", "Symbol", "src/lib.rs", "foo"]);
+    let marker = stable_id(&["node", "Symbol", "src/other.rs", "marker"]);
+    let records = vec![
+        history_symbol(
+            &foo,
+            "foo",
+            "src/lib.rs",
+            "c0c0c0c0",
+            &[],
+            "2026-01-01T00:00:00Z",
+        ),
+        history_symbol(
+            &foo,
+            "foo",
+            "src/lib.rs",
+            "b1b1b1b1",
+            &["c0c0c0c0"],
+            "2026-01-02T00:00:00Z",
+        ),
+        // Fork A: a later commit on a sibling branch carrying a different symbol.
+        history_symbol(
+            &marker,
+            "marker",
+            "src/other.rs",
+            "c0c0c0c0",
+            &[],
+            "2026-01-01T00:00:00Z",
+        ),
+        history_symbol(
+            &marker,
+            "marker",
+            "src/other.rs",
+            "a1a1a1a1",
+            &["c0c0c0c0"],
+            "2026-01-05T00:00:00Z",
+        ),
+    ];
+
+    // After fork A's later commit a1: `foo` on fork B is still live (a1 is not a
+    // descendant of b1), so it must not be reported as removed.
+    let result = symbol_as_of_transaction_time(&records, "foo", "2026-01-06T00:00:00Z", None, None)
+        .expect("query ok");
+    assert_eq!(
+        result.records.len(),
+        1,
+        "a later commit on a sibling fork must not remove a live symbol, got diagnostics {:?}",
+        result.diagnostics
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "absent_at_transaction"),
+        "the live fork-B symbol must not be reported as removed, got {:?}",
+        result.diagnostics
+    );
+}
+
 // ── Unknown symbol still reports out-of-range diagnostics ─────────────────────
 // A query for a name with no Symbol rows must still distinguish an out-of-range
 // temporal instant from a genuine in-range absence.

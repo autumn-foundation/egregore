@@ -1281,28 +1281,22 @@ const fn node_git_commit(record: &GraphRecord) -> Option<&str> {
 /// each commit a `rank` (its longest ancestor-chain length), so a descendant
 /// always outranks its ancestors regardless of identical timestamps.
 ///
-/// It also assigns each commit a `component` id: disjoint commit graphs — for
-/// example, `scan-history` output from two different repositories sharing one
-/// store — never connect through parent links, so component membership scopes
-/// "active commit" comparisons to a single repository's history stream.
+/// It also inverts the parent links into a child adjacency map so removal
+/// detection can ask whether a commit has a *strict descendant* in the requested
+/// view (see [`Self::strict_descendants`]). Child-ward reachability — rather than
+/// connected-component membership — is what distinguishes two forks that share
+/// Git ancestry: a later commit on one fork is not a descendant of a live symbol
+/// on the other, so it never makes that symbol look removed.
 #[derive(Default)]
 struct CommitOrder {
     /// Commit SHA → longest ancestor-chain length (topological rank).
     rank: BTreeMap<String, usize>,
-    /// Commit SHA → connected-component id (a representative SHA index).
-    component: BTreeMap<String, usize>,
+    /// Commit SHA → its direct child commits (parent links inverted).
+    children: BTreeMap<String, Vec<String>>,
 }
 
 impl CommitOrder {
     fn build(records: &[GraphRecord]) -> Self {
-        // Union-find root lookup with path halving.
-        fn find(uf: &mut [usize], mut x: usize) -> usize {
-            while uf[x] != x {
-                uf[x] = uf[uf[x]];
-                x = uf[x];
-            }
-            x
-        }
         // Longest chain over commits that are themselves present in the store
         // (absent shallow-boundary parents anchor at 0).
         fn rank_of(
@@ -1347,50 +1341,52 @@ impl CommitOrder {
             }
         }
 
-        // Intern every SHA seen (commit or parent) into a dense index for a
-        // union-find over the commit graph.
-        let mut id: BTreeMap<String, usize> = BTreeMap::new();
-        for (commit, ps) in &parents {
-            let next = id.len();
-            id.entry(commit.clone()).or_insert(next);
-            for p in ps {
-                let next = id.len();
-                id.entry(p.clone()).or_insert(next);
-            }
+        // Topological rank per commit.
+        let mut rank: BTreeMap<String, usize> = BTreeMap::new();
+        let mut stack: BTreeSet<String> = BTreeSet::new();
+        for commit in parents.keys() {
+            rank_of(commit, &parents, &mut rank, &mut stack);
         }
-        let mut uf: Vec<usize> = (0..id.len()).collect();
+
+        // Invert parent links into a child adjacency map for descendant walks.
+        let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (commit, ps) in &parents {
-            let c = id[commit];
             for p in ps {
-                let pi = id[p];
-                let rc = find(&mut uf, c);
-                let rp = find(&mut uf, pi);
-                if rc != rp {
-                    // Deterministic: lower index becomes the root.
-                    let (root, child) = if rc <= rp { (rc, rp) } else { (rp, rc) };
-                    uf[child] = root;
+                let entry = children.entry(p.clone()).or_default();
+                if !entry.contains(commit) {
+                    entry.push(commit.clone());
                 }
             }
         }
 
-        // Topological rank + per-commit component id.
-        let mut rank: BTreeMap<String, usize> = BTreeMap::new();
-        let mut stack: BTreeSet<String> = BTreeSet::new();
-        let mut component: BTreeMap<String, usize> = BTreeMap::new();
-        for commit in parents.keys() {
-            rank_of(commit, &parents, &mut rank, &mut stack);
-            component.insert(commit.clone(), find(&mut uf, id[commit]));
-        }
-
-        Self { rank, component }
+        Self { rank, children }
     }
 
     fn rank(&self, sha: &str) -> usize {
         self.rank.get(sha).copied().unwrap_or(0)
     }
 
-    fn component(&self, sha: &str) -> Option<usize> {
-        self.component.get(sha).copied()
+    /// All transitive descendant commits of `sha` (children, grandchildren, …),
+    /// excluding `sha` itself. Reachability follows the commit DAG child-ward, so
+    /// commits on a sibling branch (or a fork that merely shares an ancestor) are
+    /// *not* descendants even when they sit in the same connected component.
+    fn strict_descendants(&self, sha: &str) -> BTreeSet<&str> {
+        let mut out: BTreeSet<&str> = BTreeSet::new();
+        let mut stack: Vec<&str> = self
+            .children
+            .get(sha)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        while let Some(c) = stack.pop() {
+            if out.insert(c)
+                && let Some(kids) = self.children.get(c)
+            {
+                stack.extend(kids.iter().map(String::as_str));
+            }
+        }
+        out
     }
 }
 
@@ -1732,25 +1728,26 @@ pub fn symbol_as_of_transaction_time<'r>(
 
     // History-replay removal detection (AC2): `scan-history` emits a full symbol
     // snapshot per commit, so a symbol present at a commit always has a version
-    // stamped there. The symbol is absent in the requested view when its latest
-    // snapshot (restricted to its repository component and to the requested
-    // axes) predates the commit active in that same view.
+    // stamped there. A symbol is absent in the requested view when its latest
+    // snapshot commit has a descendant commit, visible in the view, that no longer
+    // carries that symbol.
     //
-    // Axis handling: with no `--as-of`, "active" is the latest commit known by
-    // `tx_as_of` on the transaction timeline (observed_at). With `--as-of V` the
-    // query asks what was true at valid time V (as known by T): the active commit
-    // is the latest commit *valid at V* (committer date ≤ V) and known by T, and
-    // the symbol's latest snapshot is likewise bounded by V. So a removal that
-    // happens *after* V leaves the row intact (it was genuinely true at V), while
-    // a removal at or before V correctly drops it — removal is evaluated against
-    // the requested valid-time view rather than disabled for two-axis queries.
+    // Axis handling: the "visible in the view" test bounds commits by the
+    // requested axes — known by `tx_as_of` (transaction axis) and, with `--as-of
+    // V`, valid at V (valid axis). So a removal that happens *after* V leaves the
+    // row intact (the symbol was genuinely true at V), while a removal at or before
+    // V correctly drops it — removal is evaluated against the requested valid-time
+    // view rather than disabled for two-axis queries.
     //
-    // Same-second commits and multi-repository stores: commits are compared by
-    // the composite key `(time, commit topological rank)`, so a descendant always
-    // beats an ancestor that shares its second, and the comparison is scoped to
-    // the queried symbol's own commit-graph component (its repository), so a later
-    // commit in a *different* repository in the same store never makes this symbol
-    // look removed.
+    // Same-second commits, forks, and multi-repository stores: removal is keyed on
+    // commit-DAG reachability, not a component-wide maximum. A symbol present at
+    // its latest snapshot commit `L` was removed iff `L` has a *strict descendant*
+    // commit, visible in the requested view, that carries no snapshot of that
+    // stable ID. Sibling-branch commits — and forks that merely share an ancestor,
+    // which land in one connected component — are not descendants of `L`, so a
+    // later commit on another branch never makes a still-live symbol look removed.
+    // Pruning is per stable record ID, so a surviving `foo` never masks a
+    // different stable `foo` that was actually deleted.
     let is_temporal = |r: &GraphRecord| -> bool {
         matches!(
             r,
@@ -1763,88 +1760,71 @@ pub fn symbol_as_of_transaction_time<'r>(
             }
         )
     };
-    // The queried name can appear in more than one repository (distinct
-    // commit-graph components) when a store holds `scan-history` output from
-    // several repos. Removal is decided independently per component, and the
-    // pruning only drops rows in the component that shows absence — so repo A
-    // removing `foo` never erases repo B's still-live `foo`.
-    let component_of = |r: &GraphRecord| -> Option<usize> {
-        node_git_commit(r).and_then(|c| commit_order.component(c))
-    };
-    let symbol_components: BTreeSet<usize> = named.iter().filter_map(|r| component_of(r)).collect();
-
-    for component in symbol_components {
-        // Composite commit key, restricted to this repository and to the commits
-        // visible in the requested view: known by `tx_as_of` (transaction axis),
-        // and — when `--as-of V` is supplied — valid at V (valid axis), ordered by
-        // the axis that defines the view so "active" means the right commit.
-        let commit_key = |r: &GraphRecord| -> Option<(DateTime<chrono::FixedOffset>, usize)> {
-            let commit = node_git_commit(r)?;
-            if commit_order.component(commit) != Some(component) {
-                return None;
-            }
-            let observed =
-                record_transaction_time(r).and_then(|s| DateTime::parse_from_rfc3339(s).ok())?;
-            if observed > tx_instant {
-                return None;
-            }
-            if let Some(vt_req) = vt_requested {
-                // Valid-time view: only commits valid at or before V participate,
-                // ordered by valid time (committer date) so "active at V" holds.
-                let vt = node_valid_time(r).and_then(|s| DateTime::parse_from_rfc3339(s).ok())?;
-                if vt > vt_req {
-                    return None;
-                }
-                Some((vt, commit_order.rank(commit)))
-            } else {
-                Some((observed, commit_order.rank(commit)))
-            }
+    // A record is visible in the requested view when it carries a commit known by
+    // `tx_as_of` (transaction axis) and, with `--as-of V`, valid at V (valid axis).
+    let axes_visible = |r: &GraphRecord| -> bool {
+        if node_git_commit(r).is_none() {
+            return false;
+        }
+        let Some(observed) =
+            record_transaction_time(r).and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        else {
+            return false;
         };
-        let active = records.iter().filter_map(&commit_key).max();
-        let Some(active) = active else {
-            continue;
-        };
-        // Removal is decided per *stable record ID*, not per name: a repository
-        // can hold several distinct `Symbol`s sharing a name (e.g. one per file),
-        // and only the IDs whose own latest snapshot predates the active commit
-        // were removed. Computing a single per-name latest would let a surviving
-        // `foo` mask a different stable `foo` that was actually deleted.
-        let mut id_latest: BTreeMap<&str, (DateTime<chrono::FixedOffset>, usize)> = BTreeMap::new();
-        for r in &named {
-            if let Some(key) = commit_key(r) {
-                id_latest
-                    .entry(r.id())
-                    .and_modify(|cur| {
-                        if key > *cur {
-                            *cur = key;
-                        }
-                    })
-                    .or_insert(key);
+        if observed > tx_instant {
+            return false;
+        }
+        if let Some(vt_req) = vt_requested {
+            let Some(vt) = node_valid_time(r).and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            else {
+                return false;
+            };
+            if vt > vt_req {
+                return false;
             }
         }
-        selected.retain(|r| {
-            if !(is_temporal(r) && component_of(r) == Some(component)) {
-                return true;
-            }
-            // Keep the row unless this specific stable ID's latest snapshot in the
-            // requested view predates the active commit (i.e. it was removed).
-            match id_latest.get(r.id()) {
-                Some(latest) if *latest < active => {
-                    diagnostics.push(TxDiagnostic {
-                        code: "absent_at_transaction".to_owned(),
-                        message: format!(
-                            "symbol '{symbol_name}' (record '{}') was absent at the commit active in the requested view (last seen '{}', active commit '{}'); excluded",
-                            r.id(),
-                            latest.0.to_rfc3339(),
-                            active.0.to_rfc3339()
-                        ),
-                    });
-                    false
-                }
-                _ => true,
-            }
-        });
+        true
+    };
+    // Commits visible in the view, and — per stable ID — the commits at which that
+    // symbol has a snapshot in the view.
+    let in_view_commits: BTreeSet<&str> = records
+        .iter()
+        .filter(|r| axes_visible(r))
+        .filter_map(node_git_commit)
+        .collect();
+    let mut id_commits: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for r in &named {
+        if axes_visible(r)
+            && let Some(commit) = node_git_commit(r)
+        {
+            id_commits.entry(r.id()).or_default().insert(commit);
+        }
     }
+    selected.retain(|r| {
+        if !is_temporal(r) {
+            return true;
+        }
+        let Some(last_commit) = node_git_commit(r) else {
+            return true;
+        };
+        let snapshots = id_commits.get(r.id());
+        // Removed iff a strict descendant of this symbol's latest snapshot is
+        // visible in the view but carries no snapshot of this stable ID.
+        let removed = commit_order
+            .strict_descendants(last_commit)
+            .into_iter()
+            .any(|c| in_view_commits.contains(c) && snapshots.is_none_or(|s| !s.contains(c)));
+        if removed {
+            diagnostics.push(TxDiagnostic {
+                code: "absent_at_transaction".to_owned(),
+                message: format!(
+                    "symbol '{symbol_name}' (record '{}') was absent at a commit descending from its last snapshot '{last_commit}' in the requested view; excluded",
+                    r.id()
+                ),
+            });
+        }
+        !removed
+    });
 
     selected.sort_by(|a, b| {
         span_start(a)
