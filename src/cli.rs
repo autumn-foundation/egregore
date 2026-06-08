@@ -4853,7 +4853,7 @@ fn decide_cmd(
                                 source_records_to_persist.push(prompt_rec.clone());
                             }
                         }
-                        NodeKind::Observation => {
+                        _ => {
                             if let Some(links) = evidence_links {
                                 for ev_link in links {
                                     if let Some(target_id) = &ev_link.target_record_id
@@ -4866,7 +4866,6 @@ fn decide_cmd(
                                 }
                             }
                         }
-                        _ => {}
                     }
                 }
             }
@@ -4874,6 +4873,8 @@ fn decide_cmd(
             let generated_ids: std::collections::HashSet<String> =
                 generated.iter().map(|g| g.id().to_owned()).collect();
             let mut copied_synthesized_edges = Vec::new();
+            let mut seen_memory_edges: std::collections::HashMap<String, (Option<String>, String)> =
+                std::collections::HashMap::new();
             for rec in &source_records_to_persist {
                 if generated_ids.contains(rec.id()) {
                     continue;
@@ -4905,13 +4906,37 @@ fn decide_cmd(
                                     edge = edge.with_temporal(crate::ir::TemporalMetadata {
                                         git_commit: commit.clone(),
                                         git_parent_commits: Vec::new(),
-                                        valid_time: String::new(),
+                                        valid_time: "1970-01-01T00:00:00Z".to_owned(),
                                         author_time: None,
-                                        observed_at: String::new(),
+                                        observed_at: "1970-01-01T00:00:00Z".to_owned(),
                                         valid_time_source: None,
                                     });
                                 }
-                                copied_synthesized_edges.push(edge);
+                                let edge_id = edge.id().to_owned();
+                                match seen_memory_edges.get(&edge_id) {
+                                    Some((existing_commit, existing_conf))
+                                        if *existing_commit == link.as_of_commit =>
+                                    {
+                                        if existing_conf != &link.confidence {
+                                            anyhow::bail!(
+                                                "evidence links for edge '{edge_id}' have conflicting confidence values"
+                                            );
+                                        }
+                                        // exact duplicate, skip silently
+                                    }
+                                    Some(_) => {
+                                        anyhow::bail!(
+                                            "evidence links for edge '{edge_id}' have conflicting as_of_commit values"
+                                        );
+                                    }
+                                    None => {
+                                        seen_memory_edges.insert(
+                                            edge_id,
+                                            (link.as_of_commit.clone(), link.confidence.clone()),
+                                        );
+                                        copied_synthesized_edges.push(edge);
+                                    }
+                                }
                             }
                         }
                     }
@@ -4962,17 +4987,22 @@ fn decide_cmd(
                             if outcome_str == "approved" || outcome_str == "edited_then_approved" {
                                 let is_revocation =
                                     user_context.candidate_id.as_ref().is_some_and(|c_id| {
-                                        records.iter().any(|r| match r {
-                                            GraphRecord::Node {
-                                                id: node_id,
-                                                user_context: node_uc,
-                                                ..
-                                            } if node_id == c_id => {
-                                                node_uc.proposed_rule_kind.as_deref()
-                                                    == Some("revocation")
-                                            }
-                                            _ => false,
-                                        })
+                                        records
+                                            .iter()
+                                            .rfind(|r| match r {
+                                                GraphRecord::Node { id: node_id, .. } => {
+                                                    node_id == c_id
+                                                }
+                                                _ => false,
+                                            })
+                                            .and_then(|r| match r {
+                                                GraphRecord::Node {
+                                                    user_context: node_uc,
+                                                    ..
+                                                } => node_uc.proposed_rule_kind.as_deref(),
+                                                _ => None,
+                                            })
+                                            == Some("revocation")
                                     });
 
                                 if is_revocation {

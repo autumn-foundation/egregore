@@ -2303,6 +2303,58 @@ pub fn active_policy<'a>(
     policy
 }
 
+fn validate_contradicting_evidence_links(
+    candidate_id: &str,
+    links: &[EvidenceLink],
+    records: &[GraphRecord],
+) -> std::result::Result<(), String> {
+    for link in links {
+        if link.target_domain != "user_context" || link.relation != "CONTRADICTS" {
+            return Err(format!(
+                "PromoteCandidate.contradicting_evidence for '{}' must use target_domain 'user_context' and relation CONTRADICTS",
+                candidate_id
+            ));
+        }
+        let conf_val: f64 = link.confidence.parse().map_err(|_| {
+            format!(
+                "PromoteCandidate.contradicting_evidence[].confidence '{}' must be a numeric float string",
+                link.confidence
+            )
+        })?;
+        if !(0.0..=1.0).contains(&conf_val) {
+            return Err(format!(
+                "PromoteCandidate.contradicting_evidence[].confidence '{}' must be in the range [0.0, 1.0]",
+                link.confidence
+            ));
+        }
+        let target_id = link.target_record_id.as_deref().ok_or_else(|| {
+            "PromoteCandidate.contradicting_evidence[].target_record_id is missing".to_owned()
+        })?;
+        let target_node = records
+            .iter()
+            .rfind(|r| r.id() == target_id)
+            .ok_or_else(|| format!("evidence target '{}' not found", target_id))?;
+        let kind = match target_node {
+            GraphRecord::Node { kind, .. } => *kind,
+            _ => return Err(format!("evidence target '{}' is not a node", target_id)),
+        };
+        if !matches!(
+            kind,
+            NodeKind::Preference
+                | NodeKind::WorkflowRule
+                | NodeKind::NamingDecision
+                | NodeKind::Constraint
+        ) {
+            return Err(format!(
+                "PromoteCandidate.contradicting_evidence target '{}' must be a Preference, WorkflowRule, NamingDecision, or Constraint, got {}",
+                target_id,
+                kind.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_scope(
     scope: Option<&UserContextScope>,
     field_name: &str,
@@ -2695,7 +2747,7 @@ pub fn audit_trail<'a>(
         &format!("PromoteCandidate '{}'", candidate_id),
     )?;
 
-    let _contradicting = candidate_fields
+    let contradicting = candidate_fields
         .contradicting_evidence
         .as_ref()
         .ok_or_else(|| {
@@ -2704,6 +2756,7 @@ pub fn audit_trail<'a>(
                 candidate_id
             )
         })?;
+    validate_contradicting_evidence_links(candidate_id, contradicting, records)?;
 
     // Perform candidate-kind/body consistency checks
     let expected_kind = match kind {

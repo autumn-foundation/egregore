@@ -8101,21 +8101,21 @@ fn test_cli_decide_copies_agent_memory_evidence_edges() {
 
     // Customize one of the generated observations to have an evidence link
     // so we can test that the edge is correctly synthesized when copying it.
-    let obs_id = format!("agent_memory:v1:{}-obs-1", cand_id);
+    let obs_id = format!("agent_memory:v1:{cand_id}-obs-1");
     for r in &mut records {
-        if r.id() == obs_id {
-            if let GraphRecord::Node { evidence_links, .. } = r {
-                *evidence_links = Some(vec![EvidenceLink {
-                    target_record_id: Some("codegraph:v1:rust:symbol:cli_test".to_owned()),
-                    target_domain: "codegraph".to_owned(),
-                    relation: "OBSERVES".to_owned(),
-                    confidence: "0.85".to_owned(),
-                    as_of_commit: Some("abcdef123456".to_owned()),
-                    target_repo_relative_path: None,
-                    target_span: None,
-                    target_git_commit: None,
-                }]);
-            }
+        if r.id() == obs_id
+            && let GraphRecord::Node { evidence_links, .. } = r
+        {
+            *evidence_links = Some(vec![EvidenceLink {
+                target_record_id: Some("codegraph:v1:rust:symbol:cli_test".to_owned()),
+                target_domain: "codegraph".to_owned(),
+                relation: "OBSERVES".to_owned(),
+                confidence: "0.85".to_owned(),
+                as_of_commit: Some("abcdef123456".to_owned()),
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]);
         }
     }
 
@@ -8197,4 +8197,264 @@ fn test_cli_decide_copies_agent_memory_evidence_edges() {
     } else {
         panic!("Expected an Edge record");
     }
+}
+
+#[test]
+fn test_cli_decide_fails_on_conflicting_copied_evidence_edges() {
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("graph.jsonl");
+    let db_path = temp.path().join("store");
+
+    let cand_id = user_context_stable_id(&["candidate", "agent_memory_conflict_cand"]);
+    let mut cand = GraphRecord::node(
+        cand_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut valid_time,
+        ref mut valid_time_source,
+        ..
+    } = cand
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-06-01T12:00:00Z".to_owned());
+        *valid_time_source = Some("inferred_from_transaction_time".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("MyPreferenceRule".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+    let mut records = Vec::new();
+    make_candidate_valid(&mut cand, &mut records);
+
+    // Customize one of the generated observations to have conflicting evidence links (e.g. same target and relation but different as_of_commit)
+    let obs_id = format!("agent_memory:v1:{cand_id}-obs-1");
+    for r in &mut records {
+        if r.id() == obs_id
+            && let GraphRecord::Node { evidence_links, .. } = r
+        {
+            *evidence_links = Some(vec![
+                EvidenceLink {
+                    target_record_id: Some("codegraph:v1:rust:symbol:cli_test".to_owned()),
+                    target_domain: "codegraph".to_owned(),
+                    relation: "OBSERVES".to_owned(),
+                    confidence: "0.85".to_owned(),
+                    as_of_commit: Some("abcdef123456".to_owned()),
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+                EvidenceLink {
+                    target_record_id: Some("codegraph:v1:rust:symbol:cli_test".to_owned()),
+                    target_domain: "codegraph".to_owned(),
+                    relation: "OBSERVES".to_owned(),
+                    confidence: "0.85".to_owned(),
+                    as_of_commit: Some("different_commit".to_owned()),
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                },
+            ]);
+        }
+    }
+
+    // Also add the codegraph targets so validation passes
+    let target_node_1 = GraphRecord::node(
+        "codegraph:v1:rust:symbol:cli_test".to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("cli_test".to_owned()),
+        "mock symbol".to_owned(),
+    )
+    .with_temporal(aletheia_egregore::ir::TemporalMetadata {
+        git_commit: "abcdef123456".to_owned(),
+        git_parent_commits: Vec::new(),
+        valid_time: "2026-06-01T12:00:00Z".to_owned(),
+        author_time: None,
+        observed_at: "2026-06-01T12:00:00Z".to_owned(),
+        valid_time_source: None,
+    });
+
+    let target_node_2 = GraphRecord::node(
+        "codegraph:v1:rust:symbol:cli_test".to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("cli_test".to_owned()),
+        "mock symbol".to_owned(),
+    )
+    .with_temporal(aletheia_egregore::ir::TemporalMetadata {
+        git_commit: "different_commit".to_owned(),
+        git_parent_commits: Vec::new(),
+        valid_time: "2026-06-01T12:00:00Z".to_owned(),
+        author_time: None,
+        observed_at: "2026-06-01T12:00:00Z".to_owned(),
+        valid_time_source: None,
+    });
+
+    let mut graph = Graph::new();
+    graph.push(cand);
+    graph.push(target_node_1);
+    graph.push(target_node_2);
+    for r in records {
+        graph.push(r);
+    }
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let output = egregore()
+        .args([
+            "decide",
+            &cand_id,
+            "--outcome",
+            "approved",
+            "--graph",
+            graph_path.to_str().unwrap(),
+            "--data-dir",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("conflicting as_of_commit values"));
+}
+
+#[test]
+fn test_audit_trail_fails_for_invalid_contradicting_evidence_links() {
+    use aletheia_egregore::query::audit_trail;
+
+    let cand_id = "test_invalid_contra_cand";
+    let mut candidate = GraphRecord::node(
+        cand_id.to_owned(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate with bad contradicting link".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut valid_time,
+        ref mut valid_time_source,
+        ..
+    } = candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-06-01T12:00:00Z".to_owned());
+        *valid_time_source = Some("inferred_from_transaction_time".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("MyPreferenceRule".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+    let dec_id = "dec_invalid_contra";
+    let prompt_id = "prompt_invalid_contra";
+    let pref_id = "target_pref_audit";
+
+    let mut dec = GraphRecord::node(
+        dec_id.to_owned(),
+        NodeKind::PromotionDecision,
+        None,
+        None,
+        None,
+        "Decision".to_owned(),
+    );
+    make_decision_valid(&mut dec, cand_id, prompt_id, pref_id);
+
+    let mut prompt = GraphRecord::node(
+        prompt_id.to_owned(),
+        NodeKind::PromotionPrompt,
+        None,
+        None,
+        None,
+        "Prompt".to_owned(),
+    );
+    make_prompt_valid(&mut prompt, cand_id);
+
+    let mut pref = GraphRecord::node(
+        pref_id.to_owned(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Preference".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        domain,
+        user_context,
+        ..
+    } = &mut pref
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *user_context = UserContextFields {
+            rule_text: Some("RuleText".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            approval_decision_id: Some(dec_id.to_owned()),
+            active_from: Some("2026-06-01T12:00:00Z".to_owned()),
+            ..UserContextFields::empty()
+        };
+    }
+
+    let mut records = vec![dec, prompt, pref];
+    make_candidate_valid(&mut candidate, &mut records);
+
+    // Set invalid contradicting link (e.g. wrong relation)
+    if let GraphRecord::Node { user_context, .. } = &mut candidate {
+        user_context.contradicting_evidence = Some(vec![EvidenceLink {
+            target_record_id: Some("target_pref".to_owned()),
+            target_domain: "user_context".to_owned(),
+            relation: "INVALID_RELATION".to_owned(),
+            confidence: "0.9".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    records.push(candidate);
+
+    // Call audit_trail and expect Err
+    let target_policy = GraphRecord::node(
+        "target_pref".to_owned(),
+        NodeKind::Preference,
+        None,
+        None,
+        None,
+        "Target Preference".to_owned(),
+    );
+    let mut records_with_target = records.clone();
+    records_with_target.push(target_policy);
+
+    let durable_node = records_with_target
+        .iter()
+        .find(|r| {
+            matches!(r, GraphRecord::Node { kind: NodeKind::Preference, .. } if r.id() != "target_pref")
+        })
+        .cloned()
+        .unwrap();
+
+    let result = audit_trail(&records_with_target, &durable_node);
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(err.contains("relation CONTRADICTS"));
 }

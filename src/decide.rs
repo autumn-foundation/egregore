@@ -1001,14 +1001,19 @@ pub fn synthesize_user_context_edges(
         if let Some(mat_id) = materialized_id {
             let out_ref = outcome.as_deref().unwrap_or("");
             if out_ref == "approved" || out_ref == "edited_then_approved" {
-                let is_revocation = records.iter().any(|r| match r {
-                    GraphRecord::Node {
-                        id, user_context, ..
-                    } if id == c_id => {
-                        user_context.proposed_rule_kind.as_deref() == Some("revocation")
-                    }
-                    _ => false,
-                });
+                let is_revocation = records
+                    .iter()
+                    .rfind(|r| match r {
+                        GraphRecord::Node { id, .. } => id == c_id,
+                        _ => false,
+                    })
+                    .and_then(|r| match r {
+                        GraphRecord::Node { user_context, .. } => {
+                            user_context.proposed_rule_kind.as_deref()
+                        }
+                        _ => None,
+                    })
+                    == Some("revocation");
 
                 if is_revocation {
                     let edge_id = user_context_stable_id(&["edge", "REVOKED_BY", &mat_id, &d_id]);
