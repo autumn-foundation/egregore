@@ -1201,7 +1201,11 @@ type TxCandidate<'r> = (
 /// 2. `ingested_at` (agent-memory / verification commit time),
 /// 3. `valid_time` when `valid_time_source == "inferred_from_transaction_time"`
 ///    (current-tree scans set `valid_time` to the scan's wall-clock instant,
-///    which *is* the transaction time).
+///    which *is* the transaction time),
+/// 4. `temporal.observed_at` for history-replay records (`scan-history`), whose
+///    only available store-observation timeline is the commit timeline. For
+///    replayed history the transaction axis collapses onto that timeline, which
+///    is the honest "known by Egregore then" handle for deterministic replay.
 ///
 /// Returns `None` when no transaction-time stamp can be resolved. Callers MUST
 /// treat `None` as *missing metadata*, never as a current-state record — a
@@ -1213,6 +1217,7 @@ pub fn record_transaction_time(record: &GraphRecord) -> Option<&str> {
         ingested_at,
         valid_time,
         valid_time_source,
+        temporal,
         ..
     } = record
     else {
@@ -1226,6 +1231,9 @@ pub fn record_transaction_time(record: &GraphRecord) -> Option<&str> {
     }
     if valid_time_source.as_deref() == Some("inferred_from_transaction_time") {
         return valid_time.as_deref();
+    }
+    if let Some(t) = temporal {
+        return Some(t.observed_at.as_str());
     }
     None
 }
@@ -1440,22 +1448,15 @@ pub fn symbol_as_of_transaction_time<'r>(
             None
         }
     };
-    let mut selected: Vec<&GraphRecord> = best.into_values().map(|(r, _, _)| r).collect();
-
     // Cross-id supersession (AC2): a Symbol carrying `superseded_by` is dropped
-    // once its replacement is *also known by the instant* — i.e. the target has a
-    // resolvable transaction time at or before `tx_as_of`. If the superseding
-    // record is not yet known (committed after the instant), the superseded row
-    // is kept, because the store did not yet know about the supersession then.
-    let known_by_instant: BTreeSet<&str> = records
-        .iter()
-        .filter(|r| {
-            record_transaction_time(r)
-                .and_then(|tt| DateTime::parse_from_rfc3339(tt).ok())
-                .is_some_and(|tt| tt <= tx_instant)
-        })
-        .map(GraphRecord::id)
-        .collect();
+    // once its replacement is also present in the *selected* view — i.e. the
+    // replacement passed every requested axis (transaction time, and valid time
+    // when supplied). Checking the selected set rather than mere transaction-time
+    // knownness keeps two-axis correctness: if the replacement's `valid_time` is
+    // after the requested `--as-of`, it is absent from the view and the older row
+    // that was true at that valid time is retained.
+    let selected_ids: BTreeSet<&str> = best.keys().copied().collect();
+    let mut selected: Vec<&GraphRecord> = best.values().map(|(r, _, _)| *r).collect();
     selected.retain(|r| {
         let GraphRecord::Node {
             superseded_by: Some(target),
@@ -1464,11 +1465,11 @@ pub fn symbol_as_of_transaction_time<'r>(
         else {
             return true;
         };
-        if known_by_instant.contains(target.as_str()) {
+        if selected_ids.contains(target.as_str()) {
             diagnostics.push(TxDiagnostic {
                 code: "superseded".to_owned(),
                 message: format!(
-                    "record '{}' is superseded by '{target}', which is known by the instant; excluded",
+                    "record '{}' is superseded by '{target}', which is present in the view; excluded",
                     r.id()
                 ),
             });

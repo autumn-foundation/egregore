@@ -3080,6 +3080,16 @@ fn query_symbol_tx_via_daemon(
                     println!("{name} (Symbol) @ {path} tx={tx}");
                 }
             }
+            // Mirror the non-daemon text path: surface diagnostics so the
+            // no-silent-fallback signal is not lost for empty diagnostic-bearing
+            // results (e.g. before_first_transaction, no_named_symbol).
+            if let Some(diags) = diagnostics.as_array() {
+                for diag in diags {
+                    let code = diag.get("code").and_then(|v| v.as_str()).unwrap_or("");
+                    let message = diag.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                    println!("# {code}: {message}");
+                }
+            }
         }
     }
     Ok(())

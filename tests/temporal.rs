@@ -173,15 +173,15 @@ fn cli_rejects_as_of_and_at_together() {
 }
 
 // ---------------------------------------------------------------------------
-// (d) --tx-as-of is implemented (issue #66): it no longer returns
-//     not_implemented. Records lacking transaction-time metadata are excluded
-//     with a machine-readable diagnostic rather than a silent current-state
-//     fallback. (The history fixture carries git-commit valid times but no
-//     transaction-time stamps.)
+// (d) --tx-as-of is implemented (issue #66) and works on history-replay data:
+//     history-backed records resolve their transaction-time handle from
+//     `temporal.observed_at` (the commit timeline that replay reconstructs), so
+//     the documented `scan-history` + `--tx-as-of` workflow returns a prior view
+//     instead of excluding every row.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn tx_as_of_is_implemented_and_reports_missing_metadata() {
+fn tx_as_of_uses_history_temporal_metadata() {
     let (_temp, graph) = fixture_temporal_graph();
 
     let output = CargoCommand::cargo_bin("egregore")
@@ -204,11 +204,21 @@ fn tx_as_of_is_implemented_and_reports_missing_metadata() {
         envelope["error"]["code"], "not_implemented",
         "--tx-as-of must no longer be reserved"
     );
-    // No row has a resolvable transaction time → empty records + diagnostics.
-    assert_eq!(
-        envelope["records"].as_array().map(Vec::len),
-        Some(0),
-        "history fixture rows lack transaction-time metadata; none should be returned"
+
+    let records = envelope["records"].as_array().expect("records array");
+    let tx_times: Vec<&str> = records
+        .iter()
+        .filter_map(|r| r["transaction_time"].as_str())
+        .collect();
+    // The fixture's three commit snapshots are observed at 2026-01-01/02/03.
+    // tx-as-of 2026-01-02 includes the first two and excludes the 2026-01-03 one.
+    assert!(
+        tx_times.contains(&"2026-01-01T00:00:00Z") && tx_times.contains(&"2026-01-02T00:00:00Z"),
+        "history rows at or before the instant must be returned, got {tx_times:?}"
+    );
+    assert!(
+        !tx_times.contains(&"2026-01-03T00:00:00Z"),
+        "the later commit snapshot must be excluded, got {tx_times:?}"
     );
     let codes: Vec<&str> = envelope["diagnostics"]
         .as_array()
@@ -217,8 +227,8 @@ fn tx_as_of_is_implemented_and_reports_missing_metadata() {
         .filter_map(|d| d["code"].as_str())
         .collect();
     assert!(
-        codes.contains(&"missing_transaction_metadata"),
-        "missing transaction metadata must be reported, got {codes:?}"
+        !codes.contains(&"missing_transaction_metadata"),
+        "history rows now resolve a transaction handle; must not be reported missing, got {codes:?}"
     );
 }
 

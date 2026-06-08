@@ -6936,6 +6936,31 @@ fn symbol_by_name_tx_response(
     started: Instant,
     budget: Option<Duration>,
 ) -> HttpResponse {
+    // Validate the temporal selectors first — before the kind-filter short
+    // circuit — so a malformed instant always yields 400 bad_request (attributed
+    // to the correct field) rather than a silent 200 no-match for a non-Symbol
+    // kind. The field attribution matches the non-tx valid-time handler.
+    if let Err(e) = DateTime::parse_from_rfc3339(tx_as_of) {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request_field(
+                format!("invalid as_of.transaction_time '{tx_as_of}': {e}"),
+                "as_of.transaction_time",
+            ),
+        );
+    }
+    if let Some(vt) = as_of_valid_time
+        && let Err(e) = DateTime::parse_from_rfc3339(vt)
+    {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request_field(
+                format!("invalid as_of.valid_time '{vt}': {e}"),
+                "as_of.valid_time",
+            ),
+        );
+    }
+
     // kind_filter only recognises "Symbol" in v1; anything else → empty result.
     if kind_filter.is_some_and(|kf| kf != "Symbol") {
         return HttpResponse::success(
@@ -6952,6 +6977,8 @@ fn symbol_by_name_tx_response(
         );
     }
 
+    // Timestamps are pre-validated above, so the resolver only errors on
+    // genuinely unexpected input; surface it as the transaction-time field.
     let result =
         match graph_query::symbol_as_of_transaction_time(records, name, tx_as_of, as_of_valid_time)
         {

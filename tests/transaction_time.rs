@@ -503,6 +503,66 @@ fn tx_as_of_excludes_superseded_symbol_once_replacement_known() {
     );
 }
 
+// ── AC4 + AC2: supersession must respect the valid-time axis ─────────────────
+// A two-axis query asks "what was true at valid time V, as known by tx time T."
+// If the replacement is known by T but only becomes valid AFTER V, the older
+// row that was true at V must NOT be dropped as superseded.
+
+#[test]
+fn tx_as_of_supersession_respects_valid_time_axis() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    let new_id = stable_id(&["node", "Symbol", "src/new.rs", "widget"]);
+    // Old: valid + committed at 2026-01-01.
+    let old = GraphRecord::symbol(
+        stable_id(&["node", "Symbol", "src/old.rs", "widget"]),
+        "fn",
+        "src/old.rs".to_owned(),
+        span(1, 5),
+        "widget".to_owned(),
+        "widget old".to_owned(),
+    )
+    .with_node_time(
+        "2026-01-01T00:00:00Z",
+        "author_provided",
+        "2026-01-01T00:00:00Z",
+    )
+    .with_transaction_time("2026-01-01T00:00:00Z")
+    .with_superseded_by(new_id.clone());
+    // New: committed at 2026-01-03 (known by T) but only valid from 2026-01-03.
+    let new = GraphRecord::symbol(
+        new_id,
+        "fn",
+        "src/new.rs".to_owned(),
+        span(1, 6),
+        "widget".to_owned(),
+        "widget new".to_owned(),
+    )
+    .with_node_time(
+        "2026-01-03T00:00:00Z",
+        "author_provided",
+        "2026-01-03T00:00:00Z",
+    )
+    .with_transaction_time("2026-01-03T00:00:00Z");
+    let records = vec![old, new];
+
+    // Known by 2026-01-04, but asking what was true at valid-time 2026-01-02:
+    // the replacement is not yet valid then, so the old row must survive.
+    let result = symbol_as_of_transaction_time(
+        &records,
+        "widget",
+        "2026-01-04T00:00:00Z",
+        Some("2026-01-02T00:00:00Z"),
+    )
+    .expect("query ok");
+    assert_eq!(
+        result.records.len(),
+        1,
+        "old row valid at V must not be dropped when the replacement isn't valid yet"
+    );
+    assert_eq!(record_path(result.records[0]), Some("src/old.rs"));
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 fn record_path(r: &GraphRecord) -> Option<&str> {

@@ -212,13 +212,16 @@ for malformed input, as a top-level `error` (exit 1):
 `tx_as_of` resolves a record's transaction-time handle from its body fields, in
 priority order: explicit `transaction_time` → `ingested_at` → `valid_time` when
 `valid_time_source == "inferred_from_transaction_time"` (current-tree scans set
-`valid_time` to the scan's wall-clock instant, which *is* the transaction time).
-A record with no resolvable transaction-time handle is **excluded** with a
-`missing_transaction_metadata` diagnostic — never treated as current state.
+`valid_time` to the scan's wall-clock instant, which *is* the transaction time) →
+`temporal.observed_at` for history-replay (`scan-history`) records. Replayed
+history has only the commit timeline as a store-observation timeline, so the
+transaction axis collapses onto it for that data. A record with no resolvable
+transaction-time handle is **excluded** with a `missing_transaction_metadata`
+diagnostic — never treated as current state.
 
 | Domain | `as_of` resolves against | `tx_as_of` resolves against | Notes |
 |--------|-------------------------|-----------------------------|-------|
-| `code_graph` | `valid_time` on node | `transaction_time`, else inferred from scan `valid_time` | Use `scan-history` to build the history |
+| `code_graph` | `valid_time` on node | `transaction_time`; else inferred-from-tx `valid_time` (current scan); else `temporal.observed_at` (history replay) | Use `scan-history` to build the history |
 | `agent_memory` | `valid_time` on node | `ingested_at` | Agent must set `valid_time` |
 | `project` | `valid_time` on node | `transaction_time` | |
 | `artifact` | `valid_time` on node | `transaction_time` / `ingested_at` | |
