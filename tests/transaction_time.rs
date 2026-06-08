@@ -809,6 +809,83 @@ fn tx_as_of_history_removal_respects_valid_time_axis() {
     );
 }
 
+// ── AC4: two-axis removal — valid time AFTER the removal must drop the row ─────
+// The mirror of the case above: when the requested valid time is after the
+// removal commit, the symbol was genuinely absent at V, so it must be excluded
+// rather than carried forward from its last pre-removal snapshot.
+
+#[test]
+fn tx_as_of_history_removal_two_axis_valid_after_removal_excludes() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    let gone_id = stable_id(&["node", "Symbol", "src/lib.rs", "gone"]);
+    let kept_id = stable_id(&["node", "Symbol", "src/lib.rs", "kept"]);
+    let mut records = Vec::new();
+    // gone present at c1/c2, removed at c3; kept survives to c3 (marks c3 active).
+    for (commit, parents, date) in [
+        ("c1c1c1c1", &[][..], "2026-01-01T00:00:00Z"),
+        ("c2c2c2c2", &["c1c1c1c1"][..], "2026-01-02T00:00:00Z"),
+    ] {
+        records.push(history_symbol(
+            &gone_id,
+            "gone",
+            "src/lib.rs",
+            commit,
+            parents,
+            date,
+        ));
+    }
+    for (commit, parents, date) in [
+        ("c1c1c1c1", &[][..], "2026-01-01T00:00:00Z"),
+        ("c2c2c2c2", &["c1c1c1c1"][..], "2026-01-02T00:00:00Z"),
+        ("c3c3c3c3", &["c2c2c2c2"][..], "2026-01-03T00:00:00Z"),
+    ] {
+        records.push(history_symbol(
+            &kept_id,
+            "kept",
+            "src/lib.rs",
+            commit,
+            parents,
+            date,
+        ));
+    }
+
+    // Known by 2026-01-04 AND asking what was true at valid time 2026-01-03T12
+    // (after the removal commit c3) → `gone` was absent then, so excluded.
+    let result = symbol_as_of_transaction_time(
+        &records,
+        "gone",
+        "2026-01-04T00:00:00Z",
+        Some("2026-01-03T12:00:00Z"),
+        None,
+    )
+    .expect("query ok");
+    assert!(
+        result.records.is_empty(),
+        "a valid time after the removal must not carry the pre-removal snapshot, got {:?}",
+        result.records
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "absent_at_transaction"),
+        "removal in the requested valid-time view must be reported, got {:?}",
+        result.diagnostics
+    );
+
+    // Control: `kept` (present at c3) is still returned at the same instants.
+    let kept = symbol_as_of_transaction_time(
+        &records,
+        "kept",
+        "2026-01-04T00:00:00Z",
+        Some("2026-01-03T12:00:00Z"),
+        None,
+    )
+    .expect("query ok");
+    assert_eq!(kept.records.len(), 1, "kept is live at c3 and valid at V");
+}
+
 // ── Same-second commits: removal must still be detected (#1564) ──────────────
 // Git commit timestamps are second-resolution; a removal commit can share its
 // second with the prior commit. Commit topology (parent links) must break the

@@ -1732,23 +1732,25 @@ pub fn symbol_as_of_transaction_time<'r>(
 
     // History-replay removal detection (AC2): `scan-history` emits a full symbol
     // snapshot per commit, so a symbol present at a commit always has a version
-    // stamped there. If the queried symbol's latest temporal version known by the
-    // instant predates the commit active at the instant (the latest commit the
-    // store knew by then, observed across all temporal records), the symbol was
-    // removed or renamed at that commit and must not be carried forward as live.
+    // stamped there. The symbol is absent in the requested view when its latest
+    // snapshot (restricted to its repository component and to the requested
+    // axes) predates the commit active in that same view.
     //
-    // This applies to the transaction axis only. When a valid-time axis is also
-    // requested, the query asks "what was true at valid time V, as known by T";
-    // a row selected because `valid_time <= V` was genuinely true at V, so a
-    // later removal (a transaction-axis fact) must not erase it. Removal
-    // detection is therefore skipped whenever `--as-of` is supplied.
+    // Axis handling: with no `--as-of`, "active" is the latest commit known by
+    // `tx_as_of` on the transaction timeline (observed_at). With `--as-of V` the
+    // query asks what was true at valid time V (as known by T): the active commit
+    // is the latest commit *valid at V* (committer date ≤ V) and known by T, and
+    // the symbol's latest snapshot is likewise bounded by V. So a removal that
+    // happens *after* V leaves the row intact (it was genuinely true at V), while
+    // a removal at or before V correctly drops it — removal is evaluated against
+    // the requested valid-time view rather than disabled for two-axis queries.
     //
-    // Same-second commits and multi-repository stores: the "active commit" is
-    // compared by the composite key `(observed_at, commit topological rank)`,
-    // so a descendant always beats an ancestor that shares its second, and the
-    // comparison is scoped to the queried symbol's own commit-graph component
-    // (its repository), so a later commit in a *different* repository in the
-    // same store never makes this symbol look removed.
+    // Same-second commits and multi-repository stores: commits are compared by
+    // the composite key `(time, commit topological rank)`, so a descendant always
+    // beats an ancestor that shares its second, and the comparison is scoped to
+    // the queried symbol's own commit-graph component (its repository), so a later
+    // commit in a *different* repository in the same store never makes this symbol
+    // look removed.
     let is_temporal = |r: &GraphRecord| -> bool {
         matches!(
             r,
@@ -1761,53 +1763,62 @@ pub fn symbol_as_of_transaction_time<'r>(
             }
         )
     };
-    if vt_requested.is_none() {
-        // The queried name can appear in more than one repository (distinct
-        // commit-graph components) when a store holds `scan-history` output from
-        // several repos. Removal is decided independently per component, and the
-        // pruning only drops rows in the component that shows absence — so repo
-        // A removing `foo` never erases repo B's still-live `foo`.
-        let component_of = |r: &GraphRecord| -> Option<usize> {
-            node_git_commit(r).and_then(|c| commit_order.component(c))
-        };
-        let symbol_components: BTreeSet<usize> =
-            named.iter().filter_map(|r| component_of(r)).collect();
+    // The queried name can appear in more than one repository (distinct
+    // commit-graph components) when a store holds `scan-history` output from
+    // several repos. Removal is decided independently per component, and the
+    // pruning only drops rows in the component that shows absence — so repo A
+    // removing `foo` never erases repo B's still-live `foo`.
+    let component_of = |r: &GraphRecord| -> Option<usize> {
+        node_git_commit(r).and_then(|c| commit_order.component(c))
+    };
+    let symbol_components: BTreeSet<usize> = named.iter().filter_map(|r| component_of(r)).collect();
 
-        for component in symbol_components {
-            // Composite commit key, restricted to this repository and to commits
-            // the store knew by the requested instant.
-            let commit_key = |r: &GraphRecord| -> Option<(DateTime<chrono::FixedOffset>, usize)> {
-                let commit = node_git_commit(r)?;
-                if commit_order.component(commit) != Some(component) {
+    for component in symbol_components {
+        // Composite commit key, restricted to this repository and to the commits
+        // visible in the requested view: known by `tx_as_of` (transaction axis),
+        // and — when `--as-of V` is supplied — valid at V (valid axis), ordered by
+        // the axis that defines the view so "active" means the right commit.
+        let commit_key = |r: &GraphRecord| -> Option<(DateTime<chrono::FixedOffset>, usize)> {
+            let commit = node_git_commit(r)?;
+            if commit_order.component(commit) != Some(component) {
+                return None;
+            }
+            let observed =
+                record_transaction_time(r).and_then(|s| DateTime::parse_from_rfc3339(s).ok())?;
+            if observed > tx_instant {
+                return None;
+            }
+            if let Some(vt_req) = vt_requested {
+                // Valid-time view: only commits valid at or before V participate,
+                // ordered by valid time (committer date) so "active at V" holds.
+                let vt = node_valid_time(r).and_then(|s| DateTime::parse_from_rfc3339(s).ok())?;
+                if vt > vt_req {
                     return None;
                 }
-                let observed = record_transaction_time(r)
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())?;
-                if observed > tx_instant {
-                    return None;
-                }
+                Some((vt, commit_order.rank(commit)))
+            } else {
                 Some((observed, commit_order.rank(commit)))
-            };
-            let active = records.iter().filter_map(&commit_key).max();
-            let name_latest = named.iter().filter_map(|r| commit_key(r)).max();
-            if let (Some(active), Some(name_latest)) = (active, name_latest)
-                && name_latest < active
-            {
-                // Prune only this component's temporal rows; rows belonging to a
-                // different repository (or carrying no commit) are untouched.
-                let in_component = |r: &GraphRecord| -> bool { component_of(r) == Some(component) };
-                let removed = selected.iter().any(|r| is_temporal(r) && in_component(r));
-                selected.retain(|r| !(is_temporal(r) && in_component(r)));
-                if removed {
-                    diagnostics.push(TxDiagnostic {
-                        code: "absent_at_transaction".to_owned(),
-                        message: format!(
-                            "symbol '{symbol_name}' was absent at the commit active at '{tx_as_of}' (last seen '{}', active commit '{}'); excluded",
-                            name_latest.0.to_rfc3339(),
-                            active.0.to_rfc3339()
-                        ),
-                    });
-                }
+            }
+        };
+        let active = records.iter().filter_map(&commit_key).max();
+        let name_latest = named.iter().filter_map(|r| commit_key(r)).max();
+        if let (Some(active), Some(name_latest)) = (active, name_latest)
+            && name_latest < active
+        {
+            // Prune only this component's temporal rows; rows belonging to a
+            // different repository (or carrying no commit) are untouched.
+            let in_component = |r: &GraphRecord| -> bool { component_of(r) == Some(component) };
+            let removed = selected.iter().any(|r| is_temporal(r) && in_component(r));
+            selected.retain(|r| !(is_temporal(r) && in_component(r)));
+            if removed {
+                diagnostics.push(TxDiagnostic {
+                    code: "absent_at_transaction".to_owned(),
+                    message: format!(
+                        "symbol '{symbol_name}' was absent at the commit active in the requested view (last seen '{}', active commit '{}'); excluded",
+                        name_latest.0.to_rfc3339(),
+                        active.0.to_rfc3339()
+                    ),
+                });
             }
         }
     }
