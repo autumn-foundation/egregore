@@ -11,6 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "embeddings")]
+use aletheia_egregore::embeddings::{EmbeddingVectorKey, EmbeddingVectorMap};
 use aletheia_egregore::{
     adapters::{EmbeddedAletheiaSink, GraphSink},
     daemon::{
@@ -21,7 +23,8 @@ use aletheia_egregore::{
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, EdgeLabel, GraphRecord, IdentitySource, NodeKind,
         PROJECT_SCHEMA_VERSION, RepositoryIdentityPayload, SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION,
-        TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, stable_id, user_context_stable_id,
+        SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION, stable_id,
+        user_context_stable_id,
     },
     traj::ImportOptions,
 };
@@ -10547,4 +10550,701 @@ fn get_dir_file_times(dir: &Path) -> std::collections::BTreeMap<PathBuf, std::ti
         }
     }
     files
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Issue #59 — daemon-backed semantic code search (`semantic_search` verb)
+//
+// These tests drive a daemon over a semantic-enabled fixture store using
+// synthetic embedding vectors, so they never invoke the real embedding model
+// (no network, no Hugging Face download, no background worker). The daemon
+// performs the same vector similarity search the embedded path uses; the
+// client supplies the query vector. This is the deterministic substrate the
+// acceptance criteria require.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "embeddings")]
+const SEMANTIC_FIXTURE_DIM: usize = 4;
+
+/// Allowed JSON keys on a daemon semantic result row (AC2/AC6/AC7).
+///
+/// Semantic results are retrieval *leads*: bounded handles only. Any key
+/// outside this set would risk leaking raw content or implying the row is
+/// proof/evidence/memory, which the redaction and trust-boundary ACs forbid.
+#[cfg(feature = "embeddings")]
+const SEMANTIC_ROW_ALLOWED_KEYS: &[&str] =
+    &["record_id", "name", "repo_relative_path", "score", "span"];
+
+/// A deterministic synthetic embedding on two independent 2-D circles, so
+/// different records rank differently for different queries without the model.
+#[cfg(feature = "embeddings")]
+fn semantic_vec_at(theta: f32) -> Vec<f32> {
+    vec![
+        theta.cos(),
+        theta.sin(),
+        (2.0 * theta).cos() * 0.5,
+        (2.0 * theta).sin() * 0.5,
+    ]
+}
+
+/// Eleven distinct natural-language-stand-in query vectors (≥ 10 per AC3),
+/// offset from the record angles so each query has a non-trivial ranking.
+#[cfg(feature = "embeddings")]
+fn semantic_fixture_query_vectors() -> Vec<Vec<f32>> {
+    let count = 11_usize;
+    (0..count)
+        .map(|q| {
+            #[allow(clippy::cast_precision_loss)]
+            let theta = (q as f32 + 0.37) * std::f32::consts::TAU / count as f32;
+            semantic_vec_at(theta)
+        })
+        .collect()
+}
+
+/// Builds a semantic-enabled fixture store with `count` embeddable symbol
+/// records carrying distinct synthetic vectors, persists the vector index, and
+/// returns the stable record IDs in creation order. The store is closed (lease
+/// released) before returning so a daemon can open it.
+#[cfg(feature = "embeddings")]
+fn build_semantic_fixture_store(data_dir: &Path, count: usize) -> Vec<String> {
+    let mut vectors = EmbeddingVectorMap::new();
+    let mut records = Vec::new();
+    let mut record_ids = Vec::new();
+    for i in 0..count {
+        let id = stable_id(&["node", "symbol", "src/lib.rs", &format!("sym{i:02}")]);
+        let record = GraphRecord::symbol(
+            id.clone(),
+            "function",
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte: 10 + i,
+                start_line: i + 1,
+                end_line: i + 1,
+            },
+            format!("sym{i:02}"),
+            format!("fixture symbol number {i}"),
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let theta = (i as f32) * std::f32::consts::TAU / count as f32;
+        vectors.insert(
+            EmbeddingVectorKey::from_record(&record).expect("symbol must be embeddable"),
+            semantic_vec_at(theta),
+        );
+        records.push(record);
+        record_ids.push(id);
+    }
+    let mut sink =
+        EmbeddedAletheiaSink::open_with_embeddings(data_dir, vectors, SEMANTIC_FIXTURE_DIM)
+            .expect("semantic fixture store should open");
+    for record in &records {
+        sink.write_record(record)
+            .expect("fixture semantic record should write");
+    }
+    sink.persist_indexes()
+        .expect("semantic fixture indexes should persist");
+    drop(sink);
+    record_ids
+}
+
+/// Reference top-k record IDs computed against the persisted store via the same
+/// embedded `semantic_search` the non-daemon CLI uses. Reads through a leased
+/// `open`, then releases before any daemon starts.
+#[cfg(feature = "embeddings")]
+fn embedded_reference_top_k(
+    data_dir: &Path,
+    queries: &[Vec<f32>],
+    k: usize,
+) -> Vec<Vec<(String, f32)>> {
+    let sink = EmbeddedAletheiaSink::open(data_dir).expect("reference store should reopen");
+    let reference = queries
+        .iter()
+        .map(|q| {
+            sink.semantic_search(q, k)
+                .expect("reference semantic search should succeed")
+                .into_iter()
+                .map(|m| (m.record_id, m.score))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    drop(sink);
+    reference
+}
+
+/// Issues a `semantic_search` query verb against the running daemon and returns
+/// the parsed result rows (the `result.records` array).
+#[cfg(feature = "embeddings")]
+fn daemon_semantic_rows(
+    metadata: &DaemonMetadata,
+    request_id: &str,
+    query_vector: &[f32],
+    limit: usize,
+) -> serde_json::Value {
+    let res = http_json(
+        metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": request_id,
+            "agent_id": "semantic-test-agent",
+            "verb": "semantic_search",
+            "params": { "query_vector": query_vector, "limit": limit as u64 }
+        }),
+    );
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "semantic_search should return 200, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], true, "semantic_search must be ok, got {body}");
+    assert_eq!(
+        body["result"]["verb"], "semantic_search",
+        "result must echo verb, got {body}"
+    );
+    body["result"]["records"].clone()
+}
+
+#[cfg(feature = "embeddings")]
+fn semantic_row_ids(rows: &serde_json::Value) -> Vec<String> {
+    rows.as_array()
+        .expect("records must be an array")
+        .iter()
+        .map(|row| {
+            row["record_id"]
+                .as_str()
+                .expect("each row must carry record_id")
+                .to_owned()
+        })
+        .collect()
+}
+
+// ── AC1 + AC2: one documented daemon workflow; rows carry the required fields ──
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_returns_record_id_score_path_and_span() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-fields-store");
+    build_semantic_fixture_store(&data_dir, 12);
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+
+    let rows = daemon_semantic_rows(&metadata, "sem-fields", &semantic_vec_at(0.1), 5);
+    daemon.stop();
+
+    let arr = rows.as_array().expect("records array");
+    assert!(!arr.is_empty(), "fixture query should match records");
+    for row in arr {
+        assert!(
+            row["record_id"].as_str().is_some(),
+            "row must carry record_id, got {row}"
+        );
+        assert!(row["score"].is_number(), "row must carry score, got {row}");
+        assert_eq!(
+            row["repo_relative_path"], "src/lib.rs",
+            "row must carry repo-relative path, got {row}"
+        );
+        assert!(
+            row["span"]["start_line"].is_number(),
+            "row must carry a span when available, got {row}"
+        );
+    }
+}
+
+// ── AC3: parity with embedded semantic query over ≥ 10 fixture queries ────────
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_matches_embedded_top_k_for_fixture_queries() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-parity-store");
+    build_semantic_fixture_store(&data_dir, 12);
+
+    let queries = semantic_fixture_query_vectors();
+    assert!(
+        queries.len() >= 10,
+        "AC3 requires at least 10 fixture queries"
+    );
+    let k = 5;
+    let reference = embedded_reference_top_k(&data_dir, &queries, k);
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+
+    let mut mismatches = Vec::new();
+    for (idx, query) in queries.iter().enumerate() {
+        let rows = daemon_semantic_rows(&metadata, &format!("sem-parity-{idx}"), query, k);
+        let daemon_ids = semantic_row_ids(&rows);
+        let expected_ids: Vec<String> = reference[idx].iter().map(|(id, _)| id.clone()).collect();
+        if daemon_ids != expected_ids {
+            mismatches.push(format!(
+                "query {idx}: daemon {daemon_ids:?} != embedded {expected_ids:?}"
+            ));
+        }
+        // Documented score tolerance: daemon and embedded read the same
+        // persisted index, so scores must agree within a tight epsilon.
+        for (row, (_, ref_score)) in rows.as_array().unwrap().iter().zip(reference[idx].iter()) {
+            #[allow(clippy::cast_possible_truncation)]
+            let daemon_score = row["score"].as_f64().expect("score number") as f32;
+            assert!(
+                (daemon_score - ref_score).abs() <= 1e-4,
+                "query {idx} score drift: {daemon_score} vs {ref_score}"
+            );
+        }
+    }
+    daemon.stop();
+
+    assert!(
+        mismatches.is_empty(),
+        "daemon semantic search must match embedded top-{k} ordering for every fixture query:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+// ── AC4: repeating the fixture set five times is stable and order-equivalent ──
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_repeated_runs_are_stable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-stable-store");
+    build_semantic_fixture_store(&data_dir, 12);
+
+    let queries = semantic_fixture_query_vectors();
+    let k = 5;
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+
+    let mut first_run: Option<Vec<Vec<String>>> = None;
+    for run in 0..5 {
+        let this_run: Vec<Vec<String>> = queries
+            .iter()
+            .enumerate()
+            .map(|(idx, query)| {
+                let rows =
+                    daemon_semantic_rows(&metadata, &format!("sem-stable-{run}-{idx}"), query, k);
+                semantic_row_ids(&rows)
+            })
+            .collect();
+        match &first_run {
+            None => first_run = Some(this_run),
+            Some(baseline) => assert_eq!(
+                baseline, &this_run,
+                "run {run} produced different ordered results than the first run"
+            ),
+        }
+    }
+    daemon.stop();
+}
+
+// ── AC2 absent-span rule: a record without a span omits the span field ────────
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_omits_span_when_absent() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-nospan-store");
+
+    // A File node has no source span; it is still an embeddable target.
+    let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+    let file = GraphRecord::node(
+        file_id.clone(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("src/lib.rs".to_owned()),
+        "fixture file summary".to_owned(),
+    );
+    let mut vectors = EmbeddingVectorMap::new();
+    vectors.insert(
+        EmbeddingVectorKey::from_record(&file).expect("file must be embeddable"),
+        semantic_vec_at(0.0),
+    );
+    {
+        let mut sink =
+            EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, SEMANTIC_FIXTURE_DIM)
+                .expect("store should open");
+        sink.write_record(&file).expect("file record should write");
+        sink.persist_indexes().expect("indexes should persist");
+    }
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+    let rows = daemon_semantic_rows(&metadata, "sem-nospan", &semantic_vec_at(0.0), 5);
+    daemon.stop();
+
+    let arr = rows.as_array().expect("records array");
+    let row = arr
+        .iter()
+        .find(|row| row["record_id"] == serde_json::json!(file_id))
+        .expect("file record should be returned");
+    assert!(
+        row.get("span").is_none(),
+        "absent span must be omitted, matching the embedded CLI contract, got {row}"
+    );
+}
+
+// ── AC6 + AC7: rows are bounded retrieval leads, never raw content or proof ───
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_rows_are_bounded_leads_only() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-leads-store");
+    build_semantic_fixture_store(&data_dir, 12);
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+    let rows = daemon_semantic_rows(&metadata, "sem-leads", &semantic_vec_at(0.2), 5);
+    daemon.stop();
+
+    for row in rows.as_array().expect("records array") {
+        let obj = row.as_object().expect("each row is an object");
+        for key in obj.keys() {
+            assert!(
+                SEMANTIC_ROW_ALLOWED_KEYS.contains(&key.as_str()),
+                "semantic row leaked disallowed key '{key}'; rows must stay bounded leads, got {row}"
+            );
+        }
+    }
+}
+
+// ── AC5: missing semantic index → stable machine-readable diagnostic ──────────
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_reports_missing_index() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-noindex-store");
+
+    // Build a structural store with NO embedding index.
+    {
+        let symbol = GraphRecord::symbol(
+            stable_id(&["node", "symbol", "src/lib.rs", "plain"]),
+            "function",
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 1,
+            },
+            "plain".to_owned(),
+            "no embedding here".to_owned(),
+        );
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("structural store should open");
+        sink.write_record(&symbol).expect("symbol should write");
+        sink.persist_indexes().expect("indexes should persist");
+    }
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sem-noindex",
+            "verb": "semantic_search",
+            "params": { "query_vector": semantic_vec_at(0.0) }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 422"),
+        "missing semantic index should be 422, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], false, "must be ok:false, got {body}");
+    assert_eq!(
+        body["error"]["code"], "missing_semantic_index",
+        "missing index must use a stable code, got {body}"
+    );
+}
+
+// ── AC5: incompatible embedding dimension → stable diagnostic ─────────────────
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_reports_incompatible_dimension() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-dim-store");
+    build_semantic_fixture_store(&data_dir, 12);
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+    // The fixture index is 4-D; send a 3-D query vector.
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sem-dim",
+            "verb": "semantic_search",
+            "params": { "query_vector": [0.1_f32, 0.2, 0.3] }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 422"),
+        "dimension mismatch should be 422, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "incompatible_embedding_dimension",
+        "dimension mismatch must use a stable code, got {body}"
+    );
+}
+
+// ── AC5: no-match result is a stable empty success, not an error or fallback ──
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_no_match_is_empty_success() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-empty-store");
+
+    // Enable an embedding index but embed no records → no candidates.
+    {
+        let sink = EmbeddedAletheiaSink::open_with_embeddings(
+            &data_dir,
+            EmbeddingVectorMap::new(),
+            SEMANTIC_FIXTURE_DIM,
+        )
+        .expect("empty semantic store should open");
+        sink.persist_indexes().expect("indexes should persist");
+    }
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sem-empty",
+            "verb": "semantic_search",
+            "params": { "query_vector": semantic_vec_at(0.0) }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 200"),
+        "no-match should still be 200, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(body["ok"], true, "no-match must be ok:true, got {body}");
+    assert_eq!(
+        body["result"]["records"],
+        serde_json::json!([]),
+        "no-match must return an empty records array, got {body}"
+    );
+    assert_eq!(
+        body["result"]["page"]["returned"], 0,
+        "no-match returned count must be 0, got {body}"
+    );
+}
+
+// ── AC5: invalid token → unauthorized diagnostic ──────────────────────────────
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_rejects_invalid_token() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-token-store");
+    build_semantic_fixture_store(&data_dir, 12);
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+    let body = serde_json::json!({
+        "request_id": "sem-token",
+        "verb": "semantic_search",
+        "params": { "query_vector": semantic_vec_at(0.0) }
+    })
+    .to_string();
+    let res = http_request(
+        &metadata.address,
+        &format!(
+            "POST /v1/query HTTP/1.1\r\nHost: egregore\r\nAuthorization: Bearer not-the-real-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 401"),
+        "invalid token should be 401, got {res}"
+    );
+    let parsed = response_json(&res);
+    assert_eq!(
+        parsed["error"]["code"], "unauthorized",
+        "invalid token must use the unauthorized code, got {parsed}"
+    );
+}
+
+// ── AC5: query timeout → stable diagnostic, no partial result ─────────────────
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_honours_query_timeout() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-timeout-store");
+    build_semantic_fixture_store(&data_dir, 12);
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sem-timeout",
+            "verb": "semantic_search",
+            "params": { "query_vector": semantic_vec_at(0.0) },
+            "budget": { "timeout_ms": 0 }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 408"),
+        "zero budget should time out, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "query_timeout",
+        "timeout must use the query_timeout code, got {body}"
+    );
+}
+
+// ── AC5: missing query vector → missing_field diagnostic ──────────────────────
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_requires_query_vector() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-noparam-store");
+    build_semantic_fixture_store(&data_dir, 12);
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sem-noparam",
+            "verb": "semantic_search",
+            "params": {}
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "missing query_vector should be 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "missing_field",
+        "missing query_vector must use missing_field, got {body}"
+    );
+}
+
+// ── AC5 (missing daemon): the CLI workflow fails cleanly without a daemon ──────
+#[cfg(feature = "embeddings")]
+#[test]
+fn cli_semantic_daemon_without_running_daemon_errors_cleanly() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("no-daemon-store");
+
+    let assert = Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("query")
+        .arg("semantic")
+        .arg("find the parser")
+        .arg("--daemon")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.to_lowercase().contains("daemon"),
+        "missing-daemon error should mention the daemon, got: {stderr}"
+    );
+}
+
+// ── AC8: the verb is documented through the parity client method too ──────────
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_via_client_verb_matches_embedded() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-client-store");
+    build_semantic_fixture_store(&data_dir, 12);
+
+    let query = semantic_vec_at(0.42);
+    let reference = embedded_reference_top_k(&data_dir, std::slice::from_ref(&query), 5);
+    let expected: Vec<String> = reference[0].iter().map(|(id, _)| id.clone()).collect();
+
+    let mut daemon = start_daemon(&data_dir);
+    read_running_metadata(&data_dir);
+    let client = DaemonClient::from_data_dir(&data_dir).expect("client should connect");
+    let records = client
+        .query_verb(
+            "semantic_search",
+            &serde_json::json!({ "query_vector": query, "limit": 5_u64 }),
+            None,
+        )
+        .expect("client semantic_search should succeed");
+    daemon.stop();
+
+    let ids: Vec<String> = records
+        .iter()
+        .map(|r| r["record_id"].as_str().expect("record_id").to_owned())
+        .collect();
+    assert_eq!(
+        ids, expected,
+        "DaemonClient::query_verb semantic_search must match embedded ordering"
+    );
+}
+
+// ── AC8: documentation describes the daemon semantic verb and its boundaries ──
+#[test]
+fn daemon_query_doc_documents_semantic_search_verb() {
+    let doc_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/schema/daemon-query.md");
+    let text = std::fs::read_to_string(&doc_path).expect("daemon-query doc should read");
+    assert!(
+        text.contains("semantic_search"),
+        "daemon-query.md must document the semantic_search verb"
+    );
+    assert!(
+        text.contains("query_vector"),
+        "daemon-query.md must document the query_vector param"
+    );
+    for code in ["missing_semantic_index", "incompatible_embedding_dimension"] {
+        assert!(
+            text.contains(code),
+            "daemon-query.md must document the {code} diagnostic"
+        );
+    }
+}
+
+#[test]
+fn semantic_guidance_doc_covers_daemon_backed_search() {
+    let doc_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/cli/semantic-search-guidance.md");
+    let text = std::fs::read_to_string(&doc_path).expect("guidance doc should read");
+    assert!(
+        text.contains("--daemon"),
+        "guidance must describe the daemon-backed semantic workflow"
+    );
+    // When to prefer the structural / boring substitutes.
+    assert!(
+        text.contains("eg query symbol") && text.contains("eg query file"),
+        "guidance must say when eg query symbol / eg query file is the better tool"
+    );
+    assert!(
+        text.contains("rg") || text.contains("ripgrep"),
+        "guidance must say when rg is the better tool"
+    );
+    // Relationship to issue #58's relevance gate.
+    assert!(
+        text.contains("#58"),
+        "guidance must relate daemon semantic search to issue #58's relevance gate"
+    );
 }

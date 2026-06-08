@@ -350,6 +350,23 @@ impl EmbeddedAletheiaSink {
         Ok(sink)
     }
 
+    /// Returns the dimensionality of the persisted `"embedding"` vector index,
+    /// or `None` when the store has no semantic index.
+    ///
+    /// Used by daemon-backed semantic search to distinguish a store that was
+    /// never ingested with embeddings (missing index) from a query whose vector
+    /// dimensionality disagrees with the index (incompatible dimension), without
+    /// leaking raw `AletheiaDB` internals to callers.
+    #[cfg(feature = "embeddings")]
+    #[must_use]
+    pub fn embedding_index_dimensions(&self) -> Option<usize> {
+        self.db
+            .list_vector_indexes()
+            .into_iter()
+            .find(|index| index.property_name == "embedding")
+            .map(|index| index.dimensions)
+    }
+
     /// Searches for nodes whose stored embedding is most similar to `query_vector`.
     ///
     /// Returns up to `limit` results ordered by descending similarity.

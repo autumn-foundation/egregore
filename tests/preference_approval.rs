@@ -1198,12 +1198,11 @@ fn candidate_suppressed_if_compatible_with_recently_rejected_candidate() {
     let candidates = parsed["candidates"].as_array().expect("candidates");
     let target = candidates
         .iter()
-        .find(|c| c["id"].as_str() == Some(&new_cand_id))
-        .unwrap();
+        .find(|c| c["id"].as_str() == Some(&new_cand_id));
 
     // Debounce window defaults to T = 30 days and M = 5 observations.
-    // The candidate was just decided, has 0 new observations, so it should be suppressed
-    assert_eq!(target["suppressed"].as_str(), Some("rejection_debounce"));
+    // The candidate was just decided, has 0 new observations, so it should be suppressed and filtered out.
+    assert!(target.is_none());
 }
 
 #[test]
@@ -1576,19 +1575,17 @@ fn candidate_debounce_requires_both_thresholds() {
 
     let c1 = candidates
         .iter()
-        .find(|c| c["id"].as_str() == Some(&new_cand_id_1))
-        .unwrap();
+        .find(|c| c["id"].as_str() == Some(&new_cand_id_1));
     let c2 = candidates
         .iter()
-        .find(|c| c["id"].as_str() == Some(&new_cand_id_2))
-        .unwrap();
+        .find(|c| c["id"].as_str() == Some(&new_cand_id_2));
     let c3 = candidates
         .iter()
         .find(|c| c["id"].as_str() == Some(&new_cand_id_3))
         .unwrap();
 
-    assert_eq!(c1["suppressed"].as_str(), Some("rejection_debounce"));
-    assert_eq!(c2["suppressed"].as_str(), Some("rejection_debounce"));
+    assert!(c1.is_none());
+    assert!(c2.is_none());
     assert!(c3["suppressed"].is_null());
 }
 
@@ -2489,10 +2486,9 @@ fn candidate_suppressed_based_on_latest_rejection_decision() {
 
     let target = candidates
         .iter()
-        .find(|c| c["id"].as_str() == Some(&new_cand_id))
-        .unwrap();
-    // It should be debounced based on the latest terminal rejection decision (not deferred)
-    assert_eq!(target["suppressed"].as_str(), Some("rejection_debounce"));
+        .find(|c| c["id"].as_str() == Some(&new_cand_id));
+    // It should be debounced based on the latest terminal rejection decision (not deferred) and filtered out
+    assert!(target.is_none());
 }
 
 #[test]
@@ -8063,4 +8059,142 @@ fn test_audit_trail_fails_for_missing_durable_kind_specific_fields() {
     assert!(result.is_err());
     let err_msg = result.err().unwrap();
     assert!(err_msg.contains("lacks triggers"));
+}
+
+#[test]
+fn test_cli_decide_copies_agent_memory_evidence_edges() {
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("graph.jsonl");
+    let db_path = temp.path().join("store");
+
+    let cand_id = user_context_stable_id(&["candidate", "agent_memory_edge_cand"]);
+    let mut cand = GraphRecord::node(
+        cand_id.clone(),
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut domain,
+        ref mut user_context,
+        ref mut valid_time,
+        ref mut valid_time_source,
+        ..
+    } = cand
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *valid_time = Some("2026-06-01T12:00:00Z".to_owned());
+        *valid_time_source = Some("inferred_from_transaction_time".to_owned());
+        *user_context = UserContextFields {
+            proposed_rule_text: Some("MyPreferenceRule".to_owned()),
+            proposed_rule_kind: Some("preference".to_owned()),
+            scope: Some(UserContextScope::default()),
+            ..UserContextFields::empty()
+        };
+    }
+    let mut records = Vec::new();
+    make_candidate_valid(&mut cand, &mut records);
+
+    // Customize one of the generated observations to have an evidence link
+    // so we can test that the edge is correctly synthesized when copying it.
+    let obs_id = format!("agent_memory:v1:{}-obs-1", cand_id);
+    for r in &mut records {
+        if r.id() == obs_id {
+            if let GraphRecord::Node { evidence_links, .. } = r {
+                *evidence_links = Some(vec![EvidenceLink {
+                    target_record_id: Some("codegraph:v1:rust:symbol:cli_test".to_owned()),
+                    target_domain: "codegraph".to_owned(),
+                    relation: "OBSERVES".to_owned(),
+                    confidence: "0.85".to_owned(),
+                    as_of_commit: Some("abcdef123456".to_owned()),
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                }]);
+            }
+        }
+    }
+
+    // Also add the codegraph target so validation passes
+    let target_node = GraphRecord::node(
+        "codegraph:v1:rust:symbol:cli_test".to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("cli_test".to_owned()),
+        "mock symbol".to_owned(),
+    )
+    .with_temporal(aletheia_egregore::ir::TemporalMetadata {
+        git_commit: "abcdef123456".to_owned(),
+        git_parent_commits: Vec::new(),
+        valid_time: "2026-06-01T12:00:00Z".to_owned(),
+        author_time: None,
+        observed_at: "2026-06-01T12:00:00Z".to_owned(),
+        valid_time_source: None,
+    });
+
+    let mut graph = Graph::new();
+    graph.push(cand);
+    graph.push(target_node);
+    for r in records {
+        graph.push(r);
+    }
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    egregore()
+        .args([
+            "decide",
+            &cand_id,
+            "--outcome",
+            "approved",
+            "--graph",
+            graph_path.to_str().unwrap(),
+            "--data-dir",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let sink = aletheia_egregore::adapters::EmbeddedAletheiaSink::open(&db_path).unwrap();
+    let db_records = sink.read_all_records().unwrap();
+
+    // Verify the observation node was copied
+    assert!(db_records.iter().any(|r| r.id() == obs_id));
+
+    // Verify the synthesized OBSERVES edge exists and carries the correct metadata
+    let expected_edge_id = agent_memory_stable_id(&[
+        "edge",
+        "OBSERVES",
+        &obs_id,
+        "codegraph:v1:rust:symbol:cli_test",
+    ]);
+    let db_edge = db_records
+        .iter()
+        .find(|r| r.id() == expected_edge_id)
+        .expect("Synthesized agent memory edge not found in database");
+
+    if let GraphRecord::Edge {
+        label,
+        source,
+        target,
+        confidence,
+        temporal,
+        ..
+    } = db_edge
+    {
+        assert_eq!(label, &EdgeLabel::Observes);
+        assert_eq!(source, &obs_id);
+        assert_eq!(target, "codegraph:v1:rust:symbol:cli_test");
+        assert_eq!(confidence.as_deref(), Some("0.85"));
+        let temp_meta = temporal
+            .as_ref()
+            .expect("Missing temporal metadata on synthesized edge");
+        assert_eq!(temp_meta.git_commit, "abcdef123456");
+    } else {
+        panic!("Expected an Edge record");
+    }
 }

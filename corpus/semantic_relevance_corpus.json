@@ -1,0 +1,515 @@
+{
+  "corpus_version": "1",
+  "description": "Rust semantic-search relevance corpus for the egregore codebase. Each query has reviewed expected targets as repo-relative file paths and optional symbol names. Ambiguous queries have no clear correct answer and are used only to count false positives.",
+  "queries": [
+    {
+      "id": "q001",
+      "text": "where are graph records written to the embedded store",
+      "class": "concept_absent",
+      "expected": [
+        {
+          "repo_relative_path": "src/adapters/aletheiadb.rs",
+          "symbol_name": null,
+          "note": "EmbeddedAletheiaSink write methods persist graph records to AletheiaDB; the concept 'write to store' does not appear in the symbol names"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "write_node",
+        "note": "rg can locate call sites for write_node but misses the conceptual boundary between ingestion and storage; it also cannot return Egregore record handles",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q002",
+      "text": "how does the tool measure similarity between two versions of a code file",
+      "class": "concept_absent",
+      "expected": [
+        {
+          "repo_relative_path": "src/embeddings.rs",
+          "symbol_name": "cosine_distance",
+          "note": "cosine_distance computes the similarity metric; the concept 'similarity between versions' does not appear in the symbol name"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "cosine",
+        "note": "rg 'cosine' finds the function but only because the implementation choice leaks into the name; a synonym-based query would not find it",
+        "rg_can_answer_semantic_intent": true
+      }
+    },
+    {
+      "id": "q003",
+      "text": "which code selects the text that gets sent to an embedding model",
+      "class": "concept_absent",
+      "expected": [
+        {
+          "repo_relative_path": "src/embeddings.rs",
+          "symbol_name": "embedding_candidates",
+          "note": "embedding_candidates selects file and symbol summaries for embedding; 'selects text for model' is absent from the symbol name"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "embedding_candidates",
+        "note": "rg works only because the symbol name was already chosen to be clear; a natural-language query 'text selection for embedding' would not help rg",
+        "rg_can_answer_semantic_intent": true
+      }
+    },
+    {
+      "id": "q004",
+      "text": "where does the tool walk through past commits to extract historical code structure",
+      "class": "concept_absent",
+      "expected": [
+        {
+          "repo_relative_path": "src/history.rs",
+          "symbol_name": null,
+          "note": "history.rs implements Git commit traversal for temporal code extraction; 'walk commits' is absent from file or symbol names"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "scan_history",
+        "note": "rg 'scan_history' finds the CLI command but misses the actual traversal logic in history.rs; no keyword captures 'walk past commits'",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q005",
+      "text": "where is stable deterministic identity computed for a graph node from its content",
+      "class": "concept_absent",
+      "expected": [
+        {
+          "repo_relative_path": "src/ir.rs",
+          "symbol_name": "stable_id",
+          "note": "stable_id computes a hash-based deterministic identifier; 'deterministic identity from content' is absent from the symbol name"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "stable_id",
+        "note": "rg works if you know the function is called stable_id; the query 'deterministic node identity' cannot be answered by rg without prior knowledge",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q006",
+      "text": "storage backend write path for ingesting records",
+      "class": "synonym_heavy",
+      "expected": [
+        {
+          "repo_relative_path": "src/adapters/aletheiadb.rs",
+          "symbol_name": null,
+          "note": "The embedded AletheiaDB adapter is the storage backend; 'backend', 'write path', and 'ingesting' are all synonyms for what the adapter does"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "ingest",
+        "note": "rg 'ingest' finds CLI usages but does not identify the adapter module as the conceptual write boundary; rg cannot return a record handle",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q007",
+      "text": "vector similarity retrieval from a knowledge store",
+      "class": "synonym_heavy",
+      "expected": [
+        {
+          "repo_relative_path": "src/adapters/aletheiadb.rs",
+          "symbol_name": "semantic_search",
+          "note": "semantic_search performs HNSW vector similarity lookup; 'vector retrieval from knowledge store' is a synonym-heavy restatement"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "semantic_search",
+        "note": "rg 'semantic_search' works if you already know the function name; 'vector similarity retrieval' cannot be answered by rg without the exact name",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q008",
+      "text": "computing angular distance between two dense arrays of floats",
+      "class": "synonym_heavy",
+      "expected": [
+        {
+          "repo_relative_path": "src/embeddings.rs",
+          "symbol_name": "cosine_distance",
+          "note": "cosine_distance computes angular distance (1 - cosine similarity); 'angular distance' is a synonym for cosine distance"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "cosine",
+        "note": "rg 'cosine' finds the implementation; 'angular distance' cannot be answered by rg without knowing the name 'cosine'",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q009",
+      "text": "parse source tree and extract structured representation of symbols",
+      "class": "synonym_heavy",
+      "expected": [
+        {
+          "repo_relative_path": "src/ir.rs",
+          "symbol_name": null,
+          "note": "ir.rs defines the GraphRecord intermediate representation produced by parsing; 'structured representation' and 'symbol extraction' are synonyms for what IR means"
+        },
+        {
+          "repo_relative_path": "src/languages/rust.rs",
+          "symbol_name": null,
+          "note": "rust.rs is where tree-sitter dispatches to extract_function and extract_named_symbol — the actual source-tree parsing and symbol extraction logic"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "GraphRecord",
+        "note": "rg 'GraphRecord' finds usages but 'source tree' and 'structured representation' are natural language that rg cannot resolve without the type name",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q010",
+      "text": "time-ordered snapshots of source artifacts across repository history",
+      "class": "synonym_heavy",
+      "expected": [
+        {
+          "repo_relative_path": "src/history.rs",
+          "symbol_name": null,
+          "note": "history.rs produces time-ordered (temporal) graph observations across Git commits; 'time-ordered snapshots' and 'history' are synonyms"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "scan_history",
+        "note": "rg 'scan_history' finds the CLI entry point but 'time-ordered snapshots' cannot be answered by rg without prior knowledge of the feature name",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q011",
+      "text": "which module defines the graph intermediate representation for code nodes",
+      "class": "architecture",
+      "expected": [
+        {
+          "repo_relative_path": "src/ir.rs",
+          "symbol_name": null,
+          "note": "ir.rs is the module defining GraphRecord, NodeKind, EdgeLabel, and the entire graph IR"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "GraphRecord",
+        "note": "rg 'GraphRecord' finds the type across files; 'which module defines the IR' is a file-level architectural question rg can partially answer",
+        "rg_can_answer_semantic_intent": true
+      }
+    },
+    {
+      "id": "q012",
+      "text": "where is the adapter interface for pluggable storage backends defined",
+      "class": "architecture",
+      "expected": [
+        {
+          "repo_relative_path": "src/adapters/mod.rs",
+          "symbol_name": null,
+          "note": "adapters/mod.rs defines the GraphSink trait and adapter traits used by all storage backends"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "GraphSink",
+        "note": "rg 'GraphSink' finds the trait definition; 'pluggable storage adapter interface' is an architectural question rg can partially answer with the trait name",
+        "rg_can_answer_semantic_intent": true
+      }
+    },
+    {
+      "id": "q013",
+      "text": "which file implements the command line interface and routes subcommands",
+      "class": "architecture",
+      "expected": [
+        {
+          "repo_relative_path": "src/cli.rs",
+          "symbol_name": null,
+          "note": "cli.rs contains the Commands enum and all subcommand routing logic"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "Commands",
+        "note": "rg 'Commands' finds the enum; 'command line interface routing' is an architectural question that rg can partially answer",
+        "rg_can_answer_semantic_intent": true
+      }
+    },
+    {
+      "id": "q014",
+      "text": "which module provides the agent-facing graph query helper surface",
+      "class": "architecture",
+      "expected": [
+        {
+          "repo_relative_path": "src/query.rs",
+          "symbol_name": null,
+          "note": "query.rs exposes symbol_at_commit, largest_semantic_drifts, and SymbolContext helpers for agents"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "query_symbol",
+        "note": "rg 'query_symbol' finds call sites in cli.rs but not the module boundary; 'agent-facing query surface' is harder for rg without the module name",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q015",
+      "text": "where is the Git history traversal and temporal extraction implemented",
+      "class": "architecture",
+      "expected": [
+        {
+          "repo_relative_path": "src/history.rs",
+          "symbol_name": null,
+          "note": "history.rs implements commit-by-commit Git traversal without mutating the active checkout"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "scan_history",
+        "note": "rg 'scan_history' finds the CLI handler but 'Git history traversal implementation' requires knowing to look in history.rs",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q016",
+      "text": "what error is returned when the embedded store directory does not exist",
+      "class": "error_handling",
+      "expected": [
+        {
+          "repo_relative_path": "src/cli.rs",
+          "symbol_name": null,
+          "note": "validate_existing_embedded_store in cli.rs returns the 'embedded store not found' error and checks for a missing data-dir"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "embedded store not found",
+        "note": "rg with the exact error message works; 'what error when store missing' is only answerable by rg if you know the error message text",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q017",
+      "text": "how are deleted records filtered from current-state query results",
+      "class": "error_handling",
+      "expected": [
+        {
+          "repo_relative_path": "src/cli.rs",
+          "symbol_name": null,
+          "note": "current_deleted_ids in cli.rs collects tombstone IDs; query results exclude tombstoned records"
+        },
+        {
+          "repo_relative_path": "src/adapters/aletheiadb.rs",
+          "symbol_name": null,
+          "note": "the adapter also filters tombstoned records during semantic search readback"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "tombstone",
+        "note": "rg 'tombstone' finds filtering logic; 'deleted records filtered from queries' is partially answerable by rg but doesn't return record handles",
+        "rg_can_answer_semantic_intent": true
+      }
+    },
+    {
+      "id": "q018",
+      "text": "where is tombstone state applied to exclude superseded nodes from search",
+      "class": "error_handling",
+      "expected": [
+        {
+          "repo_relative_path": "src/adapters/aletheiadb.rs",
+          "symbol_name": null,
+          "note": "semantic_search in the adapter filters tombstoned and superseded nodes before returning matches"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "tombstone_ids",
+        "note": "rg 'tombstone_ids' finds the field; 'tombstone applied in search' is partially answerable if you know the field name",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q019",
+      "text": "what path does code take when semantic search finds no matching records",
+      "class": "error_handling",
+      "expected": [
+        {
+          "repo_relative_path": "src/cli.rs",
+          "symbol_name": null,
+          "note": "query_semantic in cli.rs exits with code 2 and prints a diagnostic when matches is empty"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "no results",
+        "note": "rg 'no results' finds the error message; 'code path for empty semantic results' cannot be answered by rg without the exact message text",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q020",
+      "text": "how to open the embedded AletheiaDB store for reading without holding a daemon lease",
+      "class": "persistence_query",
+      "expected": [
+        {
+          "repo_relative_path": "src/adapters/aletheiadb.rs",
+          "symbol_name": "open_unleased",
+          "note": "EmbeddedAletheiaSink::open_unleased opens the store without acquiring a daemon lease"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "open_unleased",
+        "note": "rg works if you know the function name; 'open store without lease' cannot be answered by rg without prior knowledge",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q021",
+      "text": "where is the approximate nearest-neighbour vector index queried for semantic lookup",
+      "class": "persistence_query",
+      "expected": [
+        {
+          "repo_relative_path": "src/adapters/aletheiadb.rs",
+          "symbol_name": "semantic_search",
+          "note": "semantic_search calls AletheiaDB's find_similar_by_embedding HNSW query"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "find_similar_by_embedding",
+        "note": "rg finds the call site; 'approximate nearest-neighbour query' cannot be answered by rg without the method name",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q022",
+      "text": "how graph records are ingested and committed into persistent embedded storage",
+      "class": "persistence_query",
+      "expected": [
+        {
+          "repo_relative_path": "src/adapters/aletheiadb.rs",
+          "symbol_name": null,
+          "note": "EmbeddedAletheiaSink implements GraphSink::flush which commits all staged records to AletheiaDB"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "flush",
+        "note": "rg 'flush' finds the commit call; 'how records are ingested and committed' is a conceptual question rg can only partially answer",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q023",
+      "text": "where does the scan command serialize extracted graph nodes to line-delimited JSON output",
+      "class": "persistence_query",
+      "expected": [
+        {
+          "repo_relative_path": "src/cli.rs",
+          "symbol_name": null,
+          "note": "the Scan command handler in cli.rs serializes GraphRecord values to JSONL using to_jsonl()"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "to_jsonl",
+        "note": "rg 'to_jsonl' finds the serialization call; 'serialize extracted nodes to JSONL output' is partially answerable by rg",
+        "rg_can_answer_semantic_intent": true
+      }
+    },
+    {
+      "id": "q024",
+      "text": "how are embedding vectors associated with stored graph nodes in the database",
+      "class": "persistence_query",
+      "expected": [
+        {
+          "repo_relative_path": "src/adapters/aletheiadb.rs",
+          "symbol_name": null,
+          "note": "the adapter writes embedding vectors via EmbeddingVectorKey and stores them alongside the graph nodes in AletheiaDB"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "EmbeddingVectorKey",
+        "note": "rg finds the type; 'embedding vectors associated with stored nodes' requires knowing the type name and cannot be answered by rg from natural language alone",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q025",
+      "text": "which file handles network authentication and authorization for remote services",
+      "class": "architecture",
+      "expected": [
+        {
+          "repo_relative_path": "src/github/auth.rs",
+          "symbol_name": null,
+          "note": "auth.rs resolves GitHub tokens from env vars, token files, and gh CLI — the closed auth enumeration for remote service access"
+        },
+        {
+          "repo_relative_path": "src/github/client.rs",
+          "symbol_name": null,
+          "note": "client.rs conditionally attaches Authorization: Bearer headers to outbound GitHub REST requests"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "resolve_token",
+        "note": "rg 'resolve_token' finds the auth entry point; 'network authentication for remote services' cannot be answered by rg without knowing the function name",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q026",
+      "text": "how does the system implement user preference configuration file loading",
+      "class": "ambiguous",
+      "expected": [],
+      "rg_substitute": null
+    },
+    {
+      "id": "q027",
+      "text": "where does the database apply schema migrations between versions",
+      "class": "ambiguous",
+      "expected": [],
+      "rg_substitute": null
+    },
+    {
+      "id": "q028",
+      "text": "which module manages HTTP request routing and response handling",
+      "class": "architecture",
+      "expected": [
+        {
+          "repo_relative_path": "src/daemon.rs",
+          "symbol_name": null,
+          "note": "daemon.rs implements the loopback HTTP server: handle_request routes incoming requests and HttpResponse constructs the reply"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "handle_request",
+        "note": "rg 'handle_request' finds the routing function; 'HTTP request routing and response handling' cannot be answered by rg without knowing the function name",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q029",
+      "text": "where is the graphical user interface rendered and event loop managed",
+      "class": "ambiguous",
+      "expected": [],
+      "rg_substitute": null
+    },
+    {
+      "id": "q030",
+      "text": "how does concurrent write coordination prevent data races across threads",
+      "class": "architecture",
+      "expected": [
+        {
+          "repo_relative_path": "src/daemon.rs",
+          "symbol_name": null,
+          "note": "daemon.rs coordinates concurrent writes via an exclusive StoreLease, Arc<RwLock<EmbeddedAletheiaSink>>, and a bounded mpsc::sync_channel write queue"
+        }
+      ],
+      "rg_substitute": {
+        "keyword": "StoreLease",
+        "note": "rg 'StoreLease' finds the lease type; 'concurrent write coordination' cannot be answered by rg without knowing the synchronization mechanism",
+        "rg_can_answer_semantic_intent": false
+      }
+    },
+    {
+      "id": "q031",
+      "text": "how does the application manage plugin and extension lifecycle registration",
+      "class": "ambiguous",
+      "expected": [],
+      "rg_substitute": null
+    },
+    {
+      "id": "q032",
+      "text": "which module implements the web frontend rendering and client-side routing",
+      "class": "ambiguous",
+      "expected": [],
+      "rg_substitute": null
+    }
+  ]
+}

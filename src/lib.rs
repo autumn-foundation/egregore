@@ -6,6 +6,8 @@
 
 /// Graph ingestion adapters.
 pub mod adapters;
+/// Claude Code transcript JSONL importer (M4 agent-memory source, issue #52).
+pub mod claude_code;
 /// Command-line interface.
 pub mod cli;
 /// Codex session/rollout JSONL importer (M3 agent-memory source).
@@ -39,6 +41,9 @@ pub mod languages;
 pub mod link_evidence;
 /// Local project/task JSONL importer (issue #42).
 pub mod local_project;
+/// MCP server exposing read-only evidence-query tools (issue #53).
+#[cfg(feature = "embedded-aletheiadb")]
+pub mod mcp;
 /// Parser orchestration.
 pub mod parser;
 /// Agent-facing graph query helpers.
@@ -50,11 +55,14 @@ pub mod redaction;
 pub mod repair;
 /// Record schema-version compatibility checks.
 pub mod schema_version;
+/// Semantic search relevance evaluation harness (issue #58).
+pub mod semantic_eval;
 /// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
 pub mod traj;
 
 use std::{collections::BTreeMap, path::Path, sync::LazyLock};
 
+pub use claude_code::import_claude_code;
 pub use codex::import_codex;
 pub use decide::{DecideRequest, decide_candidate};
 pub use error::{CodegraphError, Result};

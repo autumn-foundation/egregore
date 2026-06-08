@@ -781,6 +781,12 @@ enum ErrorCode {
     /// Added by #19 (user-context schema): a durable user-context record lacks
     /// a referenced approval decision.
     UnapprovedDurableUserContext,
+    /// Added by #59 (daemon semantic search): the store has no embedding vector
+    /// index, so `semantic_search` cannot run. Re-ingest with `--embed`.
+    MissingSemanticIndex,
+    /// Added by #59 (daemon semantic search): the query vector dimensionality
+    /// disagrees with the store's embedding index dimensionality.
+    IncompatibleEmbeddingDimension,
 }
 
 impl ErrorCode {
@@ -815,6 +821,8 @@ impl ErrorCode {
             Self::UnknownSchemaVersion => UNKNOWN_SCHEMA_VERSION_CODE,
             Self::InsufficientPromotionEvidence => "insufficient_promotion_evidence",
             Self::UnapprovedDurableUserContext => "unapproved_durable_user_context",
+            Self::MissingSemanticIndex => "missing_semantic_index",
+            Self::IncompatibleEmbeddingDimension => "incompatible_embedding_dimension",
         }
     }
 
@@ -844,7 +852,9 @@ impl ErrorCode {
             | Self::DriftRecordImmutable
             | Self::UnknownSchemaVersion
             | Self::InsufficientPromotionEvidence
-            | Self::UnapprovedDurableUserContext => 422,
+            | Self::UnapprovedDurableUserContext
+            | Self::MissingSemanticIndex
+            | Self::IncompatibleEmbeddingDimension => 422,
         }
     }
 }
@@ -974,6 +984,32 @@ impl ApiError {
 
     fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::InternalError, message)
+    }
+
+    /// The store has no embedding vector index; semantic search is impossible
+    /// until the store is re-ingested with `--embed` (issue #59 / AC5).
+    #[cfg(feature = "embeddings")]
+    fn missing_semantic_index() -> Self {
+        Self::new(
+            ErrorCode::MissingSemanticIndex,
+            "store has no semantic embedding index; re-ingest with --embed to enable semantic search",
+        )
+    }
+
+    /// The query vector dimensionality disagrees with the store's embedding
+    /// index dimensionality (issue #59 / AC5).
+    #[cfg(feature = "embeddings")]
+    fn incompatible_embedding_dimension(expected: usize, got: usize) -> Self {
+        Self {
+            status: 422,
+            code: ErrorCode::IncompatibleEmbeddingDimension,
+            message: format!(
+                "query embedding has {got} dimensions but the store's semantic index expects {expected}"
+            ),
+            field: Some("params.query_vector".to_owned()),
+            retry_after_ms: None,
+            partial_result: None,
+        }
     }
 
     fn inline_payload_exceeds_ceiling(message: impl Into<String>) -> Self {
@@ -7155,6 +7191,11 @@ const DEFAULT_QUERY_MAX_RESULTS: usize = 5_000;
 const DEFAULT_QUERY_TIMEOUT_MS: u64 = 5_000;
 const DRIFT_TOP_N_DEFAULT: usize = 10;
 const DRIFT_TOP_N_MAX: usize = 100;
+/// Default and ceiling result counts for the `semantic_search` verb (issue #59).
+#[cfg(feature = "embeddings")]
+const SEMANTIC_SEARCH_DEFAULT: usize = 10;
+#[cfg(feature = "embeddings")]
+const SEMANTIC_SEARCH_MAX: usize = 100;
 
 /// Returns the current instant as an RFC3339 timestamp for `result.snapshot`.
 fn rfc3339_now() -> String {
@@ -7973,6 +8014,155 @@ fn handle_verb_drift_top_n(
         Some(request_id),
         200,
         verb_success_result("drift_top_n", &snapshot, &result_records),
+    )
+}
+
+// ── Verb handler: semantic_search (issue #59) ────────────────────────────────
+
+/// Shapes one embedded semantic match into the daemon query-row JSON.
+///
+/// Field parity with the embedded `eg query semantic` output contract
+/// (`SemanticResult`): `record_id` and `score` are always present; `name`,
+/// `repo_relative_path`, and `span` are omitted when absent (the documented
+/// absent-span rule). No raw content, summary text, or evidence/verification
+/// classification is ever emitted — semantic rows are bounded retrieval leads
+/// only (AC2/AC6/AC7).
+#[cfg(feature = "embeddings")]
+fn semantic_match_to_query_json(m: &crate::adapters::SemanticMatch) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("record_id".to_owned(), json!(m.record_id));
+    if let Some(name) = &m.name {
+        obj.insert("name".to_owned(), json!(name));
+    }
+    if let Some(path) = &m.repo_relative_path {
+        obj.insert("repo_relative_path".to_owned(), json!(path));
+    }
+    obj.insert("score".to_owned(), json!(m.score));
+    if let Some(span) = &m.span {
+        obj.insert("span".to_owned(), json!(span));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Runs a daemon-backed semantic code search over the shared embedded store.
+///
+/// The caller supplies a query embedding vector (`params.query_vector`); the
+/// daemon performs the same vector similarity search the embedded
+/// `eg query semantic` path uses. No model is loaded daemon-side, no remote
+/// embedding service is contacted, and there is no background indexing — the
+/// slice reuses the existing semantic ingest/query behavior (issue #59).
+///
+/// Stable diagnostics: `missing_semantic_index` when the store has no embedding
+/// index, `incompatible_embedding_dimension` when the vector width disagrees,
+/// `missing_field`/`bad_request` for malformed params, and `query_timeout` when
+/// the budget elapses. A no-match is a successful empty result, never a fallback
+/// to direct embedded reads.
+#[cfg(feature = "embeddings")]
+fn handle_verb_semantic_search(
+    request_id: &str,
+    params: &serde_json::Value,
+    budget_limit: usize,
+    started: Instant,
+    budget: Option<Duration>,
+    state: &ServerState,
+) -> HttpResponse {
+    let Some(vector_value) = params.get("query_vector") else {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::missing_field("params.query_vector"),
+        );
+    };
+    let Some(raw) = vector_value.as_array() else {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request_field(
+                "params.query_vector must be an array of numbers",
+                "params.query_vector",
+            ),
+        );
+    };
+    if raw.is_empty() {
+        return HttpResponse::error_with_id(
+            request_id,
+            ApiError::bad_request_field(
+                "params.query_vector must be a non-empty array",
+                "params.query_vector",
+            ),
+        );
+    }
+    let mut query_vector = Vec::with_capacity(raw.len());
+    for entry in raw {
+        match entry.as_f64() {
+            Some(value) if value.is_finite() => {
+                #[allow(clippy::cast_possible_truncation)]
+                query_vector.push(value as f32);
+            }
+            _ => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request_field(
+                        "params.query_vector must contain only finite numbers",
+                        "params.query_vector",
+                    ),
+                );
+            }
+        }
+    }
+
+    let params_limit = match params.get("limit") {
+        None => SEMANTIC_SEARCH_DEFAULT,
+        Some(v) => match v.as_u64() {
+            Some(n) => usize::try_from(n).unwrap_or(SEMANTIC_SEARCH_MAX),
+            None => {
+                return HttpResponse::error_with_id(
+                    request_id,
+                    ApiError::bad_request("params.limit must be a non-negative integer"),
+                );
+            }
+        },
+    }
+    .min(SEMANTIC_SEARCH_MAX);
+    let effective_limit = params_limit.min(budget_limit);
+
+    let sink = match query_sink_read(state, started, budget) {
+        Ok(sink) => sink,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+    let snapshot = rfc3339_now();
+
+    match sink.embedding_index_dimensions() {
+        None => {
+            return HttpResponse::error_with_id(request_id, ApiError::missing_semantic_index());
+        }
+        Some(dim) if dim != query_vector.len() => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::incompatible_embedding_dimension(dim, query_vector.len()),
+            );
+        }
+        Some(_) => {}
+    }
+
+    let matches = match sink.semantic_search(&query_vector, effective_limit) {
+        Ok(matches) => matches,
+        Err(e) => return HttpResponse::error_with_id(request_id, adapter_read_error_to_api(e)),
+    };
+    drop(sink);
+
+    // Enforce timeout after the search CPU phase.
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
+
+    let result_records = matches
+        .iter()
+        .map(semantic_match_to_query_json)
+        .collect::<Vec<_>>();
+
+    HttpResponse::success(
+        Some(request_id),
+        200,
+        verb_success_result("semantic_search", &snapshot, &result_records),
     )
 }
 
@@ -8818,6 +9008,22 @@ fn handle_query(request: &HttpRequest, state: &ServerState) -> HttpResponse {
             budget,
             state,
         ),
+        "semantic_search" => {
+            #[cfg(feature = "embeddings")]
+            {
+                handle_verb_semantic_search(&request_id, &params, limit, started, budget, state)
+            }
+            #[cfg(not(feature = "embeddings"))]
+            {
+                HttpResponse::error_with_id(
+                    &request_id,
+                    ApiError::new(
+                        ErrorCode::NotImplemented,
+                        "verb 'semantic_search' requires the daemon to be built with the 'embeddings' feature",
+                    ),
+                )
+            }
+        }
         "drift" | "agent_sessions_for_repo" => HttpResponse::error_with_id(
             &request_id,
             ApiError::new(
