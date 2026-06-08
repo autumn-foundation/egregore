@@ -8557,28 +8557,70 @@ fn query_verb_conformance() {
         );
     }
 
-    // ── (c) as_of.transaction_time set → not_implemented ──────────────────────
+    // ── (c) as_of.transaction_time on symbol_by_name → implemented (issue #66) ──
+    // Scanned current-tree symbols carry an inferred valid_time equal to the
+    // scan's wall-clock instant, which resolves as their transaction time. A
+    // far-future tx-as-of therefore includes them; a far-past tx-as-of excludes
+    // them with a before_first_transaction diagnostic (no current-state fallback).
     {
         let res = http_json(
             &metadata,
             "POST",
             "/v1/query",
             &serde_json::json!({
-                "request_id": "vqc-tx-time",
+                "request_id": "vqc-tx-time-future",
                 "agent_id": "verb-test-agent",
                 "verb": "symbol_by_name",
-                "params": { "name": "Widget" },
-                "as_of": { "transaction_time": "2026-01-01T00:00:00Z" }
+                "params": { "name": "nested::Widget" },
+                "as_of": { "transaction_time": "2099-01-01T00:00:00Z" }
+            }),
+        );
+        assert!(
+            res.starts_with("HTTP/1.1 200"),
+            "as_of.transaction_time on symbol_by_name must be implemented (200), got {res}"
+        );
+        let body = response_json(&res);
+        assert_eq!(body["ok"], true, "tx query must be ok, got {body}");
+        assert_ne!(
+            body["error"]["code"], "not_implemented",
+            "as_of.transaction_time must no longer be reserved, got {body}"
+        );
+        let records = body["result"]["records"].as_array().expect("records array");
+        assert!(
+            !records.is_empty(),
+            "far-future tx-as-of must include scanned symbols, got {body}"
+        );
+        // AC5: every returned row carries a transaction-time handle.
+        assert!(
+            records
+                .iter()
+                .all(|r| r["transaction_time"].as_str().is_some()),
+            "every tx row must carry a transaction_time handle, got {body}"
+        );
+    }
+
+    // ── (c2) as_of.transaction_time on a non-symbol verb → not_implemented ─────
+    {
+        let res = http_json(
+            &metadata,
+            "POST",
+            "/v1/query",
+            &serde_json::json!({
+                "request_id": "vqc-tx-time-unsupported",
+                "agent_id": "verb-test-agent",
+                "verb": "file_defines",
+                "params": { "repo_relative_path": "src/lib.rs" },
+                "as_of": { "transaction_time": "2099-01-01T00:00:00Z" }
             }),
         );
         assert!(
             res.starts_with("HTTP/1.1 501"),
-            "as_of.transaction_time should return 501, got {res}"
+            "transaction_time on a non-symbol verb stays reserved (501), got {res}"
         );
         let body = response_json(&res);
         assert_eq!(
             body["error"]["code"], "not_implemented",
-            "as_of.transaction_time must return not_implemented, got {body}"
+            "non-symbol tx query must return not_implemented, got {body}"
         );
     }
 

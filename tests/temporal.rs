@@ -173,11 +173,15 @@ fn cli_rejects_as_of_and_at_together() {
 }
 
 // ---------------------------------------------------------------------------
-// (d) --tx-as-of returns a not_implemented error envelope
+// (d) --tx-as-of is implemented (issue #66) and works on history-replay data:
+//     history-backed records resolve their transaction-time handle from
+//     `temporal.observed_at` (the commit timeline that replay reconstructs), so
+//     the documented `scan-history` + `--tx-as-of` workflow returns a prior view
+//     instead of excluding every row.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn tx_as_of_returns_not_implemented_envelope() {
+fn tx_as_of_uses_history_temporal_metadata() {
     let (_temp, graph) = fixture_temporal_graph();
 
     let output = CargoCommand::cargo_bin("egregore")
@@ -187,7 +191,7 @@ fn tx_as_of_returns_not_implemented_envelope() {
         .arg(&graph)
         .args(["--tx-as-of", "2026-01-02T00:00:00Z"])
         .assert()
-        .failure()
+        .success()
         .get_output()
         .stdout
         .clone();
@@ -195,14 +199,36 @@ fn tx_as_of_returns_not_implemented_envelope() {
     let stdout = String::from_utf8(output).expect("utf8 stdout");
     let envelope: Value =
         serde_json::from_str(stdout.trim()).expect("--tx-as-of output must be valid JSON");
-    assert_eq!(envelope["ok"], false, "envelope.ok must be false");
-    assert_eq!(
+    assert_eq!(envelope["ok"], true, "envelope.ok must be true");
+    assert_ne!(
         envelope["error"]["code"], "not_implemented",
-        "envelope.error.code must be not_implemented"
+        "--tx-as-of must no longer be reserved"
+    );
+
+    let records = envelope["records"].as_array().expect("records array");
+    let tx_times: Vec<&str> = records
+        .iter()
+        .filter_map(|r| r["transaction_time"].as_str())
+        .collect();
+    // The fixture's three commit snapshots are observed at 2026-01-01/02/03.
+    // tx-as-of 2026-01-02 includes the first two and excludes the 2026-01-03 one.
+    assert!(
+        tx_times.contains(&"2026-01-01T00:00:00Z") && tx_times.contains(&"2026-01-02T00:00:00Z"),
+        "history rows at or before the instant must be returned, got {tx_times:?}"
     );
     assert!(
-        envelope["error"]["message"].as_str().is_some(),
-        "envelope.error.message must be present"
+        !tx_times.contains(&"2026-01-03T00:00:00Z"),
+        "the later commit snapshot must be excluded, got {tx_times:?}"
+    );
+    let codes: Vec<&str> = envelope["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .filter_map(|d| d["code"].as_str())
+        .collect();
+    assert!(
+        !codes.contains(&"missing_transaction_metadata"),
+        "history rows now resolve a transaction handle; must not be reported missing, got {codes:?}"
     );
 }
 

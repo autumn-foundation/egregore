@@ -61,7 +61,7 @@ means "do not filter on this axis."
 |-----|------|-----------|
 | `as_of` | Valid time | Return the most-recent record whose `valid_time ≤ as_of` |
 | `since` | Valid time | Return all records with `valid_time ≥ since` |
-| `tx_as_of` | Transaction time | **Reserved — not yet implemented** |
+| `tx_as_of` | Transaction time | Return, per stable record ID, the version the store knew at or before `tx_as_of` (issue #66) |
 | `tx_since` | Transaction time | **Reserved — not yet implemented** |
 
 `as_of` and `since` are mutually exclusive with each other.  `tx_as_of` / `tx_since` are
@@ -77,32 +77,165 @@ The `egregore query symbol` subcommand exposes the following temporal flags:
 |------|-----------|------|-----------|
 | `--as-of <RFC3339>` | | Valid time | Point-in-time look-up |
 | `--at <commit-sha>` | | Valid time | Point-in-time by commit (existing flag) |
-| `--tx-as-of <RFC3339>` | | Transaction time | Returns `not_implemented` envelope |
+| `--tx-as-of <RFC3339>` | | Transaction time | Prior store view (issue #66); combinable with `--as-of` |
 
 `--as-of` and `--at` are **mutually exclusive** (enforced by clap `conflicts_with`).
+`--tx-as-of` may be combined with `--as-of` (two-axis query) but **not** with
+`--at` (the latter pins the valid axis to a commit; combining them is an
+`unsupported_combination` error).
 
 ### Exit Codes
 
 | Exit code | Meaning |
 |-----------|---------|
-| `0` | Match found; one JSONL line printed per record |
-| `2` | No match / invalid query (includes conflicting flags) |
-| `1` | `not_implemented` envelope printed to stdout |
+| `0` | Query ran; results in the envelope (an empty `records` list with diagnostics is still exit 0) |
+| `2` | No match for the plain (non-`--tx-as-of`) `query symbol` path |
+| `1` | `--tx-as-of` query rejected before running (malformed timestamp / unsupported flag combination) |
 
-### `not_implemented` Envelope
+### Transaction-time workflow (shortest local `eg` form)
 
-When `--tx-as-of` is supplied the CLI exits with code 1 and prints the following JSON
-to stdout:
+Seed or export a local store as JSONL (no daemon, no network), then ask what the
+graph knew at a chosen transaction instant:
+
+```sh
+# What did the store know about `widget` before the 2026-01-03 re-import?
+eg query symbol widget --graph store.jsonl --tx-as-of 2026-01-02T00:00:00Z
+
+# Two-axis: what was TRUE at valid-time V, as KNOWN BY transaction-time T?
+eg query symbol widget --graph store.jsonl \
+  --tx-as-of 2026-01-04T00:00:00Z --as-of 2026-01-02T00:00:00Z
+```
+
+The same query runs against a running daemon with `--daemon --data-dir <dir>`,
+and against the embedded store with `--data-dir <dir>`.
+
+#### Which prior versions the embedded store / daemon can see
+
+A `--tx-as-of` query can only return versions the store actually **retained**:
+
+- **History-replay (`scan-history`) records** keep every commit snapshot, so the
+  embedded store and daemon return the full prior view across the commit
+  timeline. This is the supported path for code-graph corrections over time.
+- **Project/task records** are append-with-same-entity-id; every physical
+  mutation is retained and visible to `--tx-as-of`.
+- **Non-temporal records re-ingested under the same stable ID** (a corrected
+  `scan` symbol or agent-memory observation): each write creates a new physical
+  node and only the current-state index advances, so prior versions remain in the
+  store. Current-state reads return the latest version, while `--tx-as-of`
+  queries use a history-inclusive read that also surfaces the superseded prior
+  versions — so a between-instant query returns the version known at that
+  transaction time. (Distinguishing them requires distinct `transaction_time` /
+  `ingested_at` stamps on each version; versions without a transaction handle are
+  reported as `missing_transaction_metadata`.) The `--graph <jsonl>` path
+  likewise preserves every written line.
+
+#### History removal, commit ordering, and multi-repository stores
+
+`scan-history` emits a full symbol snapshot at every commit, so a symbol that is
+present at a commit always has a version stamped there. A `--tx-as-of` query
+therefore treats a queried symbol as **removed** when its latest snapshot known
+by the instant predates the *active commit* — the latest commit the store knew by
+then. Removed symbols are excluded with an `absent_at_transaction` diagnostic.
+
+Two properties make this robust:
+
+- **Same-second commits.** Git commit timestamps are only second-resolution and
+  batch-created commits frequently share a second, so a timestamp comparison
+  alone cannot order them. The active commit is compared by the composite key
+  `(committer date, commit topological rank)`, where the rank is derived from the
+  `git_parent_commits` DAG carried on each record. A descendant always outranks
+  its ancestors, so a removal made in a same-second child commit is still
+  detected. The same `(time, rank)` key breaks equal-`transaction_time` ties when
+  selecting the latest version of a single stable ID (the later/child version
+  wins); non-history records fall back to input order.
+- **Multiple repositories in one store.** Removal detection is scoped to the
+  queried symbol's own **commit-graph component**. Disjoint histories — for
+  example, `scan-history` output from two repositories sharing one store — never
+  connect through parent links, so a later commit in one repository never makes a
+  symbol from another repository look removed.
+
+Removal detection applies to the transaction axis only. When `--as-of` (a
+valid-time instant) is also supplied, the query asks "what was true at valid time
+V, as known by T"; a row that was genuinely true at V is returned even if the
+symbol was later removed.
+
+### Response envelope
+
+`--tx-as-of` returns a single JSON object (not bare JSONL rows):
 
 ```json
 {
-  "ok": false,
-  "error": {
-    "code": "not_implemented",
-    "message": "--tx-as-of: transaction-time queries are reserved and not yet implemented for JSONL queries; see docs/schema/temporal-selectors.md"
-  }
+  "ok": true,
+  "verb": "symbol",
+  "name": "widget",
+  "tx_as_of": "2026-01-02T00:00:00Z",
+  "as_of": null,
+  "snapshot": "2026-01-02T00:00:00Z",
+  "records": [
+    {
+      "record_id": "codegraph:v4:...",
+      "schema_version": 4,
+      "name": "widget",
+      "kind": "Symbol",
+      "domain": "codegraph",
+      "trust_class": "source_fact",
+      "repo_relative_path": "src/lib.rs",
+      "span": { "start_line": 1, "end_line": 5, "start_byte": 0, "end_byte": 100 },
+      "valid_time": "2026-01-01T00:00:00Z",
+      "valid_time_source": "author_provided",
+      "transaction_time": "2026-01-01T00:00:00Z"
+    }
+  ],
+  "diagnostics": [],
+  "page": { "cursor": null, "has_more": false, "returned": 1 }
 }
 ```
+
+Every row carries a stable `record_id`, a `schema_version`, a `domain` and
+`trust_class`, valid-time fields when present, a `transaction_time` handle, and a
+citable source handle (`repo_relative_path` + `span`). Rows never contain raw
+record bodies, summaries, transcript text, command output, patch hunks, issue or
+PR bodies, environment values, tokens, or protected payloads — only bounded
+handles, hashes, IDs, and counts.
+
+### Diagnostics (stable, machine-readable)
+
+A `--tx-as-of` query **never silently falls back to current state.** Edge cases
+are reported as `diagnostics[]` entries (the query still succeeds with exit 0) or,
+for malformed input, as a top-level `error` (exit 1):
+
+| Code | Kind | Meaning |
+|------|------|---------|
+| `invalid_timestamp` | error (exit 1) | `--tx-as-of` or `--as-of` is not RFC 3339 |
+| `unsupported_combination` | error (exit 1) | `--tx-as-of` combined with `--at` |
+| `before_first_transaction` | diagnostic | instant precedes the earliest known transaction; empty view |
+| `after_latest_transaction` | diagnostic | instant at/after the latest known transaction; view reflects all known history |
+| `superseded` | diagnostic | a matched record is `superseded_by` another record that is also known by the instant; excluded |
+| `missing_transaction_metadata` | diagnostic | a matched record has no transaction-time stamp; excluded (no current-state fallback) |
+| `invalid_record_transaction_time` | diagnostic | a matched record's `transaction_time` is unparseable; excluded |
+| `no_named_symbol` | diagnostic | no Symbol with the queried name exists in the store |
+
+### When to use `--tx-as-of` vs. the boring substitutes
+
+- **`--tx-as-of`** — "what did *Egregore* know at time T?" Use it to audit the
+  graph's own memory before a re-import, correction, redaction-policy change, or
+  schema migration changed the view.
+- **`--as-of` / `--at`** — "what was *true in the domain* at valid time V / at
+  commit C?" Use these for the real-world/code timeline, not the store timeline.
+- **`git log -S` / `git blame`** — valid-time code history (when a line/symbol
+  changed in the source). They cannot say what the graph had ingested, redacted,
+  corrected, or linked at a prior store-observation time.
+- **`rg` / `jq` over a JSONL export** — fine when you already have the right file,
+  but they offer no first-class transaction-time view and will happily read
+  current-state corrections as if they were known earlier.
+- **Existing evidence-query workflows** (`eg query context`, memory evidence
+  audits, prior-failure queries) — answer "what evidence supports X," not "pin
+  the view to a store instant."
+
+> **Transaction-time answers mean "known by Egregore *then*," not "objectively
+> true forever."** A row returned for `--tx-as-of T` reflects what the store had
+> recorded by T; a later correction may have superseded it. The transaction axis
+> is an audit lens on the store's memory, not a truth oracle.
 
 ---
 
@@ -126,14 +259,24 @@ to stdout:
 
 ## Per-Domain Mapping Table
 
+`tx_as_of` resolves a record's transaction-time handle from its body fields, in
+priority order: explicit `transaction_time` → `ingested_at` → `valid_time` when
+`valid_time_source == "inferred_from_transaction_time"` (current-tree scans set
+`valid_time` to the scan's wall-clock instant, which *is* the transaction time) →
+`temporal.observed_at` for history-replay (`scan-history`) records. Replayed
+history has only the commit timeline as a store-observation timeline, so the
+transaction axis collapses onto it for that data. A record with no resolvable
+transaction-time handle is **excluded** with a `missing_transaction_metadata`
+diagnostic — never treated as current state.
+
 | Domain | `as_of` resolves against | `tx_as_of` resolves against | Notes |
 |--------|-------------------------|-----------------------------|-------|
-| `code_graph` | `valid_time` on node | transaction log (reserved) | Use `scan-history` to build the history |
-| `agent_memory` | `valid_time` on node | transaction log (reserved) | Agent must set `valid_time` |
-| `project` | `valid_time` on node | transaction log (reserved) | |
-| `artifact` | `valid_time` on node | transaction log (reserved) | |
-| `verification` | `valid_time` on node | transaction log (reserved) | |
-| `user_context` | `valid_time` on node | transaction log (reserved) | Session-scoped; usually point-in-time |
+| `code_graph` | `valid_time` on node | `transaction_time`; else inferred-from-tx `valid_time` (current scan); else `temporal.observed_at` (history replay) | Use `scan-history` to build the history |
+| `agent_memory` | `valid_time` on node | `ingested_at` | Agent must set `valid_time` |
+| `project` | `valid_time` on node | `transaction_time` | |
+| `artifact` | `valid_time` on node | `transaction_time` / `ingested_at` | |
+| `verification` | `valid_time` on node | `transaction_time` / `ingested_at` | |
+| `user_context` | `valid_time` on node | `transaction_time` / `ingested_at` | Session-scoped; usually point-in-time |
 
 ---
 
@@ -147,7 +290,9 @@ scanners carry `SCHEMA_VERSION = 1` and may omit these fields.
 
 ## Relationship to daemon-api.md
 
-The daemon query API (`POST /v1/query`) will accept a `selector` object following this
-grammar in a future release.  Until `tx_as_of` / `tx_since` are implemented, any request
-including those fields must receive a `not_implemented` error response.  See
-[daemon-api.md](daemon-api.md) for the envelope format.
+The daemon query API (`POST /v1/query`) accepts an `as_of` selector object following
+this grammar. `as_of.valid_time` and `as_of.transaction_time` are implemented for the
+`symbol_by_name` verb (issue #66); `as_of.transaction_time` on any other verb, and
+`as_of.since` on every verb, still return a `not_implemented` (HTTP 501) response. See
+[daemon-query.md](daemon-query.md) for the verb table and [daemon-api.md](daemon-api.md)
+for the envelope format.
