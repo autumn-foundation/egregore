@@ -3455,8 +3455,12 @@ const USER_CONTEXT_PROPOSED_BY_TARGET_KINDS: &[NodeKind] = &[
     NodeKind::Decision,
 ];
 
-const USER_CONTEXT_CONTRADICTS_TARGET_KINDS: &[NodeKind] =
-    &[NodeKind::Preference, NodeKind::WorkflowRule];
+const USER_CONTEXT_CONTRADICTS_TARGET_KINDS: &[NodeKind] = &[
+    NodeKind::Preference,
+    NodeKind::WorkflowRule,
+    NodeKind::NamingDecision,
+    NodeKind::Constraint,
+];
 
 const USER_CONTEXT_NAMING_ENTITY_KINDS: &[&str] = &[
     "crate", "module", "type", "function", "field", "feature", "other",
@@ -3783,6 +3787,391 @@ fn validate_promote_candidate(
     Ok(edges)
 }
 
+pub(crate) fn validate_promote_candidate_for_cli(
+    candidate: &GraphRecord,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> Result<Vec<GraphRecord>> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        schema_version,
+        domain,
+        confidence,
+        superseded_by,
+        evidence_quality,
+        valid_time,
+        valid_time_source,
+        user_context,
+        ..
+    } = candidate
+    else {
+        return Err(anyhow!("Candidate is not a node record"));
+    };
+    validate_user_context_node_base(
+        id,
+        *kind,
+        *schema_version,
+        domain.as_deref(),
+        valid_time.as_deref(),
+        valid_time_source.as_deref(),
+    )
+    .map_err(|e| anyhow!("validation failed: {}", e.message))?;
+
+    let edges = validate_promote_candidate(
+        id,
+        confidence.as_deref(),
+        superseded_by.as_deref(),
+        evidence_quality.as_deref(),
+        user_context,
+        records,
+        sink,
+    )
+    .map_err(|e| anyhow!("validation failed: {}", e.message))?;
+
+    Ok(edges)
+}
+
+/// Validates a user-context record copied during CLI decision workflow
+/// against daemon-level user-context node/edge validation rules.
+///
+/// # Errors
+///
+/// Returns an error if validation fails.
+pub fn validate_user_context_record_for_cli(
+    record: &GraphRecord,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> Result<Vec<GraphRecord>> {
+    let mut synthesized_edges = Vec::new();
+    match record {
+        GraphRecord::Node {
+            id,
+            kind,
+            schema_version,
+            domain,
+            confidence,
+            superseded_by,
+            evidence_quality,
+            valid_time,
+            valid_time_source,
+            user_context,
+            ..
+        } => {
+            let is_user_context = id.starts_with("user_context:v1:")
+                || domain.as_deref() == Some("user_context")
+                || USER_CONTEXT_NODE_KINDS.contains(kind);
+            if !is_user_context {
+                if !user_context.is_empty() {
+                    anyhow::bail!(
+                        "non-user-context node '{id}' must not carry user-context fields"
+                    );
+                }
+                return Ok(Vec::new());
+            }
+            validate_user_context_node_base(
+                id,
+                *kind,
+                *schema_version,
+                domain.as_deref(),
+                valid_time.as_deref(),
+                valid_time_source.as_deref(),
+            )
+            .map_err(|e| anyhow!("validation failed: {}", e.message))?;
+
+            match kind {
+                NodeKind::PromoteCandidate => {
+                    let edges = validate_promote_candidate(
+                        id,
+                        confidence.as_deref(),
+                        superseded_by.as_deref(),
+                        evidence_quality.as_deref(),
+                        user_context,
+                        records,
+                        sink,
+                    )
+                    .map_err(|e| anyhow!("validation failed: {}", e.message))?;
+                    synthesized_edges.extend(edges);
+                }
+                NodeKind::PromotionPrompt => {
+                    validate_promotion_prompt(id, user_context, records, sink)
+                        .map_err(|e| anyhow!("validation failed: {}", e.message))?;
+                }
+                NodeKind::PromotionDecision => {
+                    validate_promotion_decision(id, user_context, records, sink)
+                        .map_err(|e| anyhow!("validation failed: {}", e.message))?;
+                }
+                NodeKind::Preference
+                | NodeKind::WorkflowRule
+                | NodeKind::NamingDecision
+                | NodeKind::Constraint => {
+                    validate_durable_user_context(id, *kind, user_context, records, sink)
+                        .map_err(|e| anyhow!("validation failed: {}", e.message))?;
+                }
+                _ => {}
+            }
+        }
+        GraphRecord::Edge {
+            id,
+            schema_version,
+            label,
+            source,
+            target,
+            confidence,
+            ..
+        } if id.starts_with("user_context:v1:") => {
+            validate_user_context_edge(
+                id,
+                *schema_version,
+                *label,
+                source,
+                target,
+                confidence.as_deref(),
+                records,
+                sink,
+            )
+            .map_err(|e| anyhow!("validation failed: {}", e.message))?;
+        }
+        _ => {}
+    }
+    Ok(synthesized_edges)
+}
+
+/// Validates an agent-memory record copied during CLI decision workflow
+/// against daemon-level agent memory node/edge validation rules.
+///
+/// # Errors
+///
+/// Returns an error if validation fails.
+#[allow(clippy::too_many_lines)]
+pub fn validate_agent_memory_record_for_cli(
+    record: &GraphRecord,
+    records: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> Result<()> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        schema_version,
+        evidence_links,
+        name,
+        confidence,
+        text,
+        agent_id,
+        agent_kind,
+        session_id,
+        observed_at,
+        ingested_at,
+        ..
+    } = record
+    else {
+        return Ok(());
+    };
+
+    if id.starts_with("agent_memory:v1:") {
+        if !AGENT_MEMORY_NODE_KINDS.contains(kind) {
+            anyhow::bail!(
+                "node kind '{}' is not permitted under the agent_memory:v1: namespace; use codegraph: IDs for code-graph nodes",
+                kind.as_str()
+            );
+        }
+        if *schema_version != AGENT_MEMORY_SCHEMA_VERSION {
+            anyhow::bail!(
+                "agent-memory node '{id}' has schema_version {schema_version} but only version {AGENT_MEMORY_SCHEMA_VERSION} is accepted"
+            );
+        }
+        let links = evidence_links.as_deref().unwrap_or(&[]);
+        if *kind == NodeKind::Observation && links.is_empty() {
+            anyhow::bail!("evidence_links (Observation requires at least one evidence link)");
+        }
+        for link in links {
+            if link.confidence.is_empty() {
+                anyhow::bail!("evidence_links[].confidence (required)");
+            }
+            let conf_val: f64 = link.confidence.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "evidence_links[].confidence '{}' must be a numeric float string",
+                    link.confidence
+                )
+            })?;
+            if !(0.0..=1.0).contains(&conf_val) {
+                anyhow::bail!(
+                    "evidence_links[].confidence '{}' must be in the range [0.0, 1.0]",
+                    link.confidence
+                );
+            }
+            let edge_label = EdgeLabel::from_relation(&link.relation).ok_or_else(|| {
+                anyhow::anyhow!("unknown evidence link relation '{}'", link.relation)
+            })?;
+            if !edge_label.is_evidence_link_label() {
+                anyhow::bail!(
+                    "evidence link relation '{}' is a codegraph-internal label and may not be used in evidence links",
+                    link.relation
+                );
+            }
+            match edge_label {
+                EdgeLabel::Observes
+                | EdgeLabel::MentionsSymbol
+                | EdgeLabel::TouchedFile
+                | EdgeLabel::ExplainsChange
+                    if link.target_domain != "codegraph" =>
+                {
+                    anyhow::bail!(
+                        "evidence link relation '{}' requires target_domain 'codegraph'; got '{}'",
+                        edge_label.as_str(),
+                        link.target_domain
+                    );
+                }
+                EdgeLabel::FailedOn
+                    if !matches!(link.target_domain.as_str(), "codegraph" | "agent_memory") =>
+                {
+                    anyhow::bail!(
+                        "evidence link relation '{}' requires target_domain 'codegraph' or legacy 'agent_memory'; got '{}'",
+                        edge_label.as_str(),
+                        link.target_domain
+                    );
+                }
+                EdgeLabel::ValidatedBy | EdgeLabel::HasEvidence
+                    if !matches!(link.target_domain.as_str(), "agent_memory" | "verification") =>
+                {
+                    anyhow::bail!(
+                        "evidence link relation '{}' requires target_domain 'agent_memory' or 'verification'; got '{}'",
+                        edge_label.as_str(),
+                        link.target_domain
+                    );
+                }
+                EdgeLabel::Supersedes if link.target_domain != "agent_memory" => {
+                    anyhow::bail!(
+                        "evidence link relation '{}' requires target_domain 'agent_memory'; got '{}'",
+                        edge_label.as_str(),
+                        link.target_domain
+                    );
+                }
+                EdgeLabel::ReferencesTask if link.target_domain != "project" => {
+                    anyhow::bail!(
+                        "evidence link relation '{}' requires target_domain 'project'; got '{}'",
+                        edge_label.as_str(),
+                        link.target_domain
+                    );
+                }
+                EdgeLabel::ClosesAcceptanceCriterion
+                | EdgeLabel::OwnedByTask
+                | EdgeLabel::ExternalHandle
+                | EdgeLabel::TouchesFile => {
+                    anyhow::bail!(
+                        "evidence link relation '{}' is project-only and must be written as a project edge",
+                        edge_label.as_str()
+                    );
+                }
+                EdgeLabel::ProducedPatch if link.target_domain != "artifact" => {
+                    anyhow::bail!(
+                        "evidence link relation '{}' requires target_domain 'artifact'; got '{}'",
+                        edge_label.as_str(),
+                        link.target_domain
+                    );
+                }
+                EdgeLabel::ProducedEvidence if link.target_domain != "verification" => {
+                    anyhow::bail!(
+                        "evidence link relation '{}' requires target_domain 'verification'; got '{}'",
+                        edge_label.as_str(),
+                        link.target_domain
+                    );
+                }
+                _ => {}
+            }
+            let (target_id, _) = resolve_evidence_target(link, sink, records).map_err(|e| {
+                anyhow::anyhow!("evidence link target resolution failed: {}", e.message)
+            })?;
+            let target_kind = lookup_node_kind(&target_id, records, sink).map_err(|e| {
+                anyhow::anyhow!("evidence link target lookup failed: {}", e.message)
+            })?;
+            validate_evidence_endpoint_constraints(
+                Some(*kind),
+                edge_label,
+                target_kind,
+                &target_id,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("evidence link endpoint constraints failed: {}", e.message)
+            })?;
+        }
+        let session_fields_required = *kind != NodeKind::Agent;
+        let required: &[(&str, bool)] = &[
+            ("agent_id", agent_id.as_ref().is_some_and(|s| !s.is_empty())),
+            (
+                "agent_kind",
+                agent_kind.as_ref().is_some_and(|s| !s.is_empty()),
+            ),
+            (
+                "session_id",
+                !session_fields_required || session_id.as_ref().is_some_and(|s| !s.is_empty()),
+            ),
+            (
+                "observed_at",
+                !session_fields_required || observed_at.as_ref().is_some_and(|s| !s.is_empty()),
+            ),
+            (
+                "ingested_at",
+                !session_fields_required || ingested_at.as_ref().is_some_and(|s| !s.is_empty()),
+            ),
+        ];
+        for (field, present) in required {
+            if !*present {
+                anyhow::bail!(
+                    "{} (required for agent-memory {} nodes)",
+                    field,
+                    kind.as_str()
+                );
+            }
+        }
+        if let Some(ak) = agent_kind.as_deref().filter(|s| !s.is_empty())
+            && !VALID_AGENT_KINDS.contains(&ak)
+        {
+            anyhow::bail!(
+                "agent_kind '{ak}' is not a recognized value; expected one of: {}",
+                VALID_AGENT_KINDS.join(", ")
+            );
+        }
+        for (ts_field, ts_val) in [
+            ("observed_at", observed_at.as_deref()),
+            ("ingested_at", ingested_at.as_deref()),
+        ] {
+            if let Some(ts) = ts_val.filter(|s| !s.is_empty())
+                && DateTime::parse_from_rfc3339(ts).is_err()
+            {
+                anyhow::bail!("{ts_field} '{ts}' is not a valid RFC 3339 timestamp");
+            }
+        }
+        if *kind == NodeKind::Observation && confidence.as_ref().is_none_or(String::is_empty) {
+            anyhow::bail!("confidence (required for Observation nodes)");
+        }
+        if matches!(kind, NodeKind::ToolCall | NodeKind::FileEdit)
+            && confidence.as_ref().is_some_and(|s| !s.is_empty())
+        {
+            anyhow::bail!("{} nodes must not carry confidence", kind.as_str());
+        }
+        if let Some(conf_str) = confidence.as_deref().filter(|s| !s.is_empty()) {
+            let conf_val: f64 = conf_str.parse().map_err(|_| {
+                anyhow::anyhow!("confidence '{conf_str}' must be a numeric float string")
+            })?;
+            if !(0.0..=1.0).contains(&conf_val) {
+                anyhow::bail!("confidence '{conf_str}' must be in the range [0.0, 1.0]");
+            }
+        }
+        if *kind == NodeKind::Observation && text.as_ref().is_none_or(String::is_empty) {
+            anyhow::bail!("text (required for Observation nodes)");
+        }
+        if matches!(kind, NodeKind::Agent | NodeKind::AgentSession)
+            && name.as_ref().is_none_or(String::is_empty)
+        {
+            anyhow::bail!("name (required for {} nodes)", kind.as_str());
+        }
+        validate_agent_action_record(record, records, sink)
+            .map_err(|e| anyhow!("validation failed: {}", e.message))?;
+    }
+    Ok(())
+}
+
 fn require_scope(scope: Option<&UserContextScope>, field: &'static str) -> WriteResult<()> {
     let scope = scope.ok_or_else(|| ApiError::missing_field(field))?;
     if let Some(lifecycle_phase) = scope.lifecycle_phase.as_deref() {
@@ -3859,8 +4248,8 @@ fn validate_contradicting_evidence_link(
             Ok(target_id.to_owned())
         }
         Some(kind) => Err(ApiError::bad_request(format!(
-            "PromoteCandidate.contradicting_evidence target '{target_id}' must be a Preference \
-             or WorkflowRule, got {}",
+            "PromoteCandidate.contradicting_evidence target '{target_id}' must be a Preference, \
+             WorkflowRule, NamingDecision, or Constraint, got {}",
             kind.as_str()
         ))),
         None => Err(ApiError::new(
@@ -4747,7 +5136,7 @@ fn lookup_record(
     records: &[GraphRecord],
     sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<Option<GraphRecord>> {
-    if let Some(record) = records.iter().find(|record| record.id() == id) {
+    if let Some(record) = records.iter().rfind(|record| record.id() == id) {
         return Ok(Some(record.clone()));
     }
     sink.read_back(id)
@@ -5592,7 +5981,7 @@ fn lookup_node_kind(
     batch: &[GraphRecord],
     sink: &EmbeddedAletheiaSink,
 ) -> WriteResult<Option<NodeKind>> {
-    for r in batch {
+    for r in batch.iter().rev() {
         if r.id() == id {
             return Ok(if let GraphRecord::Node { kind, .. } = r {
                 Some(*kind)

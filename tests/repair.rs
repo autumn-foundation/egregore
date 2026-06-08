@@ -549,14 +549,16 @@ fn successful_repair_leaves_daemon_start_working() {
 
     // After repair: daemon start must succeed in 100% of fixture runs
     // (use CLI binary — start_background calls current_exe() which is the test binary in tests)
-    Command::cargo_bin("egregore")
-        .unwrap()
+    let status = ProcessCommand::new(assert_cmd::cargo::cargo_bin("egregore"))
         .arg("daemon")
         .arg("start")
         .arg("--data-dir")
         .arg(&data_dir)
-        .assert()
-        .success();
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("failed to execute daemon start");
+    assert!(status.success(), "daemon start failed");
 
     // Verify the daemon is actually running
     assert!(
@@ -1030,6 +1032,18 @@ impl RunningDaemon {
             .ok();
         wait_until_stopped(&self.data_dir);
         if let Some(mut child) = self.child.take() {
+            let start = std::time::Instant::now();
+            let mut exited = false;
+            while start.elapsed() < std::time::Duration::from_secs(2) {
+                if let Ok(Some(_)) = child.try_wait() {
+                    exited = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if !exited {
+                let _ = child.kill();
+            }
             let _ = child.wait();
         }
     }

@@ -2264,6 +2264,18 @@ impl RunningDaemon {
     fn stop(&mut self) {
         stop_daemon(&self.data_dir);
         if let Some(mut child) = self.child.take() {
+            let start = std::time::Instant::now();
+            let mut exited = false;
+            while start.elapsed() < std::time::Duration::from_secs(2) {
+                if let Ok(Some(_)) = child.try_wait() {
+                    exited = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if !exited {
+                let _ = child.kill();
+            }
             let _ = child.wait();
         }
     }
