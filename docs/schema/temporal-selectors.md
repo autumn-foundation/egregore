@@ -109,6 +109,24 @@ eg query symbol widget --graph store.jsonl \
 The same query runs against a running daemon with `--daemon --data-dir <dir>`,
 and against the embedded store with `--data-dir <dir>`.
 
+#### Which prior versions the embedded store / daemon can see
+
+A `--tx-as-of` query can only return versions the store actually **retained**:
+
+- **History-replay (`scan-history`) records** keep every commit snapshot, so the
+  embedded store and daemon return the full prior view across the commit
+  timeline. This is the supported path for code-graph corrections over time.
+- **Project/task records** are append-with-same-entity-id; every physical
+  mutation is retained and visible to `--tx-as-of`.
+- **Non-temporal current-state records** (a plain `scan` symbol or an
+  agent-memory observation re-ingested under the same stable ID) are kept as a
+  single current-state version by the embedded store's contract — re-ingesting a
+  changed version overwrites the prior one at *ingest* time, so no read path can
+  recover it. To time-travel over such corrections, query the exported JSONL with
+  `--graph` (which preserves every line you wrote) or model the history through
+  `scan-history`. Retaining superseded non-temporal versions in the embedded
+  store would be a store-versioning change outside this query slice.
+
 ### Response envelope
 
 `--tx-as-of` returns a single JSON object (not bare JSONL rows):

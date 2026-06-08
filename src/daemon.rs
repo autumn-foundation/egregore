@@ -7300,7 +7300,7 @@ fn handle_verb_get_records(
 
 // ── Verb handler: symbol_by_name ──────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn handle_verb_symbol_by_name(
     request_id: &str,
     params: &serde_json::Value,
@@ -7322,6 +7322,33 @@ fn handle_verb_symbol_by_name(
         .get("kind")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
+
+    // Transaction-time axis (issue #66): validate the temporal selectors BEFORE
+    // reading the store, so a malformed instant returns 400 bad_request without
+    // paying for (or timing out on) a full store read. Field attribution matches
+    // the non-tx valid-time handler.
+    if let Some(tx_as_of) = as_of_transaction_time {
+        if let Err(e) = DateTime::parse_from_rfc3339(tx_as_of) {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::bad_request_field(
+                    format!("invalid as_of.transaction_time '{tx_as_of}': {e}"),
+                    "as_of.transaction_time",
+                ),
+            );
+        }
+        if let Some(vt) = as_of_valid_time
+            && let Err(e) = DateTime::parse_from_rfc3339(vt)
+        {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::bad_request_field(
+                    format!("invalid as_of.valid_time '{vt}': {e}"),
+                    "as_of.valid_time",
+                ),
+            );
+        }
+    }
 
     let (records, snapshot) = match load_all_records_for_verb(state, started, budget, domain) {
         Ok(r) => r,

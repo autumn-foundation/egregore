@@ -1327,9 +1327,10 @@ pub fn symbol_as_of_transaction_time<'r>(
     }
 
     // Track the earliest/latest known transaction time across all named
-    // versions so we can report before-first / after-latest conditions.
-    let mut min_tx: Option<DateTime<chrono::FixedOffset>> = None;
-    let mut max_tx: Option<DateTime<chrono::FixedOffset>> = None;
+    // versions so we can report symbol-scoped not-yet-known / after-latest
+    // conditions, distinct from the store-wide range computed below.
+    let mut name_min_tx: Option<DateTime<chrono::FixedOffset>> = None;
+    let mut name_max_tx: Option<DateTime<chrono::FixedOffset>> = None;
 
     // Best candidate per stable record ID.
     // Comparison key: (valid_time, transaction_time) when a valid-time axis is
@@ -1358,8 +1359,8 @@ pub fn symbol_as_of_transaction_time<'r>(
             continue;
         };
 
-        min_tx = Some(min_tx.map_or(tt, |m| m.min(tt)));
-        max_tx = Some(max_tx.map_or(tt, |m| m.max(tt)));
+        name_min_tx = Some(name_min_tx.map_or(tt, |m| m.min(tt)));
+        name_max_tx = Some(name_max_tx.map_or(tt, |m| m.max(tt)));
 
         // Transaction axis: exclude anything committed after the instant.
         if tt > tx_instant {
@@ -1414,25 +1415,52 @@ pub fn symbol_as_of_transaction_time<'r>(
         }
     }
 
-    // Out-of-range diagnostics (do not change the result set, only annotate it).
-    if let Some(min) = min_tx
+    // Store-wide transaction range across every record carrying a parseable
+    // transaction handle. Used to tell a truly out-of-range instant apart from
+    // an in-range instant where the *queried symbol* simply did not exist yet.
+    let mut store_min_tx: Option<DateTime<chrono::FixedOffset>> = None;
+    let mut store_max_tx: Option<DateTime<chrono::FixedOffset>> = None;
+    for r in records {
+        if let Some(tt) =
+            record_transaction_time(r).and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        {
+            store_min_tx = Some(store_min_tx.map_or(tt, |m| m.min(tt)));
+            store_max_tx = Some(store_max_tx.map_or(tt, |m| m.max(tt)));
+        }
+    }
+
+    // Out-of-range / not-yet-known diagnostics (annotate, never change the set).
+    if let Some(min) = store_min_tx
         && tx_instant < min
     {
+        // Truly before any store activity.
         diagnostics.push(TxDiagnostic {
             code: "before_first_transaction".to_owned(),
             message: format!(
-                "tx-as-of '{tx_as_of}' precedes the earliest known transaction ('{}'); empty view",
+                "tx-as-of '{tx_as_of}' precedes the earliest known store transaction ('{}'); empty view",
                 min.to_rfc3339()
             ),
         });
+    } else if let Some(name_min) = name_min_tx
+        && tx_instant < name_min
+    {
+        // In store range, but the queried symbol was introduced later: a real
+        // in-range absence, not an out-of-range query.
+        diagnostics.push(TxDiagnostic {
+            code: "symbol_not_yet_known".to_owned(),
+            message: format!(
+                "symbol '{symbol_name}' has no transaction at or before '{tx_as_of}' (first known at '{}'); empty view",
+                name_min.to_rfc3339()
+            ),
+        });
     }
-    if let Some(max) = max_tx
+    if let Some(max) = name_max_tx
         && tx_instant >= max
     {
         diagnostics.push(TxDiagnostic {
             code: "after_latest_transaction".to_owned(),
             message: format!(
-                "tx-as-of '{tx_as_of}' is at or after the latest known transaction ('{}'); view reflects all known history",
+                "tx-as-of '{tx_as_of}' is at or after the latest known transaction for symbol '{symbol_name}' ('{}'); view reflects all known history",
                 max.to_rfc3339()
             ),
         });
@@ -1503,6 +1531,51 @@ pub fn symbol_as_of_transaction_time<'r>(
             true
         }
     });
+
+    // History-replay removal detection (AC2): `scan-history` emits a full symbol
+    // snapshot per commit, so a symbol present at a commit always has a version
+    // stamped there. If the queried symbol's latest temporal version known by the
+    // instant predates the commit active at the instant (the latest commit the
+    // store knew by then, observed across all temporal records), the symbol was
+    // removed or renamed at that commit and must not be carried forward as live.
+    let is_temporal = |r: &GraphRecord| -> bool {
+        matches!(
+            r,
+            GraphRecord::Node {
+                temporal: Some(_),
+                ..
+            } | GraphRecord::Edge {
+                temporal: Some(_),
+                ..
+            }
+        )
+    };
+    let observed_le = |r: &GraphRecord| -> Option<DateTime<chrono::FixedOffset>> {
+        if !is_temporal(r) {
+            return None;
+        }
+        record_transaction_time(r)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .filter(|tt| *tt <= tx_instant)
+    };
+    let active_commit_tx = records.iter().filter_map(observed_le).max();
+    let named_temporal_latest = named.iter().copied().filter_map(observed_le).max();
+    if let (Some(active), Some(name_latest)) = (active_commit_tx, named_temporal_latest)
+        && name_latest < active
+    {
+        let removed = selected.iter().any(|r| is_temporal(r));
+        selected.retain(|r| !is_temporal(r));
+        if removed {
+            diagnostics.push(TxDiagnostic {
+                code: "absent_at_transaction".to_owned(),
+                message: format!(
+                    "symbol '{symbol_name}' was absent at the commit active at '{tx_as_of}' (last seen '{}', active commit '{}'); excluded",
+                    name_latest.to_rfc3339(),
+                    active.to_rfc3339()
+                ),
+            });
+        }
+    }
 
     selected.sort_by(|a, b| {
         span_start(a)

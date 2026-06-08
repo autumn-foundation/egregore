@@ -18,7 +18,7 @@
 use std::{fs, path::PathBuf};
 
 use aletheia_egregore::{
-    GraphRecord, SourceSpan,
+    GraphRecord, SourceSpan, TemporalMetadata,
     ir::{Graph, NodeKind, stable_id},
 };
 use assert_cmd::Command as CargoCommand;
@@ -621,7 +621,133 @@ fn tx_as_of_excludes_superseded_symbol_renamed_replacement() {
     );
 }
 
+// ── AC6: in-range absence (symbol introduced later) is distinct from
+//        out-of-range (before the whole store).
+
+#[test]
+fn tx_as_of_symbol_introduced_later_reports_not_yet_known() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    // Store first transaction is 2026-01-01 (early), the queried symbol first
+    // appears at 2026-01-03. Querying at 2026-01-02 is IN the store range but
+    // before the symbol existed → symbol_not_yet_known, not before_first.
+    let early = GraphRecord::symbol(
+        stable_id(&["node", "Symbol", "src/a.rs", "early"]),
+        "fn",
+        "src/a.rs".to_owned(),
+        span(1, 5),
+        "early".to_owned(),
+        "early".to_owned(),
+    )
+    .with_node_time(
+        "2026-01-01T00:00:00Z",
+        "author_provided",
+        "2026-01-01T00:00:00Z",
+    )
+    .with_transaction_time("2026-01-01T00:00:00Z");
+    let latecomer = GraphRecord::symbol(
+        stable_id(&["node", "Symbol", "src/b.rs", "latecomer"]),
+        "fn",
+        "src/b.rs".to_owned(),
+        span(1, 5),
+        "latecomer".to_owned(),
+        "late".to_owned(),
+    )
+    .with_node_time(
+        "2026-01-03T00:00:00Z",
+        "author_provided",
+        "2026-01-03T00:00:00Z",
+    )
+    .with_transaction_time("2026-01-03T00:00:00Z");
+    let records = vec![early, latecomer];
+
+    let result = symbol_as_of_transaction_time(&records, "latecomer", "2026-01-02T00:00:00Z", None)
+        .expect("query ok");
+    assert!(result.records.is_empty());
+    let codes: Vec<&str> = result.diagnostics.iter().map(|d| d.code.as_str()).collect();
+    assert!(
+        codes.contains(&"symbol_not_yet_known"),
+        "in-range absence must report symbol_not_yet_known, got {codes:?}"
+    );
+    assert!(
+        !codes.contains(&"before_first_transaction"),
+        "must not claim out-of-range when the instant is within the store range, got {codes:?}"
+    );
+}
+
+// ── AC2: history-replay removal — a symbol removed at a later commit must not be
+//        carried forward to `--tx-as-of` instants after the removal.
+
+#[test]
+fn tx_as_of_excludes_removed_history_symbol() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    // gone: present at commit c1 (01-01) and c2 (01-02), removed at c3.
+    // kept: present at c1, c2, AND c3 (01-03) — proves c3 is the active commit.
+    let gone_id = stable_id(&["node", "Symbol", "src/lib.rs", "gone"]);
+    let kept_id = stable_id(&["node", "Symbol", "src/lib.rs", "kept"]);
+    let mut records = Vec::new();
+    for (commit, date) in [
+        ("c1c1c1c1", "2026-01-01T00:00:00Z"),
+        ("c2c2c2c2", "2026-01-02T00:00:00Z"),
+    ] {
+        records.push(history_symbol(&gone_id, "gone", "src/lib.rs", commit, date));
+    }
+    for (commit, date) in [
+        ("c1c1c1c1", "2026-01-01T00:00:00Z"),
+        ("c2c2c2c2", "2026-01-02T00:00:00Z"),
+        ("c3c3c3c3", "2026-01-03T00:00:00Z"),
+    ] {
+        records.push(history_symbol(&kept_id, "kept", "src/lib.rs", commit, date));
+    }
+
+    // At c2 (before removal) `gone` is still live.
+    let at_c2 = symbol_as_of_transaction_time(&records, "gone", "2026-01-02T12:00:00Z", None)
+        .expect("query ok");
+    assert_eq!(at_c2.records.len(), 1, "gone is present at c2");
+
+    // After c3 (its removal commit) `gone` must be excluded with a diagnostic.
+    let after_c3 = symbol_as_of_transaction_time(&records, "gone", "2026-01-04T00:00:00Z", None)
+        .expect("query ok");
+    assert!(
+        after_c3.records.is_empty(),
+        "removed history symbol must not be carried past its removal"
+    );
+    assert!(
+        after_c3
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "absent_at_transaction"),
+        "removal must be reported, got {:?}",
+        after_c3.diagnostics
+    );
+
+    // `kept` (present at c3) is still returned after c3.
+    let kept_after = symbol_as_of_transaction_time(&records, "kept", "2026-01-04T00:00:00Z", None)
+        .expect("query ok");
+    assert_eq!(kept_after.records.len(), 1, "kept survives at c3");
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
+
+fn history_symbol(id: &str, name: &str, path: &str, commit: &str, date: &str) -> GraphRecord {
+    GraphRecord::symbol(
+        id.to_owned(),
+        "fn",
+        path.to_owned(),
+        span(1, 5),
+        name.to_owned(),
+        format!("{name} at {commit}"),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: commit.to_owned(),
+        git_parent_commits: vec![],
+        valid_time: date.to_owned(),
+        author_time: None,
+        observed_at: date.to_owned(),
+        valid_time_source: Some("git_commit_committer_date".to_owned()),
+    })
+}
 
 fn record_path(r: &GraphRecord) -> Option<&str> {
     match r {
