@@ -7599,6 +7599,7 @@ fn test_decide_rightmost_resolution_prefers_redacted() {
     }
 }
 
+#[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn test_cli_decide_copies_references_for_redacted_candidate() {
     let temp = tempfile::tempdir().unwrap();
@@ -8061,6 +8062,7 @@ fn test_audit_trail_fails_for_missing_durable_kind_specific_fields() {
     assert!(err_msg.contains("lacks triggers"));
 }
 
+#[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn test_cli_decide_copies_agent_memory_evidence_edges() {
     let temp = tempfile::tempdir().unwrap();

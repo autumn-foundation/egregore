@@ -63,3 +63,6 @@ tree-sitter-rust = "0.24.2"
 assert_cmd = "2.1.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"
+
+[profile.test]
+debug = 1
