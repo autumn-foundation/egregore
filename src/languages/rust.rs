@@ -554,12 +554,15 @@ fn _path_for_error(path: &std::path::Path) -> PathBuf {
 
 /// Normalizes source code by stripping comments and collapsing whitespace.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn normalize_code(code: &str) -> String {
     let mut result = String::new();
     let mut in_line_comment = false;
     let mut in_block_comment = false;
     let mut in_string = false;
     let mut in_char = false;
+    let mut in_raw_string = false;
+    let mut raw_string_hashes = 0;
     let mut escaped = false;
 
     let chars: Vec<char> = code.chars().collect();
@@ -574,7 +577,31 @@ pub fn normalize_code(code: &str) -> String {
         } else if in_block_comment {
             if i + 1 < chars.len() && c == '*' && chars[i + 1] == '/' {
                 in_block_comment = false;
+                result.push(' '); // Preserve a separator to prevent token concatenation
                 i += 1;
+            }
+        } else if in_raw_string {
+            let mut is_end = false;
+            if c == '"' {
+                let mut matches = true;
+                for k in 0..raw_string_hashes {
+                    if i + 1 + k >= chars.len() || chars[i + 1 + k] != '#' {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    is_end = true;
+                }
+            }
+
+            result.push(c);
+            if is_end {
+                for _ in 0..raw_string_hashes {
+                    result.push('#');
+                }
+                in_raw_string = false;
+                i += raw_string_hashes;
             }
         } else if in_string {
             if escaped {
@@ -600,6 +627,45 @@ pub fn normalize_code(code: &str) -> String {
         } else if i + 1 < chars.len() && c == '/' && chars[i + 1] == '*' {
             in_block_comment = true;
             i += 1;
+        } else if let Some((p_len, h_count)) = {
+            // Check for raw string literal start
+            let mut prefix_len = 0;
+            if c == 'r' {
+                prefix_len = 1;
+            } else if (c == 'b' || c == 'c') && i + 1 < chars.len() && chars[i + 1] == 'r' {
+                prefix_len = 2;
+            }
+            let mut is_raw_str = false;
+            let mut hashes_count = 0;
+            if prefix_len > 0 {
+                // Must not be preceded by alphanumeric/underscore (identifier part)
+                let preceded_by_ident = if i > 0 {
+                    let prev = chars[i - 1];
+                    prev.is_alphanumeric() || prev == '_'
+                } else {
+                    false
+                };
+                if !preceded_by_ident {
+                    let mut temp_idx = i + prefix_len;
+                    while temp_idx < chars.len() && chars[temp_idx] == '#' {
+                        temp_idx += 1;
+                    }
+                    if temp_idx < chars.len() && chars[temp_idx] == '"' {
+                        is_raw_str = true;
+                        hashes_count = temp_idx - (i + prefix_len);
+                    }
+                }
+            }
+            if is_raw_str {
+                Some((prefix_len, hashes_count))
+            } else {
+                None
+            }
+        } {
+            in_raw_string = true;
+            raw_string_hashes = h_count;
+            result.extend(chars[i..=(i + p_len + h_count)].iter());
+            i += p_len + h_count;
         } else if c == '"' {
             in_string = true;
             result.push(c);
@@ -672,4 +738,41 @@ pub fn normalize_file_code(code: &str) -> String {
     combined.push_str(&other_lines.join("\n"));
 
     normalize_code(&combined)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_raw_strings() {
+        // Raw strings should preserve their contents, including comments-like delimiters
+        let code = r###"
+            let a = r"hello // world";
+            let b = r#"foo /* bar */ baz"#;
+            let c = r##"nested "quotes" and // comments"##;
+        "###;
+        let normalized = normalize_code(code);
+        assert!(normalized.contains("hello // world"), "Got: {normalized}");
+        assert!(
+            normalized.contains("foo /* bar */ baz"),
+            "Got: {normalized}"
+        );
+        assert!(
+            normalized.contains("nested \"quotes\" and // comments"),
+            "Got: {normalized}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_block_comments_preserves_separator() {
+        // Block comment stripping should preserve a separator space to avoid token concatenation
+        let code = "let x = 1/* comment */+2;";
+        let normalized = normalize_code(code);
+        assert_eq!(normalized, "let x = 1 +2;");
+
+        let code2 = "let x = 1 /* comment */ +2;";
+        let normalized2 = normalize_code(code2);
+        assert_eq!(normalized2, "let x = 1 +2;");
+    }
 }

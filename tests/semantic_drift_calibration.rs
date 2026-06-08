@@ -82,3 +82,61 @@ fn eval_drift_calibrates_successfully_and_is_deterministic_across_five_runs() {
         );
     }
 }
+
+#[test]
+fn eval_drift_fails_when_corpus_escapes_temp_dir() {
+    let temp = tempdir().expect("create temp dir");
+    let corpus_path = temp.path().join("test_corpus_escape.json");
+
+    let corpus_json = r#"{
+  "corpus_version": "1.0",
+  "description": "Test corpus escaping temp dir",
+  "scenarios": [
+    {
+      "id": "escape_attempt",
+      "class": "unchanged",
+      "file_path": "../escape.rs",
+      "before": "pub fn nop() {}",
+      "after": "pub fn nop() {}"
+    }
+  ]
+}"#;
+
+    fs::write(&corpus_path, corpus_json).expect("write test corpus");
+
+    Command::cargo_bin("egregore")
+        .unwrap()
+        .args(["eval-drift", "--corpus"])
+        .arg(&corpus_path)
+        .assert()
+        .failure();
+}
+
+#[test]
+fn eval_drift_fails_when_corpus_has_absolute_path() {
+    let temp = tempdir().expect("create temp dir");
+    let corpus_path = temp.path().join("test_corpus_abs.json");
+
+    let corpus_json = r#"{
+  "corpus_version": "1.0",
+  "description": "Test corpus absolute path",
+  "scenarios": [
+    {
+      "id": "abs_attempt",
+      "class": "unchanged",
+      "file_path": "/escape.rs",
+      "before": "pub fn nop() {}",
+      "after": "pub fn nop() {}"
+    }
+  ]
+}"#;
+
+    fs::write(&corpus_path, corpus_json).expect("write test corpus");
+
+    Command::cargo_bin("egregore")
+        .unwrap()
+        .args(["eval-drift", "--corpus"])
+        .arg(&corpus_path)
+        .assert()
+        .failure();
+}

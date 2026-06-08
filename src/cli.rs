@@ -3034,7 +3034,32 @@ fn eval_drift_cmd(corpus_path: &Path, threshold: f64) -> Result<()> {
         run_git(&["config", "user.email", "test@example.com"])?;
         run_git(&["config", "commit.gpgsign", "false"])?;
 
-        let file_path = temp_path.join(&scenario.file_path);
+        let path = std::path::Path::new(&scenario.file_path);
+        if path.is_absolute() {
+            anyhow::bail!(
+                "Corpus scenario file_path must be relative: {}",
+                scenario.file_path
+            );
+        }
+        for component in path.components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    anyhow::bail!(
+                        "Corpus scenario file_path cannot escape directory via '..': {}",
+                        scenario.file_path
+                    );
+                }
+                std::path::Component::RootDir => {
+                    anyhow::bail!(
+                        "Corpus scenario file_path must be relative: {}",
+                        scenario.file_path
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let file_path = temp_path.join(path);
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -3085,15 +3110,19 @@ fn eval_drift_cmd(corpus_path: &Path, threshold: f64) -> Result<()> {
         let graph = scan_repository_history_with_override(&temp_path, None)?;
         let scenario_records = graph.into_records();
 
-        let before_words: HashSet<&str> = scenario.before.split_whitespace().collect();
-        let after_words: HashSet<&str> = scenario.after.split_whitespace().collect();
-        let added_token = after_words
+        let before_list: Vec<&str> = scenario.before.split_whitespace().collect();
+        let after_list: Vec<&str> = scenario.after.split_whitespace().collect();
+
+        let before_lookup: HashSet<&str> = before_list.iter().copied().collect();
+        let after_lookup: HashSet<&str> = after_list.iter().copied().collect();
+
+        let added_token = after_list
             .iter()
-            .find(|w| !before_words.contains(*w))
+            .find(|w| !before_lookup.contains(*w))
             .copied();
-        let removed_token = before_words
+        let removed_token = before_list
             .iter()
-            .find(|w| !after_words.contains(*w))
+            .find(|w| !after_lookup.contains(*w))
             .copied();
         let diff_token = added_token.or(removed_token).map(|s| {
             s.trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
