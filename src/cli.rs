@@ -2976,7 +2976,9 @@ fn query_symbol_tx_as_of(
     as_of: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
-    match query::symbol_as_of_transaction_time(records, name, tx_as_of, as_of) {
+    // The CLI loads the entire `--graph` file, so the store-wide range is just
+    // the full record set: pass `None` to let the resolver derive it.
+    match query::symbol_as_of_transaction_time(records, name, tx_as_of, as_of, None) {
         Err(err) => {
             print_tx_error(&err.code, &err.message)?;
             std::process::exit(1);

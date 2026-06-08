@@ -346,8 +346,9 @@ fn tx_as_of_ignores_later_tombstone() {
     let records = vec![v1, tombstone];
 
     // Querying before the deletion still returns the symbol the store knew then.
-    let result = symbol_as_of_transaction_time(&records, "widget", "2026-01-02T00:00:00Z", None)
-        .expect("query ok");
+    let result =
+        symbol_as_of_transaction_time(&records, "widget", "2026-01-02T00:00:00Z", None, None)
+            .expect("query ok");
     assert_eq!(
         result.records.len(),
         1,
@@ -375,8 +376,9 @@ fn tx_as_of_excludes_record_without_transaction_metadata() {
     );
     let records = vec![sym];
 
-    let result = symbol_as_of_transaction_time(&records, "widget", "2026-01-02T00:00:00Z", None)
-        .expect("query ok");
+    let result =
+        symbol_as_of_transaction_time(&records, "widget", "2026-01-02T00:00:00Z", None, None)
+            .expect("query ok");
     assert!(
         result.records.is_empty(),
         "record without transaction metadata must be excluded (no current-state fallback)"
@@ -422,8 +424,9 @@ fn tx_as_of_orders_multiple_symbols_by_span_then_id() {
     // Push in reverse to prove the sort, not insertion order, decides output.
     let records = vec![later_line, earlier_line];
 
-    let result = symbol_as_of_transaction_time(&records, "widget", "2026-02-01T00:00:00Z", None)
-        .expect("query ok");
+    let result =
+        symbol_as_of_transaction_time(&records, "widget", "2026-02-01T00:00:00Z", None, None)
+            .expect("query ok");
     assert_eq!(result.records.len(), 2);
     let lines: Vec<usize> = result
         .records
@@ -483,14 +486,16 @@ fn tx_as_of_excludes_superseded_symbol_once_replacement_known() {
     let records = vec![old, new];
 
     // Before the replacement is committed: supersession isn't known yet → keep old.
-    let before = symbol_as_of_transaction_time(&records, "widget", "2026-01-02T00:00:00Z", None)
-        .expect("query ok");
+    let before =
+        symbol_as_of_transaction_time(&records, "widget", "2026-01-02T00:00:00Z", None, None)
+            .expect("query ok");
     assert_eq!(before.records.len(), 1, "only the old symbol is known yet");
     assert_eq!(record_path(before.records[0]), Some("src/old.rs"));
 
     // After the replacement is committed: the superseded old row is dropped.
-    let after = symbol_as_of_transaction_time(&records, "widget", "2026-01-04T00:00:00Z", None)
-        .expect("query ok");
+    let after =
+        symbol_as_of_transaction_time(&records, "widget", "2026-01-04T00:00:00Z", None, None)
+            .expect("query ok");
     assert_eq!(
         after.records.len(),
         1,
@@ -553,6 +558,7 @@ fn tx_as_of_supersession_respects_valid_time_axis() {
         "widget",
         "2026-01-04T00:00:00Z",
         Some("2026-01-02T00:00:00Z"),
+        None,
     )
     .expect("query ok");
     assert_eq!(
@@ -598,8 +604,9 @@ fn tx_as_of_excludes_superseded_symbol_renamed_replacement() {
 
     // After the rename is known, querying the old name yields an empty view plus
     // a superseded diagnostic — not the stale row.
-    let after = symbol_as_of_transaction_time(&records, "old_widget", "2026-01-04T00:00:00Z", None)
-        .expect("query ok");
+    let after =
+        symbol_as_of_transaction_time(&records, "old_widget", "2026-01-04T00:00:00Z", None, None)
+            .expect("query ok");
     assert!(
         after.records.is_empty(),
         "renamed-away symbol must not be returned once the replacement is effective"
@@ -612,7 +619,7 @@ fn tx_as_of_excludes_superseded_symbol_renamed_replacement() {
 
     // Before the rename is known, the old name is still the live view.
     let before =
-        symbol_as_of_transaction_time(&records, "old_widget", "2026-01-02T00:00:00Z", None)
+        symbol_as_of_transaction_time(&records, "old_widget", "2026-01-02T00:00:00Z", None, None)
             .expect("query ok");
     assert_eq!(
         before.records.len(),
@@ -661,8 +668,9 @@ fn tx_as_of_symbol_introduced_later_reports_not_yet_known() {
     .with_transaction_time("2026-01-03T00:00:00Z");
     let records = vec![early, latecomer];
 
-    let result = symbol_as_of_transaction_time(&records, "latecomer", "2026-01-02T00:00:00Z", None)
-        .expect("query ok");
+    let result =
+        symbol_as_of_transaction_time(&records, "latecomer", "2026-01-02T00:00:00Z", None, None)
+            .expect("query ok");
     assert!(result.records.is_empty());
     let codes: Vec<&str> = result.diagnostics.iter().map(|d| d.code.as_str()).collect();
     assert!(
@@ -717,13 +725,14 @@ fn tx_as_of_excludes_removed_history_symbol() {
     }
 
     // At c2 (before removal) `gone` is still live.
-    let at_c2 = symbol_as_of_transaction_time(&records, "gone", "2026-01-02T12:00:00Z", None)
+    let at_c2 = symbol_as_of_transaction_time(&records, "gone", "2026-01-02T12:00:00Z", None, None)
         .expect("query ok");
     assert_eq!(at_c2.records.len(), 1, "gone is present at c2");
 
     // After c3 (its removal commit) `gone` must be excluded with a diagnostic.
-    let after_c3 = symbol_as_of_transaction_time(&records, "gone", "2026-01-04T00:00:00Z", None)
-        .expect("query ok");
+    let after_c3 =
+        symbol_as_of_transaction_time(&records, "gone", "2026-01-04T00:00:00Z", None, None)
+            .expect("query ok");
     assert!(
         after_c3.records.is_empty(),
         "removed history symbol must not be carried past its removal"
@@ -738,8 +747,9 @@ fn tx_as_of_excludes_removed_history_symbol() {
     );
 
     // `kept` (present at c3) is still returned after c3.
-    let kept_after = symbol_as_of_transaction_time(&records, "kept", "2026-01-04T00:00:00Z", None)
-        .expect("query ok");
+    let kept_after =
+        symbol_as_of_transaction_time(&records, "kept", "2026-01-04T00:00:00Z", None, None)
+            .expect("query ok");
     assert_eq!(kept_after.records.len(), 1, "kept survives at c3");
 }
 
@@ -789,6 +799,7 @@ fn tx_as_of_history_removal_respects_valid_time_axis() {
         "gone",
         "2026-01-04T00:00:00Z",
         Some("2026-01-01T12:00:00Z"),
+        None,
     )
     .expect("query ok");
     assert_eq!(
@@ -855,7 +866,7 @@ fn tx_as_of_detects_removal_across_same_second_commits() {
     ];
     records.reverse(); // order independence
 
-    let after = symbol_as_of_transaction_time(&records, "gone", "2026-01-02T00:00:01Z", None)
+    let after = symbol_as_of_transaction_time(&records, "gone", "2026-01-02T00:00:01Z", None, None)
         .expect("query ok");
     assert!(
         after.records.is_empty(),
@@ -920,8 +931,9 @@ fn tx_as_of_scopes_removal_to_symbol_repository() {
 
     // Query alpha after repo B's latest commit: alpha's own repo has no newer
     // commit, so it must NOT be reported as removed.
-    let result = symbol_as_of_transaction_time(&records, "alpha", "2026-01-06T00:00:00Z", None)
-        .expect("query ok");
+    let result =
+        symbol_as_of_transaction_time(&records, "alpha", "2026-01-06T00:00:00Z", None, None)
+            .expect("query ok");
     assert_eq!(
         result.records.len(),
         1,
@@ -952,8 +964,9 @@ fn tx_as_of_equal_transaction_time_prefers_later_commit() {
         ),
     ];
 
-    let result = symbol_as_of_transaction_time(&records, "widget", "2026-01-03T00:00:00Z", None)
-        .expect("query ok");
+    let result =
+        symbol_as_of_transaction_time(&records, "widget", "2026-01-03T00:00:00Z", None, None)
+            .expect("query ok");
     assert_eq!(result.records.len(), 1);
     let commit = match result.records[0] {
         GraphRecord::Node {
@@ -964,6 +977,229 @@ fn tx_as_of_equal_transaction_time_prefers_later_commit() {
     assert_eq!(
         commit, "c2c2c2c2",
         "equal-transaction-time tie must resolve to the later (child) commit"
+    );
+}
+
+// ── Multi-repository store: same name, removal scoped per repo component ───────
+// When two repositories in one store both define a symbol of the same name, a
+// removal in one repository must not drop the still-live row in the other.
+
+#[test]
+fn tx_as_of_same_name_removal_does_not_drop_other_repository() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    let foo_a = stable_id(&["node", "Symbol", "a/lib.rs", "foo"]);
+    let keep_a = stable_id(&["node", "Symbol", "a/lib.rs", "keep"]);
+    let foo_b = stable_id(&["node", "Symbol", "b/lib.rs", "foo"]);
+    // Repo A: a1 ← a2 ← a3. `foo` lives through a2 then is removed at a3, while
+    // `keep` survives to a3 (so a3 is the active commit of repo A's component).
+    // Repo B: b1 ← b2, where `foo` is still present at the tip — a disjoint graph.
+    let records = vec![
+        history_symbol(
+            &foo_a,
+            "foo",
+            "a/lib.rs",
+            "a1a1a1a1",
+            &[],
+            "2026-01-01T00:00:00Z",
+        ),
+        history_symbol(
+            &foo_a,
+            "foo",
+            "a/lib.rs",
+            "a2a2a2a2",
+            &["a1a1a1a1"],
+            "2026-01-02T00:00:00Z",
+        ),
+        history_symbol(
+            &keep_a,
+            "keep",
+            "a/lib.rs",
+            "a1a1a1a1",
+            &[],
+            "2026-01-01T00:00:00Z",
+        ),
+        history_symbol(
+            &keep_a,
+            "keep",
+            "a/lib.rs",
+            "a2a2a2a2",
+            &["a1a1a1a1"],
+            "2026-01-02T00:00:00Z",
+        ),
+        history_symbol(
+            &keep_a,
+            "keep",
+            "a/lib.rs",
+            "a3a3a3a3",
+            &["a2a2a2a2"],
+            "2026-01-03T00:00:00Z",
+        ),
+        history_symbol(
+            &foo_b,
+            "foo",
+            "b/lib.rs",
+            "b1b1b1b1",
+            &[],
+            "2026-01-04T00:00:00Z",
+        ),
+        history_symbol(
+            &foo_b,
+            "foo",
+            "b/lib.rs",
+            "b2b2b2b2",
+            &["b1b1b1b1"],
+            "2026-01-05T00:00:00Z",
+        ),
+    ];
+
+    // Query `foo` after every commit: repo A removed it (a2 < active a3) but
+    // repo B still defines it, so exactly repo B's row survives.
+    let result = symbol_as_of_transaction_time(&records, "foo", "2026-01-06T00:00:00Z", None, None)
+        .expect("query ok");
+    assert_eq!(
+        result.records.len(),
+        1,
+        "repo B's live `foo` must survive repo A's removal, got diagnostics {:?}",
+        result.diagnostics
+    );
+    assert_eq!(
+        record_path(result.records[0]),
+        Some("b/lib.rs"),
+        "the surviving row must be repo B's, not repo A's removed one"
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "absent_at_transaction"),
+        "repo A's removal must still be reported, got {:?}",
+        result.diagnostics
+    );
+}
+
+// ── Unknown symbol still reports out-of-range diagnostics ─────────────────────
+// A query for a name with no Symbol rows must still distinguish an out-of-range
+// temporal instant from a genuine in-range absence.
+
+#[test]
+fn tx_as_of_unknown_symbol_before_store_reports_before_first() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    let known = GraphRecord::symbol(
+        stable_id(&["node", "Symbol", "src/lib.rs", "known"]),
+        "fn",
+        "src/lib.rs".to_owned(),
+        span(1, 5),
+        "known".to_owned(),
+        "known".to_owned(),
+    )
+    .with_node_time(
+        "2026-01-02T00:00:00Z",
+        "author_provided",
+        "2026-01-02T00:00:00Z",
+    )
+    .with_transaction_time("2026-01-02T00:00:00Z");
+    let records = vec![known];
+
+    // Unknown name, instant before the store: both diagnostics, empty view.
+    let before =
+        symbol_as_of_transaction_time(&records, "ghost", "2025-01-01T00:00:00Z", None, None)
+            .expect("query ok");
+    assert!(before.records.is_empty());
+    let codes: Vec<&str> = before.diagnostics.iter().map(|d| d.code.as_str()).collect();
+    assert!(
+        codes.contains(&"no_named_symbol"),
+        "unknown name must report no_named_symbol, got {codes:?}"
+    );
+    assert!(
+        codes.contains(&"before_first_transaction"),
+        "an out-of-range instant must still report before_first_transaction even for an unknown name, got {codes:?}"
+    );
+
+    // Unknown name, instant in range: only no_named_symbol (a genuine absence).
+    let in_range =
+        symbol_as_of_transaction_time(&records, "ghost", "2026-02-01T00:00:00Z", None, None)
+            .expect("query ok");
+    let codes: Vec<&str> = in_range
+        .diagnostics
+        .iter()
+        .map(|d| d.code.as_str())
+        .collect();
+    assert!(
+        codes.contains(&"no_named_symbol") && !codes.contains(&"before_first_transaction"),
+        "an in-range unknown name must not claim out-of-range, got {codes:?}"
+    );
+}
+
+// ── Explicit store-wide bounds keep range checks store-wide ───────────────────
+// When `records` is a domain-filtered slice of a larger store, passing the
+// store-wide bounds must suppress a spurious before_first_transaction.
+
+#[test]
+fn tx_as_of_explicit_store_bounds_override_filtered_range() {
+    use aletheia_egregore::query::{store_transaction_bounds, symbol_as_of_transaction_time};
+
+    // Domain-filtered slice: the only record is a symbol committed at 2026-03-01.
+    let widget = GraphRecord::symbol(
+        stable_id(&["node", "Symbol", "src/lib.rs", "widget"]),
+        "fn",
+        "src/lib.rs".to_owned(),
+        span(1, 5),
+        "widget".to_owned(),
+        "widget".to_owned(),
+    )
+    .with_node_time(
+        "2026-03-01T00:00:00Z",
+        "author_provided",
+        "2026-03-01T00:00:00Z",
+    )
+    .with_transaction_time("2026-03-01T00:00:00Z");
+    let slice = vec![widget];
+
+    // The full store also holds an earlier (non-codegraph) transaction at 01-01.
+    let early = GraphRecord::node(
+        "agent_memory:v1:obs-early".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "early observation".to_owned(),
+    )
+    .with_domain("agent_memory", 1)
+    .with_transaction_time("2026-01-01T00:00:00Z");
+    let full_store = vec![slice[0].clone(), early];
+    let store_bounds = store_transaction_bounds(&full_store);
+    assert!(store_bounds.is_some(), "full store has a transaction range");
+
+    // Querying the slice at 2026-02-01 *without* bounds sees only the 03-01
+    // record, so it wrongly reports out-of-range.
+    let derived =
+        symbol_as_of_transaction_time(&slice, "widget", "2026-02-01T00:00:00Z", None, None)
+            .expect("query ok");
+    let derived_codes: Vec<&str> = derived
+        .diagnostics
+        .iter()
+        .map(|d| d.code.as_str())
+        .collect();
+    assert!(
+        derived_codes.contains(&"before_first_transaction"),
+        "the filtered slice alone treats 02-01 as out-of-range, got {derived_codes:?}"
+    );
+
+    // With the store-wide bounds, 02-01 is in range — the symbol just did not
+    // exist yet, so we get symbol_not_yet_known and never before_first.
+    let scoped =
+        symbol_as_of_transaction_time(&slice, "widget", "2026-02-01T00:00:00Z", None, store_bounds)
+            .expect("query ok");
+    let scoped_codes: Vec<&str> = scoped.diagnostics.iter().map(|d| d.code.as_str()).collect();
+    assert!(
+        !scoped_codes.contains(&"before_first_transaction"),
+        "store-wide bounds must suppress the spurious out-of-range diagnostic, got {scoped_codes:?}"
+    );
+    assert!(
+        scoped_codes.contains(&"symbol_not_yet_known"),
+        "an in-range instant before the symbol exists is symbol_not_yet_known, got {scoped_codes:?}"
     );
 }
 

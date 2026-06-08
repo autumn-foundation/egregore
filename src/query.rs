@@ -1394,6 +1394,36 @@ impl CommitOrder {
     }
 }
 
+/// Computes the store-wide transaction-time range across every record carrying
+/// a parseable transaction handle, as `(earliest, latest)`.
+///
+/// Daemon callers derive this from the *unfiltered* store and pass it into
+/// [`symbol_as_of_transaction_time`] so the `before_first_transaction`
+/// diagnostic reflects the whole store rather than a domain-filtered slice
+/// (otherwise a mixed store with an earlier non-codegraph transaction and a
+/// later codegraph symbol would spuriously report a between-the-two instant as
+/// out of range). The CLI `--graph` path already holds the full graph, so it
+/// passes `None` and lets the resolver derive the bounds from `records`.
+#[must_use]
+pub fn store_transaction_bounds(
+    records: &[GraphRecord],
+) -> Option<(DateTime<chrono::FixedOffset>, DateTime<chrono::FixedOffset>)> {
+    let mut min_tx: Option<DateTime<chrono::FixedOffset>> = None;
+    let mut max_tx: Option<DateTime<chrono::FixedOffset>> = None;
+    for r in records {
+        if let Some(tt) =
+            record_transaction_time(r).and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        {
+            min_tx = Some(min_tx.map_or(tt, |m| m.min(tt)));
+            max_tx = Some(max_tx.map_or(tt, |m| m.max(tt)));
+        }
+    }
+    match (min_tx, max_tx) {
+        (Some(min), Some(max)) => Some((min, max)),
+        _ => None,
+    }
+}
+
 /// Finds symbol records as the store knew them at a transaction-time instant.
 ///
 /// Returns, per stable record ID, the version whose transaction time is the
@@ -1418,11 +1448,17 @@ impl CommitOrder {
 /// Returns [`TxQueryError`] with code `invalid_timestamp` when `tx_as_of` or
 /// `as_of_valid_time` is not a valid RFC 3339 instant.
 #[allow(clippy::too_many_lines)]
+///
+/// `store_tx_bounds` supplies the store-wide transaction range explicitly (see
+/// [`store_transaction_bounds`]); pass `None` to derive it from `records`. Use
+/// it when `records` is a domain-filtered subset of a larger store so the
+/// out-of-range diagnostics stay store-wide.
 pub fn symbol_as_of_transaction_time<'r>(
     records: &'r [GraphRecord],
     symbol_name: &str,
     tx_as_of: &str,
     as_of_valid_time: Option<&str>,
+    store_tx_bounds: Option<(DateTime<chrono::FixedOffset>, DateTime<chrono::FixedOffset>)>,
 ) -> Result<TxSymbolQuery<'r>, TxQueryError> {
     let tx_instant = DateTime::parse_from_rfc3339(tx_as_of).map_err(|e| TxQueryError {
         code: "invalid_timestamp".to_owned(),
@@ -1458,11 +1494,36 @@ pub fn symbol_as_of_transaction_time<'r>(
         })
         .collect();
 
+    // Store-wide transaction lower bound, used to tell a truly out-of-range
+    // instant apart from an in-range instant where the queried symbol simply did
+    // not exist yet. Caller-supplied bounds win (domain-filtered daemon reads);
+    // otherwise derive from `records` (the CLI holds the full graph).
+    let store_min_tx = match store_tx_bounds {
+        Some((min, _max)) => Some(min),
+        None => store_transaction_bounds(records).map(|(min, _max)| min),
+    };
+
     if named.is_empty() {
         diagnostics.push(TxDiagnostic {
             code: "no_named_symbol".to_owned(),
             message: format!("no Symbol named '{symbol_name}' exists in the store"),
         });
+        // Even with no matching symbol, report whether the instant predates the
+        // whole store so clients can distinguish an out-of-range temporal query
+        // from a genuine in-range absence (a misspelled or removed name).
+        if let Some(min) = store_min_tx
+            && tx_instant < min
+        {
+            diagnostics.push(TxDiagnostic {
+                code: "before_first_transaction".to_owned(),
+                message: format!(
+                    "tx-as-of '{tx_as_of}' precedes the earliest known store transaction ('{}'); empty view",
+                    min.to_rfc3339()
+                ),
+            });
+        }
+        diagnostics.sort_by(|a, b| a.code.cmp(&b.code).then_with(|| a.message.cmp(&b.message)));
+        diagnostics.dedup();
         return Ok(TxSymbolQuery {
             records: Vec::new(),
             diagnostics,
@@ -1565,21 +1626,8 @@ pub fn symbol_as_of_transaction_time<'r>(
         }
     }
 
-    // Store-wide transaction range across every record carrying a parseable
-    // transaction handle. Used to tell a truly out-of-range instant apart from
-    // an in-range instant where the *queried symbol* simply did not exist yet.
-    let mut store_min_tx: Option<DateTime<chrono::FixedOffset>> = None;
-    let mut store_max_tx: Option<DateTime<chrono::FixedOffset>> = None;
-    for r in records {
-        if let Some(tt) =
-            record_transaction_time(r).and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        {
-            store_min_tx = Some(store_min_tx.map_or(tt, |m| m.min(tt)));
-            store_max_tx = Some(store_max_tx.map_or(tt, |m| m.max(tt)));
-        }
-    }
-
     // Out-of-range / not-yet-known diagnostics (annotate, never change the set).
+    // `store_min_tx` was resolved above (caller-supplied or derived).
     if let Some(min) = store_min_tx
         && tx_instant < min
     {
@@ -1714,16 +1762,20 @@ pub fn symbol_as_of_transaction_time<'r>(
         )
     };
     if vt_requested.is_none() {
-        // The queried symbol's repository = the commit-graph component of any of
-        // its temporal versions (all of a symbol's history shares one component).
-        let symbol_component = named
-            .iter()
-            .filter_map(|r| node_git_commit(r))
-            .find_map(|c| commit_order.component(c));
+        // The queried name can appear in more than one repository (distinct
+        // commit-graph components) when a store holds `scan-history` output from
+        // several repos. Removal is decided independently per component, and the
+        // pruning only drops rows in the component that shows absence — so repo
+        // A removing `foo` never erases repo B's still-live `foo`.
+        let component_of = |r: &GraphRecord| -> Option<usize> {
+            node_git_commit(r).and_then(|c| commit_order.component(c))
+        };
+        let symbol_components: BTreeSet<usize> =
+            named.iter().filter_map(|r| component_of(r)).collect();
 
-        if let Some(component) = symbol_component {
-            // Composite commit key, restricted to the symbol's repository and to
-            // commits the store knew by the requested instant.
+        for component in symbol_components {
+            // Composite commit key, restricted to this repository and to commits
+            // the store knew by the requested instant.
             let commit_key = |r: &GraphRecord| -> Option<(DateTime<chrono::FixedOffset>, usize)> {
                 let commit = node_git_commit(r)?;
                 if commit_order.component(commit) != Some(component) {
@@ -1741,8 +1793,11 @@ pub fn symbol_as_of_transaction_time<'r>(
             if let (Some(active), Some(name_latest)) = (active, name_latest)
                 && name_latest < active
             {
-                let removed = selected.iter().any(|r| is_temporal(r));
-                selected.retain(|r| !is_temporal(r));
+                // Prune only this component's temporal rows; rows belonging to a
+                // different repository (or carrying no commit) are untouched.
+                let in_component = |r: &GraphRecord| -> bool { component_of(r) == Some(component) };
+                let removed = selected.iter().any(|r| is_temporal(r) && in_component(r));
+                selected.retain(|r| !(is_temporal(r) && in_component(r)));
                 if removed {
                     diagnostics.push(TxDiagnostic {
                         code: "absent_at_transaction".to_owned(),

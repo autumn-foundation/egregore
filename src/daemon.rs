@@ -6880,13 +6880,15 @@ fn verb_success_result(
 /// Loads all records from the embedded sink, respecting the read budget.
 /// Returns the records filtered to the given domain and the RFC3339 snapshot
 /// timestamp captured at read-lock acquisition time.
+type StoreTxBounds = Option<(DateTime<chrono::FixedOffset>, DateTime<chrono::FixedOffset>)>;
+
 fn load_all_records_for_verb(
     state: &ServerState,
     started: Instant,
     budget: Option<Duration>,
     domain: &str,
     include_superseded: bool,
-) -> std::result::Result<(Vec<GraphRecord>, String), ApiError> {
+) -> std::result::Result<(Vec<GraphRecord>, String, StoreTxBounds), ApiError> {
     let sink = query_sink_read(state, started, budget)?;
     // Capture the snapshot while the read lock is held.
     let snapshot = rfc3339_now();
@@ -6902,12 +6904,21 @@ fn load_all_records_for_verb(
     drop(sink);
     // Post-read check: the read itself may have overrun the deadline.
     check_query_budget(started, budget)?;
+    // Capture the store-wide transaction range from the *unfiltered* records
+    // before narrowing to the requested domain, so transaction-time diagnostics
+    // (`before_first_transaction`) stay store-wide and match the CLI `--graph`
+    // path even on mixed-domain stores. Only the tx path needs it.
+    let store_tx_bounds = if include_superseded {
+        graph_query::store_transaction_bounds(&records)
+    } else {
+        None
+    };
     // Filter to the requested domain.
     let records = records
         .into_iter()
         .filter(|r| record_id_matches_domain(r.id(), domain))
         .collect();
-    Ok((records, snapshot))
+    Ok((records, snapshot, store_tx_bounds))
 }
 
 /// Collects the IDs of tombstoned records in the slice.
@@ -6940,6 +6951,7 @@ fn symbol_by_name_tx_response(
     as_of_valid_time: Option<&str>,
     limit: usize,
     records: &[GraphRecord],
+    store_tx_bounds: StoreTxBounds,
     snapshot: &str,
     view_handle: &str,
     started: Instant,
@@ -6988,17 +7000,21 @@ fn symbol_by_name_tx_response(
 
     // Timestamps are pre-validated above, so the resolver only errors on
     // genuinely unexpected input; surface it as the transaction-time field.
-    let result =
-        match graph_query::symbol_as_of_transaction_time(records, name, tx_as_of, as_of_valid_time)
-        {
-            Ok(r) => r,
-            Err(err) => {
-                return HttpResponse::error_with_id(
-                    request_id,
-                    ApiError::bad_request_field(err.message, "as_of.transaction_time"),
-                );
-            }
-        };
+    let result = match graph_query::symbol_as_of_transaction_time(
+        records,
+        name,
+        tx_as_of,
+        as_of_valid_time,
+        store_tx_bounds,
+    ) {
+        Ok(r) => r,
+        Err(err) => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::bad_request_field(err.message, "as_of.transaction_time"),
+            );
+        }
+    };
 
     let rows: Vec<serde_json::Value> = result
         .records
@@ -7359,7 +7375,7 @@ fn handle_verb_symbol_by_name(
         }
     }
 
-    let (records, snapshot) = match load_all_records_for_verb(
+    let (records, snapshot, store_tx_bounds) = match load_all_records_for_verb(
         state,
         started,
         budget,
@@ -7382,6 +7398,7 @@ fn handle_verb_symbol_by_name(
             as_of_valid_time,
             limit,
             &records,
+            store_tx_bounds,
             &snapshot,
             tx_as_of,
             started,
@@ -7483,11 +7500,11 @@ fn handle_verb_symbol_at_commit(
         }
     };
 
-    let (records, snapshot) = match load_all_records_for_verb(state, started, budget, domain, false)
-    {
-        Ok(r) => r,
-        Err(e) => return HttpResponse::error_with_id(request_id, e),
-    };
+    let (records, snapshot, _) =
+        match load_all_records_for_verb(state, started, budget, domain, false) {
+            Ok(r) => r,
+            Err(e) => return HttpResponse::error_with_id(request_id, e),
+        };
 
     // Check for ambiguous commit prefix
     let matching_commits: BTreeSet<&str> = records
@@ -7750,11 +7767,11 @@ fn handle_verb_file_defines(
         }
     };
 
-    let (records, snapshot) = match load_all_records_for_verb(state, started, budget, domain, false)
-    {
-        Ok(r) => r,
-        Err(e) => return HttpResponse::error_with_id(request_id, e),
-    };
+    let (records, snapshot, _) =
+        match load_all_records_for_verb(state, started, budget, domain, false) {
+            Ok(r) => r,
+            Err(e) => return HttpResponse::error_with_id(request_id, e),
+        };
 
     // When as_of_valid_time is set, keep the most-recent-per-symbol-name at or
     // before the given instant. Records without valid_time are excluded (they are
@@ -7821,7 +7838,7 @@ fn handle_verb_drift_top_n(
     } else {
         domain
     };
-    let (mut records, snapshot) =
+    let (mut records, snapshot, _) =
         match load_all_records_for_verb(state, started, budget, drift_domain, false) {
             Ok(r) => r,
             Err(e) => return HttpResponse::error_with_id(request_id, e),
