@@ -461,14 +461,189 @@ fn store_lease_rejects_symlinked_lock_file() {
     );
 }
 
+/// RED: fails until the Windows ACL TODO is removed from the doc and replaced
+/// with the implemented permission contract.
+#[test]
+fn daemon_runtime_windows_acl_todo_removed_from_docs() {
+    let schema = read_repo_text("docs/schema/daemon-runtime.md");
+    assert!(
+        !schema.contains("TODO(windows-acl-runtime-permissions)"),
+        "daemon-runtime.md must not contain the Windows ACL TODO after implementation; \
+         remove the TODO marker and state the enforced Windows permission contract"
+    );
+    let plan = read_repo_text("docs/plans/2026-05-17-egregore-daemon-design.md");
+    assert!(
+        !plan.contains("TODO(windows-acl-runtime-permissions)"),
+        "daemon design plan must not reference the Windows ACL TODO after implementation"
+    );
+}
+
+/// On Windows: the runtime directory must have owner-only ACL after daemon
+/// startup, with no broad-group (Everyone / BUILTIN\\Users / Authenticated
+/// Users / Guests) read, write, or delete access.
 #[cfg(windows)]
 #[test]
-fn daemon_runtime_contract_windows_acl_gap_is_explicit() {
+fn windows_runtime_dir_acl_restricts_to_owner_after_enforce() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+
+    // Acquiring the lease creates the runtime dir and enforces permissions.
+    let lease = StoreLease::acquire(&data_dir).expect("lease should be acquired");
+
+    let runtime_dir = runtime_dir_for_data_dir(&data_dir);
     assert!(
-        aletheia_egregore::daemon::WINDOWS_RUNTIME_ACL_TODO
-            .contains("TODO(windows-acl-runtime-permissions)"),
-        "Windows runtime ACL enforcement must remain an explicit named gap until implemented"
+        !windows_acl_has_broad_access_for_test(&runtime_dir),
+        "runtime dir must not grant access to broad groups after enforcement"
     );
+    drop(lease);
+}
+
+/// On Windows: every runtime credential file must have owner-only ACL after
+/// daemon startup.
+#[cfg(windows)]
+#[test]
+fn windows_runtime_file_acl_restricts_to_owner_after_enforce() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+
+    let lease = StoreLease::acquire(&data_dir).expect("lease should be acquired");
+    let runtime_dir = runtime_dir_for_data_dir(&data_dir);
+    let lock_path = runtime_dir.join("egregored.lock");
+
+    assert!(
+        !windows_acl_has_broad_access_for_test(&lock_path),
+        "lock file must not grant access to broad groups after enforcement"
+    );
+    drop(lease);
+}
+
+/// On Windows: a pre-existing runtime directory that has been given permissive
+/// access (e.g. Everyone-read) must cause daemon startup to fail with
+/// `runtime_permissions_unsafe` before serving requests.
+#[cfg(windows)]
+#[test]
+fn windows_permissive_runtime_dir_fails_startup() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+
+    // Create the runtime dir and immediately broaden its ACL.
+    let runtime_dir = runtime_dir_for_data_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    windows_add_everyone_access_for_test(&runtime_dir);
+
+    let err = StoreLease::acquire(&data_dir)
+        .expect_err("startup with permissive runtime dir ACL should fail");
+    assert!(
+        err.to_string().contains("runtime_permissions_unsafe"),
+        "permissive runtime dir should fail as unsafe, got {err:#}"
+    );
+}
+
+/// On Windows: a pre-existing runtime lock file with permissive access must
+/// cause startup to fail with `runtime_permissions_unsafe` before any credentials
+/// are written.
+#[cfg(windows)]
+#[test]
+fn windows_permissive_runtime_lock_file_fails_startup() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+
+    let runtime_dir = runtime_dir_for_data_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let lock_path = runtime_dir.join("egregored.lock");
+    fs::write(&lock_path, b"").expect("lock file should be written");
+    windows_add_everyone_access_for_test(&lock_path);
+
+    let err = StoreLease::acquire(&data_dir)
+        .expect_err("startup with permissive lock file ACL should fail");
+    assert!(
+        err.to_string().contains("runtime_permissions_unsafe"),
+        "permissive lock file should fail as unsafe, got {err:#}"
+    );
+}
+
+/// On Windows: `eg daemon status` must report `runtime_permissions_unsafe` and
+/// must not send the bearer token to the reported daemon address when the
+/// runtime metadata file has permissive Windows access.
+#[cfg(windows)]
+#[test]
+fn windows_status_with_permissive_metadata_acl_does_not_send_token() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+
+    // Read the real token before tampering so we can assert it's not leaked.
+    let live_metadata = read_running_metadata(&data_dir);
+    let token = live_metadata.token.clone();
+
+    let runtime_dir = runtime_dir_for_data_dir(&data_dir);
+    let metadata_path = runtime_dir.join("egregored.json");
+
+    // Broaden the metadata ACL while the daemon is still running.
+    windows_add_everyone_access_for_test(&metadata_path);
+
+    // DaemonClient::from_data_dir should refuse to read the credential.
+    let err = aletheia_egregore::daemon::DaemonClient::from_data_dir(&data_dir)
+        .expect_err("client should refuse metadata with permissive ACL");
+    assert!(
+        err.to_string().contains("runtime_permissions_unsafe"),
+        "permissive metadata ACL should fail as unsafe, got {err:#}"
+    );
+    assert!(
+        !err.to_string().contains(&token),
+        "runtime_permissions_unsafe error must not include the bearer token"
+    );
+
+    daemon.stop();
+}
+
+/// Add Everyone-read access to a path for test purposes only.
+#[cfg(windows)]
+fn windows_add_everyone_access_for_test(path: &Path) {
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/grant:r")
+        .arg("Everyone:(R)")
+        .arg("/q")
+        .status()
+        .expect("icacls should run");
+    assert!(
+        status.success(),
+        "icacls should add Everyone read access for test"
+    );
+}
+
+/// Returns true if the ACL on `path` grants access to a broad Windows group
+/// (Everyone, BUILTIN\\Users, Authenticated Users, or Guests).
+/// Uses PowerShell + SID lookup for locale-independent detection.
+#[cfg(windows)]
+fn windows_acl_has_broad_access_for_test(path: &Path) -> bool {
+    let script = r"
+$ErrorActionPreference = 'Stop'
+$target = $env:EGREGORE_ACL_PATH
+$acl = Get-Acl -LiteralPath $target
+$broadSids = @('S-1-1-0','S-1-5-32-545','S-1-5-11','S-1-5-32-546')
+foreach ($ace in $acl.Access) {
+    if ($ace.AccessControlType -eq 'Allow') {
+        try {
+            $sid = $ace.IdentityReference.Translate(
+                [System.Security.Principal.SecurityIdentifier]).Value
+            if ($broadSids -contains $sid) { exit 1 }
+        } catch {}
+    }
+}
+exit 0
+";
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("EGREGORE_ACL_PATH", path)
+        .status()
+        .map(|s| s.code() == Some(1))
+        .unwrap_or(false)
 }
 
 #[test]

@@ -10120,6 +10120,10 @@ fn wait_until_stopped(data_dir: &Path) -> Result<()> {
 fn read_metadata(data_dir: &Path) -> Result<DaemonMetadata> {
     let path = metadata_path(data_dir);
     reject_runtime_symlink_components(&path, "runtime file")?;
+    // On Windows, verify the ACL is owner-only before reading the bearer token.
+    // Failing here prevents the token from reaching a tampered daemon address.
+    #[cfg(windows)]
+    check_runtime_file_acl_safe_for_read(&path)?;
     let contents =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let metadata = serde_json::from_str(&contents)
@@ -10453,14 +10457,16 @@ fn enforce_runtime_dir_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn enforce_runtime_dir_permissions(path: &Path) -> Result<()> {
+    reject_runtime_symlink(path, "runtime dir")?;
+    windows_set_private_acl(path, "runtime dir")
+}
+
+#[cfg(not(any(unix, windows)))]
 #[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 fn enforce_runtime_dir_permissions(path: &Path) -> Result<()> {
     reject_runtime_symlink(path, "runtime dir")?;
-    // TODO(windows-acl-runtime-permissions): set the runtime directory ACL to
-    // the current user only, then fail startup with runtime_permissions_unsafe
-    // if the ACL cannot be enforced. The Windows conformance test asserts this
-    // named gap so the bearer-token leak surface is not silent.
     Ok(())
 }
 
@@ -10490,20 +10496,127 @@ fn enforce_runtime_file_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn enforce_runtime_file_permissions(path: &Path) -> Result<()> {
+    reject_runtime_symlink(path, "runtime file")?;
+    windows_set_private_acl(path, "runtime file")
+}
+
+#[cfg(not(any(unix, windows)))]
 #[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 fn enforce_runtime_file_permissions(path: &Path) -> Result<()> {
     reject_runtime_symlink(path, "runtime file")?;
-    // TODO(windows-acl-runtime-permissions): set the lock, metadata, and
-    // idempotency journal ACL to the current user only, then fail startup with
-    // runtime_permissions_unsafe if the ACL cannot be enforced.
     Ok(())
 }
 
+/// Sets a private Windows ACL on a runtime path, granting full control only to
+/// the current user and SYSTEM, with no inherited permissions and no broad
+/// local-group access.
+///
+/// Uses PowerShell's .NET security classes with SID-based identity so that the
+/// result is locale-independent.  Returns `runtime_permissions_unsafe` if the
+/// ACL cannot be applied (e.g. the path is owned by a different account).
 #[cfg(windows)]
-/// Explicit Windows ACL enforcement gap for issue #18.
-pub const WINDOWS_RUNTIME_ACL_TODO: &str =
-    "TODO(windows-acl-runtime-permissions): restrict egregored runtime files to the current user";
+fn windows_set_private_acl(path: &Path, kind: &str) -> Result<()> {
+    use std::process::Command;
+
+    let script = r"
+$ErrorActionPreference = 'Stop'
+$target = $env:EGREGORE_ACL_PATH
+$item = Get-Item -LiteralPath $target -Force
+$isDir = $item -is [System.IO.DirectoryInfo]
+if ($isDir) {
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+} else {
+    $acl = New-Object System.Security.AccessControl.FileSecurity
+    $inherit = [System.Security.AccessControl.InheritanceFlags]::None
+}
+$prop = [System.Security.AccessControl.PropagationFlags]::None
+$acl.SetAccessRuleProtection($true, $false)
+$curSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+    $curSid, 'FullControl', $inherit, $prop, 'Allow')))
+$sysSid = New-Object System.Security.Principal.SecurityIdentifier(
+    [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+$acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+    $sysSid, 'FullControl', $inherit, $prop, 'Allow')))
+if ($isDir) { [System.IO.Directory]::SetAccessControl($target, $acl) }
+else { [System.IO.File]::SetAccessControl($target, $acl) }
+";
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("EGREGORE_ACL_PATH", path)
+        .output()
+        .context("failed to execute PowerShell for Windows ACL enforcement")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "runtime_permissions_unsafe: failed to set private ACL for {kind} {}: {}",
+            path.display(),
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Returns `true` if the ACL on `path` grants access to a broad Windows
+/// principal (Everyone, BUILTIN\\Users, Authenticated Users, or Guests).
+///
+/// Uses PowerShell SID translation for locale-independent detection.
+#[cfg(windows)]
+fn windows_acl_has_broad_access(path: &Path) -> Result<bool> {
+    use std::process::Command;
+
+    // Well-known broad-group SIDs:
+    //   S-1-1-0        Everyone
+    //   S-1-5-32-545   BUILTIN\Users
+    //   S-1-5-11       NT AUTHORITY\Authenticated Users
+    //   S-1-5-32-546   BUILTIN\Guests
+    let script = r"
+$ErrorActionPreference = 'Stop'
+$target = $env:EGREGORE_ACL_PATH
+$acl = Get-Acl -LiteralPath $target
+$broadSids = @('S-1-1-0','S-1-5-32-545','S-1-5-11','S-1-5-32-546')
+foreach ($ace in $acl.Access) {
+    if ($ace.AccessControlType -eq 'Allow') {
+        try {
+            $sid = $ace.IdentityReference.Translate(
+                [System.Security.Principal.SecurityIdentifier]).Value
+            if ($broadSids -contains $sid) { exit 1 }
+        } catch {}
+    }
+}
+exit 0
+";
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("EGREGORE_ACL_PATH", path)
+        .output()
+        .context("failed to execute PowerShell for Windows ACL inspection")?;
+
+    Ok(output.status.code() == Some(1))
+}
+
+/// Checks the Windows ACL on a runtime file before reading
+/// credential-bearing content. Fails with `runtime_permissions_unsafe` if
+/// any broad local-group SID has Allow access.
+#[cfg(windows)]
+fn check_runtime_file_acl_safe_for_read(path: &Path) -> Result<()> {
+    if windows_acl_has_broad_access(path)? {
+        return Err(anyhow!(
+            "runtime_permissions_unsafe: {} grants read access to a broad Windows \
+             principal; diagnose with `icacls \"{}\"` and repair with \
+             `eg daemon repair-permissions --data-dir <dir>`",
+            path.display(),
+            path.display(),
+        ));
+    }
+    Ok(())
+}
 
 #[cfg(unix)]
 fn same_mount(child: &Path, parent: &Path) -> Result<bool> {
