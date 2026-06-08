@@ -436,7 +436,83 @@ fn tx_as_of_orders_multiple_symbols_by_span_then_id() {
     assert_eq!(lines, vec![10, 40], "rows must sort by span.start_line");
 }
 
+// ── Envelope: `as_of` is always present (null when no valid-time axis) ───────
+
+#[test]
+fn tx_as_of_envelope_includes_null_as_of_when_absent() {
+    let (_t, graph) = seed_store();
+    let (_ok, env) = run_tx_query(&graph, &["--tx-as-of", "2026-01-02T00:00:00Z"]);
+    assert!(
+        env.get("as_of").is_some(),
+        "as_of key must be present even without --as-of"
+    );
+    assert!(
+        env["as_of"].is_null(),
+        "as_of must serialize as null when no valid-time axis is supplied"
+    );
+}
+
+// ── AC2: cross-id supersession excluded once the replacement is known ────────
+
+#[test]
+fn tx_as_of_excludes_superseded_symbol_once_replacement_known() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    let new_id = stable_id(&["node", "Symbol", "src/new.rs", "widget"]);
+    let old = GraphRecord::symbol(
+        stable_id(&["node", "Symbol", "src/old.rs", "widget"]),
+        "fn",
+        "src/old.rs".to_owned(),
+        span(1, 5),
+        "widget".to_owned(),
+        "widget old".to_owned(),
+    )
+    .with_node_time(V1_VT, "author_provided", V1_TX)
+    .with_transaction_time(V1_TX)
+    .with_superseded_by(new_id.clone());
+    let new = GraphRecord::symbol(
+        new_id,
+        "fn",
+        "src/new.rs".to_owned(),
+        span(1, 6),
+        "widget".to_owned(),
+        "widget new".to_owned(),
+    )
+    .with_node_time(V2_VT, "author_provided", V2_TX)
+    .with_transaction_time(V2_TX);
+    let records = vec![old, new];
+
+    // Before the replacement is committed: supersession isn't known yet → keep old.
+    let before = symbol_as_of_transaction_time(&records, "widget", "2026-01-02T00:00:00Z", None)
+        .expect("query ok");
+    assert_eq!(before.records.len(), 1, "only the old symbol is known yet");
+    assert_eq!(record_path(before.records[0]), Some("src/old.rs"));
+
+    // After the replacement is committed: the superseded old row is dropped.
+    let after = symbol_as_of_transaction_time(&records, "widget", "2026-01-04T00:00:00Z", None)
+        .expect("query ok");
+    assert_eq!(
+        after.records.len(),
+        1,
+        "superseded old row must be excluded"
+    );
+    assert_eq!(record_path(after.records[0]), Some("src/new.rs"));
+    assert!(
+        after.diagnostics.iter().any(|d| d.code == "superseded"),
+        "exclusion must be reported via a `superseded` diagnostic"
+    );
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
+
+fn record_path(r: &GraphRecord) -> Option<&str> {
+    match r {
+        GraphRecord::Node {
+            repo_relative_path, ..
+        } => repo_relative_path.as_deref(),
+        _ => None,
+    }
+}
 
 fn diagnostic_codes(env: &Value) -> Vec<String> {
     env["diagnostics"]

@@ -6933,6 +6933,8 @@ fn symbol_by_name_tx_response(
     records: &[GraphRecord],
     snapshot: &str,
     view_handle: &str,
+    started: Instant,
+    budget: Option<Duration>,
 ) -> HttpResponse {
     // kind_filter only recognises "Symbol" in v1; anything else → empty result.
     if kind_filter.is_some_and(|kf| kf != "Symbol") {
@@ -6968,6 +6970,12 @@ fn symbol_by_name_tx_response(
         .filter_map(|r| symbol_node_to_tx_query_json(r))
         .take(limit)
         .collect();
+    // Enforce the timeout after the tx filter/sort/convert phase, mirroring the
+    // non-tx symbol path so a slow tx query on a large history store does not
+    // return 200 past the caller's budget.
+    if let Err(e) = check_query_budget(started, budget) {
+        return HttpResponse::error_with_id(request_id, e);
+    }
     let diagnostics: Vec<serde_json::Value> = result
         .diagnostics
         .iter()
@@ -7307,6 +7315,8 @@ fn handle_verb_symbol_by_name(
             &records,
             &snapshot,
             tx_as_of,
+            started,
+            budget,
         );
     }
 

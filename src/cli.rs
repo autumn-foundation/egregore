@@ -2863,7 +2863,8 @@ struct TxSymbolEnvelope<'a> {
     verb: &'static str,
     name: &'a str,
     tx_as_of: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // Always serialized (as `null` when no valid-time axis) so the JSON schema
+    // matches the daemon path and the documented envelope.
     as_of: Option<&'a str>,
     snapshot: &'a str,
     records: Vec<TxSymbolRow<'a>>,
@@ -2998,6 +2999,25 @@ fn query_symbol_tx_via_daemon(
     as_of: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
+    // Validate timestamps client-side first so a malformed instant produces the
+    // same `invalid_timestamp` envelope as the non-daemon path, before connecting.
+    if let Err(e) = chrono::DateTime::parse_from_rfc3339(tx_as_of) {
+        print_tx_error(
+            "invalid_timestamp",
+            &format!("invalid --tx-as-of timestamp '{tx_as_of}': {e}"),
+        )?;
+        std::process::exit(1);
+    }
+    if let Some(vt) = as_of
+        && let Err(e) = chrono::DateTime::parse_from_rfc3339(vt)
+    {
+        print_tx_error(
+            "invalid_timestamp",
+            &format!("invalid --as-of timestamp '{vt}': {e}"),
+        )?;
+        std::process::exit(1);
+    }
+
     let client = DaemonClient::from_data_dir(data_dir)
         .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
     let mut as_of_obj = serde_json::Map::new();
@@ -3006,11 +3026,19 @@ fn query_symbol_tx_via_daemon(
         as_of_obj.insert("valid_time".to_owned(), serde_json::json!(vt));
     }
     let as_of_value = serde_json::Value::Object(as_of_obj);
-    let result = client.query_verb_raw_with_as_of(
+    // Translate any daemon-side rejection into the documented machine-readable
+    // CLI error envelope on stdout instead of an anyhow string on stderr.
+    let result = match client.query_verb_raw_with_as_of(
         "symbol_by_name",
         &serde_json::json!({ "name": name }),
         Some(&as_of_value),
-    )?;
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            print_tx_error("daemon_query_error", &e.to_string())?;
+            std::process::exit(1);
+        }
+    };
     // `query_verb_raw_with_as_of` returns only the daemon `result` object, whose
     // record rows already carry the tx handles. Reconstruct the same CLI
     // `--tx-as-of` envelope the non-daemon path emits (top-level `ok`, `verb`,

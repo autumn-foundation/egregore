@@ -1441,6 +1441,43 @@ pub fn symbol_as_of_transaction_time<'r>(
         }
     };
     let mut selected: Vec<&GraphRecord> = best.into_values().map(|(r, _, _)| r).collect();
+
+    // Cross-id supersession (AC2): a Symbol carrying `superseded_by` is dropped
+    // once its replacement is *also known by the instant* — i.e. the target has a
+    // resolvable transaction time at or before `tx_as_of`. If the superseding
+    // record is not yet known (committed after the instant), the superseded row
+    // is kept, because the store did not yet know about the supersession then.
+    let known_by_instant: BTreeSet<&str> = records
+        .iter()
+        .filter(|r| {
+            record_transaction_time(r)
+                .and_then(|tt| DateTime::parse_from_rfc3339(tt).ok())
+                .is_some_and(|tt| tt <= tx_instant)
+        })
+        .map(GraphRecord::id)
+        .collect();
+    selected.retain(|r| {
+        let GraphRecord::Node {
+            superseded_by: Some(target),
+            ..
+        } = r
+        else {
+            return true;
+        };
+        if known_by_instant.contains(target.as_str()) {
+            diagnostics.push(TxDiagnostic {
+                code: "superseded".to_owned(),
+                message: format!(
+                    "record '{}' is superseded by '{target}', which is known by the instant; excluded",
+                    r.id()
+                ),
+            });
+            false
+        } else {
+            true
+        }
+    });
+
     selected.sort_by(|a, b| {
         span_start(a)
             .cmp(&span_start(b))

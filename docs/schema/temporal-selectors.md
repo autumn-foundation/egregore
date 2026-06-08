@@ -160,6 +160,7 @@ for malformed input, as a top-level `error` (exit 1):
 | `unsupported_combination` | error (exit 1) | `--tx-as-of` combined with `--at` |
 | `before_first_transaction` | diagnostic | instant precedes the earliest known transaction; empty view |
 | `after_latest_transaction` | diagnostic | instant at/after the latest known transaction; view reflects all known history |
+| `superseded` | diagnostic | a matched record is `superseded_by` another record that is also known by the instant; excluded |
 | `missing_transaction_metadata` | diagnostic | a matched record has no transaction-time stamp; excluded (no current-state fallback) |
 | `invalid_record_transaction_time` | diagnostic | a matched record's `transaction_time` is unparseable; excluded |
 | `no_named_symbol` | diagnostic | no Symbol with the queried name exists in the store |

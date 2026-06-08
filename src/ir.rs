@@ -1365,6 +1365,15 @@ impl GraphRecord {
         self
     }
 
+    /// Marks a node record as superseded by another record (sets `superseded_by`).
+    #[must_use]
+    pub fn with_superseded_by(mut self, target_id: impl Into<String>) -> Self {
+        if let Self::Node { superseded_by, .. } = &mut self {
+            *superseded_by = Some(target_id.into());
+        }
+        self
+    }
+
     /// Stamps the redaction policy version on a node record.
     ///
     /// Called by importers after applying the v1 redaction policy; see
