@@ -390,6 +390,52 @@ fn tx_as_of_excludes_record_without_transaction_metadata() {
     );
 }
 
+// ── Ordering: multiple matching symbols sort by (span.start_line, record_id) ──
+// Matches the daemon `symbol_by_name` contract so a `max_results` truncation
+// keeps the documented prefix.
+
+#[test]
+fn tx_as_of_orders_multiple_symbols_by_span_then_id() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    // Two distinct symbols both named "widget", at different start lines.
+    let later_line = GraphRecord::symbol(
+        stable_id(&["node", "Symbol", "src/b.rs", "widget"]),
+        "fn",
+        "src/b.rs".to_owned(),
+        span(40, 45),
+        "widget".to_owned(),
+        "widget b".to_owned(),
+    )
+    .with_node_time(V1_VT, "author_provided", V1_TX)
+    .with_transaction_time(V1_TX);
+    let earlier_line = GraphRecord::symbol(
+        stable_id(&["node", "Symbol", "src/a.rs", "widget"]),
+        "fn",
+        "src/a.rs".to_owned(),
+        span(10, 15),
+        "widget".to_owned(),
+        "widget a".to_owned(),
+    )
+    .with_node_time(V1_VT, "author_provided", V1_TX)
+    .with_transaction_time(V1_TX);
+    // Push in reverse to prove the sort, not insertion order, decides output.
+    let records = vec![later_line, earlier_line];
+
+    let result = symbol_as_of_transaction_time(&records, "widget", "2026-02-01T00:00:00Z", None)
+        .expect("query ok");
+    assert_eq!(result.records.len(), 2);
+    let lines: Vec<usize> = result
+        .records
+        .iter()
+        .map(|r| match r {
+            GraphRecord::Node { span: Some(s), .. } => s.start_line,
+            _ => 0,
+        })
+        .collect();
+    assert_eq!(lines, vec![10, 40], "rows must sort by span.start_line");
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 fn diagnostic_codes(env: &Value) -> Vec<String> {

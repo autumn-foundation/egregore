@@ -1430,8 +1430,22 @@ pub fn symbol_as_of_transaction_time<'r>(
         });
     }
 
+    // Sort by (span.start_line, record_id) to match the daemon `symbol_by_name`
+    // contract and the non-tx handler, so a `max_results` truncation on the
+    // daemon side keeps the documented prefix. Deterministic (AC7).
+    let span_start = |r: &GraphRecord| -> Option<usize> {
+        if let GraphRecord::Node { span, .. } = r {
+            span.map(|s| s.start_line)
+        } else {
+            None
+        }
+    };
     let mut selected: Vec<&GraphRecord> = best.into_values().map(|(r, _, _)| r).collect();
-    selected.sort_by(|a, b| a.id().cmp(b.id()));
+    selected.sort_by(|a, b| {
+        span_start(a)
+            .cmp(&span_start(b))
+            .then_with(|| a.id().cmp(b.id()))
+    });
 
     diagnostics.sort_by(|a, b| a.code.cmp(&b.code).then_with(|| a.message.cmp(&b.message)));
     diagnostics.dedup();

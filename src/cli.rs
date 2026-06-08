@@ -3011,12 +3011,34 @@ fn query_symbol_tx_via_daemon(
         &serde_json::json!({ "name": name }),
         Some(&as_of_value),
     )?;
+    // `query_verb_raw_with_as_of` returns only the daemon `result` object, whose
+    // record rows already carry the tx handles. Reconstruct the same CLI
+    // `--tx-as-of` envelope the non-daemon path emits (top-level `ok`, `verb`,
+    // `name`, `as_of`, `snapshot`) so JSON consumers see one shape regardless of
+    // `--daemon`.
+    let empty_records = serde_json::json!([]);
+    let records = result.get("records").unwrap_or(&empty_records);
+    let empty_diags = serde_json::json!([]);
+    let diagnostics = result.get("diagnostics").unwrap_or(&empty_diags);
+    let default_page = serde_json::json!({ "cursor": null, "has_more": false, "returned": 0 });
+    let page = result.get("page").unwrap_or(&default_page);
+    let envelope = serde_json::json!({
+        "ok": true,
+        "verb": "symbol",
+        "name": name,
+        "tx_as_of": tx_as_of,
+        "as_of": as_of,
+        "snapshot": tx_as_of,
+        "records": records,
+        "diagnostics": diagnostics,
+        "page": page,
+    });
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string(&result)?);
+            println!("{}", serde_json::to_string(&envelope)?);
         }
         OutputFormat::Text => {
-            if let Some(records) = result.get("records").and_then(|r| r.as_array()) {
+            if let Some(records) = records.as_array() {
                 for rec in records {
                     let name = rec.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let path = rec
