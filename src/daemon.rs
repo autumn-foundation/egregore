@@ -6885,11 +6885,20 @@ fn load_all_records_for_verb(
     started: Instant,
     budget: Option<Duration>,
     domain: &str,
+    include_superseded: bool,
 ) -> std::result::Result<(Vec<GraphRecord>, String), ApiError> {
     let sink = query_sink_read(state, started, budget)?;
     // Capture the snapshot while the read lock is held.
     let snapshot = rfc3339_now();
-    let records = sink.read_all_records().map_err(adapter_read_error_to_api)?;
+    // Transaction-time queries (issue #66) need superseded non-temporal versions
+    // so a prior store view can be reconstructed; current-state verbs collapse to
+    // the latest version per stable ID.
+    let records = if include_superseded {
+        sink.read_all_records_including_superseded()
+    } else {
+        sink.read_all_records()
+    }
+    .map_err(adapter_read_error_to_api)?;
     drop(sink);
     // Post-read check: the read itself may have overrun the deadline.
     check_query_budget(started, budget)?;
@@ -7350,7 +7359,13 @@ fn handle_verb_symbol_by_name(
         }
     }
 
-    let (records, snapshot) = match load_all_records_for_verb(state, started, budget, domain) {
+    let (records, snapshot) = match load_all_records_for_verb(
+        state,
+        started,
+        budget,
+        domain,
+        as_of_transaction_time.is_some(),
+    ) {
         Ok(r) => r,
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
@@ -7468,7 +7483,8 @@ fn handle_verb_symbol_at_commit(
         }
     };
 
-    let (records, snapshot) = match load_all_records_for_verb(state, started, budget, domain) {
+    let (records, snapshot) = match load_all_records_for_verb(state, started, budget, domain, false)
+    {
         Ok(r) => r,
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
@@ -7734,7 +7750,8 @@ fn handle_verb_file_defines(
         }
     };
 
-    let (records, snapshot) = match load_all_records_for_verb(state, started, budget, domain) {
+    let (records, snapshot) = match load_all_records_for_verb(state, started, budget, domain, false)
+    {
         Ok(r) => r,
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
@@ -7805,7 +7822,7 @@ fn handle_verb_drift_top_n(
         domain
     };
     let (mut records, snapshot) =
-        match load_all_records_for_verb(state, started, budget, drift_domain) {
+        match load_all_records_for_verb(state, started, budget, drift_domain, false) {
             Ok(r) => r,
             Err(e) => return HttpResponse::error_with_id(request_id, e),
         };

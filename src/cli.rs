@@ -2177,7 +2177,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                         .expect("clap requires --data-dir with --daemon");
                     return query_symbol_tx_via_daemon(&name, dir, tx, as_of.as_deref(), format);
                 }
-                let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+                let records = load_query_records_history(graph.as_deref(), data_dir.as_deref())?;
                 return query_symbol_tx_as_of(&records, &name, tx, as_of.as_deref(), format);
             }
             #[cfg(feature = "embedded-aletheiadb")]
@@ -2445,6 +2445,41 @@ fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
         let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
             .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
         sink.read_all_records()
+            .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// Loads query records for a transaction-time query (issue #66).
+///
+/// The `--graph` JSONL path already preserves every written line, so it is used
+/// unchanged. The embedded `--data-dir` path additionally surfaces superseded
+/// non-temporal versions so a prior store view can be reconstructed.
+fn load_query_records_history(
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+) -> Result<Vec<GraphRecord>> {
+    match (graph, data_dir) {
+        (Some(path), None) => load_records_from_jsonl(path),
+        (None, Some(dir)) => load_records_from_db_history(dir),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("provide only one of --graph or --data-dir, not both")
+        }
+        (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+    }
+}
+
+fn load_records_from_db_history(data_dir: &Path) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+            .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+        sink.read_all_records_including_superseded()
             .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
     }
     #[cfg(not(feature = "embedded-aletheiadb"))]

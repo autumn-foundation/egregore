@@ -118,14 +118,16 @@ A `--tx-as-of` query can only return versions the store actually **retained**:
   timeline. This is the supported path for code-graph corrections over time.
 - **Project/task records** are append-with-same-entity-id; every physical
   mutation is retained and visible to `--tx-as-of`.
-- **Non-temporal current-state records** (a plain `scan` symbol or an
-  agent-memory observation re-ingested under the same stable ID) are kept as a
-  single current-state version by the embedded store's contract — re-ingesting a
-  changed version overwrites the prior one at *ingest* time, so no read path can
-  recover it. To time-travel over such corrections, query the exported JSONL with
-  `--graph` (which preserves every line you wrote) or model the history through
-  `scan-history`. Retaining superseded non-temporal versions in the embedded
-  store would be a store-versioning change outside this query slice.
+- **Non-temporal records re-ingested under the same stable ID** (a corrected
+  `scan` symbol or agent-memory observation): each write creates a new physical
+  node and only the current-state index advances, so prior versions remain in the
+  store. Current-state reads return the latest version, while `--tx-as-of`
+  queries use a history-inclusive read that also surfaces the superseded prior
+  versions — so a between-instant query returns the version known at that
+  transaction time. (Distinguishing them requires distinct `transaction_time` /
+  `ingested_at` stamps on each version; versions without a transaction handle are
+  reported as `missing_transaction_metadata`.) The `--graph <jsonl>` path
+  likewise preserves every written line.
 
 ### Response envelope
 

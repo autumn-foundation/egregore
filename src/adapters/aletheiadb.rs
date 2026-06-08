@@ -600,6 +600,75 @@ impl EmbeddedAletheiaSink {
         Ok(records)
     }
 
+    /// Like [`Self::read_all_records`], but also emits *superseded* non-temporal
+    /// physical nodes — older versions of a stable ID that a later re-ingest
+    /// replaced in the current-state index.
+    ///
+    /// Each write creates a new physical node and only repoints the current-state
+    /// index, so prior non-temporal versions remain in the database. Current-state
+    /// reads ([`Self::read_all_records`]) intentionally collapse to the latest
+    /// version per stable ID; transaction-time queries (issue #66) instead need
+    /// the prior versions to reconstruct a past store view. This method is used
+    /// only by the transaction-time read paths, so non-tx query behaviour is
+    /// unchanged.
+    ///
+    /// Temporal snapshots (already fully emitted via the commit index) and
+    /// project nodes (already emitted in full) are not duplicated here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a physical record cannot be read.
+    pub fn read_all_records_including_superseded(&self) -> AdapterResult<Vec<GraphRecord>> {
+        let mut records = self.read_all_records()?;
+
+        // Storage IDs already represented: latest non-temporal, every temporal
+        // snapshot, and tombstones. Project nodes are emitted in full by
+        // read_all_records and excluded below by their `project:v1:` prefix.
+        let mut emitted: BTreeSet<::aletheiadb::NodeId> = BTreeSet::new();
+        emitted.extend(self.node_lookup.non_temporal.values().copied());
+        for commits in self.node_lookup.by_commit.values() {
+            emitted.extend(commits.values().map(|candidate| candidate.storage_id));
+        }
+        emitted.extend(self.tombstone_ids.values().copied());
+
+        for node_id in self.db.get_all_node_ids() {
+            if emitted.contains(&node_id) {
+                continue;
+            }
+            let node = self.db.get_node(node_id).map_err(|error| {
+                read_back_error("read_all_records_including_superseded", error.to_string())
+            })?;
+            let Some(record_id) = optional_str_property(
+                "read_all_records_including_superseded",
+                "codegraph_id",
+                node.get_property("codegraph_id"),
+            )?
+            else {
+                continue;
+            };
+            // Only superseded non-temporal node records: temporal snapshots carry
+            // a `git_commit` property and are emitted via the commit index;
+            // project nodes are emitted in full by read_all_records; edges and
+            // tombstones are not node records.
+            if optional_str_property(
+                "read_all_records_including_superseded",
+                "record_type",
+                node.get_property("record_type"),
+            )?
+            .as_deref()
+                != Some("node")
+            {
+                continue;
+            }
+            if node.get_property("git_commit").is_some() || record_id.starts_with("project:v1:") {
+                continue;
+            }
+            records.push(self.read_node_record(&record_id, node_id)?);
+        }
+
+        Ok(records)
+    }
+
     /// Reads all physical records stored in the database for inspection.
     /// This retrieves every single node, tombstone, and edge physically stored in `AletheiaDB`
     /// without temporal deduplication, tombstone filtering, or schema version validation.
@@ -3515,6 +3584,58 @@ mod tests {
             .expect("identical current write should be a no-op");
 
         assert_eq!(sink.node_lookup.candidate_count(&file_id), 1);
+    }
+
+    #[test]
+    fn read_all_records_including_superseded_surfaces_prior_non_temporal_versions() {
+        // Issue #66: a re-ingest of the same non-temporal stable ID keeps the
+        // prior physical version in the store. Current-state reads collapse to the
+        // latest, but the transaction-time read path must surface both so a prior
+        // store view can be reconstructed.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("superseded-read-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+        let v1 = current_symbol_record(&symbol_id, "v1", 20)
+            .with_transaction_time("2026-01-01T00:00:00Z");
+        let v2 = current_symbol_record(&symbol_id, "v2", 42)
+            .with_transaction_time("2026-01-03T00:00:00Z");
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&v1).expect("v1 should write");
+        sink.write_record(&v2).expect("v2 should write");
+
+        let count_symbol_versions = |records: &[GraphRecord]| {
+            records
+                .iter()
+                .filter(|r| r.id() == symbol_id && r.node_kind_name() == Some("Symbol"))
+                .count()
+        };
+
+        let current = sink.read_all_records().expect("current read");
+        assert_eq!(
+            count_symbol_versions(&current),
+            1,
+            "current-state read collapses to the latest version"
+        );
+
+        let history = sink
+            .read_all_records_including_superseded()
+            .expect("history read");
+        assert_eq!(
+            count_symbol_versions(&history),
+            2,
+            "history-inclusive read surfaces the superseded prior version"
+        );
+        // Both transaction-time stamps are present in the history-inclusive read.
+        let tx_stamps: BTreeSet<String> = history
+            .iter()
+            .filter(|r| r.id() == symbol_id)
+            .filter_map(|r| crate::query::record_transaction_time(r).map(ToOwned::to_owned))
+            .collect();
+        assert!(
+            tx_stamps.contains("2026-01-01T00:00:00Z")
+                && tx_stamps.contains("2026-01-03T00:00:00Z"),
+            "both prior and current transaction times must be present, got {tx_stamps:?}"
+        );
     }
 
     #[cfg(feature = "embeddings")]
