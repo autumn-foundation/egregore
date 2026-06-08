@@ -170,6 +170,12 @@ impl Graph {
         &self.records
     }
 
+    /// Consumes the graph and returns the records vector.
+    #[must_use]
+    pub fn into_records(self) -> Vec<GraphRecord> {
+        self.records
+    }
+
     /// Stamps every record in the graph with the given producer envelope.
     ///
     /// When a single producer emits a batch of records, every record in that

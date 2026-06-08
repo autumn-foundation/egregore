@@ -243,6 +243,15 @@ enum Commands {
         #[arg(long, default_value = "0.5", value_parser = parse_threshold)]
         fp_threshold: f64,
     },
+    /// Run the semantic drift calibration against a corpus file.
+    EvalDrift {
+        /// Path to the drift calibration corpus JSON file.
+        #[arg(long, default_value = "corpus/drift_calibration_corpus.json")]
+        corpus: PathBuf,
+        /// Selection threshold for drift evaluation (0.0–1.0, default 0.20).
+        #[arg(long, default_value = "0.20", value_parser = parse_threshold)]
+        threshold: f64,
+    },
     /// Manage the local Egregore daemon.
     #[cfg(feature = "embedded-aletheiadb")]
     Daemon {
@@ -946,6 +955,15 @@ fn run_cli(cli: Cli) -> Result<()> {
             {
                 let _ = (corpus, data_dir, top_k, threshold, fp_threshold);
                 anyhow::bail!("eval-semantic requires the 'embeddings' feature")
+            }
+        }
+        Commands::EvalDrift { corpus, threshold } => {
+            #[cfg(feature = "embeddings")]
+            return eval_drift_cmd(&corpus, threshold);
+            #[cfg(not(feature = "embeddings"))]
+            {
+                let _ = (corpus, threshold);
+                anyhow::bail!("eval-drift requires the 'embeddings' feature")
             }
         }
         #[cfg(feature = "embedded-aletheiadb")]
@@ -1808,6 +1826,9 @@ struct DriftResult<'a> {
     repo_relative_path: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+    status: &'static str,
 }
 
 /// Output row for a semantic similarity result.
@@ -2919,6 +2940,405 @@ fn eval_semantic_cmd(
     Ok(())
 }
 
+/// Run semantic drift calibration evaluation.
+#[cfg(feature = "embeddings")]
+#[allow(clippy::too_many_lines)]
+fn eval_drift_cmd(corpus_path: &Path, threshold: f64) -> Result<()> {
+    use crate::embeddings::{
+        CandidateVector, DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_NAME,
+        aletheia_embeddings, embedding_candidates, semantic_drift_records,
+    };
+    use std::collections::HashSet;
+    use std::io::Write as _;
+    use std::process::Command;
+
+    #[derive(Debug, Clone, serde::Deserialize)]
+    struct DriftCalibrationCorpus {
+        #[allow(dead_code)]
+        pub corpus_version: String,
+        #[allow(dead_code)]
+        pub description: String,
+        pub scenarios: Vec<DriftScenario>,
+    }
+
+    #[derive(Debug, Clone, serde::Deserialize)]
+    struct DriftScenario {
+        pub id: String,
+        pub class: String,
+        pub file_path: String,
+        pub before: String,
+        pub after: String,
+    }
+
+    #[allow(clippy::struct_excessive_bools)]
+    struct ScenarioEvalResult {
+        pub scenario_id: String,
+        pub class: String,
+        pub drift_detected: bool,
+        pub max_score: f64,
+        pub drift_details: Vec<DriftDetails>,
+        pub git_diff_detected: bool,
+        pub git_log_s_detected: bool,
+        pub rg_detected: bool,
+    }
+
+    struct DriftDetails {
+        #[allow(dead_code)]
+        pub before_commit: String,
+        #[allow(dead_code)]
+        pub after_commit: String,
+        pub file_path: String,
+        pub span: Option<SourceSpan>,
+        pub score: f64,
+        pub selection_threshold: f64,
+        pub model_name: String,
+    }
+
+    let corpus_text = std::fs::read_to_string(corpus_path)
+        .with_context(|| format!("failed to read corpus file {}", corpus_path.display()))?;
+    let corpus: DriftCalibrationCorpus = serde_json::from_str(&corpus_text)
+        .with_context(|| format!("failed to parse corpus JSON from {}", corpus_path.display()))?;
+
+    let embedder = aletheia_embeddings::EmbedderBuilder::new()
+        .model_architecture(DEFAULT_EMBEDDING_MODEL_ARCHITECTURE)
+        .model_id(Some(DEFAULT_EMBEDDING_MODEL_NAME))
+        .from_pretrained_hf()
+        .context("failed to load embedding model")?;
+
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+
+    let mut scanned_scenarios = Vec::new();
+
+    for scenario in &corpus.scenarios {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+
+        let run_git = |args: &[&str]| -> Result<()> {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&temp_path)
+                .output()?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "git command failed: git {:?} in {}. stderr: {}",
+                    args,
+                    temp_path.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(())
+        };
+
+        run_git(&["init"])?;
+        run_git(&["config", "user.name", "Test User"])?;
+        run_git(&["config", "user.email", "test@example.com"])?;
+        run_git(&["config", "commit.gpgsign", "false"])?;
+
+        let file_path = temp_path.join(&scenario.file_path);
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&file_path, &scenario.before)?;
+
+        run_git(&["add", "."])?;
+
+        let run_git_with_env = |args: &[&str], envs: &[(&str, &str)]| -> Result<()> {
+            let mut cmd = Command::new("git");
+            cmd.args(args).current_dir(&temp_path);
+            for (k, v) in envs {
+                cmd.env(k, v);
+            }
+            let output = cmd.output()?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "git command failed with envs: git {:?} in {}. stderr: {}",
+                    args,
+                    temp_path.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(())
+        };
+
+        let before_date = "2026-01-01T00:00:00Z";
+        let after_date = "2026-01-02T00:00:00Z";
+
+        run_git_with_env(
+            &["commit", "--allow-empty", "-m", "before"],
+            &[
+                ("GIT_AUTHOR_DATE", before_date),
+                ("GIT_COMMITTER_DATE", before_date),
+            ],
+        )?;
+
+        std::fs::write(&file_path, &scenario.after)?;
+
+        run_git(&["add", "."])?;
+        run_git_with_env(
+            &["commit", "--allow-empty", "-m", "after"],
+            &[
+                ("GIT_AUTHOR_DATE", after_date),
+                ("GIT_COMMITTER_DATE", after_date),
+            ],
+        )?;
+
+        let graph = scan_repository_history_with_override(&temp_path, None)?;
+        let scenario_records = graph.into_records();
+
+        let before_words: HashSet<&str> = scenario.before.split_whitespace().collect();
+        let after_words: HashSet<&str> = scenario.after.split_whitespace().collect();
+        let added_token = after_words
+            .iter()
+            .find(|w| !before_words.contains(*w))
+            .copied();
+        let removed_token = before_words
+            .iter()
+            .find(|w| !after_words.contains(*w))
+            .copied();
+        let diff_token = added_token.or(removed_token).map(|s| {
+            s.trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                .to_owned()
+        });
+
+        let has_git_diff = !Command::new("git")
+            .args(["diff", "--quiet", "HEAD~1", "HEAD"])
+            .current_dir(&temp_path)
+            .status()?
+            .success();
+
+        let has_git_log_s = if let Some(ref token) = diff_token {
+            if token.is_empty() {
+                false
+            } else {
+                let out = Command::new("git")
+                    .args(["log", &format!("-S{token}")])
+                    .current_dir(&temp_path)
+                    .output()?;
+                out.status.success() && !out.stdout.is_empty()
+            }
+        } else {
+            false
+        };
+
+        let has_rg = if let Some(ref token) = diff_token {
+            if token.is_empty() {
+                false
+            } else {
+                Command::new("git")
+                    .args(["grep", "-q", token])
+                    .current_dir(&temp_path)
+                    .status()?
+                    .success()
+            }
+        } else {
+            false
+        };
+
+        scanned_scenarios.push((
+            scenario.id.clone(),
+            scenario.class.clone(),
+            scenario_records,
+            has_git_diff,
+            has_git_log_s,
+            has_rg,
+            temp_dir,
+        ));
+    }
+
+    let mut all_records = Vec::new();
+    for (_, _, records, _, _, _, _) in &scanned_scenarios {
+        all_records.extend(records.clone());
+    }
+
+    let candidates = embedding_candidates(&all_records);
+    if candidates.is_empty() {
+        anyhow::bail!("no embedding candidates found in scanned graphs");
+    }
+
+    let texts: Vec<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
+    let embed_data = rt
+        .block_on(aletheia_embeddings::embed_query(&texts, &embedder, None))
+        .context("embedding generation failed")?;
+
+    let dense: Vec<Vec<f32>> = aletheia_embeddings::embed_data_to_dense_iter(embed_data, None)
+        .collect::<Result<Vec<_>, _>>()
+        .context("embedding result was not dense")?
+        .into_iter()
+        .map(|d| d.embedding)
+        .collect();
+
+    let candidate_vectors: Vec<CandidateVector> = candidates
+        .into_iter()
+        .zip(dense)
+        .map(|(candidate, vector)| CandidateVector { candidate, vector })
+        .collect();
+
+    let mut scenario_results = Vec::new();
+
+    for (scenario_id, class, scenario_records, has_git_diff, has_git_log_s, has_rg, _) in
+        scanned_scenarios
+    {
+        let scenario_record_ids: HashSet<&str> =
+            scenario_records.iter().map(GraphRecord::id).collect();
+
+        let scenario_candidate_vectors: Vec<CandidateVector> = candidate_vectors
+            .iter()
+            .filter(|cv| scenario_record_ids.contains(cv.candidate.record_id.as_str()))
+            .cloned()
+            .collect();
+
+        let scenario_drifts = semantic_drift_records(
+            &scenario_candidate_vectors,
+            DEFAULT_EMBEDDING_MODEL_NAME,
+            threshold,
+        );
+
+        let drift_detected = !scenario_drifts.is_empty();
+        let mut max_score = 0.0;
+        let mut drift_details = Vec::new();
+
+        for record in &scenario_drifts {
+            if let GraphRecord::Node {
+                id,
+                semantic_drift: Some(drift),
+                repo_relative_path: drift_path,
+                name: drift_name,
+                ..
+            } = record
+            {
+                if drift.score > max_score {
+                    max_score = drift.score;
+                }
+
+                let (resolved_path, _resolved_name, resolved_span) = resolve_drift_target(
+                    &all_records,
+                    id,
+                    drift,
+                    drift_path.as_deref(),
+                    drift_name.as_deref(),
+                );
+
+                drift_details.push(DriftDetails {
+                    before_commit: drift.before_git_commit.clone(),
+                    after_commit: drift.after_git_commit.clone(),
+                    file_path: resolved_path.unwrap_or("").to_owned(),
+                    span: resolved_span,
+                    score: drift.score,
+                    selection_threshold: drift.selection_threshold,
+                    model_name: drift.embedding_model.name.clone(),
+                });
+            }
+        }
+
+        scenario_results.push(ScenarioEvalResult {
+            scenario_id,
+            class,
+            drift_detected,
+            max_score,
+            drift_details,
+            git_diff_detected: has_git_diff,
+            git_log_s_detected: has_git_log_s,
+            rg_detected: has_rg,
+        });
+    }
+
+    let mut tp = 0;
+    let mut fp = 0;
+    let mut fn_count = 0;
+    let mut unchanged_fp = 0;
+
+    for r in &scenario_results {
+        if r.class == "meaning_changed" {
+            if r.drift_detected {
+                tp += 1;
+            } else {
+                fn_count += 1;
+            }
+        } else if r.drift_detected {
+            fp += 1;
+            if r.class == "unchanged" {
+                unchanged_fp += 1;
+            }
+        }
+    }
+
+    let precision = if tp + fp > 0 {
+        f64::from(tp) / f64::from(tp + fp)
+    } else {
+        0.0
+    };
+
+    let recall = if tp + fn_count > 0 {
+        f64::from(tp) / f64::from(tp + fn_count)
+    } else {
+        0.0
+    };
+
+    let precision_pass = precision >= 0.75;
+    let recall_pass = recall >= 0.70;
+    let unchanged_pass = unchanged_fp == 0;
+    let passed = precision_pass && recall_pass && unchanged_pass;
+
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+
+    writeln!(handle, "Semantic Drift Calibration Report")?;
+    writeln!(handle, "=================================")?;
+    writeln!(handle, "Evaluation threshold: {threshold:.2}")?;
+    writeln!(handle, "Total scenarios: {}", scenario_results.len())?;
+    writeln!(handle, "Metrics:")?;
+    writeln!(
+        handle,
+        "  Precision: {precision:.4} (pass: {precision_pass})"
+    )?;
+    writeln!(handle, "  Recall:    {recall:.4} (pass: {recall_pass})")?;
+    writeln!(
+        handle,
+        "  Unchanged false positives: {unchanged_fp} (pass: {unchanged_pass})"
+    )?;
+    writeln!(
+        handle,
+        "  Status:    {}",
+        if passed { "PASS" } else { "FAIL" }
+    )?;
+    writeln!(handle)?;
+
+    writeln!(handle, "Scenario Details:")?;
+    writeln!(handle, "-----------------")?;
+    for r in &scenario_results {
+        writeln!(
+            handle,
+            "  [{}] class={:<22} detected={:<5} max_score={:.4} | Baselines: diff={:<5} log_s={:<5} rg={:<5}",
+            r.scenario_id,
+            r.class,
+            r.drift_detected,
+            r.max_score,
+            r.git_diff_detected,
+            r.git_log_s_detected,
+            r.rg_detected
+        )?;
+
+        if r.drift_detected {
+            for d in &r.drift_details {
+                let span_str = d
+                    .span
+                    .map_or_else(String::new, |s| format!(" {}:{}", s.start_line, s.end_line));
+                writeln!(
+                    handle,
+                    "         - model={} score={:.4} thresh={:.2} path={}{} status=\"drift is a lead, not proof\"",
+                    d.model_name, d.score, d.selection_threshold, d.file_path, span_str
+                )?;
+            }
+        }
+    }
+
+    if !passed {
+        anyhow::bail!("Calibration metrics did not meet the required gates.");
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tombstone helpers
 // ---------------------------------------------------------------------------
@@ -3444,7 +3864,7 @@ fn query_drift(records: &[GraphRecord], limit: usize, format: OutputFormat) -> R
             continue;
         };
 
-        let (resolved_path, resolved_name) = resolve_drift_target(
+        let (resolved_path, resolved_name, resolved_span) = resolve_drift_target(
             records,
             id,
             drift,
@@ -3472,6 +3892,8 @@ fn query_drift(records: &[GraphRecord], limit: usize, format: OutputFormat) -> R
             selection_basis: drift.selection_basis.as_str(),
             repo_relative_path: resolved_path,
             name: resolved_name,
+            span: resolved_span,
+            status: "drift is a lead, not proof",
         };
         print_result(&result, format)?;
     }
@@ -3484,7 +3906,7 @@ fn resolve_drift_target<'a>(
     drift: &'a SemanticDriftMetadata,
     drift_path: Option<&'a str>,
     drift_name: Option<&'a str>,
-) -> (Option<&'a str>, Option<&'a str>) {
+) -> (Option<&'a str>, Option<&'a str>, Option<SourceSpan>) {
     // Follow DriftsFrom edge first (stable contract per CLI docs); fall back to
     // target_record_id when no edge is present in this slice.
     let target_id = records
@@ -3510,12 +3932,13 @@ fn resolve_drift_target<'a>(
     if let Some(GraphRecord::Node {
         repo_relative_path,
         name,
+        span,
         ..
     }) = records.iter().rfind(|r| r.id() == target_id)
     {
-        return (repo_relative_path.as_deref(), name.as_deref());
+        return (repo_relative_path.as_deref(), name.as_deref(), *span);
     }
-    (drift_path, drift_name)
+    (drift_path, drift_name, None)
 }
 
 // ---------------------------------------------------------------------------

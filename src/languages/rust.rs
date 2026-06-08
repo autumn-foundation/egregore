@@ -300,13 +300,15 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             qualified_name,
             &disambiguator.to_string(),
         ]);
+        let node_text = self.node_text(node);
+        let normalized = normalize_code(node_text);
         let mut record = GraphRecord::symbol(
             id.clone(),
             symbol_kind,
             self.file.repo_relative_path.clone(),
             span(node),
             qualified_name.to_owned(),
-            format!("Rust {symbol_kind} {qualified_name}"),
+            format!("Rust {symbol_kind} {qualified_name}\nSource:\n{normalized}"),
         );
         if let GraphRecord::Node {
             disambiguator: node_disambiguator,
@@ -548,4 +550,94 @@ fn module_path_from_file_parts(parts: &[&str]) -> Vec<String> {
 #[allow(dead_code)]
 fn _path_for_error(path: &std::path::Path) -> PathBuf {
     path.to_path_buf()
+}
+
+/// Normalizes source code by stripping comments and collapsing whitespace.
+#[must_use]
+pub fn normalize_code(code: &str) -> String {
+    let mut result = String::new();
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut escaped = false;
+
+    let chars: Vec<char> = code.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+                result.push('\n');
+            }
+        } else if in_block_comment {
+            if i + 1 < chars.len() && c == '*' && chars[i + 1] == '/' {
+                in_block_comment = false;
+                i += 1;
+            }
+        } else if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            result.push(c);
+        } else if in_char {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '\'' {
+                in_char = false;
+            }
+            result.push(c);
+        } else if i + 1 < chars.len() && c == '/' && chars[i + 1] == '/' {
+            in_line_comment = true;
+            i += 1;
+        } else if i + 1 < chars.len() && c == '/' && chars[i + 1] == '*' {
+            in_block_comment = true;
+            i += 1;
+        } else if c == '"' {
+            in_string = true;
+            result.push(c);
+        } else if c == '\'' {
+            in_char = true;
+            result.push(c);
+        } else {
+            result.push(c);
+        }
+        i += 1;
+    }
+
+    let mut normalized = String::new();
+    let mut last_was_space = false;
+    for c in result.chars() {
+        if c.is_whitespace() {
+            if !last_was_space {
+                normalized.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            normalized.push(c);
+            last_was_space = false;
+        }
+    }
+    normalized.trim().to_owned()
+}
+
+/// Normalizes file content by removing `use` import declarations, comments, and collapsing whitespace.
+#[must_use]
+pub fn normalize_file_code(code: &str) -> String {
+    let stripped_imports: Vec<&str> = code
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.starts_with("use ") && !trimmed.is_empty()
+        })
+        .collect();
+    let content_without_imports = stripped_imports.join("\n");
+    normalize_code(&content_without_imports)
 }
