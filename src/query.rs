@@ -1538,6 +1538,12 @@ pub fn symbol_as_of_transaction_time<'r>(
     // instant predates the commit active at the instant (the latest commit the
     // store knew by then, observed across all temporal records), the symbol was
     // removed or renamed at that commit and must not be carried forward as live.
+    //
+    // This applies to the transaction axis only. When a valid-time axis is also
+    // requested, the query asks "what was true at valid time V, as known by T";
+    // a row selected because `valid_time <= V` was genuinely true at V, so a
+    // later removal (a transaction-axis fact) must not erase it. Removal
+    // detection is therefore skipped whenever `--as-of` is supplied.
     let is_temporal = |r: &GraphRecord| -> bool {
         matches!(
             r,
@@ -1560,7 +1566,8 @@ pub fn symbol_as_of_transaction_time<'r>(
     };
     let active_commit_tx = records.iter().filter_map(observed_le).max();
     let named_temporal_latest = named.iter().copied().filter_map(observed_le).max();
-    if let (Some(active), Some(name_latest)) = (active_commit_tx, named_temporal_latest)
+    if vt_requested.is_none()
+        && let (Some(active), Some(name_latest)) = (active_commit_tx, named_temporal_latest)
         && name_latest < active
     {
         let removed = selected.iter().any(|r| is_temporal(r));

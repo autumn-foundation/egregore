@@ -728,6 +728,47 @@ fn tx_as_of_excludes_removed_history_symbol() {
     assert_eq!(kept_after.records.len(), 1, "kept survives at c3");
 }
 
+// ── AC4: history removal must not erase an earlier valid-time answer ─────────
+// A two-axis query asks what was true at valid time V; a row true at V must not
+// be dropped just because the symbol was removed at a later commit known by T.
+
+#[test]
+fn tx_as_of_history_removal_respects_valid_time_axis() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    let gone_id = stable_id(&["node", "Symbol", "src/lib.rs", "gone"]);
+    let kept_id = stable_id(&["node", "Symbol", "src/lib.rs", "kept"]);
+    let mut records = Vec::new();
+    for (commit, date) in [
+        ("c1c1c1c1", "2026-01-01T00:00:00Z"),
+        ("c2c2c2c2", "2026-01-02T00:00:00Z"),
+    ] {
+        records.push(history_symbol(&gone_id, "gone", "src/lib.rs", commit, date));
+    }
+    for (commit, date) in [
+        ("c1c1c1c1", "2026-01-01T00:00:00Z"),
+        ("c2c2c2c2", "2026-01-02T00:00:00Z"),
+        ("c3c3c3c3", "2026-01-03T00:00:00Z"),
+    ] {
+        records.push(history_symbol(&kept_id, "kept", "src/lib.rs", commit, date));
+    }
+
+    // Known by 2026-01-04 (after the removal commit c3), but asking what was TRUE
+    // at valid time 2026-01-01 → `gone` existed then, so it must still be returned.
+    let result = symbol_as_of_transaction_time(
+        &records,
+        "gone",
+        "2026-01-04T00:00:00Z",
+        Some("2026-01-01T12:00:00Z"),
+    )
+    .expect("query ok");
+    assert_eq!(
+        result.records.len(),
+        1,
+        "valid-time axis asks what was true at V; a later removal must not erase it"
+    );
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 fn history_symbol(id: &str, name: &str, path: &str, commit: &str, date: &str) -> GraphRecord {
