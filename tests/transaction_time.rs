@@ -254,6 +254,28 @@ fn tx_as_of_malformed_timestamp_returns_error_envelope() {
 }
 
 #[test]
+fn tx_as_of_malformed_timestamp_is_rejected_before_reading_the_store() {
+    // A malformed instant must yield the `invalid_timestamp` envelope even when
+    // the local store cannot be read at all, proving selectors are validated
+    // before `load_query_records_history` touches the store.
+    let missing = std::path::Path::new("/nonexistent/definitely/not/here.jsonl");
+    let assert = CargoCommand::cargo_bin("egregore")
+        .expect("egregore binary")
+        .args(["query", "symbol", "widget", "--graph"])
+        .arg(missing)
+        .args(["--tx-as-of", "not-a-timestamp"])
+        .assert()
+        .failure();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8");
+    let env: Value = serde_json::from_str(stdout.trim()).expect("JSON envelope on stdout");
+    assert_eq!(env["ok"], false);
+    assert_eq!(
+        env["error"]["code"], "invalid_timestamp",
+        "must reject the timestamp before failing to read the missing store"
+    );
+}
+
+#[test]
 fn tx_as_of_with_at_is_unsupported_combination() {
     let (_t, graph) = seed_store();
     let assert = CargoCommand::cargo_bin("egregore")
@@ -1151,6 +1173,68 @@ fn tx_as_of_same_name_removal_does_not_drop_other_repository() {
             .iter()
             .any(|d| d.code == "absent_at_transaction"),
         "repo A's removal must still be reported, got {:?}",
+        result.diagnostics
+    );
+}
+
+// ── Same name, same repo: removal is pruned per stable ID, not per name ────────
+// One repository can hold several distinct `Symbol`s sharing a name (one per
+// file). Removing one must not be masked by another that survives at the active
+// commit — the removed stable ID is excluded while the live one is kept.
+
+#[test]
+fn tx_as_of_same_name_same_repo_prunes_only_the_removed_stable_id() {
+    use aletheia_egregore::query::symbol_as_of_transaction_time;
+
+    // Both `foo`s live in one repository (shared linear history c1←c2←c3).
+    let foo_a = stable_id(&["node", "Symbol", "src/a.rs", "foo"]);
+    let foo_b = stable_id(&["node", "Symbol", "src/b.rs", "foo"]);
+    let mut records = Vec::new();
+    // src/a.rs::foo present at c1/c2, removed at c3.
+    for (commit, parents, date) in [
+        ("c1c1c1c1", &[][..], "2026-01-01T00:00:00Z"),
+        ("c2c2c2c2", &["c1c1c1c1"][..], "2026-01-02T00:00:00Z"),
+    ] {
+        records.push(history_symbol(
+            &foo_a, "foo", "src/a.rs", commit, parents, date,
+        ));
+    }
+    // src/b.rs::foo present at c1/c2/c3 (so c3 is the active commit, and b's foo
+    // is still live there).
+    for (commit, parents, date) in [
+        ("c1c1c1c1", &[][..], "2026-01-01T00:00:00Z"),
+        ("c2c2c2c2", &["c1c1c1c1"][..], "2026-01-02T00:00:00Z"),
+        ("c3c3c3c3", &["c2c2c2c2"][..], "2026-01-03T00:00:00Z"),
+    ] {
+        records.push(history_symbol(
+            &foo_b, "foo", "src/b.rs", commit, parents, date,
+        ));
+    }
+
+    // After c3: a's foo was removed; b's foo (live at the active commit) survives.
+    let result = symbol_as_of_transaction_time(&records, "foo", "2026-01-04T00:00:00Z", None, None)
+        .expect("query ok");
+    assert_eq!(
+        result.records.len(),
+        1,
+        "a surviving same-name symbol must not mask the removed one, got {:?}",
+        result
+            .records
+            .iter()
+            .map(|r| record_path(r))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        record_path(result.records[0]),
+        Some("src/b.rs"),
+        "the live `foo` (src/b.rs) is kept; the removed `foo` (src/a.rs) is excluded"
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "absent_at_transaction"),
+        "the removed stable ID must be reported, got {:?}",
         result.diagnostics
     );
 }

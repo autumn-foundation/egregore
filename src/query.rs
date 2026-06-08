@@ -1801,26 +1801,49 @@ pub fn symbol_as_of_transaction_time<'r>(
             }
         };
         let active = records.iter().filter_map(&commit_key).max();
-        let name_latest = named.iter().filter_map(|r| commit_key(r)).max();
-        if let (Some(active), Some(name_latest)) = (active, name_latest)
-            && name_latest < active
-        {
-            // Prune only this component's temporal rows; rows belonging to a
-            // different repository (or carrying no commit) are untouched.
-            let in_component = |r: &GraphRecord| -> bool { component_of(r) == Some(component) };
-            let removed = selected.iter().any(|r| is_temporal(r) && in_component(r));
-            selected.retain(|r| !(is_temporal(r) && in_component(r)));
-            if removed {
-                diagnostics.push(TxDiagnostic {
-                    code: "absent_at_transaction".to_owned(),
-                    message: format!(
-                        "symbol '{symbol_name}' was absent at the commit active in the requested view (last seen '{}', active commit '{}'); excluded",
-                        name_latest.0.to_rfc3339(),
-                        active.0.to_rfc3339()
-                    ),
-                });
+        let Some(active) = active else {
+            continue;
+        };
+        // Removal is decided per *stable record ID*, not per name: a repository
+        // can hold several distinct `Symbol`s sharing a name (e.g. one per file),
+        // and only the IDs whose own latest snapshot predates the active commit
+        // were removed. Computing a single per-name latest would let a surviving
+        // `foo` mask a different stable `foo` that was actually deleted.
+        let mut id_latest: BTreeMap<&str, (DateTime<chrono::FixedOffset>, usize)> = BTreeMap::new();
+        for r in &named {
+            if let Some(key) = commit_key(r) {
+                id_latest
+                    .entry(r.id())
+                    .and_modify(|cur| {
+                        if key > *cur {
+                            *cur = key;
+                        }
+                    })
+                    .or_insert(key);
             }
         }
+        selected.retain(|r| {
+            if !(is_temporal(r) && component_of(r) == Some(component)) {
+                return true;
+            }
+            // Keep the row unless this specific stable ID's latest snapshot in the
+            // requested view predates the active commit (i.e. it was removed).
+            match id_latest.get(r.id()) {
+                Some(latest) if *latest < active => {
+                    diagnostics.push(TxDiagnostic {
+                        code: "absent_at_transaction".to_owned(),
+                        message: format!(
+                            "symbol '{symbol_name}' (record '{}') was absent at the commit active in the requested view (last seen '{}', active commit '{}'); excluded",
+                            r.id(),
+                            latest.0.to_rfc3339(),
+                            active.0.to_rfc3339()
+                        ),
+                    });
+                    false
+                }
+                _ => true,
+            }
+        });
     }
 
     selected.sort_by(|a, b| {

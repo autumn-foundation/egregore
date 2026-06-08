@@ -2177,6 +2177,26 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                         .expect("clap requires --data-dir with --daemon");
                     return query_symbol_tx_via_daemon(&name, dir, tx, as_of.as_deref(), format);
                 }
+                // Validate the temporal selectors before touching the local store
+                // so a malformed instant returns the `invalid_timestamp` envelope
+                // without reading (or failing on) a large/missing/unhealthy store —
+                // matching the daemon path, which validates before connecting.
+                if let Err(e) = chrono::DateTime::parse_from_rfc3339(tx) {
+                    print_tx_error(
+                        "invalid_timestamp",
+                        &format!("invalid --tx-as-of timestamp '{tx}': {e}"),
+                    )?;
+                    std::process::exit(1);
+                }
+                if let Some(vt) = as_of.as_deref()
+                    && let Err(e) = chrono::DateTime::parse_from_rfc3339(vt)
+                {
+                    print_tx_error(
+                        "invalid_timestamp",
+                        &format!("invalid --as-of timestamp '{vt}': {e}"),
+                    )?;
+                    std::process::exit(1);
+                }
                 let records = load_query_records_history(graph.as_deref(), data_dir.as_deref())?;
                 return query_symbol_tx_as_of(&records, &name, tx, as_of.as_deref(), format);
             }
