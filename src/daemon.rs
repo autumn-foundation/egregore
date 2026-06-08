@@ -242,6 +242,13 @@ struct IdempotencyStore {
 impl IdempotencyStore {
     fn load(path: PathBuf) -> Result<Self> {
         reject_runtime_symlink_components(&path, "runtime file")?;
+        // On Windows, enforce a private ACL on any pre-existing idempotency file
+        // before reading its contents.  A new file is created with correct
+        // permissions by `persist_entries` -> `atomic_write`.
+        #[cfg(windows)]
+        if path.exists() {
+            enforce_runtime_file_permissions(&path)?;
+        }
         let mut created = false;
         let entries = match fs::read_to_string(&path) {
             Ok(contents) => {
@@ -316,6 +323,14 @@ impl StoreLease {
             options.mode(0o600);
         }
         reject_runtime_symlink(&path, "runtime file")?;
+        // On Windows: a pre-existing lock file with a broad ACL may already be
+        // held open by another process. Rewriting the ACL after we open the file
+        // does not revoke that earlier handle, so we reject startup rather than
+        // silently repairing a file that another principal can already read.
+        #[cfg(windows)]
+        if path.exists() {
+            check_runtime_file_acl_safe_for_read(&path)?;
+        }
         let file = options
             .open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
@@ -10562,31 +10577,37 @@ else { [System.IO.File]::SetAccessControl($target, $acl) }
     Ok(())
 }
 
-/// Returns `true` if the ACL on `path` grants access to a broad Windows
-/// principal (Everyone, BUILTIN\\Users, Authenticated Users, or Guests).
+/// Returns `true` if the ACL on `path` has any Allow ACE whose SID is neither
+/// the current user nor SYSTEM (`S-1-5-18`).  Returns `false` when the path
+/// does not exist (no ACL to check).  Untranslatable SIDs fail closed (unsafe).
 ///
 /// Uses PowerShell SID translation for locale-independent detection.
 #[cfg(windows)]
 fn windows_acl_has_broad_access(path: &Path) -> Result<bool> {
     use std::process::Command;
 
-    // Well-known broad-group SIDs:
-    //   S-1-1-0        Everyone
-    //   S-1-5-32-545   BUILTIN\Users
-    //   S-1-5-11       NT AUTHORITY\Authenticated Users
-    //   S-1-5-32-546   BUILTIN\Guests
+    // Avoid calling PowerShell for a missing file; a non-existent path has no ACL.
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    // Reject any Allow ACE whose SID is not the current operator or SYSTEM.
+    // This catches both well-known broad groups and any other unexpected principal.
+    // Unknown or untranslatable SIDs are treated as unsafe (fail closed).
     let script = r"
 $ErrorActionPreference = 'Stop'
 $target = $env:EGREGORE_ACL_PATH
 $acl = Get-Acl -LiteralPath $target
-$broadSids = @('S-1-1-0','S-1-5-32-545','S-1-5-11','S-1-5-32-546')
+$curSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$sysSid = (New-Object System.Security.Principal.SecurityIdentifier(
+    [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)).Value
 foreach ($ace in $acl.Access) {
     if ($ace.AccessControlType -eq 'Allow') {
         try {
             $sid = $ace.IdentityReference.Translate(
                 [System.Security.Principal.SecurityIdentifier]).Value
-            if ($broadSids -contains $sid) { exit 1 }
-        } catch {}
+            if ($sid -ne $curSid -and $sid -ne $sysSid) { exit 1 }
+        } catch { exit 1 }
     }
 }
 exit 0
@@ -10601,16 +10622,17 @@ exit 0
     Ok(output.status.code() == Some(1))
 }
 
-/// Checks the Windows ACL on a runtime file before reading
-/// credential-bearing content. Fails with `runtime_permissions_unsafe` if
-/// any broad local-group SID has Allow access.
+/// Checks the Windows ACL on a runtime file before reading credential-bearing
+/// content. Fails with `runtime_permissions_unsafe` if any Allow ACE is for a
+/// principal other than the current user or SYSTEM. No-ops for missing files.
 #[cfg(windows)]
 fn check_runtime_file_acl_safe_for_read(path: &Path) -> Result<()> {
     if windows_acl_has_broad_access(path)? {
         return Err(anyhow!(
-            "runtime_permissions_unsafe: {} grants read access to a broad Windows \
-             principal; diagnose with `icacls \"{}\"` and repair with \
-             `eg daemon repair-permissions --data-dir <dir>`",
+            "runtime_permissions_unsafe: {} has Allow access for a principal \
+             other than the current user or SYSTEM; diagnose with \
+             `icacls \"{}\"` and repair by deleting the runtime directory and \
+             running `eg daemon start`",
             path.display(),
             path.display(),
         ));

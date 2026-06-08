@@ -8201,6 +8201,7 @@ fn test_cli_decide_copies_agent_memory_evidence_edges() {
     }
 }
 
+#[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn test_cli_decide_fails_on_conflicting_copied_evidence_edges() {
     let temp = tempfile::tempdir().unwrap();

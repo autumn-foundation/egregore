@@ -601,6 +601,35 @@ fn windows_status_with_permissive_metadata_acl_does_not_send_token() {
     daemon.stop();
 }
 
+/// On Windows: a pre-existing idempotency.json with permissive access must have
+/// its ACL enforced (repaired to owner-only) before daemon startup completes.
+#[cfg(windows)]
+#[test]
+fn windows_permissive_idempotency_acl_repaired_on_startup() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+
+    let runtime_dir = runtime_dir_for_data_dir(&data_dir);
+    fs::create_dir_all(&runtime_dir).expect("runtime dir should be created");
+    let idempotency_path = runtime_dir.join("idempotency.json");
+    fs::write(&idempotency_path, br#"{"entries":{}}"#).expect("idempotency file should be written");
+    windows_add_everyone_access_for_test(&idempotency_path);
+
+    assert!(
+        windows_acl_has_broad_access_for_test(&idempotency_path),
+        "idempotency file must have broad access before daemon startup"
+    );
+
+    let mut daemon = start_daemon(&data_dir);
+    daemon.stop();
+
+    assert!(
+        !windows_acl_has_broad_access_for_test(&idempotency_path),
+        "idempotency file ACL must be repaired to owner-only on daemon startup"
+    );
+}
+
 /// Add Everyone-read access to a path for test purposes only.
 #[cfg(windows)]
 fn windows_add_everyone_access_for_test(path: &Path) {
@@ -617,23 +646,25 @@ fn windows_add_everyone_access_for_test(path: &Path) {
     );
 }
 
-/// Returns true if the ACL on `path` grants access to a broad Windows group
-/// (Everyone, BUILTIN\\Users, Authenticated Users, or Guests).
-/// Uses PowerShell + SID lookup for locale-independent detection.
+/// Returns true if the ACL on `path` has any Allow ACE for a principal other
+/// than the current user or SYSTEM.  Mirrors the production `windows_acl_has_broad_access`
+/// logic so tests catch the same class of violations.
 #[cfg(windows)]
 fn windows_acl_has_broad_access_for_test(path: &Path) -> bool {
     let script = r"
 $ErrorActionPreference = 'Stop'
 $target = $env:EGREGORE_ACL_PATH
 $acl = Get-Acl -LiteralPath $target
-$broadSids = @('S-1-1-0','S-1-5-32-545','S-1-5-11','S-1-5-32-546')
+$curSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$sysSid = (New-Object System.Security.Principal.SecurityIdentifier(
+    [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)).Value
 foreach ($ace in $acl.Access) {
     if ($ace.AccessControlType -eq 'Allow') {
         try {
             $sid = $ace.IdentityReference.Translate(
                 [System.Security.Principal.SecurityIdentifier]).Value
-            if ($broadSids -contains $sid) { exit 1 }
-        } catch {}
+            if ($sid -ne $curSid -and $sid -ne $sysSid) { exit 1 }
+        } catch { exit 1 }
     }
 }
 exit 0
