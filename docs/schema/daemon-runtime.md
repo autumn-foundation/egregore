@@ -37,9 +37,9 @@ The v1 runtime directory file set is closed:
 
 | File | Writer | Reader | Format | Lifecycle | Permissions |
 |---|---|---|---|---|---|
-| `egregored.lock` | Daemon startup | Clients never read content | Advisory lock file | Held for daemon lifetime; released by OS on process death; may linger | POSIX `0600`; Windows current-user ACL required, tracked by `TODO(windows-acl-runtime-permissions)` until implemented |
-| `egregored.json` | Daemon startup and graceful shutdown | Clients on connect | JSON schema in section 3 | Rewritten on every start; rewritten with `state: "stopped"` on graceful shutdown; left in place | POSIX `0600`; Windows current-user ACL required, tracked by `TODO(windows-acl-runtime-permissions)` until implemented |
-| `idempotency.json` | Daemon only | Daemon only | Internal JSON journal | Created on startup; may change without a schema bump because it is not client contract | POSIX `0600`; Windows current-user ACL required, tracked by `TODO(windows-acl-runtime-permissions)` until implemented |
+| `egregored.lock` | Daemon startup | Clients never read content | Advisory lock file | Held for daemon lifetime; released by OS on process death; may linger | POSIX `0600`; Windows: current-user + SYSTEM full control, no inheritance, no broad-group access (enforced via Windows ACL) |
+| `egregored.json` | Daemon startup and graceful shutdown | Clients on connect | JSON schema in section 3 | Rewritten on every start; rewritten with `state: "stopped"` on graceful shutdown; left in place | POSIX `0600`; Windows: current-user + SYSTEM full control, no inheritance, no broad-group access (enforced via Windows ACL) |
+| `idempotency.json` | Daemon only | Daemon only | Internal JSON journal | Created on startup; may change without a schema bump because it is not client contract | POSIX `0600`; Windows: current-user + SYSTEM full control, no inheritance, no broad-group access (enforced via Windows ACL) |
 
 Any future file, such as structured logs, is an additive contract update in
 this document.
@@ -104,17 +104,43 @@ NOT silently fall back to embedded mutation.
 
 ## 6. Permissions and Startup
 
-POSIX:
+### POSIX
 
 - runtime directory: `0700`
 - `egregored.lock`: `0600`
 - `egregored.json`: `0600`
 - `idempotency.json`: `0600`
 
+### Windows ACL contract
+
+Every runtime file and the runtime directory must grant full control only to
+the **current user** (identified by SID, not username) and **SYSTEM**
+(`S-1-5-18`).  Inheritance is disabled.  No broad-group SIDs may hold any
+Allow entry:
+
+| Blocked SID | Group |
+|---|---|
+| `S-1-1-0` | Everyone |
+| `S-1-5-32-545` | BUILTIN\\Users |
+| `S-1-5-11` | NT AUTHORITY\\Authenticated Users |
+| `S-1-5-32-546` | BUILTIN\\Guests |
+
 The daemon MUST refuse startup with `runtime_permissions_unsafe` if it cannot
-enforce these modes. Windows MUST restrict runtime files to the current user
-only; v1 keeps the explicit `TODO(windows-acl-runtime-permissions)` cfg-gated
-gap until ACL enforcement lands.
+enforce these ACLs.  Before reading `egregored.json`, the daemon client also
+verifies the ACL is safe; if a broad-group SID is found, the client returns
+`runtime_permissions_unsafe` without reading or forwarding the bearer token.
+
+#### Diagnosing unsafe permissions on Windows
+
+```
+icacls <runtime-dir>
+icacls <runtime-dir>\egregored.json
+icacls <runtime-dir>\egregored.lock
+```
+
+A safe ACL shows only the current user and SYSTEM.  If broad groups appear,
+delete the runtime directory and let the daemon recreate it, or use
+`icacls <path> /reset` followed by a fresh `eg daemon start`.
 
 Startup order:
 
