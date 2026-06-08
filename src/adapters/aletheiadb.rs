@@ -619,36 +619,50 @@ impl EmbeddedAletheiaSink {
     ///
     /// Returns an error if a physical record cannot be read.
     pub fn read_all_records_including_superseded(&self) -> AdapterResult<Vec<GraphRecord>> {
-        let mut records = self.read_all_records()?;
-        let active_tombstoned = self.active_deleted_ids()?;
+        // Start from the current-state read, then drop its current non-temporal
+        // node versions: every non-temporal physical version (current,
+        // superseded, and active-tombstoned) is re-emitted below in write order.
+        //
+        // Ordering matters. The transaction-time resolver breaks equal-
+        // transaction-time ties between two versions of one stable ID by input
+        // order (later wins). `read_all_records` emits the current version first
+        // and a naive append would place older superseded versions after it, so
+        // a `--tx-as-of` at/after a shared timestamp (e.g. a batch ingest reusing
+        // one stamp) would resolve to the stale row. Re-emitting all versions
+        // sorted by `egregore_seq` (the store's monotonic write sequence) puts
+        // the latest write last, so the resolver's tie-break picks it.
+        let mut records: Vec<GraphRecord> = self
+            .read_all_records()?
+            .into_iter()
+            .filter(|record| {
+                // Keep project nodes (emitted in full), temporal nodes, tombstones
+                // and edges; drop only current non-temporal node versions, which
+                // are re-emitted in write order below.
+                !matches!(
+                    record,
+                    GraphRecord::Node { temporal: None, id, .. }
+                        if !id.starts_with("project:v1:")
+                )
+            })
+            .collect();
 
-        // The exact set of *node* storage IDs that read_all_records already
-        // emitted, so the sweep below adds only the physical node observations it
-        // did NOT surface:
-        //   * superseded non-temporal versions (a re-ingest advanced the
-        //     current-state index but left the prior node in the store),
-        //   * active-tombstoned non-temporal nodes (read_all_records omits them,
-        //     but a transaction-time view that predates the deletion must still
-        //     see the pre-delete node — the tx resolver ignores tombstones), and
-        //   * non-latest temporal observations of the same commit (the commit
-        //     index keeps one candidate per commit; earlier observations carry a
-        //     distinct `observed_at` a prior tx view may target).
-        // Project nodes are emitted in full by read_all_records and skipped below
-        // by their `project:v1:` prefix.
-        let mut emitted: BTreeSet<::aletheiadb::NodeId> = BTreeSet::new();
+        // Temporal commit candidates already emitted by read_all_records (one per
+        // commit). Their non-latest observations and every non-temporal physical
+        // node are (re)collected in the write-ordered sweep below.
+        let mut emitted_temporal: BTreeSet<::aletheiadb::NodeId> = BTreeSet::new();
         for commits in self.node_lookup.by_commit.values() {
-            emitted.extend(commits.values().map(|candidate| candidate.storage_id));
-        }
-        for (record_id, &node_id) in &self.node_lookup.non_temporal {
-            // read_all_records emits the current-state node only when it is not
-            // actively tombstoned; mirror that so tombstoned nodes are re-added.
-            if !active_tombstoned.contains(record_id.as_str()) {
-                emitted.insert(node_id);
-            }
+            emitted_temporal.extend(commits.values().map(|candidate| candidate.storage_id));
         }
 
+        // Sweep every physical node that is not an already-emitted current
+        // temporal candidate or a project node, tagging each with its write
+        // sequence. This surfaces superseded non-temporal versions, active-
+        // tombstoned non-temporal nodes (the tx resolver ignores tombstones, so a
+        // view predating a deletion must still see the pre-delete node), and the
+        // non-latest temporal observations of a commit.
+        let mut versioned: Vec<(u64, GraphRecord)> = Vec::new();
         for node_id in self.db.get_all_node_ids() {
-            if emitted.contains(&node_id) {
+            if emitted_temporal.contains(&node_id) {
                 continue;
             }
             let node = self.db.get_node(node_id).map_err(|error| {
@@ -675,8 +689,22 @@ impl EmbeddedAletheiaSink {
             {
                 continue;
             }
-            records.push(self.read_node_record(&record_id, node_id)?);
+            // `egregore_seq` is the monotonic per-write sequence; legacy nodes
+            // predating it sort first (seq 0), which is the correct write order
+            // for any version written before the sequence system existed.
+            let seq = optional_str_property(
+                "read_all_records_including_superseded",
+                "egregore_seq",
+                node.get_property("egregore_seq"),
+            )?
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+            versioned.push((seq, self.read_node_record(&record_id, node_id)?));
         }
+        // Stable sort by ascending write sequence: the latest write of any stable
+        // ID lands last, so the resolver's later-input-wins tie-break prefers it.
+        versioned.sort_by_key(|(seq, _)| *seq);
+        records.extend(versioned.into_iter().map(|(_, record)| record));
 
         Ok(records)
     }
@@ -1349,6 +1377,19 @@ impl EmbeddedAletheiaSink {
                 let temporal_key =
                     temporal_read_key_from_properties(&record_id, |key| node.get_property(key))?;
                 self.node_lookup.insert(record_id, node_id, temporal_key);
+                // Restore the write-sequence high-water mark so a re-opened store
+                // keeps assigning strictly increasing `egregore_seq` to new node
+                // writes (matching the edge/tombstone recovery below).
+                if let Some(seq) = optional_str_property(
+                    error_record_id,
+                    "egregore_seq",
+                    node.get_property("egregore_seq"),
+                )?
+                .and_then(|value| value.parse::<u64>().ok())
+                    && seq > self.write_seq
+                {
+                    self.write_seq = seq;
+                }
             }
             Some("tombstone") => {
                 self.tombstone_ids.insert(record_id, node_id);
@@ -1460,8 +1501,15 @@ impl EmbeddedAletheiaSink {
             unreachable!("write_node called with non-node record");
         };
 
-        let mut builder =
-            base_properties(id, "node", *schema_version, summary).insert("kind", kind.as_str());
+        // Stamp each physical node write with the store's monotonic write
+        // sequence so superseded versions of one stable ID can be ordered by
+        // write order on read (the transaction-time resolver breaks equal-
+        // transaction-time ties by input order).
+        self.write_seq += 1;
+        let seq_str = self.write_seq.to_string();
+        let mut builder = base_properties(id, "node", *schema_version, summary)
+            .insert("kind", kind.as_str())
+            .insert("egregore_seq", seq_str.as_str());
         builder = insert_optional(builder, "repo_relative_path", repo_relative_path.as_deref());
         builder = insert_optional(builder, "name", name.as_deref());
         builder = insert_optional(builder, "language", language.as_deref());
@@ -3647,6 +3695,43 @@ mod tests {
             tx_stamps.contains("2026-01-01T00:00:00Z")
                 && tx_stamps.contains("2026-01-03T00:00:00Z"),
             "both prior and current transaction times must be present, got {tx_stamps:?}"
+        );
+    }
+
+    #[test]
+    fn read_all_records_including_superseded_orders_equal_tx_versions_by_write_order() {
+        // Issue #66: two non-temporal versions of one stable ID can share a
+        // transaction_time (e.g. a batch ingest reusing a single stamp). A
+        // `--tx-as-of` at or after that instant must resolve to the LATEST write,
+        // not the superseded row that happens to share the timestamp. The
+        // history-inclusive read therefore emits versions in write (`egregore_seq`)
+        // order so the resolver's input-order tie-break prefers the latest write.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("equal-tx-order-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+        let shared_tx = "2026-01-02T00:00:00Z";
+        let v1 = current_symbol_record(&symbol_id, "v1", 20).with_transaction_time(shared_tx);
+        let v2 = current_symbol_record(&symbol_id, "v2", 42).with_transaction_time(shared_tx);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&v1).expect("v1 should write");
+        sink.write_record(&v2).expect("v2 should write");
+
+        let history = sink
+            .read_all_records_including_superseded()
+            .expect("history read");
+        let result =
+            crate::query::symbol_as_of_transaction_time(&history, "stable", shared_tx, None, None)
+                .expect("tx query ok");
+        assert_eq!(result.records.len(), 1, "one current version per stable ID");
+        let end_byte = match result.records[0] {
+            GraphRecord::Node {
+                span: Some(span), ..
+            } => span.end_byte,
+            _ => panic!("expected a Symbol node carrying a span"),
+        };
+        assert_eq!(
+            end_byte, 42,
+            "equal-transaction-time tie must resolve to the latest write (v2), not the superseded v1"
         );
     }
 
