@@ -949,6 +949,9 @@ pub fn normalize_file_code(code: &str) -> String {
                         }
                     }
                     if is_end {
+                        for _ in 0..raw_string_hashes {
+                            other_code.push('#');
+                        }
                         in_raw_string = false;
                         i += raw_string_hashes;
                     }
@@ -1122,5 +1125,14 @@ mod tests {
         let normalized2 = normalize_code(code2);
         assert_eq!(normalized1, normalized2);
         assert_eq!(normalized1, "fn f(a:i32)->i32{a+1}");
+    }
+
+    #[test]
+    fn test_normalize_file_code_raw_strings() {
+        let code = r##"
+            let s = r#"x"#; // comment
+        "##;
+        let normalized = normalize_file_code(code);
+        assert_eq!(normalized, "let s=r#\"x\"#;");
     }
 }
