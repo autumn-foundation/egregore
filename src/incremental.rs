@@ -144,11 +144,12 @@ pub fn scan_repository_incremental_at(
                 .into_iter()
                 .map(|r| r.with_valid_time_inferred(transaction_time))
                 .collect::<Vec<_>>();
-            if !can_reuse_cache_records && let Some(invalidated) = previous_entry {
+            if let Some(invalidated) = previous_entry {
                 for tombstone in invalidated_record_tombstones(
                     &source_file.repo_relative_path,
                     &invalidated.records,
                     &records,
+                    transaction_time,
                 ) {
                     graph.push(tombstone);
                 }
@@ -169,15 +170,12 @@ pub fn scan_repository_incremental_at(
     for (removed, cached_file) in &previous_cache.files {
         if !seen_files.contains(removed) {
             tombstoned_files.push(removed.clone());
-            if can_reuse_cache_records {
-                // repository_id is stable — tombstone the expected current file ID.
-                graph.push(file_tombstone(removed, &repository_id));
-            } else {
-                // repository_id changed; emit tombstones from the actual cached record IDs
-                // so stale records from the old identity are correctly deleted.
-                for record in &cached_file.records {
-                    graph.push(invalidated_record_tombstone(removed, record.id()));
-                }
+            // Tombstone every cached record (File node, Symbol nodes, DEFINES edges) so nothing
+            // from the deleted file remains live in persisted stores.
+            for tombstone in
+                invalidated_record_tombstones(removed, &cached_file.records, &[], transaction_time)
+            {
+                graph.push(tombstone);
             }
         }
     }
@@ -273,27 +271,11 @@ fn file_hash(path: &Path) -> Result<String> {
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
-fn file_tombstone(repo_relative_path: &str, repository_id: &str) -> GraphRecord {
-    let deleted_id = stable_id(&["node", "file", repository_id, repo_relative_path]);
-    GraphRecord::Tombstone {
-        id: stable_id(&[
-            "tombstone",
-            "file",
-            repository_id,
-            repo_relative_path,
-            &deleted_id,
-        ]),
-        schema_version: SCHEMA_VERSION,
-        deleted_id,
-        summary: format!("Removed source file {repo_relative_path}"),
-        producer: None,
-    }
-}
-
 fn invalidated_record_tombstones(
     repo_relative_path: &str,
     old_records: &[GraphRecord],
     rebuilt_records: &[GraphRecord],
+    transaction_time: &str,
 ) -> Vec<GraphRecord> {
     let rebuilt_ids = rebuilt_records
         .iter()
@@ -302,13 +284,27 @@ fn invalidated_record_tombstones(
     old_records
         .iter()
         .filter(|record| !rebuilt_ids.contains(record.id()))
-        .map(|record| invalidated_record_tombstone(repo_relative_path, record.id()))
+        .map(|record| {
+            invalidated_record_tombstone(repo_relative_path, record.id(), transaction_time)
+        })
         .collect()
 }
 
-fn invalidated_record_tombstone(repo_relative_path: &str, deleted_id: &str) -> GraphRecord {
+fn invalidated_record_tombstone(
+    repo_relative_path: &str,
+    deleted_id: &str,
+    transaction_time: &str,
+) -> GraphRecord {
     GraphRecord::Tombstone {
-        id: stable_id(&["tombstone", "cache-schema", repo_relative_path, deleted_id]),
+        // Include transaction_time so re-removing the same record after a re-add produces
+        // a fresh tombstone ID that gets a higher egregore_seq and supersedes the re-added node.
+        id: stable_id(&[
+            "tombstone",
+            "cache-schema",
+            repo_relative_path,
+            deleted_id,
+            transaction_time,
+        ]),
         schema_version: SCHEMA_VERSION,
         deleted_id: deleted_id.to_owned(),
         summary: format!("Invalidated stale cached record {deleted_id} from {repo_relative_path}"),

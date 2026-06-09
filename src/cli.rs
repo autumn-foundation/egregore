@@ -34,6 +34,8 @@ use crate::adapters::SemanticMatch;
 #[cfg(feature = "embedded-aletheiadb")]
 use crate::daemon::{DaemonClient, DaemonConfig};
 #[cfg(feature = "embedded-aletheiadb")]
+use crate::incremental::scan_repository_incremental;
+#[cfg(feature = "embedded-aletheiadb")]
 use crate::repair;
 
 #[derive(Debug, Parser)]
@@ -75,6 +77,46 @@ enum Commands {
         /// tests or when the auto-detected remote is wrong (e.g. a mirror).
         #[arg(long)]
         repo_id_override: Option<String>,
+    },
+    /// Incrementally refresh an ingested store from working-tree edits.
+    ///
+    /// Reuses the incremental file-cache (BLAKE3 per-file hashes) and the
+    /// tombstone-aware embedded re-ingest to update only changed/added/removed
+    /// files, leaving all other graph records (agent-memory, project, artifact,
+    /// verification) completely untouched.
+    ///
+    /// Shortest workflow (`docs/cli/refresh.md`):
+    ///   1. `eg scan <repo> --out g.jsonl && eg ingest g.jsonl --adapter embedded --data-dir .egregore`
+    ///   2. (edit source files …)
+    ///   3. `eg refresh <repo> --data-dir .egregore`
+    ///   4. `eg query symbol <name> --data-dir .egregore`
+    ///
+    /// Precondition failures (exit 2, machine-readable JSON to stderr):
+    ///   `{"code":"no_prior_scan"}` — `--data-dir` does not exist; run step 1 first.
+    ///   `{"code":"repository_identity_mismatch"}` — cache was built for a different
+    ///     repository; delete `<data-dir>/codegraph-cache.json` and re-run from step 1.
+    #[cfg(feature = "embedded-aletheiadb")]
+    Refresh {
+        /// Repository path to scan.
+        repo_path: PathBuf,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long, default_value = ".egregore")]
+        data_dir: PathBuf,
+        /// Incremental scan cache path.
+        /// Defaults to `<data-dir>/codegraph-cache.json`.
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// Output format for the refresh report (rebuilt / reused / tombstoned counts).
+        #[arg(long, default_value = "text")]
+        format: OutputFormat,
+        /// Refresh semantic embeddings for changed file and symbol nodes.
+        ///
+        /// Without this flag, structural records are updated but the semantic index
+        /// retains embeddings for any nodes whose source has since changed.
+        /// See `docs/cli/refresh.md` for the documented embedding-refresh workflow.
+        #[cfg(feature = "embeddings")]
+        #[arg(long)]
+        embed: bool,
     },
     /// Inspect a graph JSONL file or a running daemon.
     Inspect {
@@ -977,6 +1019,22 @@ fn run_cli(cli: Cli) -> Result<()> {
         Commands::Repair { action } => repair_cmd(action),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Mcp { data_dir } => crate::mcp::run_stdio(&data_dir),
+        #[cfg(feature = "embedded-aletheiadb")]
+        Commands::Refresh {
+            repo_path,
+            data_dir,
+            cache,
+            format,
+            #[cfg(feature = "embeddings")]
+            embed,
+        } => scan_refresh_cmd(
+            &repo_path,
+            &data_dir,
+            cache.as_deref(),
+            format,
+            #[cfg(feature = "embeddings")]
+            embed,
+        ),
     }
 }
 
@@ -1670,6 +1728,201 @@ fn ingest(
         }
         anyhow::bail!("ingest failed for {} records", report.failed);
     }
+}
+
+/// Machine-readable report emitted by `eg refresh`.
+///
+/// All counts are integers; file lists are sorted repository-relative paths.
+/// `freshness_after_refresh` is always `"fresh"` after a successful refresh
+/// (the counterpart to the read-only staleness signal in issue #82).
+#[cfg(feature = "embedded-aletheiadb")]
+#[derive(Debug, Serialize)]
+struct RefreshReport {
+    /// Repository-relative paths of files that were re-extracted in this refresh.
+    rebuilt_files: Vec<String>,
+    /// Number of rebuilt files.
+    rebuilt_count: usize,
+    /// Repository-relative paths of files whose cached records were reused unchanged.
+    reused_files: Vec<String>,
+    /// Number of reused files.
+    reused_count: usize,
+    /// Repository-relative paths of files that were tombstoned because they no longer exist.
+    tombstoned_files: Vec<String>,
+    /// Number of tombstoned files.
+    tombstoned_count: usize,
+    /// Total records submitted to the ingest adapter.
+    ingest_attempted: usize,
+    /// Records successfully written.
+    ingest_succeeded: usize,
+    /// Records that failed to write.
+    ingest_failed: usize,
+    /// Semantic embedding state after this refresh.
+    ///
+    /// `"not_requested"` — `--embed` was not passed; structural records are current
+    /// but any prior semantic embeddings for rebuilt/tombstoned nodes may be stale.
+    /// Re-run `eg ingest --adapter embedded --embed` to rebuild the full semantic index.
+    ///
+    /// `"refreshed"` — `--embed` was passed; embeddings for all changed nodes were
+    /// regenerated as part of this refresh.
+    embed_status: String,
+    /// Freshness of the store with respect to the working tree after this refresh.
+    ///
+    /// Always `"fresh"` on success: the store now reflects the current working tree.
+    /// This is the write counterpart to the read-only staleness signal (issue #82).
+    freshness_after_refresh: String,
+}
+
+/// Handles `eg refresh <repo_path> --data-dir <dir> [--cache <path>] [--format json|text]`.
+///
+/// Performs an incremental scan (BLAKE3 file-hash cache) and ingests only the
+/// changed/added/removed records into the embedded store.  Non-codegraph records
+/// (agent-memory, project, artifact, verification) are never touched.
+#[cfg(feature = "embedded-aletheiadb")]
+#[allow(clippy::too_many_lines)]
+fn scan_refresh_cmd(
+    repo_path: &Path,
+    data_dir: &Path,
+    cache: Option<&Path>,
+    format: OutputFormat,
+    #[cfg(feature = "embeddings")] embed: bool,
+) -> Result<()> {
+    // AC9: The embedded store must already exist before we can refresh it.
+    if !data_dir.exists() {
+        eprintln!(
+            r#"{{"code":"no_prior_scan","message":"embedded store not found at {}; run `eg scan <repo> --out g.jsonl && eg ingest g.jsonl --adapter embedded --data-dir {}` first"}}"#,
+            data_dir.display(),
+            data_dir.display()
+        );
+        process::exit(2);
+    }
+
+    // Derive effective cache path: defaults to <data_dir>/codegraph-cache.json.
+    let default_cache = data_dir.join("codegraph-cache.json");
+    let cache_path = cache.unwrap_or(&default_cache);
+
+    // AC9: If the cache already has a repository_id, it must match the current
+    // repository — otherwise the cache was built for a different repo and a full
+    // rebuild is required.
+    if cache_path.exists() {
+        let cache_raw = fs::read_to_string(cache_path)
+            .with_context(|| format!("failed to read cache {}", cache_path.display()))?;
+        if let Ok(cache_json) = serde_json::from_str::<serde_json::Value>(&cache_raw)
+            && let Some(cached_repo_id) = cache_json
+                .get("repository_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+        {
+            let current_identity = crate::identity::compute_repository_identity(repo_path, None);
+            if current_identity.id != cached_repo_id {
+                eprintln!(
+                    r#"{{"code":"repository_identity_mismatch","cached_id":"{}","current_id":"{}","message":"cache at {} was built for a different repository; delete it and re-run from `eg scan`"}}"#,
+                    cached_repo_id,
+                    current_identity.id,
+                    cache_path.display()
+                );
+                process::exit(2);
+            }
+        }
+    }
+
+    // Perform the incremental scan (reads cache, hashes files, rebuilds changed ones).
+    let scan = scan_repository_incremental(repo_path, cache_path)
+        .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
+
+    let records = scan.graph.records().to_vec();
+
+    // Open the embedded store and ingest the incremental graph.
+    #[cfg(feature = "embeddings")]
+    let mut sink = if embed {
+        let (vectors, dimensions) = generate_embeddings(&records)?;
+        EmbeddedAletheiaSink::open_with_embeddings(data_dir, vectors, dimensions)
+            .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?
+    } else {
+        EmbeddedAletheiaSink::open(data_dir)
+            .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?
+    };
+    #[cfg(not(feature = "embeddings"))]
+    let mut sink = EmbeddedAletheiaSink::open(data_dir)
+        .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+
+    let ingest_report = ingest_records(&records, &mut sink);
+    if !ingest_report.is_success() {
+        // Delete the cache so the next run does a clean rebuild; avoids a cache-ahead-of-store skew
+        // where the cache reflects file hashes the store never ingested.
+        let _ = fs::remove_file(cache_path);
+        for failure in &ingest_report.failures {
+            eprintln!("{}: {}", failure.record_id, failure.message);
+        }
+        anyhow::bail!("refresh failed for {} records", ingest_report.failed);
+    }
+    sink.persist_indexes()
+        .with_context(|| format!("failed to persist embedded store {}", data_dir.display()))?;
+
+    // Determine semantic embedding state for the report (AC8).
+    #[cfg(feature = "embeddings")]
+    let embed_status = if embed {
+        "refreshed".to_owned()
+    } else {
+        "not_requested".to_owned()
+    };
+    #[cfg(not(feature = "embeddings"))]
+    let embed_status = "not_requested".to_owned();
+
+    let rebuilt_files = scan.rebuilt_files;
+    let reused_files = scan.reused_files;
+    let tombstoned_files = scan.tombstoned_files;
+    let rebuilt_count = rebuilt_files.len();
+    let reused_count = reused_files.len();
+    let tombstoned_count = tombstoned_files.len();
+
+    let refresh_report = RefreshReport {
+        rebuilt_files,
+        rebuilt_count,
+        reused_files,
+        reused_count,
+        tombstoned_files,
+        tombstoned_count,
+        ingest_attempted: ingest_report.attempted,
+        ingest_succeeded: ingest_report.succeeded,
+        ingest_failed: ingest_report.failed,
+        embed_status,
+        // AC6: A successful refresh means the store now matches the working tree.
+        freshness_after_refresh: "fresh".to_owned(),
+    };
+
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&refresh_report)
+                    .context("failed to serialize refresh report")?
+            );
+        }
+        OutputFormat::Text => {
+            println!("rebuilt: {}", refresh_report.rebuilt_count);
+            println!("reused: {}", refresh_report.reused_count);
+            println!("tombstoned: {}", refresh_report.tombstoned_count);
+            println!("attempted: {}", refresh_report.ingest_attempted);
+            println!("succeeded: {}", refresh_report.ingest_succeeded);
+            println!("failed: {}", refresh_report.ingest_failed);
+            println!("embed_status: {}", refresh_report.embed_status);
+            println!(
+                "freshness_after_refresh: {}",
+                refresh_report.freshness_after_refresh
+            );
+            for f in &refresh_report.rebuilt_files {
+                println!("rebuilt_file: {f}");
+            }
+            for f in &refresh_report.reused_files {
+                println!("reused_file: {f}");
+            }
+            for f in &refresh_report.tombstoned_files {
+                println!("tombstoned_file: {f}");
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
