@@ -69,8 +69,7 @@ fn local_project_jsonl_schema_doc_locks_file_contract() {
             "parent_task_local_id",
             "unresolved_parent_task",
             "verification_handle",
-            "verified `acceptance_criterion` lines without `verification_handle` are skipped",
-            "verified `acceptance_criterion` lines with unresolved `verification_handle` are skipped",
+            "verified `acceptance_criterion` lines are imported with status downgraded to `unverified`",
             "acceptance_criterion_missing_verification",
             "unresolved_verification_handle",
             "acceptance_criterion.updated_at",
@@ -128,6 +127,8 @@ fn local_project_jsonl_schema_doc_locks_file_contract() {
             "Versioning rules",
             "schema_version` = `1`",
             "schema_version` = `2`",
+            "non_monotonic_updated_at",
+            "verified `acceptance_criterion` lines are imported with status downgraded",
         ],
     );
 
@@ -141,6 +142,8 @@ fn local_project_jsonl_schema_doc_locks_file_contract() {
             "ties broken by `updated_at`",
             "project:v<schema_version>:<blake3(domain || kind || source_kind || file_path || local_id)>",
             r#"`system_native_id": ".egregore/tasks/sample.jsonl:sample-task""#,
+            "verified `acceptance_criterion` lines without `verification_handle` are skipped",
+            "verified `acceptance_criterion` lines with unresolved `verification_handle` are skipped",
         ],
     );
 }

@@ -70,6 +70,8 @@ summaries include a `[code]` prefix:
 | `unresolved_parent_local_id` | ExternalLink references an unknown parent |
 | `duplicate_local_id_kind_mismatch` | Same `local_id` used for different record kinds |
 | `unknown_kind` | A line has an unrecognized `kind` value |
+| `non_monotonic_updated_at` | A revision's `updated_at` is earlier than the previous revision's; record is still imported |
+| `acceptance_criterion_missing_verification` | Verified AC has no resolvable verification handle; imported with status downgraded to `unverified` |
 
 ## Ingest into the Embedded Store
 

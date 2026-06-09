@@ -156,13 +156,12 @@ Field set:
 When `verification_handle` is present, the importer is responsible for resolving
 it to a verification record from issue #11 at import time.
 
-Rule: verified `acceptance_criterion` lines without `verification_handle` are skipped with an
-`acceptance_criterion_missing_verification` diagnostic. The importer MUST NOT
-write a `verified` acceptance criterion without a non-null `verification_link_id`.
-
-Rule: verified `acceptance_criterion` lines with unresolved `verification_handle` are skipped with an
-`acceptance_criterion_missing_verification` diagnostic. The importer MUST NOT
-write a `verified` acceptance criterion with a null `verification_link_id`.
+Rule: verified `acceptance_criterion` lines are imported with status downgraded to `unverified`
+and an `acceptance_criterion_missing_verification` diagnostic is emitted. The criterion is
+preserved in the graph output but not treated as proven; `verification_link_id` is not set.
+This applies both when `verification_handle` is absent and when it is present but cannot be
+resolved to a verification record. The importer MUST NOT write a `verified` acceptance
+criterion without a non-null `verification_link_id`.
 
 Rule: non-verified `acceptance_criterion` lines with unresolved
 `verification_handle` are imported with a null `verification_link_id` and emit
