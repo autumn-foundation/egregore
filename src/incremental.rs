@@ -144,7 +144,7 @@ pub fn scan_repository_incremental_at(
                 .into_iter()
                 .map(|r| r.with_valid_time_inferred(transaction_time))
                 .collect::<Vec<_>>();
-            if !can_reuse_cache_records && let Some(invalidated) = previous_entry {
+            if let Some(invalidated) = previous_entry {
                 for tombstone in invalidated_record_tombstones(
                     &source_file.repo_relative_path,
                     &invalidated.records,

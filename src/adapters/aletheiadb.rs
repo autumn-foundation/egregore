@@ -1260,8 +1260,14 @@ impl GraphSink for EmbeddedAletheiaSink {
 
     fn verify_record(&self, record: &GraphRecord) -> AdapterResult<()> {
         let Some(handle) = self.record_handles.get(record.id()).copied() else {
+            // Write was skipped (Matched); use cleared comparison to stay consistent with the Matched check.
             return match self.read_back(record.id())? {
-                Some(read_back) if read_back == *record => Ok(()),
+                Some(read_back)
+                    if read_back.with_cleared_producer_started_at()
+                        == record.with_cleared_producer_started_at() =>
+                {
+                    Ok(())
+                }
                 Some(_) => Err(AdapterError::ReadBack {
                     record_id: record.id().to_owned(),
                     message: "record mismatch".to_owned(),
