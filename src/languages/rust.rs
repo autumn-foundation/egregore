@@ -879,6 +879,256 @@ fn strip_comments_keep_newlines(code: &str) -> String {
 /// Normalizes file content by removing top-level `use` import declarations, comments, and collapsing whitespace.
 #[must_use]
 #[allow(clippy::too_many_lines)]
+fn parse_use_statement(chars: &[char], mut idx: usize) -> Option<usize> {
+    // Helper to skip whitespace
+    let skip_whitespace = |chars: &[char], mut i: usize| -> usize {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        i
+    };
+
+    idx = skip_whitespace(chars, idx);
+
+    // Loop to parse zero or more attributes
+    loop {
+        if idx < chars.len() && chars[idx] == '#' {
+            let mut j = idx + 1;
+            j = skip_whitespace(chars, j);
+            if j < chars.len() && chars[j] == '[' {
+                // Parse matching ']'
+                let mut bracket_depth = 1;
+                let mut in_str = false;
+                let mut in_ch = false;
+                let mut esc = false;
+                j += 1;
+                while j < chars.len() && bracket_depth > 0 {
+                    let c2 = chars[j];
+                    if in_str {
+                        if esc {
+                            esc = false;
+                        } else if c2 == '\\' {
+                            esc = true;
+                        } else if c2 == '"' {
+                            in_str = false;
+                        }
+                    } else if in_ch {
+                        if esc {
+                            esc = false;
+                        } else if c2 == '\\' {
+                            esc = true;
+                        } else if c2 == '\'' {
+                            in_ch = false;
+                        }
+                    } else {
+                        match c2 {
+                            '"' => in_str = true,
+                            '\'' => in_ch = true,
+                            '[' => bracket_depth += 1,
+                            ']' => bracket_depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    j += 1;
+                }
+                if bracket_depth == 0 {
+                    idx = skip_whitespace(chars, j);
+                    continue;
+                }
+                return None; // Malformed attribute
+            }
+        }
+        break;
+    }
+
+    // Parse visibility
+    if idx + 2 < chars.len() && chars[idx] == 'p' && chars[idx + 1] == 'u' && chars[idx + 2] == 'b'
+    {
+        let after_pub = idx + 3;
+        // Ensure "pub" is a whole word
+        if after_pub == chars.len()
+            || (!chars[after_pub].is_alphanumeric() && chars[after_pub] != '_')
+        {
+            idx = skip_whitespace(chars, after_pub);
+            if idx < chars.len() && chars[idx] == '(' {
+                // Parse matching ')'
+                let mut paren_depth = 1;
+                let mut in_str = false;
+                let mut in_ch = false;
+                let mut esc = false;
+                let mut j = idx + 1;
+                while j < chars.len() && paren_depth > 0 {
+                    let c2 = chars[j];
+                    if in_str {
+                        if esc {
+                            esc = false;
+                        } else if c2 == '\\' {
+                            esc = true;
+                        } else if c2 == '"' {
+                            in_str = false;
+                        }
+                    } else if in_ch {
+                        if esc {
+                            esc = false;
+                        } else if c2 == '\\' {
+                            esc = true;
+                        } else if c2 == '\'' {
+                            in_ch = false;
+                        }
+                    } else {
+                        match c2 {
+                            '"' => in_str = true,
+                            '\'' => in_ch = true,
+                            '(' => paren_depth += 1,
+                            ')' => paren_depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    j += 1;
+                }
+                if paren_depth == 0 {
+                    idx = skip_whitespace(chars, j);
+                } else {
+                    return None; // Malformed visibility
+                }
+            }
+        }
+    }
+
+    // Now we must see the "use" keyword
+    if idx + 2 < chars.len() && chars[idx] == 'u' && chars[idx + 1] == 's' && chars[idx + 2] == 'e'
+    {
+        let after_use = idx + 3;
+        if after_use == chars.len()
+            || (!chars[after_use].is_alphanumeric() && chars[after_use] != '_')
+        {
+            // Yes! It's a use statement. Now find the matching semicolon ';' at brace_depth 0 (relative to the use statement's body)
+            let mut j = after_use;
+            let mut use_brace_depth: usize = 0;
+            let mut in_str = false;
+            let mut in_ch = false;
+            let mut in_raw_str = false;
+            let mut raw_str_hashes = 0;
+            let mut esc = false;
+
+            while j < chars.len() {
+                let c2 = chars[j];
+                if in_raw_str {
+                    let mut is_end = false;
+                    if c2 == '"' {
+                        let mut matches = true;
+                        for k in 0..raw_str_hashes {
+                            if j + 1 + k >= chars.len() || chars[j + 1 + k] != '#' {
+                                matches = false;
+                                break;
+                            }
+                        }
+                        if matches {
+                            is_end = true;
+                        }
+                    }
+                    if is_end {
+                        in_raw_str = false;
+                        j += raw_str_hashes;
+                    }
+                } else if in_str {
+                    if esc {
+                        esc = false;
+                    } else if c2 == '\\' {
+                        esc = true;
+                    } else if c2 == '"' {
+                        in_str = false;
+                    }
+                } else if in_ch {
+                    if esc {
+                        esc = false;
+                    } else if c2 == '\\' {
+                        esc = true;
+                    } else if c2 == '\'' {
+                        in_ch = false;
+                    }
+                } else {
+                    // Check for raw string start
+                    let is_raw_str_start = {
+                        let mut prefix_len = 0;
+                        if c2 == 'r' {
+                            prefix_len = 1;
+                        } else if (c2 == 'b' || c2 == 'c')
+                            && j + 1 < chars.len()
+                            && chars[j + 1] == 'r'
+                        {
+                            prefix_len = 2;
+                        }
+                        let mut is_raw = false;
+                        let mut hashes_count = 0;
+                        if prefix_len > 0 {
+                            let preceded_by_ident = if j > 0 {
+                                let prev = chars[j - 1];
+                                prev.is_alphanumeric() || prev == '_'
+                            } else {
+                                false
+                            };
+                            if !preceded_by_ident {
+                                let mut temp_idx = j + prefix_len;
+                                while temp_idx < chars.len() && chars[temp_idx] == '#' {
+                                    temp_idx += 1;
+                                }
+                                if temp_idx < chars.len() && chars[temp_idx] == '"' {
+                                    is_raw = true;
+                                    hashes_count = temp_idx - (j + prefix_len);
+                                }
+                            }
+                        }
+                        if is_raw {
+                            Some((prefix_len, hashes_count))
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some((p_len, h_count)) = is_raw_str_start {
+                        in_raw_str = true;
+                        raw_str_hashes = h_count;
+                        j += p_len + h_count;
+                    } else if c2 == '"' {
+                        in_str = true;
+                    } else if c2 == '\'' {
+                        let mut is_char_lit = false;
+                        let mut k = j + 1;
+                        while k < chars.len() && k <= j + 10 && chars[k] != '\n' {
+                            if chars[k] == '\'' {
+                                is_char_lit = true;
+                                break;
+                            }
+                            if chars[k].is_whitespace()
+                                && (k != j + 1 || chars.get(j + 2) != Some(&'\''))
+                            {
+                                break;
+                            }
+                            k += 1;
+                        }
+                        if is_char_lit {
+                            in_ch = true;
+                        }
+                    } else if c2 == '{' {
+                        use_brace_depth += 1;
+                    } else if c2 == '}' {
+                        use_brace_depth = use_brace_depth.saturating_sub(1);
+                    } else if c2 == ';' && use_brace_depth == 0 {
+                        return Some(j);
+                    }
+                }
+                j += 1;
+            }
+        }
+    }
+
+    None
+}
+
+/// Normalizes file content by removing top-level `use` import declarations, comments, and collapsing whitespace.
+#[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn normalize_file_code(code: &str) -> String {
     let clean_code = strip_comments_keep_newlines(code);
     let chars: Vec<char> = clean_code.chars().collect();
@@ -892,148 +1142,120 @@ pub fn normalize_file_code(code: &str) -> String {
     let mut in_raw_string = false;
     let mut raw_string_hashes = 0;
     let mut escaped = false;
-    let mut in_use_statement = false;
-    let mut current_use = String::new();
 
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
-        if in_use_statement {
-            current_use.push(c);
-            if c == ';' {
-                in_use_statement = false;
-                let trimmed = current_use.trim().to_owned();
-                if !trimmed.is_empty() {
-                    import_lines.push(trimmed);
-                }
-                current_use.clear();
+        let parsed_use = Some(())
+            .filter(|()| brace_depth == 0 && !in_string && !in_char && !in_raw_string)
+            .and_then(|()| parse_use_statement(&chars, i));
+        if let Some(end_idx) = parsed_use {
+            let import_stmt: String = chars[i..=end_idx].iter().collect();
+            let trimmed = import_stmt.trim().to_owned();
+            if !trimmed.is_empty() {
+                import_lines.push(trimmed);
             }
+            i = end_idx + 1;
+            continue;
+        }
+
+        other_code.push(c);
+        if in_raw_string {
+            let mut is_end = false;
+            if c == '"' {
+                let mut matches = true;
+                for k in 0..raw_string_hashes {
+                    if i + 1 + k >= chars.len() || chars[i + 1 + k] != '#' {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    is_end = true;
+                }
+            }
+            if is_end {
+                for _ in 0..raw_string_hashes {
+                    other_code.push('#');
+                }
+                in_raw_string = false;
+                i += raw_string_hashes;
+            }
+        } else if in_string {
             if escaped {
                 escaped = false;
             } else if c == '\\' {
                 escaped = true;
-            } else if c == '"' && !in_char && !in_raw_string {
-                in_string = !in_string;
-            } else if c == '\'' && !in_string && !in_raw_string {
-                in_char = !in_char;
+            } else if c == '"' {
+                in_string = false;
             }
-        } else {
-            let is_use_start = c == 'u'
-                && i + 2 < chars.len()
-                && chars[i + 1] == 's'
-                && chars[i + 2] == 'e'
-                && (i + 3 == chars.len()
-                    || (!chars[i + 3].is_alphanumeric() && chars[i + 3] != '_'))
-                && (i == 0 || {
+        } else if in_char {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '\'' {
+                in_char = false;
+            }
+        } else if let Some((p_len, h_count)) = {
+            let mut prefix_len = 0;
+            if c == 'r' {
+                prefix_len = 1;
+            } else if (c == 'b' || c == 'c') && i + 1 < chars.len() && chars[i + 1] == 'r' {
+                prefix_len = 2;
+            }
+            let mut is_raw_str = false;
+            let mut hashes_count = 0;
+            if prefix_len > 0 {
+                let preceded_by_ident = if i > 0 {
                     let prev = chars[i - 1];
-                    !prev.is_alphanumeric() && prev != '_'
-                });
-
-            if brace_depth == 0 && !in_string && !in_char && !in_raw_string && is_use_start {
-                in_use_statement = true;
-                current_use.push(c);
-            } else {
-                other_code.push(c);
-                if in_raw_string {
-                    let mut is_end = false;
-                    if c == '"' {
-                        let mut matches = true;
-                        for k in 0..raw_string_hashes {
-                            if i + 1 + k >= chars.len() || chars[i + 1 + k] != '#' {
-                                matches = false;
-                                break;
-                            }
-                        }
-                        if matches {
-                            is_end = true;
-                        }
+                    prev.is_alphanumeric() || prev == '_'
+                } else {
+                    false
+                };
+                if !preceded_by_ident {
+                    let mut temp_idx = i + prefix_len;
+                    while temp_idx < chars.len() && chars[temp_idx] == '#' {
+                        temp_idx += 1;
                     }
-                    if is_end {
-                        for _ in 0..raw_string_hashes {
-                            other_code.push('#');
-                        }
-                        in_raw_string = false;
-                        i += raw_string_hashes;
+                    if temp_idx < chars.len() && chars[temp_idx] == '"' {
+                        is_raw_str = true;
+                        hashes_count = temp_idx - (i + prefix_len);
                     }
-                } else if in_string {
-                    if escaped {
-                        escaped = false;
-                    } else if c == '\\' {
-                        escaped = true;
-                    } else if c == '"' {
-                        in_string = false;
-                    }
-                } else if in_char {
-                    if escaped {
-                        escaped = false;
-                    } else if c == '\\' {
-                        escaped = true;
-                    } else if c == '\'' {
-                        in_char = false;
-                    }
-                } else if let Some((p_len, h_count)) = {
-                    let mut prefix_len = 0;
-                    if c == 'r' {
-                        prefix_len = 1;
-                    } else if (c == 'b' || c == 'c') && i + 1 < chars.len() && chars[i + 1] == 'r' {
-                        prefix_len = 2;
-                    }
-                    let mut is_raw_str = false;
-                    let mut hashes_count = 0;
-                    if prefix_len > 0 {
-                        let preceded_by_ident = if i > 0 {
-                            let prev = chars[i - 1];
-                            prev.is_alphanumeric() || prev == '_'
-                        } else {
-                            false
-                        };
-                        if !preceded_by_ident {
-                            let mut temp_idx = i + prefix_len;
-                            while temp_idx < chars.len() && chars[temp_idx] == '#' {
-                                temp_idx += 1;
-                            }
-                            if temp_idx < chars.len() && chars[temp_idx] == '"' {
-                                is_raw_str = true;
-                                hashes_count = temp_idx - (i + prefix_len);
-                            }
-                        }
-                    }
-                    if is_raw_str {
-                        Some((prefix_len, hashes_count))
-                    } else {
-                        None
-                    }
-                } {
-                    in_raw_string = true;
-                    raw_string_hashes = h_count;
-                    other_code.extend(chars[(i + 1)..=(i + p_len + h_count)].iter());
-                    i += p_len + h_count;
-                } else if c == '"' {
-                    in_string = true;
-                } else if c == '\'' {
-                    let mut is_char_lit = false;
-                    let mut j = i + 1;
-                    while j < chars.len() && j <= i + 10 && chars[j] != '\n' {
-                        if chars[j] == '\'' {
-                            is_char_lit = true;
-                            break;
-                        }
-                        if chars[j].is_whitespace()
-                            && (j != i + 1 || chars.get(i + 2) != Some(&'\''))
-                        {
-                            break;
-                        }
-                        j += 1;
-                    }
-                    if is_char_lit {
-                        in_char = true;
-                    }
-                } else if c == '{' {
-                    brace_depth += 1;
-                } else if c == '}' {
-                    brace_depth = brace_depth.saturating_sub(1);
                 }
             }
+            if is_raw_str {
+                Some((prefix_len, hashes_count))
+            } else {
+                None
+            }
+        } {
+            in_raw_string = true;
+            raw_string_hashes = h_count;
+            other_code.extend(chars[(i + 1)..=(i + p_len + h_count)].iter());
+            i += p_len + h_count;
+        } else if c == '"' {
+            in_string = true;
+        } else if c == '\'' {
+            let mut is_char_lit = false;
+            let mut j = i + 1;
+            while j < chars.len() && j <= i + 10 && chars[j] != '\n' {
+                if chars[j] == '\'' {
+                    is_char_lit = true;
+                    break;
+                }
+                if chars[j].is_whitespace() && (j != i + 1 || chars.get(i + 2) != Some(&'\'')) {
+                    break;
+                }
+                j += 1;
+            }
+            if is_char_lit {
+                in_char = true;
+            }
+        } else if c == '{' {
+            brace_depth += 1;
+        } else if c == '}' {
+            brace_depth = brace_depth.saturating_sub(1);
         }
         i += 1;
     }
@@ -1134,5 +1356,21 @@ mod tests {
         "##;
         let normalized = normalize_file_code(code);
         assert_eq!(normalized, "let s=r#\"x\"#;");
+    }
+
+    #[test]
+    fn test_normalize_file_code_visibility() {
+        let code = "
+            pub use b::Y;
+            use a::X;
+            pub(crate) use c::Z;
+        ";
+        let normalized = normalize_file_code(code);
+        // The imports should sort as:
+        // pub use b::Y;
+        // pub(crate) use c::Z;
+        // use a::X;
+        // (after normalization, all spacing is stripped/collapsed)
+        assert_eq!(normalized, "pub use b::Y;pub(crate)use c::Z;use a::X;");
     }
 }

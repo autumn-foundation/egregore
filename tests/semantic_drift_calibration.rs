@@ -140,3 +140,65 @@ fn eval_drift_fails_when_corpus_has_absolute_path() {
         .assert()
         .failure();
 }
+
+#[test]
+fn eval_drift_fails_when_corpus_has_windows_drive_prefix() {
+    let temp = tempdir().expect("create temp dir");
+    let corpus_path = temp.path().join("test_corpus_win_prefix.json");
+
+    let corpus_json = r#"{
+  "corpus_version": "1.0",
+  "description": "Test corpus with Windows drive prefix",
+  "scenarios": [
+    {
+      "id": "win_prefix_attempt",
+      "class": "unchanged",
+      "file_path": "C:escape.rs",
+      "before": "pub fn nop() {}",
+      "after": "pub fn nop() {}"
+    }
+  ]
+}"#;
+
+    fs::write(&corpus_path, corpus_json).expect("write test corpus");
+
+    Command::cargo_bin("egregore")
+        .unwrap()
+        .args(["eval-drift", "--corpus"])
+        .arg(&corpus_path)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "cannot contain a drive/prefix component",
+        ));
+}
+
+#[test]
+fn eval_drift_fails_when_corpus_has_invalid_scenario_class() {
+    let temp = tempdir().expect("create temp dir");
+    let corpus_path = temp.path().join("test_corpus_invalid_class.json");
+
+    let corpus_json = r#"{
+  "corpus_version": "1.0",
+  "description": "Test corpus with misspelled class",
+  "scenarios": [
+    {
+      "id": "misspelled_class",
+      "class": "meaning-changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn nop() {}",
+      "after": "pub fn nop() {}"
+    }
+  ]
+}"#;
+
+    fs::write(&corpus_path, corpus_json).expect("write test corpus");
+
+    Command::cargo_bin("egregore")
+        .unwrap()
+        .args(["eval-drift", "--corpus"])
+        .arg(&corpus_path)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("invalid scenario class"));
+}

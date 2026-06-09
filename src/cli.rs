@@ -2997,6 +2997,20 @@ fn eval_drift_cmd(corpus_path: &Path, threshold: f64) -> Result<()> {
     let corpus: DriftCalibrationCorpus = serde_json::from_str(&corpus_text)
         .with_context(|| format!("failed to parse corpus JSON from {}", corpus_path.display()))?;
 
+    // Validate scenario classes immediately
+    for scenario in &corpus.scenarios {
+        match scenario.class.as_str() {
+            "meaning_changed" | "structure_changed_only" | "text_changed_only" | "unchanged" => {}
+            other => {
+                anyhow::bail!(
+                    "Unrecognized or invalid scenario class '{}' in scenario '{}'. Allowed classes are: meaning_changed, structure_changed_only, text_changed_only, unchanged",
+                    other,
+                    scenario.id
+                );
+            }
+        }
+    }
+
     let embedder = aletheia_embeddings::EmbedderBuilder::new()
         .model_architecture(DEFAULT_EMBEDDING_MODEL_ARCHITECTURE)
         .model_id(Some(DEFAULT_EMBEDDING_MODEL_NAME))
@@ -3041,6 +3055,12 @@ fn eval_drift_cmd(corpus_path: &Path, threshold: f64) -> Result<()> {
         }
         for component in path.components() {
             match component {
+                std::path::Component::Prefix(_) => {
+                    anyhow::bail!(
+                        "Corpus scenario file_path cannot contain a drive/prefix component: {}",
+                        scenario.file_path
+                    );
+                }
                 std::path::Component::ParentDir => {
                     anyhow::bail!(
                         "Corpus scenario file_path cannot escape directory via '..': {}",
