@@ -6,10 +6,10 @@
 //!   AC3  — query reflects add / remove / move transitions after refresh
 //!   AC4  — resurrection: removed-then-re-added symbol is live again
 //!   AC5  — no-op refresh (unchanged files) writes no new records or tombstones
-//!   AC6  — successful refresh reports freshness_after_refresh = "fresh"
+//!   AC6  — successful refresh reports `freshness_after_refresh` = "fresh"
 //!   AC7  — non-codegraph records survive a refresh unchanged
-//!   AC8  — embed_status field documents embedding state
-//!   AC9  — missing store → exit 2 "no_prior_scan"; wrong identity → exit 2 "repository_identity_mismatch"
+//!   AC8  — `embed_status` field documents embedding state
+//!   AC9  — missing store → exit 2 `"no_prior_scan"`; wrong identity → exit 2 `"repository_identity_mismatch"`
 //!   AC10 — identical rebuilt/reused/tombstoned sets across 5 independent runs
 
 #![allow(missing_docs)]
@@ -688,6 +688,171 @@ fn refresh_embed_status_is_not_requested_without_embed_flag() {
         parsed["embed_status"], "not_requested",
         "embed_status must be \"not_requested\" when --embed is absent"
     );
+}
+
+// ── AC3 (deleted file): Symbols from deleted file tombstoned ──────────────
+
+/// AC3: Symbols from a deleted source file are no longer returned by `eg query symbol`
+/// after refresh.  Regression: `file_tombstone` only tombstoned the File node, leaving
+/// Symbol nodes and DEFINES edges live in the store.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn refresh_query_does_not_return_symbol_from_deleted_file() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(repo.join("src/lib.rs"), "pub fn keep_me() -> usize { 1 }\n").expect("write lib.rs");
+    fs::write(
+        repo.join("src/gone.rs"),
+        "pub fn in_gone_file() -> usize { 0 }\n",
+    )
+    .expect("write gone.rs");
+    let data_dir = temp.path().join("store");
+    initial_ingest(&temp, &repo, &data_dir);
+
+    // First refresh: both files in the store.
+    egregore()
+        .arg("refresh")
+        .arg(&repo)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    // Verify `in_gone_file` is initially live in the store.
+    {
+        let sink = aletheia_egregore::adapters::EmbeddedAletheiaSink::open(&data_dir)
+            .expect("store should open");
+        let records = sink.read_all_records().expect("should read records");
+        assert!(
+            records.iter().any(|r| matches!(
+                r,
+                aletheia_egregore::GraphRecord::Node { name: Some(n), .. }
+                    if n.contains("in_gone_file")
+            )),
+            "symbol from gone.rs must be live in the store before file deletion"
+        );
+    }
+
+    // Delete gone.rs.
+    fs::remove_file(repo.join("src/gone.rs")).expect("remove gone.rs");
+
+    // Refresh: gone.rs tombstoned along with all its symbol records.
+    egregore()
+        .arg("refresh")
+        .arg(&repo)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    // Symbols from the deleted file must not be live in the store after refresh.
+    {
+        let sink = aletheia_egregore::adapters::EmbeddedAletheiaSink::open(&data_dir)
+            .expect("store should reopen after refresh");
+        let records = sink
+            .read_all_records()
+            .expect("should read records after refresh");
+        assert!(
+            !records.iter().any(|r| matches!(
+                r,
+                aletheia_egregore::GraphRecord::Node { name: Some(n), .. }
+                    if n.contains("in_gone_file")
+            )),
+            "symbol from deleted file must not be live in the store after refresh"
+        );
+    }
+}
+
+// ── AC3 (remove-again cycle): Second removal must re-dead the symbol ───────
+
+/// AC3: A symbol removed, re-added, then removed again must remain dead after the
+/// second removal.  Regression: the same tombstone ID was produced for every removal
+/// of the same symbol, so the second write was skipped as Matched, leaving the
+/// re-added node (with higher `egregore_seq`) as the winner.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn refresh_query_does_not_return_symbol_after_remove_readd_remove() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn cycle_me() -> usize { 1 }\n",
+    )
+    .expect("write");
+    let data_dir = temp.path().join("store");
+    initial_ingest(&temp, &repo, &data_dir);
+
+    // Refresh 1: cycle_me enters the store.
+    egregore()
+        .arg("refresh")
+        .arg(&repo)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    // Refresh 2: remove cycle_me.
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn other_fn() -> usize { 0 }\n",
+    )
+    .expect("remove");
+    egregore()
+        .arg("refresh")
+        .arg(&repo)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+    egregore()
+        .args(["query", "symbol", "cycle_me", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .code(2);
+
+    // Refresh 3: re-add cycle_me.
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn other_fn() -> usize { 0 }\npub fn cycle_me() -> usize { 1 }\n",
+    )
+    .expect("readd");
+    egregore()
+        .arg("refresh")
+        .arg(&repo)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+    egregore()
+        .args(["query", "symbol", "cycle_me", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cycle_me"));
+
+    // Refresh 4: remove cycle_me again.
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn other_fn() -> usize { 0 }\n",
+    )
+    .expect("remove again");
+    egregore()
+        .arg("refresh")
+        .arg(&repo)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    // Must be dead again — the new tombstone must supersede the re-added node.
+    egregore()
+        .args(["query", "symbol", "cycle_me", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no match"));
 }
 
 // ── AC10: Determinism ──────────────────────────────────────────────────────

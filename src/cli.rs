@@ -1812,8 +1812,7 @@ fn scan_refresh_cmd(
                 .and_then(serde_json::Value::as_str)
                 .filter(|s| !s.is_empty())
         {
-            let current_identity =
-                crate::identity::compute_repository_identity(repo_path, None);
+            let current_identity = crate::identity::compute_repository_identity(repo_path, None);
             if current_identity.id != cached_repo_id {
                 eprintln!(
                     r#"{{"code":"repository_identity_mismatch","cached_id":"{}","current_id":"{}","message":"cache at {} was built for a different repository; delete it and re-run from `eg scan`"}}"#,
@@ -1847,10 +1846,17 @@ fn scan_refresh_cmd(
         .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
 
     let ingest_report = ingest_records(&records, &mut sink);
-    if ingest_report.is_success() {
-        sink.persist_indexes()
-            .with_context(|| format!("failed to persist embedded store {}", data_dir.display()))?;
+    if !ingest_report.is_success() {
+        // Delete the cache so the next run does a clean rebuild; avoids a cache-ahead-of-store skew
+        // where the cache reflects file hashes the store never ingested.
+        let _ = fs::remove_file(cache_path);
+        for failure in &ingest_report.failures {
+            eprintln!("{}: {}", failure.record_id, failure.message);
+        }
+        anyhow::bail!("refresh failed for {} records", ingest_report.failed);
     }
+    sink.persist_indexes()
+        .with_context(|| format!("failed to persist embedded store {}", data_dir.display()))?;
 
     // Determine semantic embedding state for the report (AC8).
     #[cfg(feature = "embeddings")]
@@ -1916,14 +1922,7 @@ fn scan_refresh_cmd(
         }
     }
 
-    if ingest_report.is_success() {
-        Ok(())
-    } else {
-        for failure in &ingest_report.failures {
-            eprintln!("{}: {}", failure.record_id, failure.message);
-        }
-        anyhow::bail!("refresh failed for {} records", ingest_report.failed)
-    }
+    Ok(())
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
