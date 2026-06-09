@@ -37,7 +37,7 @@ use crate::{
 /// Stable importer ID stamped on every emitted record.
 pub const IMPORTER_ID: &str = "local-jsonl";
 /// Importer version string; bump when the output contract changes.
-pub const IMPORTER_VERSION: &str = "0.1.0";
+pub const IMPORTER_VERSION: &str = "0.2.0";
 /// Domain value carried on every project-domain record.
 pub const DOMAIN: &str = "project";
 /// Source kind value for local-JSONL-derived records.
