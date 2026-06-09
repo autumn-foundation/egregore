@@ -18,9 +18,7 @@ use crate::{
         VerificationRequest, build_artifact_records, build_command_evidence_records,
         build_observation_records, build_verification_records,
     },
-    ir::{
-        EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan,
-    },
+    ir::{EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SourceSpan},
     link_evidence::{self, LinkOptions},
     local_project, query, scan_repository_history_with_override, scan_repository_with_override,
     schema_version::{RecordVersion, record_version},
@@ -3264,7 +3262,7 @@ fn eval_drift_cmd(corpus_path: &Path, threshold: f64) -> Result<()> {
                     max_score = drift.score;
                 }
 
-                let (resolved_path, _resolved_name, resolved_span) = resolve_drift_target(
+                let (resolved_path, _resolved_name, resolved_span) = query::resolve_drift_target(
                     &all_records,
                     id,
                     drift,
@@ -3918,7 +3916,7 @@ fn query_drift(records: &[GraphRecord], limit: usize, format: OutputFormat) -> R
             continue;
         };
 
-        let (resolved_path, resolved_name, resolved_span) = resolve_drift_target(
+        let (resolved_path, resolved_name, resolved_span) = query::resolve_drift_target(
             records,
             id,
             drift,
@@ -3952,58 +3950,6 @@ fn query_drift(records: &[GraphRecord], limit: usize, format: OutputFormat) -> R
         print_result(&result, format)?;
     }
     Ok(())
-}
-
-fn resolve_drift_target<'a>(
-    records: &'a [GraphRecord],
-    drift_id: &str,
-    drift: &'a SemanticDriftMetadata,
-    drift_path: Option<&'a str>,
-    drift_name: Option<&'a str>,
-) -> (Option<&'a str>, Option<&'a str>, Option<SourceSpan>) {
-    // Follow DriftsFrom edge first (stable contract per CLI docs); fall back to
-    // target_record_id when no edge is present in this slice.
-    let target_id = records
-        .iter()
-        .find_map(|r| {
-            let GraphRecord::Edge {
-                label: EdgeLabel::DriftsFrom,
-                source,
-                target,
-                ..
-            } = r
-            else {
-                return None;
-            };
-            if source == drift_id {
-                Some(target.as_str())
-            } else {
-                None
-            }
-        })
-        .unwrap_or(drift.target_record_id.as_str());
-
-    if let Some(GraphRecord::Node {
-        repo_relative_path,
-        name,
-        span,
-        ..
-    }) = records.iter().rfind(|r| {
-        if r.id() != target_id {
-            return false;
-        }
-        if let GraphRecord::Node {
-            temporal: Some(t), ..
-        } = r
-        {
-            t.git_commit == drift.after_git_commit
-        } else {
-            true
-        }
-    }) {
-        return (repo_relative_path.as_deref(), name.as_deref(), *span);
-    }
-    (drift_path, drift_name, None)
 }
 
 // ---------------------------------------------------------------------------
