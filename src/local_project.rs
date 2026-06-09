@@ -459,6 +459,10 @@ enum ParsedRecord {
     AcceptanceCriterion {
         line: AcLine,
         raw: Vec<u8>,
+        /// Overrides `line.status` when `Some`. Set to `"unverified"` when the AC
+        /// carries `status = "verified"` but verification cannot be resolved, so
+        /// the criterion is preserved but not treated as proven (AC7).
+        effective_status: Option<String>,
     },
     ExternalLink {
         line: ExternalLinkLine,
@@ -644,6 +648,10 @@ fn import_file(
     let mut task_ids: HashMap<String, String> = HashMap::new();
     // local_id → stable graph record ID for ACs (built during first pass)
     let mut ac_ids: HashMap<String, String> = HashMap::new();
+    // Monotonicity tracking: last-seen updated_at per task/AC local_id (file order).
+    // A new line whose updated_at is strictly earlier emits non_monotonic_updated_at.
+    let mut task_last_updated_at: HashMap<String, String> = HashMap::new();
+    let mut ac_last_updated_at: HashMap<String, String> = HashMap::new();
     // AC identity fields: local_id → (parent_task_local_id, ordinal)
     let mut ac_identity: HashMap<String, (String, u32)> = HashMap::new();
     // AC graph identity: (parent_task_local_id, ordinal) → local_id (first owner)
@@ -978,6 +986,42 @@ fn import_file(
                     .entry(("local_file".to_owned(), mat_native))
                     .or_insert_with(|| task.local_id.clone());
 
+                // Non-monotonic updated_at check: each revision should have an
+                // updated_at ≥ the previous line's updated_at for the same local_id.
+                if let Some(prev_updated_at) = task_last_updated_at.get(&task.local_id)
+                    && let Ok(prev_dt) = chrono::DateTime::parse_from_rfc3339(prev_updated_at)
+                    && let Ok(new_dt) = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
+                    && new_dt < prev_dt
+                {
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "non_monotonic_updated_at",
+                            &task.local_id,
+                        ],
+                        line_idx,
+                    );
+                    push_diagnostic(
+                        graph,
+                        &diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[non_monotonic_updated_at] task '{}' at line {} has updated_at='{}' earlier than previous revision '{}'",
+                            task.local_id,
+                            line_idx + 1,
+                            task.updated_at,
+                            prev_updated_at,
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                    // Still import — non-monotonic is a warning, not fatal.
+                }
+                task_last_updated_at.insert(task.local_id.clone(), task.updated_at.clone());
+
                 parsed.push((line_idx, ParsedRecord::Task { line: task, raw }));
             }
 
@@ -1011,11 +1055,11 @@ fn import_file(
                     }
                 };
 
-                // P1: verified ACs are skipped because this importer cannot
-                // resolve verification_handle to a verification_link_id.
-                // Emitting a verified AC without verification_link_id causes
-                // the daemon validator to reject the whole ingest.
-                if ac.status == "verified" {
+                // Verified ACs cannot have verification resolved by this importer.
+                // Per AC7: preserve the criterion but downgrade status to "unverified"
+                // so it is not treated as proven. The importer MUST NOT write a verified
+                // AC without a non-null verification_link_id (daemon validator rejects it).
+                let ac_effective_status: Option<String> = if ac.status == "verified" {
                     let diag_id = per_line_diag_id(
                         &[
                             "project",
@@ -1037,46 +1081,47 @@ fn import_file(
                         &diag_id,
                         Some(&file_rel),
                         &format!(
-                            "[acceptance_criterion_missing_verification] acceptance_criterion '{}' at line {} {reason}",
+                            "[acceptance_criterion_missing_verification] acceptance_criterion '{}' at line {} {reason}; importing with status='unverified'",
                             ac.local_id,
                             line_idx + 1
                         ),
                         transaction_time,
                     );
                     diag_count += 1;
-                    continue;
-                }
-
-                // Non-verified ACs with a verification_handle are imported with
-                // verification_link_id=null but must produce a diagnostic so operators
-                // know the handle was not resolved.
-                if ac.status != "verified" && ac.verification_handle.is_some() {
-                    let diag_id = per_line_diag_id(
-                        &[
-                            "project",
-                            "Diagnostic",
-                            SOURCE_KIND,
-                            &file_rel,
-                            "unresolved_verification_handle",
-                            &ac.local_id,
-                        ],
-                        line_idx,
-                    );
-                    push_diagnostic(
-                        graph,
-                        &diag_id,
-                        Some(&file_rel),
-                        &format!(
-                            "[unresolved_verification_handle] acceptance_criterion '{}' at line {} has status='{}' with a verification_handle that cannot be resolved",
-                            ac.local_id,
-                            line_idx + 1,
-                            ac.status
-                        ),
-                        transaction_time,
-                    );
-                    diag_count += 1;
-                    // Do NOT continue — the record is still imported with verification_link_id=null.
-                }
+                    // Preserve criterion with downgraded status (not skipped).
+                    Some("unverified".to_owned())
+                } else {
+                    // Non-verified ACs with a verification_handle are imported with
+                    // verification_link_id=null but must produce a diagnostic so
+                    // operators know the handle was not resolved.
+                    if ac.verification_handle.is_some() {
+                        let diag_id = per_line_diag_id(
+                            &[
+                                "project",
+                                "Diagnostic",
+                                SOURCE_KIND,
+                                &file_rel,
+                                "unresolved_verification_handle",
+                                &ac.local_id,
+                            ],
+                            line_idx,
+                        );
+                        push_diagnostic(
+                            graph,
+                            &diag_id,
+                            Some(&file_rel),
+                            &format!(
+                                "[unresolved_verification_handle] acceptance_criterion '{}' at line {} has status='{}' with a verification_handle that cannot be resolved",
+                                ac.local_id,
+                                line_idx + 1,
+                                ac.status
+                            ),
+                            transaction_time,
+                        );
+                        diag_count += 1;
+                    }
+                    None // use ac.status as-is
+                };
 
                 // Validate AC status against the closed enum.
                 if !VALID_AC_STATUSES.contains(&ac.status.as_str()) {
@@ -1273,9 +1318,47 @@ fn import_file(
                     ac_ids.insert(ac.local_id.clone(), ac_stable_id);
                 }
 
+                // Non-monotonic updated_at check for ACs.
+                if let Some(prev_updated_at) = ac_last_updated_at.get(&ac.local_id)
+                    && let Ok(prev_dt) = chrono::DateTime::parse_from_rfc3339(prev_updated_at)
+                    && let Ok(new_dt) = chrono::DateTime::parse_from_rfc3339(&ac.updated_at)
+                    && new_dt < prev_dt
+                {
+                    let diag_id = per_line_diag_id(
+                        &[
+                            "project",
+                            "Diagnostic",
+                            SOURCE_KIND,
+                            &file_rel,
+                            "non_monotonic_updated_at",
+                            &ac.local_id,
+                        ],
+                        line_idx,
+                    );
+                    push_diagnostic(
+                        graph,
+                        &diag_id,
+                        Some(&file_rel),
+                        &format!(
+                            "[non_monotonic_updated_at] acceptance_criterion '{}' at line {} has updated_at='{}' earlier than previous revision '{}'",
+                            ac.local_id,
+                            line_idx + 1,
+                            ac.updated_at,
+                            prev_updated_at,
+                        ),
+                        transaction_time,
+                    );
+                    diag_count += 1;
+                }
+                ac_last_updated_at.insert(ac.local_id.clone(), ac.updated_at.clone());
+
                 parsed.push((
                     line_idx,
-                    ParsedRecord::AcceptanceCriterion { line: ac, raw },
+                    ParsedRecord::AcceptanceCriterion {
+                        line: ac,
+                        raw,
+                        effective_status: ac_effective_status,
+                    },
                 ));
             }
 
@@ -1741,7 +1824,11 @@ fn import_file(
                     &mut emitted_src_links,
                 );
             }
-            ParsedRecord::AcceptanceCriterion { line: ac, raw } => {
+            ParsedRecord::AcceptanceCriterion {
+                line: ac,
+                raw,
+                effective_status,
+            } => {
                 // Parent was validated in first pass; unwrap is safe.
                 let parent_task_id = task_ids
                     .get(&ac.parent_task_local_id)
@@ -1754,6 +1841,7 @@ fn import_file(
                     parent_task_id,
                     opts,
                     transaction_time,
+                    effective_status.as_deref(),
                 );
             }
             ParsedRecord::ExternalLink { line: link, raw } => {
@@ -1964,8 +2052,13 @@ fn emit_task_records(
 
 /// Emit an `AcceptanceCriterion` node and its `OWNED_BY_TASK` edge.
 ///
+/// `status_override` replaces `ac.status` in the emitted record. Pass
+/// `Some("unverified")` when verification could not be resolved so the
+/// criterion is preserved but not treated as proven (AC7).
+///
 /// The edge is included for embedded-adapter completeness. The daemon write
 /// path synthesizes it from `parent_task_id`; pre-filter before daemon ingest.
+#[allow(clippy::too_many_arguments)]
 fn emit_ac_record(
     graph: &mut Graph,
     ac: &AcLine,
@@ -1974,6 +2067,7 @@ fn emit_ac_record(
     parent_task_id: &str,
     opts: &ImportOptions,
     transaction_time: &str,
+    status_override: Option<&str>,
 ) {
     let ac_id = project_stable_id(&[
         "project",
@@ -2014,7 +2108,7 @@ fn emit_ac_record(
         *source_kind = Some(SOURCE_KIND.to_owned());
         *ptid = Some(parent_task_id.to_owned());
         *ordinal = Some(ac.ordinal);
-        *status = Some(ac.status.clone());
+        *status = Some(status_override.unwrap_or(&ac.status).to_owned());
     }
     graph.push(ac_node);
 

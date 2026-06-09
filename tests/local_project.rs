@@ -801,3 +801,366 @@ fn source_handles_contain_local_id_component() {
         }
     }
 }
+
+// ── AC6: unknown kind produces diagnostic ─────────────────────────────────────
+
+#[test]
+fn unknown_kind_produces_diagnostic() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("sample.jsonl");
+    fs::write(
+        &file,
+        concat!(
+            "{\"kind\":\"header\",\"schema_version\":1,\"project_slug\":\"sample\",\"created_at\":\"2026-05-18T00:00:00Z\"}\n",
+            "{\"kind\":\"task\",\"local_id\":\"t1\",\"title\":\"T\",\"body\":\"\",\"status\":\"open\",\"priority\":\"normal\",\"assignees\":[],\"labels\":[],\"created_at\":\"2026-05-18T00:00:00Z\",\"updated_at\":\"2026-05-18T00:00:00Z\"}\n",
+            "{\"kind\":\"epic\",\"local_id\":\"e1\",\"title\":\"Epic 1\"}\n",
+        ),
+    )
+    .unwrap();
+
+    let result = import_local_tasks(&file, dir.path(), &fixed_opts()).unwrap();
+    let records = result.graph.records();
+
+    let has_unknown_kind_diag = records.iter().any(|r| {
+        if let GraphRecord::Node {
+            kind: NodeKind::Diagnostic,
+            summary,
+            ..
+        } = r
+        {
+            summary.contains("unknown_kind")
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_unknown_kind_diag,
+        "unknown kind must produce 'unknown_kind' Diagnostic"
+    );
+    // Valid task must still be imported
+    assert!(
+        count_kind(records, NodeKind::Task) >= 1,
+        "valid task must still be imported after unknown kind line"
+    );
+}
+
+// ── AC6: leftover .tmp-* files are silently ignored ───────────────────────────
+
+#[test]
+fn tmp_files_silently_ignored_no_crash() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    // Write a valid task file
+    fs::write(dir.path().join("sample.jsonl"), FIXTURE_CONTENT).unwrap();
+    // Write a leftover .tmp- file — must be silently ignored
+    fs::write(
+        dir.path().join("sample.jsonl.tmp-abc123"),
+        "not valid jsonl at all\n",
+    )
+    .unwrap();
+
+    let result = import_local_tasks(dir.path(), dir.path(), &fixed_opts())
+        .expect("import with .tmp- file present must not panic or error");
+
+    let task_count = count_kind(result.graph.records(), NodeKind::Task);
+    assert!(
+        task_count >= 2,
+        "expected tasks from the valid file; .tmp- file must be skipped"
+    );
+}
+
+// ── AC8: redaction removes secrets from task fields ───────────────────────────
+
+const SECRET_TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz012345";
+
+#[test]
+fn redaction_removes_api_token_from_task_title() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("sample.jsonl");
+    // Title contains a GitHub PAT that must be redacted at import time
+    let task_line = format!(
+        r#"{{"kind":"task","local_id":"t1","title":"Use token {SECRET_TOKEN} here","body":"","status":"open","priority":"normal","assignees":[],"labels":[],"created_at":"2026-05-18T00:00:00Z","updated_at":"2026-05-18T00:00:00Z"}}"#
+    );
+    let fixture = format!(
+        "{}\n{task_line}\n",
+        r#"{"kind":"header","schema_version":1,"project_slug":"sample","created_at":"2026-05-18T00:00:00Z"}"#,
+    );
+    fs::write(&file, &fixture).unwrap();
+
+    // Default opts apply real redaction
+    let opts = ImportOptions {
+        transaction_time: Some(FIXED_TX_TIME.to_owned()),
+        ..ImportOptions::default()
+    };
+    let result = import_local_tasks(&file, dir.path(), &opts).unwrap();
+
+    let jsonl = result.graph.to_jsonl().expect("serialization must succeed");
+    assert!(
+        !jsonl.contains(SECRET_TOKEN),
+        "graph output must not contain raw API token after redaction"
+    );
+    assert!(
+        jsonl.contains("<REDACTED:"),
+        "graph output must contain a <REDACTED:...> marker"
+    );
+}
+
+#[test]
+fn redaction_removes_api_token_from_ac_text() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("sample.jsonl");
+    let ac_line = format!(
+        r#"{{"kind":"acceptance_criterion","local_id":"t1-ac-1","parent_task_local_id":"t1","ordinal":1,"text":"Check token {SECRET_TOKEN}","status":"unverified","updated_at":"2026-05-18T00:00:00Z"}}"#
+    );
+    let fixture = format!(
+        "{}\n{}\n{ac_line}\n",
+        r#"{"kind":"header","schema_version":1,"project_slug":"sample","created_at":"2026-05-18T00:00:00Z"}"#,
+        r#"{"kind":"task","local_id":"t1","title":"T","body":"","status":"open","priority":"normal","assignees":[],"labels":[],"created_at":"2026-05-18T00:00:00Z","updated_at":"2026-05-18T00:00:00Z"}"#,
+    );
+    fs::write(&file, &fixture).unwrap();
+
+    let opts = ImportOptions {
+        transaction_time: Some(FIXED_TX_TIME.to_owned()),
+        ..ImportOptions::default()
+    };
+    let result = import_local_tasks(&file, dir.path(), &opts).unwrap();
+
+    let jsonl = result.graph.to_jsonl().expect("serialization must succeed");
+    assert!(
+        !jsonl.contains(SECRET_TOKEN),
+        "graph output must not contain raw API token in AC text after redaction"
+    );
+}
+
+// ── AC6: non-monotonic updated_at produces diagnostic (RED) ──────────────────
+
+#[test]
+fn non_monotonic_updated_at_task_produces_diagnostic() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("sample.jsonl");
+    fs::write(
+        &file,
+        concat!(
+            "{\"kind\":\"header\",\"schema_version\":1,\"project_slug\":\"sample\",\"created_at\":\"2026-05-18T00:00:00Z\"}\n",
+            // First occurrence: updated_at = 2026-05-18T01:00:00Z
+            "{\"kind\":\"task\",\"local_id\":\"t1\",\"title\":\"Original\",\"body\":\"\",\"status\":\"open\",\"priority\":\"normal\",\"assignees\":[],\"labels\":[],\"created_at\":\"2026-05-18T00:00:00Z\",\"updated_at\":\"2026-05-18T01:00:00Z\"}\n",
+            // Revision: updated_at = 2026-05-18T00:30:00Z — EARLIER than first occurrence
+            "{\"kind\":\"task\",\"local_id\":\"t1\",\"title\":\"Revised\",\"body\":\"\",\"status\":\"in_progress\",\"priority\":\"normal\",\"assignees\":[],\"labels\":[],\"created_at\":\"2026-05-18T00:00:00Z\",\"updated_at\":\"2026-05-18T00:30:00Z\"}\n",
+        ),
+    )
+    .unwrap();
+
+    let result = import_local_tasks(&file, dir.path(), &fixed_opts()).unwrap();
+    let records = result.graph.records();
+
+    let has_non_monotonic_diag = records.iter().any(|r| {
+        if let GraphRecord::Node {
+            kind: NodeKind::Diagnostic,
+            summary,
+            ..
+        } = r
+        {
+            summary.contains("non_monotonic_updated_at")
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_non_monotonic_diag,
+        "revision with earlier updated_at must produce 'non_monotonic_updated_at' Diagnostic; \
+         diagnostics found: {:?}",
+        records
+            .iter()
+            .filter_map(|r| {
+                if let GraphRecord::Node {
+                    kind: NodeKind::Diagnostic,
+                    summary,
+                    ..
+                } = r
+                {
+                    Some(summary.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    );
+    // The revision must still be imported despite the diagnostic (warning, not fatal)
+    assert_eq!(
+        count_kind(records, NodeKind::Task),
+        2,
+        "both the original and the revision must be imported despite the diagnostic"
+    );
+}
+
+#[test]
+fn non_monotonic_updated_at_ac_produces_diagnostic() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("sample.jsonl");
+    fs::write(
+        &file,
+        concat!(
+            "{\"kind\":\"header\",\"schema_version\":1,\"project_slug\":\"sample\",\"created_at\":\"2026-05-18T00:00:00Z\"}\n",
+            "{\"kind\":\"task\",\"local_id\":\"t1\",\"title\":\"T\",\"body\":\"\",\"status\":\"open\",\"priority\":\"normal\",\"assignees\":[],\"labels\":[],\"created_at\":\"2026-05-18T00:00:00Z\",\"updated_at\":\"2026-05-18T00:00:00Z\"}\n",
+            // First AC occurrence: updated_at = 2026-05-18T02:00:00Z
+            "{\"kind\":\"acceptance_criterion\",\"local_id\":\"t1-ac-1\",\"parent_task_local_id\":\"t1\",\"ordinal\":1,\"text\":\"Original criterion\",\"status\":\"unverified\",\"updated_at\":\"2026-05-18T02:00:00Z\"}\n",
+            // Revision: updated_at = 2026-05-18T01:00:00Z — EARLIER than first
+            "{\"kind\":\"acceptance_criterion\",\"local_id\":\"t1-ac-1\",\"parent_task_local_id\":\"t1\",\"ordinal\":1,\"text\":\"Revised criterion\",\"status\":\"unverified\",\"updated_at\":\"2026-05-18T01:00:00Z\"}\n",
+        ),
+    )
+    .unwrap();
+
+    let result = import_local_tasks(&file, dir.path(), &fixed_opts()).unwrap();
+    let records = result.graph.records();
+
+    let has_non_monotonic_diag = records.iter().any(|r| {
+        if let GraphRecord::Node {
+            kind: NodeKind::Diagnostic,
+            summary,
+            ..
+        } = r
+        {
+            summary.contains("non_monotonic_updated_at")
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_non_monotonic_diag,
+        "AC revision with earlier updated_at must produce 'non_monotonic_updated_at' Diagnostic"
+    );
+    // Both AC records must still be imported
+    assert_eq!(
+        count_kind(records, NodeKind::AcceptanceCriterion),
+        2,
+        "both the original and revised AC must be imported despite the diagnostic"
+    );
+}
+
+// ── AC7: verified AC with missing/unresolved handle preserved as non-proven (RED)
+
+#[test]
+fn verified_ac_without_handle_preserved_not_skipped() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("sample.jsonl");
+    fs::write(
+        &file,
+        concat!(
+            "{\"kind\":\"header\",\"schema_version\":1,\"project_slug\":\"sample\",\"created_at\":\"2026-05-18T00:00:00Z\"}\n",
+            "{\"kind\":\"task\",\"local_id\":\"t1\",\"title\":\"T\",\"body\":\"\",\"status\":\"open\",\"priority\":\"normal\",\"assignees\":[],\"labels\":[],\"created_at\":\"2026-05-18T00:00:00Z\",\"updated_at\":\"2026-05-18T00:00:00Z\"}\n",
+            // Verified AC with NO verification_handle — should be preserved, not skipped
+            "{\"kind\":\"acceptance_criterion\",\"local_id\":\"t1-ac-1\",\"parent_task_local_id\":\"t1\",\"ordinal\":1,\"text\":\"Criterion\",\"status\":\"verified\",\"updated_at\":\"2026-05-18T00:00:00Z\"}\n",
+        ),
+    )
+    .unwrap();
+
+    let result = import_local_tasks(&file, dir.path(), &fixed_opts()).unwrap();
+    let records = result.graph.records();
+
+    // Diagnostic must be present
+    let has_missing_verification_diag = records.iter().any(|r| {
+        if let GraphRecord::Node {
+            kind: NodeKind::Diagnostic,
+            summary,
+            ..
+        } = r
+        {
+            summary.contains("acceptance_criterion_missing_verification")
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_missing_verification_diag,
+        "verified AC without handle must produce 'acceptance_criterion_missing_verification' Diagnostic"
+    );
+
+    // The AC must still be PRESENT in the output (not skipped)
+    let ac_count = count_kind(records, NodeKind::AcceptanceCriterion);
+    assert_eq!(
+        ac_count, 1,
+        "verified AC without handle must be preserved in output (not skipped), found {ac_count} ACs"
+    );
+
+    // The AC must NOT have status="verified" in the output (not closed by evidence)
+    for record in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::AcceptanceCriterion,
+            status: Some(status),
+            ..
+        } = record
+        {
+            assert_ne!(
+                status, "verified",
+                "AC must not be marked 'verified' when verification could not be resolved"
+            );
+        }
+    }
+}
+
+#[test]
+fn verified_ac_with_unresolved_handle_preserved_not_skipped() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("sample.jsonl");
+    fs::write(
+        &file,
+        concat!(
+            "{\"kind\":\"header\",\"schema_version\":1,\"project_slug\":\"sample\",\"created_at\":\"2026-05-18T00:00:00Z\"}\n",
+            "{\"kind\":\"task\",\"local_id\":\"t1\",\"title\":\"T\",\"body\":\"\",\"status\":\"open\",\"priority\":\"normal\",\"assignees\":[],\"labels\":[],\"created_at\":\"2026-05-18T00:00:00Z\",\"updated_at\":\"2026-05-18T00:00:00Z\"}\n",
+            // Verified AC WITH a verification_handle (unresolvable) — should be preserved
+            "{\"kind\":\"acceptance_criterion\",\"local_id\":\"t1-ac-1\",\"parent_task_local_id\":\"t1\",\"ordinal\":1,\"text\":\"Criterion\",\"status\":\"verified\",\"verification_handle\":{\"system\":\"cargo-test\",\"id\":\"suite::test_foo\"},\"updated_at\":\"2026-05-18T00:00:00Z\"}\n",
+        ),
+    )
+    .unwrap();
+
+    let result = import_local_tasks(&file, dir.path(), &fixed_opts()).unwrap();
+    let records = result.graph.records();
+
+    // Diagnostic must be present
+    let has_diag = records.iter().any(|r| {
+        if let GraphRecord::Node {
+            kind: NodeKind::Diagnostic,
+            summary,
+            ..
+        } = r
+        {
+            summary.contains("acceptance_criterion_missing_verification")
+                || summary.contains("unresolved_verification_handle")
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_diag,
+        "verified AC with unresolved handle must produce a verification diagnostic"
+    );
+
+    // AC must still be present
+    let ac_count = count_kind(records, NodeKind::AcceptanceCriterion);
+    assert_eq!(
+        ac_count, 1,
+        "verified AC with unresolved handle must be preserved in output, found {ac_count} ACs"
+    );
+
+    // Status must NOT be "verified"
+    for record in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::AcceptanceCriterion,
+            status: Some(status),
+            ..
+        } = record
+        {
+            assert_ne!(
+                status, "verified",
+                "AC must not be marked 'verified' when verification_handle cannot be resolved"
+            );
+        }
+    }
+}
