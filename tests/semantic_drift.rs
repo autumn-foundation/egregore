@@ -231,3 +231,139 @@ fn temporal(commit: &str, valid_time: &str) -> TemporalMetadata {
         valid_time_source: Some("git_commit_committer_date".to_owned()),
     }
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_resolve_drift_target_temporal_fallback() {
+    use aletheia_egregore::ir::{SEMANTIC_SCHEMA_VERSION, SemanticDriftMetadata, SourceSpan};
+    use aletheia_egregore::query::resolve_drift_target;
+
+    let target_id = "codegraph:v4:my-symbol";
+    let drift_id = "semantic:v1:drift-node";
+
+    let drift = SemanticDriftMetadata {
+        before_git_commit: "commit_a".to_owned(),
+        after_git_commit: "commit_b".to_owned(),
+        before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
+        embedding_model: EmbeddingModel {
+            provider: "provider".to_owned(),
+            name: "model".to_owned(),
+            version: "version".to_owned(),
+            dim: 128,
+            content_hash: "hash".to_owned(),
+        },
+        metric_kind: MetricKind::CosineDistance,
+        prior_record_id: "codegraph:v4:prior-symbol".to_owned(),
+        target_record_id: target_id.to_owned(),
+        score: 0.5,
+        selection_threshold: 0.2,
+        selection_basis: SelectionBasis::ThresholdOnly,
+    };
+
+    let drift_node = GraphRecord::node(
+        drift_id.to_owned(),
+        NodeKind::SemanticDrift,
+        None,
+        None,
+        None,
+        "Drift summary".to_owned(),
+    )
+    .with_domain("semantic", SEMANTIC_SCHEMA_VERSION)
+    .with_semantic_drift(drift.clone());
+
+    let edge = GraphRecord::edge(
+        EdgeLabel::DriftsFrom,
+        drift_id.to_owned(),
+        target_id.to_owned(),
+        None,
+        "Drifts From".to_owned(),
+    );
+
+    // Node 1: Temporal node matching after_git_commit ("commit_b")
+    let node_matching = GraphRecord::node(
+        target_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/matching.rs".to_owned()),
+        Some(SourceSpan {
+            start_byte: 0,
+            end_byte: 100,
+            start_line: 10,
+            end_line: 20,
+        }),
+        Some("my_symbol".to_owned()),
+        "Summary".to_owned(),
+    )
+    .with_temporal(temporal("commit_b", "2026-01-02T00:00:00Z"));
+
+    // Node 2: Temporal node with different commit ("commit_other")
+    let node_other_commit = GraphRecord::node(
+        target_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/other_commit.rs".to_owned()),
+        Some(SourceSpan {
+            start_byte: 0,
+            end_byte: 100,
+            start_line: 30,
+            end_line: 40,
+        }),
+        Some("my_symbol".to_owned()),
+        "Summary".to_owned(),
+    )
+    .with_temporal(temporal("commit_other", "2026-01-03T00:00:00Z"));
+
+    // Node 3: Non-temporal node representing the current check
+    let node_nontemporal = GraphRecord::node(
+        target_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/nontemporal.rs".to_owned()),
+        Some(SourceSpan {
+            start_byte: 0,
+            end_byte: 100,
+            start_line: 50,
+            end_line: 60,
+        }),
+        Some("my_symbol".to_owned()),
+        "Summary".to_owned(),
+    );
+
+    // Case 1: All records present. Temporal node with matching commit exists.
+    // It should select the matching temporal node (Node 1).
+    let records = vec![
+        drift_node.clone(),
+        edge.clone(),
+        node_matching,
+        node_other_commit.clone(),
+        node_nontemporal.clone(),
+    ];
+    let (path, _name, span) = resolve_drift_target(&records, drift_id, &drift, None, None);
+    assert_eq!(path, Some("src/matching.rs"));
+    assert_eq!(span.unwrap().start_line, 10);
+
+    // Case 2: Matching temporal node is absent, but another temporal node exists (node_other_commit).
+    // It should NOT match the non-temporal node (Node 3) since has_temporal is true.
+    // It should return the fallback (drift_path, drift_name, None).
+    let records2 = vec![
+        drift_node.clone(),
+        edge.clone(),
+        node_other_commit,
+        node_nontemporal.clone(),
+    ];
+    let (path2, name2, span2) = resolve_drift_target(
+        &records2,
+        drift_id,
+        &drift,
+        Some("src/fallback.rs"),
+        Some("fallback_name"),
+    );
+    assert_eq!(path2, Some("src/fallback.rs"));
+    assert_eq!(name2, Some("fallback_name"));
+    assert!(span2.is_none());
+
+    // Case 3: No temporal nodes at all exist. Only non-temporal node is present.
+    // It should fall back to matching the non-temporal node (Node 3).
+    let records3 = vec![drift_node, edge, node_nontemporal];
+    let (path3, _name3, span3) = resolve_drift_target(&records3, drift_id, &drift, None, None);
+    assert_eq!(path3, Some("src/nontemporal.rs"));
+    assert_eq!(span3.unwrap().start_line, 50);
+}

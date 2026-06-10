@@ -1,0 +1,216 @@
+{
+  "corpus_version": "1.0",
+  "description": "Rust Semantic Drift Calibration Corpus",
+  "scenarios": [
+    {
+      "id": "meaning_01",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+      "after": "pub fn add(a: i32, b: i32) -> i32 { a - b }"
+    },
+    {
+      "id": "meaning_02",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn is_valid(x: i32) -> bool { x > 0 }",
+      "after": "pub fn is_valid(x: i32) -> bool { x >= 0 }"
+    },
+    {
+      "id": "meaning_03",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn process(x: Option<i32>) -> i32 { match x { Some(v) => v, None => 0 } }",
+      "after": "pub fn process(x: Option<i32>) -> i32 { match x { Some(v) => v, None => -1 } }"
+    },
+    {
+      "id": "meaning_04",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn check(flag: bool) -> &'static str { if flag { \"yes\" } else { \"no\" } }",
+      "after": "pub fn check(flag: bool) -> &'static str { if flag { \"success\" } else { \"failure\" } }"
+    },
+    {
+      "id": "meaning_05",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn calculate(val: f64) -> f64 { val * 1.05 }",
+      "after": "pub fn calculate(val: f64) -> f64 { val * 1.10 }"
+    },
+    {
+      "id": "meaning_06",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn get_user_status(active: bool) -> u8 { if active { 1 } else { 0 } }",
+      "after": "pub fn get_user_status(active: bool) -> u8 { if active { 2 } else { 0 } }"
+    },
+    {
+      "id": "meaning_07",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn max_value(a: u32, b: u32) -> u32 { if a > b { a } else { b } }",
+      "after": "pub fn max_value(a: u32, b: u32) -> u32 { if a >= b { a } else { b + 1 } }"
+    },
+    {
+      "id": "meaning_08",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn filter_odds(items: &[i32]) -> Vec<i32> { items.iter().cloned().filter(|x| x % 2 != 0).collect() }",
+      "after": "pub fn filter_odds(items: &[i32]) -> Vec<i32> { items.iter().cloned().filter(|x| x % 2 == 0).collect() }"
+    },
+    {
+      "id": "meaning_09",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn configure(port: u16) -> String { format!(\"localhost:{}\", port) }",
+      "after": "pub fn configure(port: u16) -> String { format!(\"127.0.0.1:{}\", port) }"
+    },
+    {
+      "id": "meaning_10",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn find_min(arr: &[i32]) -> i32 { *arr.iter().min().unwrap_or(&0) }",
+      "after": "pub fn find_min(arr: &[i32]) -> i32 { *arr.iter().min().unwrap_or(&-999) }"
+    },
+    {
+      "id": "meaning_11",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn update_age(age: u32) -> u32 { age + 1 }",
+      "after": "pub fn update_age(age: u32) -> u32 { age + 2 }"
+    },
+    {
+      "id": "meaning_12",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn is_empty(s: &str) -> bool { s.len() == 0 }",
+      "after": "pub fn is_empty(s: &str) -> bool { s.trim().is_empty() }"
+    },
+    {
+      "id": "meaning_13",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn greeting(name: &str) -> String { format!(\"Hello, {}!\", name) }",
+      "after": "pub fn greeting(name: &str) -> String { format!(\"Welcome, {}!\", name) }"
+    },
+    {
+      "id": "meaning_14",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn check_limit(val: usize) -> bool { val < 100 }",
+      "after": "pub fn check_limit(val: usize) -> bool { val < 200 }"
+    },
+    {
+      "id": "meaning_15",
+      "class": "meaning_changed",
+      "file_path": "src/lib.rs",
+      "before": "pub fn transform(s: String) -> String { s.to_uppercase() }",
+      "after": "pub fn transform(s: String) -> String { s.to_lowercase() }"
+    },
+    {
+      "id": "structure_01",
+      "class": "structure_changed_only",
+      "file_path": "src/lib.rs",
+      "before": "pub fn area(width: u32, height: u32) -> u32 { let w = width; let h = height; w * h }",
+      "after": "pub fn area(width: u32, height: u32) -> u32 { let x = width; let y = height; x * y }"
+    },
+    {
+      "id": "structure_02",
+      "class": "structure_changed_only",
+      "file_path": "src/lib.rs",
+      "before": "pub fn sum(arr: &[i32]) -> i32 { let mut s = 0; for x in arr { s += x; } s }",
+      "after": "pub fn sum(arr: &[i32]) -> i32 { arr.iter().sum() }"
+    },
+    {
+      "id": "structure_03",
+      "class": "structure_changed_only",
+      "file_path": "src/lib.rs",
+      "before": "pub fn compute(a: i32, b: i32) -> i32 { (a + b) * (a - b) }",
+      "after": "pub fn compute(a: i32, b: i32) -> i32 { let sum = a + b; let diff = a - b; sum * diff }"
+    },
+    {
+      "id": "structure_04",
+      "class": "structure_changed_only",
+      "file_path": "src/lib.rs",
+      "before": "pub fn parse_bool(s: &str) -> Option<bool> { match s { \"true\" => Some(true), \"false\" => Some(false), _ => None } }",
+      "after": "pub fn parse_bool(s: &str) -> Option<bool> { if s == \"true\" { Some(true) } else if s == \"false\" { Some(false) } else { None } }"
+    },
+    {
+      "id": "structure_05",
+      "class": "structure_changed_only",
+      "file_path": "src/lib.rs",
+      "before": "pub fn double_all(v: Vec<i32>) -> Vec<i32> { let mut res = Vec::new(); for x in v { res.push(x * 2); } res }",
+      "after": "pub fn double_all(v: Vec<i32>) -> Vec<i32> { v.into_iter().map(|x| x * 2).collect() }"
+    },
+    {
+      "id": "text_01",
+      "class": "text_changed_only",
+      "file_path": "src/lib.rs",
+      "before": "// Calculate the area of a square\npub fn square_area(side: u32) -> u32 { side * side }",
+      "after": "// Compute the geometric area of a square using the side length multiplied by itself.\npub fn square_area(side: u32) -> u32 { side * side }"
+    },
+    {
+      "id": "text_02",
+      "class": "text_changed_only",
+      "file_path": "src/lib.rs",
+      "before": "pub fn format_code(a:i32,b:i32)->i32{a+b}",
+      "after": "pub fn format_code(a: i32, b: i32) -> i32 {\n    a + b\n}"
+    },
+    {
+      "id": "text_03",
+      "class": "text_changed_only",
+      "file_path": "src/lib.rs",
+      "before": "use std::collections::HashMap;\nuse std::path::Path;\npub fn use_imports() {}",
+      "after": "use std::path::Path;\nuse std::collections::HashMap;\npub fn use_imports() {}"
+    },
+    {
+      "id": "text_04",
+      "class": "text_changed_only",
+      "file_path": "src/lib.rs",
+      "before": "pub fn spacer() -> bool {\n    true\n}",
+      "after": "pub fn spacer() -> bool {\n\n\n    true\n\n}"
+    },
+    {
+      "id": "text_05",
+      "class": "text_changed_only",
+      "file_path": "src/lib.rs",
+      "before": "/*\n * This function returns 42.\n */\npub fn answer() -> i32 { 42 }",
+      "after": "// This function returns 42.\npub fn answer() -> i32 { 42 }"
+    },
+    {
+      "id": "unchanged_01",
+      "class": "unchanged",
+      "file_path": "src/lib.rs",
+      "before": "pub fn nop() {}",
+      "after": "pub fn nop() {}"
+    },
+    {
+      "id": "unchanged_02",
+      "class": "unchanged",
+      "file_path": "src/lib.rs",
+      "before": "pub struct Point { pub x: f64, pub y: f64 }",
+      "after": "pub struct Point { pub x: f64, pub y: f64 }"
+    },
+    {
+      "id": "unchanged_03",
+      "class": "unchanged",
+      "file_path": "src/lib.rs",
+      "before": "pub enum Status { Active, Inactive }",
+      "after": "pub enum Status { Active, Inactive }"
+    },
+    {
+      "id": "unchanged_04",
+      "class": "unchanged",
+      "file_path": "src/lib.rs",
+      "before": "pub const VERSION: &str = \"1.0.0\";",
+      "after": "pub const VERSION: &str = \"1.0.0\";"
+    },
+    {
+      "id": "unchanged_05",
+      "class": "unchanged",
+      "file_path": "src/lib.rs",
+      "before": "pub fn check_zero(x: i32) -> bool { x == 0 }",
+      "after": "pub fn check_zero(x: i32) -> bool { x == 0 }"
+    }
+  ]
+}

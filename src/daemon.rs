@@ -7549,36 +7549,12 @@ fn drift_node_to_query_json(
         return None;
     };
 
-    // Prefer target id from a DriftsFrom edge; fall back to the inline
-    // target_record_id on the drift metadata when the edge is absent or filtered.
-    let edge_target: Option<&str> = all_records.iter().find_map(|r| {
-        if let GraphRecord::Edge {
-            source,
-            target,
-            label: EdgeLabel::DriftsFrom,
-            ..
-        } = r
-            && source == id
-        {
-            return Some(target.as_str());
-        }
-        None
-    });
-    let target_id: &str = edge_target.unwrap_or(drift.target_record_id.as_str());
-
-    let (resolved_path, resolved_name) = all_records.iter().find(|r| r.id() == target_id).map_or(
-        (drift_path.as_deref(), drift_name.as_deref()),
-        |target| match target {
-            GraphRecord::Node {
-                repo_relative_path,
-                name,
-                ..
-            } => (
-                repo_relative_path.as_deref().or(drift_path.as_deref()),
-                name.as_deref().or(drift_name.as_deref()),
-            ),
-            _ => (drift_path.as_deref(), drift_name.as_deref()),
-        },
+    let (resolved_path, resolved_name, resolved_span) = graph_query::resolve_drift_target(
+        all_records,
+        id,
+        drift,
+        drift_path.as_deref(),
+        drift_name.as_deref(),
     );
 
     let mut obj = serde_json::Map::new();
@@ -7635,6 +7611,8 @@ fn drift_node_to_query_json(
     if let Some(n) = resolved_name {
         obj.insert("name".to_owned(), json!(n));
     }
+    obj.insert("span".to_owned(), json!(resolved_span));
+    obj.insert("status".to_owned(), json!("drift is a lead, not proof"));
     Some(serde_json::Value::Object(obj))
 }
 

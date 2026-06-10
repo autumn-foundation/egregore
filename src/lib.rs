@@ -256,13 +256,14 @@ pub(crate) fn scan_source_text_records(
     let mut graph = Graph::new();
     let repo_relative_path = source_file.repo_relative_path.clone();
     let file_id = stable_id(&["node", "file", repository_id, &repo_relative_path]);
+    let normalized = crate::languages::rust::normalize_file_code(source);
     graph.push(GraphRecord::node(
         file_id.clone(),
         NodeKind::File,
         Some(repo_relative_path.clone()),
         None,
         Some(repo_relative_path.clone()),
-        format!("Rust source file {repo_relative_path}"),
+        format!("Rust source file {repo_relative_path}\nSource:\n{normalized}"),
     ));
     parser::add_repository_file_edge(&mut graph, repository_id, &file_id);
     parser::extract_source_text(source_file, source, &file_id, repository_id, &mut graph)?;

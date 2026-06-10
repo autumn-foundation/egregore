@@ -55,6 +55,73 @@ pub fn largest_semantic_drifts(records: &[GraphRecord], limit: usize) -> Vec<&Gr
         .collect()
 }
 
+/// Resolves the repo relative path, name, and span of a drift target.
+#[must_use]
+pub fn resolve_drift_target<'a>(
+    records: &'a [GraphRecord],
+    drift_id: &str,
+    drift: &'a SemanticDriftMetadata,
+    drift_path: Option<&'a str>,
+    drift_name: Option<&'a str>,
+) -> (
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<crate::ir::SourceSpan>,
+) {
+    let target_id = records
+        .iter()
+        .find_map(|r| {
+            let GraphRecord::Edge {
+                label: EdgeLabel::DriftsFrom,
+                source,
+                target,
+                ..
+            } = r
+            else {
+                return None;
+            };
+            if source == drift_id {
+                Some(target.as_str())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(drift.target_record_id.as_str());
+
+    let has_temporal = records.iter().any(|r| {
+        r.id() == target_id
+            && matches!(
+                r,
+                GraphRecord::Node {
+                    temporal: Some(_),
+                    ..
+                }
+            )
+    });
+
+    if let Some(GraphRecord::Node {
+        repo_relative_path,
+        name,
+        span,
+        ..
+    }) = records.iter().rfind(|r| {
+        if r.id() != target_id {
+            return false;
+        }
+        if let GraphRecord::Node {
+            temporal: Some(t), ..
+        } = r
+        {
+            t.git_commit == drift.after_git_commit
+        } else {
+            !has_temporal
+        }
+    }) {
+        return (repo_relative_path.as_deref(), name.as_deref(), *span);
+    }
+    (drift_path, drift_name, None)
+}
+
 fn matches_symbol_at_commit(record: &GraphRecord, symbol_name: &str, commit: &str) -> bool {
     let GraphRecord::Node {
         kind,

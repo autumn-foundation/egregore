@@ -300,13 +300,15 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             qualified_name,
             &disambiguator.to_string(),
         ]);
+        let node_text = self.node_text(node);
+        let normalized = normalize_code(node_text);
         let mut record = GraphRecord::symbol(
             id.clone(),
             symbol_kind,
             self.file.repo_relative_path.clone(),
             span(node),
             qualified_name.to_owned(),
-            format!("Rust {symbol_kind} {qualified_name}"),
+            format!("Rust {symbol_kind} {qualified_name}\nSource:\n{normalized}"),
         );
         if let GraphRecord::Node {
             disambiguator: node_disambiguator,
@@ -548,4 +550,835 @@ fn module_path_from_file_parts(parts: &[&str]) -> Vec<String> {
 #[allow(dead_code)]
 fn _path_for_error(path: &std::path::Path) -> PathBuf {
     path.to_path_buf()
+}
+
+/// Normalizes source code by stripping comments and collapsing whitespace.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn normalize_code(code: &str) -> String {
+    let mut result = String::new();
+    let mut in_line_comment = false;
+    let mut block_comment_depth = 0;
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut in_raw_string = false;
+    let mut raw_string_hashes = 0;
+    let mut escaped = false;
+
+    let mut pending_space = false;
+    let mut last_pushed: Option<char> = None;
+
+    let mut push_char = |c: char, in_literal: bool| {
+        if c.is_whitespace() {
+            if in_literal {
+                result.push(c);
+                last_pushed = Some(c);
+            } else {
+                pending_space = true;
+            }
+        } else {
+            if pending_space {
+                pending_space = false;
+                if !in_literal {
+                    let is_current_ident = c.is_alphanumeric() || c == '_';
+                    let is_last_ident =
+                        last_pushed.is_some_and(|last| last.is_alphanumeric() || last == '_');
+                    if is_current_ident && is_last_ident {
+                        result.push(' ');
+                    }
+                }
+            }
+            result.push(c);
+            last_pushed = Some(c);
+        }
+    };
+
+    let chars: Vec<char> = code.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+                push_char('\n', false);
+            }
+        } else if block_comment_depth > 0 {
+            if i + 1 < chars.len() && c == '*' && chars[i + 1] == '/' {
+                block_comment_depth -= 1;
+                if block_comment_depth == 0 {
+                    push_char(' ', false); // Preserve a separator to prevent token concatenation
+                }
+                i += 1;
+            } else if i + 1 < chars.len() && c == '/' && chars[i + 1] == '*' {
+                block_comment_depth += 1;
+                i += 1;
+            }
+        } else if in_raw_string {
+            let mut is_end = false;
+            if c == '"' {
+                let mut matches = true;
+                for k in 0..raw_string_hashes {
+                    if i + 1 + k >= chars.len() || chars[i + 1 + k] != '#' {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    is_end = true;
+                }
+            }
+
+            push_char(c, true);
+            if is_end {
+                for _ in 0..raw_string_hashes {
+                    push_char('#', true);
+                }
+                in_raw_string = false;
+                i += raw_string_hashes;
+            }
+        } else if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            push_char(c, true);
+        } else if in_char {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '\'' {
+                in_char = false;
+            }
+            push_char(c, true);
+        } else if i + 1 < chars.len() && c == '/' && chars[i + 1] == '/' {
+            in_line_comment = true;
+            i += 1;
+        } else if i + 1 < chars.len() && c == '/' && chars[i + 1] == '*' {
+            block_comment_depth = 1;
+            i += 1;
+        } else if let Some((p_len, h_count)) = {
+            // Check for raw string literal start
+            let mut prefix_len = 0;
+            if c == 'r' {
+                prefix_len = 1;
+            } else if (c == 'b' || c == 'c') && i + 1 < chars.len() && chars[i + 1] == 'r' {
+                prefix_len = 2;
+            }
+            let mut is_raw_str = false;
+            let mut hashes_count = 0;
+            if prefix_len > 0 {
+                // Must not be preceded by alphanumeric/underscore (identifier part)
+                let preceded_by_ident = if i > 0 {
+                    let prev = chars[i - 1];
+                    prev.is_alphanumeric() || prev == '_'
+                } else {
+                    false
+                };
+                if !preceded_by_ident {
+                    let mut temp_idx = i + prefix_len;
+                    while temp_idx < chars.len() && chars[temp_idx] == '#' {
+                        temp_idx += 1;
+                    }
+                    if temp_idx < chars.len() && chars[temp_idx] == '"' {
+                        is_raw_str = true;
+                        hashes_count = temp_idx - (i + prefix_len);
+                    }
+                }
+            }
+            if is_raw_str {
+                Some((prefix_len, hashes_count))
+            } else {
+                None
+            }
+        } {
+            in_raw_string = true;
+            raw_string_hashes = h_count;
+            for &item in &chars[i..=(i + p_len + h_count)] {
+                push_char(item, true);
+            }
+            i += p_len + h_count;
+        } else if c == '"' {
+            in_string = true;
+            push_char(c, true);
+        } else if c == '\'' {
+            // Check if this is likely a character literal rather than a lifetime.
+            let mut is_char_lit = false;
+            let mut j = i + 1;
+            while j < chars.len() && j <= i + 10 && chars[j] != '\n' {
+                if chars[j] == '\'' {
+                    is_char_lit = true;
+                    break;
+                }
+                if chars[j].is_whitespace() && (j != i + 1 || chars.get(i + 2) != Some(&'\'')) {
+                    break;
+                }
+                j += 1;
+            }
+            if is_char_lit {
+                in_char = true;
+                push_char(c, true);
+            } else {
+                push_char(c, false);
+            }
+        } else {
+            push_char(c, false);
+        }
+        i += 1;
+    }
+    result.trim().to_owned()
+}
+
+#[allow(clippy::too_many_lines)]
+fn strip_comments_keep_newlines(code: &str) -> String {
+    let mut result = String::new();
+    let mut in_line_comment = false;
+    let mut block_comment_depth = 0;
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut in_raw_string = false;
+    let mut raw_string_hashes = 0;
+    let mut escaped = false;
+
+    let chars: Vec<char> = code.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+                result.push('\n');
+            }
+        } else if block_comment_depth > 0 {
+            if c == '\n' {
+                result.push('\n');
+            } else if i + 1 < chars.len() && c == '*' && chars[i + 1] == '/' {
+                block_comment_depth -= 1;
+                if block_comment_depth == 0 {
+                    result.push(' ');
+                }
+                i += 1;
+            } else if i + 1 < chars.len() && c == '/' && chars[i + 1] == '*' {
+                block_comment_depth += 1;
+                i += 1;
+            }
+        } else if in_raw_string {
+            let mut is_end = false;
+            if c == '"' {
+                let mut matches = true;
+                for k in 0..raw_string_hashes {
+                    if i + 1 + k >= chars.len() || chars[i + 1 + k] != '#' {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    is_end = true;
+                }
+            }
+            result.push(c);
+            if is_end {
+                for _ in 0..raw_string_hashes {
+                    result.push('#');
+                }
+                in_raw_string = false;
+                i += raw_string_hashes;
+            }
+        } else if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            result.push(c);
+        } else if in_char {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '\'' {
+                in_char = false;
+            }
+            result.push(c);
+        } else if i + 1 < chars.len() && c == '/' && chars[i + 1] == '/' {
+            in_line_comment = true;
+            i += 1;
+        } else if i + 1 < chars.len() && c == '/' && chars[i + 1] == '*' {
+            block_comment_depth = 1;
+            i += 1;
+        } else if let Some((p_len, h_count)) = {
+            let mut prefix_len = 0;
+            if c == 'r' {
+                prefix_len = 1;
+            } else if (c == 'b' || c == 'c') && i + 1 < chars.len() && chars[i + 1] == 'r' {
+                prefix_len = 2;
+            }
+            let mut is_raw_str = false;
+            let mut hashes_count = 0;
+            if prefix_len > 0 {
+                let preceded_by_ident = if i > 0 {
+                    let prev = chars[i - 1];
+                    prev.is_alphanumeric() || prev == '_'
+                } else {
+                    false
+                };
+                if !preceded_by_ident {
+                    let mut temp_idx = i + prefix_len;
+                    while temp_idx < chars.len() && chars[temp_idx] == '#' {
+                        temp_idx += 1;
+                    }
+                    if temp_idx < chars.len() && chars[temp_idx] == '"' {
+                        is_raw_str = true;
+                        hashes_count = temp_idx - (i + prefix_len);
+                    }
+                }
+            }
+            if is_raw_str {
+                Some((prefix_len, hashes_count))
+            } else {
+                None
+            }
+        } {
+            in_raw_string = true;
+            raw_string_hashes = h_count;
+            result.extend(chars[i..=(i + p_len + h_count)].iter());
+            i += p_len + h_count;
+        } else if c == '"' {
+            in_string = true;
+            result.push(c);
+        } else if c == '\'' {
+            let mut is_char_lit = false;
+            let mut j = i + 1;
+            while j < chars.len() && j <= i + 10 && chars[j] != '\n' {
+                if chars[j] == '\'' {
+                    is_char_lit = true;
+                    break;
+                }
+                if chars[j].is_whitespace() && (j != i + 1 || chars.get(i + 2) != Some(&'\'')) {
+                    break;
+                }
+                j += 1;
+            }
+            if is_char_lit {
+                in_char = true;
+            }
+            result.push(c);
+        } else {
+            result.push(c);
+        }
+        i += 1;
+    }
+    result
+}
+
+/// Normalizes file content by removing top-level `use` import declarations, comments, and collapsing whitespace.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+fn parse_use_statement(chars: &[char], mut idx: usize) -> Option<usize> {
+    // Helper to skip whitespace
+    let skip_whitespace = |chars: &[char], mut i: usize| -> usize {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        i
+    };
+
+    idx = skip_whitespace(chars, idx);
+
+    // Loop to parse zero or more attributes
+    loop {
+        if idx < chars.len() && chars[idx] == '#' {
+            let mut j = idx + 1;
+            j = skip_whitespace(chars, j);
+            if j < chars.len() && chars[j] == '[' {
+                // Parse matching ']'
+                let mut bracket_depth = 1;
+                let mut in_str = false;
+                let mut in_ch = false;
+                let mut esc = false;
+                j += 1;
+                while j < chars.len() && bracket_depth > 0 {
+                    let c2 = chars[j];
+                    if in_str {
+                        if esc {
+                            esc = false;
+                        } else if c2 == '\\' {
+                            esc = true;
+                        } else if c2 == '"' {
+                            in_str = false;
+                        }
+                    } else if in_ch {
+                        if esc {
+                            esc = false;
+                        } else if c2 == '\\' {
+                            esc = true;
+                        } else if c2 == '\'' {
+                            in_ch = false;
+                        }
+                    } else {
+                        match c2 {
+                            '"' => in_str = true,
+                            '\'' => in_ch = true,
+                            '[' => bracket_depth += 1,
+                            ']' => bracket_depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    j += 1;
+                }
+                if bracket_depth == 0 {
+                    idx = skip_whitespace(chars, j);
+                    continue;
+                }
+                return None; // Malformed attribute
+            }
+        }
+        break;
+    }
+
+    // Parse visibility
+    if idx + 2 < chars.len() && chars[idx] == 'p' && chars[idx + 1] == 'u' && chars[idx + 2] == 'b'
+    {
+        let after_pub = idx + 3;
+        // Ensure "pub" is a whole word
+        if after_pub == chars.len()
+            || (!chars[after_pub].is_alphanumeric() && chars[after_pub] != '_')
+        {
+            idx = skip_whitespace(chars, after_pub);
+            if idx < chars.len() && chars[idx] == '(' {
+                // Parse matching ')'
+                let mut paren_depth = 1;
+                let mut in_str = false;
+                let mut in_ch = false;
+                let mut esc = false;
+                let mut j = idx + 1;
+                while j < chars.len() && paren_depth > 0 {
+                    let c2 = chars[j];
+                    if in_str {
+                        if esc {
+                            esc = false;
+                        } else if c2 == '\\' {
+                            esc = true;
+                        } else if c2 == '"' {
+                            in_str = false;
+                        }
+                    } else if in_ch {
+                        if esc {
+                            esc = false;
+                        } else if c2 == '\\' {
+                            esc = true;
+                        } else if c2 == '\'' {
+                            in_ch = false;
+                        }
+                    } else {
+                        match c2 {
+                            '"' => in_str = true,
+                            '\'' => in_ch = true,
+                            '(' => paren_depth += 1,
+                            ')' => paren_depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    j += 1;
+                }
+                if paren_depth == 0 {
+                    idx = skip_whitespace(chars, j);
+                } else {
+                    return None; // Malformed visibility
+                }
+            }
+        }
+    }
+
+    // Now we must see the "use" keyword
+    if idx + 2 < chars.len() && chars[idx] == 'u' && chars[idx + 1] == 's' && chars[idx + 2] == 'e'
+    {
+        let after_use = idx + 3;
+        if after_use == chars.len()
+            || (!chars[after_use].is_alphanumeric() && chars[after_use] != '_')
+        {
+            // Yes! It's a use statement. Now find the matching semicolon ';' at brace_depth 0 (relative to the use statement's body)
+            let mut j = after_use;
+            let mut use_brace_depth: usize = 0;
+            let mut in_str = false;
+            let mut in_ch = false;
+            let mut in_raw_str = false;
+            let mut raw_str_hashes = 0;
+            let mut esc = false;
+
+            while j < chars.len() {
+                let c2 = chars[j];
+                if in_raw_str {
+                    let mut is_end = false;
+                    if c2 == '"' {
+                        let mut matches = true;
+                        for k in 0..raw_str_hashes {
+                            if j + 1 + k >= chars.len() || chars[j + 1 + k] != '#' {
+                                matches = false;
+                                break;
+                            }
+                        }
+                        if matches {
+                            is_end = true;
+                        }
+                    }
+                    if is_end {
+                        in_raw_str = false;
+                        j += raw_str_hashes;
+                    }
+                } else if in_str {
+                    if esc {
+                        esc = false;
+                    } else if c2 == '\\' {
+                        esc = true;
+                    } else if c2 == '"' {
+                        in_str = false;
+                    }
+                } else if in_ch {
+                    if esc {
+                        esc = false;
+                    } else if c2 == '\\' {
+                        esc = true;
+                    } else if c2 == '\'' {
+                        in_ch = false;
+                    }
+                } else {
+                    // Check for raw string start
+                    let is_raw_str_start = {
+                        let mut prefix_len = 0;
+                        if c2 == 'r' {
+                            prefix_len = 1;
+                        } else if (c2 == 'b' || c2 == 'c')
+                            && j + 1 < chars.len()
+                            && chars[j + 1] == 'r'
+                        {
+                            prefix_len = 2;
+                        }
+                        let mut is_raw = false;
+                        let mut hashes_count = 0;
+                        if prefix_len > 0 {
+                            let preceded_by_ident = if j > 0 {
+                                let prev = chars[j - 1];
+                                prev.is_alphanumeric() || prev == '_'
+                            } else {
+                                false
+                            };
+                            if !preceded_by_ident {
+                                let mut temp_idx = j + prefix_len;
+                                while temp_idx < chars.len() && chars[temp_idx] == '#' {
+                                    temp_idx += 1;
+                                }
+                                if temp_idx < chars.len() && chars[temp_idx] == '"' {
+                                    is_raw = true;
+                                    hashes_count = temp_idx - (j + prefix_len);
+                                }
+                            }
+                        }
+                        if is_raw {
+                            Some((prefix_len, hashes_count))
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some((p_len, h_count)) = is_raw_str_start {
+                        in_raw_str = true;
+                        raw_str_hashes = h_count;
+                        j += p_len + h_count;
+                    } else if c2 == '"' {
+                        in_str = true;
+                    } else if c2 == '\'' {
+                        let mut is_char_lit = false;
+                        let mut k = j + 1;
+                        while k < chars.len() && k <= j + 10 && chars[k] != '\n' {
+                            if chars[k] == '\'' {
+                                is_char_lit = true;
+                                break;
+                            }
+                            if chars[k].is_whitespace()
+                                && (k != j + 1 || chars.get(j + 2) != Some(&'\''))
+                            {
+                                break;
+                            }
+                            k += 1;
+                        }
+                        if is_char_lit {
+                            in_ch = true;
+                        }
+                    } else if c2 == '{' {
+                        use_brace_depth += 1;
+                    } else if c2 == '}' {
+                        use_brace_depth = use_brace_depth.saturating_sub(1);
+                    } else if c2 == ';' && use_brace_depth == 0 {
+                        return Some(j);
+                    }
+                }
+                j += 1;
+            }
+        }
+    }
+
+    None
+}
+
+/// Normalizes file content by removing top-level `use` import declarations, comments, and collapsing whitespace.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn normalize_file_code(code: &str) -> String {
+    let clean_code = strip_comments_keep_newlines(code);
+    let chars: Vec<char> = clean_code.chars().collect();
+
+    let mut import_lines = Vec::new();
+    let mut other_code = String::new();
+
+    let mut brace_depth: usize = 0;
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut in_raw_string = false;
+    let mut raw_string_hashes = 0;
+    let mut escaped = false;
+
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let parsed_use = Some(())
+            .filter(|()| brace_depth == 0 && !in_string && !in_char && !in_raw_string)
+            .filter(|()| i == 0 || (!chars[i - 1].is_alphanumeric() && chars[i - 1] != '_'))
+            .and_then(|()| parse_use_statement(&chars, i));
+        if let Some(end_idx) = parsed_use {
+            let import_stmt: String = chars[i..=end_idx].iter().collect();
+            let trimmed = import_stmt.trim().to_owned();
+            if !trimmed.is_empty() {
+                import_lines.push(trimmed);
+            }
+            i = end_idx + 1;
+            continue;
+        }
+
+        other_code.push(c);
+        if in_raw_string {
+            let mut is_end = false;
+            if c == '"' {
+                let mut matches = true;
+                for k in 0..raw_string_hashes {
+                    if i + 1 + k >= chars.len() || chars[i + 1 + k] != '#' {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    is_end = true;
+                }
+            }
+            if is_end {
+                for _ in 0..raw_string_hashes {
+                    other_code.push('#');
+                }
+                in_raw_string = false;
+                i += raw_string_hashes;
+            }
+        } else if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if in_char {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '\'' {
+                in_char = false;
+            }
+        } else if let Some((p_len, h_count)) = {
+            let mut prefix_len = 0;
+            if c == 'r' {
+                prefix_len = 1;
+            } else if (c == 'b' || c == 'c') && i + 1 < chars.len() && chars[i + 1] == 'r' {
+                prefix_len = 2;
+            }
+            let mut is_raw_str = false;
+            let mut hashes_count = 0;
+            if prefix_len > 0 {
+                let preceded_by_ident = if i > 0 {
+                    let prev = chars[i - 1];
+                    prev.is_alphanumeric() || prev == '_'
+                } else {
+                    false
+                };
+                if !preceded_by_ident {
+                    let mut temp_idx = i + prefix_len;
+                    while temp_idx < chars.len() && chars[temp_idx] == '#' {
+                        temp_idx += 1;
+                    }
+                    if temp_idx < chars.len() && chars[temp_idx] == '"' {
+                        is_raw_str = true;
+                        hashes_count = temp_idx - (i + prefix_len);
+                    }
+                }
+            }
+            if is_raw_str {
+                Some((prefix_len, hashes_count))
+            } else {
+                None
+            }
+        } {
+            in_raw_string = true;
+            raw_string_hashes = h_count;
+            other_code.extend(chars[(i + 1)..=(i + p_len + h_count)].iter());
+            i += p_len + h_count;
+        } else if c == '"' {
+            in_string = true;
+        } else if c == '\'' {
+            let mut is_char_lit = false;
+            let mut j = i + 1;
+            while j < chars.len() && j <= i + 10 && chars[j] != '\n' {
+                if chars[j] == '\'' {
+                    is_char_lit = true;
+                    break;
+                }
+                if chars[j].is_whitespace() && (j != i + 1 || chars.get(i + 2) != Some(&'\'')) {
+                    break;
+                }
+                j += 1;
+            }
+            if is_char_lit {
+                in_char = true;
+            }
+        } else if c == '{' {
+            brace_depth += 1;
+        } else if c == '}' {
+            brace_depth = brace_depth.saturating_sub(1);
+        }
+        i += 1;
+    }
+
+    import_lines.sort_unstable();
+    let mut combined = import_lines.join("\n");
+    if !combined.is_empty() {
+        combined.push('\n');
+    }
+    combined.push_str(&other_code);
+
+    normalize_code(&combined)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_raw_strings() {
+        // Raw strings should preserve their contents, including comments-like delimiters
+        let code = r###"
+            let a = r"hello // world";
+            let b = r#"foo /* bar */ baz"#;
+            let c = r##"nested "quotes" and // comments"##;
+        "###;
+        let normalized = normalize_code(code);
+        assert!(normalized.contains("hello // world"), "Got: {normalized}");
+        assert!(
+            normalized.contains("foo /* bar */ baz"),
+            "Got: {normalized}"
+        );
+        assert!(
+            normalized.contains("nested \"quotes\" and // comments"),
+            "Got: {normalized}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_block_comments_preserves_separator() {
+        // Block comment stripping should preserve a separator space to avoid token concatenation
+        let code = "let x = 1/* comment */+2;";
+        let normalized = normalize_code(code);
+        assert_eq!(normalized, "let x=1+2;");
+
+        let code2 = "let x = 1 /* comment */ +2;";
+        let normalized2 = normalize_code(code2);
+        assert_eq!(normalized2, "let x=1+2;");
+    }
+
+    #[test]
+    fn test_normalize_nested_block_comments() {
+        let code = "let x = 1 /* outer /* inner */ changed */ + 2;";
+        let normalized = normalize_code(code);
+        assert_eq!(normalized, "let x=1+2;");
+    }
+
+    #[test]
+    fn test_strip_comments_before_sorting_imports() {
+        let code = "
+            // use old::path;
+            use new::path;
+        ";
+        let normalized = normalize_file_code(code);
+        assert_eq!(normalized, "use new::path;");
+    }
+
+    #[test]
+    fn test_preserve_scoped_imports() {
+        let code = "
+            use top::level;
+            fn foo() {
+                use inner::scoped;
+            }
+        ";
+        let normalized = normalize_file_code(code);
+        assert!(normalized.contains("use top::level;"), "Got: {normalized}");
+        assert!(
+            normalized.contains("use inner::scoped;"),
+            "Got: {normalized}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_punctuation_adjacent_whitespace() {
+        let code1 = "fn f(a: i32) -> i32 { a + 1 }";
+        let code2 = "fn f(a:i32)->i32{a+1}";
+        let normalized1 = normalize_code(code1);
+        let normalized2 = normalize_code(code2);
+        assert_eq!(normalized1, normalized2);
+        assert_eq!(normalized1, "fn f(a:i32)->i32{a+1}");
+    }
+
+    #[test]
+    fn test_normalize_file_code_raw_strings() {
+        let code = r##"
+            let s = r#"x"#; // comment
+        "##;
+        let normalized = normalize_file_code(code);
+        assert_eq!(normalized, "let s=r#\"x\"#;");
+    }
+
+    #[test]
+    fn test_normalize_file_code_visibility() {
+        let code = "
+            pub use b::Y;
+            use a::X;
+            pub(crate) use c::Z;
+        ";
+        let normalized = normalize_file_code(code);
+        // The imports should sort as:
+        // pub use b::Y;
+        // pub(crate) use c::Z;
+        // use a::X;
+        // (after normalization, all spacing is stripped/collapsed)
+        assert_eq!(normalized, "pub use b::Y;pub(crate)use c::Z;use a::X;");
+    }
+
+    #[test]
+    fn test_normalize_file_code_abuse() {
+        let code = "pub const abuse: i32 = 1;";
+        let normalized = normalize_file_code(code);
+        assert_eq!(normalized, "pub const abuse:i32=1;");
+    }
 }
