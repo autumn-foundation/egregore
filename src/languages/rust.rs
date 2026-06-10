@@ -1148,6 +1148,7 @@ pub fn normalize_file_code(code: &str) -> String {
         let c = chars[i];
         let parsed_use = Some(())
             .filter(|()| brace_depth == 0 && !in_string && !in_char && !in_raw_string)
+            .filter(|()| i == 0 || (!chars[i - 1].is_alphanumeric() && chars[i - 1] != '_'))
             .and_then(|()| parse_use_statement(&chars, i));
         if let Some(end_idx) = parsed_use {
             let import_stmt: String = chars[i..=end_idx].iter().collect();
@@ -1372,5 +1373,12 @@ mod tests {
         // use a::X;
         // (after normalization, all spacing is stripped/collapsed)
         assert_eq!(normalized, "pub use b::Y;pub(crate)use c::Z;use a::X;");
+    }
+
+    #[test]
+    fn test_normalize_file_code_abuse() {
+        let code = "pub const abuse: i32 = 1;";
+        let normalized = normalize_file_code(code);
+        assert_eq!(normalized, "pub const abuse:i32=1;");
     }
 }
