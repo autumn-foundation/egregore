@@ -208,6 +208,20 @@ impl RepositoryIndex {
     /// Builds the index from a record slice.
     #[must_use]
     pub fn build(records: &[GraphRecord]) -> Self {
+        // Tombstoned repositories (e.g. an identity change in an incremental
+        // scan) are not part of the current state: they must neither resolve
+        // as selectors nor make a live repository's selector ambiguous.
+        let tombstoned: BTreeSet<&str> = records
+            .iter()
+            .filter_map(|r| {
+                if let GraphRecord::Tombstone { deleted_id, .. } = r {
+                    Some(deleted_id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         let mut repos: BTreeMap<String, RepositoryEntry> = BTreeMap::new();
         for record in records {
             let GraphRecord::Node {
@@ -220,6 +234,9 @@ impl RepositoryIndex {
             else {
                 continue;
             };
+            if tombstoned.contains(id.as_str()) {
+                continue;
+            }
             let mut selectors: BTreeSet<String> = BTreeSet::new();
             let mut display = name.clone();
             if let Some(payload) = repository_identity.as_deref() {
@@ -241,6 +258,16 @@ impl RepositoryIndex {
             if let Some(display_name) = &display {
                 selectors.insert(display_name.clone());
             }
+            // Remote-backed identities store the remote path (`owner/name`)
+            // as both basename and display name; the human-usable final path
+            // segment (`name`) must resolve as a selector too.
+            let shorts: Vec<String> = selectors
+                .iter()
+                .filter_map(|s| s.rsplit('/').next())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            selectors.extend(shorts);
             repos.entry(id.clone()).or_insert_with(|| RepositoryEntry {
                 display: display.unwrap_or_else(|| id.clone()),
                 selectors,

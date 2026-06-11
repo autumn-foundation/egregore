@@ -88,10 +88,15 @@ from the repository identity payload
 |----------|---------|
 | Stable repository record ID | `codegraph:v4:e2aa0c…` |
 | Display name (remote-derived `owner/name`) | `acme/widget` |
+| Short name (final path segment of the display name) | `widget` |
 | Basename / operator override | `widget-a` |
 | Normalized remote URL | `https://github.com/acme/widget` |
 | Root commit SHA (`local_root_commit` identities) | `83fa99…` |
 | Canonical path (`local_path` identities) | `/home/me/src/widget` |
+
+Tombstoned `Repository` records (e.g. after an identity change in an
+incremental scan) are not selectable and never make a live repository's
+selector ambiguous.
 
 Failures are stable, machine-readable JSON on stderr with exit code `1`:
 

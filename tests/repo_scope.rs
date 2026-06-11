@@ -506,6 +506,153 @@ fn ambiguous_repo_selector_fails_with_stable_diagnostic_listing_candidates() {
     );
 }
 
+/// Builds a one-repository store shaped like a real remote-backed scan: the
+/// identity payload's `basename` is the remote path (`acme/widget`), not the
+/// final path segment. Returns `(tempdir, store_path, repo_id)`.
+fn remote_basename_store() -> (tempfile::TempDir, PathBuf, String) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let store = temp.path().join("remote.jsonl");
+
+    let mut graph = Graph::new();
+    let repo_id = stable_id(&["repository", "remote", "https://example.com/acme/widget"]);
+    graph.push(
+        GraphRecord::node(
+            repo_id.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("acme/widget".to_owned()),
+            "Repository acme/widget".to_owned(),
+        )
+        .with_repository_identity(RepositoryIdentityPayload {
+            identity_source: IdentitySource::Remote,
+            remote_url: Some("https://example.com/acme/widget".to_owned()),
+            root_commit_sha: None,
+            canonical_path: None,
+            // Real remote scans store the remote path here, not `widget`.
+            basename: "acme/widget".to_owned(),
+        }),
+    );
+    let file_id = stable_id(&["node", "file", &repo_id, "src/lib.rs"]);
+    graph.push(GraphRecord::node(
+        file_id.clone(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("src/lib.rs".to_owned()),
+        "Rust source file src/lib.rs".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.clone(),
+        file_id.clone(),
+        Some("1.0".to_owned()),
+        "Repository contains source file".to_owned(),
+    ));
+    let symbol_id = stable_id(&["node", "symbol", "function", &repo_id, "widget"]);
+    graph.push(GraphRecord::symbol(
+        symbol_id.clone(),
+        "function",
+        "src/lib.rs".to_owned(),
+        span(10, 20),
+        "widget".to_owned(),
+        "Rust function widget".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id,
+        symbol_id,
+        Some("1.0".to_owned()),
+        "file defines symbol".to_owned(),
+    ));
+    fs::write(&store, graph.to_jsonl().expect("serialize")).expect("write fixture");
+    (temp, store, repo_id)
+}
+
+#[test]
+fn remote_repo_resolves_short_basename_selector() {
+    // A normal GitHub-style remote identity stores `acme/widget` as both the
+    // display name and the payload basename; the human-usable short name
+    // `widget` must still resolve.
+    let (_temp, store, repo_id) = remote_basename_store();
+
+    let assert = eg()
+        .args(["query", "symbol", "widget", "--graph"])
+        .arg(&store)
+        .args(["--repo", "widget"])
+        .assert()
+        .success();
+    let rows = parse_jsonl(&assert.get_output().stdout);
+    assert!(!rows.is_empty());
+    for row in &rows {
+        assert_eq!(row["repository_id"].as_str(), Some(repo_id.as_str()));
+    }
+}
+
+#[test]
+fn tombstoned_repository_is_not_selectable_and_does_not_create_ambiguity() {
+    // An incremental scan that re-identifies a repository tombstones the old
+    // `Repository` record. The stale identity must neither resolve as a
+    // selector nor make a live repository's selector ambiguous.
+    let (_temp, store, repo_id) = remote_basename_store();
+
+    // Append a tombstoned old repository that shares the `widget` short name.
+    let mut graph = Graph::new();
+    let stale_repo_id = stable_id(&["repository", "remote", "https://example.com/old/widget"]);
+    graph.push(
+        GraphRecord::node(
+            stale_repo_id.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("old/widget".to_owned()),
+            "Repository old/widget".to_owned(),
+        )
+        .with_repository_identity(RepositoryIdentityPayload {
+            identity_source: IdentitySource::Remote,
+            remote_url: Some("https://example.com/old/widget".to_owned()),
+            root_commit_sha: None,
+            canonical_path: None,
+            basename: "old/widget".to_owned(),
+        }),
+    );
+    graph.push(GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &stale_repo_id]),
+        schema_version: aletheia_egregore::SCHEMA_VERSION,
+        deleted_id: stale_repo_id.clone(),
+        summary: "repository identity changed".to_owned(),
+        producer: None,
+    });
+    let mut store_text = fs::read_to_string(&store).expect("read store");
+    store_text.push_str(&graph.to_jsonl().expect("serialize"));
+    fs::write(&store, store_text).expect("append stale repo");
+
+    // The stale handle must not resolve.
+    let assert = eg()
+        .args(["query", "symbol", "widget", "--graph"])
+        .arg(&store)
+        .args(["--repo", "old/widget"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty());
+    let diag = parse_stderr_json(&assert.get_output().stderr);
+    assert_eq!(diag["code"].as_str(), Some("unknown_repository_selector"));
+
+    // The shared short name must resolve to the live repository, not turn
+    // ambiguous because of the tombstoned one.
+    let assert = eg()
+        .args(["query", "symbol", "widget", "--graph"])
+        .arg(&store)
+        .args(["--repo", "widget"])
+        .assert()
+        .success();
+    let rows = parse_jsonl(&assert.get_output().stdout);
+    assert!(!rows.is_empty());
+    for row in &rows {
+        assert_eq!(row["repository_id"].as_str(), Some(repo_id.as_str()));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AC: temporal selectors compose with repository scope; single-result temporal
 // paths never pick a repository implicitly on a collision.

@@ -159,9 +159,12 @@ store. The selector accepts:
 
 - the stable `Repository` record ID, or
 - a human-usable handle from the repository identity payload: the display
-  name (`owner/name` for remote-derived identities), the basename / operator
-  override, the normalized remote URL, the root commit SHA, or the canonical
-  path.
+  name (`owner/name` for remote-derived identities), its final path segment
+  (`name`), the basename / operator override, the normalized remote URL, the
+  root commit SHA, or the canonical path.
+
+Tombstoned `Repository` records are not selectable and never make a live
+repository's selector ambiguous.
 
 Unknown selectors fail with `unknown_repository_selector`; selectors matching
 more than one repository fail with `ambiguous_repository_selector` (the
