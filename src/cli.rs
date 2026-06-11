@@ -2798,6 +2798,45 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
     }
 }
 
+/// Re-raises a daemon query error, except for repository-selector rejections,
+/// which are printed as the same stable machine-readable stderr JSON the
+/// non-daemon paths emit (`unknown_repository_selector` /
+/// `ambiguous_repository_selector`) before exiting 1.
+#[cfg(feature = "embedded-aletheiadb")]
+fn surface_daemon_selector_rejection(error: anyhow::Error, repo: Option<&str>) -> anyhow::Error {
+    if let (Some(rejection), Some(selector)) = (
+        error.downcast_ref::<crate::daemon::DaemonQueryRejection>(),
+        repo,
+    ) && matches!(
+        rejection.code.as_str(),
+        "unknown_repository_selector" | "ambiguous_repository_selector"
+    ) {
+        let diag = serde_json::json!({
+            "code": rejection.code,
+            "selector": selector,
+            "message": rejection.message,
+        });
+        eprintln!("{diag}");
+        std::process::exit(1);
+    }
+    error
+}
+
+/// Fails closed when an unscoped daemon-backed single-answer time view
+/// (`--as-of` / `--at`) returns rows from more than one repository: the
+/// documented contract requires the `ambiguous_repository` diagnostic, not a
+/// silently widened multi-repository answer (issue #67).
+#[cfg(feature = "embedded-aletheiadb")]
+fn fail_on_unscoped_daemon_repo_collision(records: &[serde_json::Value]) {
+    let repositories: std::collections::BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| r.get("repository_id").and_then(serde_json::Value::as_str))
+        .collect();
+    if repositories.len() > 1 {
+        exit_ambiguous_repository(&repositories);
+    }
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 fn query_symbol_via_daemon(
     name: &str,
@@ -2821,7 +2860,12 @@ fn query_symbol_via_daemon(
     if let Some(repo) = repo {
         params["repo"] = serde_json::json!(repo);
     }
-    let records = client.query_verb(verb, &params, as_of)?;
+    let records = client
+        .query_verb(verb, &params, as_of)
+        .map_err(|e| surface_daemon_selector_rejection(e, repo))?;
+    if repo.is_none() && (at.is_some() || as_of.is_some()) {
+        fail_on_unscoped_daemon_repo_collision(&records);
+    }
     if records.is_empty() {
         eprintln!("error: no match found for symbol `{name}`");
         std::process::exit(2);
@@ -2845,7 +2889,9 @@ fn query_file_via_daemon(
     if let Some(repo) = repo {
         params["repo"] = serde_json::json!(repo);
     }
-    let records = client.query_verb("file_defines", &params, None)?;
+    let records = client
+        .query_verb("file_defines", &params, None)
+        .map_err(|e| surface_daemon_selector_rejection(e, repo))?;
     if records.is_empty() {
         eprintln!("error: no match found for file `{path}`");
         std::process::exit(2);
@@ -2869,7 +2915,9 @@ fn query_drift_via_daemon(
     if let Some(repo) = repo {
         params["repo"] = serde_json::json!(repo);
     }
-    let records = client.query_verb("drift_top_n", &params, None)?;
+    let records = client
+        .query_verb("drift_top_n", &params, None)
+        .map_err(|e| surface_daemon_selector_rejection(e, repo))?;
     if records.is_empty() {
         eprintln!("error: no match found — no SemanticDrift nodes in graph");
         std::process::exit(2);
@@ -3179,9 +3227,11 @@ fn query_semantic(
 
     let query_vector = embed_query_text(query)?;
 
-    // Over-fetch when scoped so the limit bounds the scoped result set.
+    // When scoped, search the whole index so higher-scoring hits from other
+    // repositories can never crowd the selected repository's matches out of
+    // the candidate set; the limit then bounds the scoped result set.
     let fetch = if selected.is_some() {
-        limit.saturating_mul(4).max(limit)
+        records.len().max(limit)
     } else {
         limit
     };
@@ -3229,7 +3279,9 @@ fn query_semantic_via_daemon(
     if let Some(repo) = repo {
         params["repo"] = serde_json::json!(repo);
     }
-    let records = client.query_verb("semantic_search", &params, None)?;
+    let records = client
+        .query_verb("semantic_search", &params, None)
+        .map_err(|e| surface_daemon_selector_rejection(e, repo))?;
 
     if records.is_empty() {
         eprintln!("no results — store may not have embeddings (re-run ingest with --embed)");
@@ -4198,6 +4250,7 @@ fn query_symbol_tx_via_daemon(
     ) {
         Ok(r) => r,
         Err(e) => {
+            let e = surface_daemon_selector_rejection(e, repo);
             print_tx_error("daemon_query_error", &e.to_string())?;
             std::process::exit(1);
         }
@@ -4270,8 +4323,13 @@ fn query_symbol_at(
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
 ) -> Result<()> {
+    // The ambiguity check is repository-scoped: a prefix that collides only
+    // across the repository boundary is unambiguous within the selected repo.
     let matching_commits: std::collections::BTreeSet<&str> = records
         .iter()
+        .filter(|r| {
+            selected_repo.is_none_or(|repo| record_belongs_to_repo_for_commit_scan(r, index, repo))
+        })
         .filter_map(|r| temporal_commit_if_prefix(r, prefix))
         .collect();
 
@@ -4310,6 +4368,23 @@ fn query_symbol_at(
         }
     }
     Ok(())
+}
+
+/// Returns `true` when a record participates in `repo` for the purposes of
+/// the commit-prefix ambiguity scan: nodes by direct ownership, edges by the
+/// ownership of either endpoint (edge records themselves carry no owner).
+fn record_belongs_to_repo_for_commit_scan(
+    record: &GraphRecord,
+    index: &query::RepositoryIndex,
+    repo: &str,
+) -> bool {
+    match record {
+        GraphRecord::Node { id, .. } => index.owner_of(id) == Some(repo),
+        GraphRecord::Edge { source, target, .. } => {
+            index.owner_of(source) == Some(repo) || index.owner_of(target) == Some(repo)
+        }
+        GraphRecord::Tombstone { .. } => false,
+    }
 }
 
 fn temporal_commit_if_prefix<'a>(record: &'a GraphRecord, prefix: &str) -> Option<&'a str> {

@@ -1453,6 +1453,29 @@ pub fn stop(data_dir: &Path) -> Result<()> {
     wait_until_stopped(data_dir)
 }
 
+/// A structured daemon-side query rejection surfaced by [`DaemonClient`].
+///
+/// Preserves the stable machine-readable `code` from the daemon error
+/// envelope so CLI callers can keep the documented diagnostic contract
+/// (e.g. `unknown_repository_selector`) instead of flattening the rejection
+/// into an opaque message string. Recover it with
+/// `anyhow::Error::downcast_ref::<DaemonQueryRejection>()`.
+#[derive(Debug, Clone)]
+pub struct DaemonQueryRejection {
+    /// Stable machine-readable error code from the daemon envelope.
+    pub code: String,
+    /// Human-readable message from the daemon envelope.
+    pub message: String,
+}
+
+impl std::fmt::Display for DaemonQueryRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "daemon query error ({}): {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for DaemonQueryRejection {}
+
 /// Client for the local Egregore daemon.
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
@@ -1614,6 +1637,8 @@ impl DaemonClient {
     /// # Errors
     ///
     /// Returns an error if the daemon rejects the request or cannot be reached.
+    /// Daemon-side rejections carry a [`DaemonQueryRejection`] so callers can
+    /// recover the stable machine-readable error code via `downcast_ref`.
     pub fn query_verb(
         &self,
         verb: &str,
@@ -1643,7 +1668,10 @@ impl DaemonClient {
             let message = envelope["error"]["message"]
                 .as_str()
                 .unwrap_or("unknown error");
-            return Err(anyhow!("daemon query error ({code}): {message}"));
+            return Err(anyhow::Error::new(DaemonQueryRejection {
+                code: code.to_owned(),
+                message: message.to_owned(),
+            }));
         }
         let envelope: serde_json::Value =
             serde_json::from_str(&body_str).context("failed to parse daemon query response")?;
@@ -1687,7 +1715,10 @@ impl DaemonClient {
             let message = envelope["error"]["message"]
                 .as_str()
                 .unwrap_or("unknown error");
-            return Err(anyhow!("daemon query error ({code}): {message}"));
+            return Err(anyhow::Error::new(DaemonQueryRejection {
+                code: code.to_owned(),
+                message: message.to_owned(),
+            }));
         }
         let envelope: serde_json::Value =
             serde_json::from_str(&body_str).context("failed to parse daemon query response")?;
@@ -1732,7 +1763,10 @@ impl DaemonClient {
             let message = envelope["error"]["message"]
                 .as_str()
                 .unwrap_or("unknown error");
-            return Err(anyhow!("daemon query error ({code}): {message}"));
+            return Err(anyhow::Error::new(DaemonQueryRejection {
+                code: code.to_owned(),
+                message: message.to_owned(),
+            }));
         }
         let envelope: serde_json::Value =
             serde_json::from_str(&body_str).context("failed to parse daemon query response")?;
@@ -8005,9 +8039,24 @@ fn handle_verb_symbol_at_commit(
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
 
-    // Check for ambiguous commit prefix
+    // Check for ambiguous commit prefix. The scan is repository-scoped: a
+    // prefix that collides only across the repository boundary is unambiguous
+    // within the selected repository (issue #67).
     let matching_commits: BTreeSet<&str> = records
         .iter()
+        .filter(|r| {
+            let Some(repo) = selected_repo.as_deref() else {
+                return true;
+            };
+            match r {
+                GraphRecord::Node { id, .. } => repo_index.owner_of(id) == Some(repo),
+                GraphRecord::Edge { source, target, .. } => {
+                    repo_index.owner_of(source) == Some(repo)
+                        || repo_index.owner_of(target) == Some(repo)
+                }
+                GraphRecord::Tombstone { .. } => false,
+            }
+        })
         .filter_map(|r| match r {
             GraphRecord::Node {
                 temporal: Some(t), ..
@@ -8626,11 +8675,11 @@ fn handle_verb_semantic_search(
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
 
-    // Over-fetch when scoped so the limit bounds the scoped result set.
+    // When scoped, search the whole index so higher-scoring hits from other
+    // repositories can never crowd the selected repository's matches out of
+    // the candidate set; the response limit still bounds the scoped rows.
     let fetch = if selected_repo.is_some() {
-        effective_limit
-            .saturating_mul(4)
-            .clamp(effective_limit, SEMANTIC_SEARCH_MAX)
+        all_records.len().max(effective_limit)
     } else {
         effective_limit
     };

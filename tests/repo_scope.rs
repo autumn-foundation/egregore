@@ -114,11 +114,13 @@ fn scanned_collision_store() -> (tempfile::TempDir, PathBuf, String, String) {
 /// Builds a synthetic two-repository store with remote-derived identities,
 /// history-backed colliding symbols, and one semantic drift record per repo.
 ///
-/// Repo `acme/widget-a`: symbol `widget` at commits `aaaa0001` (valid
-/// 2026-01-01) and `aaaa0002` (valid 2026-01-03), plus a drift node (score
-/// 0.5) targeting the later version.
-/// Repo `acme/widget-b`: symbol `widget` at commit `bbbb0001` (valid
-/// 2026-01-01), plus a drift node (score 0.4).
+/// Repo `acme/widget-a`: symbol `widget` at commits `aaaa0001…` (valid
+/// 2026-01-01) and `aaaa000200000000` (valid 2026-01-03), plus a drift node
+/// (score 0.5) targeting the later version.
+/// Repo `acme/widget-b`: symbol `widget` at commit `aaaa000299990000` (valid
+/// 2026-01-01), plus a drift node (score 0.4). The commit deliberately shares
+/// the `aaaa0002` prefix with repo A's second commit so commit-prefix
+/// ambiguity across the repository boundary can be exercised.
 ///
 /// Returns `(tempdir, store_path, repo_a_id, repo_b_id)`.
 #[allow(clippy::too_many_lines, clippy::type_complexity)]
@@ -144,7 +146,7 @@ fn synthetic_collision_store() -> (tempfile::TempDir, PathBuf, String, String) {
             "acme/widget-b",
             "widget-b",
             "https://example.com/acme/widget-b",
-            &[("bbbb000100000000", "2026-01-01T00:00:00Z")],
+            &[("aaaa000299990000", "2026-01-01T00:00:00Z")],
             0.4,
         ),
     ];
@@ -530,6 +532,34 @@ fn as_of_composes_with_repo_scope() {
 }
 
 #[test]
+fn at_commit_prefix_ambiguity_is_scoped_to_selected_repo() {
+    let (_temp, store, repo_a, _repo_b) = synthetic_collision_store();
+
+    // `aaaa0002` matches repo A's `aaaa000200000000` and repo B's
+    // `aaaa000299990000`: unscoped, the prefix is genuinely ambiguous.
+    eg().args(["query", "symbol", "widget", "--graph"])
+        .arg(&store)
+        .args(["--at", "aaaa0002"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("ambiguous commit prefix"));
+
+    // Scoped to repo A the prefix matches exactly one commit: the scoped
+    // query must succeed instead of failing on the other repository's commit.
+    let assert = eg()
+        .args(["query", "symbol", "widget", "--graph"])
+        .arg(&store)
+        .args(["--at", "aaaa0002"])
+        .args(["--repo", "acme/widget-a"])
+        .assert()
+        .success();
+    let rows = parse_jsonl(&assert.get_output().stdout);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["git_commit"].as_str(), Some("aaaa000200000000"));
+    assert_eq!(rows[0]["repository_id"].as_str(), Some(repo_a.as_str()));
+}
+
+#[test]
 fn unscoped_as_of_collision_fails_with_ambiguous_repository_diagnostic() {
     let (_temp, store, repo_a, repo_b) = synthetic_collision_store();
 
@@ -718,36 +748,39 @@ fn scoped_query_output_never_includes_raw_payloads() {
 // selector failures map to the stable error codes.
 // ---------------------------------------------------------------------------
 
+/// Ingests a graph JSONL into an embedded store and spawns a daemon for it,
+/// waiting until the runtime metadata reports a running daemon.
 #[cfg(feature = "embedded-aletheiadb")]
-#[test]
-fn daemon_query_verbs_scope_by_repository_and_reject_unknown_selectors() {
-    use std::process::{Child, Command as ProcessCommand, Stdio};
-
-    let (temp, store, repo_a, repo_b) = scanned_collision_store();
-    let data_dir = temp.path().join("egregore-store");
+fn ingest_and_start_daemon(
+    store: &std::path::Path,
+    data_dir: &std::path::Path,
+) -> std::process::Child {
+    use std::process::{Command as ProcessCommand, Stdio};
 
     eg().arg("ingest")
-        .arg(&store)
+        .arg(store)
         .args(["--adapter", "embedded", "--data-dir"])
-        .arg(&data_dir)
+        .arg(data_dir)
         .assert()
         .success();
 
-    let mut daemon: Child = ProcessCommand::new(assert_cmd::cargo::cargo_bin("egregore"))
+    let daemon = ProcessCommand::new(assert_cmd::cargo::cargo_bin("egregore"))
         .arg("daemon")
         .arg("run")
         .arg("--data-dir")
-        .arg(&data_dir)
+        .arg(data_dir)
         .args(["--port", "0"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("daemon should spawn");
 
-    // Wait for the runtime metadata to report a running daemon.
-    let runtime_metadata = data_dir
-        .with_file_name("egregore-store.egregore-runtime")
-        .join("egregored.json");
+    let mut runtime_name = data_dir
+        .file_name()
+        .expect("data dir has a name")
+        .to_os_string();
+    runtime_name.push(".egregore-runtime");
+    let runtime_metadata = data_dir.with_file_name(runtime_name).join("egregored.json");
     let started = std::time::Instant::now();
     loop {
         if let Ok(contents) = fs::read_to_string(&runtime_metadata)
@@ -761,6 +794,24 @@ fn daemon_query_verbs_scope_by_repository_and_reject_unknown_selectors() {
         );
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
+    daemon
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn stop_daemon(data_dir: &std::path::Path, daemon: &mut std::process::Child) {
+    eg().args(["daemon", "stop", "--data-dir"])
+        .arg(data_dir)
+        .assert()
+        .success();
+    let _ = daemon.wait();
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn daemon_query_verbs_scope_by_repository_and_reject_unknown_selectors() {
+    let (temp, store, repo_a, repo_b) = scanned_collision_store();
+    let data_dir = temp.path().join("egregore-store");
+    let mut daemon = ingest_and_start_daemon(&store, &data_dir);
 
     let result = std::panic::catch_unwind(|| {
         // Scoped daemon symbol query: only repo A rows, each with identity.
@@ -808,21 +859,76 @@ fn daemon_query_verbs_scope_by_repository_and_reject_unknown_selectors() {
             assert_eq!(row["repository_id"].as_str(), Some(repo_b.as_str()));
         }
 
-        // Unknown selector: stable machine-readable error code, no rows.
-        eg().args(["query", "symbol", "widget", "--daemon", "--data-dir"])
+        // Unknown selector: the daemon-routed CLI must keep the same
+        // machine-readable stderr contract as the local paths.
+        let assert = eg()
+            .args(["query", "symbol", "widget", "--daemon", "--data-dir"])
             .arg(&data_dir)
             .args(["--repo", "no-such-repo"])
             .assert()
             .failure()
-            .stdout(predicate::str::is_empty())
-            .stderr(predicate::str::contains("unknown_repository_selector"));
+            .stdout(predicate::str::is_empty());
+        let diag = parse_stderr_json(&assert.get_output().stderr);
+        assert_eq!(diag["code"].as_str(), Some("unknown_repository_selector"));
+        assert_eq!(diag["selector"].as_str(), Some("no-such-repo"));
     });
 
-    eg().args(["daemon", "stop", "--data-dir"])
-        .arg(&data_dir)
-        .assert()
-        .success();
-    let _ = daemon.wait();
+    stop_daemon(&data_dir, &mut daemon);
+
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn daemon_temporal_queries_compose_with_repo_scope_and_fail_closed_on_collisions() {
+    let (temp, store, repo_a, repo_b) = synthetic_collision_store();
+    let data_dir = temp.path().join("egregore-history-store");
+    let mut daemon = ingest_and_start_daemon(&store, &data_dir);
+
+    let result = std::panic::catch_unwind(|| {
+        // Commit-prefix ambiguity is scoped to the selected repository: the
+        // `aaaa0002` prefix collides across repos, but repo A has exactly one
+        // matching commit, so the scoped daemon query must succeed.
+        let assert = eg()
+            .args(["query", "symbol", "widget", "--daemon", "--data-dir"])
+            .arg(&data_dir)
+            .args(["--at", "aaaa0002"])
+            .args(["--repo", "acme/widget-a"])
+            .assert()
+            .success();
+        let rows = parse_jsonl(&assert.get_output().stdout);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["git_commit"].as_str(), Some("aaaa000200000000"));
+        assert_eq!(rows[0]["repository_id"].as_str(), Some(repo_a.as_str()));
+
+        // Unscoped single-answer time view on a collision fails closed with
+        // the same ambiguous_repository diagnostic as the non-daemon CLI.
+        let assert = eg()
+            .args(["query", "symbol", "widget", "--daemon", "--data-dir"])
+            .arg(&data_dir)
+            .args(["--as-of", "2026-01-02T00:00:00Z"])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::is_empty());
+        let diag = parse_stderr_json(&assert.get_output().stderr);
+        assert_eq!(diag["code"].as_str(), Some("ambiguous_repository"));
+
+        // Scoped, the same time view returns exactly the selected repo's row.
+        let assert = eg()
+            .args(["query", "symbol", "widget", "--daemon", "--data-dir"])
+            .arg(&data_dir)
+            .args(["--as-of", "2026-01-02T00:00:00Z"])
+            .args(["--repo", "acme/widget-b"])
+            .assert()
+            .success();
+        let rows = parse_jsonl(&assert.get_output().stdout);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["repository_id"].as_str(), Some(repo_b.as_str()));
+    });
+
+    stop_daemon(&data_dir, &mut daemon);
 
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
