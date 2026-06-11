@@ -10832,8 +10832,16 @@ const SEMANTIC_FIXTURE_DIM: usize = 4;
 /// outside this set would risk leaking raw content or implying the row is
 /// proof/evidence/memory, which the redaction and trust-boundary ACs forbid.
 #[cfg(feature = "embeddings")]
-const SEMANTIC_ROW_ALLOWED_KEYS: &[&str] =
-    &["record_id", "name", "repo_relative_path", "score", "span"];
+const SEMANTIC_ROW_ALLOWED_KEYS: &[&str] = &[
+    "record_id",
+    "name",
+    "repo_relative_path",
+    "score",
+    "span",
+    // Repository identity handles (issue #67); bounded, never raw content.
+    "repository_id",
+    "repository",
+];
 
 /// A deterministic synthetic embedding on two independent 2-D circles, so
 /// different records rank differently for different queries without the model.
@@ -10979,6 +10987,60 @@ fn semantic_row_ids(rows: &serde_json::Value) -> Vec<String> {
 }
 
 // ── AC1 + AC2: one documented daemon workflow; rows carry the required fields ──
+#[cfg(feature = "embeddings")]
+#[test]
+fn daemon_semantic_search_bad_repo_selector_wins_over_missing_index() {
+    // Issue #67: a repo-scoped `semantic_search` with an unknown selector must
+    // return the stable `unknown_repository_selector` diagnostic even when the
+    // store has no embedding index — selector validation precedes the
+    // semantic-index checks, matching the other repo-scoped verbs.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path().join("semantic-selector-store");
+    {
+        // A valid store ingested WITHOUT --embed: no vector index exists.
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("store should open");
+        let record = GraphRecord::symbol(
+            stable_id(&["node", "symbol", "src/lib.rs", "plain"]),
+            "function",
+            "src/lib.rs".to_owned(),
+            SourceSpan {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 1,
+            },
+            "plain".to_owned(),
+            "fixture symbol".to_owned(),
+        );
+        sink.write_record(&record).expect("record should write");
+    }
+
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_running_metadata(&data_dir);
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "sem-selector-1",
+            "agent_id": "semantic-test-agent",
+            "verb": "semantic_search",
+            "params": { "query_vector": [0.1, 0.2, 0.3, 0.4], "repo": "no-such-repo" }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "selector failure must precede semantic-index failure, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "unknown_repository_selector",
+        "selector diagnostic must stay stable for semantic queries, got {body}"
+    );
+}
+
 #[cfg(feature = "embeddings")]
 #[test]
 fn daemon_semantic_search_returns_record_id_score_path_and_span() {

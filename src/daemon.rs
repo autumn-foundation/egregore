@@ -8736,6 +8736,22 @@ fn handle_verb_semantic_search(
     };
     let snapshot = rfc3339_now();
 
+    // Repository attribution requires the store topology, not just the vector
+    // index (issue #67): build the index from the full record set so each
+    // retrieval lead carries its repository identity handle and `params.repo`
+    // can scope the result set. Selector validation precedes the
+    // semantic-index checks so an unknown/ambiguous selector returns its
+    // stable diagnostic even on a store ingested without `--embed`.
+    let all_records = match sink.read_all_records() {
+        Ok(records) => records,
+        Err(e) => return HttpResponse::error_with_id(request_id, adapter_read_error_to_api(e)),
+    };
+    let repo_index = graph_query::RepositoryIndex::build(&all_records);
+    let selected_repo = match resolve_verb_repo_selector(params, &repo_index) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+
     match sink.embedding_index_dimensions() {
         None => {
             return HttpResponse::error_with_id(request_id, ApiError::missing_semantic_index());
@@ -8748,20 +8764,6 @@ fn handle_verb_semantic_search(
         }
         Some(_) => {}
     }
-
-    // Repository attribution requires the store topology, not just the vector
-    // index (issue #67): build the index from the full record set so each
-    // retrieval lead carries its repository identity handle and `params.repo`
-    // can scope the result set.
-    let all_records = match sink.read_all_records() {
-        Ok(records) => records,
-        Err(e) => return HttpResponse::error_with_id(request_id, adapter_read_error_to_api(e)),
-    };
-    let repo_index = graph_query::RepositoryIndex::build(&all_records);
-    let selected_repo = match resolve_verb_repo_selector(params, &repo_index) {
-        Ok(s) => s,
-        Err(e) => return HttpResponse::error_with_id(request_id, e),
-    };
 
     // When scoped, search the whole index so higher-scoring hits from other
     // repositories can never crowd the selected repository's matches out of
