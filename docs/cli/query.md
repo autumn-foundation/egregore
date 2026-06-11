@@ -5,13 +5,13 @@ Query an existing graph JSONL for symbols, files, semantic drift records, or by 
 ## Synopsis
 
 ```text
-eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--format json|text]
-eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--format json|text]
-eg query file     <PATH>  --graph <PATH>    [--format json|text]
-eg query file     <PATH>  --data-dir <DIR>  [--format json|text]
-eg query drift            --graph <PATH>    [--limit N] [--format json|text]
-eg query drift            --data-dir <DIR>  [--limit N] [--format json|text]
-eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--format json|text]
+eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] [--format json|text]
+eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--format json|text]
+eg query file     <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--format json|text]
+eg query file     <PATH>  --data-dir <DIR>  [--repo <SELECTOR>] [--format json|text]
+eg query drift            --graph <PATH>    [--limit N] [--repo <SELECTOR>] [--format json|text]
+eg query drift            --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
+eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query context  <NAME>  --graph <PATH>
 eg query task     <HANDLE> --graph <PATH>
 eg query memory   <HANDLE> --graph <PATH>   [--verified-only]
@@ -36,7 +36,7 @@ Most subcommands accept exactly one input source:
 | Code | Meaning |
 |------|---------|
 | `0` | At least one result was found and printed. |
-| `1` | An error occurred (missing file, malformed JSONL, ambiguous commit prefix). A single-line message is written to stderr. No partial JSON appears on stdout. |
+| `1` | An error occurred (missing file, malformed JSONL, ambiguous commit prefix, unknown/ambiguous repository selector, ambiguous unscoped repository collision). A single-line message is written to stderr. No partial JSON appears on stdout. |
 | `2` | No match found. A single-line message is written to stderr. Stdout is empty. |
 
 ## Output format
@@ -48,6 +48,92 @@ One JSON object per line (JSONL). Field names are stable across releases. Machin
 ### `--format text`
 
 One human-readable line per result for terminal use. The exact format is not stable and must not be parsed by scripts.
+
+---
+
+## Repository scope (`--repo`, issue #67)
+
+A shared local store can hold more than one repository, and two repositories
+routinely contain the same repo-relative path (`src/lib.rs`) or the same
+symbol name (`Widget`). `name` and `repo_relative_path` alone are therefore
+not unique handles: a citation that names the right-looking path in the wrong
+repository is worse than a clean no-match. Repository scope keeps the
+repository boundary explicit on every public code query.
+
+### Shortest local workflow
+
+```sh
+# Two local repositories scanned into one store — no network, no git remote
+# required (operator overrides force distinct identities for plain dirs):
+eg scan ./widget-a --repo-id-override widget-a --out a.jsonl
+eg scan ./widget-b --repo-id-override widget-b --out b.jsonl
+cat a.jsonl b.jsonl > store.jsonl
+
+# Scope a query to exactly one repository:
+eg query symbol widget --graph store.jsonl --repo widget-a
+eg query file src/lib.rs --graph store.jsonl --repo widget-a
+```
+
+The same `--repo` flag works against an embedded store (`--data-dir`) and
+through the daemon (`--daemon`), where it maps to the `repo` query-verb param
+(see [`docs/schema/daemon-query.md` §5.1](../schema/daemon-query.md)).
+
+### Selector forms
+
+`--repo` accepts the stable `Repository` record ID or any human-usable handle
+from the repository identity payload
+([`docs/schema/repository-identity.md`](../schema/repository-identity.md)):
+
+| Selector | Example |
+|----------|---------|
+| Stable repository record ID | `codegraph:v4:e2aa0c…` |
+| Display name (remote-derived `owner/name`) | `acme/widget` |
+| Basename / operator override | `widget-a` |
+| Normalized remote URL | `https://github.com/acme/widget` |
+| Root commit SHA (`local_root_commit` identities) | `83fa99…` |
+| Canonical path (`local_path` identities) | `/home/me/src/widget` |
+
+Failures are stable, machine-readable JSON on stderr with exit code `1`:
+
+- `{"code":"unknown_repository_selector","selector":"…"}` — nothing matches.
+- `{"code":"ambiguous_repository_selector","selector":"…","candidates":[…]}` —
+  more than one repository matches (e.g. two repos sharing a basename). The
+  candidates list every matching repository record ID; Egregore never picks
+  one implicitly.
+
+### When repository scope is required
+
+- **Unscoped list queries** (`eg query symbol`, `eg query file`, `eg query
+  drift`, `eg query semantic`) stay usable in a multi-repo store: every row
+  carries `repository_id` and `repository`, and colliding rows from different
+  repositories are returned side by side — never merged across the boundary.
+- **Unscoped single-answer time views** (`eg query symbol --as-of`, `--at`)
+  fail closed on a collision with
+  `{"code":"ambiguous_repository","repositories":[…]}` and exit `1`, because a
+  single row cannot represent two repositories. Re-run with `--repo`.
+- **Scoped `eg query file`** excludes a matching path in another repository
+  from the result set and reports it only through a stderr diagnostic:
+  `{"code":"excluded_other_repositories","repo_relative_path":"src/lib.rs",
+  "excluded_repository_count":1,"excluded_row_count":2}`.
+
+Repository scope composes with the temporal selectors: `--repo` answers
+"which repository?", `--at`/`--as-of`/`--tx-as-of` answer "which time view?"
+([`docs/schema/temporal-selectors.md`](../schema/temporal-selectors.md));
+neither dimension silently widens the other.
+
+### Compared to the boring alternatives
+
+| Tool | How it scopes | What it lacks here |
+|------|---------------|--------------------|
+| `rg` / `git grep` / `git log -S` from one checkout | Implicitly: you run it inside a single working tree | No shared store, no temporal graph, no drift/semantic/evidence joins; scoping disappears the moment results from several checkouts are merged into one report |
+| GitHub Code Search `repo:owner/name` ([syntax](https://docs.github.com/en/search-github/github-code-search/understanding-github-code-search-syntax)) | Explicit `repo:` qualifier | Hosted-only; no local store, no AletheiaDB trust separation, no valid/transaction-time views |
+| Sourcegraph `repo:^github\.com/acme/widget$` ([docs](https://sourcegraph.com/docs/code-search/queries)) | Explicit `repo:` filter with revision scoping | Server deployment; not a local-first evidence-citable graph that joins to agent memory and verification records |
+| rust-analyzer / SCIP workspace navigation | Project-root-relative documents inside one workspace | Single-workspace by construction; cannot answer for a shared store where two repositories carry the same project-root-relative path |
+
+Egregore's slice is narrower than any of these on raw search, and that is the
+point: a repository-scoped, locally citable row (`record_id` +
+`repository_id` + path + span) that later joins to memory, task, artifact, and
+verification domains without leaving the shared store.
 
 ---
 
@@ -66,6 +152,7 @@ eg query symbol <NAME> --graph <PATH> [--at <COMMIT>] [--format json|text]
 | `<NAME>` | yes | Exact symbol name to look up. |
 | `--graph <PATH>` | yes | Graph JSONL produced by `eg scan` or `eg scan-history`. |
 | `--at <COMMIT>` | no | Restrict to the single best record whose `git_commit` starts with this SHA prefix. Exit `1` with `error: ambiguous commit prefix` when the prefix matches more than one distinct commit SHA. Requires a history graph. |
+| `--repo <SELECTOR>` | no | Restrict results to one repository (see [Repository scope](#repository-scope---repo-issue-67)). |
 | `--format` | no | `json` (default) or `text`. |
 
 ### JSON output fields
@@ -79,6 +166,8 @@ eg query symbol <NAME> --graph <PATH> [--at <COMMIT>] [--format json|text]
 | `repo_relative_path` | string or null | yes | Repository-relative file path, e.g. `"src/lib.rs"`. |
 | `span` | object or null | yes | Source span with `start_byte`, `end_byte`, `start_line`, `end_line`. |
 | `git_commit` | string | only in history graphs | Full commit SHA for history-backed records. |
+| `repository_id` | string | when attributable | Stable `Repository` record ID owning the row. Absent only for legacy graphs without repository topology. |
+| `repository` | string | when attributable | Human-usable repository identity handle, e.g. `acme/widget`. |
 
 ### Example
 
@@ -107,6 +196,7 @@ eg query file <PATH> --graph <PATH> [--format json|text]
 |----------|----------|-------------|
 | `<PATH>` | yes | Repository-relative file path, e.g. `src/lib.rs`. |
 | `--graph <PATH>` | yes | Graph JSONL to query. |
+| `--repo <SELECTOR>` | no | Restrict results to one repository. A matching path in another repository is excluded and reported only through the `excluded_other_repositories` stderr diagnostic. |
 | `--format` | no | `json` (default) or `text`. |
 
 ### JSON output fields
@@ -128,7 +218,8 @@ eg query drift --graph <PATH> [--limit N] [--format json|text]
 | Argument | Required | Description |
 |----------|----------|-------------|
 | `--graph <PATH>` | yes | Graph JSONL produced by `eg scan-history` after semantic drift computation. |
-| `--limit N` | no | Maximum results (default `10`). |
+| `--limit N` | no | Maximum results (default `10`). Bounds the scoped result set when `--repo` is supplied. |
+| `--repo <SELECTOR>` | no | Restrict results to drift records whose target belongs to one repository. |
 | `--format` | no | `json` (default) or `text`. |
 
 ### JSON output fields
@@ -154,8 +245,12 @@ eg query drift --graph <PATH> [--limit N] [--format json|text]
 | `embedding_model_content_hash` | string | yes | Model content hash or `unknown`. |
 | `repo_relative_path` | string or null | when resolvable | Path of the drift target, resolved from `DRIFTS_FROM` edges. |
 | `name` | string or null | when resolvable | Name of the drift target. |
+| `repository_id` | string | when attributable | Stable `Repository` record ID of the drift target's repository. |
+| `repository` | string | when attributable | Human-usable repository identity handle. |
 
-Ties in `score` are broken by `record_id` ascending.
+Ties in `score` are broken by `record_id` ascending. Drift records from
+different repositories are never merged: each row carries its own repository
+identity.
 
 ---
 
@@ -177,7 +272,8 @@ The embedded store **must** have been populated with `eg ingest --embed`. A stor
 |----------|----------|-------------|
 | `<QUERY>` | yes | Natural-language search text, symbol name, or code snippet. |
 | `--data-dir <DIR>` | yes | Embedded `AletheiaDB` store created by `eg ingest --adapter embedded --embed`. `--graph` is not accepted by this subcommand. |
-| `--limit N` | no | Maximum number of results (default `10`). |
+| `--limit N` | no | Maximum number of results (default `10`). Bounds the scoped result set when `--repo` is supplied. |
+| `--repo <SELECTOR>` | no | Restrict retrieval leads to one repository. |
 | `--format` | no | `json` (default) or `text`. |
 
 ### JSON output fields
@@ -191,6 +287,8 @@ One JSON object per line (JSONL). The default output format is `json`. Field nam
 | `name` | string | when available | Symbol or file name from the matched record. Absent when the record has no name field. |
 | `repo_relative_path` | string | when available | Repository-relative file path, e.g. `"src/lib.rs"`. Absent when the record has no path field. |
 | `span` | object | when available | Source span: `start_byte`, `end_byte`, `start_line`, `end_line` (all integers). Absent when the record has no span. |
+| `repository_id` | string | when attributable | Stable `Repository` record ID owning the row. |
+| `repository` | string | when attributable | Human-usable repository identity handle. |
 
 Machine consumers must depend only on the fields listed above. Additional fields may be added in future releases; removing or renaming any of the fields above constitutes a breaking contract change and requires a version bump.
 

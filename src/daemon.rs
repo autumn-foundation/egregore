@@ -802,6 +802,12 @@ enum ErrorCode {
     /// Added by #59 (daemon semantic search): the query vector dimensionality
     /// disagrees with the store's embedding index dimensionality.
     IncompatibleEmbeddingDimension,
+    /// Added by #67 (repository-scoped queries): `params.repo` matches no
+    /// repository identity in the store.
+    UnknownRepositorySelector,
+    /// Added by #67 (repository-scoped queries): `params.repo` matches more
+    /// than one repository identity; ambiguity is never resolved implicitly.
+    AmbiguousRepositorySelector,
 }
 
 impl ErrorCode {
@@ -838,6 +844,8 @@ impl ErrorCode {
             Self::UnapprovedDurableUserContext => "unapproved_durable_user_context",
             Self::MissingSemanticIndex => "missing_semantic_index",
             Self::IncompatibleEmbeddingDimension => "incompatible_embedding_dimension",
+            Self::UnknownRepositorySelector => "unknown_repository_selector",
+            Self::AmbiguousRepositorySelector => "ambiguous_repository_selector",
         }
     }
 
@@ -848,7 +856,9 @@ impl ErrorCode {
             | Self::MissingField
             | Self::InvalidDomain
             | Self::InlinePayloadExceedsCeiling
-            | Self::AmbiguousCommitPrefix => 400,
+            | Self::AmbiguousCommitPrefix
+            | Self::UnknownRepositorySelector
+            | Self::AmbiguousRepositorySelector => 400,
             Self::IdempotencyConflict => 409,
             Self::NotFound => 404,
             Self::PayloadTooLarge => 413,
@@ -7292,7 +7302,15 @@ fn load_all_records_for_verb(
     budget: Option<Duration>,
     domain: &str,
     include_superseded: bool,
-) -> std::result::Result<(Vec<GraphRecord>, String, StoreTxBounds), ApiError> {
+) -> std::result::Result<
+    (
+        Vec<GraphRecord>,
+        String,
+        StoreTxBounds,
+        graph_query::RepositoryIndex,
+    ),
+    ApiError,
+> {
     let sink = query_sink_read(state, started, budget)?;
     // Capture the snapshot while the read lock is held.
     let snapshot = rfc3339_now();
@@ -7317,12 +7335,79 @@ fn load_all_records_for_verb(
     } else {
         None
     };
+    // Build the repository index from the *unfiltered* records so cross-domain
+    // rows (e.g. semantic drift markers attributed through codegraph topology)
+    // still resolve their owning repository (issue #67).
+    let repo_index = graph_query::RepositoryIndex::build(&records);
     // Filter to the requested domain.
     let records = records
         .into_iter()
         .filter(|r| record_id_matches_domain(r.id(), domain))
         .collect();
-    Ok((records, snapshot, store_tx_bounds))
+    Ok((records, snapshot, store_tx_bounds, repo_index))
+}
+
+// ── Repository scope for query verbs (issue #67) ─────────────────────────────
+
+/// Resolves the optional `params.repo` selector for a query verb.
+///
+/// Returns the selected repository record ID, or `None` when the request is
+/// unscoped. Unknown and ambiguous selectors map to the stable
+/// `unknown_repository_selector` / `ambiguous_repository_selector` error codes;
+/// ambiguity is never resolved by picking a repository implicitly.
+fn resolve_verb_repo_selector(
+    params: &serde_json::Value,
+    index: &graph_query::RepositoryIndex,
+) -> std::result::Result<Option<String>, ApiError> {
+    let selector = match params.get("repo") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        Some(_) => {
+            return Err(ApiError::bad_request_field(
+                "params.repo must be a string",
+                "params.repo",
+            ));
+        }
+    };
+    match index.resolve_selector(selector) {
+        Ok(id) => Ok(Some(id.to_owned())),
+        Err(graph_query::RepositorySelectorError::Unknown { selector }) => Err(ApiError::new(
+            ErrorCode::UnknownRepositorySelector,
+            format!("no repository in the store matches selector '{selector}'"),
+        )),
+        Err(graph_query::RepositorySelectorError::Ambiguous {
+            selector,
+            candidates,
+        }) => Err(ApiError::new(
+            ErrorCode::AmbiguousRepositorySelector,
+            format!(
+                "repository selector '{selector}' matches multiple repositories: {}",
+                candidates.join(", ")
+            ),
+        )),
+    }
+}
+
+/// Adds the `repository_id` / `repository` identity handles to query rows
+/// whose `record_id` the index can attribute to a repository (issue #67).
+fn attach_repository_fields(rows: &mut [serde_json::Value], index: &graph_query::RepositoryIndex) {
+    for row in rows {
+        let Some(repo_id) = row
+            .get("record_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| index.owner_of(id))
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let display = index.display_of(&repo_id).map(str::to_owned);
+        if let Some(map) = row.as_object_mut() {
+            map.insert("repository_id".to_owned(), json!(repo_id));
+            if let Some(display) = display {
+                map.insert("repository".to_owned(), json!(display));
+            }
+        }
+    }
 }
 
 /// Collects the IDs of tombstoned records in the slice.
@@ -7360,6 +7445,8 @@ fn symbol_by_name_tx_response(
     view_handle: &str,
     started: Instant,
     budget: Option<Duration>,
+    repo_index: &graph_query::RepositoryIndex,
+    selected_repo: Option<&str>,
 ) -> HttpResponse {
     // Validate the temporal selectors first — before the kind-filter short
     // circuit — so a malformed instant always yields 400 bad_request (attributed
@@ -7420,12 +7507,14 @@ fn symbol_by_name_tx_response(
         }
     };
 
-    let rows: Vec<serde_json::Value> = result
+    let mut rows: Vec<serde_json::Value> = result
         .records
         .iter()
+        .filter(|r| selected_repo.is_none_or(|repo| repo_index.owner_of(r.id()) == Some(repo)))
         .filter_map(|r| symbol_node_to_tx_query_json(r))
         .take(limit)
         .collect();
+    attach_repository_fields(&mut rows, repo_index);
     // Enforce the timeout after the tx filter/sort/convert phase, mirroring the
     // non-tx symbol path so a slow tx query on a large history store does not
     // return 200 past the caller's budget.
@@ -7757,7 +7846,7 @@ fn handle_verb_symbol_by_name(
         }
     }
 
-    let (records, snapshot, store_tx_bounds) = match load_all_records_for_verb(
+    let (records, snapshot, store_tx_bounds, repo_index) = match load_all_records_for_verb(
         state,
         started,
         budget,
@@ -7765,6 +7854,10 @@ fn handle_verb_symbol_by_name(
         as_of_transaction_time.is_some(),
     ) {
         Ok(r) => r,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+    let selected_repo = match resolve_verb_repo_selector(params, &repo_index) {
+        Ok(s) => s,
         Err(e) => return HttpResponse::error_with_id(request_id, e),
     };
 
@@ -7785,21 +7878,35 @@ fn handle_verb_symbol_by_name(
             tx_as_of,
             started,
             budget,
+            &repo_index,
+            selected_repo.as_deref(),
         );
     }
 
-    let result_records: Vec<serde_json::Value> = if let Some(as_of) = as_of_valid_time {
-        match graph_query::symbol_as_of_valid_time(&records, &name, as_of) {
-            Ok(Some(record)) => {
+    let mut result_records: Vec<serde_json::Value> = if let Some(as_of) = as_of_valid_time {
+        // Repository-aware resolution (issue #67): one best record per
+        // repository so a multi-repo collision keeps the boundary visible
+        // instead of picking one repository implicitly.
+        match graph_query::symbol_as_of_valid_time_by_repo(
+            &records,
+            &name,
+            as_of,
+            &repo_index,
+            selected_repo.as_deref(),
+        ) {
+            Ok(matches) => {
                 // kind_filter only recognises "Symbol" in v1; anything else → empty.
                 // Apply limit: a budget cap of 0 means no results.
-                if kind_filter.as_deref().is_some_and(|kf| kf != "Symbol") || limit == 0 {
+                if kind_filter.as_deref().is_some_and(|kf| kf != "Symbol") {
                     vec![]
                 } else {
-                    symbol_node_to_query_json(record).into_iter().collect()
+                    matches
+                        .into_iter()
+                        .filter_map(symbol_node_to_query_json)
+                        .take(limit)
+                        .collect()
                 }
             }
-            Ok(None) => vec![],
             Err(msg) => {
                 return HttpResponse::error_with_id(request_id, ApiError::bad_request(msg));
             }
@@ -7830,6 +7937,11 @@ fn handle_verb_symbol_by_name(
                 if kind_filter.as_deref().is_some_and(|kf| kf != "Symbol") {
                     return None;
                 }
+                if let Some(repo) = selected_repo.as_deref()
+                    && repo_index.owner_of(r.id()) != Some(repo)
+                {
+                    return None;
+                }
                 let json = symbol_node_to_query_json(r)?;
                 let line = span.map(|s| s.start_line);
                 Some((json, line))
@@ -7847,6 +7959,7 @@ fn handle_verb_symbol_by_name(
         }
         results.into_iter().map(|(v, _)| v).collect()
     };
+    attach_repository_fields(&mut result_records, &repo_index);
 
     HttpResponse::success(
         Some(request_id),
@@ -7882,11 +7995,15 @@ fn handle_verb_symbol_at_commit(
         }
     };
 
-    let (records, snapshot, _) =
+    let (records, snapshot, _, repo_index) =
         match load_all_records_for_verb(state, started, budget, domain, false) {
             Ok(r) => r,
             Err(e) => return HttpResponse::error_with_id(request_id, e),
         };
+    let selected_repo = match resolve_verb_repo_selector(params, &repo_index) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
 
     // Check for ambiguous commit prefix
     let matching_commits: BTreeSet<&str> = records
@@ -7927,12 +8044,27 @@ fn handle_verb_symbol_at_commit(
         return HttpResponse::error_with_id(request_id, e);
     }
 
-    // Apply the budget limit: limit=0 means no results are wanted.
-    let result_records = graph_query::symbol_at_commit(&records, &name, &commit)
-        .and_then(symbol_node_to_query_json)
+    // Apply the budget limit: limit=0 means no results are wanted. The best
+    // (lowest record ID) match is returned per repository: when two repository
+    // identities share a commit (forked clones), each repository's match is
+    // returned with repository identity attached rather than picking one
+    // implicitly (issue #67).
+    let mut seen_repos: BTreeSet<Option<&str>> = BTreeSet::new();
+    let mut result_records = graph_query::symbols_at_commit(&records, &name, &commit)
         .into_iter()
+        .filter(|r| {
+            let owner = repo_index.owner_of(r.id());
+            if let Some(repo) = selected_repo.as_deref()
+                && owner != Some(repo)
+            {
+                return false;
+            }
+            seen_repos.insert(owner)
+        })
+        .filter_map(symbol_node_to_query_json)
         .take(limit)
         .collect::<Vec<_>>();
+    attach_repository_fields(&mut result_records, &repo_index);
 
     HttpResponse::success(
         Some(request_id),
@@ -7954,16 +8086,20 @@ fn file_defines_as_of(
     path: &str,
     as_of_dt: chrono::DateTime<chrono::FixedOffset>,
     limit: usize,
+    repo_index: &graph_query::RepositoryIndex,
+    selected_repo: Option<&str>,
 ) -> Vec<serde_json::Value> {
-    if !file_node_exists_as_of(records, path, as_of_dt) {
+    if !file_node_exists_as_of(records, path, as_of_dt, repo_index, selected_repo) {
         return vec![];
     }
-    // Key: (name, span_key) where span_key is "" for spanned records (dedup by
-    // name so the same logical symbol is collapsed across line-moving commits)
-    // or "id:<record_id>" for span-absent records.
+    // Key: (repository, name, span_key) where span_key is "" for spanned
+    // records (dedup by name so the same logical symbol is collapsed across
+    // line-moving commits) or "id:<record_id>" for span-absent records. The
+    // repository component keeps same-name/same-path records from different
+    // repositories from being merged across the boundary (issue #67).
     #[allow(clippy::type_complexity)]
     let mut best: std::collections::BTreeMap<
-        (String, String),
+        (String, String, String),
         (
             serde_json::Value,
             Option<usize>,
@@ -7985,6 +8121,12 @@ fn file_defines_as_of(
             continue;
         };
         if repo_relative_path.as_deref() != Some(path) {
+            continue;
+        }
+        let owner = repo_index.owner_of(id.as_str());
+        if let Some(repo) = selected_repo
+            && owner != Some(repo)
+        {
             continue;
         }
         let vt_str = temporal
@@ -8011,7 +8153,11 @@ fn file_defines_as_of(
         // For span-absent records, fall back to record_id so distinct same-name
         // symbols without positional info are not incorrectly merged.
         let span_key = line.map_or_else(|| format!("id:{}", id.as_str()), |_| String::new());
-        let key = (name_str.to_owned(), span_key);
+        let key = (
+            owner.unwrap_or_default().to_owned(),
+            name_str.to_owned(),
+            span_key,
+        );
         let is_better = best.get(&key).is_none_or(|(pv, _, pvt)| {
             vt > *pvt || (vt == *pvt && json["record_id"].as_str() < pv["record_id"].as_str())
         });
@@ -8025,8 +8171,14 @@ fn file_defines_as_of(
     results.into_iter().map(|(v, _)| v).collect()
 }
 
-/// Returns true when a non-tombstoned `File` node for `path` exists in `records`.
-fn live_file_node_exists(records: &[GraphRecord], path: &str) -> bool {
+/// Returns true when a non-tombstoned `File` node for `path` exists in `records`
+/// (within the selected repository when a scope is supplied).
+fn live_file_node_exists(
+    records: &[GraphRecord],
+    path: &str,
+    repo_index: &graph_query::RepositoryIndex,
+    selected_repo: Option<&str>,
+) -> bool {
     let deleted = tombstoned_ids_in(records);
     records.iter().any(|r| {
         matches!(
@@ -8037,19 +8189,25 @@ fn live_file_node_exists(records: &[GraphRecord], path: &str) -> bool {
                 repo_relative_path: Some(p),
                 temporal: None,
                 ..
-            } if p == path && !deleted.contains(id.as_str())
+            } if p == path
+                && !deleted.contains(id.as_str())
+                && selected_repo.is_none_or(|repo| repo_index.owner_of(id) == Some(repo))
         )
     })
 }
 
-/// Returns true when a `File` node for `path` with `valid_time <= as_of_dt` exists in `records`.
+/// Returns true when a `File` node for `path` with `valid_time <= as_of_dt` exists
+/// in `records` (within the selected repository when a scope is supplied).
 fn file_node_exists_as_of(
     records: &[GraphRecord],
     path: &str,
     as_of_dt: chrono::DateTime<chrono::FixedOffset>,
+    repo_index: &graph_query::RepositoryIndex,
+    selected_repo: Option<&str>,
 ) -> bool {
     records.iter().any(|r| {
         let GraphRecord::Node {
+            id,
             kind: NodeKind::File,
             repo_relative_path,
             temporal,
@@ -8060,6 +8218,11 @@ fn file_node_exists_as_of(
             return false;
         };
         if repo_relative_path.as_deref() != Some(path) {
+            return false;
+        }
+        if let Some(repo) = selected_repo
+            && repo_index.owner_of(id) != Some(repo)
+        {
             return false;
         }
         let vt_str = temporal
@@ -8078,8 +8241,10 @@ fn file_defines_current(
     records: &[GraphRecord],
     path: &str,
     limit: usize,
+    repo_index: &graph_query::RepositoryIndex,
+    selected_repo: Option<&str>,
 ) -> Vec<serde_json::Value> {
-    if !live_file_node_exists(records, path) {
+    if !live_file_node_exists(records, path, repo_index, selected_repo) {
         return vec![];
     }
     let deleted = tombstoned_ids_in(records);
@@ -8101,6 +8266,11 @@ fn file_defines_current(
                 return None;
             }
             if temporal.is_none() && deleted.contains(id.as_str()) {
+                return None;
+            }
+            if let Some(repo) = selected_repo
+                && repo_index.owner_of(id) != Some(repo)
+            {
                 return None;
             }
             let json = symbol_node_to_query_json(r)?;
@@ -8149,16 +8319,20 @@ fn handle_verb_file_defines(
         }
     };
 
-    let (records, snapshot, _) =
+    let (records, snapshot, _, repo_index) =
         match load_all_records_for_verb(state, started, budget, domain, false) {
             Ok(r) => r,
             Err(e) => return HttpResponse::error_with_id(request_id, e),
         };
+    let selected_repo = match resolve_verb_repo_selector(params, &repo_index) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
 
     // When as_of_valid_time is set, keep the most-recent-per-symbol-name at or
     // before the given instant. Records without valid_time are excluded (they are
     // untimed current-state records, not part of any historical point-in-time view).
-    let result_records: Vec<serde_json::Value> = if let Some(as_of) = as_of_valid_time {
+    let mut result_records: Vec<serde_json::Value> = if let Some(as_of) = as_of_valid_time {
         let as_of_dt = match chrono::DateTime::parse_from_rfc3339(as_of) {
             Ok(dt) => dt,
             Err(e) => {
@@ -8168,10 +8342,24 @@ fn handle_verb_file_defines(
                 );
             }
         };
-        file_defines_as_of(&records, &path, as_of_dt, limit)
+        file_defines_as_of(
+            &records,
+            &path,
+            as_of_dt,
+            limit,
+            &repo_index,
+            selected_repo.as_deref(),
+        )
     } else {
-        file_defines_current(&records, &path, limit)
+        file_defines_current(
+            &records,
+            &path,
+            limit,
+            &repo_index,
+            selected_repo.as_deref(),
+        )
     };
+    attach_repository_fields(&mut result_records, &repo_index);
 
     // Enforce timeout after the in-memory filter/sort phase.
     if let Err(e) = check_query_budget(started, budget) {
@@ -8220,11 +8408,15 @@ fn handle_verb_drift_top_n(
     } else {
         domain
     };
-    let (mut records, snapshot, _) =
+    let (mut records, snapshot, _, repo_index) =
         match load_all_records_for_verb(state, started, budget, drift_domain, false) {
             Ok(r) => r,
             Err(e) => return HttpResponse::error_with_id(request_id, e),
         };
+    let selected_repo = match resolve_verb_repo_selector(params, &repo_index) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
 
     // When as_of_valid_time is set, exclude drift records whose valid_time
     // exceeds the given instant. Records without valid_time are current-state
@@ -8269,11 +8461,18 @@ fn handle_verb_drift_top_n(
         });
     }
 
-    let drifts = graph_query::largest_semantic_drifts(&records, effective_limit);
-    let result_records = drifts
+    // Rank first, then apply the repository scope, then truncate: the limit
+    // must bound the scoped result set, not pre-empt it (issue #67).
+    let mut drifts = graph_query::largest_semantic_drifts(&records, usize::MAX);
+    if let Some(repo) = selected_repo.as_deref() {
+        drifts.retain(|r| repo_index.owner_of(r.id()) == Some(repo));
+    }
+    drifts.truncate(effective_limit);
+    let mut result_records = drifts
         .into_iter()
         .filter_map(|r| drift_node_to_query_json(r, &records))
         .collect::<Vec<_>>();
+    attach_repository_fields(&mut result_records, &repo_index);
 
     // Enforce timeout after ranking/materialization CPU phase.
     if let Err(e) = check_query_budget(started, budget) {
@@ -8327,38 +8526,25 @@ fn semantic_match_to_query_json(m: &crate::adapters::SemanticMatch) -> serde_jso
 /// `missing_field`/`bad_request` for malformed params, and `query_timeout` when
 /// the budget elapses. A no-match is a successful empty result, never a fallback
 /// to direct embedded reads.
+/// Parses and validates `params.query_vector` for `semantic_search`.
 #[cfg(feature = "embeddings")]
-fn handle_verb_semantic_search(
-    request_id: &str,
+fn parse_semantic_query_vector(
     params: &serde_json::Value,
-    budget_limit: usize,
-    started: Instant,
-    budget: Option<Duration>,
-    state: &ServerState,
-) -> HttpResponse {
+) -> std::result::Result<Vec<f32>, ApiError> {
     let Some(vector_value) = params.get("query_vector") else {
-        return HttpResponse::error_with_id(
-            request_id,
-            ApiError::missing_field("params.query_vector"),
-        );
+        return Err(ApiError::missing_field("params.query_vector"));
     };
     let Some(raw) = vector_value.as_array() else {
-        return HttpResponse::error_with_id(
-            request_id,
-            ApiError::bad_request_field(
-                "params.query_vector must be an array of numbers",
-                "params.query_vector",
-            ),
-        );
+        return Err(ApiError::bad_request_field(
+            "params.query_vector must be an array of numbers",
+            "params.query_vector",
+        ));
     };
     if raw.is_empty() {
-        return HttpResponse::error_with_id(
-            request_id,
-            ApiError::bad_request_field(
-                "params.query_vector must be a non-empty array",
-                "params.query_vector",
-            ),
-        );
+        return Err(ApiError::bad_request_field(
+            "params.query_vector must be a non-empty array",
+            "params.query_vector",
+        ));
     }
     let mut query_vector = Vec::with_capacity(raw.len());
     for entry in raw {
@@ -8368,16 +8554,29 @@ fn handle_verb_semantic_search(
                 query_vector.push(value as f32);
             }
             _ => {
-                return HttpResponse::error_with_id(
-                    request_id,
-                    ApiError::bad_request_field(
-                        "params.query_vector must contain only finite numbers",
-                        "params.query_vector",
-                    ),
-                );
+                return Err(ApiError::bad_request_field(
+                    "params.query_vector must contain only finite numbers",
+                    "params.query_vector",
+                ));
             }
         }
     }
+    Ok(query_vector)
+}
+
+#[cfg(feature = "embeddings")]
+fn handle_verb_semantic_search(
+    request_id: &str,
+    params: &serde_json::Value,
+    budget_limit: usize,
+    started: Instant,
+    budget: Option<Duration>,
+    state: &ServerState,
+) -> HttpResponse {
+    let query_vector = match parse_semantic_query_vector(params) {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
 
     let params_limit = match params.get("limit") {
         None => SEMANTIC_SEARCH_DEFAULT,
@@ -8413,21 +8612,48 @@ fn handle_verb_semantic_search(
         Some(_) => {}
     }
 
-    let matches = match sink.semantic_search(&query_vector, effective_limit) {
+    // Repository attribution requires the store topology, not just the vector
+    // index (issue #67): build the index from the full record set so each
+    // retrieval lead carries its repository identity handle and `params.repo`
+    // can scope the result set.
+    let all_records = match sink.read_all_records() {
+        Ok(records) => records,
+        Err(e) => return HttpResponse::error_with_id(request_id, adapter_read_error_to_api(e)),
+    };
+    let repo_index = graph_query::RepositoryIndex::build(&all_records);
+    let selected_repo = match resolve_verb_repo_selector(params, &repo_index) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::error_with_id(request_id, e),
+    };
+
+    // Over-fetch when scoped so the limit bounds the scoped result set.
+    let fetch = if selected_repo.is_some() {
+        effective_limit
+            .saturating_mul(4)
+            .clamp(effective_limit, SEMANTIC_SEARCH_MAX)
+    } else {
+        effective_limit
+    };
+    let mut matches = match sink.semantic_search(&query_vector, fetch) {
         Ok(matches) => matches,
         Err(e) => return HttpResponse::error_with_id(request_id, adapter_read_error_to_api(e)),
     };
     drop(sink);
+    if let Some(repo) = selected_repo.as_deref() {
+        matches.retain(|m| repo_index.owner_of(&m.record_id) == Some(repo));
+        matches.truncate(effective_limit);
+    }
 
     // Enforce timeout after the search CPU phase.
     if let Err(e) = check_query_budget(started, budget) {
         return HttpResponse::error_with_id(request_id, e);
     }
 
-    let result_records = matches
+    let mut result_records = matches
         .iter()
         .map(semantic_match_to_query_json)
         .collect::<Vec<_>>();
+    attach_repository_fields(&mut result_records, &repo_index);
 
     HttpResponse::success(
         Some(request_id),

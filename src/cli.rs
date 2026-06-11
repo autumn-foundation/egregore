@@ -442,6 +442,13 @@ enum QuerySubcommand {
         /// Returns a `not_implemented` error envelope rather than silently ignoring the flag.
         #[arg(long)]
         tx_as_of: Option<String>,
+        /// Restrict results to one repository. Accepts the stable Repository
+        /// record ID or a human-usable identity handle (display name such as
+        /// `owner/name`, basename / operator override, remote URL, root commit
+        /// SHA, or canonical path). Unknown or ambiguous selectors exit 1 with
+        /// a machine-readable diagnostic.
+        #[arg(long)]
+        repo: Option<String>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -460,6 +467,11 @@ enum QuerySubcommand {
         #[cfg(feature = "embedded-aletheiadb")]
         #[arg(long, requires = "data_dir", conflicts_with = "graph")]
         daemon: bool,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        /// A colliding path in another repository is excluded and reported via
+        /// a stderr diagnostic, never mixed into the result set.
+        #[arg(long)]
+        repo: Option<String>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -476,6 +488,9 @@ enum QuerySubcommand {
         #[cfg(feature = "embedded-aletheiadb")]
         #[arg(long, requires = "data_dir", conflicts_with = "graph")]
         daemon: bool,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
         /// Maximum number of results (default 10).
         #[arg(long, default_value_t = 10)]
         limit: usize,
@@ -494,6 +509,9 @@ enum QuerySubcommand {
         /// Route the query through the running daemon instead of opening the store directly.
         #[arg(long)]
         daemon: bool,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
         /// Maximum number of results (default 10).
         #[arg(long, default_value_t = 10)]
         limit: usize,
@@ -2052,6 +2070,13 @@ struct SymbolResult<'a> {
     span: Option<SourceSpan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     git_commit: Option<&'a str>,
+    /// Stable `Repository` record ID owning this row; absent when the store
+    /// carries no repository topology for the record (legacy graphs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_id: Option<&'a str>,
+    /// Human-usable repository identity handle (e.g. `owner/name`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -2079,6 +2104,13 @@ struct DriftResult<'a> {
     name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     span: Option<SourceSpan>,
+    /// Stable `Repository` record ID owning the drift target; absent when the
+    /// store carries no repository topology for the record (legacy graphs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_id: Option<&'a str>,
+    /// Human-usable repository identity handle (e.g. `owner/name`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
     status: &'static str,
 }
 
@@ -2094,17 +2126,27 @@ struct SemanticResult<'a> {
     score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     span: Option<SourceSpan>,
+    /// Stable `Repository` record ID owning this row; absent when the store
+    /// carries no repository topology for the record (legacy graphs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_id: Option<&'a str>,
+    /// Human-usable repository identity handle (e.g. `owner/name`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
 }
 
 #[cfg(feature = "embeddings")]
-impl<'a> From<&'a SemanticMatch> for SemanticResult<'a> {
-    fn from(m: &'a SemanticMatch) -> Self {
+impl<'a> SemanticResult<'a> {
+    fn from_match(m: &'a SemanticMatch, index: &'a query::RepositoryIndex) -> Self {
+        let repository_id = index.owner_of(&m.record_id);
         Self {
             record_id: &m.record_id,
             name: m.name.as_deref(),
             repo_relative_path: m.repo_relative_path.as_deref(),
             score: m.score,
             span: m.span,
+            repository_id,
+            repository: repository_id.and_then(|id| index.display_of(id)),
         }
     }
 }
@@ -2536,6 +2578,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             at,
             as_of,
             tx_as_of,
+            repo,
             format,
         } => {
             if let Some(tx) = tx_as_of.as_deref() {
@@ -2554,7 +2597,14 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     let dir = data_dir
                         .as_deref()
                         .expect("clap requires --data-dir with --daemon");
-                    return query_symbol_tx_via_daemon(&name, dir, tx, as_of.as_deref(), format);
+                    return query_symbol_tx_via_daemon(
+                        &name,
+                        dir,
+                        tx,
+                        as_of.as_deref(),
+                        repo.as_deref(),
+                        format,
+                    );
                 }
                 // Validate the temporal selectors before touching the local store
                 // so a malformed instant returns the `invalid_timestamp` envelope
@@ -2577,7 +2627,17 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     std::process::exit(1);
                 }
                 let records = load_query_records_history(graph.as_deref(), data_dir.as_deref())?;
-                return query_symbol_tx_as_of(&records, &name, tx, as_of.as_deref(), format);
+                let index = query::RepositoryIndex::build(&records);
+                let selected = resolve_repo_scope(&index, repo.as_deref());
+                return query_symbol_tx_as_of(
+                    &records,
+                    &name,
+                    tx,
+                    as_of.as_deref(),
+                    format,
+                    &index,
+                    selected.as_deref(),
+                );
             }
             #[cfg(feature = "embedded-aletheiadb")]
             if daemon {
@@ -2589,18 +2649,24 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     dir,
                     at.as_deref(),
                     as_of.as_deref(),
+                    repo.as_deref(),
                     format,
                 );
             }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            let selected = selected.as_deref();
             as_of.map_or_else(
                 || {
                     at.map_or_else(
-                        || query_symbol_all(&records, &name, format),
-                        |prefix| query_symbol_at(&records, &name, &prefix, format),
+                        || query_symbol_all(&records, &name, format, &index, selected),
+                        |prefix| {
+                            query_symbol_at(&records, &name, &prefix, format, &index, selected)
+                        },
                     )
                 },
-                |instant| query_symbol_as_of(&records, &name, &instant, format),
+                |instant| query_symbol_as_of(&records, &name, &instant, format, &index, selected),
             )
         }
         QuerySubcommand::File {
@@ -2609,6 +2675,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             data_dir,
             #[cfg(feature = "embedded-aletheiadb")]
             daemon,
+            repo,
             format,
         } => {
             #[cfg(feature = "embedded-aletheiadb")]
@@ -2616,16 +2683,19 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 let dir = data_dir
                     .as_deref()
                     .expect("clap requires --data-dir with --daemon");
-                return query_file_via_daemon(&path, dir, format);
+                return query_file_via_daemon(&path, dir, repo.as_deref(), format);
             }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            query_file(&records, &path, format)
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_file(&records, &path, format, &index, selected.as_deref())
         }
         QuerySubcommand::Drift {
             graph,
             data_dir,
             #[cfg(feature = "embedded-aletheiadb")]
             daemon,
+            repo,
             limit,
             format,
         } => {
@@ -2634,23 +2704,26 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 let dir = data_dir
                     .as_deref()
                     .expect("clap requires --data-dir with --daemon");
-                return query_drift_via_daemon(dir, limit, format);
+                return query_drift_via_daemon(dir, limit, repo.as_deref(), format);
             }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            query_drift(&records, limit, format)
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_drift(&records, limit, format, &index, selected.as_deref())
         }
         #[cfg(feature = "embeddings")]
         QuerySubcommand::Semantic {
             query,
             data_dir,
             daemon,
+            repo,
             limit,
             format,
         } => {
             if daemon {
-                query_semantic_via_daemon(&query, &data_dir, limit, format)
+                query_semantic_via_daemon(&query, &data_dir, limit, repo.as_deref(), format)
             } else {
-                query_semantic(&query, &data_dir, limit, format)
+                query_semantic(&query, &data_dir, limit, repo.as_deref(), format)
             }
         }
         QuerySubcommand::Context {
@@ -2731,11 +2804,12 @@ fn query_symbol_via_daemon(
     data_dir: &Path,
     at: Option<&str>,
     as_of: Option<&str>,
+    repo: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
     let client = DaemonClient::from_data_dir(data_dir)
         .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
-    let (verb, params) = at.map_or_else(
+    let (verb, mut params) = at.map_or_else(
         || ("symbol_by_name", serde_json::json!({ "name": name })),
         |commit| {
             (
@@ -2744,6 +2818,9 @@ fn query_symbol_via_daemon(
             )
         },
     );
+    if let Some(repo) = repo {
+        params["repo"] = serde_json::json!(repo);
+    }
     let records = client.query_verb(verb, &params, as_of)?;
     if records.is_empty() {
         eprintln!("error: no match found for symbol `{name}`");
@@ -2756,10 +2833,18 @@ fn query_symbol_via_daemon(
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
-fn query_file_via_daemon(path: &str, data_dir: &Path, format: OutputFormat) -> Result<()> {
+fn query_file_via_daemon(
+    path: &str,
+    data_dir: &Path,
+    repo: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
     let client = DaemonClient::from_data_dir(data_dir)
         .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
-    let params = serde_json::json!({ "repo_relative_path": path });
+    let mut params = serde_json::json!({ "repo_relative_path": path });
+    if let Some(repo) = repo {
+        params["repo"] = serde_json::json!(repo);
+    }
     let records = client.query_verb("file_defines", &params, None)?;
     if records.is_empty() {
         eprintln!("error: no match found for file `{path}`");
@@ -2772,10 +2857,18 @@ fn query_file_via_daemon(path: &str, data_dir: &Path, format: OutputFormat) -> R
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
-fn query_drift_via_daemon(data_dir: &Path, limit: usize, format: OutputFormat) -> Result<()> {
+fn query_drift_via_daemon(
+    data_dir: &Path,
+    limit: usize,
+    repo: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
     let client = DaemonClient::from_data_dir(data_dir)
         .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
-    let params = serde_json::json!({ "limit": limit as u64 });
+    let mut params = serde_json::json!({ "limit": limit as u64 });
+    if let Some(repo) = repo {
+        params["repo"] = serde_json::json!(repo);
+    }
     let records = client.query_verb("drift_top_n", &params, None)?;
     if records.is_empty() {
         eprintln!("error: no match found — no SemanticDrift nodes in graph");
@@ -2828,6 +2921,49 @@ fn print_daemon_drift_record(rec: &serde_json::Value, format: OutputFormat) -> R
         }
     }
     Ok(())
+}
+
+/// Resolves an optional `--repo` selector to a stable repository record ID.
+///
+/// On an unknown or ambiguous selector this prints a stable machine-readable
+/// JSON diagnostic to stderr and exits 1 — no partial rows reach stdout, and
+/// ambiguity is never resolved by picking a repository implicitly (issue #67).
+fn resolve_repo_scope(index: &query::RepositoryIndex, repo: Option<&str>) -> Option<String> {
+    let selector = repo?;
+    match index.resolve_selector(selector) {
+        Ok(id) => Some(id.to_owned()),
+        Err(err) => {
+            let diag = match &err {
+                query::RepositorySelectorError::Unknown { selector } => serde_json::json!({
+                    "code": err.code(),
+                    "selector": selector,
+                }),
+                query::RepositorySelectorError::Ambiguous {
+                    selector,
+                    candidates,
+                } => serde_json::json!({
+                    "code": err.code(),
+                    "selector": selector,
+                    "candidates": candidates,
+                }),
+            };
+            eprintln!("{diag}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Prints the stable `ambiguous_repository` diagnostic for an unscoped query
+/// whose single-result answer would otherwise pick one repository implicitly,
+/// then exits 1. `repositories` lists every candidate repository record ID.
+fn exit_ambiguous_repository(repositories: &std::collections::BTreeSet<&str>) -> ! {
+    let diag = serde_json::json!({
+        "code": "ambiguous_repository",
+        "message": "multiple repositories match; rerun with --repo <SELECTOR>",
+        "repositories": repositories.iter().collect::<Vec<_>>(),
+    });
+    eprintln!("{diag}");
+    std::process::exit(1);
 }
 
 fn load_query_records(graph: Option<&Path>, data_dir: Option<&Path>) -> Result<Vec<GraphRecord>> {
@@ -3019,25 +3155,51 @@ fn embed_query_text(query: &str) -> Result<Vec<f32>> {
 
 /// Semantic similarity search against an embedded store.
 #[cfg(feature = "embeddings")]
-fn query_semantic(query: &str, data_dir: &Path, limit: usize, format: OutputFormat) -> Result<()> {
+fn query_semantic(
+    query: &str,
+    data_dir: &Path,
+    limit: usize,
+    repo: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
     validate_existing_embedded_store(data_dir)?;
-
-    let query_vector = embed_query_text(query)?;
 
     let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
         .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
 
-    let matches = sink
-        .semantic_search(&query_vector, limit)
+    // Repository attribution requires the store topology, not just the vector
+    // index: build the index from the full record set so each retrieval lead
+    // carries its repository identity handle (issue #67). Resolve the selector
+    // before loading the embedding model so a bad `--repo` fails fast.
+    let records = sink
+        .read_all_records()
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+    let index = query::RepositoryIndex::build(&records);
+    let selected = resolve_repo_scope(&index, repo);
+
+    let query_vector = embed_query_text(query)?;
+
+    // Over-fetch when scoped so the limit bounds the scoped result set.
+    let fetch = if selected.is_some() {
+        limit.saturating_mul(4).max(limit)
+    } else {
+        limit
+    };
+    let mut matches = sink
+        .semantic_search(&query_vector, fetch)
         .with_context(|| "semantic search failed — was the store ingested with --embed?")?;
+    if let Some(repo) = selected.as_deref() {
+        matches.retain(|m| index.owner_of(&m.record_id) == Some(repo));
+        matches.truncate(limit);
+    }
 
     if matches.is_empty() {
         eprintln!("no results — store may not have embeddings (re-run ingest with --embed)");
         std::process::exit(2);
     }
 
-    for m in matches {
-        print_result(&SemanticResult::from(&m), format)?;
+    for m in &matches {
+        print_result(&SemanticResult::from_match(m, &index), format)?;
     }
     Ok(())
 }
@@ -3053,16 +3215,20 @@ fn query_semantic_via_daemon(
     query: &str,
     data_dir: &Path,
     limit: usize,
+    repo: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
     let client = DaemonClient::from_data_dir(data_dir)
         .with_context(|| format!("failed to connect to daemon at {}", data_dir.display()))?;
 
     let query_vector = embed_query_text(query)?;
-    let params = serde_json::json!({
+    let mut params = serde_json::json!({
         "query_vector": query_vector,
         "limit": limit as u64,
     });
+    if let Some(repo) = repo {
+        params["repo"] = serde_json::json!(repo);
+    }
     let records = client.query_verb("semantic_search", &params, None)?;
 
     if records.is_empty() {
@@ -3684,7 +3850,13 @@ fn current_deleted_ids(records: &[GraphRecord]) -> std::collections::BTreeSet<&s
 // query symbol (all matching)
 // ---------------------------------------------------------------------------
 
-fn query_symbol_all(records: &[GraphRecord], name: &str, format: OutputFormat) -> Result<()> {
+fn query_symbol_all(
+    records: &[GraphRecord],
+    name: &str,
+    format: OutputFormat,
+    index: &query::RepositoryIndex,
+    selected_repo: Option<&str>,
+) -> Result<()> {
     let deleted = current_deleted_ids(records);
     let mut results: Vec<SymbolResult<'_>> = records
         .iter()
@@ -3698,8 +3870,11 @@ fn query_symbol_all(records: &[GraphRecord], name: &str, format: OutputFormat) -
                 true
             }
         })
-        .filter_map(|r| symbol_result(r, name))
+        .filter_map(|r| symbol_result(r, name, index))
         .collect();
+    if let Some(repo) = selected_repo {
+        results.retain(|r| r.repository_id == Some(repo));
+    }
 
     if results.is_empty() {
         eprintln!("error: no match found for symbol `{name}`");
@@ -3713,7 +3888,11 @@ fn query_symbol_all(records: &[GraphRecord], name: &str, format: OutputFormat) -
     Ok(())
 }
 
-fn symbol_result<'a>(record: &'a GraphRecord, name: &str) -> Option<SymbolResult<'a>> {
+fn symbol_result<'a>(
+    record: &'a GraphRecord,
+    name: &str,
+    index: &'a query::RepositoryIndex,
+) -> Option<SymbolResult<'a>> {
     let GraphRecord::Node {
         id,
         kind: NodeKind::Symbol,
@@ -3730,6 +3909,7 @@ fn symbol_result<'a>(record: &'a GraphRecord, name: &str) -> Option<SymbolResult
     if node_name.as_deref() != Some(name) {
         return None;
     }
+    let repository_id = index.owner_of(id);
     Some(SymbolResult {
         record_id: id,
         schema_version: *schema_version,
@@ -3738,6 +3918,8 @@ fn symbol_result<'a>(record: &'a GraphRecord, name: &str) -> Option<SymbolResult
         repo_relative_path: repo_relative_path.as_deref(),
         span: *span,
         git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+        repository_id,
+        repository: repository_id.and_then(|repo| index.display_of(repo)),
     })
 }
 
@@ -3750,19 +3932,34 @@ fn query_symbol_as_of(
     name: &str,
     as_of: &str,
     format: OutputFormat,
+    index: &query::RepositoryIndex,
+    selected_repo: Option<&str>,
 ) -> Result<()> {
-    match query::symbol_as_of_valid_time(records, name, as_of) {
+    match query::symbol_as_of_valid_time_by_repo(records, name, as_of, index, selected_repo) {
         Err(msg) => {
             eprintln!("error: {msg}");
             std::process::exit(1);
         }
-        Ok(None) => {
+        Ok(results) if results.is_empty() => {
             eprintln!("error: no match found for symbol `{name}` at or before `{as_of}`");
             std::process::exit(2);
         }
-        Ok(Some(record)) => {
-            if let Some(result) = symbol_result(record, name) {
-                print_result(&result, format)?;
+        Ok(results) => {
+            // One best record per repository: a single-result time view must
+            // never pick one repository implicitly on a collision (issue #67).
+            if selected_repo.is_none() {
+                let repos: std::collections::BTreeSet<&str> = results
+                    .iter()
+                    .filter_map(|r| index.owner_of(r.id()))
+                    .collect();
+                if repos.len() > 1 {
+                    exit_ambiguous_repository(&repos);
+                }
+            }
+            for record in results {
+                if let Some(result) = symbol_result(record, name, index) {
+                    print_result(&result, format)?;
+                }
             }
         }
     }
@@ -3796,6 +3993,13 @@ struct TxSymbolRow<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     valid_time_source: Option<&'a str>,
     transaction_time: &'a str,
+    /// Stable `Repository` record ID owning this row; absent when the store
+    /// carries no repository topology for the record (legacy graphs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_id: Option<&'a str>,
+    /// Human-usable repository identity handle (e.g. `owner/name`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
 }
 
 /// Response envelope for `eg query symbol --tx-as-of`.
@@ -3822,7 +4026,10 @@ struct TxPage {
 }
 
 /// Builds a redaction-safe result row from a selected Symbol record.
-fn tx_symbol_row(record: &GraphRecord) -> Option<TxSymbolRow<'_>> {
+fn tx_symbol_row<'a>(
+    record: &'a GraphRecord,
+    index: &'a query::RepositoryIndex,
+) -> Option<TxSymbolRow<'a>> {
     let GraphRecord::Node {
         id,
         kind: NodeKind::Symbol,
@@ -3844,6 +4051,7 @@ fn tx_symbol_row(record: &GraphRecord) -> Option<TxSymbolRow<'_>> {
     let domain_str = domain
         .as_deref()
         .unwrap_or_else(|| crate::schema_version::domain_for_node_kind("Symbol"));
+    let repository_id = index.owner_of(id);
     Some(TxSymbolRow {
         record_id: id,
         schema_version: *schema_version,
@@ -3863,6 +4071,8 @@ fn tx_symbol_row(record: &GraphRecord) -> Option<TxSymbolRow<'_>> {
             .and_then(|t| t.valid_time_source.as_deref())
             .or(valid_time_source.as_deref()),
         transaction_time: query::record_transaction_time(record).unwrap_or(""),
+        repository_id,
+        repository: repository_id.and_then(|repo| index.display_of(repo)),
     })
 }
 
@@ -3876,12 +4086,15 @@ fn print_tx_error(code: &str, message: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_symbol_tx_as_of(
     records: &[GraphRecord],
     name: &str,
     tx_as_of: &str,
     as_of: Option<&str>,
     format: OutputFormat,
+    index: &query::RepositoryIndex,
+    selected_repo: Option<&str>,
 ) -> Result<()> {
     // The CLI loads the entire `--graph` file, so the store-wide range is just
     // the full record set: pass `None` to let the resolver derive it.
@@ -3894,7 +4107,8 @@ fn query_symbol_tx_as_of(
             let rows: Vec<TxSymbolRow<'_>> = result
                 .records
                 .iter()
-                .filter_map(|r| tx_symbol_row(r))
+                .filter(|r| selected_repo.is_none_or(|repo| index.owner_of(r.id()) == Some(repo)))
+                .filter_map(|r| tx_symbol_row(r, index))
                 .collect();
             let envelope = TxSymbolEnvelope {
                 ok: true,
@@ -3941,6 +4155,7 @@ fn query_symbol_tx_via_daemon(
     data_dir: &Path,
     tx_as_of: &str,
     as_of: Option<&str>,
+    repo: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
     // Validate timestamps client-side first so a malformed instant produces the
@@ -3972,9 +4187,13 @@ fn query_symbol_tx_via_daemon(
     let as_of_value = serde_json::Value::Object(as_of_obj);
     // Translate any daemon-side rejection into the documented machine-readable
     // CLI error envelope on stdout instead of an anyhow string on stderr.
+    let mut verb_params = serde_json::json!({ "name": name });
+    if let Some(repo) = repo {
+        verb_params["repo"] = serde_json::json!(repo);
+    }
     let result = match client.query_verb_raw_with_as_of(
         "symbol_by_name",
-        &serde_json::json!({ "name": name }),
+        &verb_params,
         Some(&as_of_value),
     ) {
         Ok(r) => r,
@@ -4048,6 +4267,8 @@ fn query_symbol_at(
     name: &str,
     prefix: &str,
     format: OutputFormat,
+    index: &query::RepositoryIndex,
+    selected_repo: Option<&str>,
 ) -> Result<()> {
     let matching_commits: std::collections::BTreeSet<&str> = records
         .iter()
@@ -4062,13 +4283,28 @@ fn query_symbol_at(
         std::process::exit(1);
     }
 
-    match query::symbol_at_commit(records, name, prefix) {
+    let mut matches = query::symbols_at_commit(records, name, prefix);
+    if let Some(repo) = selected_repo {
+        matches.retain(|r| index.owner_of(r.id()) == Some(repo));
+    } else {
+        // Two clones of one history can share a commit SHA under distinct
+        // repository identities: never pick one implicitly (issue #67).
+        let repos: std::collections::BTreeSet<&str> = matches
+            .iter()
+            .filter_map(|r| index.owner_of(r.id()))
+            .collect();
+        if repos.len() > 1 {
+            exit_ambiguous_repository(&repos);
+        }
+    }
+
+    match matches.into_iter().next() {
         None => {
             eprintln!("error: no match found for symbol `{name}` at commit `{prefix}`");
             std::process::exit(2);
         }
         Some(record) => {
-            if let Some(result) = symbol_result(record, name) {
+            if let Some(result) = symbol_result(record, name, index) {
                 print_result(&result, format)?;
             }
         }
@@ -4097,7 +4333,13 @@ fn temporal_commit_if_prefix<'a>(record: &'a GraphRecord, prefix: &str) -> Optio
 // query file
 // ---------------------------------------------------------------------------
 
-fn query_file(records: &[GraphRecord], path: &str, format: OutputFormat) -> Result<()> {
+fn query_file(
+    records: &[GraphRecord],
+    path: &str,
+    format: OutputFormat,
+    index: &query::RepositoryIndex,
+    selected_repo: Option<&str>,
+) -> Result<()> {
     let deleted = current_deleted_ids(records);
 
     let file_exists = records.iter().any(|r| {
@@ -4110,49 +4352,71 @@ fn query_file(records: &[GraphRecord], path: &str, format: OutputFormat) -> Resu
         else {
             return false;
         };
-        repo_relative_path.as_deref() == Some(path) && !deleted.contains(id.as_str())
+        repo_relative_path.as_deref() == Some(path)
+            && !deleted.contains(id.as_str())
+            && selected_repo.is_none_or(|repo| index.owner_of(id) == Some(repo))
     });
 
-    if !file_exists {
-        eprintln!("error: no match found for file `{path}`");
-        std::process::exit(2);
+    let mut results: Vec<SymbolResult<'_>> = Vec::new();
+    // Same-path rows excluded by the repository scope: counted and surfaced
+    // through a diagnostic only — never mixed into the result set (issue #67).
+    let mut excluded_rows: usize = 0;
+    let mut excluded_repos: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+
+    for r in records {
+        let GraphRecord::Node {
+            id,
+            kind: NodeKind::Symbol,
+            schema_version,
+            name,
+            repo_relative_path,
+            span,
+            temporal,
+            ..
+        } = r
+        else {
+            continue;
+        };
+        if repo_relative_path.as_deref() != Some(path) {
+            continue;
+        }
+        if temporal.is_none() && deleted.contains(id.as_str()) {
+            continue;
+        }
+        let repository_id = index.owner_of(id);
+        if let Some(repo) = selected_repo
+            && repository_id != Some(repo)
+        {
+            excluded_rows += 1;
+            if let Some(other) = repository_id {
+                excluded_repos.insert(other);
+            }
+            continue;
+        }
+        results.push(SymbolResult {
+            record_id: id,
+            schema_version: *schema_version,
+            name: name.as_deref().unwrap_or(""),
+            kind: "Symbol",
+            repo_relative_path: repo_relative_path.as_deref(),
+            span: *span,
+            git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+            repository_id,
+            repository: repository_id.and_then(|repo| index.display_of(repo)),
+        });
     }
 
-    let mut results: Vec<SymbolResult<'_>> = records
-        .iter()
-        .filter_map(|r| {
-            let GraphRecord::Node {
-                id,
-                kind: NodeKind::Symbol,
-                schema_version,
-                name,
-                repo_relative_path,
-                span,
-                temporal,
-                ..
-            } = r
-            else {
-                return None;
-            };
-            if repo_relative_path.as_deref() != Some(path) {
-                return None;
-            }
-            if temporal.is_none() && deleted.contains(id.as_str()) {
-                return None;
-            }
-            Some(SymbolResult {
-                record_id: id,
-                schema_version: *schema_version,
-                name: name.as_deref().unwrap_or(""),
-                kind: "Symbol",
-                repo_relative_path: repo_relative_path.as_deref(),
-                span: *span,
-                git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
-            })
-        })
-        .collect();
+    if excluded_rows > 0 {
+        let diag = serde_json::json!({
+            "code": "excluded_other_repositories",
+            "repo_relative_path": path,
+            "excluded_repository_count": excluded_repos.len(),
+            "excluded_row_count": excluded_rows,
+        });
+        eprintln!("{diag}");
+    }
 
-    if results.is_empty() {
+    if !file_exists || results.is_empty() {
         eprintln!("error: no match found for file `{path}`");
         std::process::exit(2);
     }
@@ -4168,8 +4432,20 @@ fn query_file(records: &[GraphRecord], path: &str, format: OutputFormat) -> Resu
 // query drift
 // ---------------------------------------------------------------------------
 
-fn query_drift(records: &[GraphRecord], limit: usize, format: OutputFormat) -> Result<()> {
-    let drifts = query::largest_semantic_drifts(records, limit);
+fn query_drift(
+    records: &[GraphRecord],
+    limit: usize,
+    format: OutputFormat,
+    index: &query::RepositoryIndex,
+    selected_repo: Option<&str>,
+) -> Result<()> {
+    // Rank first, then apply the repository scope, then truncate: the limit
+    // must bound the scoped result set, not pre-empt it.
+    let mut drifts = query::largest_semantic_drifts(records, usize::MAX);
+    if let Some(repo) = selected_repo {
+        drifts.retain(|r| index.owner_of(r.id()) == Some(repo));
+    }
+    drifts.truncate(limit);
 
     if drifts.is_empty() {
         eprintln!("error: no match found — no SemanticDrift nodes in graph");
@@ -4197,6 +4473,7 @@ fn query_drift(records: &[GraphRecord], limit: usize, format: OutputFormat) -> R
             drift_name.as_deref(),
         );
 
+        let repository_id = index.owner_of(id);
         let result = DriftResult {
             record_id: id,
             schema_version: *schema_version,
@@ -4218,6 +4495,8 @@ fn query_drift(records: &[GraphRecord], limit: usize, format: OutputFormat) -> R
             repo_relative_path: resolved_path,
             name: resolved_name,
             span: resolved_span,
+            repository_id,
+            repository: repository_id.and_then(|repo| index.display_of(repo)),
             status: "drift is a lead, not proof",
         };
         print_result(&result, format)?;
@@ -6171,6 +6450,8 @@ mod semantic_contract {
             repo_relative_path: Some("src/sink/embedded.rs"),
             score: 0.9231_f32,
             span: Some(full_span()),
+            repository_id: Some("codegraph:v1:repo"),
+            repository: Some("acme/widget"),
         };
         let json =
             serde_json::to_value(&result).expect("SemanticResult must serialize to JSON value");
@@ -6218,6 +6499,8 @@ mod semantic_contract {
             repo_relative_path: None,
             score: 0.42_f32,
             span: None,
+            repository_id: None,
+            repository: None,
         };
         let json = serde_json::to_value(&result).expect("serialize");
 

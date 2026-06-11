@@ -81,6 +81,9 @@ egregore query drift --data-dir .egregore --limit 10 --format text
 
 # Pin a symbol query to a specific commit
 egregore query symbol daemon::handle_query --data-dir .egregore --at <commit-sha>
+
+# Scope a query to one repository in a shared multi-repo store
+egregore query symbol handle_query --data-dir .egregore --repo owner/name
 ```
 
 **Semantic queries** (natural language — requires `--embed` store):

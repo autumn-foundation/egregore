@@ -123,6 +123,8 @@ Error responses follow the standard envelope in
 | `missing_field`         | 400  | `verb` is absent or blank; or `semantic_search` called without `params.query_vector` |
 | `bad_request`           | 400  | Unknown verb, or required `params` field missing or malformed |
 | `ambiguous_commit_prefix` | 400 | `symbol_at_commit` prefix matches > 1 commit |
+| `unknown_repository_selector` | 400 | `params.repo` matches no repository identity in the store (issue #67) |
+| `ambiguous_repository_selector` | 400 | `params.repo` matches more than one repository identity; ambiguity is never resolved implicitly (issue #67) |
 | `missing_semantic_index` | 422 | `semantic_search` against a store with no embedding index (re-ingest with `--embed`) |
 | `incompatible_embedding_dimension` | 422 | `semantic_search` query vector width disagrees with the store's index |
 | `not_implemented`       | 501  | Reserved verb; `as_of.transaction_time` set on a verb other than `symbol_by_name`; `as_of.since` set; or `semantic_search` on a daemon built without the `embeddings` feature |
@@ -136,15 +138,51 @@ Error responses follow the standard envelope in
 | Verb                    | Status      | Params                        | Notes |
 |-------------------------|-------------|-------------------------------|-------|
 | `get_records`           | implemented | `record_ids: [string]`        | Batch read by stable ID |
-| `symbol_by_name`        | implemented | `name: string`, `kind?: string` | Exact name match; honours `as_of.valid_time` |
-| `symbol_at_commit`      | implemented | `name: string`, `commit: string` | Prefix-safe commit lookup |
-| `file_defines`          | implemented | `repo_relative_path: string`  | Symbols defined in a file |
-| `drift_top_n`           | implemented | `limit?: u64` (default 10, max 100) | SemanticDrift records ranked by score |
-| `semantic_search`       | implemented | `query_vector: [f32]`, `limit?: u64` (default 10, max 100) | Natural-language code search over the shared store's embedding index. Requires the `embeddings` feature. |
+| `symbol_by_name`        | implemented | `name: string`, `kind?: string`, `repo?: string` | Exact name match; honours `as_of.valid_time` |
+| `symbol_at_commit`      | implemented | `name: string`, `commit: string`, `repo?: string` | Prefix-safe commit lookup |
+| `file_defines`          | implemented | `repo_relative_path: string`, `repo?: string` | Symbols defined in a file |
+| `drift_top_n`           | implemented | `limit?: u64` (default 10, max 100), `repo?: string` | SemanticDrift records ranked by score |
+| `semantic_search`       | implemented | `query_vector: [f32]`, `limit?: u64` (default 10, max 100), `repo?: string` | Natural-language code search over the shared store's embedding index. Requires the `embeddings` feature. |
 | `drift`                 | reserved    | same as `drift_top_n`         | Reserved for issue #10; returns `not_implemented` until wired. |
 | `observations_for_symbol` | reserved  | —                             | Returns `not_implemented` |
 | `agent_sessions_for_repo` | reserved  | —                             | Returns `not_implemented` |
 | `criteria_for_task`      | reserved  | `task_id: string`              | Future project-graph query over [`docs/schema/project-graph.md`](project-graph.md); returns `not_implemented` until wired. |
+
+---
+
+## 5.1 — Repository scope (`params.repo`, issue #67)
+
+The code-oriented verbs (`symbol_by_name`, `symbol_at_commit`, `file_defines`,
+`drift_top_n`, `semantic_search`) accept an optional `repo` param that
+restricts the result set to exactly one repository in a shared multi-repo
+store. The selector accepts:
+
+- the stable `Repository` record ID, or
+- a human-usable handle from the repository identity payload: the display
+  name (`owner/name` for remote-derived identities), the basename / operator
+  override, the normalized remote URL, the root commit SHA, or the canonical
+  path.
+
+Unknown selectors fail with `unknown_repository_selector`; selectors matching
+more than one repository fail with `ambiguous_repository_selector` (the
+message lists every candidate). The daemon never picks a repository
+implicitly.
+
+Every returned row additionally carries the repository identity when the store
+topology can attribute it:
+
+```json
+{ "repository_id": "codegraph:v4:...", "repository": "acme/widget" }
+```
+
+In an unscoped multi-repo collision the row set contains every matching
+repository, each row disambiguated by these fields. Rows the topology cannot
+attribute (legacy stores without `Repository` records) omit the fields rather
+than guessing.
+
+`repo` composes with the temporal selectors: `as_of.valid_time` and
+`as_of.transaction_time` answer "which time view?", `repo` answers "which
+repository?" — neither dimension widens the other.
 
 ---
 
@@ -189,8 +227,10 @@ Results are sorted by `(span.start_line, record_id)`.
 
 Optional `kind` filter (only `"Symbol"` is valid in v1).
 
-When `as_of.valid_time` is set, returns the single record whose valid-time is
-closest to and not after the instant.
+When `as_of.valid_time` is set, returns — per repository — the record whose
+valid-time is closest to and not after the instant (a single record in a
+single-repository store; one per repository on a multi-repo collision, each
+row carrying its repository identity).
 
 When `as_of.transaction_time` is set (issue #66), returns — per stable record ID —
 the version the store knew at or before the instant, excluding later corrections,
@@ -230,8 +270,10 @@ true at valid time V, as known by transaction time T." The row set is byte-equal
 
 Look up a Symbol node at a specific Git commit SHA or unique prefix.
 
-Returns at most one record. If the prefix is ambiguous (matches > 1 commit),
-returns HTTP 400 `ambiguous_commit_prefix`.
+Returns at most one record per repository (forked clones can share a commit
+under distinct repository identities; each repository's best match is returned
+with its identity attached rather than picking one implicitly). If the prefix
+is ambiguous (matches > 1 commit), returns HTTP 400 `ambiguous_commit_prefix`.
 
 **Params:**
 ```json
