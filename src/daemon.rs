@@ -892,6 +892,9 @@ struct ApiError {
     field: Option<String>,
     retry_after_ms: Option<u64>,
     partial_result: Option<bool>,
+    /// Candidate handles for ambiguous-selector rejections (issue #67):
+    /// the repository record IDs a script can retry with.
+    candidates: Option<Vec<String>>,
 }
 
 impl ApiError {
@@ -903,6 +906,7 @@ impl ApiError {
             field: None,
             retry_after_ms: None,
             partial_result: None,
+            candidates: None,
         }
     }
 
@@ -915,6 +919,7 @@ impl ApiError {
             field: Some(field),
             retry_after_ms: None,
             partial_result: None,
+            candidates: None,
         }
     }
 
@@ -934,6 +939,7 @@ impl ApiError {
             field: Some(field.into()),
             retry_after_ms: None,
             partial_result: None,
+            candidates: None,
         }
     }
 
@@ -956,6 +962,7 @@ impl ApiError {
             field: Some("schema_version".to_owned()),
             retry_after_ms: None,
             partial_result: None,
+            candidates: None,
         }
     }
 
@@ -982,6 +989,7 @@ impl ApiError {
             field: None,
             retry_after_ms: Some(QUEUE_FULL_RETRY_AFTER_MS),
             partial_result: None,
+            candidates: None,
         }
     }
 
@@ -993,6 +1001,7 @@ impl ApiError {
             field: None,
             retry_after_ms: Some(2_000),
             partial_result: None,
+            candidates: None,
         }
     }
 
@@ -1004,6 +1013,7 @@ impl ApiError {
             field: None,
             retry_after_ms: None,
             partial_result: Some(false),
+            candidates: None,
         }
     }
 
@@ -1034,6 +1044,7 @@ impl ApiError {
             field: Some("params.query_vector".to_owned()),
             retry_after_ms: None,
             partial_result: None,
+            candidates: None,
         }
     }
 
@@ -1107,6 +1118,7 @@ fn build_error_envelope(request_id: Option<&str>, error: ApiError) -> serde_json
         field,
         retry_after_ms,
         partial_result,
+        candidates,
         ..
     } = error;
     let mut error_obj = json!({
@@ -1121,6 +1133,9 @@ fn build_error_envelope(request_id: Option<&str>, error: ApiError) -> serde_json
     }
     if let Some(pr) = partial_result {
         error_obj["partial_result"] = serde_json::Value::Bool(pr);
+    }
+    if let Some(candidates) = candidates {
+        error_obj["candidates"] = json!(candidates);
     }
     json!({
         "ok": false,
@@ -1466,6 +1481,10 @@ pub struct DaemonQueryRejection {
     pub code: String,
     /// Human-readable message from the daemon envelope.
     pub message: String,
+    /// Candidate handles from the envelope (set for
+    /// `ambiguous_repository_selector` so callers can retry with an exact
+    /// repository record ID).
+    pub candidates: Option<Vec<String>>,
 }
 
 impl std::fmt::Display for DaemonQueryRejection {
@@ -1668,9 +1687,15 @@ impl DaemonClient {
             let message = envelope["error"]["message"]
                 .as_str()
                 .unwrap_or("unknown error");
+            let candidates = envelope["error"]["candidates"].as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            });
             return Err(anyhow::Error::new(DaemonQueryRejection {
                 code: code.to_owned(),
                 message: message.to_owned(),
+                candidates,
             }));
         }
         let envelope: serde_json::Value =
@@ -1715,9 +1740,15 @@ impl DaemonClient {
             let message = envelope["error"]["message"]
                 .as_str()
                 .unwrap_or("unknown error");
+            let candidates = envelope["error"]["candidates"].as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            });
             return Err(anyhow::Error::new(DaemonQueryRejection {
                 code: code.to_owned(),
                 message: message.to_owned(),
+                candidates,
             }));
         }
         let envelope: serde_json::Value =
@@ -1763,9 +1794,15 @@ impl DaemonClient {
             let message = envelope["error"]["message"]
                 .as_str()
                 .unwrap_or("unknown error");
+            let candidates = envelope["error"]["candidates"].as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            });
             return Err(anyhow::Error::new(DaemonQueryRejection {
                 code: code.to_owned(),
                 message: message.to_owned(),
+                candidates,
             }));
         }
         let envelope: serde_json::Value =
@@ -7412,13 +7449,19 @@ fn resolve_verb_repo_selector(
         Err(graph_query::RepositorySelectorError::Ambiguous {
             selector,
             candidates,
-        }) => Err(ApiError::new(
-            ErrorCode::AmbiguousRepositorySelector,
-            format!(
-                "repository selector '{selector}' matches multiple repositories: {}",
-                candidates.join(", ")
-            ),
-        )),
+        }) => {
+            let mut error = ApiError::new(
+                ErrorCode::AmbiguousRepositorySelector,
+                format!(
+                    "repository selector '{selector}' matches multiple repositories: {}",
+                    candidates.join(", ")
+                ),
+            );
+            // Structured candidates so scripts can retry with an exact
+            // repository record ID (issue #67).
+            error.candidates = Some(candidates);
+            Err(error)
+        }
     }
 }
 
@@ -7523,14 +7566,39 @@ fn symbol_by_name_tx_response(
         );
     }
 
+    // Repository scope applies to the record set BEFORE temporal resolution,
+    // not to the row list afterwards: a forked repository's descendant commits
+    // must not drive this repository's removal or supersession logic
+    // (issue #67). Store-wide transaction bounds stay global.
+    let scoped_records: Vec<GraphRecord> = selected_repo
+        .map(|repo| {
+            records
+                .iter()
+                .filter(|r| {
+                    matches!(r, GraphRecord::Node { .. })
+                        && repo_index.owner_of(r.id()) == Some(repo)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let (effective_records, store_bounds) = if selected_repo.is_some() {
+        (
+            scoped_records.as_slice(),
+            store_tx_bounds.or_else(|| graph_query::store_transaction_bounds(records)),
+        )
+    } else {
+        (records, store_tx_bounds)
+    };
+
     // Timestamps are pre-validated above, so the resolver only errors on
     // genuinely unexpected input; surface it as the transaction-time field.
     let result = match graph_query::symbol_as_of_transaction_time(
-        records,
+        effective_records,
         name,
         tx_as_of,
         as_of_valid_time,
-        store_tx_bounds,
+        store_bounds,
     ) {
         Ok(r) => r,
         Err(err) => {
@@ -7544,7 +7612,6 @@ fn symbol_by_name_tx_response(
     let mut rows: Vec<serde_json::Value> = result
         .records
         .iter()
-        .filter(|r| selected_repo.is_none_or(|repo| repo_index.owner_of(r.id()) == Some(repo)))
         .filter_map(|r| symbol_node_to_tx_query_json(r))
         .take(limit)
         .collect();
@@ -8381,45 +8448,66 @@ fn handle_verb_file_defines(
     // When as_of_valid_time is set, keep the most-recent-per-symbol-name at or
     // before the given instant. Records without valid_time are excluded (they are
     // untimed current-state records, not part of any historical point-in-time view).
-    let mut result_records: Vec<serde_json::Value> = if let Some(as_of) = as_of_valid_time {
-        let as_of_dt = match chrono::DateTime::parse_from_rfc3339(as_of) {
-            Ok(dt) => dt,
+    let as_of_dt = match as_of_valid_time {
+        Some(as_of) => match chrono::DateTime::parse_from_rfc3339(as_of) {
+            Ok(dt) => Some(dt),
             Err(e) => {
                 return HttpResponse::error_with_id(
                     request_id,
                     ApiError::bad_request(format!("invalid as_of.valid_time: {e}")),
                 );
             }
-        };
-        file_defines_as_of(
-            &records,
-            &path,
-            as_of_dt,
-            limit,
-            &repo_index,
-            selected_repo.as_deref(),
-        )
-    } else {
-        file_defines_current(
-            &records,
-            &path,
-            limit,
-            &repo_index,
-            selected_repo.as_deref(),
+        },
+        None => None,
+    };
+    let rows_for = |repo: Option<&str>, row_limit: usize| -> Vec<serde_json::Value> {
+        as_of_dt.map_or_else(
+            || file_defines_current(&records, &path, row_limit, &repo_index, repo),
+            |dt| file_defines_as_of(&records, &path, dt, row_limit, &repo_index, repo),
         )
     };
+    let mut result_records = rows_for(selected_repo.as_deref(), limit);
     attach_repository_fields(&mut result_records, &repo_index);
+
+    // A same-path match in another repository is excluded by the scope and
+    // reported only through a diagnostic — never mixed into the rows and never
+    // silently dropped (issue #67).
+    let mut diagnostics: Vec<serde_json::Value> = Vec::new();
+    if let Some(repo) = selected_repo.as_deref() {
+        let mut excluded_rows = 0_usize;
+        let mut excluded_repos: BTreeSet<String> = BTreeSet::new();
+        for row in rows_for(None, usize::MAX) {
+            let owner = row
+                .get("record_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| repo_index.owner_of(id));
+            if owner != Some(repo) {
+                excluded_rows += 1;
+                if let Some(other) = owner {
+                    excluded_repos.insert(other.to_owned());
+                }
+            }
+        }
+        if excluded_rows > 0 {
+            diagnostics.push(json!({
+                "code": "excluded_other_repositories",
+                "repo_relative_path": path,
+                "excluded_repository_count": excluded_repos.len(),
+                "excluded_row_count": excluded_rows,
+            }));
+        }
+    }
 
     // Enforce timeout after the in-memory filter/sort phase.
     if let Err(e) = check_query_budget(started, budget) {
         return HttpResponse::error_with_id(request_id, e);
     }
 
-    HttpResponse::success(
-        Some(request_id),
-        200,
-        verb_success_result("file_defines", &snapshot, &result_records),
-    )
+    let mut result = verb_success_result("file_defines", &snapshot, &result_records);
+    if !diagnostics.is_empty() {
+        result["diagnostics"] = json!(diagnostics);
+    }
+    HttpResponse::success(Some(request_id), 200, result)
 }
 
 // ── Verb handler: drift_top_n ─────────────────────────────────────────────────

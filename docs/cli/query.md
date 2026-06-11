@@ -110,7 +110,10 @@ Failures are stable, machine-readable JSON on stderr with exit code `1`:
 - **Unscoped single-answer time views** (`eg query symbol --as-of`, `--at`)
   fail closed on a collision with
   `{"code":"ambiguous_repository","repositories":[…]}` and exit `1`, because a
-  single row cannot represent two repositories. Re-run with `--repo`.
+  single row cannot represent two repositories. Re-run with `--repo`. Rows the
+  store topology cannot attribute (legacy records) count as their own
+  candidate group; when one contributes to the collision the diagnostic adds
+  `"includes_unattributed_rows":true`.
 - **Scoped `eg query file`** excludes a matching path in another repository
   from the result set and reports it only through a stderr diagnostic:
   `{"code":"excluded_other_repositories","repo_relative_path":"src/lib.rs",

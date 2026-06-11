@@ -131,10 +131,13 @@ fn synthetic_collision_store() -> (tempfile::TempDir, PathBuf, String, String) {
     let mut graph = Graph::new();
     let mut repo_ids = Vec::new();
 
+    // Both repositories deliberately share the basename `widget` so the bare
+    // basename is an ambiguous human selector while the display names stay
+    // unique.
     let repos: [(&str, &str, &str, &[(&str, &str)], f64); 2] = [
         (
             "acme/widget-a",
-            "widget-a",
+            "widget",
             "https://example.com/acme/widget-a",
             &[
                 ("aaaa000100000000", "2026-01-01T00:00:00Z"),
@@ -144,7 +147,7 @@ fn synthetic_collision_store() -> (tempfile::TempDir, PathBuf, String, String) {
         ),
         (
             "acme/widget-b",
-            "widget-b",
+            "widget",
             "https://example.com/acme/widget-b",
             &[("aaaa000299990000", "2026-01-01T00:00:00Z")],
             0.4,
@@ -532,6 +535,229 @@ fn as_of_composes_with_repo_scope() {
 }
 
 #[test]
+fn mixed_attributed_and_legacy_as_of_collision_is_ambiguous() {
+    // One repository-attributed `widget` plus one legacy `widget` with no
+    // repository topology: an unscoped single-answer time view cannot tell
+    // which one the caller means, so it must fail closed instead of printing
+    // both rows.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let store = temp.path().join("mixed.jsonl");
+
+    let mut graph = Graph::new();
+    let repo_id = stable_id(&["repository", "remote", "https://example.com/acme/widget"]);
+    graph.push(
+        GraphRecord::node(
+            repo_id.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("acme/widget".to_owned()),
+            "Repository acme/widget".to_owned(),
+        )
+        .with_repository_identity(RepositoryIdentityPayload {
+            identity_source: IdentitySource::Remote,
+            remote_url: Some("https://example.com/acme/widget".to_owned()),
+            root_commit_sha: None,
+            canonical_path: None,
+            basename: "widget".to_owned(),
+        }),
+    );
+    let file_id = stable_id(&["node", "file", &repo_id, "src/lib.rs"]);
+    graph.push(GraphRecord::node(
+        file_id.clone(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("src/lib.rs".to_owned()),
+        "Rust source file src/lib.rs".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.clone(),
+        file_id.clone(),
+        Some("1.0".to_owned()),
+        "Repository contains source file".to_owned(),
+    ));
+    let attributed_id = stable_id(&["node", "symbol", "function", &repo_id, "widget"]);
+    graph.push(
+        GraphRecord::symbol(
+            attributed_id.clone(),
+            "function",
+            "src/lib.rs".to_owned(),
+            span(10, 20),
+            "widget".to_owned(),
+            "attributed widget".to_owned(),
+        )
+        .with_temporal(TemporalMetadata {
+            git_commit: "cccc000100000000".to_owned(),
+            git_parent_commits: vec![],
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: None,
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        }),
+    );
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id,
+        attributed_id,
+        Some("1.0".to_owned()),
+        "file defines symbol".to_owned(),
+    ));
+    // Legacy record: same name, valid_time present, no repository topology.
+    graph.push(
+        GraphRecord::symbol(
+            stable_id(&["node", "symbol", "legacy", "widget"]),
+            "function",
+            "legacy/lib.rs".to_owned(),
+            span(5, 9),
+            "widget".to_owned(),
+            "legacy widget".to_owned(),
+        )
+        .with_temporal(TemporalMetadata {
+            git_commit: "dddd000100000000".to_owned(),
+            git_parent_commits: vec![],
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: None,
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        }),
+    );
+    fs::write(&store, graph.to_jsonl().expect("serialize")).expect("write fixture");
+
+    let assert = eg()
+        .args(["query", "symbol", "widget", "--graph"])
+        .arg(&store)
+        .args(["--as-of", "2026-01-02T00:00:00Z"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty());
+    let diag = parse_stderr_json(&assert.get_output().stderr);
+    assert_eq!(diag["code"].as_str(), Some("ambiguous_repository"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn tx_as_of_scoped_to_fork_parent_repo_is_not_marked_removed() {
+    // Fork scenario: repo B continued from repo A's commit, so B's commit is a
+    // strict descendant of A's in the shared commit DAG. A's symbol has no
+    // snapshot at B's commit (different repository, different stable ID), but
+    // a query scoped to repo A must not treat B's descendant commit as
+    // evidence that A's symbol was removed.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let store = temp.path().join("fork.jsonl");
+
+    let mut graph = Graph::new();
+    let mut repo_ids = Vec::new();
+    let forks: [(&str, &str, &str, &[&str], &str); 2] = [
+        (
+            "acme/fork-a",
+            "https://example.com/acme/fork-a",
+            "f1f1000100000000",
+            &[],
+            "2026-01-01T00:00:00Z",
+        ),
+        (
+            "acme/fork-b",
+            "https://example.com/acme/fork-b",
+            "f2f2000200000000",
+            &["f1f1000100000000"],
+            "2026-01-02T00:00:00Z",
+        ),
+    ];
+    for (display, remote, commit, parents, valid_time) in forks {
+        let repo_id = stable_id(&["repository", "remote", remote]);
+        repo_ids.push(repo_id.clone());
+        graph.push(
+            GraphRecord::node(
+                repo_id.clone(),
+                NodeKind::Repository,
+                None,
+                None,
+                Some(display.to_owned()),
+                format!("Repository {display}"),
+            )
+            .with_repository_identity(RepositoryIdentityPayload {
+                identity_source: IdentitySource::Remote,
+                remote_url: Some(remote.to_owned()),
+                root_commit_sha: None,
+                canonical_path: None,
+                basename: display.rsplit('/').next().unwrap_or(display).to_owned(),
+            }),
+        );
+        let file_id = stable_id(&["node", "file", &repo_id, "src/lib.rs"]);
+        graph.push(GraphRecord::node(
+            file_id.clone(),
+            NodeKind::File,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("src/lib.rs".to_owned()),
+            format!("Rust source file src/lib.rs in {display}"),
+        ));
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id.clone(),
+            file_id.clone(),
+            Some("1.0".to_owned()),
+            "Repository contains source file".to_owned(),
+        ));
+        let symbol_id = stable_id(&["node", "symbol", "function", &repo_id, "forked"]);
+        graph.push(
+            GraphRecord::symbol(
+                symbol_id.clone(),
+                "function",
+                "src/lib.rs".to_owned(),
+                span(10, 20),
+                "forked".to_owned(),
+                format!("Rust function forked in {display}"),
+            )
+            .with_temporal(TemporalMetadata {
+                git_commit: commit.to_owned(),
+                git_parent_commits: parents.iter().map(|p| (*p).to_owned()).collect(),
+                valid_time: valid_time.to_owned(),
+                author_time: None,
+                observed_at: valid_time.to_owned(),
+                valid_time_source: None,
+            }),
+        );
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id,
+            symbol_id,
+            Some("1.0".to_owned()),
+            "file defines symbol".to_owned(),
+        ));
+    }
+    fs::write(&store, graph.to_jsonl().expect("serialize")).expect("write fixture");
+    let repo_a = repo_ids.first().expect("repo a id").clone();
+
+    let assert = eg()
+        .args(["query", "symbol", "forked", "--graph"])
+        .arg(&store)
+        .args(["--tx-as-of", "2026-02-01T00:00:00Z"])
+        .args(["--repo", "acme/fork-a"])
+        .assert()
+        .success();
+    let envelope = parse_jsonl(&assert.get_output().stdout)
+        .pop()
+        .expect("tx envelope");
+    let rows = envelope["records"].as_array().expect("records array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "repo A's symbol must not be marked removed by repo B's fork commit: {envelope}"
+    );
+    assert_eq!(rows[0]["repository_id"].as_str(), Some(repo_a.as_str()));
+    let diagnostics = envelope["diagnostics"].as_array().expect("diagnostics");
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d["code"] == "absent_at_transaction"),
+        "scoped view must not carry the cross-repo removal diagnostic: {envelope}"
+    );
+}
+
+#[test]
 fn at_commit_prefix_ambiguity_is_scoped_to_selected_repo() {
     let (_temp, store, repo_a, _repo_b) = synthetic_collision_store();
 
@@ -846,18 +1072,28 @@ fn daemon_query_verbs_scope_by_repository_and_reject_unknown_selectors() {
         assert!(repos.contains(repo_a.as_str()));
         assert!(repos.contains(repo_b.as_str()));
 
-        // Scoped daemon file query: rows restricted to the selected repository.
+        // Scoped daemon file query: rows restricted to the selected repository,
+        // with the same-path collision in the other repository reported through
+        // the documented exclusion diagnostic — never silently dropped.
         let assert = eg()
             .args(["query", "file", "src/lib.rs", "--daemon", "--data-dir"])
             .arg(&data_dir)
             .args(["--repo", &repo_b])
             .assert()
             .success();
-        let rows = parse_jsonl(&assert.get_output().stdout);
+        let output = assert.get_output();
+        let rows = parse_jsonl(&output.stdout);
         assert!(!rows.is_empty());
         for row in &rows {
             assert_eq!(row["repository_id"].as_str(), Some(repo_b.as_str()));
         }
+        let diag = parse_stderr_json(&output.stderr);
+        assert_eq!(
+            diag["code"].as_str(),
+            Some("excluded_other_repositories"),
+            "daemon scoped file query must report the excluded collision: {diag}"
+        );
+        assert_eq!(diag["excluded_repository_count"].as_u64(), Some(1));
 
         // Unknown selector: the daemon-routed CLI must keep the same
         // machine-readable stderr contract as the local paths.
@@ -926,6 +1162,29 @@ fn daemon_temporal_queries_compose_with_repo_scope_and_fail_closed_on_collisions
         let rows = parse_jsonl(&assert.get_output().stdout);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["repository_id"].as_str(), Some(repo_b.as_str()));
+
+        // Both fixture repositories share the basename `widget`: the daemon
+        // rejection must carry the candidate repository IDs so scripts can
+        // retry with an exact selector, matching the local-path contract.
+        let assert = eg()
+            .args(["query", "symbol", "widget", "--daemon", "--data-dir"])
+            .arg(&data_dir)
+            .args(["--repo", "widget"])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::is_empty());
+        let diag = parse_stderr_json(&assert.get_output().stderr);
+        assert_eq!(diag["code"].as_str(), Some("ambiguous_repository_selector"));
+        assert_eq!(diag["selector"].as_str(), Some("widget"));
+        let mut expected = vec![repo_a.as_str(), repo_b.as_str()];
+        expected.sort_unstable();
+        let candidates: Vec<&str> = diag["candidates"]
+            .as_array()
+            .expect("daemon rejection must list candidate repository IDs")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(candidates, expected);
     });
 
     stop_daemon(&data_dir, &mut daemon);

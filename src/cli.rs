@@ -2811,11 +2811,14 @@ fn surface_daemon_selector_rejection(error: anyhow::Error, repo: Option<&str>) -
         rejection.code.as_str(),
         "unknown_repository_selector" | "ambiguous_repository_selector"
     ) {
-        let diag = serde_json::json!({
+        let mut diag = serde_json::json!({
             "code": rejection.code,
             "selector": selector,
             "message": rejection.message,
         });
+        if let Some(candidates) = &rejection.candidates {
+            diag["candidates"] = serde_json::json!(candidates);
+        }
         eprintln!("{diag}");
         std::process::exit(1);
     }
@@ -2828,12 +2831,14 @@ fn surface_daemon_selector_rejection(error: anyhow::Error, repo: Option<&str>) -
 /// silently widened multi-repository answer (issue #67).
 #[cfg(feature = "embedded-aletheiadb")]
 fn fail_on_unscoped_daemon_repo_collision(records: &[serde_json::Value]) {
-    let repositories: std::collections::BTreeSet<&str> = records
+    // Rows without a `repository_id` (legacy/unattributed records) form their
+    // own candidate group; they still count toward the collision.
+    let groups: std::collections::BTreeSet<Option<&str>> = records
         .iter()
-        .filter_map(|r| r.get("repository_id").and_then(serde_json::Value::as_str))
+        .map(|r| r.get("repository_id").and_then(serde_json::Value::as_str))
         .collect();
-    if repositories.len() > 1 {
-        exit_ambiguous_repository(&repositories);
+    if groups.len() > 1 {
+        exit_ambiguous_repository(&groups);
     }
 }
 
@@ -2889,9 +2894,22 @@ fn query_file_via_daemon(
     if let Some(repo) = repo {
         params["repo"] = serde_json::json!(repo);
     }
-    let records = client
-        .query_verb("file_defines", &params, None)
+    let result = client
+        .query_verb_raw("file_defines", &params, None)
         .map_err(|e| surface_daemon_selector_rejection(e, repo))?;
+    // Forward the daemon's repository-scope diagnostics (e.g.
+    // `excluded_other_repositories`) to stderr so the daemon-routed CLI keeps
+    // the same machine-readable contract as the local path (issue #67).
+    if let Some(diagnostics) = result.get("diagnostics").and_then(|v| v.as_array()) {
+        for diagnostic in diagnostics {
+            eprintln!("{}", serde_json::to_string(diagnostic)?);
+        }
+    }
+    let records = result
+        .get("records")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     if records.is_empty() {
         eprintln!("error: no match found for file `{path}`");
         std::process::exit(2);
@@ -3003,13 +3021,22 @@ fn resolve_repo_scope(index: &query::RepositoryIndex, repo: Option<&str>) -> Opt
 
 /// Prints the stable `ambiguous_repository` diagnostic for an unscoped query
 /// whose single-result answer would otherwise pick one repository implicitly,
-/// then exits 1. `repositories` lists every candidate repository record ID.
-fn exit_ambiguous_repository(repositories: &std::collections::BTreeSet<&str>) -> ! {
-    let diag = serde_json::json!({
+/// then exits 1.
+///
+/// `groups` carries one entry per candidate group: `Some(repository_id)` for
+/// attributed rows and `None` for rows the store topology cannot attribute
+/// (legacy records). An unattributed group counts toward the collision — it is
+/// still a distinct answer the caller did not choose between.
+fn exit_ambiguous_repository(groups: &std::collections::BTreeSet<Option<&str>>) -> ! {
+    let repositories: Vec<&str> = groups.iter().filter_map(|g| *g).collect();
+    let mut diag = serde_json::json!({
         "code": "ambiguous_repository",
         "message": "multiple repositories match; rerun with --repo <SELECTOR>",
-        "repositories": repositories.iter().collect::<Vec<_>>(),
+        "repositories": repositories,
     });
+    if groups.contains(&None) {
+        diag["includes_unattributed_rows"] = serde_json::Value::Bool(true);
+    }
     eprintln!("{diag}");
     std::process::exit(1);
 }
@@ -3997,15 +4024,14 @@ fn query_symbol_as_of(
             std::process::exit(2);
         }
         Ok(results) => {
-            // One best record per repository: a single-result time view must
-            // never pick one repository implicitly on a collision (issue #67).
+            // One best record per repository (plus one for any unattributed
+            // legacy group): a single-result time view must never pick one
+            // group implicitly on a collision (issue #67).
             if selected_repo.is_none() {
-                let repos: std::collections::BTreeSet<&str> = results
-                    .iter()
-                    .filter_map(|r| index.owner_of(r.id()))
-                    .collect();
-                if repos.len() > 1 {
-                    exit_ambiguous_repository(&repos);
+                let groups: std::collections::BTreeSet<Option<&str>> =
+                    results.iter().map(|r| index.owner_of(r.id())).collect();
+                if groups.len() > 1 {
+                    exit_ambiguous_repository(&groups);
                 }
             }
             for record in results {
@@ -4148,9 +4174,40 @@ fn query_symbol_tx_as_of(
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
 ) -> Result<()> {
-    // The CLI loads the entire `--graph` file, so the store-wide range is just
-    // the full record set: pass `None` to let the resolver derive it.
-    match query::symbol_as_of_transaction_time(records, name, tx_as_of, as_of, None) {
+    // Repository scope applies to the record set BEFORE temporal resolution,
+    // not to the row list afterwards: a forked repository's descendant commits
+    // must not drive this repository's removal or supersession logic
+    // (issue #67). Store-wide transaction bounds stay global so out-of-range
+    // diagnostics keep reflecting the whole store.
+    let scoped_records: Vec<GraphRecord> = selected_repo
+        .map(|repo| {
+            records
+                .iter()
+                .filter(|r| {
+                    matches!(r, GraphRecord::Node { .. }) && index.owner_of(r.id()) == Some(repo)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    // The CLI loads the entire `--graph` file, so the unscoped store-wide
+    // range is just the full record set: pass `None` to let the resolver
+    // derive it.
+    let (effective_records, store_bounds) = if selected_repo.is_some() {
+        (
+            scoped_records.as_slice(),
+            query::store_transaction_bounds(records),
+        )
+    } else {
+        (records, None)
+    };
+    match query::symbol_as_of_transaction_time(
+        effective_records,
+        name,
+        tx_as_of,
+        as_of,
+        store_bounds,
+    ) {
         Err(err) => {
             print_tx_error(&err.code, &err.message)?;
             std::process::exit(1);
@@ -4159,7 +4216,6 @@ fn query_symbol_tx_as_of(
             let rows: Vec<TxSymbolRow<'_>> = result
                 .records
                 .iter()
-                .filter(|r| selected_repo.is_none_or(|repo| index.owner_of(r.id()) == Some(repo)))
                 .filter_map(|r| tx_symbol_row(r, index))
                 .collect();
             let envelope = TxSymbolEnvelope {
@@ -4347,12 +4403,11 @@ fn query_symbol_at(
     } else {
         // Two clones of one history can share a commit SHA under distinct
         // repository identities: never pick one implicitly (issue #67).
-        let repos: std::collections::BTreeSet<&str> = matches
-            .iter()
-            .filter_map(|r| index.owner_of(r.id()))
-            .collect();
-        if repos.len() > 1 {
-            exit_ambiguous_repository(&repos);
+        // Unattributed legacy rows form their own candidate group.
+        let groups: std::collections::BTreeSet<Option<&str>> =
+            matches.iter().map(|r| index.owner_of(r.id())).collect();
+        if groups.len() > 1 {
+            exit_ambiguous_repository(&groups);
         }
     }
 

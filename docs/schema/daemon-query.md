@@ -124,7 +124,7 @@ Error responses follow the standard envelope in
 | `bad_request`           | 400  | Unknown verb, or required `params` field missing or malformed |
 | `ambiguous_commit_prefix` | 400 | `symbol_at_commit` prefix matches > 1 commit |
 | `unknown_repository_selector` | 400 | `params.repo` matches no repository identity in the store (issue #67) |
-| `ambiguous_repository_selector` | 400 | `params.repo` matches more than one repository identity; ambiguity is never resolved implicitly (issue #67) |
+| `ambiguous_repository_selector` | 400 | `params.repo` matches more than one repository identity; ambiguity is never resolved implicitly. The error object carries a `candidates` array with every matching repository record ID so callers can retry with an exact selector (issue #67) |
 | `missing_semantic_index` | 422 | `semantic_search` against a store with no embedding index (re-ingest with `--embed`) |
 | `incompatible_embedding_dimension` | 422 | `semantic_search` query vector width disagrees with the store's index |
 | `not_implemented`       | 501  | Reserved verb; `as_of.transaction_time` set on a verb other than `symbol_by_name`; `as_of.since` set; or `semantic_search` on a daemon built without the `embeddings` feature |
@@ -182,7 +182,23 @@ than guessing.
 
 `repo` composes with the temporal selectors: `as_of.valid_time` and
 `as_of.transaction_time` answer "which time view?", `repo` answers "which
-repository?" — neither dimension widens the other.
+repository?" — neither dimension widens the other. For
+`as_of.transaction_time` the scope is applied to the record set *before*
+temporal resolution (store-wide bounds stay global), so a forked repository's
+descendant commits never drive the selected repository's removal or
+supersession logic.
+
+A scoped `file_defines` whose path also matches another repository reports the
+exclusion through a result-level `diagnostics` array instead of mixing rows:
+
+```json
+"diagnostics": [{
+  "code": "excluded_other_repositories",
+  "repo_relative_path": "src/lib.rs",
+  "excluded_repository_count": 1,
+  "excluded_row_count": 2
+}]
+```
 
 ---
 
