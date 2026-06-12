@@ -611,6 +611,19 @@ enum QuerySubcommand {
         #[arg(long)]
         verified_only: bool,
     },
+    /// Find changes and trust-separated evidence over a commit range.
+    Changes {
+        /// Base commit SHA or unique prefix.
+        base: String,
+        /// Head commit SHA or unique prefix.
+        head: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -2721,6 +2734,15 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_memory_cmd(&records, &id_or_handle, verified_only)
+        }
+        QuerySubcommand::Changes {
+            base,
+            head,
+            graph,
+            data_dir,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_changes_cmd(&records, &base, &head)
         }
     }
 }
@@ -5120,6 +5142,46 @@ fn query_task_via_daemon(id_or_handle: &str, data_dir: &Path) -> Result<()> {
                 std::process::exit(1);
             }
             Err(e)
+        }
+    }
+}
+
+fn query_changes_cmd(records: &[GraphRecord], base: &str, head: &str) -> Result<()> {
+    match query::changes_context(records, base, head) {
+        Ok(ctx) => {
+            #[derive(Debug, Clone, serde::Serialize)]
+            struct ChangesResponse<'a> {
+                ok: bool,
+                #[serde(flatten)]
+                context: query::ChangesContext<'a>,
+            }
+            let response = ChangesResponse {
+                ok: true,
+                context: ctx,
+            };
+            let output = serde_json::to_string_pretty(&response)
+                .context("failed to serialize changes context")?;
+            println!("{output}");
+            Ok(())
+        }
+        Err(err) => {
+            #[derive(Debug, Clone, serde::Serialize)]
+            struct ChangesErrorResponse {
+                ok: bool,
+                error: query::ChangesError,
+            }
+            let response = ChangesErrorResponse {
+                ok: false,
+                error: err.clone(),
+            };
+            let output =
+                serde_json::to_string(&response).context("failed to serialize changes error")?;
+            println!("{output}");
+            let exit_code = match err {
+                query::ChangesError::MissingCommit { .. } | query::ChangesError::EmptyHistory => 2,
+                _ => 1,
+            };
+            std::process::exit(exit_code);
         }
     }
 }

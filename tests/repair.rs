@@ -10,7 +10,7 @@ use std::{
 
 use aletheia_egregore::{
     adapters::EmbeddedAletheiaSink,
-    daemon::{runtime_dir_for_data_dir, runtime_metadata_is_stale},
+    daemon::{runtime_dir_for_data_dir, runtime_metadata_is_stale, StoreLease},
     repair::{OwnershipVerdict, RepairRefusalCode, RepairSessionResult, preflight, run_repair},
 };
 use assert_cmd::Command;
@@ -22,16 +22,9 @@ fn fixture_data_dir(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
 
 /// Writes stale daemon metadata (crashed state, lock file present but not held).
 fn write_stale_crashed_metadata(data_dir: &Path) {
+    let lease = StoreLease::acquire(data_dir).expect("lease acquire");
+    drop(lease);
     let runtime_dir = runtime_dir_for_data_dir(data_dir);
-    fs::create_dir_all(&runtime_dir).expect("create runtime dir");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    // Create an unowned lock file (no process holds it)
-    let lock_path = runtime_dir.join("egregored.lock");
-    fs::write(&lock_path, b"").expect("create lock file");
     let metadata = serde_json::json!({
         "schema_version": 1,
         "pid": 99_999_u32,
@@ -56,15 +49,9 @@ fn write_stale_crashed_metadata(data_dir: &Path) {
 
 /// Writes stopped daemon metadata (stopped state, lock file present but not held).
 fn write_stopped_metadata(data_dir: &Path) {
+    let lease = StoreLease::acquire(data_dir).expect("lease acquire");
+    drop(lease);
     let runtime_dir = runtime_dir_for_data_dir(data_dir);
-    fs::create_dir_all(&runtime_dir).expect("create runtime dir");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    let lock_path = runtime_dir.join("egregored.lock");
-    fs::write(&lock_path, b"").expect("create lock file");
     let metadata = serde_json::json!({
         "schema_version": 1,
         "pid": 99_999_u32,
@@ -90,15 +77,9 @@ fn write_stopped_metadata(data_dir: &Path) {
 /// Writes crashed metadata declaring an unsupported daemon runtime schema, with
 /// a lock file present but not held.
 fn write_unknown_schema_metadata(data_dir: &Path) {
+    let lease = StoreLease::acquire(data_dir).expect("lease acquire");
+    drop(lease);
     let runtime_dir = runtime_dir_for_data_dir(data_dir);
-    fs::create_dir_all(&runtime_dir).expect("create runtime dir");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    let lock_path = runtime_dir.join("egregored.lock");
-    fs::write(&lock_path, b"").expect("create lock file");
     let metadata = serde_json::json!({
         "schema_version": 999,
         "pid": 99_999_u32,
@@ -124,12 +105,12 @@ fn write_unknown_schema_metadata(data_dir: &Path) {
 /// Writes crashed metadata WITHOUT a lock file (e.g. a copied store or partial
 /// crash). No active owner can exist because no lock file is present.
 fn write_stale_metadata_without_lock(data_dir: &Path) {
+    let lease = StoreLease::acquire(data_dir).expect("lease acquire");
+    drop(lease);
     let runtime_dir = runtime_dir_for_data_dir(data_dir);
-    fs::create_dir_all(&runtime_dir).expect("create runtime dir");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let lock_path = runtime_dir.join("egregored.lock");
+    if lock_path.exists() {
+        fs::remove_file(&lock_path).ok();
     }
     let metadata = serde_json::json!({
         "schema_version": 1,

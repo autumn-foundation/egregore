@@ -297,6 +297,14 @@ pub struct StoreLease {
     path: PathBuf,
 }
 
+impl std::fmt::Debug for StoreLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreLease")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
 impl StoreLease {
     /// Acquires the embedded-store lease for a data directory.
     ///
@@ -10047,7 +10055,10 @@ fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> io::R
         response.status,
         body.len()
     );
-    stream.write_all(response_text.as_bytes())
+    stream.write_all(response_text.as_bytes())?;
+    stream.flush()?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    Ok(())
 }
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
@@ -10418,6 +10429,13 @@ fn reject_runtime_symlink(path: &Path, kind: &str) -> Result<()> {
 fn ensure_runtime_dir(data_dir: &Path) -> Result<PathBuf> {
     let runtime_dir = runtime_dir(data_dir);
     reject_runtime_symlink_components(&runtime_dir, "runtime dir")?;
+    #[cfg(windows)]
+    if runtime_dir.exists() && windows_acl_has_broad_access(&runtime_dir)? {
+        return Err(anyhow!(
+            "runtime_permissions_unsafe: {} has Allow access for a principal other than the current user or SYSTEM",
+            runtime_dir.display()
+        ));
+    }
     fs::create_dir_all(&runtime_dir)
         .with_context(|| format!("failed to create {}", runtime_dir.display()))?;
     enforce_runtime_dir_permissions(&runtime_dir)?;
@@ -10502,6 +10520,19 @@ fn enforce_runtime_file_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+#[allow(clippy::option_if_let_else, clippy::uninlined_format_args)]
+fn clean_windows_path(path: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    if let Some(stripped) = path_str.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{}", stripped))
+    } else if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Sets a private Windows ACL on a runtime path, granting full control only to
 /// the current user and SYSTEM, with no inherited permissions and no broad
 /// local-group access.
@@ -10513,34 +10544,60 @@ fn enforce_runtime_file_permissions(path: &Path) -> Result<()> {
 fn windows_set_private_acl(path: &Path, kind: &str) -> Result<()> {
     use std::process::Command;
 
-    let script = r"
+    let clean_path = clean_windows_path(path);
+
+    let script = r#"
 $ErrorActionPreference = 'Stop'
-$target = $env:EGREGORE_ACL_PATH
-$item = Get-Item -LiteralPath $target -Force
-$isDir = $item -is [System.IO.DirectoryInfo]
-if ($isDir) {
-    $acl = New-Object System.Security.AccessControl.DirectorySecurity
-    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
-} else {
-    $acl = New-Object System.Security.AccessControl.FileSecurity
-    $inherit = [System.Security.AccessControl.InheritanceFlags]::None
+try {
+    $target = $env:EGREGORE_ACL_PATH
+    if (-not [System.IO.Directory]::Exists($target) -and -not [System.IO.File]::Exists($target)) {
+        exit 0
+    }
+    $isDir = [System.IO.Directory]::Exists($target)
+    if ($isDir) {
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+    } else {
+        $acl = New-Object System.Security.AccessControl.FileSecurity
+        $inherit = [System.Security.AccessControl.InheritanceFlags]::None
+    }
+    $prop = [System.Security.AccessControl.PropagationFlags]::None
+    $acl.SetAccessRuleProtection($true, $false)
+    $curSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $curSid, 'FullControl', $inherit, $prop, 'Allow')))
+    $sysSid = New-Object System.Security.Principal.SecurityIdentifier(
+        [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+    $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $sysSid, 'FullControl', $inherit, $prop, 'Allow')))
+    $retries = 10
+    while ($true) {
+        try {
+            if ($isDir) { [System.IO.Directory]::SetAccessControl($target, $acl) }
+            else { [System.IO.File]::SetAccessControl($target, $acl) }
+            break
+        } catch {
+            if ($retries -eq 0) { throw $_ }
+            $retries--
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    exit 0
+} catch {
+    [Console]::Error.WriteLine("EGREGORE_ACL_PATH env: $env:EGREGORE_ACL_PATH")
+    [Console]::Error.WriteLine("target: $target")
+    if ($_.Exception) {
+        [Console]::Error.WriteLine($_.Exception.ToString())
+    } else {
+        [Console]::Error.WriteLine($_)
+    }
+    exit 1
 }
-$prop = [System.Security.AccessControl.PropagationFlags]::None
-$acl.SetAccessRuleProtection($true, $false)
-$curSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-    $curSid, 'FullControl', $inherit, $prop, 'Allow')))
-$sysSid = New-Object System.Security.Principal.SecurityIdentifier(
-    [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
-$acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-    $sysSid, 'FullControl', $inherit, $prop, 'Allow')))
-if ($isDir) { [System.IO.Directory]::SetAccessControl($target, $acl) }
-else { [System.IO.File]::SetAccessControl($target, $acl) }
-";
+"#;
 
     let output = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("EGREGORE_ACL_PATH", path)
+        .env("EGREGORE_ACL_PATH", &clean_path)
         .output()
         .context("failed to execute PowerShell for Windows ACL enforcement")?;
 
@@ -10569,31 +10626,54 @@ fn windows_acl_has_broad_access(path: &Path) -> Result<bool> {
         return Ok(false);
     }
 
+    let clean_path = clean_windows_path(path);
+
     // Reject any Allow ACE whose SID is not the current operator or SYSTEM.
     // This catches both well-known broad groups and any other unexpected principal.
     // Unknown or untranslatable SIDs are treated as unsafe (fail closed).
     let script = r"
 $ErrorActionPreference = 'Stop'
-$target = $env:EGREGORE_ACL_PATH
-$acl = Get-Acl -LiteralPath $target
-$curSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-$sysSid = (New-Object System.Security.Principal.SecurityIdentifier(
-    [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)).Value
-foreach ($ace in $acl.Access) {
-    if ($ace.AccessControlType -eq 'Allow') {
-        try {
-            $sid = $ace.IdentityReference.Translate(
-                [System.Security.Principal.SecurityIdentifier]).Value
-            if ($sid -ne $curSid -and $sid -ne $sysSid) { exit 1 }
-        } catch { exit 1 }
+try {
+    $target = $env:EGREGORE_ACL_PATH
+    if (-not [System.IO.Directory]::Exists($target) -and -not [System.IO.File]::Exists($target)) {
+        exit 0
     }
+    $retries = 10
+    while ($true) {
+        try {
+            $acl = Get-Acl -LiteralPath $target
+            break
+        } catch {
+            if ($retries -eq 0) { throw $_ }
+            $retries--
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    foreach ($ace in $acl.Access) {
+        [Console]::WriteLine('ACE: {0} | Type: {1} | SID: {2}' -f ($ace.IdentityReference, $ace.AccessControlType, $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value))
+    }
+    $curSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $sysSid = (New-Object System.Security.Principal.SecurityIdentifier(
+        [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)).Value
+    foreach ($ace in $acl.Access) {
+        if ($ace.AccessControlType -eq 'Allow') {
+            try {
+                $sid = $ace.IdentityReference.Translate(
+                    [System.Security.Principal.SecurityIdentifier]).Value
+                if ($sid -ne $curSid -and $sid -ne $sysSid) { exit 1 }
+            } catch { exit 1 }
+        }
+    }
+    exit 0
+} catch {
+    [Console]::Error.WriteLine($_)
+    exit 1
 }
-exit 0
 ";
 
     let output = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("EGREGORE_ACL_PATH", path)
+        .env("EGREGORE_ACL_PATH", &clean_path)
         .output()
         .context("failed to execute PowerShell for Windows ACL inspection")?;
 

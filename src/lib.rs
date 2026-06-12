@@ -80,8 +80,8 @@ pub use ir::{
 };
 pub use local_project::import_local_tasks;
 pub use query::{
-    SymbolContext, UnresolvedRef, active_policy, audit_trail, is_candidate_suppressed,
-    pending_candidates, symbol_context,
+    ChangesContext, ChangesError, SymbolContext, UnresolvedRef, active_policy, audit_trail,
+    changes_context, is_candidate_suppressed, pending_candidates, symbol_context,
 };
 pub use schema_version::{
     RecordLineRead, RecordReadError, RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE,

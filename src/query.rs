@@ -145,7 +145,7 @@ fn matches_symbol_at_commit(record: &GraphRecord, symbol_name: &str, commit: &st
 ///
 /// Surfaced in [`SymbolContext::unresolved`] instead of being silently dropped.
 /// Per AC5 from issue #38.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UnresolvedRef {
     /// Record ID of the node that carries the unresolved evidence link.
     pub source_record_id: String,
@@ -4551,4 +4551,841 @@ pub fn memory_audit_context<'a>(
     ctx.excluded = excluded.into_values().collect();
     ctx.diagnostics = diagnostics;
     ctx
+}
+
+/// Represents a changed file in a commit range.
+#[derive(Debug, Clone, serde::Serialize, Eq, PartialEq)]
+pub struct ChangesFileItem<'a> {
+    /// The graph record for the file or change.
+    pub record: &'a GraphRecord,
+    /// The repository-relative path of the file.
+    pub path: &'a str,
+    /// The Git commit SHA containing this change.
+    pub git_commit: &'a str,
+}
+
+/// Represents a changed symbol in a commit range.
+#[derive(Debug, Clone, serde::Serialize, Eq, PartialEq)]
+pub struct ChangesSymbolItem<'a> {
+    /// The graph record for the symbol.
+    pub record: &'a GraphRecord,
+    /// The name of the symbol.
+    pub name: &'a str,
+    /// The repository-relative path of the symbol definition.
+    pub path: &'a str,
+    /// The Git commit SHA containing this change.
+    pub git_commit: &'a str,
+}
+
+/// Represents a commit in a commit range.
+#[derive(Debug, Clone, serde::Serialize, Eq, PartialEq)]
+pub struct ChangesCommitItem<'a> {
+    /// The graph record for the commit.
+    pub record: &'a GraphRecord,
+    /// The full Git commit SHA.
+    pub commit: &'a str,
+    /// The commit author timestamp if available.
+    pub author_time: Option<&'a str>,
+}
+
+/// Represents a tombstone (deleted node marker) associated with a commit range.
+#[derive(Debug, Clone, serde::Serialize, Eq, PartialEq)]
+pub struct ChangesTombstoneItem<'a> {
+    /// The graph record for the tombstone.
+    pub record: &'a GraphRecord,
+    /// The stable ID of the deleted node.
+    pub deleted_id: &'a str,
+}
+
+/// Represents a semantic drift record in a commit range.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChangesDriftItem<'a> {
+    /// The graph record for the semantic drift.
+    pub record: &'a GraphRecord,
+    /// The stable ID of the target node.
+    pub target_record_id: &'a str,
+    /// The computed drift score.
+    pub score: f64,
+}
+
+/// Represents a changed code fact that lacks explaining cross-domain evidence.
+#[derive(Debug, Clone, serde::Serialize, Eq, PartialEq)]
+pub struct UnexplainedChange<'a> {
+    /// The stable ID of the unexplained node.
+    pub record_id: &'a str,
+    /// The node kind (e.g. "Symbol", "File").
+    pub kind: &'a str,
+    /// The agent-facing summary text.
+    pub summary: &'a str,
+}
+
+/// Context of changed facts and trust-separated evidence over a commit range.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct ChangesContext<'a> {
+    /// All files added, modified, or deleted in the commit range.
+    pub changed_files: Vec<ChangesFileItem<'a>>,
+    /// All syntax symbols added or modified in the commit range.
+    pub changed_symbols: Vec<ChangesSymbolItem<'a>>,
+    /// Commits within the range.
+    pub commits: Vec<ChangesCommitItem<'a>>,
+    /// Deleted code graph node markers within the range.
+    pub tombstones: Vec<ChangesTombstoneItem<'a>>,
+    /// Semantic drift records within the range.
+    pub drift_records: Vec<ChangesDriftItem<'a>>,
+
+    /// Subjective agent observations referencing nodes in the range.
+    pub observations: Vec<&'a GraphRecord>,
+    /// Task and project management state referencing nodes in the range.
+    pub project_state: Vec<&'a GraphRecord>,
+    /// Persistent generated artifacts referencing nodes in the range.
+    pub artifacts: Vec<&'a GraphRecord>,
+    /// Verification runs, proof outcomes, and test results referencing nodes in the range.
+    pub verification_evidence: Vec<&'a GraphRecord>,
+    /// Changed code facts that do not map to any explaining evidence.
+    pub unexplained: Vec<UnexplainedChange<'a>>,
+    /// Citations from observations/tasks to absent target records.
+    pub unresolved: Vec<UnresolvedRef>,
+}
+
+/// Errors that can occur during commit range query resolution.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "error_type", rename_all = "snake_case")]
+pub enum ChangesError {
+    /// The specified commit prefix could not be resolved to any commit.
+    MissingCommit {
+        /// The prefix that could not be resolved.
+        commit_prefix: String,
+    },
+    /// The specified commit prefix was ambiguous.
+    AmbiguousCommitPrefix {
+        /// The prefix that resolved to multiple commits.
+        commit_prefix: String,
+        /// The full SHAs of the matching commits.
+        matches: Vec<String>,
+    },
+    /// The range is reversed (base is a descendant of head).
+    ReversedRange {
+        /// The base commit input.
+        base: String,
+        /// The head commit input.
+        head: String,
+    },
+    /// There is no ancestor path between base and head.
+    NoPath {
+        /// The base commit input.
+        base: String,
+        /// The head commit input.
+        head: String,
+    },
+    /// The store history is empty (no commits present).
+    EmptyHistory,
+}
+
+/// Query context of changed facts and trust-separated evidence over a commit range.
+///
+/// Walks the commit topology from `head_prefix` back to `base_prefix`, identifies all
+/// code facts changed in that range, and aggregates related cross-domain evidence up to 3 hops.
+///
+/// # Errors
+///
+/// Returns a [`ChangesError`] if a commit is missing, ambiguous, or the range is reversed or unconnected.
+#[allow(clippy::missing_panics_doc)]
+pub fn changes_context<'a>(
+    records: &'a [GraphRecord],
+    base_prefix: &str,
+    head_prefix: &str,
+) -> Result<ChangesContext<'a>, ChangesError> {
+    // 0. Check for empty history
+    let has_any_commits = records
+        .iter()
+        .any(|r| matches!(r.node_kind_name(), Some("Commit")));
+    if !has_any_commits {
+        return Err(ChangesError::EmptyHistory);
+    }
+
+    // 1. Resolve commit prefixes
+    let resolve_prefix = |prefix: &str| -> Result<&'a str, ChangesError> {
+        let mut matches = Vec::new();
+        for r in records {
+            if let GraphRecord::Node {
+                kind: NodeKind::Commit,
+                name: Some(sha),
+                ..
+            } = r
+            {
+                if sha.to_lowercase().starts_with(&prefix.to_lowercase()) {
+                    matches.push(sha.as_str());
+                }
+            }
+        }
+        matches.sort_unstable();
+        matches.dedup();
+
+        if matches.is_empty() {
+            return Err(ChangesError::MissingCommit {
+                commit_prefix: prefix.to_owned(),
+            });
+        }
+        if matches.len() > 1 {
+            let string_matches = matches.iter().map(|s| (*s).to_owned()).collect();
+            return Err(ChangesError::AmbiguousCommitPrefix {
+                commit_prefix: prefix.to_owned(),
+                matches: string_matches,
+            });
+        }
+        Ok(matches.into_iter().next().unwrap())
+    };
+
+    let base_sha = resolve_prefix(base_prefix)?;
+    let head_sha = resolve_prefix(head_prefix)?;
+
+    // 2. Build parent map
+    let mut parent_map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut by_id: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
+    let mut tombstoned_ids = BTreeSet::new();
+    let mut has_any_temporal_version = BTreeSet::new();
+
+    for r in records {
+        by_id.insert(r.id(), r);
+        if let GraphRecord::Tombstone { deleted_id, .. } = r {
+            tombstoned_ids.insert(deleted_id.as_str());
+        }
+        match r {
+            GraphRecord::Node {
+                id,
+                temporal: Some(_),
+                ..
+            }
+            | GraphRecord::Edge {
+                id,
+                temporal: Some(_),
+                ..
+            } => {
+                has_any_temporal_version.insert(id.as_str());
+            }
+            _ => {}
+        }
+    }
+
+    // Commits specify parents via temporal.git_parent_commits or ParentOf edges
+    for r in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Commit,
+            name: Some(sha),
+            temporal: Some(t),
+            ..
+        } = r
+        {
+            let entry = parent_map.entry(sha.as_str()).or_default();
+            for parent in &t.git_parent_commits {
+                entry.push(parent.as_str());
+            }
+        }
+        if let GraphRecord::Edge {
+            label: EdgeLabel::ParentOf,
+            source,
+            target,
+            ..
+        } = r
+        {
+            if let (Some(parent_node), Some(child_node)) =
+                (by_id.get(source.as_str()), by_id.get(target.as_str()))
+            {
+                if let (
+                    GraphRecord::Node {
+                        kind: NodeKind::Commit,
+                        name: Some(psha),
+                        ..
+                    },
+                    GraphRecord::Node {
+                        kind: NodeKind::Commit,
+                        name: Some(csha),
+                        ..
+                    },
+                ) = (parent_node, child_node)
+                {
+                    let entry = parent_map.entry(csha.as_str()).or_default();
+                    entry.push(psha.as_str());
+                }
+            }
+        }
+    }
+
+    for parents in parent_map.values_mut() {
+        parents.sort_unstable();
+        parents.dedup();
+    }
+
+    // 3. Compute reachable sets
+    let get_reachable = |start_sha: &'a str| -> BTreeSet<&'a str> {
+        let mut reachable = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        let mut queue = vec![start_sha];
+        while let Some(current) = queue.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            reachable.insert(current);
+            if let Some(parents) = parent_map.get(current) {
+                for parent in parents {
+                    if !visited.contains(*parent) {
+                        queue.push(*parent);
+                    }
+                }
+            }
+        }
+        reachable
+    };
+
+    let reachable_head = get_reachable(head_sha);
+    let reachable_base = get_reachable(base_sha);
+
+    // 4. Validate range ancestry
+    if !reachable_head.contains(base_sha) {
+        if reachable_base.contains(head_sha) {
+            return Err(ChangesError::ReversedRange {
+                base: base_prefix.to_owned(),
+                head: head_prefix.to_owned(),
+            });
+        }
+        return Err(ChangesError::NoPath {
+            base: base_prefix.to_owned(),
+            head: head_prefix.to_owned(),
+        });
+    }
+
+    let range_commit_shas: BTreeSet<&str> = reachable_head
+        .difference(&reachable_base)
+        .copied()
+        .collect();
+
+    // 5. Gather code facts in the range
+    let mut changed_files = Vec::new();
+    let mut changed_symbols = Vec::new();
+    let mut commits = Vec::new();
+    let mut drift_records = Vec::new();
+    let mut changed_paths = BTreeSet::new();
+
+    for r in records {
+        match r {
+            GraphRecord::Node {
+                kind: NodeKind::Commit,
+                name: Some(sha),
+                temporal,
+                ..
+            } if range_commit_shas.contains(sha.as_str()) => {
+                commits.push(ChangesCommitItem {
+                    record: r,
+                    commit: sha,
+                    author_time: temporal.as_ref().and_then(|t| t.author_time.as_deref()),
+                });
+            }
+            GraphRecord::Node {
+                kind: NodeKind::File,
+                repo_relative_path: Some(path),
+                temporal: Some(t),
+                ..
+            } if range_commit_shas.contains(t.git_commit.as_str()) => {
+                changed_files.push(ChangesFileItem {
+                    record: r,
+                    path,
+                    git_commit: &t.git_commit,
+                });
+                changed_paths.insert(path.as_str());
+            }
+            GraphRecord::Node {
+                kind: NodeKind::Change,
+                repo_relative_path: Some(path),
+                temporal: Some(t),
+                ..
+            } if range_commit_shas.contains(t.git_commit.as_str()) => {
+                changed_files.push(ChangesFileItem {
+                    record: r,
+                    path,
+                    git_commit: &t.git_commit,
+                });
+                changed_paths.insert(path.as_str());
+            }
+            GraphRecord::Node {
+                kind: NodeKind::Symbol,
+                name: Some(sym_name),
+                repo_relative_path: Some(path),
+                temporal: Some(t),
+                ..
+            } if range_commit_shas.contains(t.git_commit.as_str()) => {
+                changed_symbols.push(ChangesSymbolItem {
+                    record: r,
+                    name: sym_name,
+                    path,
+                    git_commit: &t.git_commit,
+                });
+            }
+            GraphRecord::Node {
+                kind: NodeKind::SemanticDrift,
+                temporal,
+                semantic_drift: Some(drift),
+                ..
+            } => {
+                let in_range = temporal
+                    .as_ref()
+                    .is_some_and(|t| range_commit_shas.contains(t.git_commit.as_str()))
+                    || range_commit_shas.contains(drift.after_git_commit.as_str());
+                if in_range {
+                    drift_records.push(ChangesDriftItem {
+                        record: r,
+                        target_record_id: &drift.target_record_id,
+                        score: drift.score,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut tombstones = Vec::new();
+    for r in records {
+        if let GraphRecord::Tombstone {
+            deleted_id,
+            summary,
+            ..
+        } = r
+        {
+            if changed_paths
+                .iter()
+                .any(|path| summary.contains(path) || deleted_id.contains(path))
+            {
+                tombstones.push(ChangesTombstoneItem {
+                    record: r,
+                    deleted_id,
+                });
+            }
+        }
+    }
+
+    // 6. Gather cross-domain evidence
+    let mut seed_ids = BTreeSet::new();
+    for item in &changed_files {
+        seed_ids.insert(item.record.id());
+    }
+    for item in &changed_symbols {
+        seed_ids.insert(item.record.id());
+    }
+    for item in &commits {
+        seed_ids.insert(item.record.id());
+    }
+    for item in &drift_records {
+        seed_ids.insert(item.record.id());
+    }
+    for item in &tombstones {
+        seed_ids.insert(item.record.id());
+    }
+
+    let mut observations = BTreeSet::new();
+    let mut project_state = BTreeSet::new();
+    let mut artifacts = BTreeSet::new();
+    let mut verification_evidence = BTreeSet::new();
+
+    let mut present_ids = BTreeSet::new();
+    for r in records {
+        present_ids.insert(r.id());
+    }
+    let mut unresolved = Vec::new();
+
+    let mut visited = seed_ids.clone();
+    let mut frontier = seed_ids.clone();
+    let mut temporal_evidence_scanned = BTreeSet::new();
+    let mut evidence_links_scanned = BTreeSet::new();
+
+    let mut edges_from: BTreeMap<&str, Vec<(EdgeLabel, &str)>> = BTreeMap::new();
+    let mut edges_to: BTreeMap<&str, Vec<(EdgeLabel, &str)>> = BTreeMap::new();
+    let mut evidence_links_to: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+
+    for r in records {
+        if let GraphRecord::Edge {
+            id: edge_id,
+            label,
+            source,
+            target,
+            ..
+        } = r
+        {
+            if tombstoned_ids.contains(edge_id.as_str())
+                && !has_any_temporal_version.contains(edge_id.as_str())
+            {
+                continue;
+            }
+            edges_from
+                .entry(source.as_str())
+                .or_default()
+                .push((*label, target.as_str()));
+            edges_to
+                .entry(target.as_str())
+                .or_default()
+                .push((*label, source.as_str()));
+        }
+        if let GraphRecord::Node {
+            id,
+            evidence_links: Some(links),
+            ..
+        } = r
+        {
+            for link in links {
+                if let Some(tid) = &link.target_record_id {
+                    evidence_links_to
+                        .entry(tid.as_str())
+                        .or_default()
+                        .push(id.as_str());
+                }
+            }
+        }
+    }
+
+    let classify_and_insert_change = |record_id: &'a str,
+                                      observations: &mut BTreeSet<&'a str>,
+                                      project_state: &mut BTreeSet<&'a str>,
+                                      artifacts: &mut BTreeSet<&'a str>,
+                                      verification_evidence: &mut BTreeSet<&'a str>|
+     -> bool {
+        if tombstoned_ids.contains(record_id) && !has_any_temporal_version.contains(record_id) {
+            return false;
+        }
+        let Some(rec) = by_id.get(record_id) else {
+            return false;
+        };
+        let GraphRecord::Node { kind, .. } = rec else {
+            return false;
+        };
+        match classify_node(*kind) {
+            Some(ContextSection::Observation) => {
+                observations.insert(record_id);
+                true
+            }
+            Some(ContextSection::ProjectState) => {
+                project_state.insert(record_id);
+                true
+            }
+            Some(ContextSection::Artifact) => {
+                artifacts.insert(record_id);
+                true
+            }
+            Some(ContextSection::VerificationEvidence) => {
+                verification_evidence.insert(record_id);
+                true
+            }
+            _ => false,
+        }
+    };
+
+    // BFS loop - 3 hops
+    for _hop in 0..3 {
+        let mut next_frontier = Vec::new();
+        for current in frontier {
+            if let Some(outs) = edges_from.get(current) {
+                for (label, target) in outs {
+                    if !is_cross_domain_label(*label) {
+                        continue;
+                    }
+                    if visited.insert(*target) {
+                        let was_classified = classify_and_insert_change(
+                            target,
+                            &mut observations,
+                            &mut project_state,
+                            &mut artifacts,
+                            &mut verification_evidence,
+                        );
+                        if was_classified
+                            || is_bfs_relay_node(
+                                target,
+                                &by_id,
+                                &tombstoned_ids,
+                                &has_any_temporal_version,
+                            )
+                        {
+                            next_frontier.push(*target);
+                        }
+                    }
+                }
+            }
+
+            if let Some(ins) = edges_to.get(current) {
+                for (label, source) in ins {
+                    if !is_cross_domain_label(*label) {
+                        continue;
+                    }
+                    if is_forward_only_label(*label) {
+                        continue;
+                    }
+                    if visited.insert(*source) {
+                        let was_classified = classify_and_insert_change(
+                            source,
+                            &mut observations,
+                            &mut project_state,
+                            &mut artifacts,
+                            &mut verification_evidence,
+                        );
+                        if was_classified
+                            || is_bfs_relay_node(
+                                source,
+                                &by_id,
+                                &tombstoned_ids,
+                                &has_any_temporal_version,
+                            )
+                        {
+                            next_frontier.push(*source);
+                        }
+                    }
+                }
+            }
+
+            if let Some(GraphRecord::Node {
+                id: node_id,
+                evidence_links: Some(links),
+                temporal,
+                ..
+            }) = by_id.get(current)
+            {
+                let already_scanned = temporal.as_ref().map_or_else(
+                    || !evidence_links_scanned.insert(node_id.as_str()),
+                    |t| {
+                        let key = format!("{}@{}", node_id, t.git_commit);
+                        !temporal_evidence_scanned.insert(key)
+                    },
+                );
+                if !already_scanned {
+                    for link in links {
+                        if let Some(target_id) = &link.target_record_id {
+                            if present_ids.contains(target_id.as_str()) {
+                                if visited.insert(target_id.as_str()) {
+                                    let was_classified = classify_and_insert_change(
+                                        target_id.as_str(),
+                                        &mut observations,
+                                        &mut project_state,
+                                        &mut artifacts,
+                                        &mut verification_evidence,
+                                    );
+                                    if was_classified {
+                                        next_frontier.push(target_id.as_str());
+                                    }
+                                }
+                            } else {
+                                unresolved.push(UnresolvedRef {
+                                    source_record_id: (*node_id).clone(),
+                                    target_handle: target_id.clone(),
+                                    relation: link.relation.clone(),
+                                    target_domain: link.target_domain.clone(),
+                                });
+                            }
+                        } else if let Some(handle) = evidence_link_triple_handle(link) {
+                            unresolved.push(UnresolvedRef {
+                                source_record_id: (*node_id).clone(),
+                                target_handle: handle,
+                                relation: link.relation.clone(),
+                                target_domain: link.target_domain.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            if let Some(sources) = evidence_links_to.get(current) {
+                for source in sources {
+                    if visited.insert(*source) {
+                        let was_classified = classify_and_insert_change(
+                            source,
+                            &mut observations,
+                            &mut project_state,
+                            &mut artifacts,
+                            &mut verification_evidence,
+                        );
+                        if was_classified {
+                            next_frontier.push(*source);
+                        }
+                    }
+                }
+            }
+        }
+        if next_frontier.is_empty() {
+            break;
+        }
+        frontier = next_frontier.into_iter().collect();
+    }
+
+    let mut output_observations = Vec::new();
+    for id in observations {
+        if let Some(rec) = by_id.get(id) {
+            output_observations.push(*rec);
+        }
+    }
+    let mut output_project_state = Vec::new();
+    for id in project_state {
+        if let Some(rec) = by_id.get(id) {
+            output_project_state.push(*rec);
+        }
+    }
+    let mut output_artifacts = Vec::new();
+    for id in artifacts {
+        if let Some(rec) = by_id.get(id) {
+            output_artifacts.push(*rec);
+        }
+    }
+    let mut output_verification_evidence = Vec::new();
+    for id in verification_evidence {
+        if let Some(rec) = by_id.get(id) {
+            output_verification_evidence.push(*rec);
+        }
+    }
+
+    let mut unexplained = Vec::new();
+    for seed_id in &seed_ids {
+        if !is_linked_to_evidence(
+            seed_id,
+            &by_id,
+            &edges_from,
+            &edges_to,
+            &evidence_links_to,
+            &tombstoned_ids,
+            &has_any_temporal_version,
+        ) {
+            if let Some(GraphRecord::Node { kind, summary, .. }) = by_id.get(seed_id) {
+                unexplained.push(UnexplainedChange {
+                    record_id: seed_id,
+                    kind: kind.as_str(),
+                    summary,
+                });
+            }
+        }
+    }
+
+    changed_files.sort_by(|a, b| {
+        a.path
+            .cmp(b.path)
+            .then_with(|| a.git_commit.cmp(b.git_commit))
+            .then_with(|| a.record.id().cmp(b.record.id()))
+    });
+    changed_symbols.sort_by(|a, b| {
+        a.name
+            .cmp(b.name)
+            .then_with(|| a.path.cmp(b.path))
+            .then_with(|| a.git_commit.cmp(b.git_commit))
+            .then_with(|| a.record.id().cmp(b.record.id()))
+    });
+    commits.sort_by(|a, b| a.commit.cmp(b.commit));
+    tombstones.sort_by(|a, b| {
+        a.deleted_id
+            .cmp(b.deleted_id)
+            .then_with(|| a.record.id().cmp(b.record.id()))
+    });
+    drift_records.sort_by(|a, b| {
+        a.target_record_id
+            .cmp(b.target_record_id)
+            .then_with(|| a.record.id().cmp(b.record.id()))
+    });
+
+    output_observations.sort_by(|a, b| a.id().cmp(b.id()));
+    output_project_state.sort_by(|a, b| a.id().cmp(b.id()));
+    output_artifacts.sort_by(|a, b| a.id().cmp(b.id()));
+    output_verification_evidence.sort_by(|a, b| a.id().cmp(b.id()));
+    unexplained.sort_by(|a, b| a.record_id.cmp(b.record_id));
+    unresolved.sort_by(|a, b| {
+        a.source_record_id
+            .cmp(&b.source_record_id)
+            .then_with(|| a.target_handle.cmp(&b.target_handle))
+            .then_with(|| a.relation.cmp(&b.relation))
+            .then_with(|| a.target_domain.cmp(&b.target_domain))
+    });
+
+    Ok(ChangesContext {
+        changed_files,
+        changed_symbols,
+        commits,
+        tombstones,
+        drift_records,
+        observations: output_observations,
+        project_state: output_project_state,
+        artifacts: output_artifacts,
+        verification_evidence: output_verification_evidence,
+        unexplained,
+        unresolved,
+    })
+}
+
+fn is_linked_to_evidence(
+    seed_id: &str,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+    edges_from: &BTreeMap<&str, Vec<(EdgeLabel, &str)>>,
+    edges_to: &BTreeMap<&str, Vec<(EdgeLabel, &str)>>,
+    evidence_links_to: &BTreeMap<&str, Vec<&str>>,
+    _tombstoned_ids: &BTreeSet<&str>,
+    _has_any_temporal_version: &BTreeSet<&str>,
+) -> bool {
+    let mut visited = BTreeSet::new();
+    let mut frontier = vec![seed_id];
+    visited.insert(seed_id);
+
+    for _hop in 0..3 {
+        let mut next_frontier = Vec::new();
+        for current in frontier {
+            if current != seed_id {
+                if let Some(GraphRecord::Node { kind, .. }) = by_id.get(current) {
+                    if classify_node(*kind).is_some()
+                        && classify_node(*kind) != Some(ContextSection::SourceFact)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            if let Some(outs) = edges_from.get(current) {
+                for (label, target) in outs {
+                    if !is_cross_domain_label(*label) {
+                        continue;
+                    }
+                    if visited.insert(*target) {
+                        next_frontier.push(*target);
+                    }
+                }
+            }
+
+            if let Some(ins) = edges_to.get(current) {
+                for (label, source) in ins {
+                    if !is_cross_domain_label(*label) {
+                        continue;
+                    }
+                    if is_forward_only_label(*label) {
+                        continue;
+                    }
+                    if visited.insert(*source) {
+                        next_frontier.push(*source);
+                    }
+                }
+            }
+
+            if let Some(GraphRecord::Node {
+                evidence_links: Some(links),
+                ..
+            }) = by_id.get(current)
+            {
+                for link in links {
+                    if let Some(target_id) = &link.target_record_id {
+                        if visited.insert(target_id.as_str()) {
+                            next_frontier.push(target_id.as_str());
+                        }
+                    }
+                }
+            }
+
+            if let Some(sources) = evidence_links_to.get(current) {
+                for source in sources {
+                    if visited.insert(*source) {
+                        next_frontier.push(*source);
+                    }
+                }
+            }
+        }
+        if next_frontier.is_empty() {
+            break;
+        }
+        frontier = next_frontier;
+    }
+    false
 }
