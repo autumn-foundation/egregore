@@ -27,12 +27,30 @@ pub fn symbol_at_commit<'records>(
     symbol_name: &str,
     commit: &str,
 ) -> Option<&'records GraphRecord> {
+    symbols_at_commit(records, symbol_name, commit)
+        .into_iter()
+        .next()
+}
+
+/// Returns every symbol record matching `symbol_name` at a specific Git
+/// commit, sorted by record ID for deterministic output.
+///
+/// In a multi-repository store the same name/commit pair can match records in
+/// more than one repository; callers that must answer with a single record
+/// use the full list to keep the repository boundary visible instead of
+/// picking one implicitly (issue #67).
+#[must_use]
+pub fn symbols_at_commit<'records>(
+    records: &'records [GraphRecord],
+    symbol_name: &str,
+    commit: &str,
+) -> Vec<&'records GraphRecord> {
     let mut matches = records
         .iter()
         .filter(|record| matches_symbol_at_commit(record, symbol_name, commit))
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| left.id().cmp(right.id()));
-    matches.into_iter().next()
+    matches
 }
 
 /// Returns semantic drift nodes ranked by score descending.
@@ -120,6 +138,272 @@ pub fn resolve_drift_target<'a>(
         return (repo_relative_path.as_deref(), name.as_deref(), *span);
     }
     (drift_path, drift_name, None)
+}
+
+// ── Repository scope (issue #67) ──────────────────────────────────────────────
+
+/// Why a repository selector failed to resolve.
+///
+/// Both variants carry stable machine-readable codes so callers can emit them
+/// verbatim as diagnostics: `unknown_repository_selector` and
+/// `ambiguous_repository_selector`. Ambiguity is never resolved implicitly.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum RepositorySelectorError {
+    /// No repository in the store matches the selector.
+    Unknown {
+        /// The selector as supplied by the caller.
+        selector: String,
+    },
+    /// More than one repository matches the selector.
+    Ambiguous {
+        /// The selector as supplied by the caller.
+        selector: String,
+        /// Stable repository record IDs of every match, sorted ascending.
+        candidates: Vec<String>,
+    },
+}
+
+impl RepositorySelectorError {
+    /// Returns the stable machine-readable diagnostic code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Unknown { .. } => "unknown_repository_selector",
+            Self::Ambiguous { .. } => "ambiguous_repository_selector",
+        }
+    }
+}
+
+/// One repository known to a [`RepositoryIndex`].
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct RepositoryEntry {
+    /// Human-usable display handle (e.g. `owner/name` for remote-derived
+    /// identities, the basename otherwise).
+    display: String,
+    /// Every identity-payload-derived handle this repository answers to.
+    selectors: BTreeSet<String>,
+}
+
+/// Maps code-graph records to their owning repository and resolves
+/// human-usable repository selectors.
+///
+/// Ownership follows the deterministic containment topology emitted by the
+/// scanner: `Repository` —CONTAINS→ `File` —DEFINES/CONTAINS/IMPORTS→ nested
+/// modules, imports, and symbols. `SemanticDrift` nodes are attributed to the
+/// repository of their `DRIFTS_FROM` target (falling back to the metadata's
+/// `target_record_id`/`prior_record_id`).
+///
+/// Records that cannot be attributed (e.g. legacy fixtures without a
+/// `Repository` node) simply have no owner; callers must keep that visible
+/// rather than guessing.
+#[derive(Debug, Default)]
+pub struct RepositoryIndex {
+    /// Node record ID → owning repository record ID.
+    owner: BTreeMap<String, String>,
+    /// Repository record ID → identity handles.
+    repos: BTreeMap<String, RepositoryEntry>,
+}
+
+impl RepositoryIndex {
+    /// Builds the index from a record slice.
+    #[must_use]
+    pub fn build(records: &[GraphRecord]) -> Self {
+        // Tombstoned repositories (e.g. an identity change in an incremental
+        // scan) are not part of the current state: they must neither resolve
+        // as selectors nor make a live repository's selector ambiguous.
+        let tombstoned: BTreeSet<&str> = records
+            .iter()
+            .filter_map(|r| {
+                if let GraphRecord::Tombstone { deleted_id, .. } = r {
+                    Some(deleted_id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut repos: BTreeMap<String, RepositoryEntry> = BTreeMap::new();
+        for record in records {
+            let GraphRecord::Node {
+                id,
+                kind: NodeKind::Repository,
+                name,
+                repository_identity,
+                ..
+            } = record
+            else {
+                continue;
+            };
+            if tombstoned.contains(id.as_str()) {
+                continue;
+            }
+            let mut selectors: BTreeSet<String> = BTreeSet::new();
+            let mut display = name.clone();
+            if let Some(payload) = repository_identity.as_deref() {
+                selectors.insert(payload.basename.clone());
+                for handle in [
+                    payload.remote_url.as_deref(),
+                    payload.root_commit_sha.as_deref(),
+                    payload.canonical_path.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    selectors.insert(handle.to_owned());
+                }
+                if display.is_none() {
+                    display = Some(payload.basename.clone());
+                }
+            }
+            if let Some(display_name) = &display {
+                selectors.insert(display_name.clone());
+            }
+            // Remote-backed identities store the remote path (`owner/name`)
+            // as both basename and display name; the human-usable final path
+            // segment (`name`) must resolve as a selector too.
+            let shorts: Vec<String> = selectors
+                .iter()
+                .filter_map(|s| s.rsplit('/').next())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            selectors.extend(shorts);
+            repos.entry(id.clone()).or_insert_with(|| RepositoryEntry {
+                display: display.unwrap_or_else(|| id.clone()),
+                selectors,
+            });
+        }
+
+        // Containment adjacency over the deterministic code-graph topology.
+        let mut adjacency: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for record in records {
+            if let GraphRecord::Edge {
+                label: EdgeLabel::Contains | EdgeLabel::Defines | EdgeLabel::Imports,
+                source,
+                target,
+                ..
+            } = record
+            {
+                adjacency.entry(source.as_str()).or_default().push(target);
+            }
+        }
+
+        let mut owner: BTreeMap<String, String> = BTreeMap::new();
+        for repo_id in repos.keys() {
+            let mut stack: Vec<&str> = vec![repo_id.as_str()];
+            while let Some(node_id) = stack.pop() {
+                if owner
+                    .insert(node_id.to_owned(), repo_id.clone())
+                    .is_some_and(|prev| prev == *repo_id)
+                {
+                    continue;
+                }
+                if let Some(next) = adjacency.get(node_id) {
+                    stack.extend(next.iter().copied());
+                }
+            }
+        }
+
+        // SemanticDrift nodes hang off their target symbol, not the
+        // containment topology: attribute them through DRIFTS_FROM (preferred)
+        // or the drift metadata's record handles.
+        let mut drift_targets: BTreeMap<&str, &str> = BTreeMap::new();
+        for record in records {
+            if let GraphRecord::Edge {
+                label: EdgeLabel::DriftsFrom,
+                source,
+                target,
+                ..
+            } = record
+            {
+                drift_targets.entry(source.as_str()).or_insert(target);
+            }
+        }
+        for record in records {
+            let GraphRecord::Node {
+                id,
+                kind: NodeKind::SemanticDrift,
+                semantic_drift,
+                ..
+            } = record
+            else {
+                continue;
+            };
+            if owner.contains_key(id.as_str()) {
+                continue;
+            }
+            let target = drift_targets.get(id.as_str()).copied().or_else(|| {
+                semantic_drift
+                    .as_deref()
+                    .map(|d| d.target_record_id.as_str())
+            });
+            let fallback = semantic_drift
+                .as_deref()
+                .map(|d| d.prior_record_id.as_str());
+            let resolved = target
+                .and_then(|t| owner.get(t))
+                .or_else(|| fallback.and_then(|t| owner.get(t)))
+                .cloned();
+            if let Some(repo_id) = resolved {
+                owner.insert(id.clone(), repo_id);
+            }
+        }
+
+        Self { owner, repos }
+    }
+
+    /// Returns the owning repository record ID for a node record ID.
+    #[must_use]
+    pub fn owner_of(&self, record_id: &str) -> Option<&str> {
+        self.owner.get(record_id).map(String::as_str)
+    }
+
+    /// Returns the human-usable display handle for a repository record ID.
+    #[must_use]
+    pub fn display_of(&self, repository_id: &str) -> Option<&str> {
+        self.repos.get(repository_id).map(|e| e.display.as_str())
+    }
+
+    /// Returns every repository record ID known to the index, sorted ascending.
+    #[must_use]
+    pub fn repository_ids(&self) -> Vec<&str> {
+        self.repos.keys().map(String::as_str).collect()
+    }
+
+    /// Resolves a repository selector to a stable repository record ID.
+    ///
+    /// Accepts the stable repository record ID directly, or any human-usable
+    /// handle derived from the identity payload: the display handle (e.g.
+    /// remote `owner/name`), the basename / operator override, the normalized
+    /// remote URL, the root commit SHA, or the canonical path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositorySelectorError::Unknown`] when nothing matches and
+    /// [`RepositorySelectorError::Ambiguous`] (with every candidate listed)
+    /// when more than one repository matches. Ambiguity is never resolved by
+    /// picking a repository implicitly.
+    pub fn resolve_selector(&self, selector: &str) -> Result<&str, RepositorySelectorError> {
+        if let Some((id, _)) = self.repos.get_key_value(selector) {
+            return Ok(id.as_str());
+        }
+        let candidates: Vec<&str> = self
+            .repos
+            .iter()
+            .filter(|(_, entry)| entry.selectors.contains(selector))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        match candidates.as_slice() {
+            [] => Err(RepositorySelectorError::Unknown {
+                selector: selector.to_owned(),
+            }),
+            [single] => Ok(single),
+            _ => Err(RepositorySelectorError::Ambiguous {
+                selector: selector.to_owned(),
+                candidates: candidates.into_iter().map(str::to_owned).collect(),
+            }),
+        }
+    }
 }
 
 fn matches_symbol_at_commit(record: &GraphRecord, symbol_name: &str, commit: &str) -> bool {
@@ -1221,6 +1505,81 @@ pub fn symbol_as_of_valid_time<'records>(
     }
 
     Ok(best.map(|(r, _)| r))
+}
+
+/// Repository-aware variant of [`symbol_as_of_valid_time`] (issue #67).
+///
+/// Returns the best record (most recent `valid_time` at or before `as_of`,
+/// ties broken by ascending record ID) **per owning repository**, sorted by
+/// record ID. When `repo` is supplied only records owned by that repository
+/// are considered.
+///
+/// A multi-repository collision therefore yields one row per repository so
+/// the caller can either surface all of them or fail with an
+/// ambiguous-repository diagnostic — never picking a repository implicitly.
+/// Records the index cannot attribute to any repository share one unattributed
+/// group, preserving single-repository and legacy-fixture behavior.
+///
+/// # Errors
+///
+/// Returns an error string when `as_of` is not a valid RFC 3339 timestamp.
+pub fn symbol_as_of_valid_time_by_repo<'records>(
+    records: &'records [GraphRecord],
+    symbol_name: &str,
+    as_of: &str,
+    index: &RepositoryIndex,
+    repo: Option<&str>,
+) -> Result<Vec<&'records GraphRecord>, String> {
+    let as_of_dt = DateTime::parse_from_rfc3339(as_of)
+        .map_err(|e| format!("invalid --as-of timestamp '{as_of}': {e}"))?;
+
+    let mut best: BTreeMap<Option<&str>, (&GraphRecord, DateTime<chrono::FixedOffset>)> =
+        BTreeMap::new();
+
+    for record in records {
+        let GraphRecord::Node {
+            kind: NodeKind::Symbol,
+            name,
+            temporal,
+            valid_time,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if name.as_deref() != Some(symbol_name) {
+            continue;
+        }
+        let owner = index.owner_of(record.id());
+        if let Some(repo_id) = repo
+            && owner != Some(repo_id)
+        {
+            continue;
+        }
+        let vt_str = temporal
+            .as_ref()
+            .map(|t| t.valid_time.as_str())
+            .or(valid_time.as_deref());
+        let Some(vt_str) = vt_str else {
+            continue;
+        };
+        let Ok(vt) = DateTime::parse_from_rfc3339(vt_str) else {
+            continue;
+        };
+        if vt > as_of_dt {
+            continue;
+        }
+        let is_better = best.get(&owner).is_none_or(|(prev_r, prev_vt)| {
+            vt > *prev_vt || (vt == *prev_vt && record.id() < prev_r.id())
+        });
+        if is_better {
+            best.insert(owner, (record, vt));
+        }
+    }
+
+    let mut results: Vec<&GraphRecord> = best.into_values().map(|(r, _)| r).collect();
+    results.sort_by(|left, right| left.id().cmp(right.id()));
+    Ok(results)
 }
 
 // ── Transaction-time queries (Issue #66) ───────────────────────────────────────
