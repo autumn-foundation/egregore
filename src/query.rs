@@ -5081,6 +5081,66 @@ fn is_pass_status(status: Option<&str>) -> bool {
     matches!(status, Some("pass"))
 }
 
+/// A reached verification/failure record with its accumulated anchor set and the
+/// relation it was first reached through. Keyed by record ID for dedup + order.
+type CandidateMap<'a> = BTreeMap<&'a str, (&'a GraphRecord, BTreeSet<&'a str>, &'a str)>;
+
+/// True when a verification record is a failed runtime attempt. Importers emit
+/// `CommandRun` nodes with an `exit_code` and no `status`, so a nonzero exit code
+/// is consulted as a fallback when `status` is absent (issue #63 review).
+fn is_failed_verification(node: &GraphRecord) -> bool {
+    let GraphRecord::Node {
+        status, exit_code, ..
+    } = node
+    else {
+        return false;
+    };
+    is_failed_status(status.as_deref())
+        || (status.is_none() && matches!(exit_code, Some(c) if *c != 0))
+}
+
+/// True for a verification record whose status is `pass`.
+fn is_pass_status_node(node: &GraphRecord) -> bool {
+    matches!(node, GraphRecord::Node { status, .. } if is_pass_status(status.as_deref()))
+}
+
+/// Merges a reached candidate into a classification map, unioning anchor sets
+/// when the same record is reached through more than one target.
+fn merge_candidate<'a>(
+    map: &mut CandidateMap<'a>,
+    node: &'a GraphRecord,
+    anchors: &BTreeSet<&'a str>,
+    rel: &'a str,
+) {
+    let entry = map
+        .entry(node.id())
+        .or_insert_with(|| (node, BTreeSet::new(), rel));
+    entry.1.extend(anchors.iter().copied());
+}
+
+/// Routes a reached record into the agent-failure, runtime-failure, or passing-
+/// success classification map by kind and status.
+fn route_candidate<'a>(
+    node: &'a GraphRecord,
+    anchors: &BTreeSet<&'a str>,
+    rel: &'a str,
+    agent: &mut CandidateMap<'a>,
+    runtime: &mut CandidateMap<'a>,
+    success: &mut CandidateMap<'a>,
+) {
+    match record_node_kind(node) {
+        Some(NodeKind::Failure) => merge_candidate(agent, node, anchors, rel),
+        Some(k) if is_verification_kind(k) => {
+            if is_failed_verification(node) {
+                merge_candidate(runtime, node, anchors, rel);
+            } else if is_pass_status_node(node) {
+                merge_candidate(success, node, anchors, rel);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Cross-domain relations that connect a failure/verification record to a code
 /// or task target. A record reaching a target through one of these is a
 /// candidate prior attempt on that target.
@@ -5161,9 +5221,24 @@ pub fn resolve_failure_handle(
         stale,
     };
 
-    // 1) Canonical code record ID (codegraph:vN:<hex>). A well-formed but absent
-    //    or out-of-scope ID resolves to nothing (caller emits no_match).
+    // 1) Canonical code record ID (codegraph:vN:<hex>). A malformed canonical ID
+    //    is unsupported (exit 1); a well-formed but absent or out-of-scope ID
+    //    resolves to nothing (caller emits no_match).
     if handle.starts_with("codegraph:") {
+        let parts: Vec<&str> = handle.split(':').collect();
+        let well_formed = parts.len() == 3
+            && parts[0] == "codegraph"
+            && parts[1].starts_with('v')
+            && parts[1].len() > 1
+            && parts[1][1..].chars().all(|c| c.is_ascii_digit())
+            && parts[2].len() == 64
+            && parts[2].chars().all(|c| c.is_ascii_hexdigit());
+        if !well_formed {
+            return Err(FailureHandleError::Unsupported {
+                handle: handle.to_owned(),
+                message: "malformed canonical codegraph ID".to_owned(),
+            });
+        }
         if tombstoned.contains(handle) {
             return Ok(empty_target(FailureTargetKind::Symbol, true));
         }
@@ -5195,12 +5270,43 @@ pub fn resolve_failure_handle(
     // 2) Task / task-source handle — reuse the task resolver verbatim.
     match resolve_task_ids(records, handle) {
         Ok(ids) => {
+            // Drop tombstoned (deleted) task IDs from the current-state read, the
+            // same way code/file/symbol handles are filtered. A handle that named
+            // only deleted tasks is stale, not a live target.
+            let had_match = !ids.is_empty();
+            let live: BTreeSet<String> = ids
+                .into_iter()
+                .filter(|id| !tombstoned.contains(id.as_str()))
+                .collect();
+            if live.is_empty() {
+                return Ok(empty_target(
+                    FailureTargetKind::Task,
+                    had_match || tombstoned.contains(handle),
+                ));
+            }
+            // Expand to the tasks' acceptance criteria so failures/verifications
+            // attached to an `AcceptanceCriterion` are included (mirrors the
+            // task-evidence query, which expands tasks to their ACs).
+            let mut anchor_ids = live.clone();
+            for r in records {
+                if let GraphRecord::Node {
+                    id,
+                    kind: NodeKind::AcceptanceCriterion,
+                    parent_task_id: Some(parent),
+                    ..
+                } = r
+                    && live.contains(parent)
+                    && !tombstoned.contains(id.as_str())
+                {
+                    anchor_ids.insert(id.clone());
+                }
+            }
             return Ok(ResolvedFailureTarget {
                 handle: handle.to_owned(),
                 kind: FailureTargetKind::Task,
-                anchor_ids: ids,
+                anchor_ids,
                 seed_failures: BTreeSet::new(),
-                stale: tombstoned.contains(handle),
+                stale: false,
             });
         }
         Err(TaskResolveError::Ambiguous {
@@ -5384,11 +5490,18 @@ pub fn failure_history_context<'a>(
     for r in records {
         match r {
             GraphRecord::Edge {
+                id,
                 label,
                 source,
                 target,
                 ..
             } => {
+                // Skip retracted edges: a tombstoned `FAILED_ON` / `VALIDATED_BY`
+                // / `PRODUCED_PATCH` edge must not surface stale relationships on
+                // current-state reads, matching `symbol_context`'s convention.
+                if tombstoned.contains(id.as_str()) {
+                    continue;
+                }
                 edges_from
                     .entry(source.as_str())
                     .or_default()
@@ -5484,73 +5597,129 @@ pub fn failure_history_context<'a>(
         }
     }
 
-    // Classify candidates and collect timestamped successes per anchor.
-    let mut agent: BTreeMap<&str, (&'a GraphRecord, BTreeSet<&str>, &str)> = BTreeMap::new();
-    let mut runtime: BTreeMap<&str, (&'a GraphRecord, BTreeSet<&str>, &str)> = BTreeMap::new();
-    let mut successes: BTreeMap<&str, MemoryEvidenceItem<'a>> = BTreeMap::new();
-    let mut success_by_anchor: BTreeMap<&str, Vec<(chrono::DateTime<chrono::FixedOffset>, &str)>> =
-        BTreeMap::new();
+    // ── Classify candidates into agent failures, runtime failures, and passing
+    //    successes, unioning anchor sets when a record is reached more than once. ──
+    let mut agent: CandidateMap<'a> = BTreeMap::new();
+    let mut runtime: CandidateMap<'a> = BTreeMap::new();
+    let mut success: CandidateMap<'a> = BTreeMap::new();
 
     for (cid, anchors) in &candidate_anchors {
         let Some(node) = present(cid) else { continue };
-        let Some(kind) = record_node_kind(node) else {
-            continue;
-        };
         let rel = candidate_rel.get(cid).copied().unwrap_or("RELATES_TO");
-        if matches!(kind, NodeKind::Failure) {
-            agent.insert(cid, (node, anchors.clone(), rel));
-        } else if is_verification_kind(kind) {
-            let GraphRecord::Node { status, .. } = node else {
-                continue;
-            };
-            let status = status.as_deref();
-            if is_failed_status(status) {
-                runtime.insert(cid, (node, anchors.clone(), rel));
-            } else if is_pass_status(status) {
-                successes.insert(
-                    cid,
-                    MemoryEvidenceItem {
-                        record: node,
-                        relation: rel.to_owned(),
-                    },
-                );
-                if let Some(instant) = node_instant(node) {
-                    for anchor in anchors {
-                        success_by_anchor
-                            .entry(anchor)
-                            .or_default()
-                            .push((instant, node.id()));
-                    }
-                } else {
-                    diagnostics.push(MemoryAuditDiagnostic {
-                        code: "missing_timestamp".to_owned(),
-                        source_record_id: node.id().to_owned(),
-                        target_handle: node.id().to_owned(),
-                        relation: "executed_at".to_owned(),
-                        target_domain: "verification".to_owned(),
-                    });
-                }
+        route_candidate(node, anchors, rel, &mut agent, &mut runtime, &mut success);
+    }
+
+    // Hop 2: from each reached agent `Failure`, follow PRODUCED_PATCH / FAILED_ON
+    // to its patch artifact and runtime command/test evidence — the Codex/traj
+    // importers attach the rejected patch and failed `CommandRun` to the `Failure`
+    // via FAILED_ON (PRODUCED_PATCH comes from the AgentTurn) — and walk the
+    // AUTHORED_BY / SESSION_OF chain for provenance.
+    let mut patch: BTreeMap<&str, MemoryEvidenceItem<'a>> = BTreeMap::new();
+    let mut sessions: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
+    let mut agents: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
+    let agent_seeds: Vec<(&'a str, &'a GraphRecord, BTreeSet<&'a str>)> = agent
+        .iter()
+        .map(|(id, (node, anchors, _))| (*id, *node, anchors.clone()))
+        .collect();
+    for (fid, fnode, fanchors) in &agent_seeds {
+        collect_failure_links(
+            fnode,
+            fid,
+            fanchors,
+            &edges_from,
+            &present,
+            &mut patch,
+            &mut runtime,
+            &mut success,
+            &mut diagnostics,
+        );
+        collect_provenance(fid, &edges_from, &present, &mut sessions, &mut agents);
+    }
+
+    // Reached-failure instants per anchor: used both to compute read-time status
+    // and to keep only successes that actually supersede a failure (AC5).
+    let mut failure_instant_by_anchor: BTreeMap<&str, Vec<chrono::DateTime<chrono::FixedOffset>>> =
+        BTreeMap::new();
+    for (node, anchors, _) in agent.values().chain(runtime.values()) {
+        if let Some(inst) = node_instant(node) {
+            for a in anchors {
+                failure_instant_by_anchor.entry(a).or_default().push(inst);
             }
         }
+    }
+
+    // A passing verification is surfaced only when it is strictly later than at
+    // least one reached failure on a shared target. A pass with no failures, or a
+    // pass that predates every failure, superseded nothing and is not shown (AC5).
+    let mut success_by_anchor: BTreeMap<&str, Vec<(chrono::DateTime<chrono::FixedOffset>, &str)>> =
+        BTreeMap::new();
+    let mut superseding: BTreeMap<&str, MemoryEvidenceItem<'a>> = BTreeMap::new();
+    for (sid, (node, anchors, rel)) in &success {
+        let Some(inst) = node_instant(node) else {
+            diagnostics.push(MemoryAuditDiagnostic {
+                code: "missing_timestamp".to_owned(),
+                source_record_id: (*sid).to_owned(),
+                target_handle: (*sid).to_owned(),
+                relation: "executed_at".to_owned(),
+                target_domain: "verification".to_owned(),
+            });
+            continue;
+        };
+        let supersedes = anchors.iter().any(|a| {
+            failure_instant_by_anchor
+                .get(a)
+                .is_some_and(|fs| fs.iter().any(|fi| *fi < inst))
+        });
+        if !supersedes {
+            continue;
+        }
+        for a in anchors {
+            success_by_anchor
+                .entry(a)
+                .or_default()
+                .push((inst, node.id()));
+        }
+        superseding
+            .entry(node.id())
+            .or_insert_with(|| MemoryEvidenceItem {
+                record: node,
+                relation: (*rel).to_owned(),
+            });
     }
     for list in success_by_anchor.values_mut() {
         list.sort_unstable();
     }
 
     // Build the failed-attempt items, computing each one's read-time status.
-    let mut patch: BTreeMap<&str, MemoryEvidenceItem<'a>> = BTreeMap::new();
-    let mut sessions: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
-    let mut agents: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
-
     let mut agent_failures: Vec<FailureAttempt<'a>> = Vec::new();
     let mut runtime_failures: Vec<FailureAttempt<'a>> = Vec::new();
-
     for (is_agent, source) in [(true, &agent), (false, &runtime)] {
-        for (cid, (node, anchors, rel)) in source {
+        for (node, anchors, rel) in source.values() {
             // AC6: surface this attempt's own unresolved / stale / triple-only
             // evidence links rather than silently dropping them.
             push_attempt_link_diagnostics(node, &tombstoned, &by_id, &mut diagnostics);
-
+            // AC5/AC6: an undated failure cannot be proven resolved; record why
+            // its status stays `still_failing` so callers can tell "no later pass"
+            // apart from "timestamp unusable".
+            if node_instant(node).is_none() {
+                diagnostics.push(MemoryAuditDiagnostic {
+                    code: "missing_timestamp".to_owned(),
+                    source_record_id: node.id().to_owned(),
+                    target_handle: node.id().to_owned(),
+                    relation: if is_agent {
+                        "observed_at"
+                    } else {
+                        "executed_at"
+                    }
+                    .to_owned(),
+                    target_domain: if is_agent {
+                        "agent_memory"
+                    } else {
+                        "verification"
+                    }
+                    .to_owned(),
+                });
+            }
             let (status, resolved_by) =
                 compute_resolution_status(node, anchors, &success_by_anchor);
             let matched_target = anchors.iter().min().copied().unwrap_or("");
@@ -5565,9 +5734,6 @@ pub fn failure_history_context<'a>(
             };
             if is_agent {
                 agent_failures.push(attempt);
-                // Hop 2: patch artifacts + session/agent provenance.
-                collect_patches(cid, &edges_from, &present, &mut patch, &mut diagnostics);
-                collect_provenance(cid, &edges_from, &present, &mut sessions, &mut agents);
             } else {
                 runtime_failures.push(attempt);
             }
@@ -5578,7 +5744,8 @@ pub fn failure_history_context<'a>(
     sort_attempts(&mut agent_failures);
     sort_attempts(&mut runtime_failures);
 
-    let mut superseding_successes: Vec<MemoryEvidenceItem<'a>> = successes.into_values().collect();
+    let mut superseding_successes: Vec<MemoryEvidenceItem<'a>> =
+        superseding.into_values().collect();
     superseding_successes.sort_by(|a, b| {
         node_instant(a.record)
             .cmp(&node_instant(b.record))
@@ -5748,37 +5915,79 @@ fn outbound_code_task_targets<'a>(
     out
 }
 
-/// Collects patch artifacts produced by a failure (1 hop, `PRODUCED_PATCH`).
-fn collect_patches<'a>(
+/// From a reached agent `Failure`, follows `PRODUCED_PATCH` / `FAILED_ON` edges
+/// and denormalized links to its patch artifact and runtime command/test
+/// evidence, inheriting the failure's anchor set for the reached runtime records.
+///
+/// The Codex/trajectory importers link a patch-invalid failure to its rejected
+/// `PatchArtifact` and a failed command to its `CommandRun` via `FAILED_ON`
+/// (`PRODUCED_PATCH` is emitted from the AgentTurn), so following only
+/// `PRODUCED_PATCH` from the failure would lose those citable artifacts.
+#[expect(clippy::too_many_arguments)]
+fn collect_failure_links<'a>(
+    failure: &'a GraphRecord,
     failure_id: &str,
+    anchors: &BTreeSet<&'a str>,
     edges_from: &BTreeMap<&'a str, Vec<(&'a EdgeLabel, &'a str)>>,
     present: &impl Fn(&str) -> Option<&'a GraphRecord>,
     patch: &mut BTreeMap<&'a str, MemoryEvidenceItem<'a>>,
+    runtime: &mut CandidateMap<'a>,
+    success: &mut CandidateMap<'a>,
     diagnostics: &mut Vec<MemoryAuditDiagnostic>,
 ) {
+    // (relation, target_id) from both graph edges and denormalized links.
+    let mut links: Vec<(&'a str, &'a str)> = Vec::new();
     if let Some(edges) = edges_from.get(failure_id) {
         for (label, target) in edges {
-            if !matches!(label, EdgeLabel::ProducedPatch) {
-                continue;
+            if matches!(label, EdgeLabel::ProducedPatch | EdgeLabel::FailedOn) {
+                links.push((label.as_str(), *target));
             }
-            if let Some(node) = present(target) {
-                if matches!(record_node_kind(node), Some(NodeKind::PatchArtifact)) {
-                    patch
-                        .entry(node.id())
-                        .or_insert_with(|| MemoryEvidenceItem {
-                            record: node,
-                            relation: "PRODUCED_PATCH".to_owned(),
-                        });
+        }
+    }
+    if let GraphRecord::Node {
+        evidence_links: Some(el),
+        ..
+    } = failure
+    {
+        for link in el {
+            if matches!(link.relation.as_str(), "PRODUCED_PATCH" | "FAILED_ON")
+                && let Some(t) = link.target_record_id.as_deref()
+            {
+                links.push((link.relation.as_str(), t));
+            }
+        }
+    }
+    links.sort_unstable();
+    links.dedup();
+
+    for (rel, target) in links {
+        let Some(node) = present(target) else {
+            diagnostics.push(MemoryAuditDiagnostic {
+                code: "unresolved_evidence_link".to_owned(),
+                source_record_id: failure_id.to_owned(),
+                target_handle: target.to_owned(),
+                relation: rel.to_owned(),
+                target_domain: String::new(),
+            });
+            continue;
+        };
+        match record_node_kind(node) {
+            Some(NodeKind::PatchArtifact) => {
+                patch
+                    .entry(node.id())
+                    .or_insert_with(|| MemoryEvidenceItem {
+                        record: node,
+                        relation: rel.to_owned(),
+                    });
+            }
+            Some(k) if is_verification_kind(k) => {
+                if is_failed_verification(node) {
+                    merge_candidate(runtime, node, anchors, rel);
+                } else if is_pass_status_node(node) {
+                    merge_candidate(success, node, anchors, rel);
                 }
-            } else {
-                diagnostics.push(MemoryAuditDiagnostic {
-                    code: "unresolved_evidence_link".to_owned(),
-                    source_record_id: failure_id.to_owned(),
-                    target_handle: (*target).to_owned(),
-                    relation: "PRODUCED_PATCH".to_owned(),
-                    target_domain: "artifact".to_owned(),
-                });
             }
+            _ => {}
         }
     }
 }

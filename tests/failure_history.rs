@@ -769,3 +769,378 @@ fn query_failures_via_data_dir() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["agent_failures"].as_array().unwrap().len(), 2);
 }
+
+// ── Review-fix coverage (issue #63 PR review) ───────────────────────────────
+
+/// Writes records to a fresh JSONL graph and returns the temp dir + path.
+fn write_graph(records: Vec<GraphRecord>) -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("graph.jsonl");
+    let mut graph = Graph::new();
+    for r in records {
+        graph.push(r);
+    }
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+    (temp, path)
+}
+
+/// Runs `eg query failures <handle> --graph <path>`.
+fn run_graph(path: &std::path::Path, handle: &str, extra: &[&str]) -> (i32, String, String) {
+    let assert = egregore()
+        .args(["query", "failures", handle, "--graph"])
+        .arg(path)
+        .args(extra)
+        .assert();
+    let output = assert.get_output().clone();
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8(output.stdout).expect("utf8 stdout"),
+        String::from_utf8(output.stderr).expect("utf8 stderr"),
+    )
+}
+
+fn failure_node(
+    id: &str,
+    failure_kind: &str,
+    observed_at: Option<&str>,
+    links: Vec<EvidenceLink>,
+) -> GraphRecord {
+    let mut n = GraphRecord::node(
+        id.to_owned(),
+        NodeKind::Failure,
+        None,
+        None,
+        None,
+        format!("Failure {failure_kind}"),
+    );
+    if let GraphRecord::Node {
+        failure_kind: fk,
+        observed_at: oa,
+        schema_version,
+        agent_id,
+        session_id,
+        evidence_links,
+        ..
+    } = &mut n
+    {
+        *fk = Some(failure_kind.to_owned());
+        *oa = observed_at.map(str::to_owned);
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent_x".to_owned());
+        *session_id = Some("sess_x".to_owned());
+        if !links.is_empty() {
+            *evidence_links = Some(links);
+        }
+    }
+    n
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verification_node(
+    id: &str,
+    kind: NodeKind,
+    status: Option<&str>,
+    exit_code: Option<i64>,
+    executed_at: Option<&str>,
+    observed_at: Option<&str>,
+    links: Vec<EvidenceLink>,
+) -> GraphRecord {
+    let mut n = GraphRecord::node(
+        id.to_owned(),
+        kind,
+        None,
+        None,
+        None,
+        "verification".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        status: s,
+        exit_code: ec,
+        executed_at: ea,
+        observed_at: oa,
+        verification_kind,
+        evidence_links,
+        ..
+    } = &mut n
+    {
+        *schema_version = VERIFICATION_SCHEMA_VERSION;
+        *s = status.map(str::to_owned);
+        *ec = exit_code;
+        *ea = executed_at.map(str::to_owned);
+        *oa = observed_at.map(str::to_owned);
+        *verification_kind = Some("command_run".to_owned());
+        if !links.is_empty() {
+            *evidence_links = Some(links);
+        }
+    }
+    n
+}
+
+fn symbol_node(path: &str, name: &str) -> (String, GraphRecord) {
+    let id = stable_id(&["node", "Symbol", path, name]);
+    let node = GraphRecord::syntax_node(
+        id.clone(),
+        NodeKind::Symbol,
+        path.to_owned(),
+        span(1, 10),
+        name.to_owned(),
+        "rust",
+        format!("Symbol {name}"),
+    );
+    (id, node)
+}
+
+#[test]
+fn malformed_codegraph_handle_exits_1_unsupported() {
+    let fx = seed();
+    // A handle with the canonical prefix but a malformed body must be rejected
+    // as unsupported (exit 1), distinct from a well-formed but absent ID.
+    let (code, _stdout, stderr) = run(&fx, "codegraph:not-a-valid-id", &[]);
+    assert_eq!(code, 1, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stderr.trim()).expect("valid JSON error");
+    assert!(v.get("Unsupported").is_some(), "got {v}");
+}
+
+#[test]
+fn tombstoned_task_handle_exits_2_stale() {
+    let task_id = project_stable_id(&["task", "deleted_task"]);
+    let mut task = GraphRecord::node(
+        task_id.clone(),
+        NodeKind::Task,
+        None,
+        None,
+        Some("Deleted task".to_owned()),
+        "Task".to_owned(),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut task {
+        *schema_version = PROJECT_SCHEMA_VERSION;
+    }
+    let tombstone = GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &task_id]),
+        schema_version: PROJECT_SCHEMA_VERSION,
+        deleted_id: task_id.clone(),
+        summary: "deleted".to_owned(),
+        producer: None,
+    };
+    let (_t, graph) = write_graph(vec![task, tombstone]);
+    let (code, stdout, _e) = run_graph(&graph, &task_id, &[]);
+    assert_eq!(code, 2, "stdout={stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["error"]["code"], "stale_handle");
+}
+
+#[test]
+fn task_query_includes_acceptance_criterion_failures() {
+    let task_id = project_stable_id(&["task", "t_ac"]);
+    let mut task = GraphRecord::node(
+        task_id.clone(),
+        NodeKind::Task,
+        None,
+        None,
+        Some("Task with AC".to_owned()),
+        "Task".to_owned(),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut task {
+        *schema_version = PROJECT_SCHEMA_VERSION;
+    }
+    let ac_id = project_stable_id(&["ac", "ac_1"]);
+    let mut ac = GraphRecord::node(
+        ac_id.clone(),
+        NodeKind::AcceptanceCriterion,
+        None,
+        None,
+        Some("AC 1".to_owned()),
+        "AC".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        parent_task_id,
+        ..
+    } = &mut ac
+    {
+        *schema_version = PROJECT_SCHEMA_VERSION;
+        *parent_task_id = Some(task_id.clone());
+    }
+    // A failure attached to the acceptance criterion, not the task directly.
+    let fail = failure_node(
+        &agent_memory_stable_id(&["failure", "f_ac"]),
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![link(&ac_id, "project", "FAILED_ON")],
+    );
+    let (_t, graph) = write_graph(vec![task, ac, fail]);
+    let (code, stdout, stderr) = run_graph(&graph, &task_id, &[]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(
+        v["agent_failures"].as_array().unwrap().len(),
+        1,
+        "AC-attached failure must surface for a task query"
+    );
+}
+
+#[test]
+fn pass_only_or_pass_before_failure_is_not_superseding() {
+    let (symbol_id, symbol) = symbol_node("src/a.rs", "alpha");
+    // A passing verification that PREDATES the only failure: it superseded
+    // nothing, so it must not appear in superseding_successes (AC5).
+    let pass = verification_node(
+        &verification_stable_id(&["v", "early_pass"]),
+        NodeKind::TestRun,
+        Some("pass"),
+        None,
+        Some("2026-01-01T00:00:00Z"),
+        None,
+        vec![link(&symbol_id, "codegraph", "VALIDATED_BY")],
+    );
+    let fail = failure_node(
+        &agent_memory_stable_id(&["failure", "later_fail"]),
+        "command_failure",
+        Some("2026-02-01T00:00:00Z"),
+        vec![link(&symbol_id, "codegraph", "FAILED_ON")],
+    );
+    let (_t, graph) = write_graph(vec![symbol, pass, fail]);
+    let (code, stdout, _e) = run_graph(&graph, &symbol_id, &[]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["agent_failures"].as_array().unwrap().len(), 1);
+    assert_eq!(v["agent_failures"][0]["resolution_status"], "still_failing");
+    assert_eq!(
+        v["superseding_successes"].as_array().unwrap().len(),
+        0,
+        "a pass before the failure superseded nothing"
+    );
+}
+
+#[test]
+fn failed_on_patch_and_command_run_are_surfaced() {
+    let (symbol_id, symbol) = symbol_node("src/b.rs", "beta");
+    let fail_id = agent_memory_stable_id(&["failure", "patch_invalid_f"]);
+    let fail = failure_node(
+        &fail_id,
+        "patch_invalid",
+        Some("2026-01-01T00:00:00Z"),
+        vec![link(&symbol_id, "codegraph", "FAILED_ON")],
+    );
+    // Importer shape: Failure --FAILED_ON--> PatchArtifact, and
+    // Failure --FAILED_ON--> CommandRun (exit_code nonzero, no status).
+    let patch_id = artifact_stable_id(&["patch", "rejected"]);
+    let mut patch = GraphRecord::node(
+        patch_id.clone(),
+        NodeKind::PatchArtifact,
+        None,
+        None,
+        None,
+        "patch".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        patch_status,
+        patch_bytes_hash,
+        ..
+    } = &mut patch
+    {
+        *schema_version = ARTIFACT_SCHEMA_VERSION;
+        *patch_status = Some("invalid".to_owned());
+        *patch_bytes_hash = Some("blake3:ph".to_owned());
+    }
+    let cmd_id = verification_stable_id(&["v", "failed_cmd"]);
+    let cmd = verification_node(
+        &cmd_id,
+        NodeKind::CommandRun,
+        None, // no status — only exit_code (#7)
+        Some(2),
+        None,
+        Some("2026-01-01T00:00:01Z"),
+        vec![],
+    );
+    let patch_edge = GraphRecord::edge(
+        EdgeLabel::FailedOn,
+        fail_id.clone(),
+        patch_id.clone(),
+        None,
+        "failure failed on patch".to_owned(),
+    );
+    let cmd_edge = GraphRecord::edge(
+        EdgeLabel::FailedOn,
+        fail_id,
+        cmd_id.clone(),
+        None,
+        "failure failed on command".to_owned(),
+    );
+    let (_t, graph) = write_graph(vec![symbol, fail, patch, cmd, patch_edge, cmd_edge]);
+    let (code, stdout, stderr) = run_graph(&graph, &symbol_id, &[]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let patches = v["patch_artifacts"].as_array().unwrap();
+    assert_eq!(patches.len(), 1, "FAILED_ON patch must be collected (#3)");
+    assert_eq!(patches[0]["record_id"], patch_id);
+    let runtime = v["runtime_failures"].as_array().unwrap();
+    assert_eq!(runtime.len(), 1, "exit_code CommandRun must surface (#7)");
+    assert_eq!(runtime[0]["record_id"], cmd_id);
+}
+
+#[test]
+fn undated_failure_emits_missing_timestamp_and_still_failing() {
+    let (symbol_id, symbol) = symbol_node("src/c.rs", "gamma");
+    let fail_id = agent_memory_stable_id(&["failure", "undated"]);
+    let fail = failure_node(
+        &fail_id,
+        "command_failure",
+        None, // no observed_at (#4)
+        vec![link(&symbol_id, "codegraph", "FAILED_ON")],
+    );
+    let (_t, graph) = write_graph(vec![symbol, fail]);
+    let (code, stdout, _e) = run_graph(&graph, &symbol_id, &[]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["agent_failures"][0]["resolution_status"], "still_failing");
+    let codes: Vec<&str> = v["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"missing_timestamp"), "codes={codes:?}");
+}
+
+#[test]
+fn tombstoned_failed_on_edge_is_skipped() {
+    let (symbol_id, symbol) = symbol_node("src/d.rs", "delta");
+    let fail_id = agent_memory_stable_id(&["failure", "edge_only"]);
+    // Failure reached ONLY via a FAILED_ON edge (no denormalized link).
+    let fail = failure_node(
+        &fail_id,
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![],
+    );
+    let edge = GraphRecord::edge(
+        EdgeLabel::FailedOn,
+        fail_id,
+        symbol_id.clone(),
+        None,
+        "failure failed on symbol".to_owned(),
+    );
+    let edge_id = edge.id().to_owned();
+    let tombstone = GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &edge_id]),
+        schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+        deleted_id: edge_id,
+        summary: "retracted edge".to_owned(),
+        producer: None,
+    };
+    let (_t, graph) = write_graph(vec![symbol, fail, edge, tombstone]);
+    let (code, stdout, stderr) = run_graph(&graph, &symbol_id, &[]);
+    // The symbol still resolves, but the retracted FAILED_ON edge must not
+    // surface the failure (#6): an honest empty answer, not a stale hit.
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["ok"], true);
+    assert_eq!(
+        v["agent_failures"].as_array().unwrap().len(),
+        0,
+        "failure reached only through a retracted edge must be excluded"
+    );
+}

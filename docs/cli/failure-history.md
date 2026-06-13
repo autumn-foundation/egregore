@@ -29,7 +29,8 @@ Reads from either a JSONL file (`--graph`) or an embedded AletheiaDB store
 2. **Task / task-source handle** — a canonical Task ID (`project:v<N>:<hex>`), a
    GitHub URL or short handle (`owner/repo#num`), or a local JSONL handle
    (`path.jsonl:local_id`). Resolved through the same contract as
-   [`eg query task`](task-queries.md).
+   [`eg query task`](task-queries.md), and expanded to the task's
+   `AcceptanceCriterion` records so failures attached to an AC are included.
 3. **Repo-relative file path** — e.g. `src/lib.rs`.
 4. **Exact symbol name** — e.g. `foo`. Several symbols of the same name in one
    repository form a multi-target query; the same name across repositories is
@@ -64,10 +65,10 @@ task-completion proof (AC4). Every section is canonically ordered for determinis
 
 | Section | Contents | Trust class |
 |---------|----------|-------------|
-| `runtime_failures` | Verification-domain command/test/CI failures (`status` fail/error/timeout). | `verification_evidence` |
+| `runtime_failures` | Verification-domain command/test/CI failures (`status` fail/error/timeout, or a nonzero `exit_code` when `status` is absent). | `verification_evidence` |
 | `agent_failures` | Agent-authored `Failure` claims. | `agent_authored` |
-| `superseding_successes` | Later **passing** verifications on a shared target. | `verification_evidence` |
-| `patch_artifacts` | Patch artifacts produced by a reached failure (`PRODUCED_PATCH`). | `artifact` |
+| `superseding_successes` | Passing verifications strictly **later** than a reached failure on a shared target — a pass with no failures, or one predating every failure, superseded nothing and is omitted. | `verification_evidence` |
+| `patch_artifacts` | Patch artifacts and runtime evidence attached to a reached failure via `PRODUCED_PATCH` / `FAILED_ON`. | `artifact` |
 | `diagnostics` | Stable codes for unresolved / stale / missing / protected / redacted handles. | — |
 | `page` | Deterministic pagination block (`cursor`, `has_more`, `returned`). | — |
 | `target_ids` / `target_type` | The resolved anchor record IDs and handle type. | — |
