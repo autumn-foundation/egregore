@@ -1726,3 +1726,101 @@ fn failure_has_evidence_link_surfaces_runtime_failure() {
     );
     assert_eq!(runtime[0]["record_id"], cmd_id);
 }
+
+// ── Round-6 review-fix coverage ─────────────────────────────────────────────
+
+#[test]
+fn resolved_by_is_the_earliest_later_pass() {
+    let (symbol_id, symbol) = symbol_node("src/rb.rs", "rby");
+    let fail = failure_node(
+        &agent_memory_stable_id(&["failure", "rb_fail"]),
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![link(&symbol_id, "codegraph", "FAILED_ON")],
+    );
+    let first_id = verification_stable_id(&["v", "rb_first"]);
+    let first = verification_node(
+        &first_id,
+        NodeKind::TestRun,
+        Some("pass"),
+        None,
+        Some("2026-02-01T00:00:00Z"),
+        None,
+        vec![link(&symbol_id, "codegraph", "VALIDATED_BY")],
+    );
+    let later = verification_node(
+        &verification_stable_id(&["v", "rb_later"]),
+        NodeKind::TestRun,
+        Some("pass"),
+        None,
+        Some("2026-03-01T00:00:00Z"),
+        None,
+        vec![link(&symbol_id, "codegraph", "VALIDATED_BY")],
+    );
+    let (_t, graph) = write_graph(vec![symbol, fail, first, later]);
+    let (code, stdout, _e) = run_graph(&graph, &symbol_id, &[]);
+    assert_eq!(code, 0);
+    let v = parse(&stdout);
+    assert_eq!(
+        v["agent_failures"][0]["resolved_by"], first_id,
+        "resolved_by must cite the first later pass, not the most recent"
+    );
+}
+
+#[test]
+fn tombstoned_external_link_does_not_resolve_task() {
+    // A GitHub-shaped handle whose ExternalLink was retracted must not surface
+    // the still-live task's failure history.
+    let task_id = project_stable_id(&["task", "ext_task"]);
+    let ext_id = stable_id(&["node", "ExternalLink", "acme/widget#5"]);
+    let mut task = GraphRecord::node(
+        task_id.clone(),
+        NodeKind::Task,
+        None,
+        None,
+        Some("Task".to_owned()),
+        "Task".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        source_external_link_id,
+        ..
+    } = &mut task
+    {
+        *schema_version = PROJECT_SCHEMA_VERSION;
+        *source_external_link_id = Some(ext_id.clone());
+    }
+    let mut ext = GraphRecord::node(
+        ext_id.clone(),
+        NodeKind::ExternalLink,
+        None,
+        None,
+        None,
+        "external link".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        system_native_id,
+        repository_remote,
+        ..
+    } = &mut ext
+    {
+        *schema_version = PROJECT_SCHEMA_VERSION;
+        *system_native_id = Some("issue:5".to_owned());
+        *repository_remote = Some("https://github.com/acme/widget".to_owned());
+    }
+    let fail = failure_node(
+        &agent_memory_stable_id(&["failure", "ext_fail"]),
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![link(&task_id, "project", "FAILED_ON")],
+    );
+    let tombstone = tombstone_for(&ext_id); // retract the external link
+    let (_t, graph) = write_graph(vec![task, ext, fail, tombstone]);
+    let (code, stdout, _e) = run_graph(&graph, "acme/widget#5", &[]);
+    assert_eq!(
+        code, 2,
+        "a retracted external link must not surface the task's failures"
+    );
+    assert_eq!(parse(&stdout)["error"]["code"], "no_match");
+}

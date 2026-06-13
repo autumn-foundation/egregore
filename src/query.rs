@@ -2359,6 +2359,17 @@ pub fn resolve_task_ids(
 
     let mut matched_ids = BTreeSet::new();
 
+    // Source-link records (ExternalLink nodes, EXTERNAL_HANDLE edges) that were
+    // tombstoned must not resolve their task on current-state reads: a retracted
+    // external handle is stale, not a live handle.
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
+            _ => None,
+        })
+        .collect();
+
     // Case 1: Canonical Task record ID
     if id_or_handle.starts_with("project:") {
         let parts: Vec<&str> = id_or_handle.split(':').collect();
@@ -2491,7 +2502,7 @@ pub fn resolve_task_ids(
                 }
             }
 
-            if matches {
+            if matches && !tombstoned.contains(id.as_str()) {
                 matched_links.insert(id.clone());
             }
         }
@@ -2514,12 +2525,14 @@ pub fn resolve_task_ids(
     // Also check EXTERNAL_HANDLE edges from Task to ExternalLink
     for r in records {
         if let GraphRecord::Edge {
+            id: edge_id,
             label: EdgeLabel::ExternalHandle,
             source,
             target,
             ..
         } = r
             && matched_links.contains(target)
+            && !tombstoned.contains(edge_id.as_str())
         {
             for task_record in records {
                 if let GraphRecord::Node {
@@ -5946,9 +5959,11 @@ fn compute_resolution_status<'a>(
             if *instant <= fail_time {
                 continue;
             }
+            // `resolved_by` is the pass that *first* resolved the failure — the
+            // earliest later success — not the most recent run. Tie-break by ID.
             let better = match best {
                 None => true,
-                Some((bt, bid)) => (*instant, *sid) > (bt, bid),
+                Some((bt, bid)) => (*instant, *sid) < (bt, bid),
             };
             if better {
                 best = Some((*instant, sid));
