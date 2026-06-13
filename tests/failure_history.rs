@@ -1364,3 +1364,248 @@ fn source_handle_returns_only_matched_seed_failures() {
     assert_eq!(agent.len(), 1, "source handle names its own failures only");
     assert_eq!(agent[0]["record_id"], f1_id);
 }
+
+// ── Round-3 review-fix coverage ─────────────────────────────────────────────
+
+#[test]
+fn file_query_relays_through_patch_artifact_to_failure() {
+    // link_evidence shape: PatchArtifact --TOUCHED_FILE--> File; the failing
+    // attempt is Failure --FAILED_ON--> PatchArtifact. A file query must reach
+    // the failure behind the patch, not silently drop it.
+    let file_path = "src/relay.rs";
+    let file_id = stable_id(&["node", "File", file_path]);
+    let file = GraphRecord::syntax_node(
+        file_id.clone(),
+        NodeKind::File,
+        file_path.to_owned(),
+        span(1, 50),
+        "relay.rs".to_owned(),
+        "rust",
+        "f".to_owned(),
+    );
+    let patch_id = artifact_stable_id(&["patch", "relay_patch"]);
+    let mut patch = GraphRecord::node(
+        patch_id.clone(),
+        NodeKind::PatchArtifact,
+        None,
+        None,
+        None,
+        "patch".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        patch_status,
+        patch_bytes_hash,
+        target_files,
+        ..
+    } = &mut patch
+    {
+        *schema_version = ARTIFACT_SCHEMA_VERSION;
+        *patch_status = Some("invalid".to_owned());
+        *patch_bytes_hash = Some("blake3:rp".to_owned());
+        *target_files = Some(vec![file_path.to_owned()]);
+    }
+    let fail_id = agent_memory_stable_id(&["failure", "relay_fail"]);
+    let fail = failure_node(
+        &fail_id,
+        "patch_invalid",
+        Some("2026-01-01T00:00:00Z"),
+        vec![],
+    );
+    let touched = GraphRecord::edge(
+        EdgeLabel::TouchedFile,
+        patch_id.clone(),
+        file_id,
+        None,
+        "patch touched file".to_owned(),
+    );
+    let failed_on = GraphRecord::edge(
+        EdgeLabel::FailedOn,
+        fail_id.clone(),
+        patch_id.clone(),
+        None,
+        "failure failed on patch".to_owned(),
+    );
+    let (_t, graph) = write_graph(vec![file, patch, fail, touched, failed_on]);
+    let (code, stdout, stderr) = run_graph(&graph, file_path, &[]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse(&stdout);
+    let agent = v["agent_failures"].as_array().unwrap();
+    assert_eq!(
+        agent.len(),
+        1,
+        "patch-relay failure must surface for a file query"
+    );
+    assert_eq!(agent[0]["record_id"], fail_id);
+    assert_eq!(
+        v["patch_artifacts"].as_array().unwrap()[0]["record_id"],
+        patch_id
+    );
+}
+
+#[test]
+fn ac_verification_link_id_supersedes_without_closure_edge() {
+    let task_id = project_stable_id(&["task", "t_vlink"]);
+    let mut task = GraphRecord::node(
+        task_id.clone(),
+        NodeKind::Task,
+        None,
+        None,
+        Some("Task".to_owned()),
+        "Task".to_owned(),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut task {
+        *schema_version = PROJECT_SCHEMA_VERSION;
+    }
+    let pass_id = verification_stable_id(&["v", "vlink_pass"]);
+    let ac_id = project_stable_id(&["ac", "ac_vlink"]);
+    let mut ac = GraphRecord::node(
+        ac_id.clone(),
+        NodeKind::AcceptanceCriterion,
+        None,
+        None,
+        Some("AC".to_owned()),
+        "AC".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        parent_task_id,
+        verification_link_id,
+        ..
+    } = &mut ac
+    {
+        *schema_version = PROJECT_SCHEMA_VERSION;
+        *parent_task_id = Some(task_id.clone());
+        *verification_link_id = Some(pass_id.clone()); // no CLOSES edge present
+    }
+    let fail = failure_node(
+        &agent_memory_stable_id(&["failure", "vlink_fail"]),
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![link(&ac_id, "project", "FAILED_ON")],
+    );
+    let pass = verification_node(
+        &pass_id,
+        NodeKind::TestRun,
+        Some("pass"),
+        None,
+        Some("2026-02-01T00:00:00Z"),
+        None,
+        vec![],
+    );
+    let (_t, graph) = write_graph(vec![task, ac, fail, pass]);
+    let (code, stdout, stderr) = run_graph(&graph, &task_id, &[]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse(&stdout);
+    assert_eq!(
+        v["superseding_successes"].as_array().unwrap().len(),
+        1,
+        "AC verification_link_id must resolve without a CLOSES edge"
+    );
+    assert_eq!(
+        v["agent_failures"][0]["resolution_status"],
+        "since_resolved"
+    );
+}
+
+#[test]
+fn task_shaped_source_handle_falls_through_to_source_match() {
+    // `owner/repo#999` is task-shaped but resolves to no task; it is also this
+    // failure's source handle, so it must fall through to source matching.
+    let (symbol_id, symbol) = symbol_node("src/ft.rs", "fall");
+    let fail_id = agent_memory_stable_id(&["failure", "ft_fail"]);
+    let mut fail = failure_node(
+        &fail_id,
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![link(&symbol_id, "codegraph", "FAILED_ON")],
+    );
+    if let GraphRecord::Node { source_handle, .. } = &mut fail {
+        *source_handle = Some("acme/widget#999".to_owned());
+    }
+    let (_t, graph) = write_graph(vec![symbol, fail]);
+    let (code, stdout, stderr) = run_graph(&graph, "acme/widget#999", &[]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse(&stdout);
+    assert_eq!(v["target_type"], "source");
+    assert_eq!(v["agent_failures"][0]["record_id"], fail_id);
+}
+
+#[test]
+fn edge_based_provenance_is_surfaced() {
+    // A Failure with no agent_id/session_id fields, but AUTHORED_BY / SESSION_OF
+    // edges, must still expose its citable agent/session provenance.
+    let (symbol_id, symbol) = symbol_node("src/pv.rs", "prov");
+    let fail_id = agent_memory_stable_id(&["failure", "pv_fail"]);
+    let mut fail = GraphRecord::node(
+        fail_id.clone(),
+        NodeKind::Failure,
+        None,
+        None,
+        None,
+        "Failure".to_owned(),
+    );
+    if let GraphRecord::Node {
+        failure_kind,
+        observed_at,
+        schema_version,
+        evidence_links,
+        ..
+    } = &mut fail
+    {
+        *failure_kind = Some("command_failure".to_owned());
+        *observed_at = Some("2026-01-01T00:00:00Z".to_owned());
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![link(&symbol_id, "codegraph", "FAILED_ON")]);
+    }
+    let session_id = agent_memory_stable_id(&["node", "agent_session", "s"]);
+    let mut session = GraphRecord::node(
+        session_id.clone(),
+        NodeKind::AgentSession,
+        None,
+        None,
+        Some("sess".to_owned()),
+        "session".to_owned(),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut session {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+    }
+    let agent_id = agent_memory_stable_id(&["node", "agent", "a"]);
+    let mut agent = GraphRecord::node(
+        agent_id.clone(),
+        NodeKind::Agent,
+        None,
+        None,
+        Some("agent".to_owned()),
+        "agent".to_owned(),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut agent {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+    }
+    let authored = GraphRecord::edge(
+        EdgeLabel::AuthoredBy,
+        fail_id,
+        session_id.clone(),
+        None,
+        "authored".to_owned(),
+    );
+    let session_of = GraphRecord::edge(
+        EdgeLabel::SessionOf,
+        session_id.clone(),
+        agent_id.clone(),
+        None,
+        "session of".to_owned(),
+    );
+    let (_t, graph) = write_graph(vec![symbol, fail, session, agent, authored, session_of]);
+    let (code, stdout, stderr) = run_graph(&graph, &symbol_id, &[]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse(&stdout);
+    assert_eq!(
+        v["agent_sessions"].as_array().unwrap(),
+        &vec![serde_json::json!(session_id)]
+    );
+    assert_eq!(
+        v["agents"].as_array().unwrap(),
+        &vec![serde_json::json!(agent_id)]
+    );
+}

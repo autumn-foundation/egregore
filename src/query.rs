@@ -5286,36 +5286,42 @@ pub fn resolve_failure_handle(
                 .into_iter()
                 .filter(|id| !tombstoned.contains(id.as_str()))
                 .collect();
-            if live.is_empty() {
+            if !live.is_empty() {
+                // Expand to the tasks' acceptance criteria so failures/verifications
+                // attached to an `AcceptanceCriterion` are included (mirrors the
+                // task-evidence query, which expands tasks to their ACs).
+                let mut anchor_ids = live.clone();
+                for r in records {
+                    if let GraphRecord::Node {
+                        id,
+                        kind: NodeKind::AcceptanceCriterion,
+                        parent_task_id: Some(parent),
+                        ..
+                    } = r
+                        && live.contains(parent)
+                        && !tombstoned.contains(id.as_str())
+                    {
+                        anchor_ids.insert(id.clone());
+                    }
+                }
+                return Ok(ResolvedFailureTarget {
+                    handle: handle.to_owned(),
+                    kind: FailureTargetKind::Task,
+                    anchor_ids,
+                    seed_failures: BTreeSet::new(),
+                    stale: false,
+                });
+            }
+            // No live task. Only a canonical `project:` ID definitively names a
+            // (now-absent or deleted) task and stops here; a GitHub/JSONL handle
+            // may also be a failure's source handle, so fall through to the
+            // source/file/symbol steps rather than returning no_match early.
+            if handle.starts_with("project:") {
                 return Ok(empty_target(
                     FailureTargetKind::Task,
                     had_match || tombstoned.contains(handle),
                 ));
             }
-            // Expand to the tasks' acceptance criteria so failures/verifications
-            // attached to an `AcceptanceCriterion` are included (mirrors the
-            // task-evidence query, which expands tasks to their ACs).
-            let mut anchor_ids = live.clone();
-            for r in records {
-                if let GraphRecord::Node {
-                    id,
-                    kind: NodeKind::AcceptanceCriterion,
-                    parent_task_id: Some(parent),
-                    ..
-                } = r
-                    && live.contains(parent)
-                    && !tombstoned.contains(id.as_str())
-                {
-                    anchor_ids.insert(id.clone());
-                }
-            }
-            return Ok(ResolvedFailureTarget {
-                handle: handle.to_owned(),
-                kind: FailureTargetKind::Task,
-                anchor_ids,
-                seed_failures: BTreeSet::new(),
-                stale: false,
-            });
         }
         Err(TaskResolveError::Ambiguous {
             handle: h,
@@ -5618,24 +5624,75 @@ pub fn failure_history_context<'a>(
     }
     // `CLOSES_ACCEPTANCE_CRITERION` runs AcceptanceCriterion -> Verification, so
     // the verification that closes an AC is reached by following the AC anchor's
-    // OUTBOUND closure edge rather than an inbound link. Without this, a task whose
-    // AC was closed by a passing run would show no superseding success.
+    // OUTBOUND closure edge (or its denormalized `verification_link_id`) rather
+    // than an inbound link. Without this, a task whose AC was closed by a passing
+    // run would show no superseding success.
     for anchor in &anchor_universe {
-        if !present(anchor)
-            .is_some_and(|n| matches!(record_node_kind(n), Some(NodeKind::AcceptanceCriterion)))
-        {
-            continue;
-        }
-        let Some(edges) = edges_from.get(*anchor) else {
+        let Some(ac_node) = present(anchor) else {
             continue;
         };
-        for (label, t) in edges {
-            if matches!(label, EdgeLabel::ClosesAcceptanceCriterion) && present(t).is_some() {
-                candidate_anchors.entry(t).or_default().insert(anchor);
-                candidate_rel
-                    .entry(t)
-                    .or_insert("CLOSES_ACCEPTANCE_CRITERION");
+        if !matches!(
+            record_node_kind(ac_node),
+            Some(NodeKind::AcceptanceCriterion)
+        ) {
+            continue;
+        }
+        if let Some(edges) = edges_from.get(*anchor) {
+            for (label, t) in edges {
+                if matches!(label, EdgeLabel::ClosesAcceptanceCriterion) && present(t).is_some() {
+                    candidate_anchors.entry(t).or_default().insert(anchor);
+                    candidate_rel
+                        .entry(t)
+                        .or_insert("CLOSES_ACCEPTANCE_CRITERION");
+                }
             }
+        }
+        // Denormalized form: an AC may carry `verification_link_id` without a
+        // synthesized closure edge (project-imported / daemon-written data).
+        if let GraphRecord::Node {
+            verification_link_id: Some(vid),
+            ..
+        } = ac_node
+            && present(vid).is_some()
+        {
+            candidate_anchors
+                .entry(vid.as_str())
+                .or_default()
+                .insert(anchor);
+            candidate_rel
+                .entry(vid.as_str())
+                .or_insert("CLOSES_ACCEPTANCE_CRITERION");
+        }
+    }
+
+    // PatchArtifact relay: `link_evidence` attaches a patch to a File via
+    // `TOUCHED_FILE` while the failing attempt is `Failure --FAILED_ON-->
+    // PatchArtifact`. A file/symbol query therefore reaches the patch, not the
+    // failure; walk each reached patch's inbound `FAILED_ON` edges so those
+    // failures enter the candidate set on the same anchor.
+    let patch_relays: Vec<(&str, BTreeSet<&str>)> = candidate_anchors
+        .iter()
+        .filter(|(cid, _)| {
+            present(cid)
+                .is_some_and(|n| matches!(record_node_kind(n), Some(NodeKind::PatchArtifact)))
+        })
+        .map(|(cid, anchors)| (*cid, anchors.clone()))
+        .collect();
+    for (patch_id, anchors) in patch_relays {
+        let Some(srcs) = inbound.get(patch_id) else {
+            continue;
+        };
+        for (src, rel) in srcs {
+            if *rel != "FAILED_ON"
+                || !present(src)
+                    .is_some_and(|n| matches!(record_node_kind(n), Some(NodeKind::Failure)))
+            {
+                continue;
+            }
+            for a in &anchors {
+                candidate_anchors.entry(src).or_default().insert(a);
+            }
+            candidate_rel.entry(src).or_insert("FAILED_ON");
         }
     }
 

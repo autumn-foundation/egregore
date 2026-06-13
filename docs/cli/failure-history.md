@@ -70,7 +70,8 @@ task-completion proof (AC4). Every section is canonically ordered for determinis
 | `runtime_failures` | Verification-domain command/test/CI failures (`status` fail/error/timeout, or a nonzero `exit_code` when `status` is absent). | `verification_evidence` |
 | `agent_failures` | Agent-authored `Failure` claims. | `agent_authored` |
 | `superseding_successes` | Passing verifications (status `pass`, or a status-absent `CommandRun` with a zero `exit_code`) strictly **later** than a reached failure on a shared target — a pass with no failures, or one predating every failure, superseded nothing and is omitted. | `verification_evidence` |
-| `patch_artifacts` | Patch artifacts and runtime evidence attached to a reached failure via `PRODUCED_PATCH` / `FAILED_ON`. | `artifact` |
+| `patch_artifacts` | Patch artifacts attached to a reached failure via `PRODUCED_PATCH` / `FAILED_ON`. A file query also relays through a `PatchArtifact --TOUCHED_FILE--> File` link back to the `Failure --FAILED_ON--> PatchArtifact` behind it. | `artifact` |
+| `agent_sessions` / `agents` | `AgentSession` / `Agent` record IDs reached via `AUTHORED_BY` / `SESSION_OF` — citable provenance when a failure carries no `agent_id`/`session_id` fields. Omitted when empty. | — |
 | `diagnostics` | Stable codes for unresolved / stale / missing / protected / redacted handles. | — |
 | `page` | Deterministic pagination block (`cursor`, `has_more`, `returned`). | — |
 | `target_ids` / `target_type` | The resolved anchor record IDs and handle type. | — |

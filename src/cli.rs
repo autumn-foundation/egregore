@@ -2624,6 +2624,13 @@ struct FailureHistoryResponse<'a> {
     agent_failures: Vec<FailureAttemptJson<'a>>,
     superseding_successes: Vec<AuditItem<'a>>,
     patch_artifacts: Vec<AuditItem<'a>>,
+    /// `AgentSession` record IDs reached via `AUTHORED_BY` from a failure — the
+    /// citable provenance when a `Failure` carries no `agent_id`/`session_id`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    agent_sessions: Vec<&'a str>,
+    /// `Agent` record IDs reached via `SESSION_OF`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    agents: Vec<&'a str>,
     diagnostics: Vec<AuditDiagnostic<'a>>,
     page: AuditPage,
 }
@@ -5713,6 +5720,8 @@ fn query_failures_cmd(
         agent_failures,
         superseding_successes,
         patch_artifacts,
+        agent_sessions: ctx.agent_sessions.iter().map(|r| r.id()).collect(),
+        agents: ctx.agents.iter().map(|r| r.id()).collect(),
         diagnostics,
         page: AuditPage {
             cursor: None,
