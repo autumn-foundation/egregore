@@ -4985,7 +4985,7 @@ pub struct UnexplainedChange<'a> {
 pub struct ContextObservation<'a> {
     pub record_id: &'a str,
     pub kind: &'static str,
-    pub summary: &'a str,
+    pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5012,7 +5012,7 @@ pub struct ContextObservation<'a> {
 pub struct ContextLinkedItem<'a> {
     pub record_id: &'a str,
     pub kind: &'static str,
-    pub summary: &'a str,
+    pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5109,8 +5109,52 @@ pub fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_
     Some(ContextObservation {
         record_id: id,
         kind: kind.as_str(),
-        summary,
+        summary: summary.to_owned(),
         text: text.as_deref(),
+        provenance_handle,
+        agent_id: agent_id.as_deref(),
+        session_id: session_id.as_deref(),
+        observed_at: observed_at.as_deref(),
+        confidence: confidence.as_deref(),
+        failure_kind: failure_kind.as_deref(),
+        exit_code: *exit_code,
+        evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
+    })
+}
+
+/// Helper function to convert a GraphRecord to ContextObservation with redacted payloads.
+#[must_use]
+pub fn redacted_context_observation(record: &GraphRecord) -> Option<ContextObservation<'_>> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        agent_id,
+        session_id,
+        observed_at,
+        confidence,
+        failure_kind,
+        exit_code,
+        evidence_links,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    let provenance_handle = match (agent_id.as_deref(), session_id.as_deref()) {
+        (Some(a), Some(s)) => Some(format!("{a}:{s}")),
+        (Some(a), None) => Some(a.to_owned()),
+        _ => None,
+    };
+    let summary = match (agent_id.as_deref(), session_id.as_deref()) {
+        (Some(a), Some(s)) => format!("{} by {a}:{s}", kind.as_str()),
+        (Some(a), None) => format!("{} by {a}", kind.as_str()),
+        _ => kind.as_str().to_owned(),
+    };
+    Some(ContextObservation {
+        record_id: id,
+        kind: kind.as_str(),
+        summary,
+        text: None,
         provenance_handle,
         agent_id: agent_id.as_deref(),
         session_id: session_id.as_deref(),
@@ -5169,7 +5213,7 @@ pub fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>
     Some(ContextLinkedItem {
         record_id: id,
         kind: kind.as_str(),
-        summary,
+        summary: summary.to_owned(),
         title: title.as_deref(),
         name: name.as_deref(),
         text: text.as_deref(),
@@ -5196,6 +5240,95 @@ pub fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>
         patch_bytes_size: *patch_bytes_size,
         target_files: target_files.as_deref(),
         validation_summary: validation_summary.as_deref(),
+        base_commit: base_commit.as_deref(),
+        unknown_base_reason: unknown_base_reason.as_deref(),
+        producer_session_id: producer_session_id.as_deref(),
+        body_handle: body_handle.as_deref(),
+        evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
+        verification_record: None,
+        author: author.as_deref(),
+    })
+}
+
+/// Helper function to convert a GraphRecord to ContextLinkedItem with redacted payloads.
+#[must_use]
+pub fn redacted_context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        name,
+        status,
+        verification_kind,
+        exit_code,
+        executed_at,
+        evidence_quality,
+        stdout_handle,
+        stderr_handle,
+        source_artifact_path,
+        source_artifact_hash,
+        repo_relative_path,
+        edit_kind,
+        before_hash,
+        after_hash,
+        rename_to,
+        hunk_count,
+        linked_turn_id,
+        linked_patch_id,
+        patch_status,
+        patch_handle,
+        patch_bytes_hash,
+        patch_bytes_size,
+        target_files,
+        base_commit,
+        unknown_base_reason,
+        producer_session_id,
+        body_handle,
+        evidence_links,
+        author,
+        agent_id,
+        session_id,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    let display_author = author.as_deref().or(agent_id.as_deref());
+    let display_session = session_id.as_deref().or(producer_session_id.as_deref());
+    let summary = match (display_author, display_session) {
+        (Some(a), Some(s)) => format!("{} by {a}:{s}", kind.as_str()),
+        (Some(a), None) => format!("{} by {a}", kind.as_str()),
+        _ => kind.as_str().to_owned(),
+    };
+    Some(ContextLinkedItem {
+        record_id: id,
+        kind: kind.as_str(),
+        summary,
+        title: None,
+        name: name.as_deref(),
+        text: None,
+        status: status.as_deref(),
+        verification_kind: verification_kind.as_deref(),
+        exit_code: *exit_code,
+        executed_at: executed_at.as_deref(),
+        evidence_quality: evidence_quality.as_deref(),
+        stdout_handle: stdout_handle.as_deref(),
+        stderr_handle: stderr_handle.as_deref(),
+        source_artifact_path: source_artifact_path.as_deref(),
+        source_artifact_hash: source_artifact_hash.as_deref(),
+        repo_relative_path: repo_relative_path.as_deref(),
+        edit_kind: edit_kind.as_deref(),
+        before_hash: before_hash.as_deref(),
+        after_hash: after_hash.as_deref(),
+        rename_to: rename_to.as_deref(),
+        hunk_count: *hunk_count,
+        linked_turn_id: linked_turn_id.as_deref(),
+        linked_patch_id: linked_patch_id.as_deref(),
+        patch_status: patch_status.as_deref(),
+        patch_handle: patch_handle.as_deref(),
+        patch_bytes_hash: patch_bytes_hash.as_deref(),
+        patch_bytes_size: *patch_bytes_size,
+        target_files: target_files.as_deref(),
+        validation_summary: None,
         base_commit: base_commit.as_deref(),
         unknown_base_reason: unknown_base_reason.as_deref(),
         producer_session_id: producer_session_id.as_deref(),
@@ -5867,7 +6000,7 @@ pub fn changes_context<'a>(
     let mut output_observations = Vec::new();
     for id in observations {
         if let Some(rec) = by_id.get(id) {
-            if let Some(obs) = context_observation(rec) {
+            if let Some(obs) = redacted_context_observation(rec) {
                 output_observations.push(obs);
             }
         }
@@ -5875,7 +6008,7 @@ pub fn changes_context<'a>(
     let mut output_project_state = Vec::new();
     for id in project_state {
         if let Some(rec) = by_id.get(id) {
-            if let Some(item) = context_linked_item(rec) {
+            if let Some(item) = redacted_context_linked_item(rec) {
                 output_project_state.push(item);
             }
         }
@@ -5883,7 +6016,7 @@ pub fn changes_context<'a>(
     let mut output_artifacts = Vec::new();
     for id in artifacts {
         if let Some(rec) = by_id.get(id) {
-            if let Some(item) = context_linked_item(rec) {
+            if let Some(item) = redacted_context_linked_item(rec) {
                 output_artifacts.push(item);
             }
         }
@@ -5891,7 +6024,7 @@ pub fn changes_context<'a>(
     let mut output_verification_evidence = Vec::new();
     for id in verification_evidence {
         if let Some(rec) = by_id.get(id) {
-            if let Some(item) = context_linked_item(rec) {
+            if let Some(item) = redacted_context_linked_item(rec) {
                 output_verification_evidence.push(item);
             }
         }
@@ -5986,40 +6119,52 @@ fn is_linked_to_evidence(
     let mut frontier = vec![seed_id];
     visited.insert(seed_id);
 
+    let is_evidence = |node_id: &str| -> bool {
+        if node_id == seed_id {
+            return false;
+        }
+        if let Some(GraphRecord::Node { kind, .. }) = by_id.get(node_id) {
+            if classify_node(*kind).is_some()
+                && classify_node(*kind) != Some(ContextSection::SourceFact)
+            {
+                return true;
+            }
+        }
+        false
+    };
+
     for _hop in 0..3 {
         let mut next_frontier = Vec::new();
         for current in frontier {
-            if current != seed_id {
-                if let Some(GraphRecord::Node { kind, .. }) = by_id.get(current) {
-                    if classify_node(*kind).is_some()
-                        && classify_node(*kind) != Some(ContextSection::SourceFact)
-                    {
-                        return true;
-                    }
-                }
-            }
-
             if let Some(outs) = edges_from.get(current) {
                 for (label, target) in outs {
+                    let target = *target;
                     if !is_cross_domain_label(*label) {
                         continue;
                     }
-                    if visited.insert(*target) {
-                        next_frontier.push(*target);
+                    if visited.insert(target) {
+                        if is_evidence(target) {
+                            return true;
+                        }
+                        next_frontier.push(target);
                     }
                 }
             }
 
             if let Some(ins) = edges_to.get(current) {
                 for (label, source) in ins {
+                    let source = *source;
                     if !is_cross_domain_label(*label) {
                         continue;
                     }
                     if is_forward_only_label(*label) {
                         continue;
                     }
-                    if visited.insert(*source) {
-                        next_frontier.push(*source);
+                    if visited.insert(source) {
+                        if is_evidence(source) {
+                            return true;
+                        }
+                        next_frontier.push(source);
                     }
                 }
             }
@@ -6032,6 +6177,9 @@ fn is_linked_to_evidence(
                 for link in links {
                     if let Some(target_id) = &link.target_record_id {
                         if visited.insert(target_id.as_str()) {
+                            if is_evidence(target_id.as_str()) {
+                                return true;
+                            }
                             next_frontier.push(target_id.as_str());
                         }
                     }
@@ -6040,8 +6188,12 @@ fn is_linked_to_evidence(
 
             if let Some(sources) = evidence_links_to.get(current) {
                 for source in sources {
-                    if visited.insert(*source) {
-                        next_frontier.push(*source);
+                    let source = *source;
+                    if visited.insert(source) {
+                        if is_evidence(source) {
+                            return true;
+                        }
+                        next_frontier.push(source);
                     }
                 }
             }
