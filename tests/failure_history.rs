@@ -1144,3 +1144,223 @@ fn tombstoned_failed_on_edge_is_skipped() {
         "failure reached only through a retracted edge must be excluded"
     );
 }
+
+// ── Round-2 review-fix coverage ─────────────────────────────────────────────
+
+fn parse(stdout: &str) -> serde_json::Value {
+    serde_json::from_str(stdout.trim()).expect("valid JSON")
+}
+
+fn tombstone_for(deleted_id: &str) -> GraphRecord {
+    GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", deleted_id]),
+        schema_version: PROJECT_SCHEMA_VERSION,
+        deleted_id: deleted_id.to_owned(),
+        summary: "deleted".to_owned(),
+        producer: None,
+    }
+}
+
+#[test]
+fn zero_exit_command_run_supersedes_failure() {
+    // A later status-absent CommandRun with exit_code 0 is citable successful
+    // evidence that supersedes an earlier failure on the same target.
+    let (symbol_id, symbol) = symbol_node("src/z.rs", "zeta");
+    let fail = failure_node(
+        &agent_memory_stable_id(&["failure", "z1"]),
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![link(&symbol_id, "codegraph", "FAILED_ON")],
+    );
+    let pass = verification_node(
+        &verification_stable_id(&["v", "z_pass"]),
+        NodeKind::CommandRun,
+        None,    // no status
+        Some(0), // exit_code 0 → pass (symmetry with failure classification)
+        None,
+        Some("2026-02-01T00:00:00Z"),
+        vec![link(&symbol_id, "codegraph", "VALIDATED_BY")],
+    );
+    let (_t, graph) = write_graph(vec![symbol, fail, pass]);
+    let (code, stdout, _e) = run_graph(&graph, &symbol_id, &[]);
+    assert_eq!(code, 0);
+    let v = parse(&stdout);
+    assert_eq!(v["superseding_successes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        v["agent_failures"][0]["resolution_status"],
+        "since_resolved"
+    );
+}
+
+#[test]
+fn tombstoned_file_path_exits_2_stale() {
+    let file_path = "src/gone.rs";
+    let file_id = stable_id(&["node", "File", file_path]);
+    let file = GraphRecord::syntax_node(
+        file_id.clone(),
+        NodeKind::File,
+        file_path.to_owned(),
+        span(1, 5),
+        "gone.rs".to_owned(),
+        "rust",
+        "deleted file".to_owned(),
+    );
+    let tombstone = tombstone_for(&file_id);
+    let (_t, graph) = write_graph(vec![file, tombstone]);
+    let (code, stdout, _e) = run_graph(&graph, file_path, &[]);
+    assert_eq!(code, 2, "a deleted file path must be stale, not no_match");
+    assert_eq!(parse(&stdout)["error"]["code"], "stale_handle");
+}
+
+#[test]
+fn task_supersession_follows_acceptance_criterion_closure_edge() {
+    let task_id = project_stable_id(&["task", "t_close"]);
+    let mut task = GraphRecord::node(
+        task_id.clone(),
+        NodeKind::Task,
+        None,
+        None,
+        Some("Task".to_owned()),
+        "Task".to_owned(),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut task {
+        *schema_version = PROJECT_SCHEMA_VERSION;
+    }
+    let ac_id = project_stable_id(&["ac", "ac_close"]);
+    let mut ac = GraphRecord::node(
+        ac_id.clone(),
+        NodeKind::AcceptanceCriterion,
+        None,
+        None,
+        Some("AC".to_owned()),
+        "AC".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        parent_task_id,
+        ..
+    } = &mut ac
+    {
+        *schema_version = PROJECT_SCHEMA_VERSION;
+        *parent_task_id = Some(task_id.clone());
+    }
+    // A failure on the AC, then a passing run that CLOSES the AC (AC -> Verification).
+    let fail = failure_node(
+        &agent_memory_stable_id(&["failure", "ac_fail"]),
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![link(&ac_id, "project", "FAILED_ON")],
+    );
+    let pass_id = verification_stable_id(&["v", "ac_pass"]);
+    let pass = verification_node(
+        &pass_id,
+        NodeKind::TestRun,
+        Some("pass"),
+        None,
+        Some("2026-02-01T00:00:00Z"),
+        None,
+        vec![],
+    );
+    let closes = GraphRecord::edge(
+        EdgeLabel::ClosesAcceptanceCriterion,
+        ac_id,
+        pass_id,
+        None,
+        "AC closed by passing run".to_owned(),
+    );
+    let (_t, graph) = write_graph(vec![task, ac, fail, pass, closes]);
+    let (code, stdout, stderr) = run_graph(&graph, &task_id, &[]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse(&stdout);
+    assert_eq!(
+        v["superseding_successes"].as_array().unwrap().len(),
+        1,
+        "AC-closing pass must surface as a superseding success"
+    );
+    assert_eq!(
+        v["agent_failures"][0]["resolution_status"],
+        "since_resolved"
+    );
+}
+
+#[test]
+fn unattributed_match_makes_repo_ambiguous() {
+    // repo-a owns one `widget`; a second unattributed `widget` has no repository.
+    let repo_id = stable_id(&["node", "Repository", "repo-a"]);
+    let owned_path = "a/src/lib.rs";
+    let owned_file = stable_id(&["node", "File", owned_path]);
+    let (owned_sym, owned_sym_node) = symbol_node(owned_path, "widget");
+    let (_unattr_sym, unattr_sym_node) = symbol_node("legacy/lib.rs", "widget");
+    let records = vec![
+        GraphRecord::node(
+            repo_id.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some("repo-a".to_owned()),
+            "repo".to_owned(),
+        ),
+        GraphRecord::syntax_node(
+            owned_file.clone(),
+            NodeKind::File,
+            owned_path.to_owned(),
+            span(1, 10),
+            "lib.rs".to_owned(),
+            "rust",
+            "f".to_owned(),
+        ),
+        owned_sym_node,
+        unattr_sym_node,
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id,
+            owned_file.clone(),
+            None,
+            "contains".to_owned(),
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Defines,
+            owned_file,
+            owned_sym,
+            None,
+            "defines".to_owned(),
+        ),
+    ];
+    let (_t, graph) = write_graph(records);
+    let (code, _stdout, stderr) = run_graph(&graph, "widget", &[]);
+    assert_eq!(
+        code, 1,
+        "an unattributed match alongside a repo-owned one is ambiguous"
+    );
+    assert!(parse(&stderr).get("Ambiguous").is_some());
+}
+
+#[test]
+fn source_handle_returns_only_matched_seed_failures() {
+    let (symbol_id, symbol) = symbol_node("src/s.rs", "sigma");
+    let make_fail = |key: &str, src: &str, when: &str| -> GraphRecord {
+        let mut f = failure_node(
+            &agent_memory_stable_id(&["failure", key]),
+            "command_failure",
+            Some(when),
+            vec![link(&symbol_id, "codegraph", "FAILED_ON")],
+        );
+        if let GraphRecord::Node { source_handle, .. } = &mut f {
+            *source_handle = Some(src.to_owned());
+        }
+        f
+    };
+    let f1 = make_fail("s1", "trajectories/run-A.traj", "2026-01-01T00:00:00Z");
+    let f1_id = f1.id().to_owned();
+    let f2 = make_fail("s2", "trajectories/run-B.traj", "2026-01-02T00:00:00Z");
+    let (_t, graph) = write_graph(vec![symbol, f1, f2]);
+    // Query by F1's source handle: only F1 is a prior attempt, not F2 (a
+    // different session on the same symbol).
+    let (code, stdout, stderr) = run_graph(&graph, "trajectories/run-A.traj", &[]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse(&stdout);
+    assert_eq!(v["target_type"], "source");
+    let agent = v["agent_failures"].as_array().unwrap();
+    assert_eq!(agent.len(), 1, "source handle names its own failures only");
+    assert_eq!(agent[0]["record_id"], f1_id);
+}

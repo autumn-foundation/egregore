@@ -5099,9 +5099,17 @@ fn is_failed_verification(node: &GraphRecord) -> bool {
         || (status.is_none() && matches!(exit_code, Some(c) if *c != 0))
 }
 
-/// True for a verification record whose status is `pass`.
+/// True for a verification record whose status is `pass`, or — symmetric with
+/// [`is_failed_verification`] — a status-absent `CommandRun` with a zero exit
+/// code, so a later successful command can supersede a prior failure.
 fn is_pass_status_node(node: &GraphRecord) -> bool {
-    matches!(node, GraphRecord::Node { status, .. } if is_pass_status(status.as_deref()))
+    let GraphRecord::Node {
+        status, exit_code, ..
+    } = node
+    else {
+        return false;
+    };
+    is_pass_status(status.as_deref()) || (status.is_none() && *exit_code == Some(0))
 }
 
 /// Merges a reached candidate into a classification map, unioning anchor sets
@@ -5327,6 +5335,11 @@ pub fn resolve_failure_handle(
         }
     }
 
+    // A path/name handle that matches only tombstoned (deleted) records is stale,
+    // not a never-seen handle: track that so step 6 reports `stale_handle` rather
+    // than `no_match`, the same distinction code/task handles already make.
+    let mut saw_tombstoned = false;
+
     // 3) Repo-relative file path.
     let mut file_matches: BTreeSet<String> = BTreeSet::new();
     for r in records {
@@ -5337,10 +5350,13 @@ pub fn resolve_failure_handle(
             ..
         } = r
             && path == handle
-            && !tombstoned.contains(id.as_str())
             && in_scope(id)
         {
-            file_matches.insert(id.clone());
+            if tombstoned.contains(id.as_str()) {
+                saw_tombstoned = true;
+            } else {
+                file_matches.insert(id.clone());
+            }
         }
     }
     if !file_matches.is_empty() {
@@ -5370,10 +5386,13 @@ pub fn resolve_failure_handle(
             ..
         } = r
             && name == handle
-            && !tombstoned.contains(id.as_str())
             && in_scope(id)
         {
-            symbol_matches.insert(id.clone());
+            if tombstoned.contains(id.as_str()) {
+                saw_tombstoned = true;
+            } else {
+                symbol_matches.insert(id.clone());
+            }
         }
     }
     if !symbol_matches.is_empty() {
@@ -5424,11 +5443,12 @@ pub fn resolve_failure_handle(
         });
     }
 
-    // 6) Nothing matched. A tombstoned handle is stale; otherwise it is a plain
-    //    no-match — the resolver never guesses a replacement (AC6).
+    // 6) Nothing matched. A handle that named a tombstoned record — or only
+    //    tombstoned path/name matches — is stale; otherwise it is a plain
+    //    no-match. The resolver never guesses a replacement (AC6).
     Ok(empty_target(
         FailureTargetKind::Symbol,
-        tombstoned.contains(handle),
+        saw_tombstoned || tombstoned.contains(handle),
     ))
 }
 
@@ -5442,11 +5462,11 @@ fn cross_repo_ambiguity(
     if repo_scope.is_some() {
         return None;
     }
-    let repos: BTreeSet<&str> = matches
-        .iter()
-        .filter_map(|id| repo_index.owner_of(id))
-        .collect();
-    if repos.len() > 1 {
+    // Unattributed (legacy) records form their own ambiguity group, matching the
+    // repository-scoped query behavior: a handle matching both a repo-owned record
+    // and an unattributed one must fail closed rather than silently merge them.
+    let owners: BTreeSet<Option<&str>> = matches.iter().map(|id| repo_index.owner_of(id)).collect();
+    if owners.len() > 1 {
         Some(matches.iter().cloned().collect())
     } else {
         None
@@ -5596,9 +5616,32 @@ pub fn failure_history_context<'a>(
             candidate_rel.entry(id).or_insert("SOURCE_HANDLE");
         }
     }
+    // `CLOSES_ACCEPTANCE_CRITERION` runs AcceptanceCriterion -> Verification, so
+    // the verification that closes an AC is reached by following the AC anchor's
+    // OUTBOUND closure edge rather than an inbound link. Without this, a task whose
+    // AC was closed by a passing run would show no superseding success.
+    for anchor in &anchor_universe {
+        if !present(anchor)
+            .is_some_and(|n| matches!(record_node_kind(n), Some(NodeKind::AcceptanceCriterion)))
+        {
+            continue;
+        }
+        let Some(edges) = edges_from.get(*anchor) else {
+            continue;
+        };
+        for (label, t) in edges {
+            if matches!(label, EdgeLabel::ClosesAcceptanceCriterion) && present(t).is_some() {
+                candidate_anchors.entry(t).or_default().insert(anchor);
+                candidate_rel
+                    .entry(t)
+                    .or_insert("CLOSES_ACCEPTANCE_CRITERION");
+            }
+        }
+    }
 
     // ── Classify candidates into agent failures, runtime failures, and passing
     //    successes, unioning anchor sets when a record is reached more than once. ──
+    let source_kind = matches!(target.kind, FailureTargetKind::Source);
     let mut agent: CandidateMap<'a> = BTreeMap::new();
     let mut runtime: CandidateMap<'a> = BTreeMap::new();
     let mut success: CandidateMap<'a> = BTreeMap::new();
@@ -5606,6 +5649,15 @@ pub fn failure_history_context<'a>(
     for (cid, anchors) in &candidate_anchors {
         let Some(node) = present(cid) else { continue };
         let rel = candidate_rel.get(cid).copied().unwrap_or("RELATES_TO");
+        // A source/provenance handle names failures directly: only the matched
+        // seeds are prior attempts. Anchor-linked records are kept solely as
+        // superseding successes, never as unrelated failures from other sessions.
+        if source_kind && !target.seed_failures.contains(*cid) {
+            if is_pass_status_node(node) {
+                merge_candidate(&mut success, node, anchors, rel);
+            }
+            continue;
+        }
         route_candidate(node, anchors, rel, &mut agent, &mut runtime, &mut success);
     }
 
