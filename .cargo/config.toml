@@ -3,3 +3,6 @@
 # tokenizers and native C++ code. On MSVC, `esaxx-rs` builds with the static CRT;
 # make `cxx`/tokenizers use the same runtime so all-features tests link.
 CXXFLAGS_x86_64_pc_windows_msvc = "/MT"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]

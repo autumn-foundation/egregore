@@ -10,7 +10,7 @@ use std::{
 
 use aletheia_egregore::{
     adapters::EmbeddedAletheiaSink,
-    daemon::{runtime_dir_for_data_dir, runtime_metadata_is_stale, StoreLease},
+    daemon::{StoreLease, runtime_dir_for_data_dir, runtime_metadata_is_stale},
     repair::{OwnershipVerdict, RepairRefusalCode, RepairSessionResult, preflight, run_repair},
 };
 use assert_cmd::Command;

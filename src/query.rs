@@ -15,7 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::DateTime;
 
 use crate::ir::{
-    EdgeLabel, EvidenceLink, GraphRecord, NodeKind, SemanticDriftMetadata, UserContextScope,
+    EdgeLabel, EvidenceLink, GraphRecord, NodeKind, OutputHandle, PatchHandle,
+    SemanticDriftMetadata, TemporalMetadata, UserContextScope,
 };
 use crate::redaction::redact_value;
 /// Finds a symbol record by name at a specific Git commit.
@@ -4978,6 +4979,233 @@ pub struct UnexplainedChange<'a> {
     pub summary: &'a str,
 }
 
+/// One item in the `observations` section of a query response.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContextObservation<'a> {
+    pub record_id: &'a str,
+    pub kind: &'static str,
+    pub summary: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance_handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence_links: Vec<&'a EvidenceLink>,
+}
+
+/// One item in the `project_state`, `artifacts`, or `verification_evidence` sections.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContextLinkedItem<'a> {
+    pub record_id: &'a str,
+    pub kind: &'static str,
+    pub summary: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executed_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_quality: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout_handle: Option<&'a OutputHandle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_handle: Option<&'a OutputHandle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_artifact_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_artifact_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rename_to: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hunk_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_turn_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_patch_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch_status: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch_handle: Option<&'a PatchHandle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch_bytes_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch_bytes_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_files: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_summary: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown_base_reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub producer_session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_handle: Option<&'a OutputHandle>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence_links: Vec<&'a EvidenceLink>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_record: Option<Box<Self>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<&'a str>,
+}
+
+/// Helper function to convert a GraphRecord to ContextObservation.
+#[must_use]
+pub fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_>> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        summary,
+        text,
+        agent_id,
+        session_id,
+        observed_at,
+        confidence,
+        failure_kind,
+        exit_code,
+        evidence_links,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    let provenance_handle = match (agent_id.as_deref(), session_id.as_deref()) {
+        (Some(a), Some(s)) => Some(format!("{a}:{s}")),
+        (Some(a), None) => Some(a.to_owned()),
+        _ => None,
+    };
+    Some(ContextObservation {
+        record_id: id,
+        kind: kind.as_str(),
+        summary,
+        text: text.as_deref(),
+        provenance_handle,
+        agent_id: agent_id.as_deref(),
+        session_id: session_id.as_deref(),
+        observed_at: observed_at.as_deref(),
+        confidence: confidence.as_deref(),
+        failure_kind: failure_kind.as_deref(),
+        exit_code: *exit_code,
+        evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
+    })
+}
+
+/// Helper function to convert a GraphRecord to ContextLinkedItem.
+#[must_use]
+pub fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        name,
+        title,
+        text,
+        summary,
+        status,
+        verification_kind,
+        exit_code,
+        executed_at,
+        evidence_quality,
+        stdout_handle,
+        stderr_handle,
+        source_artifact_path,
+        source_artifact_hash,
+        repo_relative_path,
+        edit_kind,
+        before_hash,
+        after_hash,
+        rename_to,
+        hunk_count,
+        linked_turn_id,
+        linked_patch_id,
+        patch_status,
+        patch_handle,
+        patch_bytes_hash,
+        patch_bytes_size,
+        target_files,
+        validation_summary,
+        base_commit,
+        unknown_base_reason,
+        producer_session_id,
+        body_handle,
+        evidence_links,
+        author,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    Some(ContextLinkedItem {
+        record_id: id,
+        kind: kind.as_str(),
+        summary,
+        title: title.as_deref(),
+        name: name.as_deref(),
+        text: text.as_deref(),
+        status: status.as_deref(),
+        verification_kind: verification_kind.as_deref(),
+        exit_code: *exit_code,
+        executed_at: executed_at.as_deref(),
+        evidence_quality: evidence_quality.as_deref(),
+        stdout_handle: stdout_handle.as_deref(),
+        stderr_handle: stderr_handle.as_deref(),
+        source_artifact_path: source_artifact_path.as_deref(),
+        source_artifact_hash: source_artifact_hash.as_deref(),
+        repo_relative_path: repo_relative_path.as_deref(),
+        edit_kind: edit_kind.as_deref(),
+        before_hash: before_hash.as_deref(),
+        after_hash: after_hash.as_deref(),
+        rename_to: rename_to.as_deref(),
+        hunk_count: *hunk_count,
+        linked_turn_id: linked_turn_id.as_deref(),
+        linked_patch_id: linked_patch_id.as_deref(),
+        patch_status: patch_status.as_deref(),
+        patch_handle: patch_handle.as_deref(),
+        patch_bytes_hash: patch_bytes_hash.as_deref(),
+        patch_bytes_size: *patch_bytes_size,
+        target_files: target_files.as_deref(),
+        validation_summary: validation_summary.as_deref(),
+        base_commit: base_commit.as_deref(),
+        unknown_base_reason: unknown_base_reason.as_deref(),
+        producer_session_id: producer_session_id.as_deref(),
+        body_handle: body_handle.as_deref(),
+        evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
+        verification_record: None,
+        author: author.as_deref(),
+    })
+}
+
 /// Context of changed facts and trust-separated evidence over a commit range.
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct ChangesContext<'a> {
@@ -4993,13 +5221,13 @@ pub struct ChangesContext<'a> {
     pub drift_records: Vec<ChangesDriftItem<'a>>,
 
     /// Subjective agent observations referencing nodes in the range.
-    pub observations: Vec<&'a GraphRecord>,
+    pub observations: Vec<ContextObservation<'a>>,
     /// Task and project management state referencing nodes in the range.
-    pub project_state: Vec<&'a GraphRecord>,
+    pub project_state: Vec<ContextLinkedItem<'a>>,
     /// Persistent generated artifacts referencing nodes in the range.
-    pub artifacts: Vec<&'a GraphRecord>,
+    pub artifacts: Vec<ContextLinkedItem<'a>>,
     /// Verification runs, proof outcomes, and test results referencing nodes in the range.
-    pub verification_evidence: Vec<&'a GraphRecord>,
+    pub verification_evidence: Vec<ContextLinkedItem<'a>>,
     /// Changed code facts that do not map to any explaining evidence.
     pub unexplained: Vec<UnexplainedChange<'a>>,
     /// Citations from observations/tasks to absent target records.
@@ -5219,12 +5447,69 @@ pub fn changes_context<'a>(
         .collect();
 
     // 5. Gather code facts in the range
+    let has_changed_in_edges = records.iter().any(|r| {
+        matches!(
+            r,
+            GraphRecord::Edge {
+                label: EdgeLabel::ChangedIn,
+                ..
+            }
+        )
+    });
+
+    let mut changed_node_ids = BTreeSet::new();
+    if has_changed_in_edges {
+        let mut range_target_ids = BTreeSet::new();
+        for r in records {
+            match r {
+                GraphRecord::Node {
+                    kind: NodeKind::Commit,
+                    name: Some(sha),
+                    ..
+                } if range_commit_shas.contains(sha.as_str()) => {
+                    range_target_ids.insert(r.id());
+                }
+                GraphRecord::Node {
+                    kind: NodeKind::Change,
+                    temporal: Some(t),
+                    ..
+                } if range_commit_shas.contains(t.git_commit.as_str()) => {
+                    range_target_ids.insert(r.id());
+                }
+                _ => {}
+            }
+        }
+        for r in records {
+            if let GraphRecord::Edge {
+                label: EdgeLabel::ChangedIn,
+                source,
+                target,
+                ..
+            } = r
+            {
+                if range_target_ids.contains(target.as_str()) {
+                    changed_node_ids.insert(source.as_str());
+                }
+            }
+        }
+    }
+
+    let is_changed_node = |r: &GraphRecord, t: &TemporalMetadata| -> bool {
+        if has_changed_in_edges {
+            changed_node_ids.contains(r.id())
+        } else {
+            range_commit_shas.contains(t.git_commit.as_str())
+        }
+    };
+
     let mut changed_files = Vec::new();
     let mut changed_symbols = Vec::new();
     let mut commits = Vec::new();
     let mut drift_records = Vec::new();
     let mut changed_paths = BTreeSet::new();
+    let mut added_file_commits = BTreeSet::new();
 
+    // Pass 1: commits, file nodes, symbol nodes, drift records
     for r in records {
         match r {
             GraphRecord::Node {
@@ -5244,25 +5529,13 @@ pub fn changes_context<'a>(
                 repo_relative_path: Some(path),
                 temporal: Some(t),
                 ..
-            } if range_commit_shas.contains(t.git_commit.as_str()) => {
+            } if is_changed_node(r, t) => {
                 changed_files.push(ChangesFileItem {
                     record: r,
                     path,
                     git_commit: &t.git_commit,
                 });
-                changed_paths.insert(path.as_str());
-            }
-            GraphRecord::Node {
-                kind: NodeKind::Change,
-                repo_relative_path: Some(path),
-                temporal: Some(t),
-                ..
-            } if range_commit_shas.contains(t.git_commit.as_str()) => {
-                changed_files.push(ChangesFileItem {
-                    record: r,
-                    path,
-                    git_commit: &t.git_commit,
-                });
+                added_file_commits.insert((path.as_str(), t.git_commit.as_str()));
                 changed_paths.insert(path.as_str());
             }
             GraphRecord::Node {
@@ -5271,7 +5544,7 @@ pub fn changes_context<'a>(
                 repo_relative_path: Some(path),
                 temporal: Some(t),
                 ..
-            } if range_commit_shas.contains(t.git_commit.as_str()) => {
+            } if is_changed_node(r, t) => {
                 changed_symbols.push(ChangesSymbolItem {
                     record: r,
                     name: sym_name,
@@ -5298,6 +5571,28 @@ pub fn changes_context<'a>(
                 }
             }
             _ => {}
+        }
+    }
+
+    // Pass 2: fallback Change nodes (only if not already added by Pass 1 File nodes)
+    for r in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Change,
+            repo_relative_path: Some(path),
+            temporal: Some(t),
+            ..
+        } = r
+        {
+            if range_commit_shas.contains(t.git_commit.as_str()) {
+                if added_file_commits.insert((path.as_str(), t.git_commit.as_str())) {
+                    changed_files.push(ChangesFileItem {
+                        record: r,
+                        path,
+                        git_commit: &t.git_commit,
+                    });
+                    changed_paths.insert(path.as_str());
+                }
+            }
         }
     }
 
@@ -5336,7 +5631,7 @@ pub fn changes_context<'a>(
         seed_ids.insert(item.record.id());
     }
     for item in &tombstones {
-        seed_ids.insert(item.record.id());
+        seed_ids.insert(item.deleted_id);
     }
 
     let mut observations = BTreeSet::new();
@@ -5572,25 +5867,33 @@ pub fn changes_context<'a>(
     let mut output_observations = Vec::new();
     for id in observations {
         if let Some(rec) = by_id.get(id) {
-            output_observations.push(*rec);
+            if let Some(obs) = context_observation(rec) {
+                output_observations.push(obs);
+            }
         }
     }
     let mut output_project_state = Vec::new();
     for id in project_state {
         if let Some(rec) = by_id.get(id) {
-            output_project_state.push(*rec);
+            if let Some(item) = context_linked_item(rec) {
+                output_project_state.push(item);
+            }
         }
     }
     let mut output_artifacts = Vec::new();
     for id in artifacts {
         if let Some(rec) = by_id.get(id) {
-            output_artifacts.push(*rec);
+            if let Some(item) = context_linked_item(rec) {
+                output_artifacts.push(item);
+            }
         }
     }
     let mut output_verification_evidence = Vec::new();
     for id in verification_evidence {
         if let Some(rec) = by_id.get(id) {
-            output_verification_evidence.push(*rec);
+            if let Some(item) = context_linked_item(rec) {
+                output_verification_evidence.push(item);
+            }
         }
     }
 
@@ -5606,11 +5909,13 @@ pub fn changes_context<'a>(
             &has_any_temporal_version,
         ) {
             if let Some(GraphRecord::Node { kind, summary, .. }) = by_id.get(seed_id) {
-                unexplained.push(UnexplainedChange {
-                    record_id: seed_id,
-                    kind: kind.as_str(),
-                    summary,
-                });
+                if matches!(kind, NodeKind::File | NodeKind::Symbol) {
+                    unexplained.push(UnexplainedChange {
+                        record_id: seed_id,
+                        kind: kind.as_str(),
+                        summary,
+                    });
+                }
             }
         }
     }
@@ -5640,10 +5945,10 @@ pub fn changes_context<'a>(
             .then_with(|| a.record.id().cmp(b.record.id()))
     });
 
-    output_observations.sort_by(|a, b| a.id().cmp(b.id()));
-    output_project_state.sort_by(|a, b| a.id().cmp(b.id()));
-    output_artifacts.sort_by(|a, b| a.id().cmp(b.id()));
-    output_verification_evidence.sort_by(|a, b| a.id().cmp(b.id()));
+    output_observations.sort_by(|a, b| a.record_id.cmp(b.record_id));
+    output_project_state.sort_by(|a, b| a.record_id.cmp(b.record_id));
+    output_artifacts.sort_by(|a, b| a.record_id.cmp(b.record_id));
+    output_verification_evidence.sort_by(|a, b| a.record_id.cmp(b.record_id));
     unexplained.sort_by(|a, b| a.record_id.cmp(b.record_id));
     unresolved.sort_by(|a, b| {
         a.source_record_id

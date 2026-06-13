@@ -204,7 +204,7 @@ enum Commands {
     Import {
         /// Import source.
         #[command(subcommand)]
-        source: ImportSource,
+        source: Box<ImportSource>,
     },
     /// Link imported agent evidence to code-graph facts.
     ///
@@ -232,7 +232,7 @@ enum Commands {
     Query {
         /// Query subcommand.
         #[command(subcommand)]
-        subcommand: QuerySubcommand,
+        subcommand: Box<QuerySubcommand>,
     },
     /// Write typed evidence records (observations, command evidence, artifacts, verification).
     ///
@@ -261,7 +261,7 @@ enum Commands {
     Write {
         /// Write subcommand.
         #[command(subcommand)]
-        kind: WriteKind,
+        kind: Box<WriteKind>,
     },
     /// Run the semantic code search relevance evaluation against a corpus file.
     ///
@@ -985,7 +985,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             repo_root.as_deref(),
             transaction_time.as_deref(),
         ),
-        Commands::Import { source } => match source {
+        Commands::Import { source } => match *source {
             ImportSource::Github {
                 repo,
                 out,
@@ -1011,8 +1011,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             evidence,
             out,
         } => link_evidence_cmd(&code_graph, &evidence, &out),
-        Commands::Query { subcommand } => query_cmd(subcommand),
-        Commands::Write { kind } => write_evidence(kind),
+        Commands::Query { subcommand } => query_cmd(*subcommand),
+        Commands::Write { kind } => write_evidence(*kind),
         Commands::EvalSemantic {
             corpus,
             data_dir,
@@ -2199,146 +2199,9 @@ struct ContextSourceFact<'a> {
 /// Per AC3 from issue #38, every observation must include `record_id`,
 /// `provenance_handle` (or `agent_id`/`session_id`), `observed_at`,
 /// `confidence`, and the evidence links.
-#[derive(Serialize)]
-struct ContextObservation<'a> {
-    record_id: &'a str,
-    /// Node kind (`"Observation"`, `"Decision"`, or `"Failure"`).
-    /// Lets consumers distinguish subjective observation types without
-    /// re-inspecting the raw graph.
-    kind: &'static str,
-    /// Agent-facing summary from the raw `GraphRecord`. Always present —
-    /// `Decision` records use this field for their human-readable content
-    /// rather than `text`, so consumers must not rely on `text` alone.
-    summary: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<&'a str>,
-    /// Provenance handle composed from `agent_id:session_id` when both are present.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provenance_handle: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    session_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    observed_at: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    confidence: Option<&'a str>,
-    /// Failure classification for `Failure` records (e.g. `"command_failure"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    failure_kind: Option<&'a str>,
-    /// Shell exit code for `Failure` or `CommandRun` records that represent a failure.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exit_code: Option<i64>,
-    /// Supporting evidence links from the observation.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    evidence_links: Vec<&'a crate::ir::EvidenceLink>,
-}
-
-/// One item in the `project_state`, `artifacts`, or `verification_evidence` sections.
-#[derive(Serialize)]
-struct ContextLinkedItem<'a> {
-    record_id: &'a str,
-    kind: &'static str,
-    /// Agent-facing summary from the raw `GraphRecord`. Populated for all records
-    /// so consumers can understand the item without reloading the graph — especially
-    /// for `Artifact` records where `title`/`name`/`text`/`status` may all be absent.
-    summary: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    title: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<&'a str>,
-    /// Human-readable criterion text for `AcceptanceCriterion` nodes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verification_kind: Option<&'a str>,
-    /// Shell exit code for `CommandRun` verification records.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exit_code: Option<i64>,
-    /// RFC 3339 timestamp when the command was executed (`CommandRun`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    executed_at: Option<&'a str>,
-    /// Evidence capture quality: `"verbatim"`, `"summarized"`, or `"referenced_only"`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    evidence_quality: Option<&'a str>,
-    /// Captured stdout from a `CommandRun` / `TestRun` (hash + optional inline).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stdout_handle: Option<&'a crate::ir::OutputHandle>,
-    /// Captured stderr from a `CommandRun` / `TestRun`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stderr_handle: Option<&'a crate::ir::OutputHandle>,
-    /// Repo-relative path to the script, config, or CI definition that was run.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_artifact_path: Option<&'a str>,
-    /// BLAKE3 hex of the artefact at `source_artifact_path` at run time.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_artifact_hash: Option<&'a str>,
-    /// File path for `FileEdit` nodes (the file that was edited).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    repo_relative_path: Option<&'a str>,
-    /// Edit operation for `FileEdit` nodes (e.g. `"modify"`, `"rename"`, `"delete"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    edit_kind: Option<&'a str>,
-    /// BLAKE3 hash of the file content before the edit (`FileEdit`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    before_hash: Option<&'a str>,
-    /// BLAKE3 hash of the file content after the edit (`FileEdit`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    after_hash: Option<&'a str>,
-    /// New path when the file was renamed (`FileEdit`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rename_to: Option<&'a str>,
-    /// Number of diff hunks in the edit (`FileEdit`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hunk_count: Option<u32>,
-    /// Agent turn that produced this edit (`FileEdit`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    linked_turn_id: Option<&'a str>,
-    /// Patch artifact this edit belongs to (`FileEdit`, optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    linked_patch_id: Option<&'a str>,
-    // ── PatchArtifact-specific fields ────────────────────────────────────────
-    /// Patch validation status (`"valid"`, `"invalid"`, `"pending"`) for `PatchArtifact`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    patch_status: Option<&'a str>,
-    /// Storage handle for raw patch bytes (`PatchArtifact`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    patch_handle: Option<&'a crate::ir::PatchHandle>,
-    /// BLAKE3 hash of the raw patch bytes (`PatchArtifact`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    patch_bytes_hash: Option<&'a str>,
-    /// Repo-relative file paths touched by the patch (`PatchArtifact`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target_files: Option<&'a [String]>,
-    /// Human-readable validation summary, redacted by policy (`PatchArtifact`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    validation_summary: Option<&'a str>,
-    /// Git SHA the patch was authored against (`PatchArtifact`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    base_commit: Option<&'a str>,
-    /// Reason `base_commit` is absent (`PatchArtifact`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    unknown_base_reason: Option<&'a str>,
-    /// Raw patch byte length (`PatchArtifact`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    patch_bytes_size: Option<u64>,
-    /// `AgentSession` record ID that produced this patch (`PatchArtifact`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    producer_session_id: Option<&'a str>,
-    /// Redacted body handle for `Task` nodes (required field per project schema).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    body_handle: Option<&'a crate::ir::OutputHandle>,
-    /// Evidence links that connect this item to the queried symbol.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    evidence_links: Vec<&'a crate::ir::EvidenceLink>,
-    /// The verification record that closed this acceptance criterion (only populated for verified ACs).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verification_record: Option<Box<Self>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    author: Option<&'a str>,
-}
+use crate::query::{
+    ContextLinkedItem, ContextObservation, context_linked_item, context_observation,
+};
 
 /// One unresolved evidence link target, surfaced per AC5.
 #[derive(Serialize)]
@@ -5626,127 +5489,6 @@ fn context_source_fact(record: &GraphRecord) -> Option<ContextSourceFact<'_>> {
             .or_else(|| temporal.as_ref().map(|t| t.valid_time.as_str())),
         language: language.as_deref(),
         symbol_kind: symbol_kind.as_deref(),
-    })
-}
-
-fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_>> {
-    let GraphRecord::Node {
-        id,
-        kind,
-        summary,
-        text,
-        agent_id,
-        session_id,
-        observed_at,
-        confidence,
-        failure_kind,
-        exit_code,
-        evidence_links,
-        ..
-    } = record
-    else {
-        return None;
-    };
-    let provenance_handle = match (agent_id.as_deref(), session_id.as_deref()) {
-        (Some(a), Some(s)) => Some(format!("{a}:{s}")),
-        (Some(a), None) => Some(a.to_owned()),
-        _ => None,
-    };
-    Some(ContextObservation {
-        record_id: id,
-        kind: kind.as_str(),
-        summary,
-        text: text.as_deref(),
-        provenance_handle,
-        agent_id: agent_id.as_deref(),
-        session_id: session_id.as_deref(),
-        observed_at: observed_at.as_deref(),
-        confidence: confidence.as_deref(),
-        failure_kind: failure_kind.as_deref(),
-        exit_code: *exit_code,
-        evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
-    })
-}
-
-fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>> {
-    let GraphRecord::Node {
-        id,
-        kind,
-        name,
-        title,
-        text,
-        summary,
-        status,
-        verification_kind,
-        exit_code,
-        executed_at,
-        evidence_quality,
-        stdout_handle,
-        stderr_handle,
-        source_artifact_path,
-        source_artifact_hash,
-        repo_relative_path,
-        edit_kind,
-        before_hash,
-        after_hash,
-        rename_to,
-        hunk_count,
-        linked_turn_id,
-        linked_patch_id,
-        patch_status,
-        patch_handle,
-        patch_bytes_hash,
-        patch_bytes_size,
-        target_files,
-        validation_summary,
-        base_commit,
-        unknown_base_reason,
-        producer_session_id,
-        body_handle,
-        evidence_links,
-        author,
-        ..
-    } = record
-    else {
-        return None;
-    };
-    Some(ContextLinkedItem {
-        record_id: id,
-        kind: kind.as_str(),
-        summary,
-        title: title.as_deref(),
-        name: name.as_deref(),
-        text: text.as_deref(),
-        status: status.as_deref(),
-        verification_kind: verification_kind.as_deref(),
-        exit_code: *exit_code,
-        executed_at: executed_at.as_deref(),
-        evidence_quality: evidence_quality.as_deref(),
-        stdout_handle: stdout_handle.as_deref(),
-        stderr_handle: stderr_handle.as_deref(),
-        source_artifact_path: source_artifact_path.as_deref(),
-        source_artifact_hash: source_artifact_hash.as_deref(),
-        repo_relative_path: repo_relative_path.as_deref(),
-        edit_kind: edit_kind.as_deref(),
-        before_hash: before_hash.as_deref(),
-        after_hash: after_hash.as_deref(),
-        rename_to: rename_to.as_deref(),
-        hunk_count: *hunk_count,
-        linked_turn_id: linked_turn_id.as_deref(),
-        linked_patch_id: linked_patch_id.as_deref(),
-        patch_status: patch_status.as_deref(),
-        patch_handle: patch_handle.as_deref(),
-        patch_bytes_hash: patch_bytes_hash.as_deref(),
-        patch_bytes_size: *patch_bytes_size,
-        target_files: target_files.as_deref(),
-        validation_summary: validation_summary.as_deref(),
-        base_commit: base_commit.as_deref(),
-        unknown_base_reason: unknown_base_reason.as_deref(),
-        producer_session_id: producer_session_id.as_deref(),
-        body_handle: body_handle.as_deref(),
-        evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
-        verification_record: None,
-        author: author.as_deref(),
     })
 }
 

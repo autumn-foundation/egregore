@@ -272,7 +272,7 @@ fn test_happy_path() {
     );
 
     assert_eq!(ctx.observations.len(), 1);
-    assert_eq!(ctx.observations[0].id(), obs_id.as_str());
+    assert_eq!(ctx.observations[0].record_id, obs_id.as_str());
 
     // unexplained check: s2 / main has no evidence links, so it is unexplained
     assert!(!ctx.unexplained.is_empty());
