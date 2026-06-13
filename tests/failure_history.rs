@@ -1634,3 +1634,95 @@ fn tombstoned_source_handle_exits_2_stale() {
     );
     assert_eq!(parse(&stdout)["error"]["code"], "stale_handle");
 }
+
+// ── Round-5 review-fix coverage ─────────────────────────────────────────────
+
+#[test]
+fn task_expansion_follows_owned_by_task_edge() {
+    // An AC linked to its task only via an OWNED_BY_TASK edge (no parent_task_id
+    // field) must still be expanded so its failures surface for a task query.
+    let task_id = project_stable_id(&["task", "t_owned"]);
+    let mut task = GraphRecord::node(
+        task_id.clone(),
+        NodeKind::Task,
+        None,
+        None,
+        Some("Task".to_owned()),
+        "Task".to_owned(),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut task {
+        *schema_version = PROJECT_SCHEMA_VERSION;
+    }
+    let ac_id = project_stable_id(&["ac", "ac_owned"]);
+    let mut ac = GraphRecord::node(
+        ac_id.clone(),
+        NodeKind::AcceptanceCriterion,
+        None,
+        None,
+        Some("AC".to_owned()),
+        "AC".to_owned(),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut ac {
+        *schema_version = PROJECT_SCHEMA_VERSION; // no parent_task_id field
+    }
+    let owned = GraphRecord::edge(
+        EdgeLabel::OwnedByTask,
+        ac_id.clone(),
+        task_id.clone(),
+        None,
+        "AC owned by task".to_owned(),
+    );
+    let fail = failure_node(
+        &agent_memory_stable_id(&["failure", "owned_fail"]),
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![link(&ac_id, "project", "FAILED_ON")],
+    );
+    let (_t, graph) = write_graph(vec![task, ac, owned, fail]);
+    let (code, stdout, stderr) = run_graph(&graph, &task_id, &[]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse(&stdout);
+    assert_eq!(
+        v["agent_failures"].as_array().unwrap().len(),
+        1,
+        "OWNED_BY_TASK-linked AC failure must surface"
+    );
+}
+
+#[test]
+fn failure_has_evidence_link_surfaces_runtime_failure() {
+    // A failure that cites its failed CommandRun via HAS_EVIDENCE (not FAILED_ON)
+    // must still surface that runtime evidence.
+    let (symbol_id, symbol) = symbol_node("src/he.rs", "hev");
+    let cmd_id = verification_stable_id(&["v", "he_cmd"]);
+    let fail_id = agent_memory_stable_id(&["failure", "he_fail"]);
+    let fail = failure_node(
+        &fail_id,
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![
+            link(&symbol_id, "codegraph", "FAILED_ON"),
+            link(&cmd_id, "verification", "HAS_EVIDENCE"),
+        ],
+    );
+    let cmd = verification_node(
+        &cmd_id,
+        NodeKind::CommandRun,
+        Some("fail"),
+        Some(1),
+        Some("2026-01-01T00:00:01Z"),
+        None,
+        vec![],
+    );
+    let (_t, graph) = write_graph(vec![symbol, fail, cmd]);
+    let (code, stdout, stderr) = run_graph(&graph, &symbol_id, &[]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse(&stdout);
+    let runtime = v["runtime_failures"].as_array().unwrap();
+    assert_eq!(
+        runtime.len(),
+        1,
+        "HAS_EVIDENCE CommandRun must surface as runtime failure"
+    );
+    assert_eq!(runtime[0]["record_id"], cmd_id);
+}

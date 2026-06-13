@@ -5304,6 +5304,25 @@ pub fn resolve_failure_handle(
                         anchor_ids.insert(id.clone());
                     }
                 }
+                // The project graph also represents AC ownership with
+                // `AcceptanceCriterion --OWNED_BY_TASK--> Task` edges (as consumed
+                // by `task_evidence_context`); include ACs connected only by the
+                // edge, without the denormalized `parent_task_id` field.
+                for r in records {
+                    if let GraphRecord::Edge {
+                        id: edge_id,
+                        label: EdgeLabel::OwnedByTask,
+                        source,
+                        target,
+                        ..
+                    } = r
+                        && live.contains(target)
+                        && !tombstoned.contains(edge_id.as_str())
+                        && !tombstoned.contains(source.as_str())
+                    {
+                        anchor_ids.insert(source.clone());
+                    }
+                }
                 return Ok(ResolvedFailureTarget {
                     handle: handle.to_owned(),
                     kind: FailureTargetKind::Task,
@@ -6047,11 +6066,21 @@ fn collect_failure_links<'a>(
     success: &mut CandidateMap<'a>,
     diagnostics: &mut Vec<MemoryAuditDiagnostic>,
 ) {
-    // (relation, target_id) from both graph edges and denormalized links.
+    // (relation, target_id) from both graph edges and denormalized links. A
+    // failure cites its patch/runtime evidence via PRODUCED_PATCH or FAILED_ON,
+    // or via the verification-evidence relations PRODUCED_EVIDENCE / HAS_EVIDENCE
+    // / VALIDATED_BY, so all are followed.
     let mut links: Vec<(&'a str, &'a str)> = Vec::new();
     if let Some(edges) = edges_from.get(failure_id) {
         for (label, target) in edges {
-            if matches!(label, EdgeLabel::ProducedPatch | EdgeLabel::FailedOn) {
+            if matches!(
+                label,
+                EdgeLabel::ProducedPatch
+                    | EdgeLabel::FailedOn
+                    | EdgeLabel::ProducedEvidence
+                    | EdgeLabel::HasEvidence
+                    | EdgeLabel::ValidatedBy
+            ) {
                 links.push((label.as_str(), *target));
             }
         }
@@ -6062,8 +6091,14 @@ fn collect_failure_links<'a>(
     } = failure
     {
         for link in el {
-            if matches!(link.relation.as_str(), "PRODUCED_PATCH" | "FAILED_ON")
-                && let Some(t) = link.target_record_id.as_deref()
+            if matches!(
+                link.relation.as_str(),
+                "PRODUCED_PATCH"
+                    | "FAILED_ON"
+                    | "PRODUCED_EVIDENCE"
+                    | "HAS_EVIDENCE"
+                    | "VALIDATED_BY"
+            ) && let Some(t) = link.target_record_id.as_deref()
             {
                 links.push((link.relation.as_str(), t));
             }
