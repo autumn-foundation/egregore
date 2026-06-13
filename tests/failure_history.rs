@@ -1824,3 +1824,261 @@ fn tombstoned_external_link_does_not_resolve_task() {
     );
     assert_eq!(parse(&stdout)["error"]["code"], "no_match");
 }
+
+// ── Round-7 review-fix coverage ─────────────────────────────────────────────
+
+fn external_link(id: &str, native: &str, remote: &str) -> GraphRecord {
+    let mut e = GraphRecord::node(
+        id.to_owned(),
+        NodeKind::ExternalLink,
+        None,
+        None,
+        None,
+        "external link".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        system_native_id,
+        repository_remote,
+        ..
+    } = &mut e
+    {
+        *schema_version = PROJECT_SCHEMA_VERSION;
+        *system_native_id = Some(native.to_owned());
+        *repository_remote = Some(remote.to_owned());
+    }
+    e
+}
+
+fn task_with_ext(id: &str, ext_id: &str) -> GraphRecord {
+    let mut t = GraphRecord::node(
+        id.to_owned(),
+        NodeKind::Task,
+        None,
+        None,
+        Some("Task".to_owned()),
+        "Task".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        source_external_link_id,
+        ..
+    } = &mut t
+    {
+        *schema_version = PROJECT_SCHEMA_VERSION;
+        *source_external_link_id = Some(ext_id.to_owned());
+    }
+    t
+}
+
+#[test]
+fn tombstoned_duplicate_task_does_not_block_ambiguity() {
+    // A re-imported task sharing a handle with an older deleted one must resolve
+    // the live task, not fail Ambiguous.
+    let ext_id = stable_id(&["node", "ExternalLink", "acme/widget#7"]);
+    let live = project_stable_id(&["task", "live7"]);
+    let dead = project_stable_id(&["task", "dead7"]);
+    let fail = failure_node(
+        &agent_memory_stable_id(&["failure", "dup_fail"]),
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![link(&live, "project", "FAILED_ON")],
+    );
+    let records = vec![
+        external_link(&ext_id, "issue:7", "https://github.com/acme/widget"),
+        task_with_ext(&live, &ext_id),
+        task_with_ext(&dead, &ext_id),
+        tombstone_for(&dead),
+        fail,
+    ];
+    let (_t, graph) = write_graph(records);
+    let (code, stdout, stderr) = run_graph(&graph, "acme/widget#7", &[]);
+    assert_eq!(
+        code, 0,
+        "live task must resolve; stdout={stdout} stderr={stderr}"
+    );
+    let v = parse(&stdout);
+    assert_eq!(v["target_type"], "task");
+    assert_eq!(v["agent_failures"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn source_query_anchors_through_patch_to_file() {
+    let file_path = "src/sp.rs";
+    let file_id = stable_id(&["node", "File", file_path]);
+    let file = GraphRecord::syntax_node(
+        file_id.clone(),
+        NodeKind::File,
+        file_path.to_owned(),
+        span(1, 20),
+        "sp.rs".to_owned(),
+        "rust",
+        "f".to_owned(),
+    );
+    let patch_id = artifact_stable_id(&["patch", "sp_patch"]);
+    let mut patch = GraphRecord::node(
+        patch_id.clone(),
+        NodeKind::PatchArtifact,
+        None,
+        None,
+        None,
+        "patch".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        patch_status,
+        ..
+    } = &mut patch
+    {
+        *schema_version = ARTIFACT_SCHEMA_VERSION;
+        *patch_status = Some("invalid".to_owned());
+    }
+    let fail_id = agent_memory_stable_id(&["failure", "sp_fail"]);
+    let mut fail = failure_node(
+        &fail_id,
+        "patch_invalid",
+        Some("2026-01-01T00:00:00Z"),
+        vec![],
+    );
+    if let GraphRecord::Node { source_handle, .. } = &mut fail {
+        *source_handle = Some("trajectories/sp.traj".to_owned());
+    }
+    let failed_on = GraphRecord::edge(
+        EdgeLabel::FailedOn,
+        fail_id.clone(),
+        patch_id.clone(),
+        None,
+        "f".to_owned(),
+    );
+    let touched = GraphRecord::edge(
+        EdgeLabel::TouchedFile,
+        patch_id,
+        file_id.clone(),
+        None,
+        "t".to_owned(),
+    );
+    let pass = verification_node(
+        &verification_stable_id(&["v", "sp_pass"]),
+        NodeKind::TestRun,
+        Some("pass"),
+        None,
+        Some("2026-02-01T00:00:00Z"),
+        None,
+        vec![link(&file_id, "codegraph", "VALIDATED_BY")],
+    );
+    let (_t, graph) = write_graph(vec![file, patch, fail, failed_on, touched, pass]);
+    let (code, stdout, stderr) = run_graph(&graph, "trajectories/sp.traj", &[]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse(&stdout);
+    let agent = &v["agent_failures"][0];
+    assert_eq!(agent["record_id"], fail_id);
+    assert_eq!(
+        agent["matched_target"], file_id,
+        "anchor relays through the patch"
+    );
+    assert_eq!(agent["resolution_status"], "since_resolved");
+    assert_eq!(v["superseding_successes"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn provenance_walk_stops_at_tombstoned_session() {
+    let (symbol_id, symbol) = symbol_node("src/tp.rs", "tprov");
+    let fail_id = agent_memory_stable_id(&["failure", "tp_fail"]);
+    let fail = failure_node(
+        &fail_id,
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![link(&symbol_id, "codegraph", "FAILED_ON")],
+    );
+    let session_id = agent_memory_stable_id(&["node", "agent_session", "ts"]);
+    let mut session = GraphRecord::node(
+        session_id.clone(),
+        NodeKind::AgentSession,
+        None,
+        None,
+        Some("s".to_owned()),
+        "s".to_owned(),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut session {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+    }
+    let agent_rid = agent_memory_stable_id(&["node", "agent", "ta"]);
+    let mut agent = GraphRecord::node(
+        agent_rid.clone(),
+        NodeKind::Agent,
+        None,
+        None,
+        Some("a".to_owned()),
+        "a".to_owned(),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut agent {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+    }
+    let authored = GraphRecord::edge(
+        EdgeLabel::AuthoredBy,
+        fail_id,
+        session_id.clone(),
+        None,
+        "a".to_owned(),
+    );
+    let session_of = GraphRecord::edge(
+        EdgeLabel::SessionOf,
+        session_id.clone(),
+        agent_rid,
+        None,
+        "s".to_owned(),
+    );
+    // The intermediate session is deleted: provenance must not relay to the agent.
+    let tombstone = tombstone_for(&session_id);
+    let (_t, graph) = write_graph(vec![
+        symbol, fail, session, agent, authored, session_of, tombstone,
+    ]);
+    let (code, stdout, _e) = run_graph(&graph, &symbol_id, &[]);
+    assert_eq!(code, 0);
+    let v = parse(&stdout);
+    assert!(
+        v.get("agent_sessions").is_none() || v["agent_sessions"].as_array().unwrap().is_empty(),
+        "tombstoned session must not be provenance: {v}"
+    );
+    assert!(
+        v.get("agents").is_none() || v["agents"].as_array().unwrap().is_empty(),
+        "agent reached only through a tombstoned session must not be provenance: {v}"
+    );
+}
+
+#[test]
+fn tombstoned_session_record_id_handle_is_stale() {
+    let session_id = agent_memory_stable_id(&["node", "agent_session", "deleted_sess"]);
+    let mut session = GraphRecord::node(
+        session_id.clone(),
+        NodeKind::AgentSession,
+        None,
+        None,
+        Some("s".to_owned()),
+        "s".to_owned(),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut session {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+    }
+    // A live failure still carries the deleted session's record ID in session_id.
+    let mut fail = failure_node(
+        &agent_memory_stable_id(&["failure", "orphan"]),
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![],
+    );
+    if let GraphRecord::Node {
+        session_id: sid, ..
+    } = &mut fail
+    {
+        *sid = Some(session_id.clone());
+    }
+    let tombstone = tombstone_for(&session_id);
+    let (_t, graph) = write_graph(vec![session, fail, tombstone]);
+    let (code, stdout, _e) = run_graph(&graph, &session_id, &[]);
+    assert_eq!(
+        code, 2,
+        "a deleted session handle must be stale, not a live source"
+    );
+    assert_eq!(parse(&stdout)["error"]["code"], "stale_handle");
+}

@@ -2548,6 +2548,12 @@ pub fn resolve_task_ids(
         }
     }
 
+    // Tombstoned (deleted) tasks are not part of the current state: drop them
+    // before reporting ambiguity so a re-created/re-imported task sharing a
+    // handle with an older deleted one resolves the live task instead of failing
+    // `Ambiguous`.
+    matched_ids.retain(|id| !tombstoned.contains(id.as_str()));
+
     if matched_ids.len() > 1 {
         let candidates: Vec<String> = matched_ids.iter().cloned().collect();
         return Err(TaskResolveError::Ambiguous {
@@ -5449,28 +5455,34 @@ pub fn resolve_failure_handle(
         });
     }
 
-    // 5) Source / provenance handle naming failures directly.
+    // 5) Source / provenance handle naming failures directly. A handle that is
+    //    itself a tombstoned record ID (e.g. a retracted AgentSession) is stale —
+    //    its live child evidence must not resurrect it as a source target.
     let mut seeds: BTreeSet<String> = BTreeSet::new();
-    for r in records {
-        if let GraphRecord::Node {
-            id,
-            kind,
-            session_id,
-            source_handle,
-            source_artifact_path,
-            source_artifact_hash,
-            ..
-        } = r
-            && (matches!(kind, NodeKind::Failure) || is_verification_kind(*kind))
-            && (source_handle.as_deref() == Some(handle)
-                || source_artifact_path.as_deref() == Some(handle)
-                || source_artifact_hash.as_deref() == Some(handle)
-                || session_id.as_deref() == Some(handle))
-        {
-            if tombstoned.contains(id.as_str()) {
-                saw_tombstoned = true;
-            } else {
-                seeds.insert(id.clone());
+    if tombstoned.contains(handle) {
+        saw_tombstoned = true;
+    } else {
+        for r in records {
+            if let GraphRecord::Node {
+                id,
+                kind,
+                session_id,
+                source_handle,
+                source_artifact_path,
+                source_artifact_hash,
+                ..
+            } = r
+                && (matches!(kind, NodeKind::Failure) || is_verification_kind(*kind))
+                && (source_handle.as_deref() == Some(handle)
+                    || source_artifact_path.as_deref() == Some(handle)
+                    || source_artifact_hash.as_deref() == Some(handle)
+                    || session_id.as_deref() == Some(handle))
+            {
+                if tombstoned.contains(id.as_str()) {
+                    saw_tombstoned = true;
+                } else {
+                    seeds.insert(id.clone());
+                }
             }
         }
     }
@@ -6032,10 +6044,31 @@ fn outbound_code_task_targets<'a>(
 ) -> BTreeSet<&'a str> {
     let mut out: BTreeSet<&str> = BTreeSet::new();
     let mut consider = |id: &'a str| {
-        if let Some(t) = present(id)
-            && record_node_kind(t).is_some_and(|k| is_codegraph_kind(k) || is_project_kind(k))
-        {
-            out.insert(id);
+        let Some(t) = present(id) else {
+            return;
+        };
+        match record_node_kind(t) {
+            Some(k) if is_codegraph_kind(k) || is_project_kind(k) => {
+                out.insert(id);
+            }
+            // Relay through a patch artifact to the file(s) it touched, the same
+            // `Failure --FAILED_ON--> PatchArtifact --TOUCHED_FILE--> File` shape a
+            // file query relays in reverse, so a source query on a patch-invalid
+            // failure still anchors on the touched file.
+            Some(NodeKind::PatchArtifact) => {
+                if let Some(patch_edges) = edges_from.get(id) {
+                    for (plabel, pt) in patch_edges {
+                        if matches!(plabel, EdgeLabel::TouchedFile)
+                            && present(pt).is_some_and(|n| {
+                                matches!(record_node_kind(n), Some(NodeKind::File))
+                            })
+                        {
+                            out.insert(pt);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     };
     if let Some(edges) = edges_from.get(node.id()) {
@@ -6175,19 +6208,23 @@ fn collect_provenance<'a>(
             if !matches!(label, EdgeLabel::AuthoredBy | EdgeLabel::SessionOf) {
                 continue;
             }
+            // A tombstoned (deleted) intermediate provenance node must not relay
+            // through to a live session/agent: stop the walk at it rather than
+            // enqueueing and continuing along its outgoing edges.
+            let Some(node) = present(target) else {
+                continue;
+            };
             if !visited.contains(*target) {
                 frontier.push(target);
             }
-            if let Some(node) = present(target) {
-                match record_node_kind(node) {
-                    Some(NodeKind::AgentSession) => {
-                        sessions.entry(node.id()).or_insert(node);
-                    }
-                    Some(NodeKind::Agent) => {
-                        agents.entry(node.id()).or_insert(node);
-                    }
-                    _ => {}
+            match record_node_kind(node) {
+                Some(NodeKind::AgentSession) => {
+                    sessions.entry(node.id()).or_insert(node);
                 }
+                Some(NodeKind::Agent) => {
+                    agents.entry(node.id()).or_insert(node);
+                }
+                _ => {}
             }
         }
     }
