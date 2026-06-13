@@ -588,6 +588,25 @@ fn windows_status_with_permissive_metadata_acl_does_not_send_token() {
     let live_metadata = read_running_metadata(&data_dir);
     let token = &live_metadata.token;
 
+    // Wait for the daemon to be listening on its TCP port.
+    // This guarantees that the daemon's startup (including the post-rename private ACL enforcement)
+    // has completely finished and its powershell process has exited.
+    let start_wait = Instant::now();
+    loop {
+        if let Ok(mut stream) = TcpStream::connect(&live_metadata.address) {
+            let _ = stream.write_all(b"GET /v1/health HTTP/1.1\r\nConnection: close\r\n\r\n");
+            let mut buf = [0; 16];
+            let _ = stream.read(&mut buf);
+            break;
+        }
+        assert!(
+            start_wait.elapsed() < Duration::from_secs(30),
+            "daemon at {} did not become ready",
+            live_metadata.address
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
     let runtime_dir = runtime_dir_for_data_dir(&data_dir);
     let metadata_path = runtime_dir.join("egregored.json");
 
@@ -665,24 +684,15 @@ fn clean_windows_path_for_test(path: &Path) -> std::path::PathBuf {
 #[allow(clippy::unnecessary_debug_formatting)]
 fn windows_add_everyone_access_for_test(path: &Path) {
     let clean_path = clean_windows_path_for_test(path);
-    let script = r"
-$ErrorActionPreference = 'Stop'
-$target = $env:EGREGORE_ACL_PATH
-$acl = Get-Acl -LiteralPath $target
-$sid = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::WorldSid, $null)
-$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'Read', 'Allow')
-$acl.AddAccessRule($rule)
-if ([System.IO.Directory]::Exists($target)) {
-    [System.IO.Directory]::SetAccessControl($target, $acl)
-} else {
-    [System.IO.File]::SetAccessControl($target, $acl)
-}
-";
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("EGREGORE_ACL_PATH", &clean_path)
+    // Use icacls to grant Everyone (SID: S-1-1-0) read access.
+    // This is extremely fast, works across all Windows locales, and avoids the heavy
+    // process-spawning overhead of powershell.exe under parallel test runs.
+    let output = std::process::Command::new("icacls")
+        .arg(&clean_path)
+        .arg("/grant")
+        .arg("*S-1-1-0:R")
         .output()
-        .expect("powershell should run to add Everyone read access");
+        .expect("icacls should run to add Everyone read access");
     println!(
         "ADD EVERYONE ACL OUTPUT: path={:?}, code={:?}, out={:?}, err={:?}",
         clean_path,
@@ -692,10 +702,10 @@ if ([System.IO.Directory]::Exists($target)) {
     );
     assert!(
         output.status.success(),
-        "powershell should add Everyone read access for test"
+        "icacls should add Everyone read access for test"
     );
-    let debug_out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &format!("Get-Acl -LiteralPath '{}' | select -ExpandProperty Access | % {{ 'TEST ACE: ' + $_.IdentityReference }}", clean_path.display())])
+    let debug_out = std::process::Command::new("icacls")
+        .arg(&clean_path)
         .output()
         .unwrap();
     println!(
