@@ -15,6 +15,7 @@ eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--f
 eg query context  <NAME>  --graph <PATH>
 eg query task     <HANDLE> --graph <PATH>
 eg query memory   <HANDLE> --graph <PATH>   [--verified-only]
+eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>]
 ```
 
 Evidence-backed audit subcommands have their own pages:
@@ -23,6 +24,8 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query task` — evidence for a **task** ([task-queries.md](task-queries.md), issue #48).
 - `eg query memory` — audit the evidence behind one **agent-authored memory
   claim** ([memory-audit.md](memory-audit.md), issue #64).
+- `eg query failures` — **prior failed attempts** linked to a code or task
+  handle ([failure-history.md](failure-history.md), issue #63).
 
 Most subcommands accept exactly one input source:
 
