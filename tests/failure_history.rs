@@ -1609,3 +1609,28 @@ fn edge_based_provenance_is_surfaced() {
         &vec![serde_json::json!(agent_id)]
     );
 }
+
+// ── Round-4 review-fix coverage ─────────────────────────────────────────────
+
+#[test]
+fn tombstoned_source_handle_exits_2_stale() {
+    // A source handle that matches only a deleted failure is stale, not no_match.
+    let fail_id = agent_memory_stable_id(&["failure", "ts_fail"]);
+    let mut fail = failure_node(
+        &fail_id,
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![],
+    );
+    if let GraphRecord::Node { source_handle, .. } = &mut fail {
+        *source_handle = Some("trajectories/deleted.traj".to_owned());
+    }
+    let tombstone = tombstone_for(&fail_id);
+    let (_t, graph) = write_graph(vec![fail, tombstone]);
+    let (code, stdout, _e) = run_graph(&graph, "trajectories/deleted.traj", &[]);
+    assert_eq!(
+        code, 2,
+        "a deleted source handle must be stale, not no_match"
+    );
+    assert_eq!(parse(&stdout)["error"]["code"], "stale_handle");
+}

@@ -5430,13 +5430,16 @@ pub fn resolve_failure_handle(
             ..
         } = r
             && (matches!(kind, NodeKind::Failure) || is_verification_kind(*kind))
-            && !tombstoned.contains(id.as_str())
             && (source_handle.as_deref() == Some(handle)
                 || source_artifact_path.as_deref() == Some(handle)
                 || source_artifact_hash.as_deref() == Some(handle)
                 || session_id.as_deref() == Some(handle))
         {
-            seeds.insert(id.clone());
+            if tombstoned.contains(id.as_str()) {
+                saw_tombstoned = true;
+            } else {
+                seeds.insert(id.clone());
+            }
         }
     }
     if !seeds.is_empty() {
