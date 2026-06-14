@@ -13,7 +13,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use crate::ir::{IdentitySource, RepositoryIdentityPayload, stable_id};
+use crate::ir::{IdentitySource, RepositoryIdentityPayload, SnapshotHead, stable_id};
 
 /// Computed repository identity, including its stable ID and full payload.
 #[derive(Debug, Clone)]
@@ -322,6 +322,67 @@ fn git_root_commit_sha(repo_root: &Path) -> Option<String> {
     let sha = stdout.lines().next()?.trim().to_owned();
 
     if sha.is_empty() { None } else { Some(sha) }
+}
+
+/// Captures the current working-tree source-snapshot head and dirty flag at `repo_root`.
+///
+/// Mirrors the repository-identity module's git-root gate (issue #82): a commit
+/// SHA and dirty flag are reported only when `repo_root` is the actual Git
+/// repository root. Sub-directories of a repository, non-Git directories, and
+/// environments where Git is unavailable return [`SnapshotHead::NoGit`] so that
+/// fixture scans of in-repo sub-directories stay byte-for-byte deterministic and
+/// never leak the surrounding repository's HEAD. A repository root whose HEAD has
+/// no commits yet returns [`SnapshotHead::UnbornHead`].
+///
+/// This function is strictly read-only: it runs `git rev-parse HEAD` and
+/// `git status --porcelain` and never writes to the repository or the index.
+#[must_use]
+pub fn working_tree_snapshot(repo_root: &Path) -> (SnapshotHead, bool) {
+    if !git_is_repo_root(repo_root) {
+        return (SnapshotHead::NoGit, false);
+    }
+    // Repository root but `git rev-parse HEAD` failing → HEAD has no commits.
+    git_head_commit_sha(repo_root).map_or((SnapshotHead::UnbornHead, false), |sha| {
+        let dirty = git_tree_dirty(repo_root).unwrap_or(false);
+        (SnapshotHead::Commit { sha }, dirty)
+    })
+}
+
+/// Returns the full SHA that `HEAD` resolves to, or `None` when HEAD is unborn
+/// (no commits yet), the path is not a repository, or Git is unavailable.
+fn git_head_commit_sha(repo_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "HEAD"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    if sha.is_empty() { None } else { Some(sha) }
+}
+
+/// Returns `true` when the working tree has uncommitted or untracked changes.
+///
+/// Uses `git status --porcelain`, which reports staged, unstaged, and untracked
+/// changes; a non-empty output means the tree is dirty. Returns `None` when Git
+/// is unavailable or the status probe fails.
+fn git_tree_dirty(repo_root: &Path) -> Option<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["status", "--porcelain"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(!text.trim().is_empty())
 }
 
 /// Normalizes a git remote URL to its canonical `https` form.

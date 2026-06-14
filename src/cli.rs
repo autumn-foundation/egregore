@@ -18,7 +18,9 @@ use crate::{
         VerificationRequest, build_artifact_records, build_command_evidence_records,
         build_observation_records, build_verification_records,
     },
-    ir::{EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SourceSpan},
+    freshness::{self, Freshness},
+    identity,
+    ir::{EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SnapshotHead, SourceSpan},
     link_evidence::{self, LinkOptions},
     local_project, query, scan_repository_history_with_override, scan_repository_with_override,
     schema_version::{RecordVersion, record_version},
@@ -127,6 +129,42 @@ enum Commands {
         /// Embedded `AletheiaDB` data directory.
         #[arg(long, conflicts_with = "graph")]
         data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Report whether a store still matches the current working tree (issue #82).
+    ///
+    /// Reads the store-level source-snapshot identity stamped by `scan`/`ingest`
+    /// (HEAD commit + dirty flag) and compares it against the live working tree,
+    /// classifying the store as `fresh`, `stale_head`, `stale_dirty`, or
+    /// `unknown`. An agent uses this to avoid citing file/span handles the live
+    /// code has already invalidated.
+    ///
+    /// Strictly read-only and fully offline: it never creates, modifies, or
+    /// deletes any graph record, runtime file, index, or idempotency receipt, and
+    /// never accesses the network.
+    ///
+    /// Both human-readable text (`--format text`, default) and machine-readable
+    /// JSON (`--format json`) are supported; the JSON `freshness` code is stable.
+    ///
+    /// Exits 0 regardless of the freshness verdict (the verdict is the payload,
+    /// not an error); exits non-zero only on I/O or store-read failure.
+    ///
+    /// See `docs/cli/freshness.md`.
+    Freshness {
+        /// Working-tree path to compare the store against (defaults to the current directory).
+        #[arg(default_value = ".")]
+        repo_path: PathBuf,
+        /// Graph JSONL store to check (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory to check (mutually exclusive with --graph).
+        #[arg(long, conflicts_with = "graph")]
+        data_dir: Option<PathBuf>,
+        /// Override the auto-detected repository identity used to locate the stored snapshot.
+        #[arg(long)]
+        repo_id_override: Option<String>,
         /// Output format.
         #[arg(long, default_value = "text")]
         format: OutputFormat,
@@ -489,6 +527,13 @@ enum QuerySubcommand {
         /// a machine-readable diagnostic.
         #[arg(long)]
         repo: Option<String>,
+        /// Working-tree path to compute store freshness against (issue #82).
+        ///
+        /// When set, each result carries a non-fatal `freshness` code
+        /// (`fresh` / `stale_head` / `stale_dirty` / `unknown`) so an agent can
+        /// downgrade trust in the cited handle. Omitted → no freshness field.
+        #[arg(long)]
+        repo_path: Option<PathBuf>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -512,6 +557,12 @@ enum QuerySubcommand {
         /// a stderr diagnostic, never mixed into the result set.
         #[arg(long)]
         repo: Option<String>,
+        /// Working-tree path to compute store freshness against (issue #82).
+        ///
+        /// When set, each result carries a non-fatal `freshness` code; omitted →
+        /// no freshness field. See `eg query symbol --help`.
+        #[arg(long)]
+        repo_path: Option<PathBuf>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -578,6 +629,13 @@ enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Working-tree path to compute store freshness against (issue #82).
+        ///
+        /// When set, the response carries a non-fatal top-level `freshness` code
+        /// so an agent can downgrade trust in the returned handles; omitted → no
+        /// freshness field. See `eg query symbol --help`.
+        #[arg(long)]
+        repo_path: Option<PathBuf>,
     },
     /// Retrieve evidence-backed context for a task.
     Task {
@@ -1005,6 +1063,19 @@ fn run_cli(cli: Cli) -> Result<()> {
             let daemon = false;
             inspect(graph.as_deref(), daemon, data_dir.as_deref(), format)
         }
+        Commands::Freshness {
+            repo_path,
+            graph,
+            data_dir,
+            repo_id_override,
+            format,
+        } => freshness_cmd(
+            &repo_path,
+            graph.as_deref(),
+            data_dir.as_deref(),
+            repo_id_override.as_deref(),
+            format,
+        ),
         Commands::Ingest {
             graph,
             adapter,
@@ -1616,6 +1687,150 @@ fn scan_history(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) ->
     Ok(())
 }
 
+/// Machine-readable report emitted by `eg freshness`.
+///
+/// `freshness` carries the stable code (`fresh` / `stale_head` / `stale_dirty` /
+/// `unknown`); `current_head` and `stored_snapshot` reuse the on-disk snapshot
+/// serialization so the report is self-describing.
+#[derive(Debug, Serialize)]
+struct FreshnessReport {
+    /// Stable freshness code.
+    freshness: String,
+    /// Convenience boolean: `true` only when `freshness == "fresh"`.
+    fresh: bool,
+    /// Stable `Repository` record ID the freshness was computed for.
+    repository_id: String,
+    /// Where the store was read from: `"graph"` or `"data_dir"`.
+    store_kind: String,
+    /// Current working-tree HEAD state.
+    current_head: SnapshotHead,
+    /// Current working-tree dirty flag.
+    current_dirty: bool,
+    /// The snapshot the store was built from; absent for pre-stamping stores.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stored_snapshot: Option<crate::ir::SourceSnapshotPayload>,
+    /// Human-oriented one-line explanation of the verdict.
+    message: String,
+}
+
+/// Renders a [`SnapshotHead`] for human-readable output.
+fn head_display(head: &SnapshotHead) -> String {
+    match head {
+        SnapshotHead::Commit { sha } => format!("commit {sha}"),
+        SnapshotHead::NoGit => "no_git".to_owned(),
+        SnapshotHead::UnbornHead => "unborn_head".to_owned(),
+    }
+}
+
+/// Builds the human-oriented explanation for a freshness verdict.
+fn freshness_message(verdict: Freshness) -> String {
+    match verdict {
+        Freshness::Fresh => {
+            "store matches the current working tree (HEAD unchanged, tree clean)".to_owned()
+        }
+        Freshness::StaleHead => {
+            "current HEAD differs from the stored snapshot; queried file/span handles may be \
+             invalid — re-scan before citing them"
+                .to_owned()
+        }
+        Freshness::StaleDirty => {
+            "working tree has uncommitted changes relative to the stored snapshot; queried \
+             file/span handles may be invalid — re-scan before citing them"
+                .to_owned()
+        }
+        Freshness::Unknown => {
+            "store predates snapshot stamping or no Git context exists; freshness cannot be \
+             determined"
+                .to_owned()
+        }
+    }
+}
+
+/// Handles `eg freshness [repo_path] (--graph <p> | --data-dir <d>) [--format ...]`.
+///
+/// Strictly read-only (issue #82 AC4): loads the store through the same
+/// read-only path queries use, probes the working tree with `git rev-parse` /
+/// `git status`, and never writes anything. Always returns `Ok(())` once a
+/// verdict is produced; the verdict (including `unknown`) is the payload, not an
+/// error.
+fn freshness_cmd(
+    repo_path: &Path,
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+    repo_id_override: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let store_kind = if graph.is_some() { "graph" } else { "data_dir" };
+    let identity = identity::compute_repository_identity(repo_path, repo_id_override);
+    let (current_head, current_dirty) = identity::working_tree_snapshot(repo_path);
+
+    // AC4: strictly read-only. A `--graph` JSONL is read directly (a plain file
+    // read). A `--data-dir` embedded store is read through a throwaway copy,
+    // because the embedded engine re-persists its on-disk index files on open;
+    // operating on a copy guarantees the live store's records, indexes, runtime
+    // files, and receipts are never created, modified, or deleted.
+    let records = match data_dir {
+        Some(dir) => load_records_from_data_dir_readonly(dir)?,
+        None => load_query_records(graph, None)?,
+    };
+    let stored = freshness::stored_snapshot(&records, &identity.id);
+    let verdict = freshness::classify(stored, &current_head, current_dirty);
+
+    let report = FreshnessReport {
+        freshness: verdict.code().to_owned(),
+        fresh: verdict.is_fresh(),
+        repository_id: identity.id.clone(),
+        store_kind: store_kind.to_owned(),
+        current_head,
+        current_dirty,
+        stored_snapshot: stored.cloned(),
+        message: freshness_message(verdict),
+    };
+
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&report).context("failed to serialize freshness report")?
+            );
+        }
+        OutputFormat::Text => {
+            println!("freshness: {}", report.freshness);
+            println!("repository_id: {}", report.repository_id);
+            println!("store: {store_kind}");
+            println!(
+                "current_head: {} (dirty: {})",
+                head_display(&report.current_head),
+                report.current_dirty
+            );
+            match &report.stored_snapshot {
+                Some(snapshot) => println!(
+                    "stored_head: {} (dirty: {})",
+                    head_display(&snapshot.head),
+                    snapshot.dirty
+                ),
+                None => println!("stored_head: (none — store predates snapshot stamping)"),
+            }
+            println!("message: {}", report.message);
+        }
+    }
+    Ok(())
+}
+
+/// Computes the store-freshness code for a query against `repo_path` (issue #82).
+///
+/// Returns `None` when `repo_path` is absent, so freshness-unaware queries emit
+/// byte-identical output to before this feature. When present, returns the stable
+/// freshness code (including `"fresh"`) so an agent always sees the signal it asked
+/// for and the result is never silently suppressed.
+fn query_freshness_code(records: &[GraphRecord], repo_path: Option<&Path>) -> Option<&'static str> {
+    let repo_path = repo_path?;
+    let identity = identity::compute_repository_identity(repo_path, None);
+    let (head, dirty) = identity::working_tree_snapshot(repo_path);
+    let stored = freshness::stored_snapshot(records, &identity.id);
+    Some(freshness::classify(stored, &head, dirty).code())
+}
+
 fn print_counts_text(counts: &InspectCounts) {
     println!("records: {}", counts.records);
     println!("nodes: {}", counts.nodes);
@@ -2194,6 +2409,13 @@ struct SymbolResult<'a> {
     /// Human-usable repository identity handle (e.g. `owner/name`).
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<&'a str>,
+    /// Non-fatal store-freshness code relative to a working tree (issue #82).
+    ///
+    /// Present only when `--repo-path` was supplied so an agent can downgrade
+    /// trust in the cited `repo_relative_path` + `span` handle. Absent (and the
+    /// result never suppressed) when freshness was not requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -2476,6 +2698,13 @@ struct ContextTopologyEdge<'a> {
 struct ContextResponse<'a> {
     ok: bool,
     symbol_name: &'a str,
+    /// Non-fatal store-freshness code relative to a working tree (issue #82).
+    ///
+    /// Present only when `--repo-path` was supplied; the context is never
+    /// suppressed on a non-`fresh` verdict so an agent can downgrade trust in the
+    /// returned handles instead of losing them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness: Option<&'static str>,
     source_facts: Vec<ContextSourceFact<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     topology_edges: Vec<ContextTopologyEdge<'a>>,
@@ -2740,6 +2969,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             as_of,
             tx_as_of,
             repo,
+            repo_path,
             format,
         } => {
             if let Some(tx) = tx_as_of.as_deref() {
@@ -2818,10 +3048,20 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             let selected = selected.as_deref();
+            let freshness_code = query_freshness_code(&records, repo_path.as_deref());
             as_of.map_or_else(
                 || {
                     at.map_or_else(
-                        || query_symbol_all(&records, &name, format, &index, selected),
+                        || {
+                            query_symbol_all(
+                                &records,
+                                &name,
+                                format,
+                                &index,
+                                selected,
+                                freshness_code,
+                            )
+                        },
                         |prefix| {
                             query_symbol_at(&records, &name, &prefix, format, &index, selected)
                         },
@@ -2837,6 +3077,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             #[cfg(feature = "embedded-aletheiadb")]
             daemon,
             repo,
+            repo_path,
             format,
         } => {
             #[cfg(feature = "embedded-aletheiadb")]
@@ -2849,7 +3090,15 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
-            query_file(&records, &path, format, &index, selected.as_deref())
+            let freshness_code = query_freshness_code(&records, repo_path.as_deref());
+            query_file(
+                &records,
+                &path,
+                format,
+                &index,
+                selected.as_deref(),
+                freshness_code,
+            )
         }
         QuerySubcommand::Drift {
             graph,
@@ -2891,9 +3140,11 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             name,
             graph,
             data_dir,
+            repo_path,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            query_context_cmd(&records, &name)
+            let freshness_code = query_freshness_code(&records, repo_path.as_deref());
+            query_context_cmd(&records, &name, freshness_code)
         }
         QuerySubcommand::Task {
             id_or_handle,
@@ -3269,6 +3520,55 @@ fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
         let _ = data_dir;
         anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
     }
+}
+
+/// Loads records from an embedded `--data-dir` store without mutating it (issue #82).
+///
+/// The embedded engine re-persists its index files on open, so a freshness check
+/// that opened the live store directly would modify it — violating the read-only
+/// guarantee. This copies the store to a throwaway temporary directory and reads
+/// the copy, leaving the original byte-for-byte untouched.
+fn load_records_from_data_dir_readonly(data_dir: &Path) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let temp =
+            tempfile::tempdir().context("failed to create temporary read-only store copy")?;
+        let copy_root = temp.path().join("store");
+        copy_dir_recursive(data_dir, &copy_root).with_context(|| {
+            format!(
+                "failed to copy store {} for read-only inspection",
+                data_dir.display()
+            )
+        })?;
+        load_records_from_db(&copy_root)
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// Recursively copies the regular files and directories under `src` into `dst`.
+///
+/// Symlinks and other non-regular entries are skipped; this is used only to make
+/// a read-only working copy of an embedded store directory.
+#[cfg(feature = "embedded-aletheiadb")]
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// Loads query records for a transaction-time query (issue #66).
@@ -4107,6 +4407,7 @@ fn query_symbol_all(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    freshness_code: Option<&'static str>,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
     let mut results: Vec<SymbolResult<'_>> = records
@@ -4133,6 +4434,9 @@ fn query_symbol_all(
     }
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
+    for result in &mut results {
+        result.freshness = freshness_code;
+    }
     for result in &results {
         print_result(result, format)?;
     }
@@ -4171,6 +4475,7 @@ fn symbol_result<'a>(
         git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
         repository_id,
         repository: repository_id.and_then(|repo| index.display_of(repo)),
+        freshness: None,
     })
 }
 
@@ -4641,6 +4946,7 @@ fn query_file(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    freshness_code: Option<&'static str>,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
 
@@ -4705,6 +5011,7 @@ fn query_file(
             git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
             repository_id,
             repository: repository_id.and_then(|repo| index.display_of(repo)),
+            freshness: None,
         });
     }
 
@@ -4724,6 +5031,9 @@ fn query_file(
     }
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
+    for result in &mut results {
+        result.freshness = freshness_code;
+    }
     for result in &results {
         print_result(result, format)?;
     }
@@ -4810,7 +5120,11 @@ fn query_drift(
 // query context (issue #38)
 // ---------------------------------------------------------------------------
 
-fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
+fn query_context_cmd(
+    records: &[GraphRecord],
+    symbol_name: &str,
+    freshness_code: Option<&'static str>,
+) -> Result<()> {
     let ctx = query::symbol_context(records, symbol_name);
 
     if ctx.is_no_match() {
@@ -4899,6 +5213,7 @@ fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
     let response = ContextResponse {
         ok: true,
         symbol_name,
+        freshness: freshness_code,
         source_facts,
         topology_edges,
         observations,
@@ -6038,7 +6353,13 @@ impl PrintText for SymbolResult<'_> {
         let path = self.repo_relative_path.unwrap_or("(unknown)");
         let line = self.span.map_or(0, |s| s.start_line);
         let commit = self.git_commit.map_or(String::new(), |c| format!(" [{c}]"));
-        format!("{} ({}) @ {path}:{line}{commit}", self.name, self.kind)
+        let freshness = self
+            .freshness
+            .map_or(String::new(), |code| format!(" (freshness: {code})"));
+        format!(
+            "{} ({}) @ {path}:{line}{commit}{freshness}",
+            self.name, self.kind
+        )
     }
 }
 

@@ -118,6 +118,7 @@ fn make_agent_memory_node(
         semantic_drift: None,
         evidence_links: None,
         repository_identity: None,
+        source_snapshot: None,
         text,
         superseded_by: None,
         agent_id: Some("test-agent".to_string()),

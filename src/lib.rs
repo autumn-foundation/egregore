@@ -23,6 +23,8 @@ pub mod embeddings;
 pub mod error;
 /// Typed evidence write workflows for observations, command evidence, artifacts, and verification.
 pub mod evidence;
+/// Read-only store freshness classification (issue #82).
+pub mod freshness;
 /// Filesystem discovery.
 pub mod fs;
 /// GitHub Issues/PRs importer (issue #46).
@@ -75,10 +77,10 @@ pub use ir::{
     NodeProvenance, PRODUCER_ENVELOPE_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION, PatchHandle,
     Producer, ProducerKind, RepositoryIdentityPayload, SCHEMA_VERSION,
     SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, SelectionBasis,
-    SemanticDriftMetadata, SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION,
-    UserContextFields, UserContextScope, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
-    artifact_stable_id, project_stable_id, semantic_stable_id, stable_id, user_context_stable_id,
-    verification_stable_id,
+    SemanticDriftMetadata, SnapshotHead, SourceSnapshotPayload, SourceSpan, TemporalMetadata,
+    USER_CONTEXT_SCHEMA_VERSION, UserContextFields, UserContextScope, VERIFICATION_SCHEMA_VERSION,
+    agent_memory_stable_id, artifact_stable_id, project_stable_id, semantic_stable_id, stable_id,
+    user_context_stable_id, verification_stable_id,
 };
 pub use local_project::import_local_tasks;
 pub use query::{
@@ -156,7 +158,22 @@ pub fn scan_repository_at_with_override(
     let repo_identity = identity::compute_repository_identity(repo_root, repo_id_override);
     let mut graph = Graph::new();
     let (repository_id, repo_record) = repository_record_from_identity(&repo_identity);
-    graph.push(repo_record.with_valid_time_inferred(transaction_time));
+    // Stamp the store-level source-snapshot identity (issue #82) on the Repository
+    // node. `head` + `dirty` are deterministic for an unchanged clean tree at a
+    // fixed commit; `scanned_at` reuses the transaction-time override so the JSONL
+    // stays byte-for-byte stable.
+    let (head, dirty) = identity::working_tree_snapshot(repo_root);
+    let snapshot = ir::SourceSnapshotPayload {
+        head,
+        dirty,
+        repository_id: repository_id.clone(),
+        scanned_at: transaction_time.to_owned(),
+    };
+    graph.push(
+        repo_record
+            .with_valid_time_inferred(transaction_time)
+            .with_source_snapshot(snapshot),
+    );
 
     for source_file in fs::discover_rust_source_files(repo_root)? {
         for record in scan_source_file_records(&source_file, &repository_id)? {
