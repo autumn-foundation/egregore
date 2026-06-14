@@ -20,6 +20,23 @@ cargo run -- ingest graph.jsonl --adapter dry-run
 cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .egregore
 ```
 
+Query commands (local JSONL graph, no network):
+
+```powershell
+# Symbol-level cross-domain context
+cargo run -- query context <symbol_name> --graph graph.jsonl
+
+# Subsystem-scoped cross-domain context (issue #83)
+cargo run -- query subsystem src/adapters --graph graph.jsonl   # exit 0 on match
+cargo run -- query subsystem src/nonexistent --graph graph.jsonl  # exit 2 (no_match)
+cargo run -- query subsystem "" --graph graph.jsonl               # exit 1 (malformed_prefix)
+```
+
+`eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
+verification evidence, and semantic drift for everything under a repo-relative directory prefix.
+Path matching is segment-aware: `src/alpha` never bleeds into `src/alphabet`.
+Output is a deterministic JSON envelope with trust-separated sections.
+
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
 
 ## Working Rules
