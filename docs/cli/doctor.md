@@ -76,7 +76,7 @@ separate commands.
 | `embedding_model_dimension` | none (info) | optional | always Pass — reports 384 |
 | `embeddings_feature_enabled` | semantic | optional\* | this binary was built with the `embeddings` feature; **Warn** otherwise |
 | `model_cache_present` | semantic | optional\* | a non-empty model snapshot is found under the HF cache |
-| `python_available` | semantic | optional (advisory) | `python3` or `python` found on PATH |
+| `python_available` | semantic | optional (advisory) | a **Python 3.8+** `python3`/`python` is on PATH (older interpreters are not accepted for priming) |
 | `python_priming_runnable` | semantic | optional (advisory) | `sentence_transformers` is installed (detected without importing); **Skipped** when python absent |
 | `hf_cache_readable` | semantic | optional (warn) | HF cache directory is readable |
 | `windows_symlink_support` | semantic | optional (warn) | non-Windows → **Skipped**; Windows + Developer Mode → Pass; Windows + disabled → Warn |
@@ -92,7 +92,13 @@ separate commands.
   `embedded_store_openable`, which mirrors the embedded adapter's open-time
   preconditions (runtime sidecar health and the stale-daemon repair gate from
   `eg repair preflight`) so the report does not claim readiness when
-  `eg ingest --adapter embedded` would be rejected.
+  `eg ingest --adapter embedded` would be rejected. This check is a **best-effort
+  fast preflight** — it catches the common blockers (stale metadata, a live
+  daemon lease, and symlinked/non-directory sidecar or lock paths). A few rare
+  conditions (symlinked ancestor components of the data dir, a sidecar owned by
+  another user, or a lock path that exists as a directory) are left to the
+  embedded adapter's own open-time validation, which reports them with a precise
+  error at ingest time.
 - **`semantic_ready`**: `structural_ready` AND the `embeddings` feature is
   compiled in AND `model_cache_present`. The embedding runtime loads the cached
   model through AletheiaDB's **Rust** `from_pretrained_hf()`, so **Python is not a

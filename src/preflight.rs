@@ -925,6 +925,13 @@ fn compute_next_command(
                         sentence-transformers and the SentenceTransformer snippet"
                     .to_owned();
             }
+            if obs.hf_offline {
+                // Priming downloads the model, so offline mode must be cleared first.
+                return format!(
+                    "unset HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE, then {}",
+                    priming_command(python_exe(obs))
+                );
+            }
             return priming_command(python_exe(obs));
         }
         return format!(
@@ -1326,11 +1333,20 @@ fn is_hf_offline() -> bool {
     false
 }
 
+/// Find a usable Python interpreter on PATH.
+///
+/// Requires Python 3.8+ (the documented minimum) so that a stray Python 2.x — or
+/// any older 3.x — does not get recommended for the priming command that would
+/// then fail. The probe runs only the builtin `sys` module (no importable code
+/// from the cwd), so it stays read-only/safe.
 fn find_python() -> Option<&'static str> {
     use std::process::Command;
     for candidate in &["python3", "python"] {
         let ok = Command::new(candidate)
-            .arg("--version")
+            .args([
+                "-c",
+                "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)",
+            ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -1933,6 +1949,24 @@ mod tests {
             report.next_command.contains("sentence_transformers")
                 || report.next_command.contains("SentenceTransformer"),
             "next_command should suggest model priming: {}",
+            report.next_command
+        );
+    }
+
+    #[test]
+    fn next_command_offline_model_missing_says_unset_offline() {
+        let obs = Observations {
+            hf_offline: true,
+            model_cache_present: false,
+            python_available: true,
+            python_executable: Some("python3".to_owned()),
+            python_import_ok: true,
+            ..ready_obs_structural()
+        };
+        let report = build_report(&default_config(), &obs);
+        assert!(
+            report.next_command.contains("HF_HUB_OFFLINE"),
+            "offline next_command must tell the operator to clear offline mode first: {}",
             report.next_command
         );
     }
