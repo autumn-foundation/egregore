@@ -70,6 +70,7 @@ separate commands.
 | `git_history_readable` | structural | optional → **required** with `--require-history` | `git -C <PATH> log -1` succeeds |
 | `output_path_writable` | structural | required | `--out` is a writable file target (the path itself if it exists, else its parent) |
 | `data_dir_writable` | structural | required | `--data-dir` **and its parent** are writable (the embedded store creates a sibling runtime directory) |
+| `embedded_store_openable` | structural | required | mirrors `EmbeddedAletheiaSink::open`: the runtime sidecar (`<data-dir>.egregore-runtime`) is a usable directory and no stale daemon metadata blocks the open. **Skipped** when the `embedded-aletheiadb` adapter is not compiled in |
 | `hf_cache_location` | none (info) | optional | always Pass — reports resolved cache path |
 | `embedding_model_identity` | none (info) | optional | always Pass — reports `sentence-transformers/all-MiniLM-L6-v2` |
 | `embedding_model_dimension` | none (info) | optional | always Pass — reports 384 |
@@ -87,7 +88,11 @@ separate commands.
 ### Readiness gates
 
 - **`structural_ready`**: all `required` structural checks pass. This is the
-  minimum needed for `eg scan` and `eg ingest` to work.
+  minimum needed for `eg scan` and `eg ingest` to work. It includes
+  `embedded_store_openable`, which mirrors the embedded adapter's open-time
+  preconditions (runtime sidecar health and the stale-daemon repair gate from
+  `eg repair preflight`) so the report does not claim readiness when
+  `eg ingest --adapter embedded` would be rejected.
 - **`semantic_ready`**: `structural_ready` AND the `embeddings` feature is
   compiled in AND `model_cache_present`. The embedding runtime loads the cached
   model through AletheiaDB's **Rust** `from_pretrained_hf()`, so **Python is not a

@@ -150,6 +150,54 @@ fn doctor_non_git_require_history_exits_1() {
     );
 }
 
+// ── Embedded store open preconditions (mirrors EmbeddedAletheiaSink::open) ─────
+
+/// A runtime sidecar left behind as a regular file makes embedded ingest fail
+/// (`ensure_runtime_dir` cannot `create_dir_all` over a file), so `eg doctor`
+/// must report it instead of claiming `structural_ready`.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn doctor_unusable_runtime_sidecar_exits_1() {
+    use aletheia_egregore::daemon::runtime_dir_for_data_dir;
+
+    let tmp = TempDir::new().unwrap();
+    init_git_repo(tmp.path());
+    let data_dir = tmp.path().join(".egregore");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // Plant a regular file where the runtime sidecar directory must go.
+    let sidecar = runtime_dir_for_data_dir(&data_dir);
+    fs::write(&sidecar, b"not a directory").unwrap();
+
+    let output = eg()
+        .args([
+            "doctor",
+            tmp.path().to_str().unwrap(),
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("eg doctor should execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an unusable runtime sidecar must fail structural readiness"
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["structural_ready"], false);
+    let check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "embedded_store_openable")
+        .expect("embedded_store_openable check must appear");
+    assert_eq!(check["status"], "fail");
+    assert_eq!(check["requirement"], "required");
+}
+
 // ── --format text ─────────────────────────────────────────────────────────────
 
 #[test]

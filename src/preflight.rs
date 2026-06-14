@@ -51,6 +51,10 @@ pub enum CheckId {
     OutputPathWritable,
     /// `--data-dir` is writable (or its parent, if it does not yet exist).
     DataDirWritable,
+    /// The embedded `AletheiaDB` store could be opened at `--data-dir` (runtime
+    /// sidecar is usable and no stale daemon metadata blocks it). Skipped when
+    /// the `embedded-aletheiadb` adapter is not compiled in.
+    EmbeddedStoreOpenable,
     // ── Informational (always Pass) ─────────────────────────────────────────
     /// Resolved Hugging Face cache path (always Pass; informational).
     HfCacheLocation,
@@ -174,6 +178,21 @@ pub struct DoctorConfig {
     pub network: bool,
 }
 
+/// Reason a direct embedded-store open would be rejected, mirrored from the
+/// embedded adapter's open path (`EmbeddedAletheiaSink::open`).
+///
+/// Only computed when the `embedded-aletheiadb` feature is compiled in; the
+/// variants carry only safe paths and an operator remediation string.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum EmbeddedOpenBlock {
+    /// The runtime sidecar path already exists but is not a usable directory
+    /// (it is a symlink or a regular file), so `ensure_runtime_dir` would fail.
+    RuntimeSidecarUnusable(PathBuf),
+    /// Stale, non-stopped daemon metadata blocks a direct embedded open. The
+    /// string is the operator remediation from `repair::embedded_open_repair_gate`.
+    StaleDaemonMetadata(String),
+}
+
 /// Pure snapshot of environment observations used to build a [`PreflightReport`].
 ///
 /// Contains no raw environment variable values — only booleans, resolved safe
@@ -203,6 +222,14 @@ pub struct Observations {
     pub data_dir: PathBuf,
     /// Data directory (or its nearest existing ancestor) is writable.
     pub data_dir_writable: bool,
+    /// Whether this binary includes the embedded `AletheiaDB` adapter
+    /// (`embedded-aletheiadb` feature). When false, the embedded-store-open
+    /// check is not applicable and is reported as Skipped.
+    pub embedded_adapter_available: bool,
+    /// Mirror of the embedded-store-open preconditions for `--data-dir`
+    /// (runtime sidecar health + stale-daemon repair gate). `None` when the
+    /// embedded open would not be blocked (or the adapter is unavailable).
+    pub embedded_open_block: Option<EmbeddedOpenBlock>,
 
     // ── semantic / HF ────────────────────────────────────────────────────────
     /// Resolved HF cache directory (safe path — no token values).
@@ -403,6 +430,62 @@ fn check_data_dir_writable(obs: &Observations) -> Check {
             ),
             path: Some(obs.data_dir.clone()),
         }
+    }
+}
+
+fn check_embedded_store_openable(obs: &Observations) -> Check {
+    if !obs.embedded_adapter_available {
+        return Check {
+            id: CheckId::EmbeddedStoreOpenable,
+            status: CheckStatus::Skipped,
+            requirement: Requirement::Optional,
+            gate: Gate::Structural,
+            summary: "skipped — embedded AletheiaDB adapter not compiled in this build".to_owned(),
+            remediation: None,
+            path: None,
+        };
+    }
+    match &obs.embedded_open_block {
+        None => Check {
+            id: CheckId::EmbeddedStoreOpenable,
+            status: CheckStatus::Pass,
+            requirement: Requirement::Required,
+            gate: Gate::Structural,
+            summary: format!(
+                "embedded store can be opened at: {}",
+                obs.data_dir.display()
+            ),
+            remediation: None,
+            path: Some(obs.data_dir.clone()),
+        },
+        Some(EmbeddedOpenBlock::RuntimeSidecarUnusable(sidecar)) => Check {
+            id: CheckId::EmbeddedStoreOpenable,
+            status: CheckStatus::Fail,
+            requirement: Requirement::Required,
+            gate: Gate::Structural,
+            summary: format!(
+                "embedded runtime sidecar is not a usable directory: {}",
+                sidecar.display()
+            ),
+            remediation: Some(
+                "remove or replace the runtime sidecar path (it must be a real \
+                 directory, not a file or symlink) so embedded ingest can create it"
+                    .to_owned(),
+            ),
+            path: Some(sidecar.clone()),
+        },
+        Some(EmbeddedOpenBlock::StaleDaemonMetadata(remediation)) => Check {
+            id: CheckId::EmbeddedStoreOpenable,
+            status: CheckStatus::Fail,
+            requirement: Requirement::Required,
+            gate: Gate::Structural,
+            summary: format!(
+                "stale daemon metadata blocks embedded store open at: {}",
+                obs.data_dir.display()
+            ),
+            remediation: Some(remediation.clone()),
+            path: Some(obs.data_dir.clone()),
+        },
     }
 }
 
@@ -704,6 +787,7 @@ pub fn build_report(config: &DoctorConfig, obs: &Observations) -> PreflightRepor
         check_git_history_readable(obs),
         check_output_path_writable(obs),
         check_data_dir_writable(obs),
+        check_embedded_store_openable(obs),
         check_hf_cache_location(obs),
         check_embedding_model_identity(),
         check_embedding_model_dimension(),
@@ -909,6 +993,9 @@ pub fn gather_observations(config: &DoctorConfig) -> Observations {
     let data_dir = config.data_dir.clone();
     let data_dir_writable = probe_data_dir_writable(&data_dir);
 
+    let embedded_adapter_available = cfg!(feature = "embedded-aletheiadb");
+    let embedded_open_block = compute_embedded_open_block(&data_dir);
+
     let hf_cache_dir = resolve_hf_cache_dir();
     let hf_cache_readable = hf_cache_dir.exists() && std::fs::read_dir(&hf_cache_dir).is_ok();
     let hf_offline = is_hf_offline();
@@ -935,6 +1022,8 @@ pub fn gather_observations(config: &DoctorConfig) -> Observations {
         out_writable,
         data_dir,
         data_dir_writable,
+        embedded_adapter_available,
+        embedded_open_block,
         hf_cache_dir,
         hf_cache_readable,
         hf_offline,
@@ -963,19 +1052,17 @@ fn nearest_existing_ancestor(path: &Path) -> PathBuf {
     }
 }
 
-/// Probe writability by creating and immediately removing a temp file.
+/// Probe writability by exclusively creating, then dropping, a temp file.
 ///
 /// This is the one pragmatic relaxation of "read-only": the probe is transient
-/// and self-cleaning.
+/// and self-cleaning. `tempfile` creates a uniquely-named file with `O_EXCL`
+/// semantics and removes it on drop, so an existing file or symlink at any
+/// predictable path is never truncated or deleted.
 fn probe_writable(dir: &Path) -> bool {
-    let probe_name = format!(".egregore-doctor-probe-{}", std::process::id());
-    let probe_path = dir.join(&probe_name);
-    if std::fs::write(&probe_path, b"").is_ok() {
-        let _ = std::fs::remove_file(&probe_path);
-        true
-    } else {
-        false
-    }
+    tempfile::Builder::new()
+        .prefix(".egregore-doctor-probe-")
+        .tempfile_in(dir)
+        .is_ok()
 }
 
 /// Probe whether `scan`/`ingest` could write the output JSONL at `out_path`.
@@ -1021,6 +1108,36 @@ fn probe_data_dir_writable(data_dir: &Path) -> bool {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let parent_ok = probe_writable(&nearest_existing_ancestor(&parent));
     inside_ok && parent_ok
+}
+
+/// Mirror the embedded-store-open preconditions for `data_dir`, noncreating.
+///
+/// Replicates the checks `EmbeddedAletheiaSink::open` performs before opening:
+/// the stale-daemon repair gate ([`repair::embedded_open_repair_gate`]) and the
+/// runtime sidecar directory health (`ensure_runtime_dir` rejects a sidecar that
+/// is a symlink or a regular file). Returns `None` when not blocked.
+#[cfg(feature = "embedded-aletheiadb")]
+fn compute_embedded_open_block(data_dir: &Path) -> Option<EmbeddedOpenBlock> {
+    // 1. Stale, non-stopped daemon metadata (same gate the adapter applies first).
+    if let Some(message) = crate::repair::embedded_open_repair_gate(data_dir) {
+        return Some(EmbeddedOpenBlock::StaleDaemonMetadata(message));
+    }
+    // 2. Runtime sidecar must be a real directory (not a symlink or file), since
+    //    `ensure_runtime_dir` would otherwise fail before the store is opened.
+    let runtime_dir = crate::daemon::runtime_dir_for_data_dir(data_dir);
+    if let Ok(meta) = std::fs::symlink_metadata(&runtime_dir)
+        && (meta.file_type().is_symlink() || !meta.is_dir())
+    {
+        return Some(EmbeddedOpenBlock::RuntimeSidecarUnusable(runtime_dir));
+    }
+    None
+}
+
+/// Embedded adapter is not compiled in, so there is nothing to gate on.
+#[cfg(not(feature = "embedded-aletheiadb"))]
+#[allow(clippy::missing_const_for_fn)]
+fn compute_embedded_open_block(_data_dir: &Path) -> Option<EmbeddedOpenBlock> {
+    None
 }
 
 /// Detect whether the `sentence_transformers` package is installed **without
@@ -1181,6 +1298,8 @@ mod tests {
             out_writable: true,
             data_dir: PathBuf::from("/repo/.egregore"),
             data_dir_writable: true,
+            embedded_adapter_available: true,
+            embedded_open_block: None,
             hf_cache_dir: PathBuf::from("/home/user/.cache/huggingface/hub"),
             hf_cache_readable: true,
             hf_offline: false,
@@ -1342,6 +1461,56 @@ mod tests {
         let c = find_check(&report, CheckId::DataDirWritable).unwrap();
         assert_eq!(c.status, CheckStatus::Fail);
         assert_eq!(c.requirement, Requirement::Required);
+    }
+
+    #[test]
+    fn stale_daemon_metadata_blocks_structural() {
+        let obs = Observations {
+            embedded_open_block: Some(EmbeddedOpenBlock::StaleDaemonMetadata(
+                "run `eg repair preflight`".to_owned(),
+            )),
+            ..ready_obs_structural()
+        };
+        let report = build_report(&default_config(), &obs);
+        assert!(
+            !report.structural_ready,
+            "stale daemon metadata blocks embedded ingest"
+        );
+        let c = find_check(&report, CheckId::EmbeddedStoreOpenable).unwrap();
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert_eq!(c.requirement, Requirement::Required);
+        assert_eq!(c.gate, Gate::Structural);
+        assert!(c.remediation.as_deref().unwrap().contains("repair"));
+    }
+
+    #[test]
+    fn unusable_runtime_sidecar_blocks_structural() {
+        let obs = Observations {
+            embedded_open_block: Some(EmbeddedOpenBlock::RuntimeSidecarUnusable(PathBuf::from(
+                "/repo/.egregore.egregore-runtime",
+            ))),
+            ..ready_obs_structural()
+        };
+        let report = build_report(&default_config(), &obs);
+        assert!(!report.structural_ready);
+        let c = find_check(&report, CheckId::EmbeddedStoreOpenable).unwrap();
+        assert_eq!(c.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn embedded_store_check_skipped_without_adapter() {
+        let obs = Observations {
+            embedded_adapter_available: false,
+            embedded_open_block: None,
+            ..ready_obs_structural()
+        };
+        let report = build_report(&default_config(), &obs);
+        assert!(
+            report.structural_ready,
+            "skipped check never blocks structural"
+        );
+        let c = find_check(&report, CheckId::EmbeddedStoreOpenable).unwrap();
+        assert_eq!(c.status, CheckStatus::Skipped);
     }
 
     // ── Fixtures: semantic-only failures (exit 0) ─────────────────────────────
