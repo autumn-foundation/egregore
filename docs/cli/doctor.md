@@ -65,31 +65,35 @@ separate commands.
 
 | Check ID | Gate | Requirement | Pass condition |
 |---|---|---|---|
-| `repository_path` | structural | required | PATH exists on disk |
+| `repository_path` | structural | required | PATH is an existing, readable directory (`scan` rejects files and unreadable roots) |
 | `git_available` | structural | required | `git --version` succeeds |
 | `git_history_readable` | structural | optional → **required** with `--require-history` | `git -C <PATH> log -1` succeeds |
-| `output_path_writable` | structural | required | parent of `--out` is writable |
-| `data_dir_writable` | structural | required | `--data-dir` (or its ancestor) is writable |
+| `output_path_writable` | structural | required | `--out` is a writable file target (the path itself if it exists, else its parent) |
+| `data_dir_writable` | structural | required | `--data-dir` **and its parent** are writable (the embedded store creates a sibling runtime directory) |
 | `hf_cache_location` | none (info) | optional | always Pass — reports resolved cache path |
 | `embedding_model_identity` | none (info) | optional | always Pass — reports `sentence-transformers/all-MiniLM-L6-v2` |
 | `embedding_model_dimension` | none (info) | optional | always Pass — reports 384 |
-| `model_cache_present` | semantic | optional\* | model directory found under HF cache |
-| `python_available` | semantic | optional\* | `python3` or `python` found on PATH |
-| `python_priming_runnable` | semantic | optional\* | `import sentence_transformers` succeeds; **Skipped** when python absent |
+| `embeddings_feature_enabled` | semantic | optional\* | this binary was built with the `embeddings` feature; **Warn** otherwise |
+| `model_cache_present` | semantic | optional\* | a non-empty model snapshot is found under the HF cache |
+| `python_available` | semantic | optional (advisory) | `python3` or `python` found on PATH |
+| `python_priming_runnable` | semantic | optional (advisory) | `sentence_transformers` is installed (detected without importing); **Skipped** when python absent |
 | `hf_cache_readable` | semantic | optional (warn) | HF cache directory is readable |
 | `windows_symlink_support` | semantic | optional (warn) | non-Windows → **Skipped**; Windows + Developer Mode → Pass; Windows + disabled → Warn |
 | `hf_reachable` | semantic | optional | TCP connect to `huggingface.co:443`; **only emitted with `--network`** |
 
-\* Optional in the sense that they do not affect the exit code. Their failure
-  makes `semantic_ready: false` in the JSON output.
+\* Optional in the sense that they do not affect the exit code. The `embeddings`
+  feature and the model cache make `semantic_ready: false` when missing.
 
 ### Readiness gates
 
 - **`structural_ready`**: all `required` structural checks pass. This is the
   minimum needed for `eg scan` and `eg ingest` to work.
-- **`semantic_ready`**: `structural_ready` AND all semantic checks that are
-  required-for-semantic (`model_cache_present`, `python_available`,
-  `python_priming_runnable`) pass.
+- **`semantic_ready`**: `structural_ready` AND the `embeddings` feature is
+  compiled in AND `model_cache_present`. The embedding runtime loads the cached
+  model through AletheiaDB's **Rust** `from_pretrained_hf()`, so **Python is not a
+  runtime dependency** — `python_available` and `python_priming_runnable` are
+  advisory checks that only help you *prime a missing cache* and never gate
+  `semantic_ready`.
 - **`overall_ready`**: equals `structural_ready`. Semantic is an enhancement,
   not required for overall readiness.
 

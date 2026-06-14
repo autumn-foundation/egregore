@@ -59,6 +59,9 @@ pub enum CheckId {
     /// Expected embedding model vector dimension (always Pass; informational).
     EmbeddingModelDimension,
     // ── Semantic ─────────────────────────────────────────────────────────────
+    /// This binary was compiled with the `embeddings` feature (Warn when not,
+    /// since semantic ingest/query are unavailable in that build).
+    EmbeddingsFeatureEnabled,
     /// Expected model directory is present under the HF cache.
     ModelCachePresent,
     /// `python3` or `python` is available on PATH.
@@ -182,8 +185,9 @@ pub struct Observations {
     // ── structural ───────────────────────────────────────────────────────────
     /// Canonicalised repository path (or the input if canonicalisation fails).
     pub repo_path: PathBuf,
-    /// Repository path exists on disk **and is a directory** (`scan` rejects
-    /// non-directories in `validate_repository`).
+    /// Repository path is an existing, **readable** directory. `scan` rejects
+    /// non-directories in `validate_repository` and then calls `read_dir` on the
+    /// root in `discover_rust_source_files`, so an unreadable directory fails too.
     pub repo_path_is_dir: bool,
     /// `git --version` returned exit 0.
     pub git_available: bool,
@@ -211,8 +215,13 @@ pub struct Observations {
     pub model_cache_present: bool,
     /// `python3` or `python` binary found on PATH.
     pub python_available: bool,
-    /// `python -c "import sentence_transformers"` succeeded.
+    /// The `sentence_transformers` package is installed (detected without
+    /// executing it). Only needed to *prime* a missing model cache — the
+    /// embedding runtime loads the cached model through Rust, not Python.
     pub python_import_ok: bool,
+    /// This binary was compiled with the `embeddings` feature, so `eg ingest
+    /// --embed` and `eg query semantic` exist. Gathered via `cfg!`.
+    pub embeddings_feature_enabled: bool,
 
     // ── platform ─────────────────────────────────────────────────────────────
     /// Running on Windows.
@@ -241,7 +250,7 @@ fn check_repository_path(obs: &Observations) -> Check {
             requirement: Requirement::Required,
             gate: Gate::Structural,
             summary: format!(
-                "repository path is a directory: {}",
+                "repository path is a readable directory: {}",
                 obs.repo_path.display()
             ),
             remediation: None,
@@ -254,11 +263,13 @@ fn check_repository_path(obs: &Observations) -> Check {
             requirement: Requirement::Required,
             gate: Gate::Structural,
             summary: format!(
-                "repository path is not an existing directory: {}",
+                "repository path is not a readable directory: {}",
                 obs.repo_path.display()
             ),
             remediation: Some(
-                "pass a directory to scan: eg doctor <DIR> (scan rejects file paths)".to_owned(),
+                "pass a readable directory to scan: eg doctor <DIR> \
+                 (scan rejects file paths and unreadable roots)"
+                    .to_owned(),
             ),
             path: Some(obs.repo_path.clone()),
         }
@@ -435,6 +446,36 @@ fn check_embedding_model_dimension() -> Check {
     }
 }
 
+fn check_embeddings_feature(obs: &Observations) -> Check {
+    if obs.embeddings_feature_enabled {
+        Check {
+            id: CheckId::EmbeddingsFeatureEnabled,
+            status: CheckStatus::Pass,
+            requirement: Requirement::Optional,
+            gate: Gate::Semantic,
+            summary: "embeddings feature is compiled in (semantic ingest/query available)"
+                .to_owned(),
+            remediation: None,
+            path: None,
+        }
+    } else {
+        Check {
+            id: CheckId::EmbeddingsFeatureEnabled,
+            status: CheckStatus::Warn,
+            requirement: Requirement::Optional,
+            gate: Gate::Semantic,
+            summary: "this binary was built without the embeddings feature; \
+                      eg ingest --embed and eg query semantic are unavailable"
+                .to_owned(),
+            remediation: Some(
+                "rebuild with default features (or --features embeddings) to enable semantic search"
+                    .to_owned(),
+            ),
+            path: None,
+        }
+    }
+}
+
 fn check_model_cache_present(obs: &Observations) -> Check {
     if obs.model_cache_present {
         Check {
@@ -522,7 +563,8 @@ fn check_python_priming_runnable(obs: &Observations) -> Check {
             status: CheckStatus::Pass,
             requirement: Requirement::Optional,
             gate: Gate::Semantic,
-            summary: "sentence_transformers package is importable".to_owned(),
+            summary: "sentence_transformers package is installed (model priming available)"
+                .to_owned(),
             remediation: None,
             path: None,
         }
@@ -665,6 +707,7 @@ pub fn build_report(config: &DoctorConfig, obs: &Observations) -> PreflightRepor
         check_hf_cache_location(obs),
         check_embedding_model_identity(),
         check_embedding_model_dimension(),
+        check_embeddings_feature(obs),
         check_model_cache_present(obs),
         check_python_available(obs),
         check_python_priming_runnable(obs),
@@ -686,16 +729,17 @@ pub fn build_report(config: &DoctorConfig, obs: &Observations) -> PreflightRepor
             && c.status == CheckStatus::Fail)
     });
 
-    // Semantic: structural must be ready AND the three semantic-required checks must Pass.
-    let semantic_ready = structural_ready
-        && checks.iter().all(|c| {
-            !(matches!(
-                c.id,
-                CheckId::ModelCachePresent
-                    | CheckId::PythonAvailable
-                    | CheckId::PythonPrimingRunnable
-            ) && c.status == CheckStatus::Fail)
-        });
+    // Semantic readiness reflects what the embedding *runtime* needs:
+    //   1. structural readiness (scan/ingest must work first),
+    //   2. the `embeddings` feature compiled into this binary, and
+    //   3. the model cache present on disk.
+    // Python / sentence-transformers are NOT runtime dependencies — the cached
+    // model loads through AletheiaDB's Rust `from_pretrained_hf()`. Python only
+    // primes a *missing* cache, so the Python checks stay advisory and never gate.
+    let model_cache_ready = !checks
+        .iter()
+        .any(|c| c.id == CheckId::ModelCachePresent && c.status == CheckStatus::Fail);
+    let semantic_ready = structural_ready && obs.embeddings_feature_enabled && model_cache_ready;
 
     let overall_ready = structural_ready;
 
@@ -715,7 +759,7 @@ pub fn build_report(config: &DoctorConfig, obs: &Observations) -> PreflightRepor
 /// Compute the shortest next command for the local workflow (pure).
 fn compute_next_command(
     config: &DoctorConfig,
-    _obs: &Observations,
+    obs: &Observations,
     checks: &[Check],
     structural_ready: bool,
     semantic_ready: bool,
@@ -733,6 +777,11 @@ fn compute_next_command(
     }
 
     if !semantic_ready {
+        if !obs.embeddings_feature_enabled {
+            return "rebuild with default features (or --features embeddings) \
+                    to enable semantic search"
+                .to_owned();
+        }
         let model_missing = checks
             .iter()
             .any(|c| c.id == CheckId::ModelCachePresent && c.status == CheckStatus::Fail);
@@ -826,7 +875,10 @@ pub fn gather_observations(config: &DoctorConfig) -> Observations {
         .repo_path
         .canonicalize()
         .unwrap_or_else(|_| config.repo_path.clone());
-    let repo_path_is_dir = config.repo_path.is_dir();
+    // `scan` requires a directory it can `read_dir` (discover_rust_source_files),
+    // so an unreadable directory must fail the check too.
+    let repo_path_is_dir =
+        config.repo_path.is_dir() && std::fs::read_dir(&config.repo_path).is_ok();
 
     let git_available = Command::new("git")
         .arg("--version")
@@ -855,7 +907,7 @@ pub fn gather_observations(config: &DoctorConfig) -> Observations {
     let out_writable = probe_out_writable(&out_path);
 
     let data_dir = config.data_dir.clone();
-    let data_dir_writable = probe_writable(&nearest_existing_ancestor(&data_dir));
+    let data_dir_writable = probe_data_dir_writable(&data_dir);
 
     let hf_cache_dir = resolve_hf_cache_dir();
     let hf_cache_readable = hf_cache_dir.exists() && std::fs::read_dir(&hf_cache_dir).is_ok();
@@ -864,14 +916,9 @@ pub fn gather_observations(config: &DoctorConfig) -> Observations {
 
     let python_cmd = find_python();
     let python_available = python_cmd.is_some();
-    let python_import_ok = python_cmd.is_some_and(|py| {
-        Command::new(py)
-            .args(["-c", "import sentence_transformers"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    });
+    let python_import_ok = python_cmd.is_some_and(probe_sentence_transformers_installed);
+
+    let embeddings_feature_enabled = cfg!(feature = "embeddings");
 
     let is_windows = cfg!(windows);
     let windows_symlinks_enabled = is_windows.then(probe_windows_symlinks);
@@ -894,6 +941,7 @@ pub fn gather_observations(config: &DoctorConfig) -> Observations {
         model_cache_present,
         python_available,
         python_import_ok,
+        embeddings_feature_enabled,
         is_windows,
         windows_symlinks_enabled,
         hf_reachable,
@@ -955,6 +1003,49 @@ fn probe_out_writable(out_path: &Path) -> bool {
         .filter(|p| !p.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     probe_writable(&parent)
+}
+
+/// Probe whether `eg ingest --adapter embedded --data-dir <dir>` could write.
+///
+/// Two locations must be writable:
+///   1. inside `data_dir` (or its nearest existing ancestor, if it does not yet
+///      exist) — where the embedded store files live; and
+///   2. the parent directory of `data_dir` — where `StoreLease::acquire` creates
+///      a sibling runtime directory (`<name>.egregore-runtime`) via
+///      `create_dir_all`. This matters even when `data_dir` already exists.
+fn probe_data_dir_writable(data_dir: &Path) -> bool {
+    let inside_ok = probe_writable(&nearest_existing_ancestor(data_dir));
+    let parent = data_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let parent_ok = probe_writable(&nearest_existing_ancestor(&parent));
+    inside_ok && parent_ok
+}
+
+/// Detect whether the `sentence_transformers` package is installed **without
+/// importing it**.
+///
+/// `eg doctor` is advertised as read-only, so the probe must not execute
+/// arbitrary code. Importing would run a `sentence_transformers.py` planted in an
+/// untrusted checkout (the cwd is on `sys.path`). Instead we run in isolated mode
+/// (`-I`, which drops env-based paths) from a neutral working directory and use
+/// `importlib.util.find_spec`, which locates the installed package without
+/// executing it.
+fn probe_sentence_transformers_installed(py: &str) -> bool {
+    use std::process::Command;
+    Command::new(py)
+        .args([
+            "-I",
+            "-c",
+            "import importlib.util, sys; \
+             sys.exit(0 if importlib.util.find_spec('sentence_transformers') is not None else 1)",
+        ])
+        .current_dir(std::env::temp_dir())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Whether a usable model snapshot exists under the HF cache.
@@ -1096,6 +1187,7 @@ mod tests {
             model_cache_present: false,
             python_available: false,
             python_import_ok: false,
+            embeddings_feature_enabled: true,
             is_windows: false,
             windows_symlinks_enabled: None,
             hf_reachable: None,
@@ -1303,6 +1395,58 @@ mod tests {
         assert!(!report.semantic_ready);
         let c = find_check(&report, CheckId::ModelCachePresent).unwrap();
         assert_eq!(c.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn cached_model_without_python_is_semantic_ready() {
+        // The embedding runtime loads the cached model through Rust, not Python,
+        // so a present cache should be semantic-ready even with no Python at all.
+        let obs = Observations {
+            model_cache_present: true,
+            python_available: false,
+            python_import_ok: false,
+            ..ready_obs_structural()
+        };
+        let report = build_report(&default_config(), &obs);
+        assert!(report.structural_ready);
+        assert!(
+            report.semantic_ready,
+            "cached model + embeddings feature should be semantic-ready without Python"
+        );
+        // Python checks remain visible but advisory (do not gate).
+        assert_eq!(
+            find_check(&report, CheckId::PythonAvailable)
+                .unwrap()
+                .status,
+            CheckStatus::Fail
+        );
+    }
+
+    #[test]
+    fn semantic_not_ready_when_embeddings_feature_disabled() {
+        // A --no-default-features binary cannot run semantic ingest/query even
+        // with a primed cache, so semantic_ready must be false.
+        let obs = Observations {
+            model_cache_present: true,
+            python_available: true,
+            python_import_ok: true,
+            embeddings_feature_enabled: false,
+            ..ready_obs_structural()
+        };
+        let report = build_report(&default_config(), &obs);
+        assert!(
+            report.structural_ready,
+            "structural unaffected by the feature gate"
+        );
+        assert!(!report.semantic_ready);
+        let c = find_check(&report, CheckId::EmbeddingsFeatureEnabled).unwrap();
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert_eq!(
+            c.requirement,
+            Requirement::Optional,
+            "feature check never affects exit"
+        );
+        assert!(report.next_command.contains("features"));
     }
 
     #[test]
