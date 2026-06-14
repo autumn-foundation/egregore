@@ -1823,12 +1823,30 @@ fn freshness_cmd(
 /// byte-identical output to before this feature. When present, returns the stable
 /// freshness code (including `"fresh"`) so an agent always sees the signal it asked
 /// for and the result is never silently suppressed.
-fn query_freshness_code(records: &[GraphRecord], repo_path: Option<&Path>) -> Option<&'static str> {
+fn query_freshness_code(
+    records: &[GraphRecord],
+    repo_path: Option<&Path>,
+) -> Option<(String, &'static str)> {
     let repo_path = repo_path?;
     let identity = identity::compute_repository_identity(repo_path, None);
     let (head, dirty) = identity::working_tree_snapshot(repo_path);
     let stored = freshness::stored_snapshot(records, &identity.id);
-    Some(freshness::classify(stored, &head, dirty).code())
+    let code = freshness::classify(stored, &head, dirty).code();
+    Some((identity.id, code))
+}
+
+/// Stamps the freshness `code` on each result whose repository matches the
+/// checkout the code was computed for (issue #82). Rows owned by a different
+/// repository (multi-repo stores) are left unstamped rather than mislabeled.
+fn stamp_freshness(results: &mut [SymbolResult<'_>], freshness: Option<&(String, &'static str)>) {
+    let Some((repo_id, code)) = freshness else {
+        return;
+    };
+    for result in results.iter_mut() {
+        if result.repository_id == Some(repo_id.as_str()) {
+            result.freshness = Some(code);
+        }
+    }
 }
 
 fn print_counts_text(counts: &InspectCounts) {
@@ -3059,7 +3077,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                                 format,
                                 &index,
                                 selected,
-                                freshness_code,
+                                freshness_code.as_ref(),
                             )
                         },
                         |prefix| {
@@ -3097,7 +3115,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 format,
                 &index,
                 selected.as_deref(),
-                freshness_code,
+                freshness_code.as_ref(),
             )
         }
         QuerySubcommand::Drift {
@@ -3143,7 +3161,10 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo_path,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            let freshness_code = query_freshness_code(&records, repo_path.as_deref());
+            // Context is keyed to the single working tree at `repo_path`; carry
+            // just the verdict code as a top-level signal.
+            let freshness_code =
+                query_freshness_code(&records, repo_path.as_deref()).map(|(_, code)| code);
             query_context_cmd(&records, &name, freshness_code)
         }
         QuerySubcommand::Task {
@@ -4407,7 +4428,7 @@ fn query_symbol_all(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
-    freshness_code: Option<&'static str>,
+    freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
     let mut results: Vec<SymbolResult<'_>> = records
@@ -4434,9 +4455,7 @@ fn query_symbol_all(
     }
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
-    for result in &mut results {
-        result.freshness = freshness_code;
-    }
+    stamp_freshness(&mut results, freshness_code);
     for result in &results {
         print_result(result, format)?;
     }
@@ -4946,7 +4965,7 @@ fn query_file(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
-    freshness_code: Option<&'static str>,
+    freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
 
@@ -5031,9 +5050,7 @@ fn query_file(
     }
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
-    for result in &mut results {
-        result.freshness = freshness_code;
-    }
+    stamp_freshness(&mut results, freshness_code);
     for result in &results {
         print_result(result, format)?;
     }

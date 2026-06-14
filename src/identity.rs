@@ -335,7 +335,13 @@ fn git_root_commit_sha(repo_root: &Path) -> Option<String> {
 /// no commits yet returns [`SnapshotHead::UnbornHead`].
 ///
 /// This function is strictly read-only: it runs `git rev-parse HEAD` and
-/// `git status --porcelain` and never writes to the repository or the index.
+/// `git status` with `GIT_OPTIONAL_LOCKS=0` so Git never refreshes/writes the
+/// index or takes the `index.lock` (the freshness check must not mutate the
+/// repository or contend with concurrent Git operations).
+///
+/// A failed dirty probe is treated conservatively as **dirty** so the store can
+/// never be falsely classified `fresh` when the working-tree state could not be
+/// verified (e.g. a locked or unreadable index).
 #[must_use]
 pub fn working_tree_snapshot(repo_root: &Path) -> (SnapshotHead, bool) {
     if !git_is_repo_root(repo_root) {
@@ -343,19 +349,32 @@ pub fn working_tree_snapshot(repo_root: &Path) -> (SnapshotHead, bool) {
     }
     // Repository root but `git rev-parse HEAD` failing → HEAD has no commits.
     git_head_commit_sha(repo_root).map_or((SnapshotHead::UnbornHead, false), |sha| {
-        let dirty = git_tree_dirty(repo_root).unwrap_or(false);
+        // Conservative default: an unverifiable dirty state is treated as dirty,
+        // never silently downgraded to clean (which could report a false `fresh`).
+        let dirty = git_tree_dirty(repo_root).unwrap_or(true);
         (SnapshotHead::Commit { sha }, dirty)
     })
+}
+
+/// Builds a `git` command rooted at `repo_root` that never writes the index.
+///
+/// `GIT_OPTIONAL_LOCKS=0` disables the optional index-refresh write `git status`
+/// performs by default, keeping the freshness probe strictly read-only.
+fn read_only_git(repo_root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(repo_root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null());
+    command
 }
 
 /// Returns the full SHA that `HEAD` resolves to, or `None` when HEAD is unborn
 /// (no commits yet), the path is not a repository, or Git is unavailable.
 fn git_head_commit_sha(repo_root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let output = read_only_git(repo_root)
         .args(["rev-parse", "HEAD"])
-        .stdin(Stdio::null())
         .output()
         .ok()?;
     if !output.status.success() {
@@ -368,14 +387,12 @@ fn git_head_commit_sha(repo_root: &Path) -> Option<String> {
 /// Returns `true` when the working tree has uncommitted or untracked changes.
 ///
 /// Uses `git status --porcelain`, which reports staged, unstaged, and untracked
-/// changes; a non-empty output means the tree is dirty. Returns `None` when Git
-/// is unavailable or the status probe fails.
+/// changes; a non-empty output means the tree is dirty. Runs read-only
+/// (`GIT_OPTIONAL_LOCKS=0`, so Git never writes the index). Returns `None` when
+/// Git is unavailable or the status probe fails, which callers treat as dirty.
 fn git_tree_dirty(repo_root: &Path) -> Option<bool> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let output = read_only_git(repo_root)
         .args(["status", "--porcelain"])
-        .stdin(Stdio::null())
         .output()
         .ok()?;
     if !output.status.success() {

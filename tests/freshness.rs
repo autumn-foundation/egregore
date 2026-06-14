@@ -88,9 +88,15 @@ struct Fixture {
 impl Fixture {
     /// Fresh Git repo with one committed `src/lib.rs`.
     fn committed() -> Self {
+        Self::committed_with("pub fn hello() {}\n")
+    }
+
+    /// Fresh Git repo with `body` as the committed `src/lib.rs`. Distinct bodies
+    /// produce distinct root commits, hence distinct repository identities.
+    fn committed_with(body: &str) -> Self {
         let repo = tempfile::tempdir().unwrap();
         git_init(repo.path());
-        write_lib(repo.path(), "pub fn hello() {}\n");
+        write_lib(repo.path(), body);
         commit_all(repo.path(), "initial");
         Self {
             repo,
@@ -421,4 +427,136 @@ fn query_context_surfaces_freshness_when_stale() {
     let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(report["freshness"], "stale_dirty");
     assert_eq!(report["ok"], Value::Bool(true));
+}
+
+// ---------------------------------------------------------------------------
+// Codex review follow-ups (issue #82)
+// ---------------------------------------------------------------------------
+
+/// In a multi-repository store, `--repo-path` freshness must stamp only rows
+/// belonging to that checkout's repository — never mislabel another repo's rows.
+#[test]
+fn query_freshness_only_stamps_matching_repository() {
+    // Two independent git repos, each defining `hello`, scanned into one graph.
+    // Their initial commits differ (distinct content) so they get distinct
+    // repository identities rather than colliding on an identical root commit.
+    let a = Fixture::committed();
+    let b = Fixture::committed_with("pub fn hello() {}\npub fn b_only() {}\n");
+    a.scan();
+    b.scan();
+
+    let combined = a.work.path().join("combined.jsonl");
+    let mut bytes = std::fs::read(a.graph()).unwrap();
+    bytes.extend_from_slice(&std::fs::read(b.graph()).unwrap());
+    std::fs::write(&combined, bytes).unwrap();
+
+    // Compare against repo A's (clean) working tree.
+    let out = eg()
+        .args(["query", "symbol", "hello"])
+        .arg("--graph")
+        .arg(&combined)
+        .arg("--repo-path")
+        .arg(a.repo())
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let rows: Vec<Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2, "both repos define `hello`: {stdout}");
+
+    let stamped: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r.get("freshness").is_some())
+        .collect();
+    assert_eq!(
+        stamped.len(),
+        1,
+        "exactly one repo's row should carry freshness: {stdout}"
+    );
+    assert_eq!(stamped[0]["freshness"], "fresh");
+    // The stamped row must belong to repo A, not the other repository.
+    let other = rows.iter().find(|r| r.get("freshness").is_none()).unwrap();
+    assert_ne!(
+        stamped[0]["repository_id"], other["repository_id"],
+        "the two rows must be attributed to different repositories"
+    );
+}
+
+/// `git status` must not write `.git/index` during a freshness probe
+/// (`GIT_OPTIONAL_LOCKS=0`), even when a tracked file's mtime changed.
+#[test]
+fn freshness_does_not_write_git_index() {
+    let fx = Fixture::committed();
+    fx.scan();
+
+    let index_path = fx.repo().join(".git").join("index");
+    // Touch a tracked file so a default `git status` would refresh + rewrite the
+    // index stat cache; with GIT_OPTIONAL_LOCKS=0 it must not.
+    let lib = fx.repo().join("src").join("lib.rs");
+    let contents = std::fs::read(&lib).unwrap();
+    std::fs::write(&lib, &contents).unwrap();
+
+    let before = std::fs::read(&index_path).unwrap();
+    let report = fx.freshness_graph();
+    // HEAD unchanged, no content change → fresh.
+    assert_eq!(report["freshness"], "fresh");
+    let after = std::fs::read(&index_path).unwrap();
+    assert_eq!(before, after, "freshness probe must not rewrite .git/index");
+}
+
+/// After refreshing a stale embedded store, the re-stamped snapshot must make
+/// `eg freshness --data-dir` report `fresh` (not `unknown`).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn refresh_restamps_snapshot_so_store_is_fresh() {
+    let fx = Fixture::committed();
+    fx.scan();
+
+    let data_dir = fx.data_dir();
+    eg().args(["ingest"])
+        .arg(fx.graph())
+        .args(["--adapter", "embedded"])
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    // Move HEAD: the store is now stale_head.
+    write_lib(fx.repo(), "pub fn hello() {}\npub fn added() {}\n");
+    commit_all(fx.repo(), "second");
+    let stale = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let stale: Value = serde_json::from_slice(&stale.get_output().stdout).unwrap();
+    assert_eq!(stale["freshness"], "stale_head");
+
+    // Refresh re-stamps the Repository node with the current snapshot.
+    eg().args(["refresh"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let fresh = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let fresh: Value = serde_json::from_slice(&fresh.get_output().stdout).unwrap();
+    assert_eq!(
+        fresh["freshness"], "fresh",
+        "refresh must re-stamp the snapshot so the store reports fresh"
+    );
 }

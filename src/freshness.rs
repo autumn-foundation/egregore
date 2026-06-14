@@ -89,39 +89,46 @@ pub fn classify(
 
 /// Finds the source snapshot a store recorded for the given repository ID.
 ///
-/// Returns the snapshot stamped on the `Repository` node whose stable ID matches
-/// `repository_id`. When no such node carries a snapshot, falls back to the only
-/// snapshot in the store (single-repository stores); returns `None` when the
-/// store carries no source snapshot at all (pre-stamping stores).
+/// Prefers the snapshot stamped on the `Repository` node whose stable ID matches
+/// `repository_id`. As a fallback it returns the sole repository's snapshot, but
+/// **only when the store contains exactly one `Repository` node** — never in a
+/// multi-repository store, where returning an unrelated repository's snapshot
+/// would misclassify a legacy/pre-stamping target against an unrelated checkout.
+/// Returns `None` when the matched (or sole) repository carries no snapshot
+/// (pre-stamping stores).
 #[must_use]
 pub fn stored_snapshot<'a>(
     records: &'a [GraphRecord],
     repository_id: &str,
 ) -> Option<&'a SourceSnapshotPayload> {
-    let mut only: Option<&'a SourceSnapshotPayload> = None;
-    let mut count = 0usize;
+    let mut repository_nodes = 0usize;
+    let mut matched: Option<&'a SourceSnapshotPayload> = None;
+    let mut sole: Option<&'a SourceSnapshotPayload> = None;
     for record in records {
         if let GraphRecord::Node {
             kind: NodeKind::Repository,
             id,
-            source_snapshot: Some(snapshot),
+            source_snapshot,
             ..
         } = record
         {
+            repository_nodes += 1;
+            let snapshot = source_snapshot.as_deref();
             if id == repository_id {
-                return Some(snapshot.as_ref());
+                matched = snapshot;
             }
-            only = Some(snapshot.as_ref());
-            count += 1;
+            sole = snapshot;
         }
     }
-    if count == 1 { only } else { None }
+    // Exact identity match wins. Otherwise fall back to the sole repository's
+    // snapshot only when the store holds exactly one Repository node.
+    matched.or_else(|| (repository_nodes == 1).then_some(sole).flatten())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Freshness, classify};
-    use crate::ir::{SnapshotHead, SourceSnapshotPayload};
+    use super::{Freshness, classify, stored_snapshot};
+    use crate::ir::{GraphRecord, NodeKind, SnapshotHead, SourceSnapshotPayload};
 
     fn snapshot(head: SnapshotHead, dirty: bool) -> SourceSnapshotPayload {
         SourceSnapshotPayload {
@@ -208,5 +215,56 @@ mod tests {
         assert_eq!(Freshness::StaleHead.code(), "stale_head");
         assert_eq!(Freshness::StaleDirty.code(), "stale_dirty");
         assert_eq!(Freshness::Unknown.code(), "unknown");
+    }
+
+    fn repo_node(id: &str, snapshot: Option<SourceSnapshotPayload>) -> GraphRecord {
+        let node = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(id.to_owned()),
+            format!("Repository {id}"),
+        );
+        match snapshot {
+            Some(s) => node.with_source_snapshot(s),
+            None => node,
+        }
+    }
+
+    #[test]
+    fn stored_snapshot_matches_by_repository_id() {
+        let records = vec![
+            repo_node("repo-a", Some(snapshot(commit("aaa"), false))),
+            repo_node("repo-b", Some(snapshot(commit("bbb"), false))),
+        ];
+        let found = stored_snapshot(&records, "repo-b").expect("repo-b snapshot");
+        assert_eq!(found.head, commit("bbb"));
+    }
+
+    #[test]
+    fn stored_snapshot_no_cross_repo_fallback_in_multi_repo_store() {
+        // Requested repo is a legacy/pre-stamping node (no snapshot); another repo
+        // has one. The unrelated snapshot must NOT be returned.
+        let records = vec![
+            repo_node("legacy", None),
+            repo_node("other", Some(snapshot(commit("ccc"), false))),
+        ];
+        assert!(stored_snapshot(&records, "legacy").is_none());
+    }
+
+    #[test]
+    fn stored_snapshot_single_repo_fallback_allows_id_mismatch() {
+        // Exactly one Repository node: fall back to its snapshot even if the
+        // requested id differs (e.g. identity recomputed differently).
+        let records = vec![repo_node("only", Some(snapshot(commit("ddd"), false)))];
+        let found = stored_snapshot(&records, "different-id").expect("sole snapshot");
+        assert_eq!(found.head, commit("ddd"));
+    }
+
+    #[test]
+    fn stored_snapshot_single_pre_stamping_repo_is_none() {
+        let records = vec![repo_node("only", None)];
+        assert!(stored_snapshot(&records, "only").is_none());
     }
 }

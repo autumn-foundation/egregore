@@ -79,7 +79,23 @@ pub fn scan_repository_incremental_at(
     let mut reused_files = Vec::new();
     let mut seen_files = BTreeSet::new();
 
-    graph.push(repository.with_valid_time_inferred(transaction_time));
+    // Stamp the store-level source-snapshot identity (issue #82) on the Repository
+    // node, mirroring the full-scan path. Without this, refreshing a stale store
+    // would replace the stamped Repository node with one whose snapshot is absent,
+    // so a follow-up `eg freshness --data-dir` would report `unknown` instead of
+    // confirming the refreshed store is fresh.
+    let (head, dirty) = identity::working_tree_snapshot(repo_root);
+    let snapshot = crate::ir::SourceSnapshotPayload {
+        head,
+        dirty,
+        repository_id: repository_id.clone(),
+        scanned_at: transaction_time.to_owned(),
+    };
+    graph.push(
+        repository
+            .with_valid_time_inferred(transaction_time)
+            .with_source_snapshot(snapshot),
+    );
 
     // If the repository identity changed from a previous scan, tombstone the old Repository node
     // so it does not remain live in persisted stores alongside the new identity.  Without this,
