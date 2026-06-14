@@ -191,6 +191,10 @@ pub enum EmbeddedOpenBlock {
     /// Stale, non-stopped daemon metadata blocks a direct embedded open. The
     /// string is the operator remediation from `repair::embedded_open_repair_gate`.
     StaleDaemonMetadata(String),
+    /// A live Egregore daemon currently holds the store lease, so a direct
+    /// embedded open would be rejected by `StoreLease::acquire`. This is a
+    /// healthy state (ingest via `--adapter daemon`), reported as a warning.
+    StoreLeased,
 }
 
 /// Pure snapshot of environment observations used to build a [`PreflightReport`].
@@ -408,6 +412,19 @@ fn check_output_path_writable(obs: &Observations) -> Check {
 }
 
 fn check_data_dir_writable(obs: &Observations) -> Check {
+    if !obs.embedded_adapter_available {
+        // Without the embedded adapter the only structural ingest path is
+        // `ingest --adapter dry-run`, which never uses `--data-dir`.
+        return Check {
+            id: CheckId::DataDirWritable,
+            status: CheckStatus::Skipped,
+            requirement: Requirement::Optional,
+            gate: Gate::Structural,
+            summary: "skipped — embedded AletheiaDB adapter not compiled in this build".to_owned(),
+            remediation: None,
+            path: None,
+        };
+    }
     if obs.data_dir_writable {
         Check {
             id: CheckId::DataDirWritable,
@@ -484,6 +501,22 @@ fn check_embedded_store_openable(obs: &Observations) -> Check {
                 obs.data_dir.display()
             ),
             remediation: Some(remediation.clone()),
+            path: Some(obs.data_dir.clone()),
+        },
+        Some(EmbeddedOpenBlock::StoreLeased) => Check {
+            id: CheckId::EmbeddedStoreOpenable,
+            status: CheckStatus::Warn,
+            requirement: Requirement::Optional,
+            gate: Gate::Structural,
+            summary: format!(
+                "a running daemon holds the store lease for: {}",
+                obs.data_dir.display()
+            ),
+            remediation: Some(
+                "ingest via --adapter daemon, or stop the daemon \
+                 (eg daemon stop --data-dir <dir>) before using --adapter embedded"
+                    .to_owned(),
+            ),
             path: Some(obs.data_dir.clone()),
         },
     }
@@ -870,6 +903,13 @@ fn compute_next_command(
             .iter()
             .any(|c| c.id == CheckId::ModelCachePresent && c.status == CheckStatus::Fail);
         if model_missing {
+            if !obs.python_available {
+                // The priming command needs Python, so install it first.
+                return "install Python 3.8+ (https://python.org/downloads), \
+                        then prime the model cache with pip install -U \
+                        sentence-transformers and the SentenceTransformer snippet"
+                    .to_owned();
+            }
             return format!(
                 "pip install -U sentence-transformers && python -c \
                  \"from sentence_transformers import SentenceTransformer; \
@@ -1122,7 +1162,13 @@ fn compute_embedded_open_block(data_dir: &Path) -> Option<EmbeddedOpenBlock> {
     if let Some(message) = crate::repair::embedded_open_repair_gate(data_dir) {
         return Some(EmbeddedOpenBlock::StaleDaemonMetadata(message));
     }
-    // 2. Runtime sidecar must be a real directory (not a symlink or file), since
+    // 2. A live daemon holding the lease: metadata is non-stopped AND not stale
+    //    (the lock is held). `StoreLease::acquire` would reject a direct embedded
+    //    open here. This is healthy (use `--adapter daemon`), so it is a warning.
+    if embedded_store_is_leased(data_dir) {
+        return Some(EmbeddedOpenBlock::StoreLeased);
+    }
+    // 3. Runtime sidecar must be a real directory (not a symlink or file), since
     //    `ensure_runtime_dir` would otherwise fail before the store is opened.
     let runtime_dir = crate::daemon::runtime_dir_for_data_dir(data_dir);
     if let Ok(meta) = std::fs::symlink_metadata(&runtime_dir)
@@ -1131,6 +1177,23 @@ fn compute_embedded_open_block(data_dir: &Path) -> Option<EmbeddedOpenBlock> {
         return Some(EmbeddedOpenBlock::RuntimeSidecarUnusable(runtime_dir));
     }
     None
+}
+
+/// Whether a live daemon currently holds the embedded store lease.
+///
+/// Noncreating: metadata exists with a non-stopped state and the runtime lock is
+/// held (not stale). Mirrors the condition under which `repair::embedded_open_repair_gate`
+/// returns `None` but `StoreLease::acquire` would still reject a direct open.
+#[cfg(feature = "embedded-aletheiadb")]
+fn embedded_store_is_leased(data_dir: &Path) -> bool {
+    let Ok(Some(metadata)) = crate::daemon::try_read_raw_metadata(data_dir) else {
+        return false;
+    };
+    if metadata.state == crate::daemon::DaemonState::Stopped {
+        return false;
+    }
+    // Non-stopped metadata with the lock still held (not stale) means a live lease.
+    !crate::daemon::runtime_metadata_is_stale_noncreating(data_dir).unwrap_or(false)
 }
 
 /// Embedded adapter is not compiled in, so there is nothing to gate on.
@@ -1145,20 +1208,24 @@ fn compute_embedded_open_block(_data_dir: &Path) -> Option<EmbeddedOpenBlock> {
 ///
 /// `eg doctor` is advertised as read-only, so the probe must not execute
 /// arbitrary code. Importing would run a `sentence_transformers.py` planted in an
-/// untrusted checkout (the cwd is on `sys.path`). Instead we run in isolated mode
-/// (`-I`, which drops env-based paths) from a neutral working directory and use
+/// untrusted checkout (the cwd is on `sys.path`). Instead we use
 /// `importlib.util.find_spec`, which locates the installed package without
-/// executing it.
+/// executing it, run from a neutral working directory with `PYTHONSAFEPATH=1`
+/// (Python 3.11+) so the checkout directory is never prepended to `sys.path`.
+///
+/// We deliberately avoid `-I`/`-s`, which would drop the user-site directory and
+/// hide a `pip install --user sentence-transformers` that the documented priming
+/// command would actually use.
 fn probe_sentence_transformers_installed(py: &str) -> bool {
     use std::process::Command;
     Command::new(py)
         .args([
-            "-I",
             "-c",
             "import importlib.util, sys; \
              sys.exit(0 if importlib.util.find_spec('sentence_transformers') is not None else 1)",
         ])
         .current_dir(std::env::temp_dir())
+        .env("PYTHONSAFEPATH", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -1267,13 +1334,18 @@ fn tcp_reachable(addr: &str) -> bool {
 
 #[cfg(windows)]
 fn probe_windows_symlinks() -> bool {
-    let tmp = std::env::temp_dir().join(format!("eg-symlink-probe-{}", std::process::id()));
-    let target = tmp.with_extension("target");
-    let _ = std::fs::write(&target, b"");
-    let result = std::os::windows::fs::symlink_file(&target, &tmp).is_ok();
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&target);
-    result
+    // Probe inside a freshly created, uniquely named temp directory so no
+    // predictable path is ever truncated or removed. The directory (and its
+    // contents) is deleted when the `TempDir` is dropped.
+    let Ok(dir) = tempfile::tempdir() else {
+        return false;
+    };
+    let target = dir.path().join("target");
+    if std::fs::write(&target, b"").is_err() {
+        return false;
+    }
+    let link = dir.path().join("link");
+    std::os::windows::fs::symlink_file(&target, &link).is_ok()
 }
 
 #[cfg(not(windows))]
@@ -1510,6 +1582,42 @@ mod tests {
             "skipped check never blocks structural"
         );
         let c = find_check(&report, CheckId::EmbeddedStoreOpenable).unwrap();
+        assert_eq!(c.status, CheckStatus::Skipped);
+    }
+
+    #[test]
+    fn live_lease_is_warn_not_structural_fail() {
+        let obs = Observations {
+            embedded_open_block: Some(EmbeddedOpenBlock::StoreLeased),
+            ..ready_obs_structural()
+        };
+        let report = build_report(&default_config(), &obs);
+        assert!(
+            report.structural_ready,
+            "a running daemon lease is healthy and must not fail structural readiness"
+        );
+        let c = find_check(&report, CheckId::EmbeddedStoreOpenable).unwrap();
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert_eq!(c.requirement, Requirement::Optional);
+        assert!(c.remediation.as_deref().unwrap().contains("daemon"));
+    }
+
+    #[test]
+    fn data_dir_skipped_without_embedded_adapter() {
+        // Without the embedded adapter, an unwritable data dir must not block
+        // structural readiness (the dry-run ingest path never uses --data-dir).
+        let obs = Observations {
+            embedded_adapter_available: false,
+            embedded_open_block: None,
+            data_dir_writable: false,
+            ..ready_obs_structural()
+        };
+        let report = build_report(&default_config(), &obs);
+        assert!(
+            report.structural_ready,
+            "data-dir is not required without the adapter"
+        );
+        let c = find_check(&report, CheckId::DataDirWritable).unwrap();
         assert_eq!(c.status, CheckStatus::Skipped);
     }
 
@@ -1796,6 +1904,23 @@ mod tests {
             report.next_command.contains("sentence_transformers")
                 || report.next_command.contains("SentenceTransformer"),
             "next_command should suggest model priming: {}",
+            report.next_command
+        );
+    }
+
+    #[test]
+    fn next_command_model_missing_without_python_suggests_python_install() {
+        // The priming command needs Python; when it is absent, point there first.
+        let obs = Observations {
+            python_available: false,
+            python_import_ok: false,
+            model_cache_present: false,
+            ..ready_obs_structural()
+        };
+        let report = build_report(&default_config(), &obs);
+        assert!(
+            report.next_command.contains("Python"),
+            "next_command should recommend installing Python first: {}",
             report.next_command
         );
     }

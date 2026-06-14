@@ -69,8 +69,8 @@ separate commands.
 | `git_available` | structural | required | `git --version` succeeds |
 | `git_history_readable` | structural | optional → **required** with `--require-history` | `git -C <PATH> log -1` succeeds |
 | `output_path_writable` | structural | required | `--out` is a writable file target (the path itself if it exists, else its parent) |
-| `data_dir_writable` | structural | required | `--data-dir` **and its parent** are writable (the embedded store creates a sibling runtime directory) |
-| `embedded_store_openable` | structural | required | mirrors `EmbeddedAletheiaSink::open`: the runtime sidecar (`<data-dir>.egregore-runtime`) is a usable directory and no stale daemon metadata blocks the open. **Skipped** when the `embedded-aletheiadb` adapter is not compiled in |
+| `data_dir_writable` | structural | required | `--data-dir` **and its parent** are writable (the embedded store creates a sibling runtime directory). **Skipped** when the `embedded-aletheiadb` adapter is not compiled in |
+| `embedded_store_openable` | structural | required | mirrors `EmbeddedAletheiaSink::open`: the runtime sidecar (`<data-dir>.egregore-runtime`) is a usable directory and no stale daemon metadata blocks the open. **Warn** (not fail) when a live daemon holds the lease — ingest via `--adapter daemon` instead. **Skipped** when the `embedded-aletheiadb` adapter is not compiled in |
 | `hf_cache_location` | none (info) | optional | always Pass — reports resolved cache path |
 | `embedding_model_identity` | none (info) | optional | always Pass — reports `sentence-transformers/all-MiniLM-L6-v2` |
 | `embedding_model_dimension` | none (info) | optional | always Pass — reports 384 |
