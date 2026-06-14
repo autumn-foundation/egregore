@@ -221,10 +221,16 @@ The HF cache directory is resolved using the standard Hugging Face convention:
 
 1. `HF_HUB_CACHE` if set and non-empty
 2. `$HF_HOME/hub` if `HF_HOME` is set and non-empty
-3. `<home>/.cache/huggingface/hub` (default)
+3. `$XDG_CACHE_HOME/huggingface/hub` if `XDG_CACHE_HOME` is set and non-empty (non-Windows)
+4. `<home>/.cache/huggingface/hub` (default)
 
-The resolved path (never the env value) appears in the report as the
-`hf_cache_location` check's `path` field.
+This mirrors `huggingface_hub`, which bases its default cache on `XDG_CACHE_HOME`
+when that variable is set. The resolved path (never the env value) appears in the
+report as the `hf_cache_location` check's `path` field.
+
+The `model_cache_present` check requires a non-empty `snapshots/` subdirectory
+under the model slug directory — a bare top-level `models--…` directory left
+behind by an interrupted priming run does not count as present.
 
 When `HF_HUB_OFFLINE=1` or `TRANSFORMERS_OFFLINE=1` is set and the model cache
 is absent, the remediation text for `model_cache_present` explains that offline

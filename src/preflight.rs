@@ -182,8 +182,9 @@ pub struct Observations {
     // ── structural ───────────────────────────────────────────────────────────
     /// Canonicalised repository path (or the input if canonicalisation fails).
     pub repo_path: PathBuf,
-    /// Repository path exists on disk.
-    pub repo_path_exists: bool,
+    /// Repository path exists on disk **and is a directory** (`scan` rejects
+    /// non-directories in `validate_repository`).
+    pub repo_path_is_dir: bool,
     /// `git --version` returned exit 0.
     pub git_available: bool,
     /// `git -C <repo> rev-parse --git-dir` returned exit 0.
@@ -233,13 +234,16 @@ pub struct Observations {
 // ── Check builders ───────────────────────────────────────────────────────────
 
 fn check_repository_path(obs: &Observations) -> Check {
-    if obs.repo_path_exists {
+    if obs.repo_path_is_dir {
         Check {
             id: CheckId::RepositoryPath,
             status: CheckStatus::Pass,
             requirement: Requirement::Required,
             gate: Gate::Structural,
-            summary: format!("repository path exists: {}", obs.repo_path.display()),
+            summary: format!(
+                "repository path is a directory: {}",
+                obs.repo_path.display()
+            ),
             remediation: None,
             path: Some(obs.repo_path.clone()),
         }
@@ -250,10 +254,12 @@ fn check_repository_path(obs: &Observations) -> Check {
             requirement: Requirement::Required,
             gate: Gate::Structural,
             summary: format!(
-                "repository path does not exist: {}",
+                "repository path is not an existing directory: {}",
                 obs.repo_path.display()
             ),
-            remediation: Some("pass a valid repository path: eg doctor <PATH>".to_owned()),
+            remediation: Some(
+                "pass a directory to scan: eg doctor <DIR> (scan rejects file paths)".to_owned(),
+            ),
             path: Some(obs.repo_path.clone()),
         }
     }
@@ -820,7 +826,7 @@ pub fn gather_observations(config: &DoctorConfig) -> Observations {
         .repo_path
         .canonicalize()
         .unwrap_or_else(|_| config.repo_path.clone());
-    let repo_path_exists = config.repo_path.exists();
+    let repo_path_is_dir = config.repo_path.is_dir();
 
     let git_available = Command::new("git")
         .arg("--version")
@@ -846,11 +852,7 @@ pub fn gather_observations(config: &DoctorConfig) -> Observations {
             .is_ok_and(|s| s.success());
 
     let out_path = config.out.clone();
-    let out_parent = out_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let out_writable = probe_writable(&out_parent);
+    let out_writable = probe_out_writable(&out_path);
 
     let data_dir = config.data_dir.clone();
     let data_dir_writable = probe_writable(&nearest_existing_ancestor(&data_dir));
@@ -858,7 +860,7 @@ pub fn gather_observations(config: &DoctorConfig) -> Observations {
     let hf_cache_dir = resolve_hf_cache_dir();
     let hf_cache_readable = hf_cache_dir.exists() && std::fs::read_dir(&hf_cache_dir).is_ok();
     let hf_offline = is_hf_offline();
-    let model_cache_present = hf_cache_dir.join(MODEL_CACHE_DIR_SLUG).exists();
+    let model_cache_present = model_snapshot_present(&hf_cache_dir);
 
     let python_cmd = find_python();
     let python_available = python_cmd.is_some();
@@ -878,7 +880,7 @@ pub fn gather_observations(config: &DoctorConfig) -> Observations {
 
     Observations {
         repo_path,
-        repo_path_exists,
+        repo_path_is_dir,
         git_available,
         is_git_repo,
         git_history_readable,
@@ -928,15 +930,59 @@ fn probe_writable(dir: &Path) -> bool {
     }
 }
 
+/// Probe whether `scan`/`ingest` could write the output JSONL at `out_path`.
+///
+/// When `out_path` already exists, `scan` writes to that exact path, so probing
+/// only the parent is insufficient: an existing directory is never a valid file
+/// target, and an existing read-only file would fail at write time. Otherwise
+/// fall back to probing the parent directory.
+fn probe_out_writable(out_path: &Path) -> bool {
+    if out_path.is_dir() {
+        // `scan` would try to write a file at a directory path → always fails.
+        return false;
+    }
+    if out_path.exists() {
+        // Existing file: writable iff it can be opened for writing (no truncate,
+        // so the probe does not alter the file's contents).
+        return std::fs::OpenOptions::new()
+            .write(true)
+            .open(out_path)
+            .is_ok();
+    }
+    // Does not exist yet: the parent directory must accept a new file.
+    let parent = out_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    probe_writable(&parent)
+}
+
+/// Whether a usable model snapshot exists under the HF cache.
+///
+/// A bare top-level `models--…` directory can be left behind by an interrupted
+/// priming run, so require a non-empty `snapshots/` subdirectory rather than
+/// accepting any directory with the expected slug.
+fn model_snapshot_present(hf_cache_dir: &Path) -> bool {
+    let snapshots = hf_cache_dir.join(MODEL_CACHE_DIR_SLUG).join("snapshots");
+    std::fs::read_dir(&snapshots).is_ok_and(|mut entries| entries.next().is_some())
+}
+
 /// Resolve the HF cache directory per HF convention (safe path, never a token).
 ///
-/// Resolution order: `HF_HUB_CACHE` → `$HF_HOME/hub` → `<home>/.cache/huggingface/hub`.
+/// Resolution order: `HF_HUB_CACHE` → `$HF_HOME/hub` →
+/// `$XDG_CACHE_HOME/huggingface/hub` (non-Windows) →
+/// `<home>/.cache/huggingface/hub`. This mirrors `huggingface_hub`, which bases
+/// its default cache on `XDG_CACHE_HOME` when set.
 fn resolve_hf_cache_dir() -> PathBuf {
     if let Some(v) = std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()) {
         return PathBuf::from(v);
     }
     if let Some(v) = std::env::var_os("HF_HOME").filter(|v| !v.is_empty()) {
         return PathBuf::from(v).join("hub");
+    }
+    #[cfg(not(windows))]
+    if let Some(v) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(v).join("huggingface").join("hub");
     }
     home_dir().map_or_else(
         || PathBuf::from(".cache/huggingface/hub"),
@@ -995,12 +1041,20 @@ fn find_python() -> Option<&'static str> {
 }
 
 fn tcp_reachable(addr: &str) -> bool {
-    use std::net::TcpStream;
+    use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration;
-    addr.parse()
-        .ok()
-        .and_then(|a| TcpStream::connect_timeout(&a, Duration::from_secs(5)).ok())
-        .is_some()
+    // Resolve the hostname (e.g. `huggingface.co:443`) to one or more socket
+    // addresses, then try connecting to each. A bare `SocketAddr` parse would
+    // reject hostnames and always report unreachable.
+    let Ok(addrs) = addr.to_socket_addrs() else {
+        return false;
+    };
+    for socket_addr in addrs {
+        if TcpStream::connect_timeout(&socket_addr, Duration::from_secs(5)).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(windows)]
@@ -1028,7 +1082,7 @@ mod tests {
     fn ready_obs_structural() -> Observations {
         Observations {
             repo_path: PathBuf::from("/repo"),
-            repo_path_exists: true,
+            repo_path_is_dir: true,
             git_available: true,
             is_git_repo: true,
             git_history_readable: true,
@@ -1097,6 +1151,24 @@ mod tests {
         let r_b = build_report(&default_config(), &ready_obs_semantic());
         assert_eq!(r_a.overall_ready, r_a.structural_ready);
         assert_eq!(r_b.overall_ready, r_b.structural_ready);
+    }
+
+    #[test]
+    fn non_directory_repo_path_structural_fail() {
+        // e.g. `eg doctor file.rs` — exists as a file but is not a directory.
+        let obs = Observations {
+            repo_path_is_dir: false,
+            ..ready_obs_structural()
+        };
+        let report = build_report(&default_config(), &obs);
+        assert!(
+            !report.structural_ready,
+            "a non-directory path is not ready"
+        );
+        let c = find_check(&report, CheckId::RepositoryPath).unwrap();
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert_eq!(c.requirement, Requirement::Required);
+        assert_eq!(c.gate, Gate::Structural);
     }
 
     // ── Fixtures: required failures (exit 1) ──────────────────────────────────

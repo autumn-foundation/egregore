@@ -334,3 +334,141 @@ fn doctor_json_shape_stable_across_five_runs() {
         );
     }
 }
+
+// ── Repository path must be a directory ───────────────────────────────────────
+
+#[test]
+fn doctor_file_path_exits_1_not_a_directory() {
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("lib.rs");
+    fs::write(&file, "fn main() {}").unwrap();
+
+    let output = eg()
+        .args(["doctor", file.to_str().unwrap(), "--format", "json"])
+        .output()
+        .expect("eg doctor should execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "doctor on a file path should exit 1 (scan rejects non-directories)"
+    );
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["structural_ready"], false);
+
+    let repo_check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "repository_path")
+        .expect("repository_path check must appear");
+    assert_eq!(repo_check["status"], "fail");
+    assert_eq!(repo_check["requirement"], "required");
+}
+
+// ── Existing unwritable --out target ──────────────────────────────────────────
+
+#[test]
+fn doctor_out_path_is_existing_directory_exits_1() {
+    let tmp = TempDir::new().unwrap();
+    init_git_repo(tmp.path());
+
+    // --out points at an existing directory: scan's fs::write(out) would fail.
+    let out_dir = tmp.path().join("out-is-a-dir");
+    fs::create_dir(&out_dir).unwrap();
+
+    let output = eg()
+        .args([
+            "doctor",
+            tmp.path().to_str().unwrap(),
+            "--out",
+            out_dir.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("eg doctor should execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "doctor with --out pointing at a directory should exit 1"
+    );
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let out_check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "output_path_writable")
+        .expect("output_path_writable check must appear");
+    assert_eq!(out_check["status"], "fail");
+    assert_eq!(out_check["requirement"], "required");
+}
+
+// ── Model cache: bare slug dir without snapshots is not "present" ─────────────
+
+#[test]
+fn doctor_empty_model_slug_dir_is_not_ready() {
+    let tmp = TempDir::new().unwrap();
+    init_git_repo(tmp.path());
+
+    // Simulate an interrupted priming run: top-level slug dir exists but has no
+    // snapshots/ contents. Point HF_HUB_CACHE at it.
+    let hf_cache = tmp.path().join("hf-cache");
+    let slug_dir = hf_cache.join("models--sentence-transformers--all-MiniLM-L6-v2");
+    fs::create_dir_all(&slug_dir).unwrap();
+
+    let output = eg()
+        .args(["doctor", tmp.path().to_str().unwrap(), "--format", "json"])
+        .env("HF_HUB_CACHE", hf_cache.to_str().unwrap())
+        .output()
+        .expect("eg doctor should execute");
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["semantic_ready"], false,
+        "an empty slug dir without snapshots must not be semantic-ready"
+    );
+    let model_check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "model_cache_present")
+        .expect("model_cache_present check must appear");
+    assert_eq!(model_check["status"], "fail");
+}
+
+#[test]
+fn doctor_model_snapshot_present_is_detected() {
+    let tmp = TempDir::new().unwrap();
+    init_git_repo(tmp.path());
+
+    // A populated snapshots/ dir signals a usable cache.
+    let hf_cache = tmp.path().join("hf-cache");
+    let snapshot = hf_cache
+        .join("models--sentence-transformers--all-MiniLM-L6-v2")
+        .join("snapshots")
+        .join("abc123");
+    fs::create_dir_all(&snapshot).unwrap();
+    fs::write(snapshot.join("config.json"), "{}").unwrap();
+
+    let output = eg()
+        .args(["doctor", tmp.path().to_str().unwrap(), "--format", "json"])
+        .env("HF_HUB_CACHE", hf_cache.to_str().unwrap())
+        .output()
+        .expect("eg doctor should execute");
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let model_check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "model_cache_present")
+        .expect("model_cache_present check must appear");
+    assert_eq!(
+        model_check["status"], "pass",
+        "a populated snapshots/ dir must be detected as present"
+    );
+}
