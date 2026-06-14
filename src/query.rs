@@ -735,6 +735,64 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
         }
     }
 
+    context_from_seeds(records, symbol_name, source_facts, &symbol_ids)
+}
+
+/// Resolves the trust-separated context sections from a frozen set of
+/// source-fact seed IDs.
+///
+/// Shared core used by [`symbol_context`] (seeds collected by symbol *name*)
+/// and [`record_context`] (seeds collected from a specific *record ID*, so a
+/// File-typed match is first-class). `source_facts` is the seed set already
+/// containing the anchor node(s) plus their co-located/defined neighbors;
+/// `symbol_ids` is the set of *primary* query nodes (the thing the caller asked
+/// about), used to keep them in the source-facts section and to avoid
+/// re-scanning them during backfill. The bounded cross-domain BFS, backfill to
+/// convergence, and per-section sort are identical regardless of how the seeds
+/// were chosen, so both entry points share one implementation and one set of
+/// determinism guarantees.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+fn context_from_seeds<'a>(
+    records: &'a [GraphRecord],
+    symbol_name: &str,
+    source_facts: BTreeSet<&'a str>,
+    symbol_ids: &BTreeSet<&'a str>,
+) -> SymbolContext<'a> {
+    // Recompute the prelim lookups the core needs. These are cheap O(n) scans
+    // and are derived deterministically from `records`, so computing them here
+    // (rather than threading them through the seeding step) keeps the seam
+    // narrow without changing behavior.
+    let tombstoned_ids: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Tombstone { deleted_id, .. } = r {
+                Some(deleted_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let by_id: std::collections::BTreeMap<&str, &GraphRecord> =
+        records.iter().map(|r| (r.id(), r)).collect();
+    let has_any_temporal_version: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                temporal: Some(_),
+                ..
+            }
+            | GraphRecord::Edge {
+                id,
+                temporal: Some(_),
+                ..
+            } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut source_facts = source_facts;
+
     // Snapshot seed IDs (symbol IDs + co-located file IDs) before the main
     // loop. Used to detect links that target the symbol's context, including
     // file-scoped relations such as CommandRun --TOUCHED_FILE--> File.
@@ -1219,7 +1277,7 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
 
     // Remove symbol records from non-source-fact sections to avoid overlap
     // (a Symbol node classified via edge could end up in the wrong section).
-    for sid in &symbol_ids {
+    for sid in symbol_ids {
         observations.remove(sid);
         project_state.remove(sid);
         artifacts.remove(sid);
@@ -1316,6 +1374,352 @@ pub fn symbol_context<'a>(records: &'a [GraphRecord], symbol_name: &str) -> Symb
             u
         },
     }
+}
+
+/// Returns evidence-backed context anchored on a specific record ID, so a
+/// File-typed semantic match (which has no symbol name) is first-class (#90).
+///
+/// Mirrors [`symbol_context`] but seeds from the record itself rather than from
+/// a name:
+/// - a `Symbol` anchor seeds the symbol plus its co-located `File` (via
+///   DEFINES, falling back to the shared repo-relative path);
+/// - a `File` anchor seeds the file plus the `Symbol`s it DEFINES;
+/// - any other anchor seeds just itself.
+///
+/// Returns an empty [`SymbolContext`] (`is_no_match()` is `true`) when the
+/// anchor is absent from the slice or is a tombstoned current-state record.
+/// The bounded BFS, backfill, trust separation, and deterministic ordering are
+/// shared with [`symbol_context`] via [`context_from_seeds`].
+#[must_use]
+pub fn record_context<'a>(records: &'a [GraphRecord], anchor_id: &str) -> SymbolContext<'a> {
+    let tombstoned_ids: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let has_any_temporal_version: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                temporal: Some(_),
+                ..
+            }
+            | GraphRecord::Edge {
+                id,
+                temporal: Some(_),
+                ..
+            } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    // A record id is live unless it is a tombstoned current-state record; a
+    // historical (temporal) version survives the current-state tombstone.
+    let is_live = |id: &str| has_any_temporal_version.contains(id) || !tombstoned_ids.contains(id);
+
+    // Canonical `&'a str` for a record id, if present in the slice.
+    let id_ref = |wanted: &str| -> Option<&'a str> {
+        records
+            .iter()
+            .find_map(|r| if r.id() == wanted { Some(r.id()) } else { None })
+    };
+
+    // Node kind for an id (from any version present in the slice).
+    let kind_of = |wanted: &str| -> Option<NodeKind> {
+        records.iter().find_map(|r| match r {
+            GraphRecord::Node { id, kind, .. } if id == wanted => Some(*kind),
+            _ => None,
+        })
+    };
+
+    // No-match for an anchor that is absent, not a node, or tombstoned in the
+    // current state without a surviving historical version.
+    let (Some(anchor_ref), Some(anchor_kind)) = (id_ref(anchor_id), kind_of(anchor_id)) else {
+        return SymbolContext {
+            symbol_name: anchor_id.to_owned(),
+            ..Default::default()
+        };
+    };
+    if !is_live(anchor_id) {
+        return SymbolContext {
+            symbol_name: anchor_id.to_owned(),
+            ..Default::default()
+        };
+    }
+
+    let mut source_facts: BTreeSet<&str> = BTreeSet::new();
+    let mut primary: BTreeSet<&str> = BTreeSet::new();
+    source_facts.insert(anchor_ref);
+    primary.insert(anchor_ref);
+
+    if anchor_kind == NodeKind::File {
+        // File anchor: seed the symbols this file DEFINES (file → symbols).
+        for r in records {
+            let GraphRecord::Edge {
+                id: edge_id,
+                label: EdgeLabel::Defines,
+                source,
+                target,
+                temporal,
+                ..
+            } = r
+            else {
+                continue;
+            };
+            if source.as_str() != anchor_id {
+                continue;
+            }
+            let edge_live = temporal.is_some() || !tombstoned_ids.contains(edge_id.as_str());
+            if edge_live
+                && is_live(target.as_str())
+                && kind_of(target.as_str()) == Some(NodeKind::Symbol)
+                && let Some(sym) = id_ref(target.as_str())
+            {
+                source_facts.insert(sym);
+                primary.insert(sym);
+            }
+        }
+    } else {
+        // Symbol (or other) anchor: seed the co-located File (symbol → file),
+        // preferring DEFINES and falling back to the shared repo-relative path.
+        let mut resolved_by_defines = false;
+        for r in records {
+            let GraphRecord::Edge {
+                id: edge_id,
+                label: EdgeLabel::Defines,
+                source,
+                target,
+                temporal,
+                ..
+            } = r
+            else {
+                continue;
+            };
+            if target.as_str() != anchor_id {
+                continue;
+            }
+            let edge_live = temporal.is_some() || !tombstoned_ids.contains(edge_id.as_str());
+            if edge_live
+                && is_live(source.as_str())
+                && kind_of(source.as_str()) == Some(NodeKind::File)
+                && let Some(file) = id_ref(source.as_str())
+            {
+                source_facts.insert(file);
+                resolved_by_defines = true;
+            }
+        }
+        if !resolved_by_defines {
+            let anchor_path = records.iter().find_map(|r| match r {
+                GraphRecord::Node {
+                    id,
+                    repo_relative_path: Some(p),
+                    ..
+                } if id == anchor_id => Some(p.as_str()),
+                _ => None,
+            });
+            if let Some(path) = anchor_path {
+                for r in records {
+                    if let GraphRecord::Node {
+                        id: file_id,
+                        kind: NodeKind::File,
+                        repo_relative_path: Some(p),
+                        ..
+                    } = r
+                        && p == path
+                        && is_live(file_id.as_str())
+                    {
+                        source_facts.insert(file_id.as_str());
+                    }
+                }
+            }
+        }
+    }
+
+    let label = records
+        .iter()
+        .find_map(|r| match r {
+            GraphRecord::Node {
+                id, name: Some(n), ..
+            } if id == anchor_id => Some(n.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| anchor_id.to_owned());
+
+    context_from_seeds(records, &label, source_facts, &primary)
+}
+
+// ── semantic → context bridge (issue #90) ──────────────────────────────────
+
+/// A single semantic retrieval lead handed to [`semantic_context_bundle`].
+///
+/// Decoupled from the embeddings-feature `SemanticMatch` so the bridge — and
+/// its tests — need no embedding model: callers (the CLI) convert each
+/// `SemanticMatch` into one of these before context resolution. Carries only
+/// the bounded retrieval-lead fields (record id, optional name/path/span, and
+/// the relevance score), never raw content.
+#[derive(Debug, Clone)]
+pub struct SemanticLead {
+    /// Stable record ID of the matched node.
+    pub record_id: String,
+    /// Human-readable name when the match carries one (absent for File nodes).
+    pub name: Option<String>,
+    /// Repository-relative path when available.
+    pub repo_relative_path: Option<String>,
+    /// Relevance score (higher = more similar).
+    pub score: f32,
+    /// Source span when available.
+    pub span: Option<crate::ir::SourceSpan>,
+}
+
+/// How a semantic match anchored its context. Documents how File matches differ
+/// from Symbol matches in the response (AC3 of #90).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AnchorKind {
+    /// The match resolved to a `Symbol` node.
+    Symbol,
+    /// The match resolved to a `File` node (no symbol name; defined symbols are
+    /// seeded into the context instead).
+    File,
+    /// The match resolved to some other embeddable node kind.
+    Other,
+}
+
+impl AnchorKind {
+    /// Stable lowercase tag for serialization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Symbol => "symbol",
+            Self::File => "file",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One semantic match expanded into evidence-backed context.
+pub struct SemanticMatchContext<'a> {
+    /// The retrieval lead (handle + score) that produced this row.
+    pub lead: SemanticLead,
+    /// Whether the match anchored on a Symbol, File, or other node.
+    pub anchor_kind: AnchorKind,
+    /// Every candidate record ID when the match name resolves to more than one
+    /// live symbol (AC4 — ambiguity is surfaced, not guessed). Sorted and
+    /// deduplicated; empty when the match is unambiguous.
+    pub candidate_record_ids: Vec<String>,
+    /// The trust-separated context anchored on the match's record ID.
+    pub context: SymbolContext<'a>,
+}
+
+/// The combined natural-language → evidence-backed-context answer.
+pub struct SemanticContextBundle<'a> {
+    /// One row per lead that cleared the relevance floor, in ranking order.
+    pub matches: Vec<SemanticMatchContext<'a>>,
+}
+
+impl SemanticContextBundle<'_> {
+    /// Returns `true` when no lead cleared the relevance floor — the documented
+    /// no-match condition (AC7). Callers MUST check this before reading
+    /// `matches`; the CLI maps it to a stable diagnostic and a distinct exit
+    /// code rather than an empty success.
+    #[must_use]
+    pub const fn is_no_match(&self) -> bool {
+        self.matches.is_empty()
+    }
+}
+
+/// Bridges ranked semantic leads into evidence-backed context (#90).
+///
+/// For each lead whose `score` is at or above `min_score` — the documented
+/// relevance floor — in the leads' given (already-deterministic) ranking order,
+/// resolves [`record_context`] anchored on the lead's record ID. File-typed
+/// leads are first-class (defined symbols are seeded); an ambiguous symbol name
+/// surfaces every candidate record ID instead of silently picking one. This
+/// consumes the existing semantic ranking and symbol-context contracts and adds
+/// no new domain, schema, or model. Read-only: it borrows `records` and mutates
+/// nothing, and identical inputs produce identical output.
+#[must_use]
+pub fn semantic_context_bundle<'a>(
+    records: &'a [GraphRecord],
+    leads: &[SemanticLead],
+    min_score: f32,
+) -> SemanticContextBundle<'a> {
+    let mut matches = Vec::new();
+    for lead in leads {
+        if lead.score < min_score {
+            continue;
+        }
+        let anchor_kind = match record_kind(records, &lead.record_id) {
+            Some(NodeKind::Symbol) => AnchorKind::Symbol,
+            Some(NodeKind::File) => AnchorKind::File,
+            _ => AnchorKind::Other,
+        };
+        let candidate_record_ids = lead
+            .name
+            .as_deref()
+            .map(|name| live_symbol_ids_for_name(records, name))
+            .filter(|ids| ids.len() > 1)
+            .unwrap_or_default();
+        let context = record_context(records, &lead.record_id);
+        matches.push(SemanticMatchContext {
+            lead: lead.clone(),
+            anchor_kind,
+            candidate_record_ids,
+            context,
+        });
+    }
+    SemanticContextBundle { matches }
+}
+
+/// Node kind for a record id (from any version present in the slice).
+fn record_kind(records: &[GraphRecord], id: &str) -> Option<NodeKind> {
+    records.iter().find_map(|r| match r {
+        GraphRecord::Node { id: nid, kind, .. } if nid == id => Some(*kind),
+        _ => None,
+    })
+}
+
+/// All live `Symbol` record IDs matching `name`, sorted and deduplicated.
+///
+/// Mirrors the current-state filter used by [`symbol_context`]: a historical
+/// (temporal) version survives a current-state tombstone; a tombstoned
+/// current-state symbol is excluded.
+fn live_symbol_ids_for_name(records: &[GraphRecord], name: &str) -> Vec<String> {
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut ids: Vec<String> = records
+        .iter()
+        .filter_map(|r| {
+            let GraphRecord::Node {
+                id,
+                kind: NodeKind::Symbol,
+                name: Some(n),
+                temporal,
+                ..
+            } = r
+            else {
+                return None;
+            };
+            if n != name {
+                return None;
+            }
+            let is_historical = temporal.is_some();
+            if !is_historical && tombstoned.contains(id.as_str()) {
+                return None;
+            }
+            Some(id.clone())
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 /// Returns `true` for edge labels that cross domain boundaries and therefore

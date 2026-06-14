@@ -12,6 +12,7 @@ eg query file     <PATH>  --data-dir <DIR>  [--repo <SELECTOR>] [--format json|t
 eg query drift            --graph <PATH>    [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query drift            --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
+eg query semantic-context <QUERY> --data-dir <DIR> [--limit N] [--min-score F] [--repo <SELECTOR>]
 eg query context  <NAME>  --graph <PATH>
 eg query task     <HANDLE> --graph <PATH>
 eg query memory   <HANDLE> --graph <PATH>   [--verified-only]
@@ -21,6 +22,9 @@ eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>]
 Evidence-backed audit subcommands have their own pages:
 
 - `eg query context` — evidence-backed context for a **symbol** (issue #38).
+- `eg query semantic-context` — **natural-language query → evidence-backed
+  context** for the top-N semantic matches in one call
+  ([semantic-search-guidance.md](semantic-search-guidance.md), issue #90).
 - `eg query task` — evidence for a **task** ([task-queries.md](task-queries.md), issue #48).
 - `eg query memory` — audit the evidence behind one **agent-authored memory
   claim** ([memory-audit.md](memory-audit.md), issue #64).
@@ -32,7 +36,7 @@ Most subcommands accept exactly one input source:
 - `--graph <PATH>` — read from a JSONL file produced by `eg scan` or `eg scan-history`.
 - `--data-dir <DIR>` — read from an embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. Requires the `embedded-aletheiadb` feature (enabled by default). Providing both `--graph` and `--data-dir` is an error.
 
-`eg query semantic` accepts **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results.
+`eg query semantic` and `eg query semantic-context` accept **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results. `eg query semantic-context` follows the `eg query context` no-match convention: on no semantic hit clearing `--min-score` it prints `{"ok":false,"error":{"code":"no_match",...}}` to **stdout** and exits `2`.
 
 ## Exit codes
 
