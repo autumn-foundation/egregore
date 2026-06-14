@@ -362,6 +362,46 @@ enum Commands {
         #[arg(long, default_value = ".egregore")]
         data_dir: PathBuf,
     },
+    /// Report local setup readiness for the scan → ingest → semantic-search workflow.
+    ///
+    /// Read-only by default: does not download models, create graph records, mutate
+    /// `.egregore`, start or stop the daemon, or contact hosted services unless
+    /// `--network` is explicitly passed.
+    ///
+    /// Exits 0 when all required structural checks pass; exits 1 when a required
+    /// check fails. Optional and semantic failures (python, model cache) never
+    /// change the exit code.
+    ///
+    /// Both human-readable text (`--format text`) and machine-readable JSON
+    /// (`--format json`, default) are supported. JSON check IDs are stable.
+    ///
+    /// See docs/cli/doctor.md for the full check matrix, exit codes, and the
+    /// distinction from the post-ingest semantic index readiness report (issue #71).
+    ///
+    /// Note: `--out` defaults to `graph.jsonl` here (unlike `scan`/`ingest` where
+    /// it is required). The default is for diagnostic convenience only.
+    Doctor {
+        /// Repository path to inspect.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Output JSONL path whose parent writability is checked.
+        #[arg(long, default_value = "graph.jsonl")]
+        out: PathBuf,
+        /// Embedded data directory whose writability is checked.
+        #[arg(long, default_value = ".egregore")]
+        data_dir: PathBuf,
+        /// Promote git-history readability from optional to required.
+        /// Use when you need `eg scan-history` to work.
+        #[arg(long)]
+        require_history: bool,
+        /// Perform one optional Hugging Face TCP reachability check.
+        /// Without this flag, no hosted services are contacted.
+        #[arg(long)]
+        network: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 /// Subcommands for `import`.
@@ -1082,6 +1122,14 @@ fn run_cli(cli: Cli) -> Result<()> {
         Commands::Repair { action } => repair_cmd(action),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Mcp { data_dir } => crate::mcp::run_stdio(&data_dir),
+        Commands::Doctor {
+            path,
+            out,
+            data_dir,
+            require_history,
+            network,
+            format,
+        } => doctor_cmd(path, out, data_dir, require_history, network, format),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Refresh {
             repo_path,
@@ -2033,6 +2081,46 @@ fn daemon(action: DaemonAction) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Handles `eg doctor`: gather environment observations, build the preflight
+/// report, print it, and exit with the appropriate code.
+///
+/// Exits 0 when structural checks all pass; exits 1 otherwise.
+/// Optional/semantic failures never change the exit code.
+fn doctor_cmd(
+    path: PathBuf,
+    out: PathBuf,
+    data_dir: PathBuf,
+    require_history: bool,
+    network: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    use crate::preflight::{DoctorConfig, build_report, gather_observations, render_doctor_text};
+
+    let config = DoctorConfig {
+        repo_path: path,
+        out,
+        data_dir,
+        require_history,
+        network,
+    };
+    let obs = gather_observations(&config);
+    let report = build_report(&config, &obs);
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Text => {
+            print!("{}", render_doctor_text(&report));
+        }
+    }
+
+    if !report.structural_ready {
+        process::exit(1);
+    }
+    Ok(())
 }
 
 /// Handles `eg repair preflight` and `eg repair run`.

@@ -46,6 +46,8 @@ pub mod local_project;
 pub mod mcp;
 /// Parser orchestration.
 pub mod parser;
+/// Local setup preflight report for the `eg doctor` command (issue #75).
+pub mod preflight;
 /// Agent-facing graph query helpers.
 pub mod query;
 /// Redaction policy engine (`docs/schema/redaction.md` v1).
