@@ -629,6 +629,35 @@ enum QuerySubcommand {
         #[arg(long)]
         verified_only: bool,
     },
+    /// Surface prior failed attempts linked to a code or task handle (issue #63).
+    ///
+    /// Starts from a symbol record ID / name, a repo-relative file path, or a
+    /// task / source handle and returns prior FAILED attempts as citable local
+    /// facts — separated into `runtime_failures` (verification-domain evidence,
+    /// trust `verification_evidence`) and `agent_failures` (agent-authored
+    /// `Failure` claims, trust `agent_authored`) so neither is presented as
+    /// source truth. A later passing verification on the same target appears in
+    /// `superseding_successes`, and each failure carries a read-time
+    /// `resolution_status` (`still_failing` | `since_resolved`). Output never
+    /// includes raw transcript text, command output, or patch hunks — only
+    /// hashes, handles, bounded summaries, and redaction markers.
+    ///
+    /// "No prior failure found" is not evidence the code or task is correct.
+    ///
+    /// Documented in `docs/cli/failure-history.md`.
+    Failures {
+        /// Symbol record ID / name, repo-relative file path, or task/source handle.
+        handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict symbol/file handle resolution to one repository (issue #67).
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -2562,6 +2591,50 @@ struct MemoryAuditResponse<'a> {
     page: AuditPage,
 }
 
+/// One prior failed attempt: a redaction-safe [`AuditItem`] plus the
+/// failure-specific read-time fields (issue #63).
+#[derive(Serialize)]
+struct FailureAttemptJson<'a> {
+    #[serde(flatten)]
+    item: AuditItem<'a>,
+    /// Read-time `still_failing` / `since_resolved` status (AC5).
+    resolution_status: &'static str,
+    /// Record ID of the later passing verification that resolved it, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_by: Option<&'a str>,
+    /// The target handle (anchor record ID) this attempt linked to.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    matched_target: &'a str,
+    /// `command_failure` / `patch_invalid` for an agent `Failure` claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_kind: Option<&'a str>,
+    /// RFC-3339 execution time for a runtime verification failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executed_at: Option<&'a str>,
+}
+
+/// Full prior-failed-attempt response envelope (issue #63).
+#[derive(Serialize)]
+struct FailureHistoryResponse<'a> {
+    ok: bool,
+    target_handle: &'a str,
+    target_type: &'a str,
+    target_ids: Vec<&'a str>,
+    runtime_failures: Vec<FailureAttemptJson<'a>>,
+    agent_failures: Vec<FailureAttemptJson<'a>>,
+    superseding_successes: Vec<AuditItem<'a>>,
+    patch_artifacts: Vec<AuditItem<'a>>,
+    /// `AgentSession` record IDs reached via `AUTHORED_BY` from a failure — the
+    /// citable provenance when a `Failure` carries no `agent_id`/`session_id`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    agent_sessions: Vec<&'a str>,
+    /// `Agent` record IDs reached via `SESSION_OF`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    agents: Vec<&'a str>,
+    diagnostics: Vec<AuditDiagnostic<'a>>,
+    page: AuditPage,
+}
+
 // ---------------------------------------------------------------------------
 // query_cmd — dispatch
 // ---------------------------------------------------------------------------
@@ -2794,6 +2867,17 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_memory_cmd(&records, &id_or_handle, verified_only)
+        }
+        QuerySubcommand::Failures {
+            handle,
+            graph,
+            data_dir,
+            repo,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_failures_cmd(&records, &handle, &index, selected.as_deref())
         }
     }
 }
@@ -5496,6 +5580,158 @@ fn query_memory_cmd(
 
     let output =
         serde_json::to_string_pretty(&response).context("failed to serialize memory audit")?;
+    println!("{output}");
+    Ok(())
+}
+
+/// Builds one redaction-safe failed-attempt view from a context attempt.
+fn failure_attempt_json<'a>(attempt: &query::FailureAttempt<'a>) -> FailureAttemptJson<'a> {
+    let item = audit_item(&attempt.item);
+    let (failure_kind, executed_at) = match attempt.item.record {
+        GraphRecord::Node {
+            failure_kind,
+            executed_at,
+            ..
+        } => (failure_kind.as_deref(), executed_at.as_deref()),
+        _ => (None, None),
+    };
+    FailureAttemptJson {
+        item,
+        resolution_status: attempt.status.as_str(),
+        resolved_by: attempt.resolved_by,
+        matched_target: attempt.matched_target,
+        failure_kind,
+        executed_at,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn query_failures_cmd(
+    records: &[GraphRecord],
+    handle: &str,
+    index: &query::RepositoryIndex,
+    repo_scope: Option<&str>,
+) -> Result<()> {
+    let target = match query::resolve_failure_handle(records, handle, index, repo_scope) {
+        Ok(t) => t,
+        Err(
+            err @ (query::FailureHandleError::Ambiguous { .. }
+            | query::FailureHandleError::Unsupported { .. }),
+        ) => {
+            eprintln!("{}", serde_json::to_string(&err)?);
+            std::process::exit(1);
+        }
+    };
+
+    // A handle that resolved to nothing live in the store is a no-match (or a
+    // stale handle when it named a tombstoned record). This is distinct from a
+    // resolved target that simply has no recorded failures, which is a real
+    // exit-0 empty answer below (AC6).
+    if target.is_empty() {
+        let code = if target.stale {
+            "stale_handle"
+        } else {
+            "no_match"
+        };
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": { "code": code, "handle": handle },
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(2);
+    }
+
+    let ctx = query::failure_history_context(records, &target);
+
+    let runtime_failures: Vec<FailureAttemptJson<'_>> = ctx
+        .runtime_failures
+        .iter()
+        .map(failure_attempt_json)
+        .collect();
+    let agent_failures: Vec<FailureAttemptJson<'_>> = ctx
+        .agent_failures
+        .iter()
+        .map(failure_attempt_json)
+        .collect();
+    let superseding_successes: Vec<AuditItem<'_>> =
+        ctx.superseding_successes.iter().map(audit_item).collect();
+    let patch_artifacts: Vec<AuditItem<'_>> = ctx.patch_artifacts.iter().map(audit_item).collect();
+
+    // Diagnostics: context diagnostics + protected-payload + redaction markers
+    // for every reached record, exactly as the memory audit (AC6, AC8).
+    let mut diagnostics: Vec<AuditDiagnostic<'_>> = ctx
+        .diagnostics
+        .iter()
+        .map(|d| AuditDiagnostic {
+            code: &d.code,
+            source_record_id: &d.source_record_id,
+            target_handle: &d.target_handle,
+            relation: &d.relation,
+            target_domain: &d.target_domain,
+        })
+        .collect();
+    for attempt in ctx.agent_failures.iter().chain(&ctx.runtime_failures) {
+        protected_payload_diagnostics(attempt.item.record, &mut diagnostics);
+        if let GraphRecord::Node {
+            id,
+            redaction_policy_version: Some(ver),
+            ..
+        } = attempt.item.record
+        {
+            diagnostics.push(AuditDiagnostic {
+                code: "redacted_payload",
+                source_record_id: id,
+                target_handle: ver,
+                relation: "redaction_policy_version",
+                target_domain: "agent_memory",
+            });
+        }
+    }
+    for item in ctx.superseding_successes.iter().chain(&ctx.patch_artifacts) {
+        protected_payload_diagnostics(item.record, &mut diagnostics);
+    }
+    diagnostics.sort_by(|a, b| {
+        a.code
+            .cmp(b.code)
+            .then_with(|| a.source_record_id.cmp(b.source_record_id))
+            .then_with(|| a.target_handle.cmp(b.target_handle))
+            .then_with(|| a.relation.cmp(b.relation))
+            .then_with(|| a.target_domain.cmp(b.target_domain))
+    });
+    diagnostics.dedup_by(|a, b| {
+        a.code == b.code
+            && a.source_record_id == b.source_record_id
+            && a.target_handle == b.target_handle
+            && a.relation == b.relation
+            && a.target_domain == b.target_domain
+    });
+
+    let returned = runtime_failures.len()
+        + agent_failures.len()
+        + superseding_successes.len()
+        + patch_artifacts.len();
+
+    let response = FailureHistoryResponse {
+        ok: true,
+        target_handle: handle,
+        target_type: ctx.target_kind,
+        target_ids: ctx.target_ids.iter().map(String::as_str).collect(),
+        runtime_failures,
+        agent_failures,
+        superseding_successes,
+        patch_artifacts,
+        agent_sessions: ctx.agent_sessions.iter().map(|r| r.id()).collect(),
+        agents: ctx.agents.iter().map(|r| r.id()).collect(),
+        diagnostics,
+        page: AuditPage {
+            cursor: None,
+            has_more: false,
+            returned,
+        },
+    };
+
+    let output =
+        serde_json::to_string_pretty(&response).context("failed to serialize failure history")?;
     println!("{output}");
     Ok(())
 }
