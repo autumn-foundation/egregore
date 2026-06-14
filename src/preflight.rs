@@ -246,6 +246,10 @@ pub struct Observations {
     pub model_cache_present: bool,
     /// `python3` or `python` binary found on PATH.
     pub python_available: bool,
+    /// The interpreter `find_python` detected (`"python3"` or `"python"`), so
+    /// remediation/`next_command` strings name a runnable executable. `None`
+    /// when no interpreter is on PATH.
+    pub python_executable: Option<String>,
     /// The `sentence_transformers` package is installed (detected without
     /// executing it). Only needed to *prime* a missing model cache — the
     /// embedding runtime loads the cached model through Rust, not Python.
@@ -481,12 +485,13 @@ fn check_embedded_store_openable(obs: &Observations) -> Check {
             requirement: Requirement::Required,
             gate: Gate::Structural,
             summary: format!(
-                "embedded runtime sidecar is not a usable directory: {}",
+                "embedded runtime path is not usable (symlink or unexpected type): {}",
                 sidecar.display()
             ),
             remediation: Some(
-                "remove or replace the runtime sidecar path (it must be a real \
-                 directory, not a file or symlink) so embedded ingest can create it"
+                "remove or replace the runtime path (the sidecar directory and its \
+                 egregored.lock must not be symlinks or non-directories) so embedded \
+                 ingest can open the store"
                     .to_owned(),
             ),
             path: Some(sidecar.clone()),
@@ -592,6 +597,23 @@ fn check_embeddings_feature(obs: &Observations) -> Check {
     }
 }
 
+/// The interpreter to name in remediation/`next_command` strings: the one the
+/// probe detected, or the documented `python` when none was found.
+fn python_exe(obs: &Observations) -> &str {
+    obs.python_executable.as_deref().unwrap_or("python")
+}
+
+/// The documented model-priming command, using the detected interpreter so it is
+/// runnable in the same environment being diagnosed (`python3 -m pip` / `python3
+/// -c` when only `python3` exists).
+fn priming_command(py: &str) -> String {
+    format!(
+        "{py} -m pip install -U sentence-transformers && {py} -c \
+         \"from sentence_transformers import SentenceTransformer; \
+         SentenceTransformer('{DEFAULT_EMBEDDING_MODEL_NAME}')\""
+    )
+}
+
 fn check_model_cache_present(obs: &Observations) -> Check {
     if obs.model_cache_present {
         Check {
@@ -607,18 +629,15 @@ fn check_model_cache_present(obs: &Observations) -> Check {
             path: Some(obs.hf_cache_dir.join(MODEL_CACHE_DIR_SLUG)),
         }
     } else {
+        let py = python_exe(obs);
         let remediation = if obs.hf_offline {
             format!(
                 "HF_HUB_OFFLINE is set but model is not cached; \
-                 disable offline mode and run: python -c \"from sentence_transformers \
-                 import SentenceTransformer; SentenceTransformer('{DEFAULT_EMBEDDING_MODEL_NAME}')\""
+                 disable offline mode and run: {}",
+                priming_command(py)
             )
         } else {
-            format!(
-                "prime the model cache: pip install -U sentence-transformers && \
-                 python -c \"from sentence_transformers import SentenceTransformer; \
-                 SentenceTransformer('{DEFAULT_EMBEDDING_MODEL_NAME}')\""
-            )
+            format!("prime the model cache: {}", priming_command(py))
         };
         Check {
             id: CheckId::ModelCachePresent,
@@ -691,11 +710,7 @@ fn check_python_priming_runnable(obs: &Observations) -> Check {
             requirement: Requirement::Optional,
             gate: Gate::Semantic,
             summary: "sentence_transformers package is not installed".to_owned(),
-            remediation: Some(format!(
-                "pip install -U sentence-transformers && \
-                 python -c \"from sentence_transformers import SentenceTransformer; \
-                 SentenceTransformer('{DEFAULT_EMBEDDING_MODEL_NAME}')\""
-            )),
+            remediation: Some(priming_command(python_exe(obs))),
             path: None,
         }
     }
@@ -910,11 +925,7 @@ fn compute_next_command(
                         sentence-transformers and the SentenceTransformer snippet"
                     .to_owned();
             }
-            return format!(
-                "pip install -U sentence-transformers && python -c \
-                 \"from sentence_transformers import SentenceTransformer; \
-                 SentenceTransformer('{DEFAULT_EMBEDDING_MODEL_NAME}')\""
-            );
+            return priming_command(python_exe(obs));
         }
         return format!(
             "eg ingest {} --adapter embedded --data-dir {} --embed",
@@ -999,10 +1010,12 @@ pub fn gather_observations(config: &DoctorConfig) -> Observations {
         .repo_path
         .canonicalize()
         .unwrap_or_else(|_| config.repo_path.clone());
-    // `scan` requires a directory it can `read_dir` (discover_rust_source_files),
-    // so an unreadable directory must fail the check too.
-    let repo_path_is_dir =
-        config.repo_path.is_dir() && std::fs::read_dir(&config.repo_path).is_ok();
+    // `scan` recursively reads the tree via `discover_rust_source_files`, so the
+    // repo check must reflect full traversability — not just the readable root.
+    // Reuse the exact discovery `scan` uses: an unreadable root or descendant
+    // directory makes it (and therefore `scan`) fail.
+    let repo_path_is_dir = config.repo_path.is_dir()
+        && crate::fs::discover_rust_source_files(&config.repo_path).is_ok();
 
     let git_available = Command::new("git")
         .arg("--version")
@@ -1043,6 +1056,7 @@ pub fn gather_observations(config: &DoctorConfig) -> Observations {
 
     let python_cmd = find_python();
     let python_available = python_cmd.is_some();
+    let python_executable = python_cmd.map(str::to_owned);
     let python_import_ok = python_cmd.is_some_and(probe_sentence_transformers_installed);
 
     let embeddings_feature_enabled = cfg!(feature = "embeddings");
@@ -1069,6 +1083,7 @@ pub fn gather_observations(config: &DoctorConfig) -> Observations {
         hf_offline,
         model_cache_present,
         python_available,
+        python_executable,
         python_import_ok,
         embeddings_feature_enabled,
         is_windows,
@@ -1156,6 +1171,13 @@ fn probe_data_dir_writable(data_dir: &Path) -> bool {
 /// the stale-daemon repair gate ([`repair::embedded_open_repair_gate`]) and the
 /// runtime sidecar directory health (`ensure_runtime_dir` rejects a sidecar that
 /// is a symlink or a regular file). Returns `None` when not blocked.
+/// True when `path` exists and is either a symlink or not a directory.
+#[cfg(feature = "embedded-aletheiadb")]
+fn path_is_symlink_or_nondir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_symlink() || !meta.is_dir())
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 fn compute_embedded_open_block(data_dir: &Path) -> Option<EmbeddedOpenBlock> {
     // 1. Stale, non-stopped daemon metadata (same gate the adapter applies first).
@@ -1171,10 +1193,15 @@ fn compute_embedded_open_block(data_dir: &Path) -> Option<EmbeddedOpenBlock> {
     // 3. Runtime sidecar must be a real directory (not a symlink or file), since
     //    `ensure_runtime_dir` would otherwise fail before the store is opened.
     let runtime_dir = crate::daemon::runtime_dir_for_data_dir(data_dir);
-    if let Ok(meta) = std::fs::symlink_metadata(&runtime_dir)
-        && (meta.file_type().is_symlink() || !meta.is_dir())
-    {
+    if path_is_symlink_or_nondir(&runtime_dir) {
         return Some(EmbeddedOpenBlock::RuntimeSidecarUnusable(runtime_dir));
+    }
+    // 4. The lock file inside the sidecar must not be a symlink: `StoreLease::acquire`
+    //    rejects it via `reject_runtime_symlink(&path, "runtime file")`. The lock
+    //    file is named `egregored.lock` (see daemon `LOCK_FILE`).
+    let lock_file = runtime_dir.join("egregored.lock");
+    if std::fs::symlink_metadata(&lock_file).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Some(EmbeddedOpenBlock::RuntimeSidecarUnusable(lock_file));
     }
     None
 }
@@ -1377,6 +1404,7 @@ mod tests {
             hf_offline: false,
             model_cache_present: false,
             python_available: false,
+            python_executable: None,
             python_import_ok: false,
             embeddings_feature_enabled: true,
             is_windows: false,
@@ -1391,6 +1419,7 @@ mod tests {
         Observations {
             model_cache_present: true,
             python_available: true,
+            python_executable: Some("python3".to_owned()),
             python_import_ok: true,
             ..ready_obs_structural()
         }
@@ -1904,6 +1933,25 @@ mod tests {
             report.next_command.contains("sentence_transformers")
                 || report.next_command.contains("SentenceTransformer"),
             "next_command should suggest model priming: {}",
+            report.next_command
+        );
+    }
+
+    #[test]
+    fn next_command_uses_detected_python_executable() {
+        // Only python3 exists; the priming next_command must name python3, not python.
+        let obs = Observations {
+            python_available: true,
+            python_executable: Some("python3".to_owned()),
+            python_import_ok: true,
+            model_cache_present: false,
+            ..ready_obs_structural()
+        };
+        let report = build_report(&default_config(), &obs);
+        assert!(
+            report.next_command.contains("python3 -m pip")
+                && report.next_command.contains("python3 -c"),
+            "next_command should use the detected python3 executable: {}",
             report.next_command
         );
     }

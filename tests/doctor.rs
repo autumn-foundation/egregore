@@ -198,6 +198,50 @@ fn doctor_unusable_runtime_sidecar_exits_1() {
     assert_eq!(check["requirement"], "required");
 }
 
+/// A symlinked `egregored.lock` inside the runtime sidecar makes embedded ingest
+/// fail (`StoreLease::acquire` rejects symlinked runtime files), so `eg doctor`
+/// must report it rather than claiming `structural_ready`.
+#[cfg(all(unix, feature = "embedded-aletheiadb"))]
+#[test]
+fn doctor_symlinked_runtime_lock_exits_1() {
+    use aletheia_egregore::daemon::runtime_dir_for_data_dir;
+
+    let tmp = TempDir::new().unwrap();
+    init_git_repo(tmp.path());
+    let data_dir = tmp.path().join(".egregore");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // Create the runtime sidecar directory, then a symlinked lock file inside it.
+    let sidecar = runtime_dir_for_data_dir(&data_dir);
+    fs::create_dir_all(&sidecar).unwrap();
+    let bait = tmp.path().join("bait");
+    fs::write(&bait, b"").unwrap();
+    std::os::unix::fs::symlink(&bait, sidecar.join("egregored.lock")).unwrap();
+
+    let output = eg()
+        .args([
+            "doctor",
+            tmp.path().to_str().unwrap(),
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("eg doctor should execute");
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["structural_ready"], false);
+    let check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "embedded_store_openable")
+        .expect("embedded_store_openable check must appear");
+    assert_eq!(check["status"], "fail");
+}
+
 // ── --format text ─────────────────────────────────────────────────────────────
 
 #[test]
