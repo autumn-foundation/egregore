@@ -5236,6 +5236,27 @@ pub fn resolve_failure_handle(
             _ => None,
         })
         .collect();
+    // A record/edge that still has a temporal (history) version is not deleted
+    // for history-bearing reads: a current-state tombstone only retires the
+    // current state, so failure history for moved/deleted code stays reachable
+    // (mirrors `symbol_context`).
+    let has_temporal: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                temporal: Some(_),
+                ..
+            }
+            | GraphRecord::Edge {
+                id,
+                temporal: Some(_),
+                ..
+            } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let deleted = |id: &str| tombstoned.contains(id) && !has_temporal.contains(id);
     let in_scope = |id: &str| -> bool {
         repo_scope.is_none_or(|scope| repo_index.owner_of(id) == Some(scope))
     };
@@ -5266,7 +5287,7 @@ pub fn resolve_failure_handle(
                 message: "malformed canonical codegraph ID".to_owned(),
             });
         }
-        if tombstoned.contains(handle) {
+        if deleted(handle) {
             return Ok(empty_target(FailureTargetKind::Symbol, true));
         }
         for r in records {
@@ -5396,7 +5417,7 @@ pub fn resolve_failure_handle(
             && path == handle
             && in_scope(id)
         {
-            if tombstoned.contains(id.as_str()) {
+            if deleted(id.as_str()) {
                 saw_tombstoned = true;
             } else {
                 file_matches.insert(id.clone());
@@ -5432,7 +5453,7 @@ pub fn resolve_failure_handle(
             && name == handle
             && in_scope(id)
         {
-            if tombstoned.contains(id.as_str()) {
+            if deleted(id.as_str()) {
                 saw_tombstoned = true;
             } else {
                 symbol_matches.insert(id.clone());
@@ -5459,7 +5480,7 @@ pub fn resolve_failure_handle(
     //    itself a tombstoned record ID (e.g. a retracted AgentSession) is stale —
     //    its live child evidence must not resurrect it as a source target.
     let mut seeds: BTreeSet<String> = BTreeSet::new();
-    if tombstoned.contains(handle) {
+    if deleted(handle) {
         saw_tombstoned = true;
     } else {
         for r in records {
@@ -5478,10 +5499,66 @@ pub fn resolve_failure_handle(
                     || source_artifact_hash.as_deref() == Some(handle)
                     || session_id.as_deref() == Some(handle))
             {
-                if tombstoned.contains(id.as_str()) {
+                if deleted(id.as_str()) {
                     saw_tombstoned = true;
                 } else {
                     seeds.insert(id.clone());
+                }
+            }
+        }
+        // If the handle is an `AgentSession` record ID, resolve the failures
+        // authored in that session even when provenance lives only in
+        // `AUTHORED_BY` edges or the session_id value differs from the record ID
+        // (the command emits these record IDs as citable provenance).
+        let session_key = records.iter().find_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                kind: NodeKind::AgentSession,
+                session_id,
+                name,
+                ..
+            } if id == handle => Some(session_id.clone().or_else(|| name.clone())),
+            _ => None,
+        });
+        if let Some(key) = session_key {
+            if let Some(k) = key.as_deref() {
+                for r in records {
+                    if let GraphRecord::Node {
+                        id,
+                        kind,
+                        session_id: Some(sid),
+                        ..
+                    } = r
+                        && (matches!(kind, NodeKind::Failure) || is_verification_kind(*kind))
+                        && sid == k
+                        && !deleted(id.as_str())
+                    {
+                        seeds.insert(id.clone());
+                    }
+                }
+            }
+            let authored_sources: BTreeSet<&str> = records
+                .iter()
+                .filter_map(|r| match r {
+                    GraphRecord::Edge {
+                        id: eid,
+                        label: EdgeLabel::AuthoredBy,
+                        source,
+                        target,
+                        ..
+                    } if target == handle && !deleted(eid.as_str()) => Some(source.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if !authored_sources.is_empty() {
+                for r in records {
+                    if let GraphRecord::Node { id, kind, .. } = r
+                        && authored_sources.contains(id.as_str())
+                        && (matches!(kind, NodeKind::Failure) || is_verification_kind(*kind))
+                        && !deleted(id.as_str())
+                    {
+                        seeds.insert(id.clone());
+                    }
                 }
             }
         }
@@ -5501,7 +5578,7 @@ pub fn resolve_failure_handle(
     //    no-match. The resolver never guesses a replacement (AC6).
     Ok(empty_target(
         FailureTargetKind::Symbol,
-        saw_tombstoned || tombstoned.contains(handle),
+        saw_tombstoned || deleted(handle),
     ))
 }
 
@@ -5547,8 +5624,28 @@ pub fn failure_history_context<'a>(
             _ => None,
         })
         .collect();
+    // History-bearing reads keep records/edges that have a temporal version even
+    // when a current-state tombstone shares their ID, so failure links for
+    // moved/deleted code remain traversable (mirrors `symbol_context`).
+    let has_temporal: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                temporal: Some(_),
+                ..
+            }
+            | GraphRecord::Edge {
+                id,
+                temporal: Some(_),
+                ..
+            } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let deleted = |id: &str| tombstoned.contains(id) && !has_temporal.contains(id);
     let present = |id: &str| -> Option<&'a GraphRecord> {
-        if tombstoned.contains(id) {
+        if deleted(id) {
             None
         } else {
             by_id.get(id).copied()
@@ -5571,8 +5668,9 @@ pub fn failure_history_context<'a>(
             } => {
                 // Skip retracted edges: a tombstoned `FAILED_ON` / `VALIDATED_BY`
                 // / `PRODUCED_PATCH` edge must not surface stale relationships on
-                // current-state reads, matching `symbol_context`'s convention.
-                if tombstoned.contains(id.as_str()) {
+                // current-state reads, matching `symbol_context`'s convention —
+                // unless the edge has a temporal version (history read).
+                if deleted(id.as_str()) {
                     continue;
                 }
                 edges_from
@@ -5617,7 +5715,7 @@ pub fn failure_history_context<'a>(
         } else {
             let code = if matches!(target.kind, FailureTargetKind::Task) {
                 "missing_task_ref"
-            } else if tombstoned.contains(a.as_str()) {
+            } else if deleted(a.as_str()) {
                 "stale_code_handle"
             } else {
                 "missing_code_handle"

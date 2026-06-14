@@ -9,7 +9,7 @@
 use std::{fs, path::PathBuf};
 
 use aletheia_egregore::{
-    EdgeLabel, EvidenceLink, GraphRecord, NodeKind, SourceSpan,
+    EdgeLabel, EvidenceLink, GraphRecord, NodeKind, SourceSpan, TemporalMetadata,
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, Graph, OutputHandle,
         PROJECT_SCHEMA_VERSION, PatchHandle, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
@@ -2081,4 +2081,122 @@ fn tombstoned_session_record_id_handle_is_stale() {
         "a deleted session handle must be stale, not a live source"
     );
     assert_eq!(parse(&stdout)["error"]["code"], "stale_handle");
+}
+
+// ── Round-8 review-fix coverage ─────────────────────────────────────────────
+
+#[test]
+fn historical_code_with_tombstone_still_surfaces_failures() {
+    // A File/Symbol deleted in the current state but retained as a history
+    // version (scan-history JSONL) must not be treated as stale: its prior
+    // failures stay reachable.
+    let symbol_id = stable_id(&["node", "Symbol", "src/h.rs", "gone"]);
+    let symbol = GraphRecord::symbol(
+        symbol_id.clone(),
+        "fn",
+        "src/h.rs".to_owned(),
+        span(1, 5),
+        "gone".to_owned(),
+        "historical symbol".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "a".repeat(16),
+        git_parent_commits: vec![],
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: None,
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: Some("git_commit_committer_date".to_owned()),
+    });
+    let fail = failure_node(
+        &agent_memory_stable_id(&["failure", "h_fail"]),
+        "command_failure",
+        Some("2026-01-02T00:00:00Z"),
+        vec![link(&symbol_id, "codegraph", "FAILED_ON")],
+    );
+    let tombstone = tombstone_for(&symbol_id);
+    let (_t, graph) = write_graph(vec![symbol, fail, tombstone]);
+    let (code, stdout, stderr) = run_graph(&graph, &symbol_id, &[]);
+    assert_eq!(
+        code, 0,
+        "history-bearing code must not be stale; stderr={stderr}"
+    );
+    let v = parse(&stdout);
+    assert_eq!(
+        v["agent_failures"].as_array().unwrap().len(),
+        1,
+        "prior failures for deleted-but-historical code must surface: {stdout}"
+    );
+}
+
+#[test]
+fn agent_session_record_id_resolves_authored_failures() {
+    // Querying an AgentSession record ID must find failures authored in that
+    // session via AUTHORED_BY edges and via the session_id key, not only nodes
+    // that happen to store the record ID in session_id.
+    let session_id = agent_memory_stable_id(&["node", "agent_session", "s2"]);
+    let mut session = GraphRecord::node(
+        session_id.clone(),
+        NodeKind::AgentSession,
+        None,
+        None,
+        Some("sk1".to_owned()),
+        "session".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        session_id: sid,
+        ..
+    } = &mut session
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *sid = Some("sk1".to_owned());
+    }
+    // F1: provenance only via AUTHORED_BY edge.
+    let f1_id = agent_memory_stable_id(&["failure", "s2_f1"]);
+    let f1 = failure_node(
+        &f1_id,
+        "command_failure",
+        Some("2026-01-01T00:00:00Z"),
+        vec![],
+    );
+    let authored = GraphRecord::edge(
+        EdgeLabel::AuthoredBy,
+        f1_id.clone(),
+        session_id.clone(),
+        None,
+        "f1 authored by session".to_owned(),
+    );
+    // F2: carries the session key in session_id.
+    let f2_id = agent_memory_stable_id(&["failure", "s2_f2"]);
+    let mut f2 = failure_node(
+        &f2_id,
+        "command_failure",
+        Some("2026-01-02T00:00:00Z"),
+        vec![],
+    );
+    if let GraphRecord::Node {
+        session_id: sid, ..
+    } = &mut f2
+    {
+        *sid = Some("sk1".to_owned());
+    }
+    let (_t, graph) = write_graph(vec![session, f1, authored, f2]);
+    let (code, stdout, stderr) = run_graph(&graph, &session_id, &[]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse(&stdout);
+    assert_eq!(v["target_type"], "source");
+    let ids: Vec<&str> = v["agent_failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["record_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&f1_id.as_str()),
+        "AUTHORED_BY failure: {ids:?}"
+    );
+    assert!(
+        ids.contains(&f2_id.as_str()),
+        "session-key failure: {ids:?}"
+    );
 }
