@@ -22,7 +22,7 @@ use crate::{
     identity,
     ir::{EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SnapshotHead, SourceSpan},
     link_evidence::{self, LinkOptions},
-    local_project, query, scan_repository_history_with_override, scan_repository_with_override,
+    local_project, query, scan_repository_history_with_override, scan_repository_with_exclusions,
     schema_version::{RecordVersion, record_version},
     traj::{self, ImportOptions},
 };
@@ -34,7 +34,7 @@ use crate::adapters::SemanticMatch;
 #[cfg(feature = "embedded-aletheiadb")]
 use crate::daemon::{DaemonClient, DaemonConfig};
 #[cfg(feature = "embedded-aletheiadb")]
-use crate::incremental::scan_repository_incremental;
+use crate::incremental::scan_repository_incremental_excluding;
 #[cfg(feature = "embedded-aletheiadb")]
 use crate::repair;
 
@@ -1666,7 +1666,11 @@ fn link_evidence_cmd(code_graph_path: &Path, evidence_path: &Path, out: &Path) -
 }
 
 fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<()> {
-    let graph = scan_repository_with_override(repo_path, repo_id_override)
+    // Exclude the output file from the dirty probe (PR #186 E): if a previous
+    // `graph.jsonl` is still untracked in the worktree, the snapshot should not
+    // count it as a source change and stamp `dirty = true`.
+    let exclusions = store_artifact_exclusions(repo_path, &[Some(out)]);
+    let graph = scan_repository_with_exclusions(repo_path, repo_id_override, &exclusions)
         .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
     let jsonl = graph
         .to_jsonl()
@@ -1762,9 +1766,11 @@ fn freshness_cmd(
 ) -> Result<()> {
     let store_kind = if graph.is_some() { "graph" } else { "data_dir" };
     let identity = identity::compute_repository_identity(repo_path, repo_id_override);
-    // Exclude the store artifact being checked from the dirty probe so an in-tree
-    // `--graph`/`--data-dir` does not falsely report `stale_dirty` (PR #186 #4).
-    let exclusions = store_artifact_exclusions(repo_path, graph.or(data_dir));
+    // Exclude both known store artifacts from the dirty probe (PR #186 E/F): when
+    // checking `--data-dir`, `graph.jsonl` from the same workflow may sit untracked
+    // and vice versa; excluding both prevents a just-written store from reading as
+    // `stale_dirty` before the user gitignores or deletes the intermediate output.
+    let exclusions = store_artifact_exclusions(repo_path, &[graph, data_dir]);
     let (current_head, current_dirty) =
         identity::working_tree_snapshot_excluding(repo_path, &exclusions);
 
@@ -1830,11 +1836,11 @@ fn freshness_cmd(
 fn query_freshness_code(
     records: &[GraphRecord],
     repo_path: Option<&Path>,
-    artifact: Option<&Path>,
+    artifacts: &[Option<&Path>],
 ) -> Option<(String, &'static str)> {
     let repo_path = repo_path?;
     let identity = identity::compute_repository_identity(repo_path, None);
-    let exclusions = store_artifact_exclusions(repo_path, artifact);
+    let exclusions = store_artifact_exclusions(repo_path, artifacts);
     let (head, dirty) = identity::working_tree_snapshot_excluding(repo_path, &exclusions);
     // Stamp against the repository that actually owns the matched snapshot. When
     // the match came from the single-repository fallback (e.g. a `--repo-id-override`
@@ -1856,18 +1862,18 @@ fn query_freshness_code(
 /// it — an in-tree store the workflow just wrote must not by itself make the tree
 /// look `stale_dirty`. Returns empty when there is no artifact or it lives
 /// outside the working tree.
-fn store_artifact_exclusions(repo_path: &Path, artifact: Option<&Path>) -> Vec<String> {
-    let Some(artifact) = artifact else {
-        return Vec::new();
-    };
+fn store_artifact_exclusions(repo_path: &Path, artifacts: &[Option<&Path>]) -> Vec<String> {
     let repo_abs = fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
-    let artifact_abs = fs::canonicalize(artifact).unwrap_or_else(|_| artifact.to_path_buf());
-    artifact_abs
-        .strip_prefix(&repo_abs)
-        .ok()
-        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-        .filter(|rel| !rel.is_empty())
-        .map_or_else(Vec::new, |rel| vec![rel])
+    artifacts
+        .iter()
+        .filter_map(|a| *a)
+        .filter_map(|artifact| {
+            let abs = fs::canonicalize(artifact).unwrap_or_else(|_| artifact.to_path_buf());
+            let rel = abs.strip_prefix(&repo_abs).ok()?;
+            let s = rel.to_string_lossy().replace('\\', "/");
+            (!s.is_empty()).then_some(s)
+        })
+        .collect()
 }
 
 /// Stamps the freshness `code` on each result whose repository matches the
@@ -2205,7 +2211,11 @@ fn scan_refresh_cmd(
     }
 
     // Perform the incremental scan (reads cache, hashes files, rebuilds changed ones).
-    let scan = scan_repository_incremental(repo_path, cache_path)
+    // Exclude the data-dir from the dirty probe (PR #186 A): `refresh` always runs
+    // with a pre-existing store in the worktree; the store itself must not mark the
+    // snapshot as `dirty` so a subsequent `eg freshness --data-dir` reads `fresh`.
+    let snapshot_exclusions = store_artifact_exclusions(repo_path, &[Some(data_dir)]);
+    let scan = scan_repository_incremental_excluding(repo_path, cache_path, &snapshot_exclusions)
         .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
 
     let records = scan.graph.records().to_vec();
@@ -3104,7 +3114,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let freshness_code = query_freshness_code(
                 &records,
                 repo_path.as_deref(),
-                graph.as_deref().or(data_dir.as_deref()),
+                &[graph.as_deref(), data_dir.as_deref()],
             );
             as_of.map_or_else(
                 || {
@@ -3150,7 +3160,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let freshness_code = query_freshness_code(
                 &records,
                 repo_path.as_deref(),
-                graph.as_deref().or(data_dir.as_deref()),
+                &[graph.as_deref(), data_dir.as_deref()],
             );
             query_file(
                 &records,
@@ -3210,7 +3220,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let freshness = query_freshness_code(
                 &records,
                 repo_path.as_deref(),
-                graph.as_deref().or(data_dir.as_deref()),
+                &[graph.as_deref(), data_dir.as_deref()],
             );
             query_context_cmd(&records, &name, freshness)
         }

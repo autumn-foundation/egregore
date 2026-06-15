@@ -140,6 +140,25 @@ pub fn scan_repository_with_override(
     scan_repository_at_with_override(repo_path, &now, repo_id_override)
 }
 
+/// Like [`scan_repository_with_override`] but excludes repo-relative paths from
+/// the dirty probe when stamping the snapshot.
+///
+/// Pass the output graph path (if inside the repository) so a pre-existing
+/// `graph.jsonl` from a previous run is not counted as a source change (PR #186 E/F).
+///
+/// # Errors
+///
+/// Returns an error when the repository path is missing, is not a directory, or
+/// source discovery cannot read the filesystem.
+pub fn scan_repository_with_exclusions(
+    repo_path: impl AsRef<Path>,
+    repo_id_override: Option<&str>,
+    snapshot_exclusions: &[String],
+) -> Result<Graph> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    scan_repository_at_with_override_inner(repo_path, &now, repo_id_override, snapshot_exclusions)
+}
+
 /// Scans a repository with an explicit `transaction_time` and optional identity override.
 ///
 /// # Errors
@@ -150,6 +169,15 @@ pub fn scan_repository_at_with_override(
     repo_path: impl AsRef<Path>,
     transaction_time: &str,
     repo_id_override: Option<&str>,
+) -> Result<Graph> {
+    scan_repository_at_with_override_inner(repo_path, transaction_time, repo_id_override, &[])
+}
+
+fn scan_repository_at_with_override_inner(
+    repo_path: impl AsRef<Path>,
+    transaction_time: &str,
+    repo_id_override: Option<&str>,
+    snapshot_exclusions: &[String],
 ) -> Result<Graph> {
     LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
@@ -162,7 +190,7 @@ pub fn scan_repository_at_with_override(
     // node. `head` + `dirty` are deterministic for an unchanged clean tree at a
     // fixed commit; `scanned_at` reuses the transaction-time override so the JSONL
     // stays byte-for-byte stable.
-    let (head, dirty) = identity::working_tree_snapshot(repo_root);
+    let (head, dirty) = identity::working_tree_snapshot_excluding(repo_root, snapshot_exclusions);
     let snapshot = ir::SourceSnapshotPayload {
         head,
         dirty,

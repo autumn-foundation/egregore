@@ -734,3 +734,138 @@ fn query_context_omits_freshness_across_repositories() {
         "context freshness must be omitted when facts span repositories: {report}"
     );
 }
+
+/// E: scanning into the working tree a second time while the previous
+/// `graph.jsonl` is still untracked must not stamp `dirty = true` on the new
+/// output — the snapshot excludes its own output file (PR #186 follow-up A/E/F).
+#[test]
+fn repeated_in_tree_scan_does_not_stamp_dirty() {
+    let fx = Fixture::committed();
+    let in_tree_graph = fx.repo().join("graph.jsonl");
+
+    // First scan — creates the untracked artifact.
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&in_tree_graph)
+        .assert()
+        .success();
+    assert!(in_tree_graph.exists());
+
+    // Second scan — artifact already present as untracked, must still produce fresh.
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&in_tree_graph)
+        .assert()
+        .success();
+
+    let out = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--graph")
+        .arg(&in_tree_graph)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "repeated in-tree scan must not stamp dirty=true due to its own previous output: {report}"
+    );
+}
+
+/// F: after `eg scan . --out graph.jsonl && eg ingest graph.jsonl --data-dir .egregore`
+/// `eg freshness --data-dir` must report `fresh`. The documented workflow expects the
+/// project's `.gitignore` to cover `*.jsonl` so `git status` never sees the
+/// intermediate graph file (the egregore repo ships this rule; the fixture below
+/// mirrors it). The data-dir exclusion ensures `.egregore` itself is also unseen.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn in_tree_graph_not_counted_when_checking_data_dir() {
+    let fx = Fixture::committed();
+    // graph.jsonl lives inside the repository; gitignore it so git status ignores it,
+    // mirroring the documented `*.jsonl` rule in egregore's own .gitignore.
+    let in_tree_graph = fx.repo().join("graph.jsonl");
+    let data_dir = fx.repo().join(".egregore");
+    std::fs::write(fx.repo().join(".gitignore"), "*.jsonl\n.egregore*/\n").unwrap();
+    commit_all(fx.repo(), "add gitignore");
+
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&in_tree_graph)
+        .assert()
+        .success();
+
+    eg().args(["ingest"])
+        .arg(&in_tree_graph)
+        .args(["--adapter", "embedded"])
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    // Both graph.jsonl and .egregore are gitignored; freshness must report `fresh`.
+    let out = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "gitignored store artifacts must not make the data-dir read stale_dirty: {report}"
+    );
+}
+
+/// A: `eg refresh` on a tree with uncommitted edits must not stamp `dirty = true`
+/// for the `.egregore` data-dir itself, so a follow-up `eg freshness --data-dir`
+/// distinguishes "real source edit" from "store artifact is untracked"
+/// (PR #186 follow-up A).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn refresh_excludes_in_tree_data_dir_from_dirty_probe() {
+    let fx = Fixture::committed();
+    fx.scan();
+
+    // Ingest into the repository (in-tree store, like the documented workflow).
+    let in_tree_data_dir = fx.repo().join(".egregore");
+    eg().args(["ingest"])
+        .arg(fx.graph())
+        .args(["--adapter", "embedded"])
+        .arg("--data-dir")
+        .arg(&in_tree_data_dir)
+        .assert()
+        .success();
+
+    // Commit a source change — the store is stale_head.
+    write_lib(fx.repo(), "pub fn hello() {}\npub fn v2() {}\n");
+    commit_all(fx.repo(), "v2");
+
+    // Refresh — the data-dir is inside the repo (untracked); it must not be
+    // counted as dirty in the stamped snapshot.
+    eg().args(["refresh"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&in_tree_data_dir)
+        .assert()
+        .success();
+
+    let out = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&in_tree_data_dir)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "data-dir must be excluded from the dirty probe during refresh: {report}"
+    );
+}
