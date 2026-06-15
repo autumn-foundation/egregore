@@ -1177,3 +1177,173 @@ fn scan_does_not_exclude_egregore_directory_with_tracked_content() {
         "tracked .egregore-prefixed directory must not be excluded: {repo_node}"
     );
 }
+
+/// Y1: an untracked `.egregore`-prefixed directory that contains `.rs` source
+/// files must not be auto-excluded from the dirty probe — its files appear in
+/// the graph and must be covered by the freshness signal.
+#[test]
+fn scan_does_not_exclude_untracked_egregore_dir_with_rust_sources() {
+    let fx = Fixture::committed();
+    // Create an untracked `.egregore_plugin/` directory containing Rust source.
+    // It has no tracked content (git ls-files is empty) but it has `.rs` files,
+    // so it must not be excluded from the dirty probe.
+    let plugin_dir = fx.repo().join(".egregore_plugin");
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+    std::fs::write(plugin_dir.join("lib.rs"), "// plugin\n").unwrap();
+
+    // Modify the `.rs` file (not committed, not gitignored) — tree is dirty.
+    std::fs::write(plugin_dir.join("lib.rs"), "// modified\n").unwrap();
+
+    let out_graph = fx.work.path().join("graph.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&out_graph)
+        .assert()
+        .success();
+
+    let jsonl = std::fs::read_to_string(&out_graph).unwrap();
+    let repo_node = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["record_type"] == "node" && v["kind"] == "Repository")
+        .expect("Repository node");
+    assert_eq!(
+        repo_node["source_snapshot"]["dirty"],
+        Value::Bool(true),
+        "untracked .egregore-prefixed directory with .rs files must not be excluded: {repo_node}"
+    );
+}
+
+/// Y2: `query context` with `--repo-path` on an override-ID store must emit a
+/// freshness verdict — the context owner is now used as the hint so the lookup
+/// finds the override-ID snapshot rather than the auto-detected identity.
+#[test]
+fn query_context_uses_context_owner_as_freshness_hint() {
+    let fx = Fixture::committed();
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(fx.graph())
+        .args(["--repo-id-override", "my-context-repo"])
+        .assert()
+        .success();
+
+    let out = eg()
+        .args(["query", "context", "hello"])
+        .arg("--graph")
+        .arg(fx.graph())
+        .arg("--repo-path")
+        .arg(fx.repo())
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(report["ok"], Value::Bool(true));
+    assert!(
+        report.get("freshness").is_some(),
+        "context must include freshness when owner hint resolves the override-ID snapshot: {report}"
+    );
+    assert_eq!(
+        report["freshness"], "fresh",
+        "context freshness must be fresh for a just-scanned override-ID repo: {report}"
+    );
+}
+
+/// Y3: when the selected repo's `Repository` node has no `source_snapshot`
+/// (pre-stamping / legacy store) and the hint differs from the auto-detected
+/// identity, the `unknown` verdict must still be stamped on the matching rows
+/// rather than silently dropped.
+///
+/// Without the hint-owner fallback the owner defaults to `identity.id`; then
+/// `stamp_freshness` compares against a different ID and emits no field at all.
+#[test]
+fn freshness_unknown_stamped_on_legacy_override_repo_rows() {
+    let fx = Fixture::committed();
+
+    // Scan with override ID — produces a stamped store.
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(fx.graph())
+        .args(["--repo-id-override", "legacy-override-repo"])
+        .assert()
+        .success();
+
+    // Strip `source_snapshot` from every record to simulate a pre-stamping store:
+    // rewrite the JSONL removing that field from Repository nodes.
+    let raw = std::fs::read_to_string(fx.graph()).unwrap();
+    let stripped: String = raw
+        .lines()
+        .map(|line| {
+            let Ok(mut v) = serde_json::from_str::<Value>(line) else {
+                return line.to_owned();
+            };
+            if v["kind"] == "Repository" {
+                v.as_object_mut().map(|o| o.remove("source_snapshot"));
+            }
+            serde_json::to_string(&v).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(fx.graph(), stripped).unwrap();
+
+    // Query symbol with --repo legacy-override-repo --repo-path:
+    // the `unknown` verdict must be stamped on the row (not absent).
+    let out = eg()
+        .args(["query", "symbol", "hello"])
+        .arg("--graph")
+        .arg(fx.graph())
+        .arg("--repo-path")
+        .arg(fx.repo())
+        .args(["--repo", "legacy-override-repo"])
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let first_line = stdout.lines().next().unwrap_or("{}");
+    let row: Value = serde_json::from_str(first_line).unwrap();
+    assert!(
+        row.get("freshness").is_some(),
+        "legacy override-ID rows must still carry a freshness field: {row}"
+    );
+    assert_eq!(
+        row["freshness"], "unknown",
+        "legacy pre-stamping store must emit unknown, not omit the field: {row}"
+    );
+}
+
+/// Y4: `scan` must not descend into gitignored directories, so a repo with a
+/// gitignored directory that contains unreadable content does not cause a
+/// traversal failure.
+///
+/// We test the observable outcome — directory pruning — by verifying that when
+/// a directory is listed in `.gitignore`, no symbols from it appear in the graph
+/// even though its `.rs` files exist on disk.
+#[test]
+fn scan_skips_gitignored_directory_before_traversal() {
+    let fx = Fixture::committed();
+    // Create a gitignored `generated/` directory with a Rust file.
+    let gen_dir = fx.repo().join("generated");
+    std::fs::create_dir_all(&gen_dir).unwrap();
+    std::fs::write(gen_dir.join("gen.rs"), "pub fn generated_fn() {}\n").unwrap();
+    std::fs::write(fx.repo().join(".gitignore"), "/generated/\n").unwrap();
+    commit_all(fx.repo(), "add gitignore");
+
+    let out_graph = fx.work.path().join("graph.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&out_graph)
+        .assert()
+        .success();
+
+    let jsonl = std::fs::read_to_string(&out_graph).unwrap();
+    assert!(
+        !jsonl.contains("generated_fn"),
+        "gitignored directory must be pruned before traversal, not post-filtered: {jsonl}"
+    );
+    assert!(
+        jsonl.contains("hello"),
+        "tracked source symbols must still appear in the graph: {jsonl}"
+    );
+}

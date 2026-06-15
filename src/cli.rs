@@ -1697,7 +1697,11 @@ fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<
                     .output()
                     .map(|out| !out.stdout.is_empty())
                     .unwrap_or(false);
-                if !has_tracked {
+                // Even when no content is tracked, an untracked directory that
+                // contains `.rs` files is a source directory, not a store output:
+                // its files appear in the graph but are outside `git status`, so
+                // excluding it from the dirty probe would mask deletions.
+                if !has_tracked && !dir_has_rust_sources(&path) {
                     egregore_dirs.push(path);
                 }
             }
@@ -1870,18 +1874,12 @@ fn freshness_cmd(
 /// byte-identical output to before this feature. When present, returns the stable
 /// freshness code (including `"fresh"`) so an agent always sees the signal it asked
 /// for and the result is never silently suppressed.
+///
 /// `repo_id_hint` is an optional known repository ID from the already-resolved
-/// `--repo` scope; it is tried alongside the recomputed identity so that a
-/// multi-repo store containing an `--repo-id-override` entry can still match
-/// even when the auto-detected ID differs from the override (PR #186 follow-up).
-fn query_freshness_code(
-    records: &[GraphRecord],
-    repo_path: Option<&Path>,
-    artifacts: &[Option<&Path>],
-) -> Option<(String, &'static str)> {
-    query_freshness_code_inner(records, repo_path, artifacts, None)
-}
-
+/// `--repo` scope or context owner; when provided and distinct from the
+/// auto-detected identity it is tried first so that operator-override IDs win in
+/// a multi-repo store, and used as the owner ID when no snapshot is found so that
+/// `stamp_freshness` can match selected rows (PR #186 follow-up).
 fn query_freshness_code_with_hint(
     records: &[GraphRecord],
     repo_path: Option<&Path>,
@@ -1911,9 +1909,19 @@ fn query_freshness_code_inner(
             .or_else(|| freshness::stored_snapshot_with_owner(records, &identity.id)),
         None => freshness::stored_snapshot_with_owner(records, &identity.id),
     };
+    // When no snapshot is found but the caller supplied an explicit hint (from
+    // `--repo`), use the hint as the owner ID so `stamp_freshness` can match
+    // the selected rows.  Falling back to `identity.id` would emit the unknown
+    // verdict under the wrong owner, making freshness invisible on those rows.
     let (owner_id, stored) = match matched {
         Some((owner, snapshot)) => (owner.to_owned(), Some(snapshot)),
-        None => (identity.id, None),
+        None => (
+            repo_id_hint
+                .filter(|h| *h != identity.id.as_str())
+                .map(ToOwned::to_owned)
+                .unwrap_or(identity.id),
+            None,
+        ),
     };
     let code = freshness::classify(stored, &head, dirty).code();
     Some((owner_id, code))
@@ -1939,6 +1947,28 @@ fn store_artifact_exclusions(repo_path: &Path, artifacts: &[Option<&Path>]) -> V
             (!s.is_empty()).then_some(s)
         })
         .collect()
+}
+
+/// Returns `true` if `dir` or any subdirectory contains a `.rs` file.
+///
+/// Used in the `.egregore*` auto-exclusion check: an untracked directory whose
+/// subtree contains `.rs` source files is a source directory, not a store output,
+/// and must not be excluded from the snapshot dirty probe.
+fn dir_has_rust_sources(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if dir_has_rust_sources(&path) {
+                return true;
+            }
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Stamps the freshness `code` on each result whose repository matches the
@@ -3331,13 +3361,34 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo_path,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            // Context is keyed to the single working tree at `repo_path`. Pass the
-            // (owning repository id, code) so the command can attach the verdict
-            // only when the response does not span other repositories (PR #186).
-            let freshness = query_freshness_code(
+            // Pre-compute the context owner so the freshness hint matches the
+            // repository that actually owns the returned source facts.  Without this,
+            // `query_freshness_code` auto-detects the identity from `repo_path`, which
+            // can differ from an operator-override ID: the snapshot lookup then fails
+            // (no match for the auto-detected ID in a single-override-ID store), the
+            // single-repo fallback is disabled, and the verdict is `unknown` even
+            // though all facts are from one stamped repository (PR #186 follow-up).
+            let owner_hint = if repo_path.is_some() {
+                let index = query::RepositoryIndex::build(&records);
+                let ctx = query::symbol_context(&records, &name);
+                let owners: std::collections::BTreeSet<Option<&str>> = ctx
+                    .source_facts
+                    .iter()
+                    .map(|r| index.owner_of(r.id()))
+                    .collect();
+                if owners.len() == 1 {
+                    owners.into_iter().next().flatten().map(ToOwned::to_owned)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let freshness = query_freshness_code_with_hint(
                 &records,
                 repo_path.as_deref(),
                 &[graph.as_deref(), data_dir.as_deref()],
+                owner_hint.as_deref(),
             );
             query_context_cmd(&records, &name, freshness)
         }

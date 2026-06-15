@@ -29,8 +29,16 @@ pub struct SourceFile {
 /// Returns an error when directory traversal cannot read an entry or when a
 /// discovered source file cannot be relativized against the repository root.
 pub fn discover_rust_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
+    // Pre-compute the set of gitignored directories so traversal can skip them
+    // entirely rather than descending into them and failing on unreadable content
+    // (PR #186 follow-up).  Purely filesystem-local for non-Git trees.
+    let ignored_dirs = if crate::identity::is_repo_root(repo_root) {
+        git_ignored_dir_prefixes(repo_root)
+    } else {
+        HashSet::new()
+    };
     let mut files = Vec::new();
-    collect_rust_source_files(repo_root, &mut files)?;
+    collect_rust_source_files(repo_root, &ignored_dirs, &mut files)?;
     // Respect .gitignore so generated/ignored Rust files are not indexed (issue
     // #82 / PR #186): a git-ignored file has no citable graph spans, and the
     // read-only freshness probe (`git status`, which omits ignored files) then
@@ -55,7 +63,11 @@ pub fn discover_rust_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
         .collect()
 }
 
-fn collect_rust_source_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_rust_source_files(
+    directory: &Path,
+    ignored_dirs: &HashSet<PathBuf>,
+    files: &mut Vec<PathBuf>,
+) -> Result<()> {
     let entries = std::fs::read_dir(directory).map_err(|source| CodegraphError::ReadDirectory {
         path: directory.to_path_buf(),
         source,
@@ -75,8 +87,8 @@ fn collect_rust_source_files(directory: &Path, files: &mut Vec<PathBuf>) -> Resu
             })?;
 
         if metadata.is_dir() {
-            if should_descend(&path) {
-                collect_rust_source_files(&path, files)?;
+            if should_descend(&path) && !ignored_dirs.contains(&path) {
+                collect_rust_source_files(&path, ignored_dirs, files)?;
             }
         } else if metadata.is_file() && path.extension() == Some(OsStr::new("rs")) {
             files.push(path);
@@ -91,6 +103,39 @@ fn should_descend(path: &Path) -> bool {
         .file_name()
         .and_then(OsStr::to_str)
         .is_some_and(|name| matches!(name, ".git" | "target"))
+}
+
+/// Runs `git ls-files --others --ignored --directory --exclude-standard` to
+/// obtain the set of gitignored top-level directories.  Returns their absolute
+/// paths so callers can skip them during traversal without descending into
+/// potentially unreadable or very large subtrees.
+///
+/// Returns an empty set when Git is unavailable or `repo_root` is not a Git
+/// work tree, preserving the filesystem-local behavior for non-Git trees.
+fn git_ignored_dir_prefixes(repo_root: &Path) -> HashSet<PathBuf> {
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--directory",
+            "--exclude-standard",
+        ])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return HashSet::new();
+    };
+    if !output.status.success() && output.status.code() != Some(1) {
+        return HashSet::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| repo_root.join(l.trim_end_matches('/')))
+        .collect()
 }
 
 fn repo_relative_path(repo_root: &Path, path: &Path) -> Result<String> {
