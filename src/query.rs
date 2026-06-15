@@ -1456,11 +1456,12 @@ pub fn record_context<'a>(records: &'a [GraphRecord], anchor_id: &str) -> Symbol
     primary.insert(anchor_ref);
 
     if anchor_kind == NodeKind::File {
-        // File anchor: BFS over DEFINES edges to seed all symbols that belong
-        // to this file — top-level items (File → DEFINES → Symbol) and nested
-        // items (Module/Impl → DEFINES → Symbol). Pure edge traversal avoids
-        // the repo-bleed of path-only matching: same-path symbols from other
-        // repositories are unreachable via DEFINES edges from this anchor.
+        // File anchor: BFS over DEFINES and CONTAINS edges to seed all
+        // code-graph nodes belonging to this file — top-level items
+        // (File → DEFINES → Symbol), modules (File → CONTAINS → Module),
+        // and deeper nesting (Module → DEFINES → Symbol, ImplBlock → DEFINES
+        // → Method). Pure edge traversal stays within the file's own tree so
+        // same-path nodes from other repositories are never mixed in.
         let mut frontier: Vec<&str> = vec![anchor_ref];
         while !frontier.is_empty() {
             let mut next_frontier: Vec<&str> = Vec::new();
@@ -1468,7 +1469,7 @@ pub fn record_context<'a>(records: &'a [GraphRecord], anchor_id: &str) -> Symbol
                 for r in records {
                     let GraphRecord::Edge {
                         id: edge_id,
-                        label: EdgeLabel::Defines,
+                        label,
                         source,
                         target,
                         temporal,
@@ -1480,75 +1481,88 @@ pub fn record_context<'a>(records: &'a [GraphRecord], anchor_id: &str) -> Symbol
                     if source.as_str() != container {
                         continue;
                     }
+                    if !matches!(label, EdgeLabel::Defines | EdgeLabel::Contains) {
+                        continue;
+                    }
                     let edge_live =
                         temporal.is_some() || !tombstoned_ids.contains(edge_id.as_str());
-                    if edge_live
-                        && is_live(target.as_str())
-                        && kind_of(target.as_str()) == Some(NodeKind::Symbol)
-                        && let Some(sym) = id_ref(target.as_str())
-                        && !source_facts.contains(sym)
+                    if !edge_live || !is_live(target.as_str()) {
+                        continue;
+                    }
+                    let target_kind = kind_of(target.as_str());
+                    // Seed Symbol, Module, and Import nodes; skip File (already
+                    // the anchor) and infrastructure kinds.
+                    if !matches!(
+                        target_kind,
+                        Some(NodeKind::Symbol | NodeKind::Module | NodeKind::Import)
+                    ) {
+                        continue;
+                    }
+                    if let Some(t) = id_ref(target.as_str())
+                        && !source_facts.contains(t)
                     {
-                        source_facts.insert(sym);
-                        primary.insert(sym);
-                        next_frontier.push(sym);
+                        source_facts.insert(t);
+                        primary.insert(t);
+                        // Symbol and Module can contain further items — keep
+                        // them in the frontier to continue the traversal.
+                        if matches!(target_kind, Some(NodeKind::Symbol | NodeKind::Module)) {
+                            next_frontier.push(t);
+                        }
                     }
                 }
             }
             frontier = next_frontier;
         }
     } else {
-        // Symbol (or other) anchor: seed the co-located File (symbol → file),
-        // preferring DEFINES and falling back to the shared repo-relative path.
-        let mut resolved_by_defines = false;
-        for r in records {
-            let GraphRecord::Edge {
-                id: edge_id,
-                label: EdgeLabel::Defines,
-                source,
-                target,
-                temporal,
-                ..
-            } = r
-            else {
-                continue;
-            };
-            if target.as_str() != anchor_id {
-                continue;
-            }
-            let edge_live = temporal.is_some() || !tombstoned_ids.contains(edge_id.as_str());
-            if edge_live
-                && is_live(source.as_str())
-                && kind_of(source.as_str()) == Some(NodeKind::File)
-                && let Some(file) = id_ref(source.as_str())
-            {
-                source_facts.insert(file);
-                resolved_by_defines = true;
-            }
-        }
-        if !resolved_by_defines {
-            let anchor_path = records.iter().find_map(|r| match r {
-                GraphRecord::Node {
-                    id,
-                    repo_relative_path: Some(p),
-                    ..
-                } if id == anchor_id => Some(p.as_str()),
-                _ => None,
-            });
-            if let Some(path) = anchor_path {
+        // Symbol (or other) anchor: find the co-located File by traversing
+        // upward through DEFINES and CONTAINS edges. Handles both top-level
+        // items (File → DEFINES → Symbol) and nested items
+        // (File → CONTAINS → Module → DEFINES → Symbol and
+        //  File → DEFINES → ImplBlock → DEFINES → Method). No path-only
+        // fallback is used, so same-path files from other repositories cannot
+        // bleed into this match's source_facts.
+        let mut to_search: Vec<&str> = vec![anchor_ref];
+        let mut visited_up: BTreeSet<&str> = BTreeSet::new();
+        visited_up.insert(anchor_ref);
+        while !to_search.is_empty() {
+            let mut next: Vec<&str> = Vec::new();
+            for &target_id in &to_search {
                 for r in records {
-                    if let GraphRecord::Node {
-                        id: file_id,
-                        kind: NodeKind::File,
-                        repo_relative_path: Some(p),
+                    let GraphRecord::Edge {
+                        id: edge_id,
+                        label,
+                        source,
+                        target,
+                        temporal,
                         ..
                     } = r
-                        && p == path
-                        && is_live(file_id.as_str())
+                    else {
+                        continue;
+                    };
+                    if target.as_str() != target_id {
+                        continue;
+                    }
+                    if !matches!(label, EdgeLabel::Defines | EdgeLabel::Contains) {
+                        continue;
+                    }
+                    let edge_live =
+                        temporal.is_some() || !tombstoned_ids.contains(edge_id.as_str());
+                    if !edge_live || !is_live(source.as_str()) {
+                        continue;
+                    }
+                    if kind_of(source.as_str()) == Some(NodeKind::File) {
+                        if let Some(file) = id_ref(source.as_str()) {
+                            source_facts.insert(file);
+                        }
+                    } else if let Some(container) = id_ref(source.as_str())
+                        && !visited_up.contains(container)
                     {
-                        source_facts.insert(file_id.as_str());
+                        visited_up.insert(container);
+                        next.push(container);
                     }
                 }
             }
+            to_search = next;
         }
     }
 

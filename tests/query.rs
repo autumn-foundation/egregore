@@ -4002,14 +4002,25 @@ fn ctx_file(path: &str) -> (String, GraphRecord) {
     (file_id, file)
 }
 
-/// Build a DEFINES edge from a File to a Symbol.
-fn ctx_defines(file_id: &str, sym_id: &str) -> GraphRecord {
+/// Build a DEFINES edge (source defines target).
+fn ctx_defines(source_id: &str, target_id: &str) -> GraphRecord {
     GraphRecord::edge(
         EdgeLabel::Defines,
-        file_id.to_owned(),
-        sym_id.to_owned(),
+        source_id.to_owned(),
+        target_id.to_owned(),
         None,
-        "file defines symbol".to_owned(),
+        "defines".to_owned(),
+    )
+}
+
+/// Build a CONTAINS edge (source contains target — used for file→module).
+fn ctx_contains(source_id: &str, target_id: &str) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::Contains,
+        source_id.to_owned(),
+        target_id.to_owned(),
+        None,
+        "contains".to_owned(),
     )
 }
 
@@ -4128,27 +4139,44 @@ fn record_context_file_anchor_includes_defined_symbols_and_context() {
 }
 
 #[test]
-fn record_context_file_anchor_finds_nested_symbols_via_defines_bfs() {
-    // Nested symbols (methods in impl blocks, functions in modules) have their
-    // DEFINES edge from the containing symbol, not directly from the file. The
-    // file anchor seeds them by BFS over DEFINES edges so that same-path
-    // symbols from other repositories are not mixed in.
+fn record_context_file_anchor_traverses_contains_and_defines() {
+    // The Rust extractor emits File → CONTAINS → Module and
+    // Module → DEFINES → Symbol. The BFS must follow both edge types to reach
+    // module-nested symbols, and the Module itself (NodeKind::Module, a
+    // SourceFact) must appear in source_facts alongside its defined symbols.
     let file_path = "src/lib.rs";
     let (file_id, file) = ctx_file(file_path);
-    let module_id = "codegraph:v4:mod001".to_owned();
-    let module = ctx_symbol(&module_id, "my_module", file_path, 1);
-    // module's DEFINES edge comes from the file (top-level)
-    let file_defines_module = ctx_defines(&file_id, &module_id);
-    let nested_id = "codegraph:v4:nested001".to_owned();
-    let nested = ctx_symbol(&nested_id, "nested_fn", file_path, 5);
-    // nested_fn's DEFINES edge comes from the module, NOT directly from the file
+
+    // Module node (NodeKind::Module, not Symbol) — extractor uses CONTAINS
+    let module_id = "codegraph:v4:module-m001".to_owned();
+    let module_node = GraphRecord::node(
+        module_id.clone(),
+        NodeKind::Module,
+        Some(file_path.to_owned()),
+        None,
+        Some("my_module".to_owned()),
+        "Rust module my_module".to_owned(),
+    );
+    let file_contains_module = ctx_contains(&file_id, &module_id);
+
+    // Symbol inside the module — extractor uses Module → DEFINES → Symbol
+    let nested_id = "codegraph:v4:sym-nested001".to_owned();
+    let nested = ctx_symbol(&nested_id, "my_module::nested_fn", file_path, 5);
     let module_defines_nested = ctx_defines(&module_id, &nested_id);
+
+    // Symbol at top level — extractor uses File → DEFINES → Symbol
+    let top_id = "codegraph:v4:sym-top001".to_owned();
+    let top = ctx_symbol(&top_id, "top_fn", file_path, 1);
+    let file_defines_top = ctx_defines(&file_id, &top_id);
+
     let records = vec![
         file,
-        module,
-        file_defines_module,
+        module_node,
+        file_contains_module,
         nested,
         module_defines_nested,
+        top,
+        file_defines_top,
     ];
 
     let ctx = record_context(&records, &file_id);
@@ -4156,11 +4184,64 @@ fn record_context_file_anchor_finds_nested_symbols_via_defines_bfs() {
     assert!(!ctx.is_no_match(), "file anchor must resolve context");
     assert!(
         ctx.source_facts.iter().any(|r| r.id() == module_id),
-        "top-level module (direct DEFINES from file) must be in source_facts"
+        "Module node (via CONTAINS) must be in source_facts"
     );
     assert!(
         ctx.source_facts.iter().any(|r| r.id() == nested_id),
-        "nested function (BFS hop via module DEFINES) must be in source_facts"
+        "module-nested symbol (Module → DEFINES) must be in source_facts"
+    );
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == top_id),
+        "top-level symbol (File → DEFINES) must be in source_facts"
+    );
+}
+
+#[test]
+fn record_context_symbol_anchor_finds_file_via_module_contains_chain() {
+    // When a symbol is nested inside a module (File → CONTAINS → Module →
+    // DEFINES → Symbol), the Symbol anchor must still find the owning File via
+    // the backward-BFS through DEFINES + CONTAINS edges rather than a path
+    // fallback that would bleed in same-path files from other repos.
+    let file_path = "src/lib.rs";
+    let (file_id, file) = ctx_file(file_path);
+
+    let module_id = "codegraph:v4:module-m002".to_owned();
+    let module_node = GraphRecord::node(
+        module_id.clone(),
+        NodeKind::Module,
+        Some(file_path.to_owned()),
+        None,
+        Some("inner".to_owned()),
+        "Rust module inner".to_owned(),
+    );
+    let file_contains_module = ctx_contains(&file_id, &module_id);
+
+    let nested_id = "codegraph:v4:sym-nested002".to_owned();
+    let nested = ctx_symbol(&nested_id, "inner::nested_fn", file_path, 5);
+    // Only edge to the symbol is from the module, NOT from the file
+    let module_defines_nested = ctx_defines(&module_id, &nested_id);
+
+    let records = vec![
+        file,
+        module_node,
+        file_contains_module,
+        nested,
+        module_defines_nested,
+    ];
+
+    let ctx = record_context(&records, &nested_id);
+
+    assert!(
+        !ctx.is_no_match(),
+        "nested symbol anchor must resolve context"
+    );
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == nested_id),
+        "anchor symbol must be in source_facts"
+    );
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == file_id),
+        "owning File must be seeded via backward BFS (File → CONTAINS → Module → DEFINES → Symbol)"
     );
 }
 
