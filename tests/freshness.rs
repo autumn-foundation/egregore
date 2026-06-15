@@ -1204,3 +1204,238 @@ fn triple_resolves_at_commit_not_reused_path_span() {
     assert_eq!(entry["verdict"], "unresolved");
     assert_eq!(entry["triggering_handle"]["kind"], "handle_removed");
 }
+
+// ── A retracted (tombstoned) drift record is not a trigger ───────────────────
+
+#[test]
+fn tombstoned_drift_record_is_not_a_trigger() {
+    // The cited symbol has an identical body across commits, so only a drift
+    // record could flag it. That drift record is itself tombstoned (a retracted /
+    // recomputed measurement), so the verdict must be `current`, not `drifted`.
+    let mut graph = Graph::new();
+    let path = "src/td.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    for (commit, vt) in [
+        ("commit_a", "2026-01-01T00:00:00Z"),
+        ("commit_b", "2026-01-02T00:00:00Z"),
+    ] {
+        graph.push(symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "same_body",
+            commit,
+            vt,
+        ));
+    }
+    let drift_id = semantic_stable_id(&["drift", "retracted"]);
+    for r in drift_record(
+        &drift_id,
+        &sym,
+        &sym,
+        "commit_a",
+        "commit_b",
+        "2026-01-01T00:00:00Z",
+        "2026-01-02T00:00:00Z",
+    ) {
+        graph.push(r);
+    }
+    // Retract the drift record.
+    graph.push(GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &drift_id]),
+        schema_version: aletheia_egregore::SCHEMA_VERSION,
+        deleted_id: drift_id.clone(),
+        summary: "drift retracted".to_owned(),
+        producer: None,
+    });
+    let obs = agent_memory_stable_id(&["obs", "td"]);
+    graph.push(observation(
+        &obs,
+        "f at commit_a",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("g.jsonl");
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run(&graph_path, &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(verdict_for(&v, &obs)["verdict"], "current");
+}
+
+// ── Content change across a committer-timestamp tie still drifts ─────────────
+
+#[test]
+fn content_change_across_committer_timestamp_tie_drifts() {
+    // Two commits share the same committer timestamp, with no drift record. The
+    // later version is a direct child of the anchor commit and its body changed,
+    // so the content-hash path must report `drifted` despite the tied timestamps.
+    let mut graph = Graph::new();
+    let path = "src/cc.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let tie = "2026-01-01T00:00:00Z";
+    graph.push(symbol_version(
+        &sym,
+        path,
+        "f",
+        span(1, 5),
+        "body_v1",
+        "commit_a",
+        tie,
+    ));
+    // commit_b shares the timestamp but is a child of commit_a and changed the body.
+    let mut child = symbol_version(&sym, path, "f", span(1, 5), "body_v2", "commit_b", tie);
+    if let GraphRecord::Node {
+        temporal: Some(t), ..
+    } = &mut child
+    {
+        t.git_parent_commits = vec!["commit_a".to_owned()];
+    }
+    graph.push(child);
+    let obs = agent_memory_stable_id(&["obs", "cc"]);
+    graph.push(observation(
+        &obs,
+        "f returns body_v1",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("g.jsonl");
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run(&graph_path, &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let entry = verdict_for(&v, &obs);
+    assert_eq!(entry["verdict"], "drifted");
+    assert_eq!(entry["triggering_handle"]["kind"], "content_change");
+}
+
+// ── History-only removal (no tombstone) is unresolved, not current ───────────
+
+#[test]
+fn historical_only_handle_without_tombstone_is_unresolved() {
+    // `scan-history` leaves no tombstone when a symbol is removed; the ghost
+    // symbol exists only at commit_a while the graph frontier advanced to
+    // commit_b. A note citing the ghost must be `unresolved`, never `current`.
+    let mut graph = Graph::new();
+    let path = "src/h.rs";
+    let ghost = stable_id(&["node", "symbol", "fn", "repo-a", path, "ghost", "0"]);
+    let keeper = stable_id(&["node", "symbol", "fn", "repo-a", path, "keeper", "0"]);
+    // ghost present only at commit_a (no tombstone).
+    graph.push(symbol_version(
+        &ghost,
+        path,
+        "ghost",
+        span(10, 20),
+        "ghost_body",
+        "commit_a",
+        "2026-01-01T00:00:00Z",
+    ));
+    // keeper advances the frontier to commit_b.
+    graph.push(symbol_version(
+        &keeper,
+        path,
+        "keeper",
+        span(30, 40),
+        "keeper_body",
+        "commit_b",
+        "2026-01-02T00:00:00Z",
+    ));
+    let obs = agent_memory_stable_id(&["obs", "ghost"]);
+    graph.push(observation(
+        &obs,
+        "ghost did the thing",
+        "0.9",
+        Some(&ghost),
+        Some(path),
+        Some(span(10, 20)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("g.jsonl");
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run(&graph_path, &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let entry = verdict_for(&v, &obs);
+    assert_eq!(entry["verdict"], "unresolved");
+    assert_eq!(entry["triggering_handle"]["kind"], "handle_absent");
+}
+
+// ── A triple cites a Module handle, not the whole file ───────────────────────
+
+#[test]
+fn triple_resolves_module_handle_not_file_fallback() {
+    // A Module and a File share a path. The module's body changed across commits;
+    // the file body did not. A triple citing the module's span must resolve to the
+    // module (→ `drifted`), not fall back to the unchanged file (→ `current`).
+    let mut graph = Graph::new();
+    let path = "src/m.rs";
+    let module = stable_id(&["node", "module", "repo-a", path, "m"]);
+    let file = stable_id(&["node", "File", "repo-a", path]);
+    let module_span = span(5, 10);
+    for (commit, vt, body) in [
+        ("commit_a", "2026-01-01T00:00:00Z", "mod_v1"),
+        ("commit_b", "2026-01-02T00:00:00Z", "mod_v2"),
+    ] {
+        graph.push(
+            GraphRecord::node(
+                module.clone(),
+                NodeKind::Module,
+                Some(path.to_owned()),
+                Some(module_span),
+                Some("m".to_owned()),
+                format!("Rust mod m\nSource:\n{body}"),
+            )
+            .with_temporal(temporal(commit, vt)),
+        );
+        // File body is identical across both commits.
+        graph.push(file_version(&file, path, "file_body", commit, vt));
+    }
+    let obs = agent_memory_stable_id(&["obs", "module"]);
+    graph.push(observation(
+        &obs,
+        "module m sets things up",
+        "0.9",
+        None, // no record id → triple resolution
+        Some(path),
+        Some(module_span),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("g.jsonl");
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run(&graph_path, &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let entry = verdict_for(&v, &obs);
+    assert_eq!(
+        entry["verdict"], "drifted",
+        "triple should resolve the changed module, not the unchanged file"
+    );
+    assert_eq!(entry["triggering_handle"]["kind"], "content_change");
+}

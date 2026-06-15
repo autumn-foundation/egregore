@@ -56,9 +56,11 @@ pub enum FreshnessVerdict {
     Current,
     /// The cited symbol/file changed after the observation's anchor.
     Drifted,
-    /// The cited handle no longer resolves (removed/renamed/deleted).
+    /// The cited handle no longer resolves: removed/renamed/deleted, or absent
+    /// from the latest snapshot in a history graph.
     Unresolved,
-    /// The observation carries no valid-time/commit anchor to compare against.
+    /// The observation carries no commit, valid-time, or recording-time anchor to
+    /// compare against.
     Untemporal,
 }
 
@@ -241,13 +243,45 @@ impl<'a> FreshnessIndex<'a> {
                 } else if let (NodeKind::SemanticDrift, Some(drift)) =
                     (*kind, record_semantic_drift(record))
                 {
-                    drift_meta_by_id.insert(id.as_str(), drift);
-                    drifts_by_prior
-                        .entry(drift.prior_record_id.as_str())
-                        .or_default()
-                        .push((id.as_str(), drift));
+                    // A retracted (tombstoned) drift record is no longer part of
+                    // current memory and must not trigger a `drifted` verdict.
+                    if !tombstone_by_deleted.contains_key(id.as_str()) {
+                        drift_meta_by_id.insert(id.as_str(), drift);
+                        drifts_by_prior
+                            .entry(drift.prior_record_id.as_str())
+                            .or_default()
+                            .push((id.as_str(), drift));
+                    }
                 }
             }
+        }
+
+        // Frontier liveness: `scan-history` emits a full snapshot at every commit
+        // but no `Tombstone` when a symbol is removed or renamed, so a handle that
+        // exists only at older commits would otherwise look live and a citation to
+        // it could be reported `current`/`drifted` instead of `unresolved`. Treat a
+        // temporal handle as live only when it is present at the frontier (the
+        // latest valid-time in the graph); a non-temporal (current-tree `scan`)
+        // handle has no frontier and stays live.
+        let mut frontier: Option<&str> = None;
+        for versions in live_code_by_id.values() {
+            for record in versions {
+                if let Some(vt) = version_valid(record)
+                    && frontier.is_none_or(|f| time_after(vt, f))
+                {
+                    frontier = Some(vt);
+                }
+            }
+        }
+        if let Some(frontier_vt) = frontier {
+            live_code_by_id.retain(|_id, versions| {
+                // A handle with any non-temporal version is a current-tree fact.
+                versions.iter().any(|r| version_valid(r).is_none())
+                    // Otherwise it must be present at the frontier to count as live.
+                    || versions
+                        .iter()
+                        .any(|r| version_valid(r).is_some_and(|vt| !time_after(frontier_vt, vt)))
+            });
         }
 
         // Second pass: index drift triggers from `DRIFTS_PRIOR` edges too. The
@@ -308,10 +342,16 @@ impl<'a> FreshnessIndex<'a> {
                     continue;
                 }
                 match kind {
-                    NodeKind::Symbol if span.is_some() && node_span.as_ref() == span => {
+                    NodeKind::File => file_match = Some(id.as_str()),
+                    // A triple can name any code handle (`Symbol`/`Module`/`Import`),
+                    // not just a symbol; match the span for all of them before
+                    // falling back to the whole file.
+                    k if is_code_handle_kind(*k)
+                        && span.is_some()
+                        && node_span.as_ref() == span =>
+                    {
                         return Some(id.as_str());
                     }
-                    NodeKind::File => file_match = Some(id.as_str()),
                     _ => {}
                 }
             }
@@ -351,10 +391,13 @@ impl<'a> FreshnessIndex<'a> {
                 continue;
             }
             match kind {
-                NodeKind::Symbol if span.is_some() && node_span.as_ref() == span => {
+                NodeKind::File => file_match = Some(id.as_str()),
+                // A triple can name any code handle (`Symbol`/`Module`/`Import`),
+                // not just a symbol; match the span for all of them before falling
+                // back to the whole file.
+                k if is_code_handle_kind(*k) && span.is_some() && node_span.as_ref() == span => {
                     return Some(id.as_str());
                 }
-                NodeKind::File => file_match = Some(id.as_str()),
                 _ => {}
             }
         }
@@ -714,7 +757,18 @@ fn content_change_trigger(
     let mut later: Vec<&GraphRecord> = versions
         .iter()
         .copied()
-        .filter(|r| version_valid(r).is_some_and(|vt| time_after(vt, anchor_vt)))
+        .filter(|r| {
+            version_valid(r).is_some_and(|vt| {
+                time_after(vt, anchor_vt)
+                    // A committer-timestamp tie still counts when the version is a
+                    // direct child of the anchor commit — consecutive commits can
+                    // share a timestamp — mirroring the drift path's anchor-commit
+                    // check so a content change in the next commit is not missed.
+                    || (!time_after(anchor_vt, vt)
+                        && anchor_commit
+                            .is_some_and(|ac| version_parents(r).iter().any(|p| p == ac)))
+            })
+        })
         .collect();
     later.sort_by(|a, b| {
         version_valid(a)
@@ -772,6 +826,16 @@ const fn version_valid(record: &GraphRecord) -> Option<&str> {
             temporal: Some(t), ..
         } => Some(t.valid_time.as_str()),
         _ => None,
+    }
+}
+
+/// Parent commit SHAs recorded on a code-graph node version, empty when absent.
+fn version_parents(record: &GraphRecord) -> &[String] {
+    match record {
+        GraphRecord::Node {
+            temporal: Some(t), ..
+        } => &t.git_parent_commits,
+        _ => &[],
     }
 }
 

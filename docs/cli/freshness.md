@@ -82,10 +82,20 @@ time even when they omit a commit and a valid-time, so "drifted since recording"
 remains answerable rather than collapsing to `untemporal`.
 
 A triple citation `(path, span, target_git_commit)` is resolved **at its anchor
-commit**, scanning historical and tombstoned versions. If the cited symbol was
-later removed or renamed and a different live symbol reused the same path/span,
-the verdict is `unresolved` for the original identity rather than a silent
-re-point at the new occupant.
+commit**, scanning historical and tombstoned versions, and matches any code
+handle — `Symbol`, `Module`, or `Import` — by span before falling back to the
+whole file. If the cited symbol was later removed or renamed and a different live
+symbol reused the same path/span, the verdict is `unresolved` for the original
+identity rather than a silent re-point at the new occupant.
+
+### Liveness in a history graph
+
+A handle is resolved against the **frontier** — the latest snapshot in the graph.
+`scan-history` re-emits a full snapshot at every commit but writes no `Tombstone`
+when a symbol is removed or renamed, so a handle present only at older commits is
+treated as **gone**, not live: a citation to it is `unresolved`, never a false
+`current`. A current-tree `scan` (no temporal versions) has no frontier and every
+present handle stays live.
 
 ### Trigger sources (reused, never re-derived)
 
