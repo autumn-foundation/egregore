@@ -11,7 +11,10 @@ use crate::{
     error::{CodegraphError, Result},
     fs::SourceFile,
     identity,
-    ir::{EdgeLabel, Graph, GraphRecord, NodeKind, ProducerKind, TemporalMetadata, stable_id},
+    ir::{
+        EdgeLabel, Graph, GraphRecord, NodeKind, ProducerKind, SourceSnapshotPayload,
+        TemporalMetadata, stable_id,
+    },
     repository_record_from_identity, scan_source_text_records, validate_repository,
 };
 
@@ -37,6 +40,7 @@ pub fn scan_repository_history(repo_path: impl AsRef<Path>) -> Result<Graph> {
 ///
 /// Returns an error when the repository path is invalid, Git is unavailable, or
 /// a reachable Rust source blob cannot be parsed.
+#[allow(clippy::too_many_lines)]
 pub fn scan_repository_history_with_override(
     repo_path: impl AsRef<Path>,
     repo_id_override: Option<&str>,
@@ -48,8 +52,25 @@ pub fn scan_repository_history_with_override(
     let repo_identity = identity::compute_repository_identity(repo_root, repo_id_override);
     let (repository_id, repository) = repository_record_from_identity(&repo_identity);
 
+    // Stamp the current working-tree snapshot on the Repository node (BB1 /
+    // PR #186 follow-up): without this, `eg freshness --graph history.graph.jsonl`
+    // and `--at` queries with `--repo-path` always report `unknown` because the
+    // Repository node carries no `source_snapshot`.  The stamped HEAD lets
+    // freshness detect `stale_head` after new commits are added.
+    let transaction_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (head, dirty) = identity::working_tree_snapshot(repo_root);
+    let snapshot = SourceSnapshotPayload {
+        head,
+        dirty,
+        repository_id: repository_id.clone(),
+        scanned_at: transaction_time.clone(),
+    };
     let mut graph = Graph::new();
-    graph.push(repository);
+    graph.push(
+        repository
+            .with_valid_time_inferred(&transaction_time)
+            .with_source_snapshot(snapshot),
+    );
 
     for commit in list_commits(repo_root)? {
         let commit_record = commit_record(&repository_id, &commit);

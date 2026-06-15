@@ -1400,3 +1400,51 @@ fn freshness_stamped_without_repo_flag_via_sole_stamped_fallback() {
         "sole-stamped fallback must return fresh for a just-scanned override-ID repo: {row}"
     );
 }
+
+/// BB1: `scan-history` must stamp `source_snapshot` on its Repository node so
+/// `eg freshness --graph history.graph.jsonl` can detect `stale_head` after new
+/// commits, rather than always returning `unknown`.
+#[test]
+fn scan_history_stamps_source_snapshot() {
+    let fx = Fixture::committed();
+    let history_graph = fx.work.path().join("history.jsonl");
+
+    eg().args(["scan-history"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&history_graph)
+        .assert()
+        .success();
+
+    // The Repository node in the history graph must carry a source_snapshot.
+    let jsonl = std::fs::read_to_string(&history_graph).unwrap();
+    let repo_node = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["record_type"] == "node" && v["kind"] == "Repository")
+        .expect("Repository node in history graph");
+    assert!(
+        repo_node["source_snapshot"].is_object(),
+        "scan-history Repository node must carry source_snapshot: {repo_node}"
+    );
+    assert!(
+        repo_node["source_snapshot"]["head"].is_object(),
+        "source_snapshot must have a head: {repo_node}"
+    );
+
+    // Freshness check: a just-produced history graph at the current HEAD must
+    // not report `unknown` — it should report `fresh` or `stale_dirty` at worst.
+    let out = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--graph")
+        .arg(&history_graph)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_ne!(
+        report["freshness"], "unknown",
+        "freshness for a just-produced history graph must not be unknown: {report}"
+    );
+}
