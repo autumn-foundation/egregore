@@ -1456,59 +1456,45 @@ pub fn record_context<'a>(records: &'a [GraphRecord], anchor_id: &str) -> Symbol
     primary.insert(anchor_ref);
 
     if anchor_kind == NodeKind::File {
-        // File anchor: seed the symbols this file DEFINES (file → symbols).
-        for r in records {
-            let GraphRecord::Edge {
-                id: edge_id,
-                label: EdgeLabel::Defines,
-                source,
-                target,
-                temporal,
-                ..
-            } = r
-            else {
-                continue;
-            };
-            if source.as_str() != anchor_id {
-                continue;
-            }
-            let edge_live = temporal.is_some() || !tombstoned_ids.contains(edge_id.as_str());
-            if edge_live
-                && is_live(target.as_str())
-                && kind_of(target.as_str()) == Some(NodeKind::Symbol)
-                && let Some(sym) = id_ref(target.as_str())
-            {
-                source_facts.insert(sym);
-                primary.insert(sym);
-            }
-        }
-        // Also seed by repo_relative_path to capture nested symbols (methods
-        // inside impl blocks, functions inside modules) whose DEFINES edge
-        // comes from the containing symbol, not directly from the file.
-        let anchor_path = records.iter().find_map(|r| match r {
-            GraphRecord::Node {
-                id,
-                repo_relative_path: Some(p),
-                ..
-            } if id.as_str() == anchor_id => Some(p.as_str()),
-            _ => None,
-        });
-        if let Some(path) = anchor_path {
-            for r in records {
-                if let GraphRecord::Node {
-                    id,
-                    kind: NodeKind::Symbol,
-                    repo_relative_path: Some(p),
-                    ..
-                } = r
-                    && p.as_str() == path
-                    && is_live(id.as_str())
-                    && let Some(sym) = id_ref(id.as_str())
-                {
-                    source_facts.insert(sym);
-                    primary.insert(sym);
+        // File anchor: BFS over DEFINES edges to seed all symbols that belong
+        // to this file — top-level items (File → DEFINES → Symbol) and nested
+        // items (Module/Impl → DEFINES → Symbol). Pure edge traversal avoids
+        // the repo-bleed of path-only matching: same-path symbols from other
+        // repositories are unreachable via DEFINES edges from this anchor.
+        let mut frontier: Vec<&str> = vec![anchor_ref];
+        while !frontier.is_empty() {
+            let mut next_frontier: Vec<&str> = Vec::new();
+            for &container in &frontier {
+                for r in records {
+                    let GraphRecord::Edge {
+                        id: edge_id,
+                        label: EdgeLabel::Defines,
+                        source,
+                        target,
+                        temporal,
+                        ..
+                    } = r
+                    else {
+                        continue;
+                    };
+                    if source.as_str() != container {
+                        continue;
+                    }
+                    let edge_live =
+                        temporal.is_some() || !tombstoned_ids.contains(edge_id.as_str());
+                    if edge_live
+                        && is_live(target.as_str())
+                        && kind_of(target.as_str()) == Some(NodeKind::Symbol)
+                        && let Some(sym) = id_ref(target.as_str())
+                        && !source_facts.contains(sym)
+                    {
+                        source_facts.insert(sym);
+                        primary.insert(sym);
+                        next_frontier.push(sym);
+                    }
                 }
             }
+            frontier = next_frontier;
         }
     } else {
         // Symbol (or other) anchor: seed the co-located File (symbol → file),
