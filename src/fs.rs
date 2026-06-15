@@ -114,6 +114,11 @@ fn should_descend(path: &Path) -> bool {
 /// work tree, preserving the filesystem-local behavior for non-Git trees.
 fn git_ignored_dir_prefixes(repo_root: &Path) -> HashSet<PathBuf> {
     let Ok(output) = Command::new("git")
+        // Override core.excludesFile to suppress user/system-level global gitignore
+        // patterns (PR #186 follow-up AA1): scans must be reproducible across
+        // different developer environments and must only honour repository-controlled
+        // ignore rules (.gitignore, .git/info/exclude), not operator-specific globals.
+        .args(["-c", "core.excludesFile="])
         .arg("-C")
         .arg(repo_root)
         .args([
@@ -196,6 +201,10 @@ fn filter_git_ignored(repo_root: &Path, files: &mut Vec<PathBuf>) {
 /// ignored") is a normal, non-error result. The probe is strictly read-only.
 fn git_check_ignored(repo_root: &Path, rels: &[String]) -> Option<HashSet<String>> {
     let mut child = Command::new("git")
+        // Suppress user/system-level global gitignore (core.excludesFile) so the
+        // scan is reproducible across developer environments; only honour
+        // repository-controlled rules (.gitignore, .git/info/exclude) (AA1).
+        .args(["-c", "core.excludesFile="])
         .arg("-C")
         .arg(repo_root)
         .args(["check-ignore", "-z", "--stdin"])

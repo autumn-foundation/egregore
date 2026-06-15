@@ -1904,10 +1904,22 @@ fn query_freshness_code_inner(
     // try the hint FIRST.  This ensures that an operator-pinned override ID wins
     // over the auto-detected identity in a multi-repo store — the identity-first
     // order would silently return the wrong snapshot when both IDs are present.
+    // When the caller supplies an explicit hint (a resolved `--repo` scope or
+    // `--repo-id-override` value that differs from the auto-detected identity),
+    // try the hint FIRST.  This ensures that an operator-pinned override ID wins
+    // over the auto-detected identity in a multi-repo store — the identity-first
+    // order would silently return the wrong snapshot when both IDs are present.
+    //
+    // When no hint is given and the identity probe fails, try a sole-stamped
+    // fallback: if exactly one Repository node in the store carries a snapshot,
+    // that snapshot is unambiguous and should be used.  This handles combined
+    // stores where --repo-id-override was used on the scanned checkout but no
+    // --repo flag was passed to the query command (PR #186 follow-up Z1).
     let matched = match repo_id_hint.filter(|h| *h != identity.id.as_str()) {
         Some(h) => freshness::stored_snapshot_with_owner(records, h)
             .or_else(|| freshness::stored_snapshot_with_owner(records, &identity.id)),
-        None => freshness::stored_snapshot_with_owner(records, &identity.id),
+        None => freshness::stored_snapshot_with_owner(records, &identity.id)
+            .or_else(|| freshness::stored_snapshot_sole_stamped(records)),
     };
     // When no snapshot is found but the caller supplied an explicit hint (from
     // `--repo`), use the hint as the owner ID so `stamp_freshness` can match

@@ -1347,3 +1347,56 @@ fn scan_skips_gitignored_directory_before_traversal() {
         "tracked source symbols must still appear in the graph: {jsonl}"
     );
 }
+
+/// Z1: `query symbol --repo-path` on a combined store where the checkout was
+/// scanned with `--repo-id-override` must still emit a freshness verdict even
+/// when `--repo` is not given.
+///
+/// The sole-stamped fallback fires when exactly one Repository node in the
+/// store carries a `source_snapshot`; without it the identity probe fails, the
+/// verdict is owned by the wrong ID, and `stamp_freshness` omits the field.
+#[test]
+fn freshness_stamped_without_repo_flag_via_sole_stamped_fallback() {
+    let fx = Fixture::committed();
+
+    // Scan checkout A with an override ID → one stamped repo.
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(fx.graph())
+        .args(["--repo-id-override", "sole-override-repo"])
+        .assert()
+        .success();
+
+    // Add a second Repository node (no snapshot) to make a multi-repo store,
+    // disabling the single-repo fallback.  Strip its source_snapshot (pre-stamping).
+    let raw = std::fs::read_to_string(fx.graph()).unwrap();
+    let mut lines: Vec<String> = raw.lines().map(str::to_owned).collect();
+    lines.push(
+        r#"{"record_type":"node","schema_version":1,"id":"codegraph:v3:other-repo","kind":"Repository","display_name":"other-repo","summary":"Repository other-repo"}"#
+            .to_owned(),
+    );
+    std::fs::write(fx.graph(), lines.join("\n")).unwrap();
+
+    // Query without --repo: the sole-stamped fallback must find the one stamped
+    // repo (sole-override-repo) and use it to stamp freshness on the result rows.
+    let out = eg()
+        .args(["query", "symbol", "hello"])
+        .arg("--graph")
+        .arg(fx.graph())
+        .arg("--repo-path")
+        .arg(fx.repo())
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let row: Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    assert!(
+        row.get("freshness").is_some(),
+        "sole-stamped fallback must stamp freshness when --repo is absent: {row}"
+    );
+    assert_eq!(
+        row["freshness"], "fresh",
+        "sole-stamped fallback must return fresh for a just-scanned override-ID repo: {row}"
+    );
+}

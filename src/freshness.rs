@@ -142,6 +142,38 @@ pub fn stored_snapshot_with_owner<'a>(
     matched.or_else(|| (repository_nodes == 1).then_some(sole).flatten())
 }
 
+/// Returns the stored snapshot and its owner when exactly **one** `Repository`
+/// node in the store carries a `source_snapshot`, regardless of how many
+/// `Repository` nodes exist in total.
+///
+/// This is a last-resort fallback for combined stores where `--repo-id-override`
+/// was used (so the identity probe misses) and no `--repo` scope is given: if
+/// only one stamped repository exists its snapshot is unambiguous and should be
+/// used. When multiple stamped repositories are present the caller must require
+/// an explicit repository selector.
+#[must_use]
+pub fn stored_snapshot_sole_stamped<'a>(
+    records: &'a [GraphRecord],
+) -> Option<(&'a str, &'a SourceSnapshotPayload)> {
+    let mut stamped: Option<(&'a str, &'a SourceSnapshotPayload)> = None;
+    for record in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Repository,
+            id,
+            source_snapshot: Some(snapshot),
+            ..
+        } = record
+        {
+            if stamped.is_some() {
+                // More than one stamped repository — result is ambiguous.
+                return None;
+            }
+            stamped = Some((id.as_str(), snapshot));
+        }
+    }
+    stamped
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Freshness, classify, stored_snapshot};
@@ -283,5 +315,40 @@ mod tests {
     fn stored_snapshot_single_pre_stamping_repo_is_none() {
         let records = vec![repo_node("only", None)];
         assert!(stored_snapshot(&records, "only").is_none());
+    }
+
+    #[test]
+    fn stored_snapshot_sole_stamped_returns_when_exactly_one_stamped() {
+        // Multi-repo store: one stamped, one legacy (no snapshot).  The sole-stamped
+        // fallback should return the stamped repo's snapshot regardless of which ID
+        // is queried.
+        use super::stored_snapshot_sole_stamped;
+        let records = vec![
+            repo_node("override-id", Some(snapshot(commit("eee"), false))),
+            repo_node("legacy-id", None),
+        ];
+        let (owner, snap) = stored_snapshot_sole_stamped(&records).expect("sole stamped");
+        assert_eq!(owner, "override-id");
+        assert_eq!(snap.head, commit("eee"));
+    }
+
+    #[test]
+    fn stored_snapshot_sole_stamped_returns_none_when_multiple_stamped() {
+        use super::stored_snapshot_sole_stamped;
+        let records = vec![
+            repo_node("repo-a", Some(snapshot(commit("aaa"), false))),
+            repo_node("repo-b", Some(snapshot(commit("bbb"), false))),
+        ];
+        assert!(
+            stored_snapshot_sole_stamped(&records).is_none(),
+            "ambiguous: two stamped repos must not fall back"
+        );
+    }
+
+    #[test]
+    fn stored_snapshot_sole_stamped_returns_none_when_none_stamped() {
+        use super::stored_snapshot_sole_stamped;
+        let records = vec![repo_node("legacy", None)];
+        assert!(stored_snapshot_sole_stamped(&records).is_none());
     }
 }
