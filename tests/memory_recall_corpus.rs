@@ -1,4 +1,5 @@
 #![allow(missing_docs)]
+#![allow(clippy::too_many_lines)]
 
 //! Corpus-structure and metrics tests for the agent-memory recall slice
 //! (issue #91).
@@ -106,12 +107,11 @@ fn seed_memory_ids() -> HashSet<String> {
     let mut ids = HashSet::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let value: serde_json::Value = serde_json::from_str(line).expect("seed line is JSON");
-        if value["record_type"] == "node" {
-            if let Some(id) = value["id"].as_str() {
-                if id.starts_with("agent_memory:") {
-                    ids.insert(id.to_owned());
-                }
-            }
+        if value["record_type"] == "node"
+            && let Some(id) = value["id"].as_str()
+            && id.starts_with("agent_memory:")
+        {
+            ids.insert(id.to_owned());
         }
     }
     ids
