@@ -1512,3 +1512,249 @@ fn triple_resolves_module_handle_not_file_fallback() {
     );
     assert_eq!(entry["triggering_handle"]["kind"], "content_change");
 }
+
+/// Builds a `Commit` node carrying temporal metadata and parent commits.
+fn commit_node(sha: &str, parents: &[&str], valid_time: &str) -> GraphRecord {
+    GraphRecord::node(
+        stable_id(&["node", "commit", "repo-a", sha]),
+        NodeKind::Commit,
+        None,
+        None,
+        Some(sha.to_owned()),
+        format!("Git commit {sha}"),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: sha.to_owned(),
+        git_parent_commits: parents.iter().map(|p| (*p).to_owned()).collect(),
+        valid_time: valid_time.to_owned(),
+        author_time: None,
+        observed_at: valid_time.to_owned(),
+        valid_time_source: Some("git_commit_committer_date".to_owned()),
+    })
+}
+
+// ── A tip commit that deletes the last code file is still the frontier ───────
+
+#[test]
+fn deletion_commit_advances_frontier_to_unresolved() {
+    // commit_b is HEAD and deletes the last `.rs` file, so it emits a `Commit`
+    // node but no code-handle version. The frontier must still advance to
+    // commit_b (via that node), making the symbol that lived only at commit_a
+    // `unresolved` rather than a false `current`.
+    let mut graph = Graph::new();
+    let path = "src/d.rs";
+    let gone = stable_id(&["node", "symbol", "fn", "repo-a", path, "gone", "0"]);
+    graph.push(symbol_version(
+        &gone,
+        path,
+        "gone",
+        span(10, 20),
+        "gone_body",
+        "commit_a",
+        "2026-01-01T00:00:00Z",
+    ));
+    // commit_a exists as a commit; commit_b is its child and the tip, with no code.
+    graph.push(commit_node("commit_a", &[], "2026-01-01T00:00:00Z"));
+    graph.push(commit_node(
+        "commit_b",
+        &["commit_a"],
+        "2026-01-02T00:00:00Z",
+    ));
+
+    let obs = agent_memory_stable_id(&["obs", "gone"]);
+    graph.push(observation(
+        &obs,
+        "gone did the thing",
+        "0.9",
+        Some(&gone),
+        Some(path),
+        Some(span(10, 20)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("g.jsonl");
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run(&graph_path, &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let entry = verdict_for(&v, &obs);
+    assert_eq!(
+        entry["verdict"], "unresolved",
+        "code absent from the deleting HEAD commit must be unresolved"
+    );
+}
+
+// ── Superseded and duplicate memory rows collapse to the current view ────────
+
+#[test]
+fn superseded_observation_is_excluded_from_current_view() {
+    // The history-inclusive read can surface a superseded note alongside its
+    // successor. Only the current (non-superseded) note should be classified.
+    let path = "src/s.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let obs_old = agent_memory_stable_id(&["obs", "old"]);
+    let obs_new = agent_memory_stable_id(&["obs", "new"]);
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body_v1",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body_v2",
+            "commit_b",
+            "2026-01-02T00:00:00Z",
+        ),
+        observation(
+            &obs_old,
+            "f returns body_v1 (old)",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        )
+        .with_superseded_by(&obs_new),
+        observation(
+            &obs_new,
+            "f returns body_v1 (current)",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    assert!(
+        verdicts.iter().all(|e| e.observation_id != obs_old),
+        "a superseded note must not be classified"
+    );
+    let current: Vec<_> = verdicts
+        .iter()
+        .filter(|e| e.observation_id == obs_new)
+        .collect();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].verdict, FreshnessVerdict::Drifted);
+}
+
+#[test]
+fn duplicate_observation_rows_are_deduped() {
+    // Two byte-identical physical rows of the same observation (a re-ingest) must
+    // produce exactly one verdict, not two.
+    let path = "src/dup.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let obs_id = agent_memory_stable_id(&["obs", "dup"]);
+    let obs = observation(
+        &obs_id,
+        "f exists",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    );
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        obs.clone(),
+        obs,
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let count = verdicts
+        .iter()
+        .filter(|e| e.observation_id == obs_id)
+        .count();
+    assert_eq!(count, 1, "re-ingested observation must be classified once");
+}
+
+// ── A backdated child commit is still the later code state ───────────────────
+
+#[test]
+fn backdated_child_commit_content_change_drifts() {
+    // commit_b is a child of the anchor commit_a but carries an *earlier*
+    // committer timestamp (rebase / clock skew). It is still the later code
+    // state, so a content change there must register as `drifted`.
+    let path = "src/bd.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    // Anchor version at commit_a, dated later than its own child.
+    let anchor = symbol_version(
+        &sym,
+        path,
+        "f",
+        span(1, 5),
+        "body_v1",
+        "commit_a",
+        "2026-02-01T00:00:00Z",
+    );
+    // Child of commit_a, backdated, with changed content.
+    let mut child = symbol_version(
+        &sym,
+        path,
+        "f",
+        span(1, 5),
+        "body_v2",
+        "commit_b",
+        "2026-01-01T00:00:00Z",
+    );
+    if let GraphRecord::Node {
+        temporal: Some(t), ..
+    } = &mut child
+    {
+        t.git_parent_commits = vec!["commit_a".to_owned()];
+    }
+    let obs = agent_memory_stable_id(&["obs", "bd"]);
+    let records = vec![
+        anchor,
+        child,
+        observation(
+            &obs,
+            "f returns body_v1",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs)
+        .expect("verdict for obs");
+    assert_eq!(entry.verdict, FreshnessVerdict::Drifted);
+    assert!(matches!(
+        entry.triggering_handle,
+        Some(freshness::TriggeringHandle::ContentChange { .. })
+    ));
+}

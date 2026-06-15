@@ -40,7 +40,7 @@
 //!
 //! Documented in `docs/cli/freshness.md`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
@@ -269,17 +269,22 @@ impl<'a> FreshnessIndex<'a> {
         // branches: HEAD is always a tip, so code at HEAD is never falsely
         // `unresolved`. A non-temporal (current-tree `scan`) version has no commit
         // and keeps its handle live.
+        //
+        // The DAG is built from *every* temporal record — `Commit`/`Change` nodes
+        // included — not just code handles. A HEAD commit that deletes the last
+        // code file emits no code-handle version but still emits a `Commit` node,
+        // so without it the deletion commit would be missing from the graph, the
+        // prior commit would look like the tip, and a citation to the now-deleted
+        // code would be reported `current` instead of `unresolved`.
         let mut all_commits: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         let mut parent_commits: std::collections::BTreeSet<&str> =
             std::collections::BTreeSet::new();
-        for versions in live_code_by_id.values() {
-            for record in versions {
-                if let Some(commit) = version_commit(record) {
-                    all_commits.insert(commit);
-                }
-                for parent in version_parents(record) {
-                    parent_commits.insert(parent.as_str());
-                }
+        for record in records {
+            if let Some(commit) = version_commit(record) {
+                all_commits.insert(commit);
+            }
+            for parent in version_parents(record) {
+                parent_commits.insert(parent.as_str());
             }
         }
         let tips: std::collections::BTreeSet<&str> =
@@ -450,6 +455,13 @@ const fn is_observation_kind(kind: NodeKind) -> bool {
 pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictEntry> {
     let index = FreshnessIndex::build(records);
     let mut entries: Vec<FreshnessVerdictEntry> = Vec::new();
+    // Freshness reads the history-inclusive store view so superseded *code*
+    // versions are available for comparison, but that view also surfaces
+    // superseded and re-ingested *memory* rows. Collapse observations to the
+    // current view — skip superseded notes and emit each observation ID once —
+    // so a re-ingest or retained older version cannot yield duplicate or
+    // non-current verdicts. Code handles keep all their versions.
+    let mut seen_observations: BTreeSet<&str> = BTreeSet::new();
 
     for record in records {
         let GraphRecord::Node {
@@ -462,6 +474,7 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
             confidence,
             redaction_policy_version,
             valid_time,
+            superseded_by,
             ..
         } = record
         else {
@@ -474,6 +487,16 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
         // observation yields no verdicts, matching the current-state reads used by
         // the memory query paths.
         if index.tombstone_by_deleted.contains_key(id.as_str()) {
+            continue;
+        }
+        // A superseded note has been replaced by a newer one; the current view
+        // excludes it, just as the store's default read does.
+        if superseded_by.as_deref().is_some_and(|s| !s.is_empty()) {
+            continue;
+        }
+        // Dedupe re-ingested physical rows of the same observation (same stable
+        // ID ⇒ byte-identical content), so each note is classified once.
+        if !seen_observations.insert(id.as_str()) {
             continue;
         }
 
@@ -767,16 +790,16 @@ fn content_change_trigger(
         .iter()
         .copied()
         .filter(|r| {
-            version_valid(r).is_some_and(|vt| {
-                time_after(vt, anchor_vt)
-                    // A committer-timestamp tie still counts when the version is a
-                    // direct child of the anchor commit — consecutive commits can
-                    // share a timestamp — mirroring the drift path's anchor-commit
-                    // check so a content change in the next commit is not missed.
-                    || (!time_after(anchor_vt, vt)
-                        && anchor_commit
-                            .is_some_and(|ac| version_parents(r).iter().any(|p| p == ac)))
-            })
+            // A direct child of the anchor commit is the later code state
+            // regardless of committer-timestamp direction: consecutive commits can
+            // share a timestamp, and rebases/clock skew can even backdate a child.
+            // The commit-parent relationship wins for commit-anchored comparisons,
+            // mirroring the drift path's anchor-commit check; otherwise fall back to
+            // a strictly later valid-time.
+            if anchor_commit.is_some_and(|ac| version_parents(r).iter().any(|p| p == ac)) {
+                return true;
+            }
+            version_valid(r).is_some_and(|vt| time_after(vt, anchor_vt))
         })
         .collect();
     later.sort_by(|a, b| {

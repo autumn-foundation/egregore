@@ -100,6 +100,14 @@ committer timestamp is robust to clock skew, rebases, and merged side branches �
 HEAD is always a tip, so code at HEAD is never falsely `unresolved`. A
 current-tree `scan` (no commits) has no tips and every present handle stays live.
 
+The commit graph is read from every temporal record — `Commit`/`Change` nodes
+included — not just code handles, so a HEAD commit that deletes the last code
+file (no code-handle version, but still a `Commit` node) is correctly the tip and
+citations to the removed code resolve to `unresolved`. For the same reason a
+commit-anchored content comparison follows the commit-parent edge rather than the
+timestamp: a direct child of the anchor commit is the later code state even when a
+rebase or clock skew backdated it.
+
 A `--data-dir` query reads the **superseded-inclusive** store view (the same
 history surface as `eg query drift`), so the pre-change code version an
 observation was anchored against is available for comparison even after later
