@@ -698,6 +698,30 @@ enum QuerySubcommand {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Flag agent observations whose cited code has drifted since recording (issue #85).
+    ///
+    /// For every agent `Observation` / `Decision` citing a code handle, returns a
+    /// per-evidence-link **freshness verdict**: `current`, `drifted`,
+    /// `unresolved`, or `untemporal`. A `drifted` / `unresolved` verdict is a
+    /// **freshness lead, never a truth claim** — it states only that the evidence
+    /// basis moved, never that the observation is now false. Strictly read-only
+    /// and deterministic; reuses existing drift records, content hashes, and
+    /// temporal anchors. The verdict attaches to the evidence link and never
+    /// rewrites, hides, or marks stale any deterministic code fact.
+    ///
+    /// Documented in `docs/cli/freshness.md`.
+    Freshness {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Return only stale observations (`drifted` + `unresolved`). An empty
+        /// result is reported with a stable diagnostic, never silently (AC7).
+        #[arg(long)]
+        stale_only: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -2966,6 +2990,14 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_failures_cmd(&records, &handle, &index, selected.as_deref())
+        }
+        QuerySubcommand::Freshness {
+            graph,
+            data_dir,
+            stale_only,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_freshness_cmd(&records, stale_only)
         }
     }
 }
@@ -5820,6 +5852,61 @@ fn query_failures_cmd(
 
     let output =
         serde_json::to_string_pretty(&response).context("failed to serialize failure history")?;
+    println!("{output}");
+    Ok(())
+}
+
+/// Machine-readable report emitted by `eg query freshness` (issue #85).
+#[derive(serde::Serialize)]
+struct FreshnessReport {
+    ok: bool,
+    stale_only: bool,
+    /// Verdict tally across `current` / `drifted` / `unresolved` / `untemporal`.
+    counts: std::collections::BTreeMap<&'static str, usize>,
+    /// Stable diagnostic so an empty stale-only result is never silent (AC7).
+    diagnostic: &'static str,
+    /// Per-evidence-link freshness verdicts, deterministically ordered.
+    verdicts: Vec<crate::freshness::FreshnessVerdictEntry>,
+}
+
+/// Handles `eg query freshness --graph <path> | --data-dir <dir> [--stale-only]`.
+///
+/// Strictly read-only: computes verdicts from records already in the store and
+/// never creates, modifies, or deletes anything. Output carries only record IDs,
+/// hashes, handles, spans, confidence, and redaction markers — never raw
+/// observation text or other protected payloads (AC9).
+fn query_freshness_cmd(records: &[GraphRecord], stale_only: bool) -> Result<()> {
+    let all = crate::freshness::evidence_link_freshness(records);
+    let counts = crate::freshness::verdict_counts(&all);
+
+    let verdicts = if stale_only {
+        crate::freshness::stale_only(all)
+    } else {
+        all
+    };
+
+    // In stale-only mode an empty result is reported with a stable diagnostic,
+    // never silently as success-with-nothing (AC7).
+    let diagnostic = if stale_only {
+        if verdicts.is_empty() {
+            crate::freshness::NO_STALE_DIAGNOSTIC
+        } else {
+            crate::freshness::STALE_PRESENT_DIAGNOSTIC
+        }
+    } else {
+        "freshness_verdicts"
+    };
+
+    let report = FreshnessReport {
+        ok: true,
+        stale_only,
+        counts,
+        diagnostic,
+        verdicts,
+    };
+
+    let output =
+        serde_json::to_string_pretty(&report).context("failed to serialize freshness report")?;
     println!("{output}");
     Ok(())
 }
