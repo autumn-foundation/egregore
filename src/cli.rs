@@ -698,6 +698,34 @@ enum QuerySubcommand {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Retrieve cross-domain context for a repo-relative directory or module prefix (issue #83).
+    ///
+    /// Returns a structured JSON object with six trust-separated sections:
+    /// `source_facts` (code-graph files and symbols under the prefix),
+    /// `observations` (agent-authored), `project_state` (tasks/ACs),
+    /// `artifacts`, `verification_evidence`, and `semantic_drift`.
+    /// Missing evidence links are surfaced as `unresolved` items.
+    ///
+    /// Both the bare form (`src/alpha`) and the trailing-slash form
+    /// (`src/alpha/`) resolve to the same record set. Prefix matching is
+    /// segment-aware: `src/alpha` never bleeds into `src/alphabet/`.
+    ///
+    /// On no-match: emits `{"ok":false,"error":{"code":"no_match",...}}` to
+    /// stdout and exits 2. On malformed/empty prefix: exits 1 with
+    /// `{"ok":false,"error":{"code":"malformed_prefix",...}}`.
+    Subsystem {
+        /// Repo-relative directory or module path prefix (e.g. `src/parser` or `src/parser/`).
+        prefix: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -2503,6 +2531,35 @@ struct TaskContextResponse<'a> {
     unresolved: Vec<ContextUnresolved<'a>>,
 }
 
+/// One semantic drift item in the `semantic_drift` section of a subsystem response.
+#[derive(Serialize)]
+struct SubsystemDrift<'a> {
+    record_id: &'a str,
+    score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_span: Option<crate::ir::SourceSpan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_git_commit: Option<&'a str>,
+}
+
+/// Full subsystem context query response envelope (issue #83).
+#[derive(Serialize)]
+struct SubsystemResponse<'a> {
+    ok: bool,
+    prefix: &'a str,
+    source_facts: Vec<ContextSourceFact<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    topology_edges: Vec<ContextTopologyEdge<'a>>,
+    observations: Vec<ContextObservation<'a>>,
+    project_state: Vec<ContextLinkedItem<'a>>,
+    artifacts: Vec<ContextLinkedItem<'a>>,
+    verification_evidence: Vec<ContextLinkedItem<'a>>,
+    semantic_drift: Vec<SubsystemDrift<'a>>,
+    unresolved: Vec<ContextUnresolved<'a>>,
+}
+
 // ---------------------------------------------------------------------------
 // memory evidence audit (issue #64)
 // ---------------------------------------------------------------------------
@@ -2966,6 +3023,29 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_failures_cmd(&records, &handle, &index, selected.as_deref())
+        }
+        QuerySubcommand::Subsystem {
+            prefix,
+            graph,
+            data_dir,
+            format,
+        } => {
+            // Validate the prefix before loading records so malformed input fails
+            // fast with a machine-readable diagnostic, not a store I/O error.
+            if prefix.trim_end_matches('/').is_empty() {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "malformed_prefix",
+                        "prefix": prefix,
+                        "message": "prefix must be non-empty after stripping trailing slashes"
+                    }
+                });
+                println!("{}", serde_json::to_string(&envelope)?);
+                std::process::exit(1);
+            }
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_subsystem_cmd(&records, &prefix, format)
         }
     }
 }
@@ -4909,6 +4989,150 @@ fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
     };
 
     let output = serde_json::to_string_pretty(&response).context("failed to serialize context")?;
+    println!("{output}");
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn query_subsystem_cmd(records: &[GraphRecord], prefix: &str, _format: OutputFormat) -> Result<()> {
+    let ctx = match query::subsystem_context(records, prefix) {
+        Ok(ctx) => ctx,
+        Err(query::SubsystemPrefixError::Malformed { prefix: p }) => {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "malformed_prefix",
+                    "prefix": p,
+                    "message": "prefix must be non-empty after stripping trailing slashes"
+                }
+            });
+            println!("{}", serde_json::to_string(&envelope)?);
+            std::process::exit(1);
+        }
+    };
+
+    if ctx.is_no_match() {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "no_match",
+                "prefix": prefix,
+                "message": "no records found under the given prefix"
+            }
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(2);
+    }
+
+    let source_facts: Vec<ContextSourceFact<'_>> = ctx
+        .source_facts
+        .iter()
+        .filter_map(|r| context_source_fact(r))
+        .collect();
+
+    let observations: Vec<ContextObservation<'_>> = ctx
+        .observations
+        .iter()
+        .filter_map(|r| context_observation(r))
+        .collect();
+
+    let project_state: Vec<ContextLinkedItem<'_>> = ctx
+        .project_state
+        .iter()
+        .filter_map(|r| context_linked_item(r))
+        .collect();
+
+    let artifacts: Vec<ContextLinkedItem<'_>> = ctx
+        .artifacts
+        .iter()
+        .filter_map(|r| context_linked_item(r))
+        .collect();
+
+    let verification_evidence: Vec<ContextLinkedItem<'_>> = ctx
+        .verification_evidence
+        .iter()
+        .filter_map(|r| context_linked_item(r))
+        .collect();
+
+    let unresolved: Vec<ContextUnresolved<'_>> = ctx
+        .unresolved
+        .iter()
+        .map(|u| ContextUnresolved {
+            source_record_id: &u.source_record_id,
+            target_handle: &u.target_handle,
+            relation: &u.relation,
+            target_domain: &u.target_domain,
+            verification_status: "unresolved",
+        })
+        .collect();
+
+    let topology_edges: Vec<ContextTopologyEdge<'_>> = ctx
+        .topology_edges
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Edge {
+                id,
+                label,
+                source,
+                target,
+                summary,
+                temporal,
+                ..
+            } = r
+            {
+                Some(ContextTopologyEdge {
+                    record_id: id,
+                    label: label.as_str(),
+                    source_id: source,
+                    target_id: target,
+                    summary,
+                    git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+                    valid_time: temporal.as_ref().map(|t| t.valid_time.as_str()),
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let semantic_drift: Vec<SubsystemDrift<'_>> = ctx
+        .semantic_drift
+        .iter()
+        .filter_map(|r| {
+            let GraphRecord::Node {
+                id,
+                semantic_drift: Some(drift_meta),
+                ..
+            } = r
+            else {
+                return None;
+            };
+            let (path, _, span) = query::resolve_drift_target(records, id, drift_meta, None, None);
+            Some(SubsystemDrift {
+                record_id: id,
+                score: drift_meta.score,
+                target_repo_relative_path: path,
+                target_span: span,
+                after_git_commit: Some(drift_meta.after_git_commit.as_str()),
+            })
+        })
+        .collect();
+
+    let response = SubsystemResponse {
+        ok: true,
+        prefix: ctx.prefix.as_str(),
+        source_facts,
+        topology_edges,
+        observations,
+        project_state,
+        artifacts,
+        verification_evidence,
+        semantic_drift,
+        unresolved,
+    };
+
+    let output =
+        serde_json::to_string_pretty(&response).context("failed to serialize subsystem context")?;
     println!("{output}");
     Ok(())
 }
