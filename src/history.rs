@@ -40,10 +40,37 @@ pub fn scan_repository_history(repo_path: impl AsRef<Path>) -> Result<Graph> {
 ///
 /// Returns an error when the repository path is invalid, Git is unavailable, or
 /// a reachable Rust source blob cannot be parsed.
-#[allow(clippy::too_many_lines)]
 pub fn scan_repository_history_with_override(
     repo_path: impl AsRef<Path>,
     repo_id_override: Option<&str>,
+) -> Result<Graph> {
+    scan_repository_history_inner(repo_path, repo_id_override, &[])
+}
+
+/// Like [`scan_repository_history_with_override`] but excludes repo-relative
+/// paths from the dirty probe when stamping the snapshot.
+///
+/// Pass the history graph output path (if inside the repository) so a
+/// pre-existing `history.graph.jsonl` from a previous run is not counted as a
+/// source change (CC1 / PR #186 follow-up).
+///
+/// # Errors
+///
+/// Returns an error when the repository path is invalid, Git is unavailable, or
+/// a reachable Rust source blob cannot be parsed.
+pub fn scan_repository_history_excluding(
+    repo_path: impl AsRef<Path>,
+    repo_id_override: Option<&str>,
+    snapshot_exclusions: &[String],
+) -> Result<Graph> {
+    scan_repository_history_inner(repo_path, repo_id_override, snapshot_exclusions)
+}
+
+#[allow(clippy::too_many_lines)]
+fn scan_repository_history_inner(
+    repo_path: impl AsRef<Path>,
+    repo_id_override: Option<&str>,
+    snapshot_exclusions: &[String],
 ) -> Result<Graph> {
     std::sync::LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
@@ -57,8 +84,10 @@ pub fn scan_repository_history_with_override(
     // and `--at` queries with `--repo-path` always report `unknown` because the
     // Repository node carries no `source_snapshot`.  The stamped HEAD lets
     // freshness detect `stale_head` after new commits are added.
+    // Exclude the output artifact from the dirty probe so a pre-existing
+    // in-tree history graph does not stamp dirty=true (CC1).
     let transaction_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let (head, dirty) = identity::working_tree_snapshot(repo_root);
+    let (head, dirty) = identity::working_tree_snapshot_excluding(repo_root, snapshot_exclusions);
     let snapshot = SourceSnapshotPayload {
         head,
         dirty,

@@ -1448,3 +1448,42 @@ fn scan_history_stamps_source_snapshot() {
         "freshness for a just-produced history graph must not be unknown: {report}"
     );
 }
+
+/// CC1: re-running `scan-history --out history.graph.jsonl` when the previous
+/// in-tree output is still untracked must not stamp `dirty=true` on the new
+/// snapshot.  Without the exclusion the pre-existing JSONL is counted as
+/// untracked dirtiness and the freshly replayed store reports `stale_dirty`.
+#[test]
+fn scan_history_excludes_in_tree_output_from_dirty_probe() {
+    let fx = Fixture::committed();
+    let in_tree_history = fx.repo().join("history.graph.jsonl");
+
+    // First scan-history — creates the in-tree artifact.
+    eg().args(["scan-history"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&in_tree_history)
+        .assert()
+        .success();
+
+    // Second scan-history: pre-existing untracked history.graph.jsonl must not
+    // stamp dirty=true on the new snapshot.
+    eg().args(["scan-history"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&in_tree_history)
+        .assert()
+        .success();
+
+    let jsonl = std::fs::read_to_string(&in_tree_history).unwrap();
+    let repo_node = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["record_type"] == "node" && v["kind"] == "Repository")
+        .expect("Repository node in history graph");
+    assert_eq!(
+        repo_node["source_snapshot"]["dirty"],
+        Value::Bool(false),
+        "re-run scan-history must not stamp dirty=true for its own output: {repo_node}"
+    );
+}

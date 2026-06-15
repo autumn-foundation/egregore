@@ -22,7 +22,8 @@ use crate::{
     identity,
     ir::{EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SnapshotHead, SourceSpan},
     link_evidence::{self, LinkOptions},
-    local_project, query, scan_repository_history_with_override, scan_repository_with_exclusions,
+    local_project, query, scan_repository_history_excluding, scan_repository_history_with_override,
+    scan_repository_with_exclusions,
     schema_version::{RecordVersion, record_version},
     traj::{self, ImportOptions},
 };
@@ -1722,7 +1723,11 @@ fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<
 }
 
 fn scan_history(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<()> {
-    let graph = scan_repository_history_with_override(repo_path, repo_id_override)
+    // Exclude the output file from the dirty probe (CC1 / PR #186 follow-up):
+    // a pre-existing in-tree history.graph.jsonl must not stamp dirty=true on
+    // the new snapshot, just as `scan` excludes its graph output.
+    let exclusions = store_artifact_exclusions(repo_path, &[Some(out)]);
+    let graph = scan_repository_history_excluding(repo_path, repo_id_override, &exclusions)
         .with_context(|| format!("failed to scan Git history for {}", repo_path.display()))?;
     let jsonl = graph
         .to_jsonl()
