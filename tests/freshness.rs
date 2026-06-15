@@ -1887,3 +1887,187 @@ fn ingested_at_anchors_drift_when_no_observed_at() {
         "ingested_at should anchor the comparison"
     );
 }
+
+// ── A tombstoned DRIFTS_PRIOR edge is not a trigger ──────────────────────────
+
+#[test]
+fn tombstoned_drift_prior_edge_is_not_a_trigger() {
+    // Identical body across commits, so only a drift can flag it. The drift's
+    // metadata prior is stale and its DRIFTS_PRIOR edge — the only recovery path —
+    // is tombstoned. The retracted edge must not produce a `drifted` verdict.
+    let path = "src/te.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let drift_id = semantic_stable_id(&["drift", "edge_retracted"]);
+    let drift = SemanticDriftMetadata {
+        embedding_model: EmbeddingModel {
+            provider: "p".to_owned(),
+            name: "m".to_owned(),
+            version: "v".to_owned(),
+            dim: 8,
+            content_hash: "h".to_owned(),
+        },
+        target_record_id: sym.clone(),
+        prior_record_id: "stale:nope".to_owned(),
+        before_git_commit: "commit_a".to_owned(),
+        after_git_commit: "commit_b".to_owned(),
+        before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
+        metric_kind: MetricKind::CosineDistance,
+        score: 0.7,
+        selection_threshold: 0.2,
+        selection_basis: SelectionBasis::ThresholdOnly,
+    };
+    let edge = GraphRecord::edge(
+        EdgeLabel::DriftsPrior,
+        drift_id.clone(),
+        sym.clone(),
+        None,
+        "drifts prior".to_owned(),
+    );
+    let edge_id = edge.id().to_owned();
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "same",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "same",
+            "commit_b",
+            "2026-01-02T00:00:00Z",
+        ),
+        GraphRecord::node(
+            drift_id,
+            NodeKind::SemanticDrift,
+            None,
+            None,
+            None,
+            "Drift".to_owned(),
+        )
+        .with_domain("semantic", SEMANTIC_SCHEMA_VERSION)
+        .with_semantic_drift(drift),
+        edge,
+        GraphRecord::Tombstone {
+            id: stable_id(&["tombstone", &edge_id]),
+            schema_version: aletheia_egregore::SCHEMA_VERSION,
+            deleted_id: edge_id,
+            summary: "drift-prior edge retracted".to_owned(),
+            producer: None,
+        },
+        observation(
+            &agent_memory_stable_id(&["obs", "te"]),
+            "f at commit_a",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "te"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(entry.verdict, FreshnessVerdict::Current);
+}
+
+// ── Ambiguous multi-repo triple citation is left unresolved ──────────────────
+
+#[test]
+fn ambiguous_multi_repo_triple_is_unresolved() {
+    // Two repositories share the same path + span. A triple-only citation carries
+    // no repository identity, so it must not be resolved to an arbitrary repo —
+    // the verdict is `unresolved`.
+    let path = "src/x.rs";
+    let sym_a = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let sym_b = stable_id(&["node", "symbol", "fn", "repo-b", path, "f", "0"]);
+    let records = vec![
+        symbol_version(
+            &sym_a,
+            path,
+            "f",
+            span(10, 20),
+            "body_a",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        symbol_version(
+            &sym_b,
+            path,
+            "f",
+            span(10, 20),
+            "body_b",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        observation(
+            &agent_memory_stable_id(&["obs", "amb"]),
+            "the f at this span",
+            "0.9",
+            None, // triple-only, no record id
+            Some(path),
+            Some(span(10, 20)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "amb"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(entry.verdict, FreshnessVerdict::Unresolved);
+}
+
+// ── The evidence link's recorded span is preserved in the report ─────────────
+
+#[test]
+fn recorded_link_span_is_preserved() {
+    // The link records a specific span; the live node carries a different one.
+    // The report must surface the recorded citation span, not an arbitrary live
+    // version's span, so auditors are pointed at the cited lines.
+    let path = "src/rs.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let recorded = span(99, 120);
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        observation(
+            &agent_memory_stable_id(&["obs", "rs"]),
+            "f at the recorded span",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(recorded),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "rs"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(
+        entry.cited_handle.span.map(|s| s.start_line),
+        Some(99),
+        "the recorded citation span must be preserved"
+    );
+}

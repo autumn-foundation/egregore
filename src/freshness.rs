@@ -304,11 +304,13 @@ impl<'a> FreshnessIndex<'a> {
         // have missed — never a sibling's drift.
         for record in records {
             if let GraphRecord::Edge {
+                id,
                 label: crate::ir::EdgeLabel::DriftsPrior,
                 source,
                 target,
                 ..
             } = record
+                && !tombstone_by_deleted.contains_key(id.as_str())
                 && let Some(drift) = drift_meta_by_id.get(source.as_str())
             {
                 let entry = drifts_by_prior.entry(target.as_str()).or_default();
@@ -337,9 +339,16 @@ impl<'a> FreshnessIndex<'a> {
     }
 
     /// Resolves a triple `(path, span)` to a live code node ID, preferring a
-    /// span-equal Symbol (symbol-level), falling back to the File for the path.
+    /// span-equal handle (symbol-level), falling back to the File for the path.
+    ///
+    /// A triple with no `target_record_id` carries no repository identity, so in a
+    /// shared multi-repo store the same `(path, span)` can match handles in more
+    /// than one repository. Such ambiguous matches are **not** silently resolved
+    /// to an arbitrary one — they return `None` so the verdict is `unresolved`
+    /// rather than a false comparison against another repository's symbol.
     fn resolve_triple(&self, path: &str, span: Option<&SourceSpan>) -> Option<&'a str> {
-        let mut file_match: Option<&str> = None;
+        let mut span_matches: BTreeSet<&str> = BTreeSet::new();
+        let mut file_matches: BTreeSet<&str> = BTreeSet::new();
         for versions in self.live_code_by_id.values() {
             for record in versions {
                 let GraphRecord::Node {
@@ -356,7 +365,9 @@ impl<'a> FreshnessIndex<'a> {
                     continue;
                 }
                 match kind {
-                    NodeKind::File => file_match = Some(id.as_str()),
+                    NodeKind::File => {
+                        file_matches.insert(id.as_str());
+                    }
                     // A triple can name any code handle (`Symbol`/`Module`/`Import`),
                     // not just a symbol; match the span for all of them before
                     // falling back to the whole file.
@@ -364,13 +375,13 @@ impl<'a> FreshnessIndex<'a> {
                         && span.is_some()
                         && node_span.as_ref() == span =>
                     {
-                        return Some(id.as_str());
+                        span_matches.insert(id.as_str());
                     }
                     _ => {}
                 }
             }
         }
-        file_match
+        unique_match(&span_matches).or_else(|| unique_match(&file_matches))
     }
 
     /// Resolves a triple `(path, span)` to the code node that occupied it **at the
@@ -385,7 +396,8 @@ impl<'a> FreshnessIndex<'a> {
         span: Option<&SourceSpan>,
         commit: &str,
     ) -> Option<&'a str> {
-        let mut file_match: Option<&str> = None;
+        let mut span_matches: BTreeSet<&str> = BTreeSet::new();
+        let mut file_matches: BTreeSet<&str> = BTreeSet::new();
         for record in &self.all_code_handles {
             let GraphRecord::Node {
                 id,
@@ -405,17 +417,42 @@ impl<'a> FreshnessIndex<'a> {
                 continue;
             }
             match kind {
-                NodeKind::File => file_match = Some(id.as_str()),
+                NodeKind::File => {
+                    file_matches.insert(id.as_str());
+                }
                 // A triple can name any code handle (`Symbol`/`Module`/`Import`),
                 // not just a symbol; match the span for all of them before falling
                 // back to the whole file.
                 k if is_code_handle_kind(*k) && span.is_some() && node_span.as_ref() == span => {
-                    return Some(id.as_str());
+                    span_matches.insert(id.as_str());
                 }
                 _ => {}
             }
         }
-        file_match
+        // Ambiguous matches (same path/span/commit across repositories) are left
+        // unresolved rather than compared against an arbitrary repository.
+        unique_match(&span_matches).or_else(|| unique_match(&file_matches))
+    }
+}
+
+/// Returns the single element of `matches`, or `None` when it is empty or
+/// ambiguous (more than one distinct record ID).
+fn unique_match<'a>(matches: &BTreeSet<&'a str>) -> Option<&'a str> {
+    match matches.len() {
+        1 => matches.iter().next().copied(),
+        _ => None,
+    }
+}
+
+/// Repo-relative path and span of a node record, both `None` for non-nodes.
+fn node_path_span(record: &GraphRecord) -> (Option<String>, Option<SourceSpan>) {
+    match record {
+        GraphRecord::Node {
+            repo_relative_path,
+            span,
+            ..
+        } => (repo_relative_path.clone(), *span),
+        _ => (None, None),
     }
 }
 
@@ -639,19 +676,24 @@ fn classify_link(
 
     let live_versions = cited_id.and_then(|id| index.live_code_by_id.get(id));
 
-    // The cited node's repo-relative path / span comes from a live version when
-    // resolvable, else from the link's triple.
-    let (handle_path, handle_span) = live_versions
-        .and_then(|versions| versions.first())
-        .and_then(|record| match record {
-            GraphRecord::Node {
-                repo_relative_path,
-                span,
-                ..
-            } => Some((repo_relative_path.clone(), *span)),
-            _ => None,
+    // The reported handle path/span prefers what the evidence link actually
+    // recorded (the span the agent cited), then the version at the anchor commit,
+    // then any live version — never an arbitrary `versions.first()` (which a
+    // history-inclusive read can make an older/unrelated version) when a more
+    // authoritative source is available.
+    let reference_version = anchor_commit
+        .and_then(|commit| {
+            live_versions.and_then(|versions| {
+                versions
+                    .iter()
+                    .copied()
+                    .find(|r| version_commit(r) == Some(commit))
+            })
         })
-        .unwrap_or_else(|| (link.target_repo_relative_path.clone(), link.target_span));
+        .or_else(|| live_versions.and_then(|versions| versions.first().copied()));
+    let (version_path, version_span) = reference_version.map_or((None, None), node_path_span);
+    let handle_path = link.target_repo_relative_path.clone().or(version_path);
+    let handle_span = link.target_span.or(version_span);
 
     let mut cited_handle = CitedHandle {
         target_record_id: link
