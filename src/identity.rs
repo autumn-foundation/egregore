@@ -387,9 +387,13 @@ pub fn working_tree_snapshot_excluding(
 ///
 /// `GIT_OPTIONAL_LOCKS=0` disables the optional index-refresh write `git status`
 /// performs by default, keeping the freshness probe strictly read-only.
+/// `-c core.excludesFile=` suppresses the user/system-level global gitignore so
+/// probes see the same file set as the scanner (which runs with the same override),
+/// keeping freshness results reproducible across developer environments.
 fn read_only_git(repo_root: &Path) -> Command {
     let mut command = Command::new("git");
     command
+        .args(["-c", "core.excludesFile="])
         .arg("-C")
         .arg(repo_root)
         .env("GIT_OPTIONAL_LOCKS", "0")

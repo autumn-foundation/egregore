@@ -99,10 +99,18 @@ fn collect_rust_source_files(
 }
 
 fn should_descend(path: &Path) -> bool {
-    !path
+    if path
         .file_name()
         .and_then(OsStr::to_str)
         .is_some_and(|name| matches!(name, ".git" | "target"))
+    {
+        return false;
+    }
+    // Submodules (and linked worktrees) store .git as a FILE rather than a
+    // directory; don't descend into them.  Without this guard, paths inside the
+    // submodule reach `git check-ignore --stdin` and can trigger a fatal exit 128
+    // that disables gitignore filtering for the entire superproject scan.
+    !path.join(".git").is_file()
 }
 
 /// Runs `git ls-files --others --ignored --directory --exclude-standard` to

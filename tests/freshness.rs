@@ -1487,3 +1487,108 @@ fn scan_history_excludes_in_tree_output_from_dirty_probe() {
         "re-run scan-history must not stamp dirty=true for its own output: {repo_node}"
     );
 }
+
+/// DD1: the dirty probe (`git status`) must run with `-c core.excludesFile=`
+/// matching the scanner's own gitignore checks.  Without the override,
+/// `git status` honours the user's global excludes file and silently hides
+/// untracked files that the scanner (which also runs with `-c core.excludesFile=`)
+/// has already indexed.  The mismatch causes `dirty=false` to be stamped even
+/// though indexed untracked files are present, and a later edit to those files
+/// produces a false `fresh` verdict.
+///
+/// This test sets `GIT_CONFIG_GLOBAL` to a temporary gitconfig that installs a
+/// global excludes file matching `globally_hidden.rs`, then verifies that:
+/// 1. The scanner still indexes the file (its `git check-ignore` suppresses the
+///    global config).
+/// 2. The dirty probe also suppresses the global config and stamps `dirty=true`
+///    for the untracked file.
+#[test]
+fn dirty_probe_suppresses_global_excludes_file() {
+    let fx = Fixture::committed();
+
+    let global_dir = tempfile::tempdir().unwrap();
+    let global_excludes = global_dir.path().join("excludes");
+    let global_gitconfig = global_dir.path().join("gitconfig");
+
+    std::fs::write(&global_excludes, "globally_hidden.rs\n").unwrap();
+    std::fs::write(
+        &global_gitconfig,
+        format!("[core]\n\texcludesFile = {}\n", global_excludes.display()),
+    )
+    .unwrap();
+
+    // Untracked Rust file that matches the global ignore pattern.
+    std::fs::write(
+        fx.repo().join("src").join("globally_hidden.rs"),
+        "pub fn hidden() {}\n",
+    )
+    .unwrap();
+
+    let out_graph = fx.work.path().join("graph.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&out_graph)
+        .env("GIT_CONFIG_GLOBAL", &global_gitconfig)
+        .assert()
+        .success();
+
+    let jsonl = std::fs::read_to_string(&out_graph).unwrap();
+    assert!(
+        jsonl.contains("globally_hidden"),
+        "globally-ignored untracked file must be indexed by the scanner: {jsonl}"
+    );
+
+    let repo_node = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["record_type"] == "node" && v["kind"] == "Repository")
+        .expect("Repository node in graph");
+    assert_eq!(
+        repo_node["source_snapshot"]["dirty"],
+        Value::Bool(true),
+        "globally-ignored untracked file must be visible to the dirty probe: {repo_node}"
+    );
+}
+
+/// EE1: `discover_rust_source_files` must not descend into git submodules (or
+/// linked worktrees), whose `.git` entry is a FILE rather than a directory.
+///
+/// Without this guard, paths inside the submodule are fed to `git check-ignore
+/// --stdin`, which can exit 128 and disable gitignore filtering for the entire
+/// superproject scan.  Symbols from the submodule would then also appear in the
+/// superproject's graph.
+#[test]
+fn scan_does_not_descend_into_submodule_directory() {
+    let fx = Fixture::committed();
+
+    // Simulate a submodule by creating a directory with `.git` as a FILE
+    // (the real on-disk shape of a checked-out submodule or linked worktree).
+    let sub_dir = fx.repo().join("deps").join("sub");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+    std::fs::write(sub_dir.join(".git"), "gitdir: ../../.git/modules/sub\n").unwrap();
+    std::fs::create_dir_all(sub_dir.join("src")).unwrap();
+    std::fs::write(
+        sub_dir.join("src").join("lib.rs"),
+        "pub fn submodule_fn() {}\n",
+    )
+    .unwrap();
+
+    let out_graph = fx.work.path().join("graph.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&out_graph)
+        .assert()
+        .success();
+
+    let jsonl = std::fs::read_to_string(&out_graph).unwrap();
+    assert!(
+        !jsonl.contains("submodule_fn"),
+        "scanner must not descend into submodule directories: {jsonl}"
+    );
+    assert!(
+        jsonl.contains("hello"),
+        "superproject symbols must still appear in the graph: {jsonl}"
+    );
+}
