@@ -1836,9 +1836,16 @@ fn query_freshness_code(
     let identity = identity::compute_repository_identity(repo_path, None);
     let exclusions = store_artifact_exclusions(repo_path, artifact);
     let (head, dirty) = identity::working_tree_snapshot_excluding(repo_path, &exclusions);
-    let stored = freshness::stored_snapshot(records, &identity.id);
+    // Stamp against the repository that actually owns the matched snapshot. When
+    // the match came from the single-repository fallback (e.g. a `--repo-id-override`
+    // store), that owner ID differs from the recomputed identity, and stamping
+    // against the recomputed identity would leave every row unstamped (PR #186).
+    let (owner_id, stored) = match freshness::stored_snapshot_with_owner(records, &identity.id) {
+        Some((owner, snapshot)) => (owner.to_owned(), Some(snapshot)),
+        None => (identity.id, None),
+    };
     let code = freshness::classify(stored, &head, dirty).code();
-    Some((identity.id, code))
+    Some((owner_id, code))
 }
 
 /// Computes repo-relative dirty-probe exclusions for the store artifact being
@@ -3197,15 +3204,15 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo_path,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            // Context is keyed to the single working tree at `repo_path`; carry
-            // just the verdict code as a top-level signal.
-            let freshness_code = query_freshness_code(
+            // Context is keyed to the single working tree at `repo_path`. Pass the
+            // (owning repository id, code) so the command can attach the verdict
+            // only when the response does not span other repositories (PR #186).
+            let freshness = query_freshness_code(
                 &records,
                 repo_path.as_deref(),
                 graph.as_deref().or(data_dir.as_deref()),
-            )
-            .map(|(_, code)| code);
-            query_context_cmd(&records, &name, freshness_code)
+            );
+            query_context_cmd(&records, &name, freshness)
         }
         QuerySubcommand::Task {
             id_or_handle,
@@ -5180,7 +5187,7 @@ fn query_drift(
 fn query_context_cmd(
     records: &[GraphRecord],
     symbol_name: &str,
-    freshness_code: Option<&'static str>,
+    freshness: Option<(String, &'static str)>,
 ) -> Result<()> {
     let ctx = query::symbol_context(records, symbol_name);
 
@@ -5266,6 +5273,21 @@ fn query_context_cmd(
             }
         })
         .collect();
+
+    // Attach the freshness verdict only when every source fact belongs to the
+    // repository the verdict was computed for (PR #186): `query context` has no
+    // repository selector, so in a multi-repo store the same symbol can collect
+    // facts from several repositories — presenting one checkout's verdict across
+    // all of them would be misleading. Omit it when the response spans repos.
+    let freshness_code = freshness.and_then(|(owner_id, code)| {
+        let index = query::RepositoryIndex::build(records);
+        let owners: std::collections::BTreeSet<Option<&str>> = ctx
+            .source_facts
+            .iter()
+            .map(|record| index.owner_of(record.id()))
+            .collect();
+        (owners.len() == 1 && owners.contains(&Some(owner_id.as_str()))).then_some(code)
+    });
 
     let response = ContextResponse {
         ok: true,

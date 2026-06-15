@@ -139,6 +139,16 @@ fn git_top_level(repo_root: &Path) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(path_str.trim()))
 }
 
+/// Returns `true` if `path` is exactly the root of its git repository (not a
+/// subdirectory of one). Used to gate Git-derived behavior — identity, snapshot
+/// stamping, and gitignore-aware discovery — to the repository root so scans of
+/// in-repo sub-directories stay filesystem-local and independent of the
+/// surrounding checkout.
+#[must_use]
+pub(crate) fn is_repo_root(path: &Path) -> bool {
+    git_is_repo_root(path)
+}
+
 /// Returns `true` if `repo_root` is exactly the root of its git repository
 /// (not a subdirectory of one).
 fn git_is_repo_root(repo_root: &Path) -> bool {

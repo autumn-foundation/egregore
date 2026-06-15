@@ -101,9 +101,25 @@ pub fn stored_snapshot<'a>(
     records: &'a [GraphRecord],
     repository_id: &str,
 ) -> Option<&'a SourceSnapshotPayload> {
+    stored_snapshot_with_owner(records, repository_id).map(|(_, snapshot)| snapshot)
+}
+
+/// Like [`stored_snapshot`], but also returns the stable ID of the `Repository`
+/// node the snapshot belongs to.
+///
+/// Callers that stamp per-result freshness (the query commands) need the owning
+/// repository ID, not the caller's recomputed identity: when the match comes from
+/// the single-repository fallback — e.g. a store scanned with
+/// `--repo-id-override`, whose rows are owned by the overridden ID — stamping
+/// against the recomputed identity would leave every row unstamped (PR #186).
+#[must_use]
+pub fn stored_snapshot_with_owner<'a>(
+    records: &'a [GraphRecord],
+    repository_id: &str,
+) -> Option<(&'a str, &'a SourceSnapshotPayload)> {
     let mut repository_nodes = 0usize;
-    let mut matched: Option<&'a SourceSnapshotPayload> = None;
-    let mut sole: Option<&'a SourceSnapshotPayload> = None;
+    let mut matched: Option<(&'a str, &'a SourceSnapshotPayload)> = None;
+    let mut sole: Option<(&'a str, &'a SourceSnapshotPayload)> = None;
     for record in records {
         if let GraphRecord::Node {
             kind: NodeKind::Repository,
@@ -113,11 +129,12 @@ pub fn stored_snapshot<'a>(
         } = record
         {
             repository_nodes += 1;
-            let snapshot = source_snapshot.as_deref();
-            if id == repository_id {
-                matched = snapshot;
+            if let Some(snapshot) = source_snapshot.as_deref() {
+                if id == repository_id {
+                    matched = Some((id.as_str(), snapshot));
+                }
+                sole = Some((id.as_str(), snapshot));
             }
-            sole = snapshot;
         }
     }
     // Exact identity match wins. Otherwise fall back to the sole repository's

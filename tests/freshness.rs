@@ -640,3 +640,97 @@ fn scanner_skips_gitignored_rust_files() {
         "git-ignored source must not be indexed: {jsonl}"
     );
 }
+
+/// The gitignore filter must be gated to the repository root: scanning an in-repo
+/// sub-directory stays filesystem-local and must NOT honor a parent `.gitignore`
+/// (PR #186, follow-up review).
+#[test]
+fn gitignore_filter_gated_to_repo_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    std::fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
+    let sub_src = root.join("crate_a").join("src");
+    std::fs::create_dir_all(&sub_src).unwrap();
+    std::fs::write(sub_src.join("ignored.rs"), "pub fn ignored_fn() {}\n").unwrap();
+    std::fs::write(sub_src.join("keep.rs"), "pub fn keep_fn() {}\n").unwrap();
+    commit_all(root, "initial");
+
+    let work = tempfile::tempdir().unwrap();
+    let graph = work.path().join("graph.jsonl");
+    // Scan the sub-directory, not the repository root.
+    eg().args(["scan"])
+        .arg(root.join("crate_a"))
+        .arg("--out")
+        .arg(&graph)
+        .assert()
+        .success();
+
+    let jsonl = std::fs::read_to_string(&graph).unwrap();
+    assert!(jsonl.contains("keep_fn"));
+    assert!(
+        jsonl.contains("ignored_fn"),
+        "a sub-directory scan must ignore the parent .gitignore (filesystem-local): {jsonl}"
+    );
+}
+
+/// Rows owned by a `--repo-id-override` repository must still receive a freshness
+/// verdict when `--repo-path` is supplied (PR #186, follow-up review): the
+/// single-repository fallback's owner ID, not the recomputed identity, is stamped.
+#[test]
+fn query_freshness_stamps_override_repo_rows() {
+    let fx = Fixture::committed();
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(fx.graph())
+        .args(["--repo-id-override", "my-fixture-repo"])
+        .assert()
+        .success();
+
+    let out = eg()
+        .args(["query", "symbol", "hello"])
+        .arg("--graph")
+        .arg(fx.graph())
+        .arg("--repo-path")
+        .arg(fx.repo())
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let line = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let row: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        row["freshness"], "fresh",
+        "override-stamped rows must still receive a freshness verdict: {row}"
+    );
+}
+
+/// `query context` must omit the top-level freshness verdict when source facts
+/// span multiple repositories (PR #186, follow-up review).
+#[test]
+fn query_context_omits_freshness_across_repositories() {
+    let a = Fixture::committed();
+    let b = Fixture::committed_with("pub fn hello() {}\npub fn b_only() {}\n");
+    a.scan();
+    b.scan();
+
+    let combined = a.work.path().join("combined.jsonl");
+    let mut bytes = std::fs::read(a.graph()).unwrap();
+    bytes.extend_from_slice(&std::fs::read(b.graph()).unwrap());
+    std::fs::write(&combined, bytes).unwrap();
+
+    let out = eg()
+        .args(["query", "context", "hello"])
+        .arg("--graph")
+        .arg(&combined)
+        .arg("--repo-path")
+        .arg(a.repo())
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(report["ok"], Value::Bool(true));
+    assert!(
+        report.get("freshness").is_none(),
+        "context freshness must be omitted when facts span repositories: {report}"
+    );
+}

@@ -112,6 +112,13 @@ fn filter_git_ignored(repo_root: &Path, files: &mut Vec<PathBuf>) {
     if files.is_empty() {
         return;
     }
+    // Gate to the actual Git repository root (PR #186): scanning an in-repo
+    // sub-directory (e.g. a test fixture inside a larger checkout) is treated as
+    // `no_git` everywhere else, and applying a parent repository's `.gitignore`
+    // here would let the surrounding checkout silently drop files from the graph.
+    if !crate::identity::is_repo_root(repo_root) {
+        return;
+    }
     let rels: Vec<String> = files
         .iter()
         .map(|file| {
