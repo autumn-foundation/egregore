@@ -3617,27 +3617,34 @@ fn non_empty(value: Option<&String>) -> Option<&str> {
 /// Agent-memory nodes are not part of the code-graph containment topology, so
 /// [`query::RepositoryIndex::owner_of`] returns `None` for them directly. A
 /// memory record is attributed to a repository through the code it cites: any
-/// `evidence_links` target that resolves to a code node owned by a repository
-/// scopes the memory to that repository. Returned sorted and deduplicated for
-/// deterministic selection.
+/// cited code target that resolves to a repository-owned node scopes the memory
+/// to that repository. Both citation shapes are honored — inline
+/// `evidence_links` and standalone outgoing `GraphRecord::Edge` records (e.g.
+/// the `link-evidence` `MENTIONS_SYMBOL` / `FAILED_ON` / `TOUCHED_FILE` edges) —
+/// so imported memory that stores normalized edges is not dropped under `--repo`.
+/// Returned sorted and deduplicated for deterministic selection.
 #[cfg(feature = "embeddings")]
 fn memory_repo_owners<'a>(
     record_id: &str,
     links: Option<&Vec<EvidenceLink>>,
+    edges_from: &query::OutgoingEdgeIndex<'_>,
     index: &'a query::RepositoryIndex,
 ) -> Vec<&'a str> {
     if let Some(owner) = index.owner_of(record_id) {
         return vec![owner];
     }
-    let mut owners: Vec<&str> = links
-        .map(|links| {
+    let mut owners: Vec<&str> = Vec::new();
+    if let Some(links) = links {
+        owners.extend(
             links
                 .iter()
                 .filter_map(|l| l.target_record_id.as_deref())
-                .filter_map(|target| index.owner_of(target))
-                .collect()
-        })
-        .unwrap_or_default();
+                .filter_map(|target| index.owner_of(target)),
+        );
+    }
+    if let Some(out) = edges_from.get(record_id) {
+        owners.extend(out.iter().filter_map(|(_, target)| index.owner_of(target)));
+    }
     owners.sort_unstable();
     owners.dedup();
     owners
@@ -3801,8 +3808,9 @@ fn query_semantic_memory(
 
         // Scope through the code this memory cites: memory nodes are not in the
         // containment topology, so a `--repo` filter must resolve the repository
-        // from the linked code handles, not the memory record ID directly.
-        let owners = memory_repo_owners(&m.record_id, evidence_links.as_ref(), &index);
+        // from the linked code handles (inline links and outgoing edges), not the
+        // memory record ID directly.
+        let owners = memory_repo_owners(&m.record_id, evidence_links.as_ref(), &edges_from, &index);
         if let Some(repo) = selected.as_deref()
             && !owners.contains(&repo)
         {
@@ -3832,7 +3840,13 @@ fn query_semantic_memory(
             })
             .unwrap_or_default();
 
-        let repository_id = owners.first().copied();
+        // Label with the selected repository when scoped (the membership filter
+        // above guarantees it is among `owners`), so a memory citing code in
+        // several repositories is never misattributed to a different one than the
+        // user selected; otherwise fall back to the first owner deterministically.
+        let repository_id = selected
+            .as_deref()
+            .or_else(|| owners.first().copied());
         rows.push(MemoryRecallResult {
             record_id: record.id(),
             kind: record.node_kind_name().unwrap_or("Observation"),
@@ -4125,15 +4139,24 @@ fn eval_memory_recall_cmd(
                 )
             })?;
 
-        let hits: Vec<MemoryHit> = matches
+        // Collect every recallable hit, then apply the canonical score/record-id
+        // ordering before truncating to top-k: truncating the raw ANN order first
+        // could drop a record that belongs in the canonical top 3 when scores tie
+        // (and vary between runs). `evaluate_query` re-applies canonical ordering.
+        let mut hits: Vec<MemoryHit> = matches
             .iter()
             .filter(|m| is_recallable_memory(m, &by_id, &edges_from, &tombstoned, verified_only))
-            .take(top_k.max(3))
             .map(|m| MemoryHit {
                 record_id: m.record_id.clone(),
                 score: m.score,
             })
             .collect();
+        hits.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.record_id.cmp(&b.record_id))
+        });
+        hits.truncate(top_k.max(3));
 
         results.push(evaluate_query(question, &hits));
     }
