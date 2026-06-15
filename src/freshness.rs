@@ -461,6 +461,23 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
     // current view — skip superseded notes and emit each observation ID once —
     // so a re-ingest or retained older version cannot yield duplicate or
     // non-current verdicts. Code handles keep all their versions.
+    //
+    // Collect superseded IDs in a first pass: the history-inclusive view can emit
+    // the original row (no marker) before the updated row that carries
+    // `superseded_by`, so a first-seen check during the main pass would classify
+    // the stale row before ever seeing the supersession marker.
+    let mut superseded_ids: BTreeSet<&str> = BTreeSet::new();
+    for record in records {
+        if let GraphRecord::Node {
+            id,
+            superseded_by: Some(target),
+            ..
+        } = record
+            && !target.is_empty()
+        {
+            superseded_ids.insert(id.as_str());
+        }
+    }
     let mut seen_observations: BTreeSet<&str> = BTreeSet::new();
 
     for record in records {
@@ -471,10 +488,10 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
             agent_id,
             session_id,
             observed_at,
+            ingested_at,
             confidence,
             redaction_policy_version,
             valid_time,
-            superseded_by,
             ..
         } = record
         else {
@@ -490,8 +507,9 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
             continue;
         }
         // A superseded note has been replaced by a newer one; the current view
-        // excludes it, just as the store's default read does.
-        if superseded_by.as_deref().is_some_and(|s| !s.is_empty()) {
+        // excludes it, just as the store's default read does. Checked against the
+        // first-pass set so the marker is honored regardless of row order.
+        if superseded_ids.contains(id.as_str()) {
             continue;
         }
         // Dedupe re-ingested physical rows of the same observation (same stable
@@ -514,7 +532,8 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
         let obs_valid_time = valid_time
             .as_deref()
             .filter(|s| !s.is_empty())
-            .or_else(|| observed_at.as_deref().filter(|s| !s.is_empty()));
+            .or_else(|| observed_at.as_deref().filter(|s| !s.is_empty()))
+            .or_else(|| ingested_at.as_deref().filter(|s| !s.is_empty()));
 
         for link in links {
             // Only links to the deterministic code graph carry a code handle.

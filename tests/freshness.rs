@@ -1656,6 +1656,69 @@ fn superseded_observation_is_excluded_from_current_view() {
 }
 
 #[test]
+fn supersession_marker_in_a_later_row_is_honored() {
+    // The same observation ID is emitted twice: first the original row (no
+    // marker), then the updated row carrying `superseded_by`. Order must not
+    // matter — the note is superseded and must not be classified.
+    let path = "src/sm.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let obs_id = agent_memory_stable_id(&["obs", "marker"]);
+    let successor = agent_memory_stable_id(&["obs", "successor"]);
+    let original = observation(
+        &obs_id,
+        "f returns body_v1",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    );
+    let superseded = observation(
+        &obs_id,
+        "f returns body_v1",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    )
+    .with_superseded_by(&successor);
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body_v1",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body_v2",
+            "commit_b",
+            "2026-01-02T00:00:00Z",
+        ),
+        // Original row first, supersession marker second.
+        original,
+        superseded,
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    assert!(
+        verdicts.iter().all(|e| e.observation_id != obs_id),
+        "supersession must be honored even when the marker is on a later row"
+    );
+}
+
+#[test]
 fn duplicate_observation_rows_are_deduped() {
     // Two byte-identical physical rows of the same observation (a re-ingest) must
     // produce exactly one verdict, not two.
@@ -1757,4 +1820,70 @@ fn backdated_child_commit_content_change_drifts() {
         entry.triggering_handle,
         Some(freshness::TriggeringHandle::ContentChange { .. })
     ));
+}
+
+// ── ingested_at anchors drift for legacy notes lacking observed_at ───────────
+
+#[test]
+fn ingested_at_anchors_drift_when_no_observed_at() {
+    // A legacy/imported note carries only `ingested_at` — no valid_time, no
+    // commit, and no observed_at. The recording-time fallback must still anchor
+    // the comparison so later drift surfaces, instead of reporting `untemporal`.
+    let path = "src/ia.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let obs = agent_memory_stable_id(&["obs", "ingested"]);
+    let mut note = observation(
+        &obs,
+        "f returns body_v1",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        None, // no commit
+        None, // no valid_time
+    );
+    // Strip observed_at; keep only ingested_at as the recording time.
+    if let GraphRecord::Node {
+        observed_at,
+        ingested_at,
+        ..
+    } = &mut note
+    {
+        *observed_at = None;
+        *ingested_at = Some("2026-02-01T00:00:00Z".to_owned());
+    }
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body_v1",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body_v2",
+            "commit_c",
+            "2026-03-01T00:00:00Z",
+        ),
+        note,
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs)
+        .expect("verdict for obs");
+    assert_eq!(entry.verdict, FreshnessVerdict::Drifted);
+    assert_eq!(
+        entry.cited_handle.anchor_valid_time.as_deref(),
+        Some("2026-02-01T00:00:00Z"),
+        "ingested_at should anchor the comparison"
+    );
 }
