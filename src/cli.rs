@@ -1673,12 +1673,33 @@ fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<
     let mut egregore_dirs: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(repo_path) {
         for entry in entries.flatten() {
-            if entry
+            let name_matches = entry
                 .file_name()
                 .to_str()
-                .is_some_and(|n| n.starts_with(".egregore"))
-            {
-                egregore_dirs.push(entry.path());
+                .is_some_and(|n| n.starts_with(".egregore"));
+            // Only exclude directories, not regular files such as `.egregore.rs`.
+            // Also skip directories that contain tracked content — those are source
+            // directories that happen to share the prefix, not store outputs.
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            if name_matches && is_dir {
+                let path = entry.path();
+                // `git ls-files` returns tracked paths under the directory; an empty
+                // result means the entire subtree is untracked / gitignored, which is
+                // the hallmark of a store output rather than a source directory.
+                // Use the entry name directly so `git ls-files` receives a
+                // repo-relative path regardless of whether `repo_path` itself is
+                // absolute or relative, avoiding double-prefix issues on some platforms.
+                let name = entry.file_name();
+                let has_tracked = std::process::Command::new("git")
+                    .env("GIT_OPTIONAL_LOCKS", "0")
+                    .current_dir(repo_path)
+                    .args(["ls-files", "--", name.to_str().unwrap_or("")])
+                    .output()
+                    .map(|out| !out.stdout.is_empty())
+                    .unwrap_or(false);
+                if !has_tracked {
+                    egregore_dirs.push(path);
+                }
             }
         }
     }
@@ -1880,14 +1901,16 @@ fn query_freshness_code_inner(
     let identity = identity::compute_repository_identity(repo_path, None);
     let exclusions = store_artifact_exclusions(repo_path, artifacts);
     let (head, dirty) = identity::working_tree_snapshot_excluding(repo_path, &exclusions);
-    // Try the recomputed identity first, then the hint (a resolved `--repo` scope
-    // or `--repo-id-override` value). In a multi-repo store the single-repo
-    // fallback is disabled, so the hint is the only way to match an override ID.
-    let matched = freshness::stored_snapshot_with_owner(records, &identity.id).or_else(|| {
-        repo_id_hint
-            .filter(|h| *h != identity.id.as_str())
-            .and_then(|h| freshness::stored_snapshot_with_owner(records, h))
-    });
+    // When the caller supplies an explicit hint (a resolved `--repo` scope or
+    // `--repo-id-override` value that differs from the auto-detected identity),
+    // try the hint FIRST.  This ensures that an operator-pinned override ID wins
+    // over the auto-detected identity in a multi-repo store — the identity-first
+    // order would silently return the wrong snapshot when both IDs are present.
+    let matched = match repo_id_hint.filter(|h| *h != identity.id.as_str()) {
+        Some(h) => freshness::stored_snapshot_with_owner(records, h)
+            .or_else(|| freshness::stored_snapshot_with_owner(records, &identity.id)),
+        None => freshness::stored_snapshot_with_owner(records, &identity.id),
+    };
     let (owner_id, stored) = match matched {
         Some((owner, snapshot)) => (owner.to_owned(), Some(snapshot)),
         None => (identity.id, None),
@@ -3080,6 +3103,19 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             format,
         } => {
             if let Some(tx) = tx_as_of.as_deref() {
+                // --repo-path is used to stamp freshness onto results.  TxSymbolRow
+                // has no freshness field and the tx-as-of path never computes one,
+                // so accepting --repo-path here would silently drop the signal.
+                // Reject the combination early so users see a clear error rather
+                // than a result that looks correct but carries no freshness stamp.
+                if repo_path.is_some() {
+                    print_tx_error(
+                        "unsupported_combination",
+                        "--repo-path cannot be used with --tx-as-of; \
+                         freshness stamping is not available for transaction-time queries",
+                    )?;
+                    std::process::exit(1);
+                }
                 // --at keys the valid-time axis to a commit; combining it with a
                 // transaction-time selector is an unsupported workflow (AC6).
                 if at.is_some() {

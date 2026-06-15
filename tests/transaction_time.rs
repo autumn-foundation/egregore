@@ -291,6 +291,25 @@ fn tx_as_of_with_at_is_unsupported_combination() {
     assert_eq!(env["error"]["code"], "unsupported_combination");
 }
 
+// X2: --repo-path must be rejected when --tx-as-of is present because
+// TxSymbolRow carries no freshness field and the tx-as-of path never computes one.
+#[test]
+fn tx_as_of_rejects_repo_path() {
+    let (_t, graph) = seed_store();
+    let assert = CargoCommand::cargo_bin("egregore")
+        .expect("egregore binary")
+        .args(["query", "symbol", "widget", "--graph"])
+        .arg(&graph)
+        .args(["--tx-as-of", "2026-01-02T00:00:00Z"])
+        .args(["--repo-path", "."])
+        .assert()
+        .failure();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8");
+    let env: Value = serde_json::from_str(stdout.trim()).expect("JSON");
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "unsupported_combination");
+}
+
 // ── AC7: determinism across repeated runs ───────────────────────────────────
 
 #[test]

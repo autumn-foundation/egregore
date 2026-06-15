@@ -674,6 +674,67 @@ fn gitignore_filter_gated_to_repo_root() {
     );
 }
 
+/// X1: when `--repo` selects an operator-override repository whose ID differs
+/// from the auto-detected identity, the hint must take priority so the correct
+/// stored snapshot is returned in a multi-repo store.
+///
+/// Without hint-first ordering the identity-first lookup would find the
+/// auto-detected-identity snapshot (which is `stale_head` after a new commit) and
+/// return `stale_head` even though the override-ID scan is fresh.
+#[test]
+fn freshness_hint_takes_priority_over_identity_in_multi_repo_store() {
+    let fx = Fixture::committed();
+
+    // Scan 1: auto-detected identity at initial commit.
+    let scan1 = fx.work.path().join("scan1.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&scan1)
+        .assert()
+        .success();
+
+    // Advance HEAD so the auto-detected-identity snapshot becomes stale_head.
+    write_lib(fx.repo(), "pub fn hello() {}\npub fn extra() {}\n");
+    commit_all(fx.repo(), "second");
+
+    // Scan 2: override ID at the new HEAD — this snapshot is fresh.
+    let scan2 = fx.work.path().join("scan2.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&scan2)
+        .args(["--repo-id-override", "my-override-repo"])
+        .assert()
+        .success();
+
+    // Combined store: two Repository nodes — one identity-ID (stale_head) and
+    // one override-ID (fresh).
+    let combined = fx.work.path().join("combined.jsonl");
+    let mut bytes = std::fs::read(&scan1).unwrap();
+    bytes.extend_from_slice(&std::fs::read(&scan2).unwrap());
+    std::fs::write(&combined, bytes).unwrap();
+
+    // Query scoped to the override repo with --repo-path: hint-first lookup
+    // must find the override snapshot (fresh), not the identity snapshot (stale_head).
+    let out = eg()
+        .args(["query", "symbol", "hello"])
+        .arg("--graph")
+        .arg(&combined)
+        .arg("--repo-path")
+        .arg(fx.repo())
+        .args(["--repo", "my-override-repo"])
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let row: Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        row["freshness"], "fresh",
+        "hint-first lookup must find the override snapshot (fresh), not the identity snapshot (stale_head): {row}"
+    );
+}
+
 /// Rows owned by a `--repo-id-override` repository must still receive a freshness
 /// verdict when `--repo-path` is supplied (PR #186, follow-up review): the
 /// single-repository fallback's owner ID, not the recomputed identity, is stamped.
@@ -1043,5 +1104,76 @@ fn refresh_excludes_custom_cache_from_dirty_probe() {
         report["stored_snapshot"]["dirty"],
         Value::Bool(false),
         "custom cache must not stamp dirty=true on the refreshed snapshot: {report}"
+    );
+}
+
+/// X3a: a `.egregore`-prefixed *file* (not a directory) must not be auto-excluded
+/// from the scan dirty probe — only untracked *directories* are store outputs.
+/// Modifying a tracked `.egregore`-prefixed source file must produce `dirty=true`.
+#[test]
+fn scan_does_not_exclude_tracked_egregore_prefixed_file() {
+    let fx = Fixture::committed();
+    // Add a tracked source file whose name starts with `.egregore`.
+    std::fs::write(fx.repo().join(".egregore_plugin.rs"), "// plugin\n").unwrap();
+    commit_all(fx.repo(), "add egregore plugin file");
+
+    // Modify the tracked file (uncommitted) — the tree is dirty.
+    std::fs::write(fx.repo().join(".egregore_plugin.rs"), "// modified\n").unwrap();
+
+    // Scan: the file is tracked, so it must NOT be excluded from the dirty probe.
+    let out_graph = fx.work.path().join("graph.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&out_graph)
+        .assert()
+        .success();
+
+    let jsonl = std::fs::read_to_string(&out_graph).unwrap();
+    let repo_node = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["record_type"] == "node" && v["kind"] == "Repository")
+        .expect("Repository node");
+    assert_eq!(
+        repo_node["source_snapshot"]["dirty"],
+        Value::Bool(true),
+        "tracked .egregore-prefixed file must not be excluded: {repo_node}"
+    );
+}
+
+/// X3b: a `.egregore`-prefixed directory that contains tracked content must not
+/// be auto-excluded from the scan dirty probe — only directories with no tracked
+/// content are store outputs.
+#[test]
+fn scan_does_not_exclude_egregore_directory_with_tracked_content() {
+    let fx = Fixture::committed();
+    // Add a tracked file inside an `.egregore_src/` directory.
+    let tracked_dir = fx.repo().join(".egregore_src");
+    std::fs::create_dir_all(&tracked_dir).unwrap();
+    std::fs::write(tracked_dir.join("mod.rs"), "// module\n").unwrap();
+    commit_all(fx.repo(), "add egregore_src directory");
+
+    // Modify the tracked file (uncommitted).
+    std::fs::write(tracked_dir.join("mod.rs"), "// modified\n").unwrap();
+
+    let out_graph = fx.work.path().join("graph.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&out_graph)
+        .assert()
+        .success();
+
+    let jsonl = std::fs::read_to_string(&out_graph).unwrap();
+    let repo_node = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["record_type"] == "node" && v["kind"] == "Repository")
+        .expect("Repository node");
+    assert_eq!(
+        repo_node["source_snapshot"]["dirty"],
+        Value::Bool(true),
+        "tracked .egregore-prefixed directory must not be excluded: {repo_node}"
     );
 }
