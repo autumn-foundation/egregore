@@ -470,7 +470,7 @@ fn seed() -> Fixture {
     ));
 
     let obs_untemporal = agent_memory_stable_id(&["obs", "untemporal"]);
-    graph.push(observation(
+    let mut untemporal_node = observation(
         &obs_untemporal,
         "stable_fn is fine, no anchor recorded",
         "0.5",
@@ -480,7 +480,13 @@ fn seed() -> Fixture {
         "OBSERVES",
         None,
         None,
-    ));
+    );
+    // Genuinely untemporal: no commit, no valid-time, and no recording time
+    // (`observed_at`) either, so no anchor can be inferred.
+    if let GraphRecord::Node { observed_at, .. } = &mut untemporal_node {
+        *observed_at = None;
+    }
+    graph.push(untemporal_node);
 
     // Neighbor guard: cite stable_fn (unchanged) in a file where sibling_fn drifted.
     let obs_neighbor = agent_memory_stable_id(&["obs", "neighbor"]);
@@ -806,4 +812,395 @@ fn file_level_citation_drifts_on_content_change() {
     assert_eq!(entry["verdict"], "drifted");
     assert_eq!(entry["triggering_handle"]["kind"], "content_change");
     assert_eq!(entry["cited_handle"]["repo_relative_path"], file_path);
+}
+
+fn find_verdict<'a>(v: &'a serde_json::Value, obs_id: &str) -> Option<&'a serde_json::Value> {
+    v["verdicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["observation_id"] == obs_id)
+}
+
+// ── Retracted notes are not classified ───────────────────────────────────────
+
+#[test]
+fn tombstoned_observation_yields_no_verdict() {
+    // A drifted observation that is later retracted (tombstoned) must not appear
+    // in freshness output — it is no longer part of current memory.
+    let mut graph = Graph::new();
+    let path = "src/r.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    graph.push(symbol_version(
+        &sym,
+        path,
+        "f",
+        span(1, 5),
+        "v1",
+        "commit_a",
+        "2026-01-01T00:00:00Z",
+    ));
+    graph.push(symbol_version(
+        &sym,
+        path,
+        "f",
+        span(1, 5),
+        "v2",
+        "commit_b",
+        "2026-01-02T00:00:00Z",
+    ));
+    let obs = agent_memory_stable_id(&["obs", "retracted"]);
+    graph.push(observation(
+        &obs,
+        "f does the thing",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    ));
+    // Retract the observation.
+    graph.push(GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &obs]),
+        schema_version: aletheia_egregore::SCHEMA_VERSION,
+        deleted_id: obs.clone(),
+        summary: "observation retracted".to_owned(),
+        producer: None,
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("g.jsonl");
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run(&graph_path, &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(
+        find_verdict(&v, &obs).is_none(),
+        "tombstoned observation must not be classified"
+    );
+}
+
+// ── Non-handle codegraph links (Commit/Change) are not code handles ──────────
+
+#[test]
+fn non_handle_codegraph_link_is_not_flagged() {
+    // An observation that EXPLAINS_CHANGE a codegraph `Commit` cites a valid link,
+    // not a stale code handle, so it must not surface as `unresolved`.
+    let mut graph = Graph::new();
+    let commit_id = stable_id(&["node", "Commit", "repo-a", "commit_a"]);
+    graph.push(GraphRecord::node(
+        commit_id.clone(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("commit_a".to_owned()),
+        "Commit commit_a".to_owned(),
+    ));
+    let obs = agent_memory_stable_id(&["obs", "explains_change"]);
+    graph.push(observation(
+        &obs,
+        "this commit introduced the bug",
+        "0.9",
+        Some(&commit_id),
+        None,
+        None,
+        "EXPLAINS_CHANGE",
+        Some("commit_a"),
+        None,
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("g.jsonl");
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run(&graph_path, &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(
+        find_verdict(&v, &obs).is_none(),
+        "a codegraph Commit link is not a code handle and must not be classified"
+    );
+}
+
+// ── Drift recovered from the DRIFTS_PRIOR edge when metadata prior is stale ───
+
+#[test]
+fn drift_edge_triggers_when_metadata_prior_is_stale() {
+    // Body is identical across commits, so only a drift record can flag this
+    // handle. The drift metadata's prior_record_id is stale, but its DRIFTS_PRIOR
+    // edge points at the cited symbol — freshness must still report `drifted`.
+    let mut graph = Graph::new();
+    let path = "src/e.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    for (commit, vt) in [
+        ("commit_a", "2026-01-01T00:00:00Z"),
+        ("commit_b", "2026-01-02T00:00:00Z"),
+    ] {
+        graph.push(symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "identical_body",
+            commit,
+            vt,
+        ));
+    }
+
+    // Drift node whose metadata prior is a stale/unrelated ID.
+    let drift_id = semantic_stable_id(&["drift", "edge_only"]);
+    let drift = SemanticDriftMetadata {
+        embedding_model: EmbeddingModel {
+            provider: "p".to_owned(),
+            name: "m".to_owned(),
+            version: "v".to_owned(),
+            dim: 8,
+            content_hash: "h".to_owned(),
+        },
+        target_record_id: sym.clone(),
+        prior_record_id: "stale:does-not-resolve".to_owned(),
+        before_git_commit: "commit_a".to_owned(),
+        after_git_commit: "commit_b".to_owned(),
+        before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        after_valid_time: "2026-01-02T00:00:00Z".to_owned(),
+        metric_kind: MetricKind::CosineDistance,
+        score: 0.7,
+        selection_threshold: 0.2,
+        selection_basis: SelectionBasis::ThresholdOnly,
+    };
+    graph.push(
+        GraphRecord::node(
+            drift_id.clone(),
+            NodeKind::SemanticDrift,
+            None,
+            None,
+            None,
+            "Drift".to_owned(),
+        )
+        .with_domain("semantic", SEMANTIC_SCHEMA_VERSION)
+        .with_semantic_drift(drift),
+    );
+    // The stable recovery path: a DRIFTS_PRIOR edge to the cited symbol.
+    graph.push(GraphRecord::edge(
+        EdgeLabel::DriftsPrior,
+        drift_id,
+        sym.clone(),
+        None,
+        "drifts prior".to_owned(),
+    ));
+
+    let obs = agent_memory_stable_id(&["obs", "edge_drift"]);
+    graph.push(observation(
+        &obs,
+        "f behaves a certain way",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("g.jsonl");
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run(&graph_path, &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let entry = verdict_for(&v, &obs);
+    assert_eq!(entry["verdict"], "drifted");
+    assert_eq!(entry["triggering_handle"]["kind"], "drift_record");
+}
+
+// ── observed_at is a usable anchor when no commit / valid-time is present ─────
+
+#[test]
+fn observed_at_anchors_drift_when_no_valid_time() {
+    // The observation carries only a recording time (observed_at), no commit and
+    // no valid_time. Code drifts after that recording time → `drifted`, not the
+    // `untemporal` that a valid-time-only anchor would yield.
+    let mut graph = Graph::new();
+    let path = "src/o.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    // observation() stamps observed_at = 2026-02-01. v1 precedes it; v2 follows.
+    graph.push(symbol_version(
+        &sym,
+        path,
+        "f",
+        span(1, 5),
+        "body_v1",
+        "commit_a",
+        "2026-01-01T00:00:00Z",
+    ));
+    graph.push(symbol_version(
+        &sym,
+        path,
+        "f",
+        span(1, 5),
+        "body_v2",
+        "commit_c",
+        "2026-03-01T00:00:00Z",
+    ));
+    let obs = agent_memory_stable_id(&["obs", "observed_at"]);
+    graph.push(observation(
+        &obs,
+        "f returns body_v1",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        None, // no commit anchor
+        None, // no valid_time
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("g.jsonl");
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run(&graph_path, &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let entry = verdict_for(&v, &obs);
+    assert_eq!(entry["verdict"], "drifted");
+    assert_eq!(
+        entry["cited_handle"]["anchor_valid_time"], "2026-02-01T00:00:00Z",
+        "the recording time should be used as the anchor"
+    );
+}
+
+// ── Commit-anchored drift across a committer-timestamp tie still drifts ───────
+
+#[test]
+fn commit_tie_drift_is_detected() {
+    // Two commits share the same committer timestamp. A drift whose before-commit
+    // is exactly the anchor commit must register even though the later valid-time
+    // is not strictly greater.
+    let mut graph = Graph::new();
+    let path = "src/t.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let tie = "2026-01-01T00:00:00Z";
+    // Identical body so only the drift record (not a content change) can flag it.
+    graph.push(symbol_version(
+        &sym,
+        path,
+        "f",
+        span(1, 5),
+        "same",
+        "commit_a",
+        tie,
+    ));
+    graph.push(symbol_version(
+        &sym,
+        path,
+        "f",
+        span(1, 5),
+        "same",
+        "commit_b",
+        tie,
+    ));
+    for r in drift_record(
+        &semantic_stable_id(&["drift", "tie"]),
+        &sym,
+        &sym,
+        "commit_a",
+        "commit_b",
+        tie,
+        tie,
+    ) {
+        graph.push(r);
+    }
+    let obs = agent_memory_stable_id(&["obs", "tie"]);
+    graph.push(observation(
+        &obs,
+        "f at commit_a",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("g.jsonl");
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run(&graph_path, &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(verdict_for(&v, &obs)["verdict"], "drifted");
+}
+
+// ── Triple resolved at the anchor commit, not the live path/span occupant ─────
+
+#[test]
+fn triple_resolves_at_commit_not_reused_path_span() {
+    // A note cites a symbol by triple at commit_a. That symbol is later removed
+    // and a DIFFERENT live symbol reuses the same path/span. Honoring the anchor
+    // commit binds the citation to the original identity → `unresolved`, not a
+    // silent re-point at the new occupant.
+    let mut graph = Graph::new();
+    let path = "src/x.rs";
+    let old_sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "old", "0"]);
+    let new_sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "new", "0"]);
+
+    // OLD existed at commit_a, then was tombstoned.
+    graph.push(symbol_version(
+        &old_sym,
+        path,
+        "old",
+        span(10, 20),
+        "old_body",
+        "commit_a",
+        "2026-01-01T00:00:00Z",
+    ));
+    graph.push(GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &old_sym]),
+        schema_version: aletheia_egregore::SCHEMA_VERSION,
+        deleted_id: old_sym.clone(),
+        summary: "old removed".to_owned(),
+        producer: None,
+    });
+    // NEW reused the same path/span at commit_b and is live.
+    graph.push(symbol_version(
+        &new_sym,
+        path,
+        "new",
+        span(10, 20),
+        "new_body",
+        "commit_b",
+        "2026-01-02T00:00:00Z",
+    ));
+
+    // Cite by triple (no record ID) anchored at commit_a.
+    let obs = agent_memory_stable_id(&["obs", "triple_commit"]);
+    graph.push(observation(
+        &obs,
+        "the symbol here did X",
+        "0.9",
+        None,
+        Some(path),
+        Some(span(10, 20)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("g.jsonl");
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run(&graph_path, &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let entry = verdict_for(&v, &obs);
+    assert_eq!(entry["verdict"], "unresolved");
+    assert_eq!(entry["triggering_handle"]["kind"], "handle_removed");
 }

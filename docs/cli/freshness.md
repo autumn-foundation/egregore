@@ -58,10 +58,15 @@ is stale, the result is reported with the stable diagnostic
 | `current` | The cited code is unchanged since the observation's anchor. |
 | `drifted` | The cited symbol/file changed after the observation's anchor. |
 | `unresolved` | The cited handle no longer resolves (symbol removed/renamed or file deleted). |
-| `untemporal` | The observation carries no valid-time/commit anchor to compare against. |
+| `untemporal` | The observation carries no commit, valid-time, or recording time to anchor a comparison. |
 
 Verdicts are mutually exclusive and decided in this precedence: `unresolved`
 (anchor-independent) → `untemporal` (no anchor) → `drifted` → `current`.
+
+A retracted (tombstoned) observation is omitted entirely — a deleted note is no
+longer current memory, matching the current-state reads of the other query
+paths. Evidence links to non-handle codegraph records (a `Commit`/`Change` cited
+by `EXPLAINS_CHANGE`) are valid links, not code handles, and are not classified.
 
 ### The anchor
 
@@ -69,9 +74,18 @@ The comparison anchor is, in order:
 
 1. the evidence link's `as_of_commit`,
 2. the evidence link's `target_git_commit`,
-3. the observation's `valid_time`.
+3. the observation's `valid_time`,
+4. the observation's recording time (`observed_at` / `ingested_at`).
 
-If none is present the verdict is `untemporal`.
+If none is present the verdict is `untemporal`. Most notes carry a recording
+time even when they omit a commit and a valid-time, so "drifted since recording"
+remains answerable rather than collapsing to `untemporal`.
+
+A triple citation `(path, span, target_git_commit)` is resolved **at its anchor
+commit**, scanning historical and tombstoned versions. If the cited symbol was
+later removed or renamed and a different live symbol reused the same path/span,
+the verdict is `unresolved` for the original identity rather than a silent
+re-point at the new occupant.
 
 ### Trigger sources (reused, never re-derived)
 
@@ -79,8 +93,10 @@ Drift is read from signals the graph already stores, anchored to the **cited
 handle** — a sibling symbol changing under the same file never flags a neighbor:
 
 - **`drift_record`** — a semantic-drift record (issue #55) whose
-  `prior_record_id` equals the cited record ID and whose later measurement
-  post-dates the anchor. Triggering handle: the drift record ID + later commit.
+  `prior_record_id` (or `DRIFTS_PRIOR` edge target) equals the cited record ID
+  and whose later measurement post-dates the anchor — or whose `before` commit is
+  exactly the anchor commit. Triggering handle: the drift record ID + later
+  commit.
 - **`content_change`** — a later code-graph version of the *same* cited record ID
   (same handle, distinct `temporal.git_commit`) whose content hash differs from
   the anchor version. Triggering handle: the later commit + content hash.

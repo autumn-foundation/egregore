@@ -21,8 +21,8 @@
 //! - `drifted` — the cited symbol/file changed after the observation's anchor.
 //! - `unresolved` — the cited handle no longer resolves (symbol removed/renamed
 //!   or file deleted).
-//! - `untemporal` — the observation carries no valid-time/commit anchor to
-//!   compare against.
+//! - `untemporal` — the observation carries no commit, valid-time, or recording
+//!   time to anchor a comparison.
 //!
 //! # Triggers (reused, never re-derived — AC11)
 //!
@@ -201,6 +201,13 @@ struct FreshnessIndex<'a> {
     tombstone_by_deleted: BTreeMap<&'a str, &'a str>,
     /// Drift metadata keyed by the prior (anchor-side) record ID.
     drifts_by_prior: BTreeMap<&'a str, Vec<(&'a str, &'a SemanticDriftMetadata)>>,
+    /// Node kind keyed by record ID, for any domain. Lets the scan tell a code
+    /// handle (`File`/`Symbol`/…) apart from a non-handle codegraph record such
+    /// as a `Commit`/`Change` cited by `EXPLAINS_CHANGE`.
+    kind_by_id: BTreeMap<&'a str, NodeKind>,
+    /// Every code-handle node version, including historical and tombstoned ones,
+    /// used to resolve a triple citation at the commit it was anchored to.
+    all_code_handles: Vec<&'a GraphRecord>,
 }
 
 impl<'a> FreshnessIndex<'a> {
@@ -209,6 +216,12 @@ impl<'a> FreshnessIndex<'a> {
         let mut tombstone_by_deleted: BTreeMap<&str, &str> = BTreeMap::new();
         let mut drifts_by_prior: BTreeMap<&str, Vec<(&str, &SemanticDriftMetadata)>> =
             BTreeMap::new();
+        let mut kind_by_id: BTreeMap<&str, NodeKind> = BTreeMap::new();
+        let mut all_code_handles: Vec<&GraphRecord> = Vec::new();
+        // Drift metadata keyed by the drift record's own ID, so a `DRIFTS_PRIOR`
+        // edge can recover the metadata when the metadata's `prior_record_id` is
+        // stale or filtered out of the slice.
+        let mut drift_meta_by_id: BTreeMap<&str, &SemanticDriftMetadata> = BTreeMap::new();
 
         // First pass: tombstones so liveness is decided independent of record order.
         for record in records {
@@ -218,24 +231,42 @@ impl<'a> FreshnessIndex<'a> {
         }
 
         for record in records {
-            match record {
-                GraphRecord::Node { id, kind, .. } if is_code_handle_kind(*kind) => {
+            if let GraphRecord::Node { id, kind, .. } = record {
+                kind_by_id.insert(id.as_str(), *kind);
+                if is_code_handle_kind(*kind) {
+                    all_code_handles.push(record);
                     if !tombstone_by_deleted.contains_key(id.as_str()) {
                         live_code_by_id.entry(id).or_default().push(record);
                     }
-                }
-                GraphRecord::Node {
-                    id,
-                    kind: NodeKind::SemanticDrift,
-                    semantic_drift: Some(drift),
-                    ..
-                } => {
+                } else if let (NodeKind::SemanticDrift, Some(drift)) =
+                    (*kind, record_semantic_drift(record))
+                {
+                    drift_meta_by_id.insert(id.as_str(), drift);
                     drifts_by_prior
                         .entry(drift.prior_record_id.as_str())
                         .or_default()
                         .push((id.as_str(), drift));
                 }
-                _ => {}
+            }
+        }
+
+        // Second pass: index drift triggers from `DRIFTS_PRIOR` edges too. The
+        // edge target is the prior (cited-side) symbol, the same neighbor-safe key
+        // as `prior_record_id`, so this only adds drifts a stale metadata ID would
+        // have missed — never a sibling's drift.
+        for record in records {
+            if let GraphRecord::Edge {
+                label: crate::ir::EdgeLabel::DriftsPrior,
+                source,
+                target,
+                ..
+            } = record
+                && let Some(drift) = drift_meta_by_id.get(source.as_str())
+            {
+                let entry = drifts_by_prior.entry(target.as_str()).or_default();
+                if !entry.iter().any(|(id, _)| *id == source.as_str()) {
+                    entry.push((source.as_str(), drift));
+                }
             }
         }
 
@@ -243,7 +274,18 @@ impl<'a> FreshnessIndex<'a> {
             live_code_by_id,
             tombstone_by_deleted,
             drifts_by_prior,
+            kind_by_id,
+            all_code_handles,
         }
+    }
+
+    /// True when `record_id` resolves to a codegraph record that is *not* a code
+    /// handle (e.g. a `Commit`/`Change`), so a valid `EXPLAINS_CHANGE`-style link
+    /// is skipped instead of being mis-reported as an `unresolved` handle.
+    fn is_non_handle_target(&self, record_id: &str) -> bool {
+        self.kind_by_id
+            .get(record_id)
+            .is_some_and(|kind| !is_code_handle_kind(*kind))
     }
 
     /// Resolves a triple `(path, span)` to a live code node ID, preferring a
@@ -275,6 +317,59 @@ impl<'a> FreshnessIndex<'a> {
             }
         }
         file_match
+    }
+
+    /// Resolves a triple `(path, span)` to the code node that occupied it **at the
+    /// anchor commit**, scanning historical and tombstoned versions too. Honoring
+    /// the commit keeps a citation bound to the identity it named: if that symbol
+    /// was later removed or renamed and a different live symbol reused the same
+    /// path/span, this returns the original (now-tombstoned) ID, so the verdict is
+    /// `unresolved` rather than silently re-pointing at the new occupant.
+    fn resolve_triple_at_commit(
+        &self,
+        path: &str,
+        span: Option<&SourceSpan>,
+        commit: &str,
+    ) -> Option<&'a str> {
+        let mut file_match: Option<&str> = None;
+        for record in &self.all_code_handles {
+            let GraphRecord::Node {
+                id,
+                kind,
+                repo_relative_path: Some(rp),
+                span: node_span,
+                temporal,
+                ..
+            } = record
+            else {
+                continue;
+            };
+            if rp != path {
+                continue;
+            }
+            if temporal.as_ref().map(|t| t.git_commit.as_str()) != Some(commit) {
+                continue;
+            }
+            match kind {
+                NodeKind::Symbol if span.is_some() && node_span.as_ref() == span => {
+                    return Some(id.as_str());
+                }
+                NodeKind::File => file_match = Some(id.as_str()),
+                _ => {}
+            }
+        }
+        file_match
+    }
+}
+
+/// Borrows the semantic-drift metadata from a node record, if present.
+const fn record_semantic_drift(record: &GraphRecord) -> Option<&SemanticDriftMetadata> {
+    match record {
+        GraphRecord::Node {
+            semantic_drift: Some(drift),
+            ..
+        } => Some(drift),
+        _ => None,
     }
 }
 
@@ -323,6 +418,12 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
         if !is_observation_kind(*kind) {
             continue;
         }
+        // A retracted note is no longer part of current memory: a tombstoned
+        // observation yields no verdicts, matching the current-state reads used by
+        // the memory query paths.
+        if index.tombstone_by_deleted.contains_key(id.as_str()) {
+            continue;
+        }
 
         let provenance = VerdictProvenance {
             agent_id: agent_id.clone(),
@@ -331,11 +432,29 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
             confidence: confidence.clone(),
             redaction_policy_version: redaction_policy_version.clone(),
         };
-        let obs_valid_time = valid_time.as_deref().filter(|s| !s.is_empty());
+        // Anchor order: an explicit `valid_time` (when the fact was true) first,
+        // then the recording time `observed_at`/`ingested_at` — most notes carry a
+        // recording time but no valid-time, and "drifted since recording" is the
+        // whole point, so a recording time is a usable anchor before `untemporal`.
+        let obs_valid_time = valid_time
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| observed_at.as_deref().filter(|s| !s.is_empty()));
 
         for link in links {
             // Only links to the deterministic code graph carry a code handle.
             if link.target_domain != "codegraph" {
+                continue;
+            }
+            // A codegraph link can point at a non-handle record (a `Commit`/
+            // `Change` cited by `EXPLAINS_CHANGE`); those are valid links, not
+            // stale code handles, so they are not classified.
+            if link
+                .target_record_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .is_some_and(|rid| index.is_non_handle_target(rid))
+            {
                 continue;
             }
             entries.push(classify_link(
@@ -407,14 +526,21 @@ fn classify_link(
         .or_else(|| link.target_git_commit.as_deref().filter(|s| !s.is_empty()));
 
     // Resolve the cited handle to a code node ID (record ID first, triple next).
+    // A triple anchored to a commit is resolved at that commit so the citation
+    // stays bound to the identity it named, even if the path/span was later reused
+    // by a different symbol; fall back to live resolution only when the anchored
+    // version is absent from this slice.
     let cited_id: Option<&str> = link
         .target_record_id
         .as_deref()
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            link.target_repo_relative_path
-                .as_deref()
-                .and_then(|p| index.resolve_triple(p, link.target_span.as_ref()))
+            link.target_repo_relative_path.as_deref().and_then(|p| {
+                let span = link.target_span.as_ref();
+                anchor_commit
+                    .and_then(|commit| index.resolve_triple_at_commit(p, span, commit))
+                    .or_else(|| index.resolve_triple(p, span))
+            })
         });
 
     let live_versions = cited_id.and_then(|id| index.live_code_by_id.get(id));
@@ -557,11 +683,17 @@ fn after_anchor(
     anchor_commit: Option<&str>,
     anchor_valid_time: Option<&str>,
 ) -> bool {
+    // A drift whose "before" state is exactly the anchor commit measured change
+    // from the cited version forward — a drift regardless of timestamps. Checked
+    // first so consecutive commits sharing a committer timestamp (no strictly
+    // greater valid-time) are not missed.
+    if anchor_commit.is_some_and(|c| before_git_commit == c) {
+        return true;
+    }
     if let Some(anchor_vt) = anchor_valid_time {
         return time_after(after_valid_time, anchor_vt);
     }
-    // No valid-time anchor: the drift must begin at the anchor commit.
-    anchor_commit.is_some_and(|c| before_git_commit == c)
+    false
 }
 
 /// Finds the earliest later code-graph version whose content hash differs from
