@@ -1347,8 +1347,9 @@ fn historical_only_handle_without_tombstone_is_unresolved() {
         "commit_a",
         "2026-01-01T00:00:00Z",
     ));
-    // keeper advances the frontier to commit_b.
-    graph.push(symbol_version(
+    // keeper is HEAD (child of commit_a) → commit_a is interior, not a tip, so
+    // the ghost present only at commit_a is treated as removed.
+    let mut keeper_rec = symbol_version(
         &keeper,
         path,
         "keeper",
@@ -1356,7 +1357,14 @@ fn historical_only_handle_without_tombstone_is_unresolved() {
         "keeper_body",
         "commit_b",
         "2026-01-02T00:00:00Z",
-    ));
+    );
+    if let GraphRecord::Node {
+        temporal: Some(t), ..
+    } = &mut keeper_rec
+    {
+        t.git_parent_commits = vec!["commit_a".to_owned()];
+    }
+    graph.push(keeper_rec);
     let obs = agent_memory_stable_id(&["obs", "ghost"]);
     graph.push(observation(
         &obs,
@@ -1380,6 +1388,71 @@ fn historical_only_handle_without_tombstone_is_unresolved() {
     let entry = verdict_for(&v, &obs);
     assert_eq!(entry["verdict"], "unresolved");
     assert_eq!(entry["triggering_handle"]["kind"], "handle_absent");
+}
+
+// ── HEAD code is live even when an ancestor commit is future-dated ───────────
+
+#[test]
+fn head_handle_live_despite_future_dated_ancestor() {
+    // Clock skew / rebase: an ancestor commit carries a LATER committer timestamp
+    // than HEAD. A max-timestamp frontier would treat the ancestor as the frontier
+    // and wrongly drop the HEAD symbol; the tip-commit frontier keeps HEAD live.
+    let mut graph = Graph::new();
+    let path = "src/skew.rs";
+    let head_sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "head", "0"]);
+    // head is HEAD (child of commit_old) but committed earlier than its ancestor.
+    let mut head_rec = symbol_version(
+        &head_sym,
+        path,
+        "head",
+        span(10, 20),
+        "head_body",
+        "commit_head",
+        "2026-01-01T00:00:00Z",
+    );
+    if let GraphRecord::Node {
+        temporal: Some(t), ..
+    } = &mut head_rec
+    {
+        t.git_parent_commits = vec!["commit_old".to_owned()];
+    }
+    graph.push(head_rec);
+    // An ancestor symbol on the future-dated commit_old (no longer at HEAD).
+    graph.push(symbol_version(
+        &stable_id(&["node", "symbol", "fn", "repo-a", path, "old", "0"]),
+        path,
+        "old",
+        span(30, 40),
+        "old_body",
+        "commit_old",
+        "2026-03-01T00:00:00Z",
+    ));
+
+    let obs = agent_memory_stable_id(&["obs", "head"]);
+    graph.push(observation(
+        &obs,
+        "head does the thing",
+        "0.9",
+        Some(&head_sym),
+        Some(path),
+        Some(span(10, 20)),
+        "OBSERVES",
+        Some("commit_head"),
+        None,
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("g.jsonl");
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run(&graph_path, &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        verdict_for(&v, &obs)["verdict"],
+        "current",
+        "HEAD code must stay live even when an ancestor commit is future-dated"
+    );
 }
 
 // ── A triple cites a Module handle, not the whole file ───────────────────────

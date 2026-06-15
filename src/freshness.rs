@@ -259,28 +259,37 @@ impl<'a> FreshnessIndex<'a> {
         // Frontier liveness: `scan-history` emits a full snapshot at every commit
         // but no `Tombstone` when a symbol is removed or renamed, so a handle that
         // exists only at older commits would otherwise look live and a citation to
-        // it could be reported `current`/`drifted` instead of `unresolved`. Treat a
-        // temporal handle as live only when it is present at the frontier (the
-        // latest valid-time in the graph); a non-temporal (current-tree `scan`)
-        // handle has no frontier and stays live.
-        let mut frontier: Option<&str> = None;
+        // it could be reported `current`/`drifted` instead of `unresolved`.
+        //
+        // The frontier is the set of **tip commits** — commits that are no other
+        // commit's parent (HEAD and any branch tips). A temporal handle is live
+        // only when it has a version at a tip; a handle present solely at interior
+        // (superseded) commits has been removed. Using tips rather than the latest
+        // committer timestamp is robust to clock skew, rebases, and merged side
+        // branches: HEAD is always a tip, so code at HEAD is never falsely
+        // `unresolved`. A non-temporal (current-tree `scan`) version has no commit
+        // and keeps its handle live.
+        let mut all_commits: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut parent_commits: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
         for versions in live_code_by_id.values() {
             for record in versions {
-                if let Some(vt) = version_valid(record)
-                    && frontier.is_none_or(|f| time_after(vt, f))
-                {
-                    frontier = Some(vt);
+                if let Some(commit) = version_commit(record) {
+                    all_commits.insert(commit);
+                }
+                for parent in version_parents(record) {
+                    parent_commits.insert(parent.as_str());
                 }
             }
         }
-        if let Some(frontier_vt) = frontier {
+        let tips: std::collections::BTreeSet<&str> =
+            all_commits.difference(&parent_commits).copied().collect();
+        if !tips.is_empty() {
             live_code_by_id.retain(|_id, versions| {
-                // A handle with any non-temporal version is a current-tree fact.
-                versions.iter().any(|r| version_valid(r).is_none())
-                    // Otherwise it must be present at the frontier to count as live.
-                    || versions
-                        .iter()
-                        .any(|r| version_valid(r).is_some_and(|vt| !time_after(frontier_vt, vt)))
+                versions.iter().any(|r| {
+                    // A non-temporal (current-tree) version keeps the handle live.
+                    version_commit(r).is_none_or(|c| tips.contains(c))
+                })
             });
         }
 
@@ -820,11 +829,19 @@ const fn version_commit(record: &GraphRecord) -> Option<&str> {
     }
 }
 
+/// Valid-time of a code-graph node version. Prefers the history-replay
+/// `temporal.valid_time`; falls back to the node-level `valid_time` stamped on
+/// current-tree `scan`/`refresh` records so repeated current-tree snapshots are
+/// still ordered and comparable.
 const fn version_valid(record: &GraphRecord) -> Option<&str> {
     match record {
         GraphRecord::Node {
             temporal: Some(t), ..
         } => Some(t.valid_time.as_str()),
+        GraphRecord::Node {
+            valid_time: Some(vt),
+            ..
+        } if !vt.is_empty() => Some(vt.as_str()),
         _ => None,
     }
 }

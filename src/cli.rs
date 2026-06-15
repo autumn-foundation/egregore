@@ -2996,7 +2996,12 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             data_dir,
             stale_only,
         } => {
-            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            // Freshness compares an observation's anchored code version against
+            // later ones, so it needs superseded (pre-change) versions. The
+            // default `--data-dir` read collapses repeated non-temporal scans to
+            // the latest physical node per ID, which would hide the very change
+            // a verdict is about; use the history-inclusive read instead.
+            let records = load_query_records_history(graph.as_deref(), data_dir.as_deref())?;
             query_freshness_cmd(&records, stale_only)
         }
     }

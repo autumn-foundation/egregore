@@ -90,12 +90,20 @@ identity rather than a silent re-point at the new occupant.
 
 ### Liveness in a history graph
 
-A handle is resolved against the **frontier** — the latest snapshot in the graph.
+A handle is resolved against the **frontier** — the set of **tip commits**
+(commits that are no other commit's parent: HEAD and any branch tips).
 `scan-history` re-emits a full snapshot at every commit but writes no `Tombstone`
-when a symbol is removed or renamed, so a handle present only at older commits is
-treated as **gone**, not live: a citation to it is `unresolved`, never a false
-`current`. A current-tree `scan` (no temporal versions) has no frontier and every
-present handle stays live.
+when a symbol is removed or renamed, so a handle present only at interior
+(superseded) commits is treated as **gone**, not live: a citation to it is
+`unresolved`, never a false `current`. Using tips rather than the latest
+committer timestamp is robust to clock skew, rebases, and merged side branches —
+HEAD is always a tip, so code at HEAD is never falsely `unresolved`. A
+current-tree `scan` (no commits) has no tips and every present handle stays live.
+
+A `--data-dir` query reads the **superseded-inclusive** store view (the same
+history surface as `eg query drift`), so the pre-change code version an
+observation was anchored against is available for comparison even after later
+scans.
 
 ### Trigger sources (reused, never re-derived)
 
@@ -200,3 +208,19 @@ trust class, hosted service, LLM-generated answer, or memory-mutation workflow.
 Detecting and labelling is the whole job — auto-invalidating, deleting,
 rewriting, superseding, or re-pointing stale memory is explicitly out of scope
 (supersession authoring stays with #50/#64).
+
+### Known limitations
+
+- **Citation form.** Only inline `evidence_links` are scanned. Observations that
+  cite code solely through standalone graph edges (`MENTIONS_SYMBOL`,
+  `TOUCHED_FILE`, …) are not yet covered; synthesizing freshness inputs from those
+  edges is a tracked follow-up.
+- **Module / import content.** `Module` and `Import` nodes summarize to a name,
+  not normalized source, so a content-hash change cannot be observed for them.
+  Citations to a module/import are still flagged when the handle is removed
+  (`unresolved`) or a semantic-drift record names it, but a change *inside* a
+  module that leaves its name intact is not detected by the content-hash trigger.
+- **Span relocation.** A symbol moved without any content change (e.g. lines
+  inserted above it) is **not** treated as drift: the observation about what the
+  code does is still accurate, and flagging pure relocations would manufacture
+  false positives. The cited span is reported as recorded.
