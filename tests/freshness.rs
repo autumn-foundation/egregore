@@ -560,3 +560,83 @@ fn refresh_restamps_snapshot_so_store_is_fresh() {
         "refresh must re-stamp the snapshot so the store reports fresh"
     );
 }
+
+/// The in-tree store artifact (`--graph` written under the repo) must not by
+/// itself make the working tree look `stale_dirty` (PR #186 #4).
+#[test]
+fn freshness_excludes_in_tree_graph_artifact() {
+    let fx = Fixture::committed();
+    // Scan the store *into* the working tree (the documented `eg scan . --out
+    // graph.jsonl` shape), where graph.jsonl is an untracked file.
+    let in_tree_graph = fx.repo().join("graph.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&in_tree_graph)
+        .assert()
+        .success();
+    // Sanity: the untracked artifact really is present in the tree.
+    assert!(in_tree_graph.exists());
+
+    let out = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--graph")
+        .arg(&in_tree_graph)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "the checked store artifact must be excluded from the dirty probe"
+    );
+
+    // A *source* edit is still detected as stale_dirty (exclusion is artifact-only).
+    write_lib(fx.repo(), "pub fn hello() {}\npub fn edited() {}\n");
+    let out = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--graph")
+        .arg(&in_tree_graph)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(report["freshness"], "stale_dirty");
+}
+
+/// The scanner must skip git-ignored Rust files so they never enter the graph
+/// (PR #186 #7), keeping the indexed set aligned with the read-only dirty probe.
+#[test]
+fn scanner_skips_gitignored_rust_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git_init(repo);
+    write_lib(repo, "pub fn tracked_fn() {}\n");
+    // A generated, git-ignored Rust file.
+    let gen_dir = repo.join("gen");
+    std::fs::create_dir_all(&gen_dir).unwrap();
+    std::fs::write(gen_dir.join("generated.rs"), "pub fn ignored_fn() {}\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/gen/\n").unwrap();
+    commit_all(repo, "initial");
+
+    let work = tempfile::tempdir().unwrap();
+    let graph = work.path().join("graph.jsonl");
+    eg().args(["scan"])
+        .arg(repo)
+        .arg("--out")
+        .arg(&graph)
+        .assert()
+        .success();
+
+    let jsonl = std::fs::read_to_string(&graph).unwrap();
+    assert!(
+        jsonl.contains("tracked_fn"),
+        "tracked source must be indexed"
+    );
+    assert!(
+        !jsonl.contains("ignored_fn"),
+        "git-ignored source must not be indexed: {jsonl}"
+    );
+}

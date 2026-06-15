@@ -41,7 +41,23 @@ receipt. It always exits `0` once a verdict is produced — the verdict (includi
 | `unknown`     | The store predates snapshot stamping, or no Git context exists on either side.           |
 
 A store whose stored HEAD differs from the working tree, or whose tree is dirty,
-is **never** reported `fresh`.
+is **never** reported `fresh`. A failed dirty probe (e.g. a locked index) is
+treated conservatively as dirty rather than silently reported `fresh`.
+
+### What counts as "dirty"
+
+The dirty probe (`git status`, run read-only with `GIT_OPTIONAL_LOCKS=0`) reports
+any uncommitted change in the working tree, with two refinements:
+
+- **The checked store artifact is excluded.** When the `--graph` file or
+  `--data-dir` directory lives under the working tree, it is excluded from the
+  probe, so the documented in-tree workflow (`eg scan . --out graph.jsonl`) is
+  not reported `stale_dirty` merely because the store it just wrote is itself an
+  untracked file.
+- **Git-ignored files are excluded — and so are they from the graph.** The
+  scanner skips git-ignored Rust files (they are never indexed, so they carry no
+  citable spans), which keeps the indexed set aligned with what `git status`
+  reports.
 
 ---
 

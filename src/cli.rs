@@ -1762,7 +1762,11 @@ fn freshness_cmd(
 ) -> Result<()> {
     let store_kind = if graph.is_some() { "graph" } else { "data_dir" };
     let identity = identity::compute_repository_identity(repo_path, repo_id_override);
-    let (current_head, current_dirty) = identity::working_tree_snapshot(repo_path);
+    // Exclude the store artifact being checked from the dirty probe so an in-tree
+    // `--graph`/`--data-dir` does not falsely report `stale_dirty` (PR #186 #4).
+    let exclusions = store_artifact_exclusions(repo_path, graph.or(data_dir));
+    let (current_head, current_dirty) =
+        identity::working_tree_snapshot_excluding(repo_path, &exclusions);
 
     // AC4: strictly read-only. A `--graph` JSONL is read directly (a plain file
     // read). A `--data-dir` embedded store is read through a throwaway copy,
@@ -1826,13 +1830,37 @@ fn freshness_cmd(
 fn query_freshness_code(
     records: &[GraphRecord],
     repo_path: Option<&Path>,
+    artifact: Option<&Path>,
 ) -> Option<(String, &'static str)> {
     let repo_path = repo_path?;
     let identity = identity::compute_repository_identity(repo_path, None);
-    let (head, dirty) = identity::working_tree_snapshot(repo_path);
+    let exclusions = store_artifact_exclusions(repo_path, artifact);
+    let (head, dirty) = identity::working_tree_snapshot_excluding(repo_path, &exclusions);
     let stored = freshness::stored_snapshot(records, &identity.id);
     let code = freshness::classify(stored, &head, dirty).code();
     Some((identity.id, code))
+}
+
+/// Computes repo-relative dirty-probe exclusions for the store artifact being
+/// read (issue #82 / PR #186).
+///
+/// When the `--graph` file or `--data-dir` directory lives under `repo_path`, it
+/// is returned as a repo-relative pathspec so the freshness dirty probe ignores
+/// it — an in-tree store the workflow just wrote must not by itself make the tree
+/// look `stale_dirty`. Returns empty when there is no artifact or it lives
+/// outside the working tree.
+fn store_artifact_exclusions(repo_path: &Path, artifact: Option<&Path>) -> Vec<String> {
+    let Some(artifact) = artifact else {
+        return Vec::new();
+    };
+    let repo_abs = fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let artifact_abs = fs::canonicalize(artifact).unwrap_or_else(|_| artifact.to_path_buf());
+    artifact_abs
+        .strip_prefix(&repo_abs)
+        .ok()
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .filter(|rel| !rel.is_empty())
+        .map_or_else(Vec::new, |rel| vec![rel])
 }
 
 /// Stamps the freshness `code` on each result whose repository matches the
@@ -3066,7 +3094,11 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             let selected = selected.as_deref();
-            let freshness_code = query_freshness_code(&records, repo_path.as_deref());
+            let freshness_code = query_freshness_code(
+                &records,
+                repo_path.as_deref(),
+                graph.as_deref().or(data_dir.as_deref()),
+            );
             as_of.map_or_else(
                 || {
                     at.map_or_else(
@@ -3108,7 +3140,11 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
-            let freshness_code = query_freshness_code(&records, repo_path.as_deref());
+            let freshness_code = query_freshness_code(
+                &records,
+                repo_path.as_deref(),
+                graph.as_deref().or(data_dir.as_deref()),
+            );
             query_file(
                 &records,
                 &path,
@@ -3163,8 +3199,12 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             // Context is keyed to the single working tree at `repo_path`; carry
             // just the verdict code as a top-level signal.
-            let freshness_code =
-                query_freshness_code(&records, repo_path.as_deref()).map(|(_, code)| code);
+            let freshness_code = query_freshness_code(
+                &records,
+                repo_path.as_deref(),
+                graph.as_deref().or(data_dir.as_deref()),
+            )
+            .map(|(_, code)| code);
             query_context_cmd(&records, &name, freshness_code)
         }
         QuerySubcommand::Task {

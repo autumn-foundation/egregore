@@ -344,6 +344,23 @@ fn git_root_commit_sha(repo_root: &Path) -> Option<String> {
 /// verified (e.g. a locked or unreadable index).
 #[must_use]
 pub fn working_tree_snapshot(repo_root: &Path) -> (SnapshotHead, bool) {
+    working_tree_snapshot_excluding(repo_root, &[])
+}
+
+/// Like [`working_tree_snapshot`], but excludes the given repo-relative paths
+/// from the dirty probe (issue #82 / PR #186).
+///
+/// A freshness check passes the store artifact it is reading (the `--graph` file
+/// or `--data-dir` directory) when that artifact lives under `repo_root`, so the
+/// documented in-tree workflow (`eg scan . --out graph.jsonl`) is not reported
+/// `stale_dirty` merely because the store it just wrote is itself an untracked
+/// change. Excluded paths are matched by Git pathspec, so a directory excludes
+/// everything beneath it.
+#[must_use]
+pub fn working_tree_snapshot_excluding(
+    repo_root: &Path,
+    exclude_rel: &[String],
+) -> (SnapshotHead, bool) {
     if !git_is_repo_root(repo_root) {
         return (SnapshotHead::NoGit, false);
     }
@@ -351,7 +368,7 @@ pub fn working_tree_snapshot(repo_root: &Path) -> (SnapshotHead, bool) {
     git_head_commit_sha(repo_root).map_or((SnapshotHead::UnbornHead, false), |sha| {
         // Conservative default: an unverifiable dirty state is treated as dirty,
         // never silently downgraded to clean (which could report a false `fresh`).
-        let dirty = git_tree_dirty(repo_root).unwrap_or(true);
+        let dirty = git_tree_dirty(repo_root, exclude_rel).unwrap_or(true);
         (SnapshotHead::Commit { sha }, dirty)
     })
 }
@@ -388,13 +405,21 @@ fn git_head_commit_sha(repo_root: &Path) -> Option<String> {
 ///
 /// Uses `git status --porcelain`, which reports staged, unstaged, and untracked
 /// changes; a non-empty output means the tree is dirty. Runs read-only
-/// (`GIT_OPTIONAL_LOCKS=0`, so Git never writes the index). Returns `None` when
+/// (`GIT_OPTIONAL_LOCKS=0`, so Git never writes the index). `exclude_rel` paths
+/// are dropped from consideration via `:(exclude)` pathspecs. Returns `None` when
 /// Git is unavailable or the status probe fails, which callers treat as dirty.
-fn git_tree_dirty(repo_root: &Path) -> Option<bool> {
-    let output = read_only_git(repo_root)
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()?;
+fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
+    let mut command = read_only_git(repo_root);
+    command.args(["status", "--porcelain"]);
+    if !exclude_rel.is_empty() {
+        // A positive `.` pathspec plus `:(exclude)<path>` magic drops the store
+        // artifact (and, for a directory, everything beneath it) from the probe.
+        command.args(["--", "."]);
+        for rel in exclude_rel {
+            command.arg(format!(":(exclude){rel}"));
+        }
+    }
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }

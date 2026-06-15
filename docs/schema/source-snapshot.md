@@ -36,7 +36,7 @@ ID; only their `source_snapshot` differs.
 | Field           | Meaning                                                                                           |
 | --------------- | ------------------------------------------------------------------------------------------------- |
 | `head`          | HEAD state at scan time (tagged union, see below).                                                |
-| `dirty`         | `true` when the tree had uncommitted/untracked changes at scan time; always `false` for non-commit heads. |
+| `dirty`         | `true` when the tree had uncommitted/untracked changes at scan time; always `false` for non-commit heads. Git-ignored files are excluded (the scanner does not index them); a failed probe is recorded conservatively as `true`. |
 | `repository_id` | The stable `Repository` ID this snapshot describes (the identity already used by the graph).      |
 | `scanned_at`    | RFC 3339 scan time. Flows through the transaction-time override, so it never breaks determinism.  |
 
