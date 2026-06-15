@@ -420,7 +420,11 @@ fn git_head_commit_sha(repo_root: &Path) -> Option<String> {
 /// Git is unavailable or the status probe fails, which callers treat as dirty.
 fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
     let mut command = read_only_git(repo_root);
-    command.args(["status", "--porcelain"]);
+    // `--untracked-files=all` overrides any `status.showUntrackedFiles=no` user
+    // config that would suppress `??` rows for untracked files. The scanner
+    // indexes untracked `.rs` files, so silently hiding them here would make a
+    // freshly added untracked source read as `fresh` (PR #186 follow-up).
+    command.args(["status", "--porcelain", "--untracked-files=all"]);
     if !exclude_rel.is_empty() {
         // A positive `.` pathspec plus `:(exclude)<path>` magic drops the store
         // artifact (and, for a directory, everything beneath it) from the probe.

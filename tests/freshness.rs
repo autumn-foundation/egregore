@@ -869,3 +869,179 @@ fn refresh_excludes_in_tree_data_dir_from_dirty_probe() {
         "data-dir must be excluded from the dirty probe during refresh: {report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Codex follow-up round 3 (commit 67dcda5)
+// ---------------------------------------------------------------------------
+
+/// Finding 5: `status.showUntrackedFiles=no` must not suppress the dirty probe.
+/// An untracked source file must still be detected (PR #186 follow-up).
+#[test]
+fn dirty_probe_detects_untracked_files_despite_config() {
+    let fx = Fixture::committed();
+    fx.scan();
+
+    // Simulate `status.showUntrackedFiles=no` in the repo config.
+    git(fx.repo(), ["config", "status.showUntrackedFiles", "no"]);
+
+    // Add an untracked .rs file — without --untracked-files=all this would be hidden.
+    std::fs::write(fx.repo().join("src").join("new.rs"), "pub fn new_fn() {}\n").unwrap();
+
+    let out = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--graph")
+        .arg(fx.graph())
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        report["freshness"], "stale_dirty",
+        "untracked files must be detected even when showUntrackedFiles=no: {report}"
+    );
+}
+
+/// Finding 4: `--as-of` branch must stamp freshness (PR #186 follow-up).
+/// `--as-of` works on valid-time in current-scan output (no scan-history needed).
+#[test]
+fn query_symbol_as_of_surfaces_freshness() {
+    let fx = Fixture::committed();
+    fx.scan();
+
+    // Use a far-future timestamp so the current record is always "most recent".
+    let out = eg()
+        .args([
+            "query",
+            "symbol",
+            "hello",
+            "--as-of",
+            "2099-01-01T00:00:00Z",
+        ])
+        .arg("--graph")
+        .arg(fx.graph())
+        .arg("--repo-path")
+        .arg(fx.repo())
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let line = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let row: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        row["freshness"], "fresh",
+        "`--as-of` branch must stamp freshness: {row}"
+    );
+}
+
+/// Finding 9: a full `eg scan` must not stamp `dirty=true` due to an untracked
+/// in-tree `.egregore` data-dir (PR #186 follow-up). The fix is at stamp time
+/// (the snapshot stored in the JSONL must have `dirty: false`). The freshness
+/// check-time gap for an untracked `.egregore` is covered by gitignore (F-class).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn scan_excludes_in_tree_egregore_data_dir() {
+    let fx = Fixture::committed();
+    // graph.jsonl is gitignored; .egregore is left untracked (not gitignored) to
+    // exercise the auto-detect exclusion in the scan's dirty probe.
+    let in_tree_graph = fx.repo().join("graph.jsonl");
+    let in_tree_data_dir = fx.repo().join(".egregore");
+    std::fs::write(fx.repo().join(".gitignore"), "*.jsonl\n").unwrap();
+    commit_all(fx.repo(), "add gitignore");
+
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&in_tree_graph)
+        .assert()
+        .success();
+    eg().args(["ingest"])
+        .arg(&in_tree_graph)
+        .args(["--adapter", "embedded"])
+        .arg("--data-dir")
+        .arg(&in_tree_data_dir)
+        .assert()
+        .success();
+
+    // Second scan: .egregore is untracked; must stamp dirty=false (not dirty=true).
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&in_tree_graph)
+        .assert()
+        .success();
+
+    // Verify the stamp directly from the JSONL (stamp-time fix, not check-time).
+    let jsonl = std::fs::read_to_string(&in_tree_graph).unwrap();
+    let repo_node = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["record_type"] == "node" && v["kind"] == "Repository")
+        .expect("Repository node in graph");
+    assert_eq!(
+        repo_node["source_snapshot"]["dirty"],
+        Value::Bool(false),
+        "in-tree .egregore must not stamp dirty=true on the snapshot: {repo_node}"
+    );
+}
+
+/// Finding 7: custom `--cache` path must be excluded from the refresh dirty probe
+/// at stamp time (PR #186 follow-up). A pre-existing cache does not stamp dirty=true
+/// on the refreshed Repository snapshot. Uses an in-repo cache path to exercise the
+/// exclusion; the data-dir is out-of-repo so the check-time probe stays clean.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn refresh_excludes_custom_cache_from_dirty_probe() {
+    let fx = Fixture::committed();
+    fx.scan();
+    // data-dir lives outside the repo (work dir) so check-time sees it as ignored.
+    let data_dir = fx.data_dir();
+    // cache lives inside the repo (untracked) to exercise stamp-time exclusion.
+    let custom_cache = fx.repo().join("my-cache.json");
+
+    eg().args(["ingest"])
+        .arg(fx.graph())
+        .args(["--adapter", "embedded"])
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    // First refresh creates the custom cache (in-tree, untracked).
+    eg().args(["refresh"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--cache")
+        .arg(&custom_cache)
+        .assert()
+        .success();
+
+    // Second refresh: custom cache already exists (in-tree, untracked).
+    // Must stamp dirty=false on the snapshot (stamp-time fix).
+    eg().args(["refresh"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--cache")
+        .arg(&custom_cache)
+        .assert()
+        .success();
+
+    // Verify stamp-time: stored_snapshot.dirty must be false (the cache was excluded).
+    // The check-time probe sees my-cache.json as untracked (F-class limitation; fix
+    // the gap by gitignoring the custom cache in production use).
+    let out = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        report["stored_snapshot"]["dirty"],
+        Value::Bool(false),
+        "custom cache must not stamp dirty=true on the refreshed snapshot: {report}"
+    );
+}

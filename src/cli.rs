@@ -1666,10 +1666,26 @@ fn link_evidence_cmd(code_graph_path: &Path, evidence_path: &Path, out: &Path) -
 }
 
 fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<()> {
-    // Exclude the output file from the dirty probe (PR #186 E): if a previous
-    // `graph.jsonl` is still untracked in the worktree, the snapshot should not
-    // count it as a source change and stamp `dirty = true`.
-    let exclusions = store_artifact_exclusions(repo_path, &[Some(out)]);
+    // Exclude the graph output and any in-tree egregore store from the dirty probe
+    // (PR #186 E, follow-up): a pre-existing graph.jsonl or .egregore data-dir from
+    // a previous workflow must not stamp `dirty = true` on the new scan output.
+    let mut artifact_paths: Vec<Option<&Path>> = vec![Some(out)];
+    let mut egregore_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(repo_path) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(".egregore"))
+            {
+                egregore_dirs.push(entry.path());
+            }
+        }
+    }
+    for dir in &egregore_dirs {
+        artifact_paths.push(Some(dir.as_path()));
+    }
+    let exclusions = store_artifact_exclusions(repo_path, &artifact_paths);
     let graph = scan_repository_with_exclusions(repo_path, repo_id_override, &exclusions)
         .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
     let jsonl = graph
@@ -1833,20 +1849,46 @@ fn freshness_cmd(
 /// byte-identical output to before this feature. When present, returns the stable
 /// freshness code (including `"fresh"`) so an agent always sees the signal it asked
 /// for and the result is never silently suppressed.
+/// `repo_id_hint` is an optional known repository ID from the already-resolved
+/// `--repo` scope; it is tried alongside the recomputed identity so that a
+/// multi-repo store containing an `--repo-id-override` entry can still match
+/// even when the auto-detected ID differs from the override (PR #186 follow-up).
 fn query_freshness_code(
     records: &[GraphRecord],
     repo_path: Option<&Path>,
     artifacts: &[Option<&Path>],
 ) -> Option<(String, &'static str)> {
+    query_freshness_code_inner(records, repo_path, artifacts, None)
+}
+
+fn query_freshness_code_with_hint(
+    records: &[GraphRecord],
+    repo_path: Option<&Path>,
+    artifacts: &[Option<&Path>],
+    repo_id_hint: Option<&str>,
+) -> Option<(String, &'static str)> {
+    query_freshness_code_inner(records, repo_path, artifacts, repo_id_hint)
+}
+
+fn query_freshness_code_inner(
+    records: &[GraphRecord],
+    repo_path: Option<&Path>,
+    artifacts: &[Option<&Path>],
+    repo_id_hint: Option<&str>,
+) -> Option<(String, &'static str)> {
     let repo_path = repo_path?;
     let identity = identity::compute_repository_identity(repo_path, None);
     let exclusions = store_artifact_exclusions(repo_path, artifacts);
     let (head, dirty) = identity::working_tree_snapshot_excluding(repo_path, &exclusions);
-    // Stamp against the repository that actually owns the matched snapshot. When
-    // the match came from the single-repository fallback (e.g. a `--repo-id-override`
-    // store), that owner ID differs from the recomputed identity, and stamping
-    // against the recomputed identity would leave every row unstamped (PR #186).
-    let (owner_id, stored) = match freshness::stored_snapshot_with_owner(records, &identity.id) {
+    // Try the recomputed identity first, then the hint (a resolved `--repo` scope
+    // or `--repo-id-override` value). In a multi-repo store the single-repo
+    // fallback is disabled, so the hint is the only way to match an override ID.
+    let matched = freshness::stored_snapshot_with_owner(records, &identity.id).or_else(|| {
+        repo_id_hint
+            .filter(|h| *h != identity.id.as_str())
+            .and_then(|h| freshness::stored_snapshot_with_owner(records, h))
+    });
+    let (owner_id, stored) = match matched {
         Some((owner, snapshot)) => (owner.to_owned(), Some(snapshot)),
         None => (identity.id, None),
     };
@@ -2211,10 +2253,12 @@ fn scan_refresh_cmd(
     }
 
     // Perform the incremental scan (reads cache, hashes files, rebuilds changed ones).
-    // Exclude the data-dir from the dirty probe (PR #186 A): `refresh` always runs
-    // with a pre-existing store in the worktree; the store itself must not mark the
-    // snapshot as `dirty` so a subsequent `eg freshness --data-dir` reads `fresh`.
-    let snapshot_exclusions = store_artifact_exclusions(repo_path, &[Some(data_dir)]);
+    // Exclude both the data-dir and the cache file from the dirty probe (PR #186 A,
+    // follow-up): both are refresh artifacts; counting either as dirty would stamp
+    // `dirty = true` on the snapshot and make a follow-up `eg freshness --data-dir`
+    // report `stale_dirty` even when no source changed.
+    let snapshot_exclusions =
+        store_artifact_exclusions(repo_path, &[Some(data_dir), Some(cache_path)]);
     let scan = scan_repository_incremental_excluding(repo_path, cache_path, &snapshot_exclusions)
         .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
 
@@ -3095,6 +3139,16 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             }
             #[cfg(feature = "embedded-aletheiadb")]
             if daemon {
+                if repo_path.is_some() {
+                    // Daemon-routed results bypass the local freshness probe entirely;
+                    // accepting --repo-path here would silently emit results without
+                    // the promised `freshness` field (PR #186 follow-up).
+                    eprintln!(
+                        "error: --repo-path cannot be used with --daemon; \
+                         run without --daemon to get freshness stamping"
+                    );
+                    std::process::exit(1);
+                }
                 let dir = data_dir
                     .as_deref()
                     .expect("clap requires --data-dir with --daemon");
@@ -3111,10 +3165,11 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             let selected = selected.as_deref();
-            let freshness_code = query_freshness_code(
+            let freshness_code = query_freshness_code_with_hint(
                 &records,
                 repo_path.as_deref(),
                 &[graph.as_deref(), data_dir.as_deref()],
+                selected,
             );
             as_of.map_or_else(
                 || {
@@ -3130,11 +3185,29 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                             )
                         },
                         |prefix| {
-                            query_symbol_at(&records, &name, &prefix, format, &index, selected)
+                            query_symbol_at(
+                                &records,
+                                &name,
+                                &prefix,
+                                format,
+                                &index,
+                                selected,
+                                freshness_code.as_ref(),
+                            )
                         },
                     )
                 },
-                |instant| query_symbol_as_of(&records, &name, &instant, format, &index, selected),
+                |instant| {
+                    query_symbol_as_of(
+                        &records,
+                        &name,
+                        &instant,
+                        format,
+                        &index,
+                        selected,
+                        freshness_code.as_ref(),
+                    )
+                },
             )
         }
         QuerySubcommand::File {
@@ -3149,6 +3222,13 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         } => {
             #[cfg(feature = "embedded-aletheiadb")]
             if daemon {
+                if repo_path.is_some() {
+                    eprintln!(
+                        "error: --repo-path cannot be used with --daemon; \
+                         run without --daemon to get freshness stamping"
+                    );
+                    std::process::exit(1);
+                }
                 let dir = data_dir
                     .as_deref()
                     .expect("clap requires --data-dir with --daemon");
@@ -3157,10 +3237,11 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
-            let freshness_code = query_freshness_code(
+            let freshness_code = query_freshness_code_with_hint(
                 &records,
                 repo_path.as_deref(),
                 &[graph.as_deref(), data_dir.as_deref()],
+                selected.as_deref(),
             );
             query_file(
                 &records,
@@ -4566,6 +4647,7 @@ fn query_symbol_as_of(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     match query::symbol_as_of_valid_time_by_repo(records, name, as_of, index, selected_repo) {
         Err(msg) => {
@@ -4587,10 +4669,13 @@ fn query_symbol_as_of(
                     exit_ambiguous_repository(&groups);
                 }
             }
-            for record in results {
-                if let Some(result) = symbol_result(record, name, index) {
-                    print_result(&result, format)?;
-                }
+            let mut symbol_results: Vec<SymbolResult<'_>> = results
+                .iter()
+                .filter_map(|r| symbol_result(r, name, index))
+                .collect();
+            stamp_freshness(&mut symbol_results, freshness_code);
+            for result in &symbol_results {
+                print_result(result, format)?;
             }
         }
     }
@@ -4931,6 +5016,7 @@ fn query_symbol_at(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     // The ambiguity check is repository-scoped: a prefix that collides only
     // across the repository boundary is unambiguous within the selected repo.
@@ -4970,7 +5056,8 @@ fn query_symbol_at(
             std::process::exit(2);
         }
         Some(record) => {
-            if let Some(result) = symbol_result(record, name, index) {
+            if let Some(mut result) = symbol_result(record, name, index) {
+                stamp_freshness(std::slice::from_mut(&mut result), freshness_code);
                 print_result(&result, format)?;
             }
         }
