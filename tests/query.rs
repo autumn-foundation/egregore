@@ -4128,6 +4128,42 @@ fn record_context_file_anchor_includes_defined_symbols_and_context() {
 }
 
 #[test]
+fn record_context_file_anchor_finds_nested_symbols_by_path() {
+    // Nested symbols (methods in impl blocks, functions in modules) have their
+    // DEFINES edge from the container, not directly from the file. The file
+    // anchor must still seed them via repo_relative_path matching.
+    let file_path = "src/lib.rs";
+    let (file_id, file) = ctx_file(file_path);
+    let module_id = "codegraph:v4:mod001".to_owned();
+    let module = ctx_symbol(&module_id, "my_module", file_path, 1);
+    // module's DEFINES edge comes from the file (top-level)
+    let file_defines_module = ctx_defines(&file_id, &module_id);
+    let nested_id = "codegraph:v4:nested001".to_owned();
+    let nested = ctx_symbol(&nested_id, "nested_fn", file_path, 5);
+    // nested_fn's DEFINES edge comes from the module, NOT the file
+    let module_defines_nested = ctx_defines(&module_id, &nested_id);
+    let records = vec![
+        file,
+        module,
+        file_defines_module,
+        nested,
+        module_defines_nested,
+    ];
+
+    let ctx = record_context(&records, &file_id);
+
+    assert!(!ctx.is_no_match(), "file anchor must resolve context");
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == module_id),
+        "top-level module (direct DEFINES) must be in source_facts"
+    );
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == nested_id),
+        "nested function (path-based) must be in source_facts even though its DEFINES comes from the module"
+    );
+}
+
+#[test]
 fn record_context_absent_anchor_is_no_match() {
     let (records, _sym_id, _file_id) = bridge_fixture();
     let ctx = record_context(&records, "codegraph:v4:does_not_exist");

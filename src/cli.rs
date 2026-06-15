@@ -3661,6 +3661,20 @@ fn query_semantic_context(
         })
         .collect();
 
+    // Scope the record slice for context expansion when a repo is selected so
+    // that ambiguity detection (candidate_record_ids) and the path-based file
+    // fallback in record_context don't return IDs from other repos. Cross-
+    // domain records (observations, artifacts, verification) are unowned and
+    // always kept so that context sections remain fully populated.
+    let records: Vec<GraphRecord> = if let Some(repo) = selected.as_deref() {
+        records
+            .into_iter()
+            .filter(|r| index.owner_of(r.id()).is_none_or(|o| o == repo))
+            .collect()
+    } else {
+        records
+    };
+
     let bundle = query::semantic_context_bundle(&records, &leads, min_score);
 
     if bundle.is_no_match() {

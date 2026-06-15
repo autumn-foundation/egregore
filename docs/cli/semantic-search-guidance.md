@@ -98,11 +98,12 @@ ambiguity instead of silently picking one.
 
 Every returned row carries a stable record ID and a citable handle; rows whose
 evidence link has no resolvable target are surfaced under `unresolved` rather
-than emitting uncited prose. Output never includes raw transcript text, command
-output, patch hunks, issue/PR bodies, env values, or tokens — only record IDs,
-hashes, handles, spans, scores, confidence, and redaction markers. The answer is
-read-only and deterministic: identical queries against an unchanged store return
-byte-identical matches, sections, and ordering.
+than emitting uncited prose. The five context sections carry the same fields as
+`eg query context` — including agent-facing summary text, observation text, and
+`OutputHandle` inline content bounded by the ingest-time 16 KiB ceiling and
+redaction policies applied at ingest. The answer is read-only and deterministic:
+identical queries against an unchanged store return byte-identical matches,
+sections, and ordering.
 
 ### When to use which tool
 

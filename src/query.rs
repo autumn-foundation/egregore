@@ -1482,6 +1482,34 @@ pub fn record_context<'a>(records: &'a [GraphRecord], anchor_id: &str) -> Symbol
                 primary.insert(sym);
             }
         }
+        // Also seed by repo_relative_path to capture nested symbols (methods
+        // inside impl blocks, functions inside modules) whose DEFINES edge
+        // comes from the containing symbol, not directly from the file.
+        let anchor_path = records.iter().find_map(|r| match r {
+            GraphRecord::Node {
+                id,
+                repo_relative_path: Some(p),
+                ..
+            } if id.as_str() == anchor_id => Some(p.as_str()),
+            _ => None,
+        });
+        if let Some(path) = anchor_path {
+            for r in records {
+                if let GraphRecord::Node {
+                    id,
+                    kind: NodeKind::Symbol,
+                    repo_relative_path: Some(p),
+                    ..
+                } = r
+                    && p.as_str() == path
+                    && is_live(id.as_str())
+                    && let Some(sym) = id_ref(id.as_str())
+                {
+                    source_facts.insert(sym);
+                    primary.insert(sym);
+                }
+            }
+        }
     } else {
         // Symbol (or other) anchor: seed the co-located File (symbol → file),
         // preferring DEFINES and falling back to the shared repo-relative path.
