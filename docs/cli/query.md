@@ -12,6 +12,7 @@ eg query file     <PATH>  --data-dir <DIR>  [--repo <SELECTOR>] [--format json|t
 eg query drift            --graph <PATH>    [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query drift            --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
+eg query semantic-memory <QUERY> --data-dir <DIR> [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
 eg query context  <NAME>  --graph <PATH>
 eg query task     <HANDLE> --graph <PATH>
 eg query memory   <HANDLE> --graph <PATH>   [--verified-only]
@@ -24,6 +25,9 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query task` — evidence for a **task** ([task-queries.md](task-queries.md), issue #48).
 - `eg query memory` — audit the evidence behind one **agent-authored memory
   claim** ([memory-audit.md](memory-audit.md), issue #64).
+- `eg query semantic-memory` — recall prior **agent memory by meaning** with
+  provenance, trust-separated from code
+  ([semantic-memory-recall.md](semantic-memory-recall.md), issue #91).
 - `eg query failures` — **prior failed attempts** linked to a code or task
   handle ([failure-history.md](failure-history.md), issue #63).
 
@@ -32,7 +36,7 @@ Most subcommands accept exactly one input source:
 - `--graph <PATH>` — read from a JSONL file produced by `eg scan` or `eg scan-history`.
 - `--data-dir <DIR>` — read from an embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. Requires the `embedded-aletheiadb` feature (enabled by default). Providing both `--graph` and `--data-dir` is an error.
 
-`eg query semantic` accepts **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results.
+`eg query semantic` and `eg query semantic-memory` accept **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results. `eg query semantic` returns only deterministic **code** hits; `eg query semantic-memory` returns only **agent-authored** memory hits — the two are never blended (issue #91).
 
 ## Exit codes
 

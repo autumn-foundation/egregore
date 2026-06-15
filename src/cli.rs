@@ -292,6 +292,29 @@ enum Commands {
         #[arg(long, default_value = "0.20", value_parser = parse_threshold)]
         threshold: f64,
     },
+    /// Run the agent-memory recall evaluation against a corpus file (issue #91).
+    ///
+    /// Requires a pre-built embedded store seeded with imported memory and
+    /// ingested with `--embed`. Exits 0 if top-3 recall meets the threshold,
+    /// 1 with a diagnostic if missed.
+    #[cfg(feature = "embeddings")]
+    EvalMemoryRecall {
+        /// Path to the agent-memory recall corpus JSON file.
+        #[arg(long, default_value = "corpus/agent_memory_recall_corpus.json")]
+        corpus: PathBuf,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Number of top memory results to retrieve per question.
+        #[arg(long, default_value = "3")]
+        top_k: usize,
+        /// Minimum top-3 recall fraction required to pass (0.0–1.0, default 0.80).
+        #[arg(long, default_value = "0.8", value_parser = parse_threshold)]
+        threshold: f64,
+        /// Exclude unverified observations from recall, as the trust filter does.
+        #[arg(long)]
+        verified_only: bool,
+    },
     /// Manage the local Egregore daemon.
     #[cfg(feature = "embedded-aletheiadb")]
     Daemon {
@@ -555,6 +578,40 @@ enum QuerySubcommand {
         /// Maximum number of results (default 10).
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Recall prior agent memory by meaning (issue #91).
+    ///
+    /// Returns agent-authored observations, decisions, and failures ranked by
+    /// semantic similarity to the natural-language query — each carrying its
+    /// provenance handle: record ID, kind, source transcript/session handle,
+    /// authoring agent, confidence, observed time, and any linked code handle.
+    ///
+    /// Results are typed `agent_authored` and are NEVER blended with
+    /// deterministic code hits (use `eg query semantic` for code). A memory hit
+    /// that cannot cite where it came from is excluded, not returned. A semantic
+    /// match is recall, not verification: a returned lesson is a prior agent's
+    /// subjective claim, not source truth.
+    ///
+    /// Documented in `docs/cli/semantic-memory-recall.md`.
+    #[cfg(feature = "embeddings")]
+    SemanticMemory {
+        /// Natural-language question to recall memory by meaning.
+        query: String,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum number of results (default 10).
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Exclude unverified agent observations (no cited verification evidence).
+        #[arg(long)]
+        verified_only: bool,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -1093,6 +1150,14 @@ fn run_cli(cli: Cli) -> Result<()> {
                 anyhow::bail!("eval-drift requires the 'embeddings' feature")
             }
         }
+        #[cfg(feature = "embeddings")]
+        Commands::EvalMemoryRecall {
+            corpus,
+            data_dir,
+            top_k,
+            threshold,
+            verified_only,
+        } => eval_memory_recall_cmd(&corpus, &data_dir, top_k, threshold, verified_only),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Daemon { action } => daemon(action),
         Commands::Decide {
@@ -2887,6 +2952,22 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 query_semantic(&query, &data_dir, limit, repo.as_deref(), format)
             }
         }
+        #[cfg(feature = "embeddings")]
+        QuerySubcommand::SemanticMemory {
+            query,
+            data_dir,
+            repo,
+            limit,
+            verified_only,
+            format,
+        } => query_semantic_memory(
+            &query,
+            &data_dir,
+            limit,
+            repo.as_deref(),
+            verified_only,
+            format,
+        ),
         QuerySubcommand::Context {
             name,
             graph,
@@ -3437,6 +3518,14 @@ fn query_semantic(
     let mut matches = sink
         .semantic_search(&query_vector, fetch)
         .with_context(|| "semantic search failed — was the store ingested with --embed?")?;
+    // Code search must never blend agent-authored memory hits into deterministic
+    // code results (issue #91): the shared vector index now also embeds
+    // observation-class memory nodes, recalled only via `eg query semantic-memory`.
+    matches.retain(|m| {
+        m.kind
+            .as_deref()
+            .is_some_and(|k| k == "File" || k == "Symbol")
+    });
     if let Some(repo) = selected.as_deref() {
         matches.retain(|m| index.owner_of(&m.record_id) == Some(repo));
         matches.truncate(limit);
@@ -3449,6 +3538,326 @@ fn query_semantic(
 
     for m in &matches {
         print_result(&SemanticResult::from_match(m, &index), format)?;
+    }
+    Ok(())
+}
+
+/// One agent-authored memory record recalled by meaning (issue #91).
+///
+/// Typed `agent_authored` so a consuming agent can never mistake a recalled
+/// lesson for deterministic source truth. Every emitted row carries a citable
+/// `source_handle`; a hit lacking provenance is excluded upstream, never
+/// returned with empty provenance.
+#[cfg(feature = "embeddings")]
+#[derive(Serialize)]
+struct MemoryRecallResult<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    trust_class: &'static str,
+    retrieval_score: f32,
+    /// Citable source transcript / session / turn handle proving where the
+    /// memory came from.
+    source_handle: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingested_at: Option<&'a str>,
+    /// `verified` when the claim cites present verification evidence, else
+    /// `unverified` — a structural, non-inferential trust signal (issue #64).
+    review_state: &'static str,
+    redacted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<&'a str>,
+    /// Resolved code handles this memory cites (`OBSERVES`/`MENTIONS_SYMBOL`/…).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    linked_code_handles: Vec<String>,
+    /// The recalled memory body (post-redaction stored text).
+    memory_text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
+}
+
+#[cfg(feature = "embeddings")]
+impl PrintText for MemoryRecallResult<'_> {
+    fn as_text(&self) -> String {
+        format!(
+            "{} [{}] {} score={:.4} author={} source={} review={}\n  {}",
+            self.record_id,
+            self.kind,
+            self.trust_class,
+            self.retrieval_score,
+            self.agent_id.unwrap_or("(unknown)"),
+            self.source_handle,
+            self.review_state,
+            self.memory_text,
+        )
+    }
+}
+
+/// Node kinds that carry deterministic verification evidence (issue #64).
+#[cfg(feature = "embeddings")]
+fn is_verification_kind_name(kind: &str) -> bool {
+    matches!(
+        kind,
+        "Verification"
+            | "TestRun"
+            | "CommandRun"
+            | "CommandEvidence"
+            | "CIStatus"
+            | "BenchmarkRun"
+            | "CoverageReport"
+            | "ProofResult"
+    )
+}
+
+/// A memory claim is **verified** when it cites at least one present
+/// verification-domain record through an evidence link (`VALIDATED_BY`,
+/// `HAS_EVIDENCE`, `PRODUCED_EVIDENCE`). This is the same structural,
+/// non-inferential rule the memory-audit `--verified-only` filter uses — not a
+/// truth judgement.
+#[cfg(feature = "embeddings")]
+fn memory_is_verified(
+    links: Option<&Vec<EvidenceLink>>,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+) -> bool {
+    let Some(links) = links else { return false };
+    links.iter().any(|link| {
+        if !matches!(
+            link.relation.as_str(),
+            "VALIDATED_BY" | "HAS_EVIDENCE" | "PRODUCED_EVIDENCE"
+        ) {
+            return false;
+        }
+        if let Some(target_id) = link.target_record_id.as_deref()
+            && let Some(target) = by_id.get(target_id)
+            && target
+                .node_kind_name()
+                .is_some_and(is_verification_kind_name)
+        {
+            return true;
+        }
+        // Triple-only citation with no resolvable record: trust the declared
+        // verification domain rather than silently dropping the signal.
+        link.target_record_id.is_none() && link.target_domain == "verification"
+    })
+}
+
+/// Resolves one evidence link to a citable code handle string when it points at
+/// the code-graph domain.
+#[cfg(feature = "embeddings")]
+fn code_handle_from_link(
+    link: &EvidenceLink,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+) -> Option<String> {
+    let is_code = link.target_domain == "codegraph"
+        || matches!(
+            link.relation.as_str(),
+            "OBSERVES" | "MENTIONS_SYMBOL" | "TOUCHED_FILE"
+        );
+    if !is_code {
+        return None;
+    }
+    if let Some(target_id) = link.target_record_id.as_deref()
+        && let Some(GraphRecord::Node {
+            repo_relative_path,
+            name,
+            ..
+        }) = by_id.get(target_id).copied()
+    {
+        if let Some(path) = repo_relative_path {
+            return Some(
+                name.as_ref()
+                    .map_or_else(|| path.clone(), |n| format!("{path}::{n}")),
+            );
+        }
+        return Some(target_id.to_owned());
+    }
+    link.target_repo_relative_path
+        .clone()
+        .or_else(|| link.target_record_id.clone())
+}
+
+/// Decides whether a semantic hit is a recallable agent-memory record (issue #91).
+///
+/// A hit qualifies only when it is an agent-memory observation-class kind, can
+/// cite where it came from (a `source_handle`, source artifact path, or session
+/// handle), and — under `verified_only` — cites present verification evidence.
+/// A hit lacking provenance is rejected here so it is excluded, never returned.
+#[cfg(feature = "embeddings")]
+fn is_recallable_memory(
+    m: &SemanticMatch,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+    verified_only: bool,
+) -> bool {
+    if !m
+        .kind
+        .as_deref()
+        .is_some_and(|k| matches!(k, "Observation" | "Decision" | "Failure"))
+    {
+        return false;
+    }
+    let Some(GraphRecord::Node {
+        session_id,
+        source_handle,
+        source_artifact_path,
+        evidence_links,
+        ..
+    }) = by_id.get(m.record_id.as_str()).copied()
+    else {
+        return false;
+    };
+    let has_provenance =
+        source_handle.is_some() || source_artifact_path.is_some() || session_id.is_some();
+    if !has_provenance {
+        return false;
+    }
+    if verified_only && !memory_is_verified(evidence_links.as_ref(), by_id) {
+        return false;
+    }
+    true
+}
+
+/// Recalls prior agent memory by meaning, trust-separated from code (issue #91).
+///
+/// Embeds the natural-language query with the local model, runs the same vector
+/// search the code path uses, then keeps only agent-memory observation-class
+/// hits — each enriched with its provenance handle. A hit that cannot cite
+/// where it came from is excluded, not returned. With `--verified-only`,
+/// observations lacking cited verification evidence are excluded too.
+#[cfg(feature = "embeddings")]
+#[allow(clippy::too_many_lines)]
+fn query_semantic_memory(
+    query: &str,
+    data_dir: &Path,
+    limit: usize,
+    repo: Option<&str>,
+    verified_only: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    validate_existing_embedded_store(data_dir)?;
+
+    let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+        .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+
+    let records = sink
+        .read_all_records()
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+    let index = query::RepositoryIndex::build(&records);
+    let selected = resolve_repo_scope(&index, repo);
+
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+
+    let query_vector = embed_query_text(query)?;
+
+    // The shared vector index holds both code and memory; fetch a generous pool
+    // and filter to memory so the `limit` bounds recalled memory, not the blend.
+    let fetch = records.len().max(limit);
+    let matches = sink
+        .semantic_search(&query_vector, fetch)
+        .with_context(|| "semantic search failed — was the store ingested with --embed?")?;
+
+    let mut rows: Vec<MemoryRecallResult> = Vec::new();
+    for m in &matches {
+        if rows.len() == limit {
+            break;
+        }
+        // Trust separation + provenance exclusion (AC3): keep only agent-memory
+        // observation-class hits that can cite where they came from.
+        if !is_recallable_memory(m, &by_id, verified_only) {
+            continue;
+        }
+        if let Some(repo) = selected.as_deref()
+            && index.owner_of(&m.record_id) != Some(repo)
+        {
+            continue;
+        }
+        let Some(record) = by_id.get(m.record_id.as_str()).copied() else {
+            continue;
+        };
+        let GraphRecord::Node {
+            text,
+            summary,
+            agent_id,
+            agent_kind,
+            session_id,
+            observed_at,
+            ingested_at,
+            confidence,
+            source_handle,
+            source_artifact_path,
+            redaction_policy_version,
+            superseded_by,
+            evidence_links,
+            ..
+        } = record
+        else {
+            continue;
+        };
+
+        // `is_recallable_memory` guarantees a citable handle is present.
+        let source_handle_value = source_handle
+            .clone()
+            .or_else(|| source_artifact_path.clone())
+            .or_else(|| session_id.clone())
+            .unwrap_or_default();
+
+        let verified = memory_is_verified(evidence_links.as_ref(), &by_id);
+
+        let linked_code_handles: Vec<String> = evidence_links
+            .as_ref()
+            .map(|links| {
+                let mut handles: Vec<String> = links
+                    .iter()
+                    .filter_map(|l| code_handle_from_link(l, &by_id))
+                    .collect();
+                handles.sort();
+                handles.dedup();
+                handles
+            })
+            .unwrap_or_default();
+
+        let repository_id = index.owner_of(&m.record_id);
+        rows.push(MemoryRecallResult {
+            record_id: record.id(),
+            kind: record.node_kind_name().unwrap_or("Observation"),
+            trust_class: "agent_authored",
+            retrieval_score: m.score,
+            source_handle: source_handle_value,
+            agent_id: agent_id.as_deref(),
+            agent_kind: agent_kind.as_deref(),
+            session_id: session_id.as_deref(),
+            confidence: confidence.as_deref(),
+            observed_at: observed_at.as_deref(),
+            ingested_at: ingested_at.as_deref(),
+            review_state: if verified { "verified" } else { "unverified" },
+            redacted: redaction_policy_version.is_some(),
+            superseded_by: superseded_by.as_deref(),
+            linked_code_handles,
+            memory_text: text.as_deref().unwrap_or(summary.as_str()),
+            repository_id,
+            repository: repository_id.and_then(|id| index.display_of(id)),
+        });
+    }
+
+    if rows.is_empty() {
+        eprintln!(
+            "no memory results — store may lack embedded memory (re-run ingest with --embed) or all hits were filtered"
+        );
+        std::process::exit(2);
+    }
+
+    for row in &rows {
+        print_result(row, format)?;
     }
     Ok(())
 }
@@ -3595,6 +4004,101 @@ fn eval_semantic_cmd(
         let hits: Vec<SearchHit> = matches.iter().map(SearchHit::from).collect();
         #[allow(clippy::cast_possible_truncation)]
         results.push(evaluate_query(query, &hits, fp_threshold as f32));
+    }
+
+    let report = build_report(results, threshold);
+    print_report(&report, std::io::stdout())?;
+
+    if !report.passed {
+        eprintln!("{}", format_diagnostic(&report));
+        process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Runs the agent-memory recall corpus evaluation against an embedded store
+/// seeded with imported memory records (issue #91).
+///
+/// Reads each natural-language question, embeds it with the local model, runs
+/// semantic search, keeps only recallable agent-memory hits (trust-separated
+/// from code, provenance-bearing), then evaluates top-1/top-3/MRR against the
+/// reviewed expected memory record IDs. Exits 1 with a diagnostic if the top-3
+/// recall threshold is missed.
+#[cfg(feature = "embeddings")]
+fn eval_memory_recall_cmd(
+    corpus_path: &Path,
+    data_dir: &Path,
+    top_k: usize,
+    threshold: f64,
+    verified_only: bool,
+) -> Result<()> {
+    use crate::embeddings::{
+        DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_NAME, aletheia_embeddings,
+    };
+    use crate::memory_recall_eval::{
+        MemoryHit, MemoryRecallCorpus, build_report, evaluate_query, format_diagnostic,
+        print_report,
+    };
+
+    validate_existing_embedded_store(data_dir)?;
+
+    let corpus = MemoryRecallCorpus::from_json_file(corpus_path)?;
+
+    let embedder = aletheia_embeddings::EmbedderBuilder::new()
+        .model_architecture(DEFAULT_EMBEDDING_MODEL_ARCHITECTURE)
+        .model_id(Some(DEFAULT_EMBEDDING_MODEL_NAME))
+        .from_pretrained_hf()
+        .context("failed to load embedding model")?;
+
+    let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+        .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+
+    let records = sink
+        .read_all_records()
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+
+    let mut results = Vec::new();
+    for question in &corpus.questions {
+        let embed_data = rt
+            .block_on(aletheia_embeddings::embed_query(
+                &[question.text.as_str()],
+                &embedder,
+                None,
+            ))
+            .with_context(|| format!("failed to embed question {}", question.id))?;
+
+        let query_vector = aletheia_embeddings::embed_data_to_dense_iter(embed_data, Some(1))
+            .next()
+            .with_context(|| format!("no embedding returned for question {}", question.id))?
+            .with_context(|| format!("embedding result not dense for question {}", question.id))?
+            .embedding;
+
+        // Fetch a generous pool, then narrow to recallable memory so `top_k`
+        // bounds memory hits rather than the code+memory blend.
+        let matches = sink
+            .semantic_search(&query_vector, records.len().max(top_k))
+            .with_context(|| {
+                format!(
+                    "semantic search failed for question {} — was the store ingested with --embed?",
+                    question.id
+                )
+            })?;
+
+        let hits: Vec<MemoryHit> = matches
+            .iter()
+            .filter(|m| is_recallable_memory(m, &by_id, verified_only))
+            .take(top_k.max(3))
+            .map(|m| MemoryHit {
+                record_id: m.record_id.clone(),
+                score: m.score,
+            })
+            .collect();
+
+        results.push(evaluate_query(question, &hits));
     }
 
     let report = build_report(results, threshold);

@@ -8778,6 +8778,14 @@ fn handle_verb_semantic_search(
         Err(e) => return HttpResponse::error_with_id(request_id, adapter_read_error_to_api(e)),
     };
     drop(sink);
+    // Code search must never blend agent-authored memory hits into deterministic
+    // code results (issue #91): the shared vector index now also embeds
+    // observation-class memory nodes, retrievable only via `semantic_memory`.
+    matches.retain(|m| {
+        m.kind
+            .as_deref()
+            .is_some_and(|k| k == "File" || k == "Symbol")
+    });
     if let Some(repo) = selected_repo.as_deref() {
         matches.retain(|m| repo_index.owner_of(&m.record_id) == Some(repo));
         matches.truncate(effective_limit);

@@ -18,6 +18,7 @@ cargo run -- scan-history . --out history.graph.jsonl
 cargo run -- inspect graph.jsonl
 cargo run -- ingest graph.jsonl --adapter dry-run
 cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .egregore
+cargo run -- query semantic-memory "parser edge case on empty input" --data-dir .egregore
 ```
 
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.

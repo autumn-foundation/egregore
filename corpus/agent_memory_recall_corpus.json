@@ -1,0 +1,167 @@
+{
+  "corpus_version": "1.0",
+  "description": "Agent-memory recall corpus (issue #91): natural-language questions over a seeded store of imported observations, decisions, and failures, each labeling the reviewed expected memory record id(s).",
+  "questions": [
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:obs-thiserror-libraries"
+      ],
+      "id": "m01",
+      "text": "which error-handling crate should I use inside a library?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:fail-empty-input-panic"
+      ],
+      "id": "m02",
+      "text": "what breaks when the input file is empty?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:dec-workspace-single-binary"
+      ],
+      "id": "m03",
+      "text": "how is the project laid out as crates and binaries?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:obs-tree-sitter-over-regex"
+      ],
+      "id": "m04",
+      "text": "why shouldn't I use regular expressions to parse source code?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:obs-blake3-stable-ids"
+      ],
+      "id": "m05",
+      "text": "how are stable record identities computed?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:fail-windows-acl"
+      ],
+      "id": "m06",
+      "text": "were there file permission problems on Windows?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:obs-hnsw-nondeterministic-ties"
+      ],
+      "id": "m07",
+      "text": "how do we make vector search results reproducible across runs?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:dec-embed-into-existing-store"
+      ],
+      "id": "m08",
+      "text": "where does agent memory get indexed so it can be recalled?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:obs-redaction-at-import"
+      ],
+      "id": "m09",
+      "text": "is the stored memory text already scrubbed of secrets?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:obs-msvc-crt-flag"
+      ],
+      "id": "m10",
+      "text": "what compiler flag is needed for tokenizer linking on Windows?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:fail-superseded-returned"
+      ],
+      "id": "m11",
+      "text": "did replaced code ever show up in search after being superseded?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:obs-temporal-valid-time"
+      ],
+      "id": "m12",
+      "text": "how is valid time set for an ordinary working-tree scan?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:dec-no-network-mvp"
+      ],
+      "id": "m13",
+      "text": "can the tool fetch remote repositories over the network?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:obs-evidence-links-dual"
+      ],
+      "id": "m14",
+      "text": "how are citations stored between a memory note and code?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:obs-incremental-cache-content-hash"
+      ],
+      "id": "m15",
+      "text": "what does the incremental scan cache key on?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:fail-daemon-lease-conflict"
+      ],
+      "id": "m16",
+      "text": "what happens if I open the store while the daemon is running?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:obs-confidence-is-string"
+      ],
+      "id": "m17",
+      "text": "what data type is the confidence value stored as?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:dec-aletheiadb-published-crate"
+      ],
+      "id": "m18",
+      "text": "may I use a local path dependency for the database crate?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:obs-observation-not-truth"
+      ],
+      "id": "m19",
+      "text": "should I trust an agent's note as established fact?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:obs-cosine-not-verification"
+      ],
+      "id": "m20",
+      "text": "is a high semantic similarity score proof that something works?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:fail-empty-store-exit2"
+      ],
+      "id": "m21",
+      "text": "what should querying an empty store do?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:obs-tombstone-active"
+      ],
+      "id": "m22",
+      "text": "are deleted nodes kept out of search results?"
+    },
+    {
+      "expected_record_ids": [
+        "agent_memory:v1:obs-thiserror-libraries"
+      ],
+      "id": "m23",
+      "text": "a general lesson about structured errors that is tied to no particular file or symbol"
+    }
+  ]
+}
