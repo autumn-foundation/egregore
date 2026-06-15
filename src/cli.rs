@@ -3507,14 +3507,13 @@ fn query_semantic(
 
     let query_vector = embed_query_text(query)?;
 
-    // When scoped, search the whole index so higher-scoring hits from other
-    // repositories can never crowd the selected repository's matches out of
-    // the candidate set; the limit then bounds the scoped result set.
-    let fetch = if selected.is_some() {
-        records.len().max(limit)
-    } else {
-        limit
-    };
+    // Over-fetch the whole index, not just `limit` raw hits: the shared vector
+    // index now also embeds agent-memory nodes (issue #91), so a query whose top
+    // `limit` raw matches are memory would otherwise drop them all and never see
+    // the code hits ranked just behind them. Fetching the full pool lets the
+    // code-kind filter below recover those code hits; the limit then bounds the
+    // filtered result set. Scoping needs the full pool for the same reason.
+    let fetch = records.len().max(limit);
     let mut matches = sink
         .semantic_search(&query_vector, fetch)
         .with_context(|| "semantic search failed — was the store ingested with --embed?")?;
@@ -3528,8 +3527,8 @@ fn query_semantic(
     });
     if let Some(repo) = selected.as_deref() {
         matches.retain(|m| index.owner_of(&m.record_id) == Some(repo));
-        matches.truncate(limit);
     }
+    matches.truncate(limit);
 
     if matches.is_empty() {
         eprintln!("no results — store may not have embeddings (re-run ingest with --embed)");
@@ -3604,52 +3603,44 @@ impl PrintText for MemoryRecallResult<'_> {
     }
 }
 
-/// Node kinds that carry deterministic verification evidence (issue #64).
+/// Returns a trimmed, non-empty string slice, or `None` for a missing or
+/// blank-only value. Used so an imported memory record carrying
+/// `source_handle: ""` is treated as having no provenance rather than passing
+/// the recall gate and being emitted with an empty handle (issue #91).
 #[cfg(feature = "embeddings")]
-fn is_verification_kind_name(kind: &str) -> bool {
-    matches!(
-        kind,
-        "Verification"
-            | "TestRun"
-            | "CommandRun"
-            | "CommandEvidence"
-            | "CIStatus"
-            | "BenchmarkRun"
-            | "CoverageReport"
-            | "ProofResult"
-    )
+fn non_empty(value: Option<&String>) -> Option<&str> {
+    value.map(String::as_str).filter(|s| !s.trim().is_empty())
 }
 
-/// A memory claim is **verified** when it cites at least one present
-/// verification-domain record through an evidence link (`VALIDATED_BY`,
-/// `HAS_EVIDENCE`, `PRODUCED_EVIDENCE`). This is the same structural,
-/// non-inferential rule the memory-audit `--verified-only` filter uses — not a
-/// truth judgement.
+/// Resolves the repositories a memory record belongs to (issue #91).
+///
+/// Agent-memory nodes are not part of the code-graph containment topology, so
+/// [`query::RepositoryIndex::owner_of`] returns `None` for them directly. A
+/// memory record is attributed to a repository through the code it cites: any
+/// `evidence_links` target that resolves to a code node owned by a repository
+/// scopes the memory to that repository. Returned sorted and deduplicated for
+/// deterministic selection.
 #[cfg(feature = "embeddings")]
-fn memory_is_verified(
+fn memory_repo_owners<'a>(
+    record_id: &str,
     links: Option<&Vec<EvidenceLink>>,
-    by_id: &BTreeMap<&str, &GraphRecord>,
-) -> bool {
-    let Some(links) = links else { return false };
-    links.iter().any(|link| {
-        if !matches!(
-            link.relation.as_str(),
-            "VALIDATED_BY" | "HAS_EVIDENCE" | "PRODUCED_EVIDENCE"
-        ) {
-            return false;
-        }
-        if let Some(target_id) = link.target_record_id.as_deref()
-            && let Some(target) = by_id.get(target_id)
-            && target
-                .node_kind_name()
-                .is_some_and(is_verification_kind_name)
-        {
-            return true;
-        }
-        // Triple-only citation with no resolvable record: trust the declared
-        // verification domain rather than silently dropping the signal.
-        link.target_record_id.is_none() && link.target_domain == "verification"
-    })
+    index: &'a query::RepositoryIndex,
+) -> Vec<&'a str> {
+    if let Some(owner) = index.owner_of(record_id) {
+        return vec![owner];
+    }
+    let mut owners: Vec<&str> = links
+        .map(|links| {
+            links
+                .iter()
+                .filter_map(|l| l.target_record_id.as_deref())
+                .filter_map(|target| index.owner_of(target))
+                .collect()
+        })
+        .unwrap_or_default();
+    owners.sort_unstable();
+    owners.dedup();
+    owners
 }
 
 /// Resolves one evidence link to a citable code handle string when it points at
@@ -3697,6 +3688,8 @@ fn code_handle_from_link(
 fn is_recallable_memory(
     m: &SemanticMatch,
     by_id: &BTreeMap<&str, &GraphRecord>,
+    edges_from: &query::OutgoingEdgeIndex<'_>,
+    tombstoned: &query::TombstonedSet<'_>,
     verified_only: bool,
 ) -> bool {
     if !m
@@ -3706,22 +3699,31 @@ fn is_recallable_memory(
     {
         return false;
     }
-    let Some(GraphRecord::Node {
+    let Some(record) = by_id.get(m.record_id.as_str()).copied() else {
+        return false;
+    };
+    let GraphRecord::Node {
         session_id,
         source_handle,
         source_artifact_path,
-        evidence_links,
         ..
-    }) = by_id.get(m.record_id.as_str()).copied()
+    } = record
     else {
         return false;
     };
-    let has_provenance =
-        source_handle.is_some() || source_artifact_path.is_some() || session_id.is_some();
+    // Provenance must be a present, non-blank handle: a record carrying only
+    // empty strings is excluded, never emitted with an empty `source_handle`.
+    let has_provenance = non_empty(source_handle.as_ref()).is_some()
+        || non_empty(source_artifact_path.as_ref()).is_some()
+        || non_empty(session_id.as_ref()).is_some();
     if !has_provenance {
         return false;
     }
-    if verified_only && !memory_is_verified(evidence_links.as_ref(), by_id) {
+    // Verified-only reuses the memory-audit structural rule (issue #64): a
+    // resolvable, non-tombstoned verification record cited via VALIDATED_BY /
+    // HAS_EVIDENCE / PRODUCED_EVIDENCE, on either an inline evidence link or an
+    // outgoing edge. A triple-only citation stub never counts as verified.
+    if verified_only && !query::is_verified_claim(record, by_id, edges_from, tombstoned) {
         return false;
     }
     true
@@ -3756,6 +3758,7 @@ fn query_semantic_memory(
     let selected = resolve_repo_scope(&index, repo);
 
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let (edges_from, tombstoned) = query::verification_support_indexes(&records);
 
     let query_vector = embed_query_text(query)?;
 
@@ -3768,17 +3771,9 @@ fn query_semantic_memory(
 
     let mut rows: Vec<MemoryRecallResult> = Vec::new();
     for m in &matches {
-        if rows.len() == limit {
-            break;
-        }
         // Trust separation + provenance exclusion (AC3): keep only agent-memory
         // observation-class hits that can cite where they came from.
-        if !is_recallable_memory(m, &by_id, verified_only) {
-            continue;
-        }
-        if let Some(repo) = selected.as_deref()
-            && index.owner_of(&m.record_id) != Some(repo)
-        {
+        if !is_recallable_memory(m, &by_id, &edges_from, &tombstoned, verified_only) {
             continue;
         }
         let Some(record) = by_id.get(m.record_id.as_str()).copied() else {
@@ -3804,14 +3799,25 @@ fn query_semantic_memory(
             continue;
         };
 
-        // `is_recallable_memory` guarantees a citable handle is present.
-        let source_handle_value = source_handle
-            .clone()
-            .or_else(|| source_artifact_path.clone())
-            .or_else(|| session_id.clone())
-            .unwrap_or_default();
+        // Scope through the code this memory cites: memory nodes are not in the
+        // containment topology, so a `--repo` filter must resolve the repository
+        // from the linked code handles, not the memory record ID directly.
+        let owners = memory_repo_owners(&m.record_id, evidence_links.as_ref(), &index);
+        if let Some(repo) = selected.as_deref()
+            && !owners.contains(&repo)
+        {
+            continue;
+        }
 
-        let verified = memory_is_verified(evidence_links.as_ref(), &by_id);
+        // `is_recallable_memory` guarantees a present, non-blank handle; pick the
+        // first non-empty among source handle, artifact path, and session ID.
+        let source_handle_value = non_empty(source_handle.as_ref())
+            .or_else(|| non_empty(source_artifact_path.as_ref()))
+            .or_else(|| non_empty(session_id.as_ref()))
+            .unwrap_or_default()
+            .to_owned();
+
+        let verified = query::is_verified_claim(record, &by_id, &edges_from, &tombstoned);
 
         let linked_code_handles: Vec<String> = evidence_links
             .as_ref()
@@ -3826,7 +3832,7 @@ fn query_semantic_memory(
             })
             .unwrap_or_default();
 
-        let repository_id = index.owner_of(&m.record_id);
+        let repository_id = owners.first().copied();
         rows.push(MemoryRecallResult {
             record_id: record.id(),
             kind: record.node_kind_name().unwrap_or("Observation"),
@@ -3848,6 +3854,17 @@ fn query_semantic_memory(
             repository: repository_id.and_then(|id| index.display_of(id)),
         });
     }
+
+    // Canonical ordering before truncation (AC7): equal-score ANN results can be
+    // returned in arbitrary order, so sort by score descending then record ID
+    // ascending so repeated runs print byte-identical output and the row chosen
+    // at the `limit` boundary is stable.
+    rows.sort_by(|a, b| {
+        b.retrieval_score
+            .total_cmp(&a.retrieval_score)
+            .then_with(|| a.record_id.cmp(b.record_id))
+    });
+    rows.truncate(limit);
 
     if rows.is_empty() {
         eprintln!(
@@ -3974,6 +3991,16 @@ fn eval_semantic_cmd(
     let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
         .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
 
+    // The shared vector index may also hold agent-memory nodes (issue #91). The
+    // code-relevance gate must score only deterministic code hits, exactly like
+    // `eg query semantic`, so over-fetch the full pool and filter to File/Symbol
+    // before scoring; otherwise embedded memory could occupy top-k slots or
+    // count as ambiguous-query false positives and corrupt the gate.
+    let total_records = sink
+        .read_all_records()
+        .map(|r| r.len())
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
 
     let mut results = Vec::new();
@@ -3993,7 +4020,7 @@ fn eval_semantic_cmd(
             .embedding;
 
         let matches = sink
-            .semantic_search(&query_vector, top_k.max(3))
+            .semantic_search(&query_vector, total_records.max(top_k.max(3)))
             .with_context(|| {
                 format!(
                     "semantic search failed for query {} — was the store ingested with --embed?",
@@ -4001,7 +4028,16 @@ fn eval_semantic_cmd(
                 )
             })?;
 
-        let hits: Vec<SearchHit> = matches.iter().map(SearchHit::from).collect();
+        let hits: Vec<SearchHit> = matches
+            .iter()
+            .filter(|m| {
+                m.kind
+                    .as_deref()
+                    .is_some_and(|k| k == "File" || k == "Symbol")
+            })
+            .take(top_k.max(3))
+            .map(SearchHit::from)
+            .collect();
         #[allow(clippy::cast_possible_truncation)]
         results.push(evaluate_query(query, &hits, fp_threshold as f32));
     }
@@ -4058,6 +4094,7 @@ fn eval_memory_recall_cmd(
         .read_all_records()
         .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let (edges_from, tombstoned) = query::verification_support_indexes(&records);
 
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
 
@@ -4090,7 +4127,7 @@ fn eval_memory_recall_cmd(
 
         let hits: Vec<MemoryHit> = matches
             .iter()
-            .filter(|m| is_recallable_memory(m, &by_id, verified_only))
+            .filter(|m| is_recallable_memory(m, &by_id, &edges_from, &tombstoned, verified_only))
             .take(top_k.max(3))
             .map(|m| MemoryHit {
                 record_id: m.record_id.clone(),
