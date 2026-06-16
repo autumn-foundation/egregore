@@ -217,6 +217,9 @@ struct FreshnessIndex<'a> {
     /// `SUPERSEDES` edge, or a `SUPERSEDES` evidence link). These are excluded from
     /// the current view — both superseded observations and superseded code handles.
     superseded_ids: BTreeSet<&'a str>,
+    /// Tip commits (no other commit's parent). Empty for edge-less graphs. Used to
+    /// resolve unanchored triple citations against the frontier only.
+    tips: BTreeSet<&'a str>,
 }
 
 impl<'a> FreshnessIndex<'a> {
@@ -275,14 +278,37 @@ impl<'a> FreshnessIndex<'a> {
         // (e.g. a renamed/replaced symbol), via the node's `superseded_by` field, a
         // live `SUPERSEDES` edge, or a `SUPERSEDES` evidence link.
         let mut superseded_ids: BTreeSet<&str> = BTreeSet::new();
+        // The node's own `superseded_by` marker is decided from the LATEST physical
+        // row per stable ID, so a restored row re-emitted without the marker clears
+        // an earlier supersession — mirroring tombstone restoration.
+        let mut last_node_superseded: BTreeMap<&str, bool> = BTreeMap::new();
         for record in records {
             match record {
                 GraphRecord::Node {
                     id,
-                    superseded_by: Some(target),
+                    superseded_by,
+                    evidence_links,
                     ..
-                } if !target.is_empty() => {
-                    superseded_ids.insert(id.as_str());
+                } => {
+                    last_node_superseded.insert(
+                        id.as_str(),
+                        superseded_by.as_deref().is_some_and(|s| !s.is_empty()),
+                    );
+                    // A `SUPERSEDES` evidence link is honored only when its source
+                    // (this node) is not itself actively tombstoned — a retracted
+                    // superseding note must not hide the older record.
+                    if let Some(links) = evidence_links
+                        && !tombstone_by_deleted.contains_key(id.as_str())
+                    {
+                        for link in links {
+                            if link.relation == crate::ir::EdgeLabel::Supersedes.as_str()
+                                && let Some(target) = link.target_record_id.as_deref()
+                                && !target.is_empty()
+                            {
+                                superseded_ids.insert(target);
+                            }
+                        }
+                    }
                 }
                 GraphRecord::Edge {
                     id,
@@ -292,20 +318,12 @@ impl<'a> FreshnessIndex<'a> {
                 } if !tombstone_by_deleted.contains_key(id.as_str()) => {
                     superseded_ids.insert(target.as_str());
                 }
-                GraphRecord::Node {
-                    evidence_links: Some(links),
-                    ..
-                } => {
-                    for link in links {
-                        if link.relation == crate::ir::EdgeLabel::Supersedes.as_str()
-                            && let Some(target) = link.target_record_id.as_deref()
-                            && !target.is_empty()
-                        {
-                            superseded_ids.insert(target);
-                        }
-                    }
-                }
                 _ => {}
+            }
+        }
+        for (id, superseded) in &last_node_superseded {
+            if *superseded {
+                superseded_ids.insert(id);
             }
         }
 
@@ -413,6 +431,7 @@ impl<'a> FreshnessIndex<'a> {
             all_code_handles,
             commit_children,
             superseded_ids,
+            tips,
         }
     }
 
@@ -453,14 +472,20 @@ impl<'a> FreshnessIndex<'a> {
             .is_some_and(|kind| !is_code_handle_kind(*kind))
     }
 
-    /// Resolves a triple `(path, span)` to a live code node ID, preferring a
-    /// span-equal handle (symbol-level), falling back to the File for the path.
+    /// Resolves an unanchored triple `(path, span)` to a live code node ID against
+    /// the **frontier** only: a version is matched only when it sits at a tip commit
+    /// (or carries no commit, i.e. current-tree). A span that matched only a
+    /// historical (non-frontier) version no longer resolves, so a note recorded
+    /// against a since-moved span is `unresolved` rather than a stale `current`.
+    ///
+    /// A spanned triple targets a symbol/module/import, never the file: if no live
+    /// frontier handle matches the span it returns `None` (→ `unresolved`), and only
+    /// a path-only triple (no span) falls back to the file.
     ///
     /// A triple with no `target_record_id` carries no repository identity, so in a
     /// shared multi-repo store the same `(path, span)` can match handles in more
     /// than one repository. Such ambiguous matches are **not** silently resolved
-    /// to an arbitrary one — they return `None` so the verdict is `unresolved`
-    /// rather than a false comparison against another repository's symbol.
+    /// to an arbitrary one — they return `None` so the verdict is `unresolved`.
     fn resolve_triple(&self, path: &str, span: Option<&SourceSpan>) -> Option<&'a str> {
         let mut span_matches: BTreeSet<&str> = BTreeSet::new();
         let mut file_matches: BTreeSet<&str> = BTreeSet::new();
@@ -479,13 +504,19 @@ impl<'a> FreshnessIndex<'a> {
                 if rp != path {
                     continue;
                 }
+                // Match against the frontier only: skip historical (non-tip) versions
+                // when the graph carries commit ancestry.
+                if !self.tips.is_empty()
+                    && !version_commit(record).is_none_or(|c| self.tips.contains(c))
+                {
+                    continue;
+                }
                 match kind {
                     NodeKind::File => {
                         file_matches.insert(id.as_str());
                     }
                     // A triple can name any code handle (`Symbol`/`Module`/`Import`),
-                    // not just a symbol; match the span for all of them before
-                    // falling back to the whole file.
+                    // not just a symbol; match the span for all of them.
                     k if is_code_handle_kind(*k)
                         && span.is_some()
                         && node_span.as_ref() == span =>
@@ -496,7 +527,13 @@ impl<'a> FreshnessIndex<'a> {
                 }
             }
         }
-        unique_match(&span_matches).or_else(|| unique_match(&file_matches))
+        // A spanned citation never falls back to the whole file; only a path-only
+        // triple does.
+        if span.is_some() {
+            unique_match(&span_matches)
+        } else {
+            unique_match(&file_matches)
+        }
     }
 
     /// Resolves a triple `(path, span)` to the code node that occupied it **at the
@@ -544,9 +581,14 @@ impl<'a> FreshnessIndex<'a> {
                 _ => {}
             }
         }
-        // Ambiguous matches (same path/span/commit across repositories) are left
-        // unresolved rather than compared against an arbitrary repository.
-        unique_match(&span_matches).or_else(|| unique_match(&file_matches))
+        // A spanned citation never falls back to the whole file (a moved/removed
+        // symbol must be `unresolved`, not the file). Ambiguous matches (same
+        // path/span/commit across repositories) are also left unresolved.
+        if span.is_some() {
+            unique_match(&span_matches)
+        } else {
+            unique_match(&file_matches)
+        }
     }
 }
 
@@ -742,6 +784,7 @@ fn sort_key(handle: &CitedHandle) -> (String, String, String, String) {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn classify_link(
     index: &FreshnessIndex<'_>,
     observation_id: &str,
@@ -750,11 +793,23 @@ fn classify_link(
     obs_valid_time: Option<&str>,
     link: &crate::ir::EvidenceLink,
 ) -> FreshnessVerdictEntry {
+    // Freshness anchor: when was the cited state recorded. `as_of_commit` first,
+    // then the triple's `target_git_commit`.
     let anchor_commit = link
         .as_of_commit
         .as_deref()
         .filter(|s| !s.is_empty())
         .or_else(|| link.target_git_commit.as_deref().filter(|s| !s.is_empty()));
+
+    // Identity-resolution commit: the schema defines `target_git_commit` as the
+    // commit at which to resolve the cited node, distinct from the freshness
+    // anchor `as_of_commit`. Prefer it so the citation binds to the identity that
+    // occupied the path/span at that commit, even if `as_of_commit` later reused it.
+    let identity_commit = link
+        .target_git_commit
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or(anchor_commit);
 
     // Resolve the cited handle to a code node ID (record ID first, triple next).
     // A triple anchored to a commit is resolved at that commit so the citation
@@ -768,7 +823,7 @@ fn classify_link(
         .or_else(|| {
             link.target_repo_relative_path.as_deref().and_then(|p| {
                 let span = link.target_span.as_ref();
-                anchor_commit
+                identity_commit
                     .and_then(|commit| index.resolve_triple_at_commit(p, span, commit))
                     .or_else(|| index.resolve_triple(p, span))
             })
@@ -909,6 +964,7 @@ fn drift_record_trigger(
         if !after_anchor(
             &drift.after_valid_time,
             &drift.before_git_commit,
+            &drift.after_git_commit,
             anchor_commit,
             anchor_valid_time,
             anchor_descendants,
@@ -942,26 +998,27 @@ fn drift_record_trigger(
 fn after_anchor(
     after_valid_time: &str,
     before_git_commit: &str,
+    after_git_commit: &str,
     anchor_commit: Option<&str>,
     anchor_valid_time: Option<&str>,
     anchor_descendants: &BTreeSet<&str>,
     has_ancestry: bool,
 ) -> bool {
-    // A drift whose "before" state is exactly the anchor commit measured change
-    // from the cited version forward — a drift regardless of timestamps. Checked
-    // first so consecutive commits sharing a committer timestamp (no strictly
-    // greater valid-time) are not missed.
+    // With commit ancestry available, a drift is post-anchor only when its *after*
+    // commit is a descendant of the anchor — the new code state lies forward on the
+    // anchored branch. This both catches rebased/backdated descendants (timestamps
+    // can lie) and rejects a drift that merely *begins* at the anchor but lands on a
+    // sibling/unmerged branch, which is not a later state of the anchored code.
+    if has_ancestry && anchor_commit.is_some() {
+        return anchor_descendants.contains(after_git_commit);
+    }
+    // No ancestry to trust. A drift whose "before" state is exactly the anchor
+    // commit measured change from the cited version forward — a drift regardless of
+    // timestamps (consecutive commits can share a committer timestamp).
     if anchor_commit.is_some_and(|c| before_git_commit == c) {
         return true;
     }
-    // With commit ancestry available, a drift is post-anchor only when it begins
-    // at a descendant of the anchor commit (rebases/clock skew can backdate it, so
-    // reachability — not timestamps — is authoritative). A drift beginning off the
-    // anchored branch is a side branch and does not count.
-    if has_ancestry && anchor_commit.is_some() {
-        return anchor_descendants.contains(before_git_commit);
-    }
-    // No ancestry to trust: fall back to a strictly later valid-time.
+    // Otherwise fall back to a strictly later valid-time.
     if let Some(anchor_vt) = anchor_valid_time {
         return time_after(after_valid_time, anchor_vt);
     }

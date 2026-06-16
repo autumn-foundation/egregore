@@ -2480,3 +2480,373 @@ fn superseded_code_handle_is_unresolved() {
     let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
     assert_eq!(entry.verdict, FreshnessVerdict::Unresolved);
 }
+
+// ── Node supersession is cleared by a later restored row (#285) ──────────────
+
+#[test]
+fn restored_row_clears_node_supersession() {
+    // An older physical row carries `superseded_by`; a later row for the same ID
+    // is restored without it. The current view exposes the restored note, so
+    // freshness must classify it, not skip it forever.
+    let path = "src/rr.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let obs_id = agent_memory_stable_id(&["obs", "rr"]);
+    let superseded_row = observation(
+        &obs_id,
+        "f",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    )
+    .with_superseded_by("some:replacement");
+    let restored_row = observation(
+        &obs_id,
+        "f",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    );
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "b",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        superseded_row,
+        restored_row,
+    ];
+    let verdicts = freshness::evidence_link_freshness(&records);
+    assert!(
+        verdicts.iter().any(|e| e.observation_id == obs_id),
+        "a restored note must be classified, not skipped"
+    );
+}
+
+// ── A retracted superseding note does not hide the old note (#304) ───────────
+
+#[test]
+fn tombstoned_superseding_note_does_not_hide_old() {
+    // A newer note N supersedes O via a SUPERSEDES evidence link, but N is then
+    // tombstoned (retracted). With the only supersession evidence gone, O is still
+    // current and must be classified.
+    let path = "src/ts.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let old = agent_memory_stable_id(&["obs", "old"]);
+    let new = agent_memory_stable_id(&["obs", "new"]);
+    let mut superseding = observation(
+        &new,
+        "f (new)",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    );
+    if let GraphRecord::Node {
+        evidence_links: Some(links),
+        ..
+    } = &mut superseding
+    {
+        links.push(EvidenceLink {
+            target_record_id: Some(old.clone()),
+            target_domain: "agent_memory".to_owned(),
+            relation: "SUPERSEDES".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        });
+    }
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "b",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        observation(
+            &old,
+            "f (old)",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+        superseding,
+        GraphRecord::Tombstone {
+            id: stable_id(&["tombstone", &new]),
+            schema_version: aletheia_egregore::SCHEMA_VERSION,
+            deleted_id: new.clone(),
+            summary: "superseding note retracted".to_owned(),
+            producer: None,
+        },
+    ];
+    let verdicts = freshness::evidence_link_freshness(&records);
+    assert!(
+        verdicts.iter().any(|e| e.observation_id == old),
+        "a retracted supersession must not hide the old note"
+    );
+}
+
+// ── A spanned triple to a removed symbol is unresolved, not the file (#499) ──
+
+#[test]
+fn spanned_triple_does_not_fall_back_to_file() {
+    let path = "src/sp.rs";
+    let file = stable_id(&["node", "File", "repo-a", path]);
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "gone", "0"]);
+    let records = vec![
+        file_version(&file, path, "fb", "commit_a", "2026-01-01T00:00:00Z"),
+        symbol_version(
+            &sym,
+            path,
+            "gone",
+            span(10, 20),
+            "g",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        GraphRecord::Tombstone {
+            id: stable_id(&["tombstone", &sym]),
+            schema_version: aletheia_egregore::SCHEMA_VERSION,
+            deleted_id: sym.clone(),
+            summary: "gone removed".to_owned(),
+            producer: None,
+        },
+        observation(
+            &agent_memory_stable_id(&["obs", "sp"]),
+            "the symbol",
+            "0.9",
+            None,
+            Some(path),
+            Some(span(10, 20)),
+            "OBSERVES",
+            None,
+            None,
+        ),
+    ];
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "sp"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(entry.verdict, FreshnessVerdict::Unresolved);
+}
+
+// ── A drift that lands on a sibling branch is not drift of the anchor (#955) ──
+
+#[test]
+fn drift_landing_on_sibling_branch_is_not_post_anchor() {
+    let path = "src/dl.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let records = vec![
+        symbol_version_p(
+            &sym,
+            path,
+            "same",
+            "commit_a",
+            &["commit_p"],
+            "2026-01-01T00:00:00Z",
+        ),
+        symbol_version_p(
+            &sym,
+            path,
+            "same",
+            "commit_s",
+            &["commit_p"],
+            "2026-02-01T00:00:00Z",
+        ),
+        GraphRecord::node(
+            semantic_stable_id(&["drift", "sib"]),
+            NodeKind::SemanticDrift,
+            None,
+            None,
+            None,
+            "Drift".to_owned(),
+        )
+        .with_domain("semantic", SEMANTIC_SCHEMA_VERSION)
+        .with_semantic_drift(SemanticDriftMetadata {
+            embedding_model: EmbeddingModel {
+                provider: "p".to_owned(),
+                name: "m".to_owned(),
+                version: "v".to_owned(),
+                dim: 8,
+                content_hash: "h".to_owned(),
+            },
+            target_record_id: sym.clone(),
+            prior_record_id: sym.clone(),
+            before_git_commit: "commit_a".to_owned(),
+            after_git_commit: "commit_s".to_owned(),
+            before_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            after_valid_time: "2026-02-01T00:00:00Z".to_owned(),
+            metric_kind: MetricKind::CosineDistance,
+            score: 0.7,
+            selection_threshold: 0.2,
+            selection_basis: SelectionBasis::ThresholdOnly,
+        }),
+        observation(
+            &agent_memory_stable_id(&["obs", "dl"]),
+            "f on A",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "dl"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(
+        entry.verdict,
+        FreshnessVerdict::Current,
+        "a drift onto a sibling branch is not a later state of the anchored branch"
+    );
+}
+
+// ── Triple identity resolves at target_git_commit, anchor stays as_of (#772) ──
+
+#[test]
+fn triple_identity_uses_target_git_commit() {
+    // OLD occupied (path, span) at c1 and was removed; NEW reused the same
+    // (path, span) at c2. The link records target_git_commit=c1 (identity) and
+    // as_of_commit=c2 (freshness anchor). Identity must bind to OLD at c1 →
+    // unresolved, not silently re-point at NEW.
+    let path = "src/ti.rs";
+    let old = stable_id(&["node", "symbol", "fn", "repo-a", path, "old", "0"]);
+    let new = stable_id(&["node", "symbol", "fn", "repo-a", path, "new", "0"]);
+    let mut obs = observation(
+        &agent_memory_stable_id(&["obs", "ti"]),
+        "the symbol",
+        "0.9",
+        None,
+        Some(path),
+        Some(span(10, 20)),
+        "OBSERVES",
+        Some("commit_c2"),
+        None,
+    );
+    if let GraphRecord::Node {
+        evidence_links: Some(links),
+        ..
+    } = &mut obs
+    {
+        links[0].target_git_commit = Some("commit_c1".to_owned());
+    }
+    let records = vec![
+        symbol_version(
+            &old,
+            path,
+            "old",
+            span(10, 20),
+            "ob",
+            "commit_c1",
+            "2026-01-01T00:00:00Z",
+        ),
+        GraphRecord::Tombstone {
+            id: stable_id(&["tombstone", &old]),
+            schema_version: aletheia_egregore::SCHEMA_VERSION,
+            deleted_id: old.clone(),
+            summary: "old removed".to_owned(),
+            producer: None,
+        },
+        symbol_version(
+            &new,
+            path,
+            "new",
+            span(10, 20),
+            "nb",
+            "commit_c2",
+            "2026-01-02T00:00:00Z",
+        ),
+        obs,
+    ];
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs_id = agent_memory_stable_id(&["obs", "ti"]);
+    let entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs_id)
+        .unwrap();
+    assert_eq!(entry.verdict, FreshnessVerdict::Unresolved);
+}
+
+// ── Unanchored triples resolve against frontier spans only (#468) ─────────────
+
+#[test]
+fn unanchored_triple_matches_frontier_span_only() {
+    // The symbol is still live but its span moved (S1 at c1 → S2 at the tip c2). A
+    // note recorded with the old span S1 and no anchor commit must be `unresolved`
+    // against the frontier, not resolved through the historical version.
+    let path = "src/uf.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let mut v1 = symbol_version(
+        &sym,
+        path,
+        "f",
+        span(10, 20),
+        "b",
+        "commit_a",
+        "2026-01-01T00:00:00Z",
+    );
+    let mut v2 = symbol_version(
+        &sym,
+        path,
+        "f",
+        span(30, 40),
+        "b",
+        "commit_b",
+        "2026-01-02T00:00:00Z",
+    );
+    if let GraphRecord::Node {
+        temporal: Some(t), ..
+    } = &mut v2
+    {
+        t.git_parent_commits = vec!["commit_a".to_owned()];
+    }
+    // (v1 keeps empty parents; commit_a is the root.)
+    let _ = &mut v1;
+    let records = vec![
+        v1,
+        v2,
+        observation(
+            &agent_memory_stable_id(&["obs", "uf"]),
+            "old span",
+            "0.9",
+            None,
+            Some(path),
+            Some(span(10, 20)),
+            "OBSERVES",
+            None,
+            None,
+        ),
+    ];
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "uf"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(
+        entry.verdict,
+        FreshnessVerdict::Unresolved,
+        "old span must not resolve through a historical version"
+    );
+}
