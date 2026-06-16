@@ -2430,3 +2430,53 @@ fn side_branch_version_does_not_falsely_drift() {
         "a sibling side-branch change is not drift of the anchored branch"
     );
 }
+
+// ── A superseded (renamed/replaced) code handle resolves unresolved ──────────
+
+#[test]
+fn superseded_code_handle_is_unresolved() {
+    // A symbol was renamed/replaced: its old handle carries `superseded_by` and the
+    // replacement is present. An observation citing the old handle must be
+    // `unresolved` (the cited identity is no longer current), not `current`.
+    let path = "src/sc.rs";
+    let old_sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "old", "0"]);
+    let new_sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "new", "0"]);
+    let old_handle = symbol_version(
+        &old_sym,
+        path,
+        "old",
+        span(10, 20),
+        "old_body",
+        "commit_a",
+        "2026-01-01T00:00:00Z",
+    )
+    .with_superseded_by(&new_sym);
+    let records = vec![
+        old_handle,
+        symbol_version(
+            &new_sym,
+            path,
+            "new",
+            span(10, 20),
+            "new_body",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        observation(
+            &agent_memory_stable_id(&["obs", "sc"]),
+            "old did the thing",
+            "0.9",
+            Some(&old_sym),
+            Some(path),
+            Some(span(10, 20)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "sc"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(entry.verdict, FreshnessVerdict::Unresolved);
+}

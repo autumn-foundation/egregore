@@ -213,6 +213,10 @@ struct FreshnessIndex<'a> {
     /// Commit DAG child adjacency (`parent → children`), used to decide whether a
     /// version is a descendant of an anchor commit regardless of timestamps.
     commit_children: BTreeMap<&'a str, BTreeSet<&'a str>>,
+    /// Record IDs that have been superseded (by a node's `superseded_by`, a live
+    /// `SUPERSEDES` edge, or a `SUPERSEDES` evidence link). These are excluded from
+    /// the current view — both superseded observations and superseded code handles.
+    superseded_ids: BTreeSet<&'a str>,
 }
 
 impl<'a> FreshnessIndex<'a> {
@@ -265,12 +269,57 @@ impl<'a> FreshnessIndex<'a> {
             }
         }
 
+        // Superseded IDs: a record replaced by a newer one is non-current, the same
+        // way the store's current-state read and the memory query paths treat it.
+        // This covers both superseded observations and superseded code handles
+        // (e.g. a renamed/replaced symbol), via the node's `superseded_by` field, a
+        // live `SUPERSEDES` edge, or a `SUPERSEDES` evidence link.
+        let mut superseded_ids: BTreeSet<&str> = BTreeSet::new();
+        for record in records {
+            match record {
+                GraphRecord::Node {
+                    id,
+                    superseded_by: Some(target),
+                    ..
+                } if !target.is_empty() => {
+                    superseded_ids.insert(id.as_str());
+                }
+                GraphRecord::Edge {
+                    id,
+                    label: crate::ir::EdgeLabel::Supersedes,
+                    target,
+                    ..
+                } if !tombstone_by_deleted.contains_key(id.as_str()) => {
+                    superseded_ids.insert(target.as_str());
+                }
+                GraphRecord::Node {
+                    evidence_links: Some(links),
+                    ..
+                } => {
+                    for link in links {
+                        if link.relation == crate::ir::EdgeLabel::Supersedes.as_str()
+                            && let Some(target) = link.target_record_id.as_deref()
+                            && !target.is_empty()
+                        {
+                            superseded_ids.insert(target);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         for record in records {
             if let GraphRecord::Node { id, kind, .. } = record {
                 kind_by_id.insert(id.as_str(), *kind);
                 if is_code_handle_kind(*kind) {
                     all_code_handles.push(record);
-                    if !tombstone_by_deleted.contains_key(id.as_str()) {
+                    // A superseded handle is kept for anchor lookup (above) but is
+                    // not a current code fact, so it is excluded from the live index
+                    // — a citation to a renamed/replaced symbol resolves `unresolved`.
+                    if !tombstone_by_deleted.contains_key(id.as_str())
+                        && !superseded_ids.contains(id.as_str())
+                    {
                         live_code_by_id.entry(id).or_default().push(record);
                     }
                 } else if let (NodeKind::SemanticDrift, Some(drift)) =
@@ -363,6 +412,7 @@ impl<'a> FreshnessIndex<'a> {
             kind_by_id,
             all_code_handles,
             commit_children,
+            superseded_ids,
         }
     }
 
@@ -561,54 +611,10 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
     // Freshness reads the history-inclusive store view so superseded *code*
     // versions are available for comparison, but that view also surfaces
     // superseded and re-ingested *memory* rows. Collapse observations to the
-    // current view — skip superseded notes and emit each observation ID once —
-    // so a re-ingest or retained older version cannot yield duplicate or
-    // non-current verdicts. Code handles keep all their versions.
-    //
-    // Collect superseded IDs in a first pass: the history-inclusive view can emit
-    // the original row (no marker) before the updated row that carries
-    // `superseded_by`, so a first-seen check during the main pass would classify
-    // the stale row before ever seeing the supersession marker.
-    let mut superseded_ids: BTreeSet<&str> = BTreeSet::new();
-    for record in records {
-        match record {
-            // The `superseded_by` field on the replaced note itself.
-            GraphRecord::Node {
-                id,
-                superseded_by: Some(target),
-                ..
-            } if !target.is_empty() => {
-                superseded_ids.insert(id.as_str());
-            }
-            // A `SUPERSEDES` edge: `source` supersedes `target`, so the edge target
-            // is the replaced note (the same direction the memory query paths use),
-            // even when the replaced node never materialized `superseded_by`. A
-            // retracted (tombstoned) supersession edge must not hide the old note.
-            GraphRecord::Edge {
-                id,
-                label: crate::ir::EdgeLabel::Supersedes,
-                target,
-                ..
-            } if !index.tombstone_by_deleted.contains_key(id.as_str()) => {
-                superseded_ids.insert(target.as_str());
-            }
-            // A `SUPERSEDES` evidence link on the newer note pointing at the old one.
-            GraphRecord::Node {
-                evidence_links: Some(links),
-                ..
-            } => {
-                for link in links {
-                    if link.relation == crate::ir::EdgeLabel::Supersedes.as_str()
-                        && let Some(target) = link.target_record_id.as_deref()
-                        && !target.is_empty()
-                    {
-                        superseded_ids.insert(target);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    // current view — skip superseded notes (via the index's order-independent
+    // superseded set) and emit each observation ID once — so a re-ingest or
+    // retained older version cannot yield duplicate or non-current verdicts.
+    let superseded_ids = &index.superseded_ids;
     let mut seen_observations: BTreeSet<&str> = BTreeSet::new();
 
     for record in records {
