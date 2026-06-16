@@ -104,14 +104,31 @@ The commit graph is read from every temporal record — `Commit`/`Change` nodes
 included — not just code handles, so a HEAD commit that deletes the last code
 file (no code-handle version, but still a `Commit` node) is correctly the tip and
 citations to the removed code resolve to `unresolved`. For the same reason a
-commit-anchored content comparison follows the commit-parent edge rather than the
-timestamp: a direct child of the anchor commit is the later code state even when a
-rebase or clock skew backdated it.
+commit-anchored content comparison follows commit **ancestry** rather than the
+timestamp: any descendant of the anchor commit (child, grandchild, …) is a later
+code state even when a rebase or clock skew backdated it. Timestamps, when
+compared, are ordered by parsed instant so mixed UTC offsets (`scan-history`
+preserves Git's committer offset) compare correctly.
 
 A `--data-dir` query reads the **superseded-inclusive** store view (the same
 history surface as `eg query drift`), so the pre-change code version an
 observation was anchored against is available for comparison even after later
-scans.
+scans. Memory rows are collapsed to the current view: a retracted (tombstoned, or
+restored-then-current) note and notes superseded by a `superseded_by` field, a
+`SUPERSEDES` edge, or a `SUPERSEDES` evidence link are excluded, and re-ingested
+duplicate rows are classified once.
+
+### Known limitations
+
+- **Multi-repo shared commit history.** Commit tips are computed across the whole
+  store. If two repositories in one store share a commit SHA and one repo's HEAD
+  is another's interior commit, a handle at that HEAD can be conservatively
+  reported `unresolved`. Tracked as a follow-up (per-repository tip partitioning).
+- **Repeated current-tree `scan`s.** Content-drift and liveness are derived from
+  commit history (`scan-history`); repeated current-tree full scans (node-level
+  `valid_time`, no commits or tombstones) are not compared by content, and a
+  handle deleted between two such scans is not flagged `unresolved`. Use
+  `scan-history` for drift detection. Tracked as a follow-up.
 
 ### Trigger sources (reused, never re-derived)
 

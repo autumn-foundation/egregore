@@ -210,9 +210,13 @@ struct FreshnessIndex<'a> {
     /// Every code-handle node version, including historical and tombstoned ones,
     /// used to resolve a triple citation at the commit it was anchored to.
     all_code_handles: Vec<&'a GraphRecord>,
+    /// Commit DAG child adjacency (`parent → children`), used to decide whether a
+    /// version is a descendant of an anchor commit regardless of timestamps.
+    commit_children: BTreeMap<&'a str, BTreeSet<&'a str>>,
 }
 
 impl<'a> FreshnessIndex<'a> {
+    #[allow(clippy::too_many_lines)]
     fn build(records: &'a [GraphRecord]) -> Self {
         let mut live_code_by_id: BTreeMap<&str, Vec<&GraphRecord>> = BTreeMap::new();
         let mut tombstone_by_deleted: BTreeMap<&str, &str> = BTreeMap::new();
@@ -225,10 +229,38 @@ impl<'a> FreshnessIndex<'a> {
         // stale or filtered out of the slice.
         let mut drift_meta_by_id: BTreeMap<&str, &SemanticDriftMetadata> = BTreeMap::new();
 
-        // First pass: tombstones so liveness is decided independent of record order.
-        for record in records {
-            if let GraphRecord::Tombstone { id, deleted_id, .. } = record {
-                tombstone_by_deleted.entry(deleted_id).or_insert(id);
+        // First pass: active tombstones. In an append-only graph a delete can be
+        // followed by re-ingesting the same stable ID (restoration), so a
+        // tombstone is "active" only when it is the *latest* event for its deleted
+        // ID — a later node version supersedes it and the handle is live again.
+        // Treating every tombstone line as current would report a restored handle
+        // as `unresolved`.
+        let mut last_node_idx: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut last_tombstone: BTreeMap<&str, (usize, &str)> = BTreeMap::new();
+        for (idx, record) in records.iter().enumerate() {
+            match record {
+                GraphRecord::Node { id, .. } => {
+                    last_node_idx.insert(id.as_str(), idx);
+                }
+                GraphRecord::Tombstone { id, deleted_id, .. } => {
+                    last_tombstone
+                        .entry(deleted_id.as_str())
+                        .and_modify(|e| {
+                            if idx > e.0 {
+                                *e = (idx, id.as_str());
+                            }
+                        })
+                        .or_insert((idx, id.as_str()));
+                }
+                GraphRecord::Edge { .. } => {}
+            }
+        }
+        for (deleted_id, (t_idx, t_id)) in &last_tombstone {
+            let restored = last_node_idx
+                .get(deleted_id)
+                .is_some_and(|n_idx| n_idx > t_idx);
+            if !restored {
+                tombstone_by_deleted.insert(deleted_id, t_id);
             }
         }
 
@@ -276,19 +308,22 @@ impl<'a> FreshnessIndex<'a> {
         // so without it the deletion commit would be missing from the graph, the
         // prior commit would look like the tip, and a citation to the now-deleted
         // code would be reported `current` instead of `unresolved`.
-        let mut all_commits: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        let mut parent_commits: std::collections::BTreeSet<&str> =
-            std::collections::BTreeSet::new();
+        let mut all_commits: BTreeSet<&str> = BTreeSet::new();
+        let mut parent_commits: BTreeSet<&str> = BTreeSet::new();
+        let mut commit_children: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for record in records {
             if let Some(commit) = version_commit(record) {
                 all_commits.insert(commit);
-            }
-            for parent in version_parents(record) {
-                parent_commits.insert(parent.as_str());
+                for parent in version_parents(record) {
+                    parent_commits.insert(parent.as_str());
+                    commit_children
+                        .entry(parent.as_str())
+                        .or_default()
+                        .insert(commit);
+                }
             }
         }
-        let tips: std::collections::BTreeSet<&str> =
-            all_commits.difference(&parent_commits).copied().collect();
+        let tips: BTreeSet<&str> = all_commits.difference(&parent_commits).copied().collect();
         if !tips.is_empty() {
             live_code_by_id.retain(|_id, versions| {
                 versions.iter().any(|r| {
@@ -326,7 +361,27 @@ impl<'a> FreshnessIndex<'a> {
             drifts_by_prior,
             kind_by_id,
             all_code_handles,
+            commit_children,
         }
+    }
+
+    /// Commits reachable forward from `commit` through child edges (its
+    /// descendants, excluding `commit` itself). A version at any of these is a
+    /// later code state than an anchor at `commit`, regardless of committer
+    /// timestamps (rebases/clock skew can backdate a descendant).
+    fn descendants_of(&self, commit: &str) -> BTreeSet<&'a str> {
+        let mut seen: BTreeSet<&'a str> = BTreeSet::new();
+        let mut stack: Vec<&str> = vec![commit];
+        while let Some(current) = stack.pop() {
+            if let Some(children) = self.commit_children.get(current) {
+                for &child in children {
+                    if seen.insert(child) {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+        seen
     }
 
     /// True when `record_id` resolves to a codegraph record that is *not* a code
@@ -489,6 +544,7 @@ const fn is_observation_kind(kind: NodeKind) -> bool {
 /// observation ID, then cited handle, so the same store yields byte-identical
 /// output across runs (AC8). No records are created, modified, or deleted.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictEntry> {
     let index = FreshnessIndex::build(records);
     let mut entries: Vec<FreshnessVerdictEntry> = Vec::new();
@@ -505,14 +561,40 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
     // the stale row before ever seeing the supersession marker.
     let mut superseded_ids: BTreeSet<&str> = BTreeSet::new();
     for record in records {
-        if let GraphRecord::Node {
-            id,
-            superseded_by: Some(target),
-            ..
-        } = record
-            && !target.is_empty()
-        {
-            superseded_ids.insert(id.as_str());
+        match record {
+            // The `superseded_by` field on the replaced note itself.
+            GraphRecord::Node {
+                id,
+                superseded_by: Some(target),
+                ..
+            } if !target.is_empty() => {
+                superseded_ids.insert(id.as_str());
+            }
+            // A `SUPERSEDES` edge: `source` supersedes `target`, so the edge target
+            // is the replaced note (the same direction the memory query paths use),
+            // even when the replaced node never materialized `superseded_by`.
+            GraphRecord::Edge {
+                label: crate::ir::EdgeLabel::Supersedes,
+                target,
+                ..
+            } => {
+                superseded_ids.insert(target.as_str());
+            }
+            // A `SUPERSEDES` evidence link on the newer note pointing at the old one.
+            GraphRecord::Node {
+                evidence_links: Some(links),
+                ..
+            } => {
+                for link in links {
+                    if link.relation == crate::ir::EdgeLabel::Supersedes.as_str()
+                        && let Some(target) = link.target_record_id.as_deref()
+                        && !target.is_empty()
+                    {
+                        superseded_ids.insert(target);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     let mut seen_observations: BTreeSet<&str> = BTreeSet::new();
@@ -749,10 +831,21 @@ fn classify_link(
     }
 
     // (3) Drifted vs current. Prefer an explicit drift record; fall back to a
-    // content change across code-graph versions of the same handle.
+    // content change across code-graph versions of the same handle. Commit-anchored
+    // comparisons treat any descendant of the anchor commit as later code.
+    let anchor_descendants = anchor_commit
+        .map(|c| index.descendants_of(c))
+        .unwrap_or_default();
     let trigger =
         drift_record_trigger(index, cited_id, anchor_commit, anchor_valid_time.as_deref()).or_else(
-            || content_change_trigger(versions, anchor_commit, anchor_valid_time.as_deref()),
+            || {
+                content_change_trigger(
+                    versions,
+                    anchor_commit,
+                    anchor_valid_time.as_deref(),
+                    &anchor_descendants,
+                )
+            },
         );
 
     cited_handle.anchor_valid_time = anchor_valid_time;
@@ -797,8 +890,12 @@ fn drift_record_trigger(
         let take = match best {
             None => true,
             Some((best_id, best_drift)) => {
-                (drift.after_valid_time.as_str(), drift_id)
-                    < (best_drift.after_valid_time.as_str(), best_id)
+                // Earliest post-anchor measurement, by parsed instant then ID.
+                matches!(
+                    time_cmp(&drift.after_valid_time, &best_drift.after_valid_time)
+                        .then_with(|| drift_id.cmp(best_id)),
+                    std::cmp::Ordering::Less
+                )
             }
         };
         if take {
@@ -839,6 +936,7 @@ fn content_change_trigger(
     versions: &[&GraphRecord],
     anchor_commit: Option<&str>,
     anchor_valid_time: Option<&str>,
+    anchor_descendants: &BTreeSet<&str>,
 ) -> Option<TriggeringHandle> {
     let anchor_vt = anchor_valid_time?;
     let anchor_version = anchor_commit
@@ -851,27 +949,27 @@ fn content_change_trigger(
         .iter()
         .copied()
         .filter(|r| {
-            // A direct child of the anchor commit is the later code state
-            // regardless of committer-timestamp direction: consecutive commits can
-            // share a timestamp, and rebases/clock skew can even backdate a child.
-            // The commit-parent relationship wins for commit-anchored comparisons,
-            // mirroring the drift path's anchor-commit check; otherwise fall back to
-            // a strictly later valid-time.
-            if anchor_commit.is_some_and(|ac| version_parents(r).iter().any(|p| p == ac)) {
+            // Any descendant of the anchor commit is a later code state regardless
+            // of committer-timestamp direction — consecutive commits can share a
+            // timestamp, and rebases/clock skew can backdate a child or grandchild.
+            // Commit ancestry wins for commit-anchored comparisons; otherwise fall
+            // back to a strictly later valid-time.
+            if version_commit(r).is_some_and(|c| anchor_descendants.contains(c)) {
                 return true;
             }
             version_valid(r).is_some_and(|vt| time_after(vt, anchor_vt))
         })
         .collect();
     later.sort_by(|a, b| {
-        version_valid(a)
-            .unwrap_or_default()
-            .cmp(version_valid(b).unwrap_or_default())
-            .then_with(|| {
-                version_commit(a)
-                    .unwrap_or_default()
-                    .cmp(version_commit(b).unwrap_or_default())
-            })
+        time_cmp(
+            version_valid(a).unwrap_or_default(),
+            version_valid(b).unwrap_or_default(),
+        )
+        .then_with(|| {
+            version_commit(a)
+                .unwrap_or_default()
+                .cmp(version_commit(b).unwrap_or_default())
+        })
     });
 
     later.into_iter().find_map(|record| {
@@ -898,9 +996,10 @@ fn at_or_before<'a>(versions: &[&'a GraphRecord], anchor_vt: &str) -> Option<&'a
         .copied()
         .filter(|r| version_valid(r).is_some_and(|vt| !time_after(vt, anchor_vt)))
         .max_by(|a, b| {
-            version_valid(a)
-                .unwrap_or_default()
-                .cmp(version_valid(b).unwrap_or_default())
+            time_cmp(
+                version_valid(a).unwrap_or_default(),
+                version_valid(b).unwrap_or_default(),
+            )
         })
 }
 
@@ -956,11 +1055,18 @@ fn content_hash(record: &GraphRecord) -> String {
 /// Compares two RFC 3339 instants, returning true when `later` is strictly after
 /// `anchor`. Falls back to byte ordering when either fails to parse.
 fn time_after(later: &str, anchor: &str) -> bool {
+    time_cmp(later, anchor) == std::cmp::Ordering::Greater
+}
+
+/// Orders two RFC 3339 instants by parsed value so mixed UTC offsets compare
+/// correctly (`scan-history` preserves Git's committer offset). Falls back to
+/// byte ordering only when either value fails to parse.
+fn time_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     match (
-        chrono::DateTime::parse_from_rfc3339(later),
-        chrono::DateTime::parse_from_rfc3339(anchor),
+        chrono::DateTime::parse_from_rfc3339(a),
+        chrono::DateTime::parse_from_rfc3339(b),
     ) {
-        (Ok(l), Ok(a)) => l > a,
-        _ => later > anchor,
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        _ => a.cmp(b),
     }
 }

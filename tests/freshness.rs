@@ -2071,3 +2071,227 @@ fn recorded_link_span_is_preserved() {
         "the recorded citation span must be preserved"
     );
 }
+
+// ── A restored handle (delete then re-ingest) is live, not unresolved ────────
+
+#[test]
+fn restored_handle_after_tombstone_is_live() {
+    // Append-only order: original node, a tombstone, then a re-ingested node with
+    // the same stable ID. The tombstone is superseded by the restore, so the
+    // handle is live and a citation to it is `current`, not `unresolved`.
+    let path = "src/restore.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "same",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        GraphRecord::Tombstone {
+            id: stable_id(&["tombstone", &sym]),
+            schema_version: aletheia_egregore::SCHEMA_VERSION,
+            deleted_id: sym.clone(),
+            summary: "deleted".to_owned(),
+            producer: None,
+        },
+        // Restored after the delete.
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "same",
+            "commit_b",
+            "2026-01-02T00:00:00Z",
+        ),
+        observation(
+            &agent_memory_stable_id(&["obs", "restore"]),
+            "f exists",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "restore"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(entry.verdict, FreshnessVerdict::Current);
+}
+
+// ── A backdated grandchild commit is a later code state (full ancestry) ──────
+
+#[test]
+fn descendant_grandchild_content_change_drifts() {
+    // Anchor at commit_a; commit_c is a grandchild (a→b→c) whose committer
+    // timestamp is backdated before the anchor. Commit ancestry must still treat
+    // it as later code, so its content change registers as `drifted`.
+    let path = "src/anc.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let mk = |body: &str, commit: &str, vt: &str, parent: Option<&str>| {
+        let mut v = symbol_version(&sym, path, "f", span(1, 5), body, commit, vt);
+        if let GraphRecord::Node {
+            temporal: Some(t), ..
+        } = &mut v
+        {
+            t.git_parent_commits = parent.map(|p| vec![p.to_owned()]).unwrap_or_default();
+        }
+        v
+    };
+    let records = vec![
+        mk("body_v1", "commit_a", "2026-02-01T00:00:00Z", None),
+        // unchanged at b, child of a
+        mk(
+            "body_v1",
+            "commit_b",
+            "2026-02-02T00:00:00Z",
+            Some("commit_a"),
+        ),
+        // changed at c, grandchild of a, backdated before the anchor
+        mk(
+            "body_v2",
+            "commit_c",
+            "2026-01-01T00:00:00Z",
+            Some("commit_b"),
+        ),
+        observation(
+            &agent_memory_stable_id(&["obs", "anc"]),
+            "f returns body_v1",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "anc"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(entry.verdict, FreshnessVerdict::Drifted);
+}
+
+// ── Anchor selection orders mixed UTC offsets by parsed instant ──────────────
+
+#[test]
+fn mixed_offset_anchor_selection_uses_parsed_instants() {
+    // Two versions precede the anchor instant (10:30Z): P at 09:00Z written as
+    // +02:00 (so it sorts *after* Q as a raw string) and Q at 10:00Z. The correct
+    // anchor is Q. A later version R matches Q's content, so the verdict is
+    // `current`; string ordering would wrongly anchor on P and report `drifted`.
+    let path = "src/tz.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "other",
+            "commit_p",
+            "2026-01-01T11:00:00+02:00", // == 09:00Z
+        ),
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "anchor_body",
+            "commit_q",
+            "2026-01-01T10:00:00Z",
+        ),
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "anchor_body", // same as Q ⇒ no drift from the correct anchor
+            "commit_r",
+            "2026-01-01T12:00:00Z",
+        ),
+        observation(
+            &agent_memory_stable_id(&["obs", "tz"]),
+            "f at 10:30Z",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            None,                         // no commit anchor
+            Some("2026-01-01T10:30:00Z"), // valid-time anchor
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "tz"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(entry.verdict, FreshnessVerdict::Current);
+}
+
+// ── A SUPERSEDES edge excludes the replaced note (no superseded_by field) ────
+
+#[test]
+fn supersedes_edge_excludes_old_observation() {
+    // The old note carries no `superseded_by` field; supersession is expressed
+    // only via a SUPERSEDES edge (newer → older). The replaced note must not be
+    // classified, even though its cited code drifted.
+    let path = "src/sup.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let obs_old = agent_memory_stable_id(&["obs", "sup_old"]);
+    let obs_new = agent_memory_stable_id(&["obs", "sup_new"]);
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body_v1",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body_v2",
+            "commit_b",
+            "2026-01-02T00:00:00Z",
+        ),
+        observation(
+            &obs_old,
+            "f returns body_v1 (old)",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+        // newer SUPERSEDES older (source supersedes target).
+        GraphRecord::edge(
+            EdgeLabel::Supersedes,
+            obs_new,
+            obs_old.clone(),
+            None,
+            "supersedes".to_owned(),
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    assert!(
+        verdicts.iter().all(|e| e.observation_id != obs_old),
+        "a note superseded via a SUPERSEDES edge must not be classified"
+    );
+}
