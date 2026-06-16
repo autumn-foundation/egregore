@@ -123,12 +123,12 @@ duplicate rows are classified once.
 - **Multi-repo shared commit history.** Commit tips are computed across the whole
   store. If two repositories in one store share a commit SHA and one repo's HEAD
   is another's interior commit, a handle at that HEAD can be conservatively
-  reported `unresolved`. Tracked as a follow-up (per-repository tip partitioning).
+  reported `unresolved`. Tracked in #203 (per-repository tip partitioning).
 - **Repeated current-tree `scan`s.** Content-drift and liveness are derived from
   commit history (`scan-history`); repeated current-tree full scans (node-level
   `valid_time`, no commits or tombstones) are not compared by content, and a
   handle deleted between two such scans is not flagged `unresolved`. Use
-  `scan-history` for drift detection. Tracked as a follow-up.
+  `scan-history` for drift detection. Tracked in #204.
 
 ### Trigger sources (reused, never re-derived)
 
