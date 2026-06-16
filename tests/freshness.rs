@@ -2850,3 +2850,209 @@ fn unanchored_triple_matches_frontier_span_only() {
         "old span must not resolve through a historical version"
     );
 }
+
+// ── A SUPERSEDES edge from a tombstoned source does not hide the old (#319) ───
+
+#[test]
+fn tombstoned_supersedes_edge_source_does_not_hide_old() {
+    let path = "src/se.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let old = agent_memory_stable_id(&["obs", "old"]);
+    let new = agent_memory_stable_id(&["obs", "new"]);
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "b",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        observation(
+            &old,
+            "old",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+        observation(
+            &new,
+            "new",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+        GraphRecord::edge(
+            EdgeLabel::Supersedes,
+            new.clone(),
+            old.clone(),
+            None,
+            "supersedes".to_owned(),
+        ),
+        GraphRecord::Tombstone {
+            id: stable_id(&["tombstone", &new]),
+            schema_version: aletheia_egregore::SCHEMA_VERSION,
+            deleted_id: new.clone(),
+            summary: "superseding note retracted".to_owned(),
+            producer: None,
+        },
+    ];
+    let verdicts = freshness::evidence_link_freshness(&records);
+    assert!(
+        verdicts.iter().any(|e| e.observation_id == old),
+        "a SUPERSEDES edge from a retracted source must not hide the old note"
+    );
+}
+
+// ── Ancestry is scoped to the cited anchor, not the whole store (#444) ───────
+
+#[test]
+fn ancestry_is_scoped_to_the_cited_anchor() {
+    // The cited handle's commits carry no parent metadata, but an UNRELATED history
+    // in the same store does. Freshness must fall back to timestamps for the cited
+    // anchor (drifted), not apply descendant-only logic and report `current`.
+    let path = "src/sa.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let records = vec![
+        // Cited handle: no parent edges between its versions.
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body_v1",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body_v2",
+            "commit_b",
+            "2026-01-02T00:00:00Z",
+        ),
+        // Unrelated history that DOES carry ancestry edges.
+        commit_node("commit_x", &[], "2026-01-01T00:00:00Z"),
+        commit_node("commit_y", &["commit_x"], "2026-01-02T00:00:00Z"),
+        observation(
+            &agent_memory_stable_id(&["obs", "sa"]),
+            "f returns body_v1",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "sa"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(
+        entry.verdict,
+        FreshnessVerdict::Drifted,
+        "an anchor with no ancestry of its own must use the timestamp fallback"
+    );
+}
+
+// ── EXPLAINS_CHANGE to an absent Commit is skipped by relation (#729) ────────
+
+#[test]
+fn explains_change_to_absent_target_is_skipped() {
+    // The cited Commit/Change target is not in the slice; the link must be skipped
+    // by relation, not reported as a false `unresolved` handle.
+    let records = vec![observation(
+        &agent_memory_stable_id(&["obs", "ec"]),
+        "this commit introduced the bug",
+        "0.9",
+        Some("codegraph:v1:commit:absent"),
+        None,
+        None,
+        "EXPLAINS_CHANGE",
+        Some("commit_a"),
+        None,
+    )];
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "ec"]);
+    assert!(
+        verdicts.iter().all(|e| e.observation_id != obs),
+        "a non-handle relation must be skipped even when the target is absent"
+    );
+}
+
+// ── Ambiguous commit-anchored triple does not fall back to the live one (#828) ─
+
+#[test]
+fn ambiguous_anchored_triple_does_not_fall_back_to_live() {
+    // Two repos occupied the same (path, span) at the target commit; only repo-a
+    // remains live. The ambiguous anchored lookup must not silently bind to repo-a.
+    let path = "src/at.rs";
+    let sym_a = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let sym_b = stable_id(&["node", "symbol", "fn", "repo-b", path, "f", "0"]);
+    let mut obs = observation(
+        &agent_memory_stable_id(&["obs", "at"]),
+        "the symbol",
+        "0.9",
+        None,
+        Some(path),
+        Some(span(10, 20)),
+        "OBSERVES",
+        Some("commit_c"),
+        None,
+    );
+    if let GraphRecord::Node {
+        evidence_links: Some(links),
+        ..
+    } = &mut obs
+    {
+        links[0].target_git_commit = Some("commit_c".to_owned());
+    }
+    let records = vec![
+        symbol_version(
+            &sym_a,
+            path,
+            "f",
+            span(10, 20),
+            "a",
+            "commit_c",
+            "2026-01-01T00:00:00Z",
+        ),
+        symbol_version(
+            &sym_b,
+            path,
+            "f",
+            span(10, 20),
+            "b",
+            "commit_c",
+            "2026-01-01T00:00:00Z",
+        ),
+        // repo-b's symbol is removed (so a live fallback would bind only to repo-a).
+        GraphRecord::Tombstone {
+            id: stable_id(&["tombstone", &sym_b]),
+            schema_version: aletheia_egregore::SCHEMA_VERSION,
+            deleted_id: sym_b.clone(),
+            summary: "repo-b symbol removed".to_owned(),
+            producer: None,
+        },
+        obs,
+    ];
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs_id = agent_memory_stable_id(&["obs", "at"]);
+    let entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs_id)
+        .unwrap();
+    assert_eq!(entry.verdict, FreshnessVerdict::Unresolved);
+}

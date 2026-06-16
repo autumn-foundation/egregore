@@ -220,6 +220,9 @@ struct FreshnessIndex<'a> {
     /// Tip commits (no other commit's parent). Empty for edge-less graphs. Used to
     /// resolve unanchored triple citations against the frontier only.
     tips: BTreeSet<&'a str>,
+    /// Commits that participate in any parent/child edge. A commit-anchored
+    /// comparison trusts descendant reachability only when its anchor is here.
+    dag_commits: BTreeSet<&'a str>,
 }
 
 impl<'a> FreshnessIndex<'a> {
@@ -313,9 +316,14 @@ impl<'a> FreshnessIndex<'a> {
                 GraphRecord::Edge {
                     id,
                     label: crate::ir::EdgeLabel::Supersedes,
+                    source,
                     target,
                     ..
-                } if !tombstone_by_deleted.contains_key(id.as_str()) => {
+                } if !tombstone_by_deleted.contains_key(id.as_str())
+                    && !tombstone_by_deleted.contains_key(source.as_str()) =>
+                {
+                    // Honor a standalone SUPERSEDES edge only when neither the edge
+                    // nor its superseding source node has been retracted.
                     superseded_ids.insert(target.as_str());
                 }
                 _ => {}
@@ -379,11 +387,18 @@ impl<'a> FreshnessIndex<'a> {
         let mut all_commits: BTreeSet<&str> = BTreeSet::new();
         let mut parent_commits: BTreeSet<&str> = BTreeSet::new();
         let mut commit_children: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        // Commits that participate in any parent/child edge. Ancestry is trusted
+        // (descendant-only comparison) for an anchor only when the anchor itself is
+        // in this set; an anchor with no ancestry metadata falls back to timestamps
+        // even if unrelated histories in the same store carry edges.
+        let mut dag_commits: BTreeSet<&str> = BTreeSet::new();
         for record in records {
             if let Some(commit) = version_commit(record) {
                 all_commits.insert(commit);
                 for parent in version_parents(record) {
                     parent_commits.insert(parent.as_str());
+                    dag_commits.insert(parent.as_str());
+                    dag_commits.insert(commit);
                     commit_children
                         .entry(parent.as_str())
                         .or_default()
@@ -432,16 +447,17 @@ impl<'a> FreshnessIndex<'a> {
             commit_children,
             superseded_ids,
             tips,
+            dag_commits,
         }
     }
 
-    /// True when the graph carries commit parent/child edges at all. When it does,
-    /// descendant reachability is authoritative for commit-anchored comparisons; a
-    /// non-descendant later-timestamp version is a side branch and must not count.
-    /// When it does not (edge-less current-tree `scan`, partial slices), there is no
-    /// ancestry to trust and comparisons fall back to committer timestamps.
-    fn has_commit_ancestry(&self) -> bool {
-        !self.commit_children.is_empty()
+    /// True when `commit` participates in the commit DAG (has a parent or child
+    /// edge). Descendant reachability is authoritative for a commit-anchored
+    /// comparison only when its anchor is in the DAG; an anchor with no ancestry
+    /// metadata falls back to committer timestamps even if unrelated histories in
+    /// the same store carry edges (so a mixed/pruned graph is not over-filtered).
+    fn has_ancestry_for(&self, commit: &str) -> bool {
+        self.dag_commits.contains(commit)
     }
 
     /// Commits reachable forward from `commit` through child edges (its
@@ -547,7 +563,7 @@ impl<'a> FreshnessIndex<'a> {
         path: &str,
         span: Option<&SourceSpan>,
         commit: &str,
-    ) -> Option<&'a str> {
+    ) -> TripleResolution<'a> {
         let mut span_matches: BTreeSet<&str> = BTreeSet::new();
         let mut file_matches: BTreeSet<&str> = BTreeSet::new();
         for record in &self.all_code_handles {
@@ -582,14 +598,30 @@ impl<'a> FreshnessIndex<'a> {
             }
         }
         // A spanned citation never falls back to the whole file (a moved/removed
-        // symbol must be `unresolved`, not the file). Ambiguous matches (same
-        // path/span/commit across repositories) are also left unresolved.
-        if span.is_some() {
-            unique_match(&span_matches)
+        // symbol must be `unresolved`, not the file). Ambiguity (same
+        // path/span/commit across repositories) is distinguished from absence so
+        // the caller does not silently fall back to the live frontier on ambiguity.
+        let matches = if span.is_some() {
+            &span_matches
         } else {
-            unique_match(&file_matches)
+            &file_matches
+        };
+        match matches.len() {
+            0 => TripleResolution::Absent,
+            1 => TripleResolution::Resolved(matches.iter().next().copied().expect("one match")),
+            _ => TripleResolution::Ambiguous,
         }
     }
+}
+
+/// Outcome of resolving a triple citation at a specific commit.
+enum TripleResolution<'a> {
+    /// A single code node occupied the path/span at the commit.
+    Resolved(&'a str),
+    /// More than one repository matched — not safely resolvable.
+    Ambiguous,
+    /// No code node matched the path/span at the commit in this slice.
+    Absent,
 }
 
 /// Returns the single element of `matches`, or `None` when it is empty or
@@ -630,6 +662,14 @@ const fn is_code_handle_kind(kind: NodeKind) -> bool {
         kind,
         NodeKind::File | NodeKind::Symbol | NodeKind::Module | NodeKind::Import
     )
+}
+
+/// Evidence-link relations that cite a codegraph `Commit`/`Change`, not a code
+/// handle. These are skipped by relation so an absent target node is never
+/// mis-reported as an `unresolved` handle.
+fn is_non_handle_relation(relation: &str) -> bool {
+    relation == crate::ir::EdgeLabel::ExplainsChange.as_str()
+        || relation == crate::ir::EdgeLabel::ChangedIn.as_str()
 }
 
 /// Observation kinds whose evidence links are checked for freshness.
@@ -719,14 +759,18 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
             if link.target_domain != "codegraph" {
                 continue;
             }
-            // A codegraph link can point at a non-handle record (a `Commit`/
-            // `Change` cited by `EXPLAINS_CHANGE`); those are valid links, not
-            // stale code handles, so they are not classified.
-            if link
-                .target_record_id
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .is_some_and(|rid| index.is_non_handle_target(rid))
+            // A codegraph link can point at a non-handle record (a `Commit`/`Change`
+            // cited by `EXPLAINS_CHANGE`/`CHANGED_IN`); those are valid links, not
+            // stale code handles, so they are not classified. Decide by relation
+            // first — that holds even when the target node is absent from the slice
+            // (so it cannot be classified as a false `unresolved`) — then by the
+            // resolved target kind for any other relation.
+            if is_non_handle_relation(&link.relation)
+                || link
+                    .target_record_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .is_some_and(|rid| index.is_non_handle_target(rid))
             {
                 continue;
             }
@@ -823,9 +867,17 @@ fn classify_link(
         .or_else(|| {
             link.target_repo_relative_path.as_deref().and_then(|p| {
                 let span = link.target_span.as_ref();
-                identity_commit
-                    .and_then(|commit| index.resolve_triple_at_commit(p, span, commit))
-                    .or_else(|| index.resolve_triple(p, span))
+                match identity_commit.map(|commit| index.resolve_triple_at_commit(p, span, commit))
+                {
+                    Some(TripleResolution::Resolved(id)) => Some(id),
+                    // An ambiguous commit-anchored match must not silently fall back
+                    // to the live frontier (which could bind to whichever repository
+                    // stayed live); leave it unresolved.
+                    Some(TripleResolution::Ambiguous) => None,
+                    // No version at the anchor commit in this slice: fall back to
+                    // resolving against the live frontier.
+                    Some(TripleResolution::Absent) | None => index.resolve_triple(p, span),
+                }
             })
         });
 
@@ -909,7 +961,9 @@ fn classify_link(
     let anchor_descendants = anchor_commit
         .map(|c| index.descendants_of(c))
         .unwrap_or_default();
-    let has_ancestry = index.has_commit_ancestry();
+    // Ancestry is trusted only when *this* anchor commit is in the DAG; otherwise
+    // (no parent metadata for the cited handle's history) fall back to timestamps.
+    let has_ancestry = anchor_commit.is_some_and(|c| index.has_ancestry_for(c));
     let trigger = drift_record_trigger(
         index,
         cited_id,
