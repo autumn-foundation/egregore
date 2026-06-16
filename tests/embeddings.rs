@@ -222,6 +222,157 @@ fn embedding_vector_keys_preserve_per_commit_observations_for_stable_record_ids(
     );
 }
 
+// ---------------------------------------------------------------------------
+// RED: issue #91 — memory-kind embedding candidates
+// ---------------------------------------------------------------------------
+
+#[test]
+fn embedding_candidates_include_agent_memory_observations() {
+    use aletheia_egregore::agent_memory_stable_id;
+    use aletheia_egregore::ir::AGENT_MEMORY_SCHEMA_VERSION;
+    let obs_id = agent_memory_stable_id(&["obs", "test_obs"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation about error handling".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut text,
+        ref mut schema_version,
+        agent_id: ref mut aid,
+        session_id: ref mut sid,
+        ref mut observed_at,
+        ..
+    } = obs
+    {
+        *text = Some("prefer thiserror in libraries for structured errors".to_owned());
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *aid = Some("agent_1".to_owned());
+        *sid = Some("sess_1".to_owned());
+        *observed_at = Some("2026-06-01T00:00:00Z".to_owned());
+    }
+
+    let candidates = embedding_candidates(&[obs]);
+    assert!(
+        candidates.iter().any(|c| c.record_id == obs_id),
+        "Observation nodes must become embedding candidates (issue #91)"
+    );
+    assert!(
+        candidates
+            .iter()
+            .all(|c| c.target != "file" || c.record_id != obs_id),
+        "Observation must not be classified as a code 'file' target"
+    );
+}
+
+#[test]
+fn embedding_candidates_include_agent_memory_decisions() {
+    use aletheia_egregore::agent_memory_stable_id;
+    use aletheia_egregore::ir::AGENT_MEMORY_SCHEMA_VERSION;
+    let dec_id = agent_memory_stable_id(&["decision", "test_dec"]);
+    let mut dec = GraphRecord::node(
+        dec_id.clone(),
+        NodeKind::Decision,
+        None,
+        None,
+        None,
+        "Decision on crate structure".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut text,
+        ref mut schema_version,
+        agent_id: ref mut aid,
+        session_id: ref mut sid,
+        ref mut observed_at,
+        ref mut confidence,
+        ..
+    } = dec
+    {
+        *text = Some("we decided to use a workspace layout with a single binary crate".to_owned());
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *aid = Some("agent_1".to_owned());
+        *sid = Some("sess_1".to_owned());
+        *observed_at = Some("2026-06-01T00:00:00Z".to_owned());
+        *confidence = Some("0.95".to_owned());
+    }
+
+    let candidates = embedding_candidates(&[dec]);
+    assert!(
+        candidates.iter().any(|c| c.record_id == dec_id),
+        "Decision nodes must become embedding candidates (issue #91)"
+    );
+}
+
+#[test]
+fn embedding_candidates_include_agent_memory_failures() {
+    use aletheia_egregore::agent_memory_stable_id;
+    use aletheia_egregore::ir::AGENT_MEMORY_SCHEMA_VERSION;
+    let fail_id = agent_memory_stable_id(&["failure", "test_fail"]);
+    let mut fail_node = GraphRecord::node(
+        fail_id.clone(),
+        NodeKind::Failure,
+        None,
+        None,
+        None,
+        "Failure: parser panics on empty input".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut text,
+        ref mut schema_version,
+        agent_id: ref mut aid,
+        session_id: ref mut sid,
+        ref mut observed_at,
+        ..
+    } = fail_node
+    {
+        *text = Some("the JSON parser panics on empty input with index out of range".to_owned());
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *aid = Some("agent_1".to_owned());
+        *sid = Some("sess_1".to_owned());
+        *observed_at = Some("2026-06-01T00:00:00Z".to_owned());
+    }
+
+    let candidates = embedding_candidates(&[fail_node]);
+    assert!(
+        candidates.iter().any(|c| c.record_id == fail_id),
+        "Failure nodes must become embedding candidates (issue #91)"
+    );
+}
+
+#[test]
+fn embedding_candidates_skip_memory_records_with_empty_text() {
+    use aletheia_egregore::agent_memory_stable_id;
+    use aletheia_egregore::ir::AGENT_MEMORY_SCHEMA_VERSION;
+    let obs_id = agent_memory_stable_id(&["obs", "no_text_obs"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation with no text body".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        agent_id: ref mut aid,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *aid = Some("agent_1".to_owned());
+        // text intentionally left as None
+    }
+
+    let candidates = embedding_candidates(&[obs]);
+    assert!(
+        candidates.iter().all(|c| c.record_id != obs_id),
+        "Observation without text must not be an embedding candidate (no meaningful content)"
+    );
+}
+
 fn temporal(commit: &str, valid_time: &str) -> TemporalMetadata {
     TemporalMetadata {
         git_commit: commit.to_owned(),

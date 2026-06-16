@@ -4,6 +4,8 @@
 # Generated egregore stores and graph snapshots
 *.jsonl
 !tests/fixtures/**/*.jsonl
+# Checked-in evaluation corpora (seeds for reproducible recall metrics)
+!corpus/*.jsonl
 # GitHub importer idempotency state (operator-local, never committed)
 .github-import-state.json
 # Ignore all .egregore* directories (runtime data, caches, variant stores)

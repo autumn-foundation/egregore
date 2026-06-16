@@ -4938,7 +4938,12 @@ const fn record_node_kind(record: &GraphRecord) -> Option<NodeKind> {
 /// record through an evidence link (`VALIDATED_BY`, `HAS_EVIDENCE`,
 /// `PRODUCED_EVIDENCE`) or an equivalent outgoing edge. This is a structural,
 /// non-inferential rule over existing contracts — not a truth judgement.
-fn is_verified_claim(
+///
+/// Shared by the memory-audit `--verified-only` filter and the semantic-memory
+/// recall `--verified-only` filter (issue #91) so both surfaces apply the
+/// identical rule: a resolvable, non-tombstoned verification record is required;
+/// a triple-only citation stub that names no record never counts as verified.
+pub(crate) fn is_verified_claim(
     record: &GraphRecord,
     by_id: &BTreeMap<&str, &GraphRecord>,
     edges_from: &BTreeMap<&str, Vec<(&EdgeLabel, &str)>>,
@@ -4983,6 +4988,45 @@ fn is_verified_claim(
         }
     }
     false
+}
+
+/// Outgoing edges keyed by source record ID, used for edge-backed verification.
+pub(crate) type OutgoingEdgeIndex<'a> = BTreeMap<&'a str, Vec<(&'a EdgeLabel, &'a str)>>;
+
+/// Set of tombstoned record IDs, treated as absent during verification checks.
+pub(crate) type TombstonedSet<'a> = BTreeSet<&'a str>;
+
+/// Builds the support indexes [`is_verified_claim`] needs: outgoing edges keyed
+/// by source record ID (for edge-backed verification) and the set of tombstoned
+/// record IDs (treated as absent). Shared so the semantic-memory recall surface
+/// (issue #91) applies the exact rule the memory audit does.
+#[must_use]
+pub(crate) fn verification_support_indexes(
+    records: &[GraphRecord],
+) -> (OutgoingEdgeIndex<'_>, TombstonedSet<'_>) {
+    let mut edges_from: BTreeMap<&str, Vec<(&EdgeLabel, &str)>> = BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Edge {
+            label,
+            source,
+            target,
+            ..
+        } = r
+        {
+            edges_from
+                .entry(source.as_str())
+                .or_default()
+                .push((label, target.as_str()));
+        }
+    }
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    (edges_from, tombstoned)
 }
 
 /// Pushes an `unresolved_evidence_link` (absent) or `stale_evidence_target`
