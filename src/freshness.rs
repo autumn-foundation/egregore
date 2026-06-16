@@ -944,6 +944,36 @@ fn classify_link(
     let versions = live_versions.expect("live versions present");
     let cited_id = cited_id.expect("resolved id");
 
+    let anchor_descendants = anchor_commit
+        .map(|c| index.descendants_of(c))
+        .unwrap_or_default();
+    // Ancestry is trusted only when *this* anchor commit is in the DAG; otherwise
+    // (no parent metadata for the cited handle's history) fall back to timestamps.
+    let has_ancestry = anchor_commit.is_some_and(|c| index.has_ancestry_for(c));
+
+    // (1b) Per-anchor liveness. The global tip pruning keeps a handle live when any
+    // branch tip still carries its ID, but for a commit-anchored citation the handle
+    // must survive on the *anchored* lineage: at the anchor commit or a descendant
+    // that is a tip. If the anchored lineage has a frontier in this slice and the
+    // handle is absent from it, the symbol was removed downstream of the anchor — a
+    // sibling branch still holding it does not make the cited note current.
+    if has_ancestry && anchor_commit.is_some() {
+        let on_lineage_tip = |c: &str| {
+            index.tips.contains(c) && (Some(c) == anchor_commit || anchor_descendants.contains(c))
+        };
+        let lineage_has_frontier = index.tips.iter().any(|t| on_lineage_tip(t));
+        let live_on_lineage = versions
+            .iter()
+            .any(|v| version_commit(v).is_some_and(on_lineage_tip));
+        if lineage_has_frontier && !live_on_lineage {
+            return make(
+                FreshnessVerdict::Unresolved,
+                Some(TriggeringHandle::HandleAbsent),
+                cited_handle,
+            );
+        }
+    }
+
     // Resolve the anchor valid-time: prefer the cited version recorded at the
     // anchor commit, else the observation's own valid-time.
     let anchor_valid_time: Option<String> = anchor_commit
@@ -958,12 +988,6 @@ fn classify_link(
     // (3) Drifted vs current. Prefer an explicit drift record; fall back to a
     // content change across code-graph versions of the same handle. Commit-anchored
     // comparisons treat any descendant of the anchor commit as later code.
-    let anchor_descendants = anchor_commit
-        .map(|c| index.descendants_of(c))
-        .unwrap_or_default();
-    // Ancestry is trusted only when *this* anchor commit is in the DAG; otherwise
-    // (no parent metadata for the cited handle's history) fall back to timestamps.
-    let has_ancestry = anchor_commit.is_some_and(|c| index.has_ancestry_for(c));
     let trigger = drift_record_trigger(
         index,
         cited_id,

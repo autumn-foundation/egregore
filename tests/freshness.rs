@@ -3127,3 +3127,55 @@ fn sibling_to_merge_drift_is_not_post_anchor() {
         "a sibling-branch change merged in is not drift of the anchored lineage"
     );
 }
+
+// ── Liveness is scoped to the anchored lineage, not sibling tips (#414) ──────
+
+#[test]
+fn anchored_liveness_ignores_sibling_branch_tips() {
+    // The cited symbol exists at the anchor A and on a sibling branch tip S, but
+    // the anchored lineage's own frontier D (a descendant of A) deleted it. A note
+    // anchored at A must be `unresolved` — the sibling tip does not keep it current.
+    let path = "src/al.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let records = vec![
+        // Symbol at A (anchor, child of P) and S (sibling, child of P); absent at D.
+        symbol_version_p(
+            &sym,
+            path,
+            "b",
+            "commit_a",
+            &["commit_p"],
+            "2026-01-02T00:00:00Z",
+        ),
+        symbol_version_p(
+            &sym,
+            path,
+            "b",
+            "commit_s",
+            &["commit_p"],
+            "2026-01-03T00:00:00Z",
+        ),
+        // D is a descendant of A (the anchored lineage frontier) where the symbol
+        // is gone; represented by a Commit node so D is in the DAG as a tip.
+        commit_node("commit_d", &["commit_a"], "2026-01-04T00:00:00Z"),
+        observation(
+            &agent_memory_stable_id(&["obs", "al"]),
+            "f on A",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "al"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(
+        entry.verdict,
+        FreshnessVerdict::Unresolved,
+        "a symbol deleted on the anchored lineage is unresolved despite a sibling tip"
+    );
+}
