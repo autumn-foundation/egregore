@@ -44,6 +44,8 @@ pub mod local_project;
 /// MCP server exposing read-only evidence-query tools (issue #53).
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod mcp;
+/// Agent-memory recall evaluation harness (issue #91).
+pub mod memory_recall_eval;
 /// Parser orchestration.
 pub mod parser;
 /// Local setup preflight report for the `eg doctor` command (issue #75).
@@ -82,8 +84,9 @@ pub use ir::{
 };
 pub use local_project::import_local_tasks;
 pub use query::{
-    RepositoryIndex, RepositorySelectorError, SymbolContext, UnresolvedRef, active_policy,
-    audit_trail, is_candidate_suppressed, pending_candidates, symbol_context,
+    RepositoryIndex, RepositorySelectorError, SubsystemContext, SubsystemPrefixError,
+    SymbolContext, UnresolvedRef, active_policy, audit_trail, is_candidate_suppressed,
+    path_is_under_prefix, pending_candidates, subsystem_context, symbol_context,
 };
 pub use schema_version::{
     RecordLineRead, RecordReadError, RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE,

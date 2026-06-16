@@ -7,7 +7,10 @@ use aletheia_egregore::{
         AGENT_MEMORY_SCHEMA_VERSION, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
         verification_stable_id,
     },
-    query::{largest_semantic_drifts, symbol_at_commit, symbol_context},
+    query::{
+        largest_semantic_drifts, path_is_under_prefix, subsystem_context, symbol_at_commit,
+        symbol_context,
+    },
 };
 
 #[test]
@@ -3980,6 +3983,441 @@ fn symbol_context_backfill_evidence_links_scanned_recursively() {
             .any(|r| r.id() == run_id.as_str()),
         "CommandRun must be in verification_evidence via iterative backfill: \
          ObsA → ObsB → CommandRun (second backfill pass on newly classified ObsB)"
+    );
+}
+
+// ── path_is_under_prefix unit tests (issue #83) ──────────────────────────────
+
+#[test]
+fn path_is_under_prefix_bare_form_matches_file_under_dir() {
+    assert!(path_is_under_prefix("src/alpha/foo.rs", "src/alpha"));
+}
+
+#[test]
+fn path_is_under_prefix_trailing_slash_form_matches_same_as_bare() {
+    assert!(path_is_under_prefix("src/alpha/foo.rs", "src/alpha/"));
+}
+
+#[test]
+fn path_is_under_prefix_exact_match_returns_true() {
+    assert!(path_is_under_prefix("src/alpha", "src/alpha"));
+}
+
+#[test]
+fn path_is_under_prefix_sibling_alphabet_is_excluded() {
+    // AC3: segment-aware — "src/alpha" must not bleed into "src/alphabet"
+    assert!(!path_is_under_prefix("src/alphabet/x.rs", "src/alpha"));
+}
+
+#[test]
+fn path_is_under_prefix_sibling_alpha_excluded_by_trailing_slash_prefix() {
+    assert!(!path_is_under_prefix("src/alphabet/x.rs", "src/alpha/"));
+}
+
+#[test]
+fn path_is_under_prefix_unrelated_path_returns_false() {
+    assert!(!path_is_under_prefix("src/beta/bar.rs", "src/alpha"));
+}
+
+#[test]
+fn path_is_under_prefix_nested_subdir_matches() {
+    assert!(path_is_under_prefix("src/alpha/sub/deep.rs", "src/alpha"));
+}
+
+// ── subsystem_context unit tests (issue #83) ─────────────────────────────────
+
+/// Build a File node under the given path.
+fn sub_file(id: &str, path: &str) -> GraphRecord {
+    GraphRecord::node(
+        id.to_owned(),
+        NodeKind::File,
+        Some(path.to_owned()),
+        None,
+        Some(path.to_owned()),
+        format!("file {path}"),
+    )
+}
+
+/// Build a Symbol node under the given path.
+fn sub_symbol(id: &str, name: &str, path: &str) -> GraphRecord {
+    GraphRecord::symbol(
+        id.to_owned(),
+        "fn",
+        path.to_owned(),
+        aletheia_egregore::SourceSpan {
+            start_byte: 0,
+            end_byte: 50,
+            start_line: 1,
+            end_line: 5,
+        },
+        name.to_owned(),
+        format!("fn {name} in {path}"),
+    )
+}
+
+/// Build an Observation node with an evidence link to `target_id`.
+fn sub_observation(id: &str, text: &str, target_id: &str) -> GraphRecord {
+    let obs_id = agent_memory_stable_id(&["obs", id]);
+    let mut record = GraphRecord::node(
+        obs_id,
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        text.to_owned(),
+    );
+    if let GraphRecord::Node {
+        evidence_links: ref mut el,
+        schema_version: ref mut sv,
+        ..
+    } = record
+    {
+        *el = Some(vec![EvidenceLink {
+            target_record_id: Some(target_id.to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "0.9".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+        *sv = AGENT_MEMORY_SCHEMA_VERSION;
+    }
+    record
+}
+
+/// Build a Task node linked to `symbol_id` via evidence link.
+fn sub_task(id: &str, title: &str, symbol_id: &str) -> GraphRecord {
+    let mut record = GraphRecord::node(
+        id.to_owned(),
+        NodeKind::Task,
+        None,
+        None,
+        Some(title.to_owned()),
+        format!("Task: {title}"),
+    );
+    if let GraphRecord::Node {
+        evidence_links: ref mut el,
+        ..
+    } = record
+    {
+        *el = Some(vec![EvidenceLink {
+            target_record_id: Some(symbol_id.to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: "REFERENCES_TASK".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+    record
+}
+
+/// Build an Artifact node linked to `symbol_id`.
+fn sub_artifact(id: &str, name: &str, symbol_id: &str) -> GraphRecord {
+    let mut record = GraphRecord::node(
+        id.to_owned(),
+        NodeKind::Artifact,
+        None,
+        None,
+        Some(name.to_owned()),
+        format!("Artifact: {name}"),
+    );
+    if let GraphRecord::Node {
+        evidence_links: ref mut el,
+        ..
+    } = record
+    {
+        *el = Some(vec![EvidenceLink {
+            target_record_id: Some(symbol_id.to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: "RELATES_TO".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+    record
+}
+
+/// Build a Verification node linked to `symbol_id` via evidence link.
+fn sub_verification(id: &str, symbol_id: &str) -> GraphRecord {
+    let ver_id = verification_stable_id(&[id]);
+    let mut record = GraphRecord::node(
+        ver_id,
+        NodeKind::Verification,
+        None,
+        None,
+        None,
+        format!("Verification for {id}"),
+    );
+    if let GraphRecord::Node {
+        evidence_links: ref mut el,
+        schema_version: ref mut sv,
+        ..
+    } = record
+    {
+        *el = Some(vec![EvidenceLink {
+            target_record_id: Some(symbol_id.to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: "VALIDATED_BY".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+        *sv = VERIFICATION_SCHEMA_VERSION;
+    }
+    record
+}
+
+/// Build a [`SemanticDrift`] node pointing at `target_id` via `DRIFTS_FROM` edge.
+///
+/// [`SemanticDrift`]: aletheia_egregore::NodeKind::SemanticDrift
+fn sub_drift(drift_id: &str, target_id: &str) -> (GraphRecord, GraphRecord) {
+    let drift_node = GraphRecord::node(
+        drift_id.to_owned(),
+        NodeKind::SemanticDrift,
+        Some("src/alpha/a.rs".to_owned()),
+        None,
+        None,
+        "Semantic drift".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "aabbccdd".to_owned(),
+        git_parent_commits: vec![],
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: None,
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
+    })
+    .with_semantic_drift(SemanticDriftMetadata {
+        embedding_model: EmbeddingModel {
+            provider: "test".to_owned(),
+            name: "model".to_owned(),
+            version: "v1".to_owned(),
+            dim: 384,
+            content_hash: "hash".to_owned(),
+        },
+        target_record_id: target_id.to_owned(),
+        prior_record_id: target_id.to_owned(),
+        before_git_commit: "00000000".to_owned(),
+        after_git_commit: "aabbccdd".to_owned(),
+        before_valid_time: "2025-12-01T00:00:00Z".to_owned(),
+        after_valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        metric_kind: MetricKind::CosineDistance,
+        score: 0.55,
+        selection_threshold: 0.2,
+        selection_basis: SelectionBasis::ThresholdOnly,
+    });
+    let drift_edge = GraphRecord::edge(
+        EdgeLabel::DriftsFrom,
+        drift_id.to_owned(),
+        target_id.to_owned(),
+        Some("1.0".to_owned()),
+        "drifts from target".to_owned(),
+    );
+    (drift_node, drift_edge)
+}
+
+/// Seeded fixture with files under src/alpha/ and src/beta/, all cross-domain
+/// record types under src/alpha/.
+fn subsystem_fixture() -> Vec<GraphRecord> {
+    let alpha_sym_id = "codegraph:v4:sub_alpha_sym001";
+    let alpha_second_sym_id = "codegraph:v4:sub_alpha_sym002";
+    let beta_sym_id = "codegraph:v4:sub_beta_sym001";
+    let drift_id = "semadrift:v1:sub_drift001";
+
+    let alpha_file = sub_file("file:sub:alpha_a", "src/alpha/a.rs");
+    let alpha_sym = sub_symbol(alpha_sym_id, "alpha_fn", "src/alpha/a.rs");
+    let alpha_sym2 = sub_symbol(alpha_second_sym_id, "alpha_fn2", "src/alpha/b.rs");
+    let beta_file = sub_file("file:sub:beta_a", "src/beta/a.rs");
+    let beta_sym = sub_symbol(beta_sym_id, "beta_fn", "src/beta/a.rs");
+
+    let obs = sub_observation("obs_alpha", "observation about alpha_fn", alpha_sym_id);
+    let task = sub_task("task:sub:t001", "Refactor alpha", alpha_sym_id);
+    let artifact = sub_artifact("artifact:sub:a001", "alpha patch", alpha_sym_id);
+    let verification = sub_verification("sub_ver001", alpha_sym_id);
+    let (drift_node, drift_edge) = sub_drift(drift_id, alpha_sym_id);
+
+    vec![
+        alpha_file,
+        alpha_sym,
+        alpha_sym2,
+        beta_file,
+        beta_sym,
+        obs,
+        task,
+        artifact,
+        verification,
+        drift_node,
+        drift_edge,
+    ]
+}
+
+#[test]
+fn subsystem_context_returns_alpha_symbols_not_beta() {
+    let records = subsystem_fixture();
+    let ctx = subsystem_context(&records, "src/alpha").expect("valid prefix");
+
+    assert!(!ctx.is_no_match(), "src/alpha subsystem must have results");
+
+    let fact_paths: Vec<_> = ctx
+        .source_facts
+        .iter()
+        .filter_map(|r| {
+            if let aletheia_egregore::GraphRecord::Node {
+                repo_relative_path: Some(p),
+                ..
+            } = r
+            {
+                Some(p.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert!(
+        fact_paths.iter().all(|p| p.starts_with("src/alpha")),
+        "source_facts must only contain src/alpha records, got: {fact_paths:?}"
+    );
+    assert!(
+        fact_paths.contains(&"src/alpha/a.rs"),
+        "src/alpha/a.rs must be in source_facts"
+    );
+    // Beta must not appear
+    assert!(
+        !ctx.source_facts
+            .iter()
+            .any(|r| r.id() == "file:sub:beta_a" || r.id() == "codegraph:v4:sub_beta_sym001"),
+        "beta records must not appear in src/alpha subsystem context"
+    );
+}
+
+#[test]
+fn subsystem_context_observations_not_in_source_facts() {
+    let records = subsystem_fixture();
+    let ctx = subsystem_context(&records, "src/alpha").expect("valid prefix");
+
+    let obs_ids: std::collections::HashSet<_> = ctx.observations.iter().map(|r| r.id()).collect();
+    for r in &ctx.source_facts {
+        assert!(
+            !obs_ids.contains(r.id()),
+            "observation {:?} must not appear in source_facts",
+            r.id()
+        );
+    }
+}
+
+#[test]
+fn subsystem_context_includes_cross_domain_sections() {
+    let records = subsystem_fixture();
+    let ctx = subsystem_context(&records, "src/alpha").expect("valid prefix");
+
+    assert!(
+        !ctx.observations.is_empty(),
+        "observations must be populated"
+    );
+    assert!(
+        !ctx.project_state.is_empty(),
+        "project_state must be populated"
+    );
+    assert!(!ctx.artifacts.is_empty(), "artifacts must be populated");
+    assert!(
+        !ctx.verification_evidence.is_empty(),
+        "verification_evidence must be populated"
+    );
+    assert!(
+        !ctx.semantic_drift.is_empty(),
+        "semantic_drift must be populated"
+    );
+}
+
+#[test]
+fn subsystem_context_unknown_prefix_is_no_match() {
+    let records = subsystem_fixture();
+    let ctx = subsystem_context(&records, "src/nonexistent").expect("valid prefix");
+    assert!(
+        ctx.is_no_match(),
+        "unknown prefix must return is_no_match()"
+    );
+}
+
+#[test]
+fn subsystem_context_malformed_empty_prefix_returns_error() {
+    let records = subsystem_fixture();
+    let result = subsystem_context(&records, "");
+    assert!(result.is_err(), "empty prefix must return Err");
+}
+
+#[test]
+fn subsystem_context_slash_only_prefix_returns_error() {
+    let records = subsystem_fixture();
+    let result = subsystem_context(&records, "/");
+    assert!(result.is_err(), "slash-only prefix must return Err");
+}
+
+#[test]
+fn subsystem_context_trailing_slash_same_as_bare() {
+    let records = subsystem_fixture();
+    let ctx_bare = subsystem_context(&records, "src/alpha").expect("valid prefix");
+    let ctx_slash = subsystem_context(&records, "src/alpha/").expect("valid prefix");
+
+    let ids_bare: Vec<_> = ctx_bare.source_facts.iter().map(|r| r.id()).collect();
+    let ids_slash: Vec<_> = ctx_slash.source_facts.iter().map(|r| r.id()).collect();
+    assert_eq!(
+        ids_bare, ids_slash,
+        "trailing-slash form must produce identical source_facts"
+    );
+}
+
+#[test]
+fn subsystem_context_no_prefix_bleed_to_sibling() {
+    // Create a "src/alphabet/" sibling that must not appear in "src/alpha" results
+    let alpha_sym_id = "codegraph:v4:bleed_alpha_sym";
+    let alphabet_sym_id = "codegraph:v4:bleed_alphabet_sym";
+
+    let alpha_sym = sub_symbol(alpha_sym_id, "bleed_alpha_fn", "src/alpha/a.rs");
+    let alphabet_sym = sub_symbol(alphabet_sym_id, "bleed_alphabet_fn", "src/alphabet/a.rs");
+
+    let records = vec![alpha_sym, alphabet_sym];
+    let ctx = subsystem_context(&records, "src/alpha").expect("valid prefix");
+
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == alpha_sym_id),
+        "src/alpha symbol must be in source_facts"
+    );
+    assert!(
+        !ctx.source_facts.iter().any(|r| r.id() == alphabet_sym_id),
+        "src/alphabet symbol must NOT be in src/alpha context (no bleed)"
+    );
+}
+
+#[test]
+fn subsystem_context_ordering_is_deterministic() {
+    let records = subsystem_fixture();
+    let ctx_a = subsystem_context(&records, "src/alpha").expect("valid prefix");
+    let ctx_b = subsystem_context(&records, "src/alpha").expect("valid prefix");
+
+    let ids_a: Vec<_> = ctx_a.source_facts.iter().map(|r| r.id()).collect();
+    let ids_b: Vec<_> = ctx_b.source_facts.iter().map(|r| r.id()).collect();
+    assert_eq!(
+        ids_a, ids_b,
+        "source_facts ordering must be deterministic (AC7)"
+    );
+
+    let obs_a: Vec<_> = ctx_a.observations.iter().map(|r| r.id()).collect();
+    let obs_b: Vec<_> = ctx_b.observations.iter().map(|r| r.id()).collect();
+    assert_eq!(
+        obs_a, obs_b,
+        "observations ordering must be deterministic (AC7)"
     );
 }
 
