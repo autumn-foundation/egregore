@@ -129,6 +129,12 @@ duplicate rows are classified once.
   `valid_time`, no commits or tombstones) are not compared by content, and a
   handle deleted between two such scans is not flagged `unresolved`. Use
   `scan-history` for drift detection. Tracked in #204.
+- **Retractions/deletions via the embedded `--data-dir` read.** Tombstone
+  *activity* is decided from record order, which is write order for an append-only
+  `--graph` file. The embedded `--data-dir` history-inclusive read re-emits a
+  deleted non-temporal record after its tombstone, so a retracted observation or a
+  deleted current-tree handle can be mis-handled there (classified/live instead of
+  omitted/`unresolved`). The `--graph` path is correct. Tracked in #205.
 
 ### Trigger sources (reused, never re-derived)
 
