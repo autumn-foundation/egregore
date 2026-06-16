@@ -1456,12 +1456,13 @@ pub fn record_context<'a>(records: &'a [GraphRecord], anchor_id: &str) -> Symbol
     primary.insert(anchor_ref);
 
     if anchor_kind == NodeKind::File {
-        // File anchor: BFS over DEFINES and CONTAINS edges to seed all
-        // code-graph nodes belonging to this file — top-level items
+        // File anchor: BFS over DEFINES, CONTAINS, and IMPORTS edges to seed
+        // all code-graph nodes belonging to this file — top-level items
         // (File → DEFINES → Symbol), modules (File → CONTAINS → Module),
-        // and deeper nesting (Module → DEFINES → Symbol, ImplBlock → DEFINES
-        // → Method). Pure edge traversal stays within the file's own tree so
-        // same-path nodes from other repositories are never mixed in.
+        // deeper nesting (Module → DEFINES → Symbol, ImplBlock → DEFINES →
+        // Method), and imports (owner → IMPORTS → Import). Pure edge traversal
+        // stays within the file's own tree so same-path nodes from other
+        // repositories are never mixed in.
         let mut frontier: Vec<&str> = vec![anchor_ref];
         while !frontier.is_empty() {
             let mut next_frontier: Vec<&str> = Vec::new();
@@ -1481,7 +1482,10 @@ pub fn record_context<'a>(records: &'a [GraphRecord], anchor_id: &str) -> Symbol
                     if source.as_str() != container {
                         continue;
                     }
-                    if !matches!(label, EdgeLabel::Defines | EdgeLabel::Contains) {
+                    if !matches!(
+                        label,
+                        EdgeLabel::Defines | EdgeLabel::Contains | EdgeLabel::Imports
+                    ) {
                         continue;
                     }
                     let edge_live =

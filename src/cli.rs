@@ -4154,19 +4154,36 @@ fn query_semantic_context(
 
     let query_vector = embed_query_text(query)?;
 
-    // When scoped, search the whole index so the limit bounds the scoped set.
-    let fetch = if selected.is_some() {
-        records.len().max(limit)
-    } else {
-        limit
-    };
+    // Over-fetch the whole index, not just `limit` raw hits: the shared vector
+    // index also embeds agent-memory nodes (issue #91), so a query whose top
+    // `limit` raw matches are memory would otherwise drop the code hits ranked
+    // just behind them. Fetch the full pool so the code-kind filter below
+    // recovers those code hits; the limit then bounds the filtered set.
+    let fetch = records.len().max(limit);
     let mut matches = sink
         .semantic_search(&query_vector, fetch)
         .with_context(|| "semantic search failed — was the store ingested with --embed?")?;
+    // `semantic-context` is a code-context bridge: never expand agent-authored
+    // memory hits (issue #91). Mirror `query semantic` and keep only
+    // deterministic code kinds before building leads.
+    matches.retain(|m| {
+        m.kind
+            .as_deref()
+            .is_some_and(|k| k == "File" || k == "Symbol")
+    });
     if let Some(repo) = selected.as_deref() {
         matches.retain(|m| index.owner_of(&m.record_id) == Some(repo));
-        matches.truncate(limit);
     }
+    // Canonical ordering before truncation: equal-score ANN results can be
+    // returned in arbitrary order, so sort by score descending then record ID
+    // ascending so repeated runs choose the same rows at the `limit` boundary
+    // and emit byte-identical output.
+    matches.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.record_id.cmp(&b.record_id))
+    });
+    matches.truncate(limit);
 
     let leads: Vec<query::SemanticLead> = matches
         .iter()

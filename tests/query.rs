@@ -4635,6 +4635,43 @@ fn record_context_file_anchor_traverses_contains_and_defines() {
 }
 
 #[test]
+fn record_context_file_anchor_seeds_imports_via_imports_edge() {
+    // The Rust extractor emits use-declarations as Import nodes linked by
+    // EdgeLabel::Imports (owner → IMPORTS → Import). A File semantic anchor must
+    // follow IMPORTS so import source facts (and anything attached to them) are
+    // reachable, not just DEFINES/CONTAINS targets.
+    let file_path = "src/lib.rs";
+    let (file_id, file) = ctx_file(file_path);
+
+    let import_id = "codegraph:v4:import-i001".to_owned();
+    let import_node = GraphRecord::node(
+        import_id.clone(),
+        NodeKind::Import,
+        Some(file_path.to_owned()),
+        None,
+        Some("std::collections::BTreeMap".to_owned()),
+        "Rust import std::collections::BTreeMap".to_owned(),
+    );
+    let file_imports = GraphRecord::edge(
+        EdgeLabel::Imports,
+        file_id.clone(),
+        import_id.clone(),
+        None,
+        "imports".to_owned(),
+    );
+
+    let records = vec![file, import_node, file_imports];
+
+    let ctx = record_context(&records, &file_id);
+
+    assert!(!ctx.is_no_match(), "file anchor must resolve context");
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == import_id),
+        "Import node (via IMPORTS) must be seeded into source_facts"
+    );
+}
+
+#[test]
 fn record_context_symbol_anchor_finds_file_via_module_contains_chain() {
     // When a symbol is nested inside a module (File → CONTAINS → Module →
     // DEFINES → Symbol), the Symbol anchor must still find the owning File via
