@@ -1058,13 +1058,17 @@ fn after_anchor(
     anchor_descendants: &BTreeSet<&str>,
     has_ancestry: bool,
 ) -> bool {
-    // With commit ancestry available, a drift is post-anchor only when its *after*
-    // commit is a descendant of the anchor — the new code state lies forward on the
-    // anchored branch. This both catches rebased/backdated descendants (timestamps
-    // can lie) and rejects a drift that merely *begins* at the anchor but lands on a
-    // sibling/unmerged branch, which is not a later state of the anchored code.
+    // With commit ancestry available, a drift is post-anchor only when **both** its
+    // endpoints lie on the anchored lineage: its `before` commit is the anchor (or
+    // a descendant) and its `after` commit is a descendant. Requiring both rejects a
+    // merge case where a sibling-branch change `B → M` lands on a merge commit `M`
+    // reachable from the anchor `A` while `B` is not — that is not drift of the
+    // code on `A`'s lineage. Reachability (not timestamps) is authoritative, so
+    // rebased/backdated descendants are still caught.
     if has_ancestry && anchor_commit.is_some() {
-        return anchor_descendants.contains(after_git_commit);
+        let before_on_lineage = anchor_commit.is_some_and(|c| before_git_commit == c)
+            || anchor_descendants.contains(before_git_commit);
+        return before_on_lineage && anchor_descendants.contains(after_git_commit);
     }
     // No ancestry to trust. A drift whose "before" state is exactly the anchor
     // commit measured change from the cited version forward — a drift regardless of

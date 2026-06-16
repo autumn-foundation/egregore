@@ -135,6 +135,12 @@ duplicate rows are classified once.
   deleted non-temporal record after its tombstone, so a retracted observation or a
   deleted current-tree handle can be mis-handled there (classified/live instead of
   omitted/`unresolved`). The `--graph` path is correct. Tracked in #205.
+- **Module/import body drift.** Content comparison hashes a node's summary, which
+  embeds the normalized source body for **symbols** but only the name/path for
+  `Module`/`Import` records (and drift records skip them). A module/import whose
+  body changed while its name/path is unchanged is therefore reported `current`;
+  cite the symbols inside the module for body-level freshness. Removal/rename is
+  still correctly `unresolved`. Tracked in #206.
 
 ### Trigger sources (reused, never re-derived)
 

@@ -3056,3 +3056,74 @@ fn ambiguous_anchored_triple_does_not_fall_back_to_live() {
         .unwrap();
     assert_eq!(entry.verdict, FreshnessVerdict::Unresolved);
 }
+
+// ── A sibling→merge drift is not drift of the anchored lineage (#1067) ───────
+
+#[test]
+fn sibling_to_merge_drift_is_not_post_anchor() {
+    // Merge history: M merges anchor branch A and sibling branch B. A semantic
+    // drift compares B → M. M is a descendant of A, but B is not, so the B→M
+    // change is the sibling branch being merged in, not drift of A's lineage. A
+    // note anchored at A whose content equals M must be `current`.
+    let path = "src/mg.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let records = vec![
+        symbol_version_p(&sym, path, "same", "commit_a", &[], "2026-01-01T00:00:00Z"),
+        // Merge commit M has both A and B as parents.
+        symbol_version_p(
+            &sym,
+            path,
+            "same",
+            "commit_m",
+            &["commit_a", "commit_b"],
+            "2026-01-03T00:00:00Z",
+        ),
+        GraphRecord::node(
+            semantic_stable_id(&["drift", "merge"]),
+            NodeKind::SemanticDrift,
+            None,
+            None,
+            None,
+            "Drift".to_owned(),
+        )
+        .with_domain("semantic", SEMANTIC_SCHEMA_VERSION)
+        .with_semantic_drift(SemanticDriftMetadata {
+            embedding_model: EmbeddingModel {
+                provider: "p".to_owned(),
+                name: "m".to_owned(),
+                version: "v".to_owned(),
+                dim: 8,
+                content_hash: "h".to_owned(),
+            },
+            target_record_id: sym.clone(),
+            prior_record_id: sym.clone(),
+            before_git_commit: "commit_b".to_owned(),
+            after_git_commit: "commit_m".to_owned(),
+            before_valid_time: "2026-01-02T00:00:00Z".to_owned(),
+            after_valid_time: "2026-01-03T00:00:00Z".to_owned(),
+            metric_kind: MetricKind::CosineDistance,
+            score: 0.7,
+            selection_threshold: 0.2,
+            selection_basis: SelectionBasis::ThresholdOnly,
+        }),
+        observation(
+            &agent_memory_stable_id(&["obs", "mg"]),
+            "f on A",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "mg"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(
+        entry.verdict,
+        FreshnessVerdict::Current,
+        "a sibling-branch change merged in is not drift of the anchored lineage"
+    );
+}
