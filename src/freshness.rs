@@ -235,12 +235,14 @@ impl<'a> FreshnessIndex<'a> {
         // ID — a later node version supersedes it and the handle is live again.
         // Treating every tombstone line as current would report a restored handle
         // as `unresolved`.
-        let mut last_node_idx: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut last_record_idx: BTreeMap<&str, usize> = BTreeMap::new();
         let mut last_tombstone: BTreeMap<&str, (usize, &str)> = BTreeMap::new();
         for (idx, record) in records.iter().enumerate() {
             match record {
-                GraphRecord::Node { id, .. } => {
-                    last_node_idx.insert(id.as_str(), idx);
+                // A node *or* edge re-emitted after its tombstone restores that ID;
+                // both share the stable-ID/tombstone mechanism in append-only input.
+                GraphRecord::Node { id, .. } | GraphRecord::Edge { id, .. } => {
+                    last_record_idx.insert(id.as_str(), idx);
                 }
                 GraphRecord::Tombstone { id, deleted_id, .. } => {
                     last_tombstone
@@ -252,11 +254,10 @@ impl<'a> FreshnessIndex<'a> {
                         })
                         .or_insert((idx, id.as_str()));
                 }
-                GraphRecord::Edge { .. } => {}
             }
         }
         for (deleted_id, (t_idx, t_id)) in &last_tombstone {
-            let restored = last_node_idx
+            let restored = last_record_idx
                 .get(deleted_id)
                 .is_some_and(|n_idx| n_idx > t_idx);
             if !restored {
@@ -363,6 +364,15 @@ impl<'a> FreshnessIndex<'a> {
             all_code_handles,
             commit_children,
         }
+    }
+
+    /// True when the graph carries commit parent/child edges at all. When it does,
+    /// descendant reachability is authoritative for commit-anchored comparisons; a
+    /// non-descendant later-timestamp version is a side branch and must not count.
+    /// When it does not (edge-less current-tree `scan`, partial slices), there is no
+    /// ancestry to trust and comparisons fall back to committer timestamps.
+    fn has_commit_ancestry(&self) -> bool {
+        !self.commit_children.is_empty()
     }
 
     /// Commits reachable forward from `commit` through child edges (its
@@ -572,12 +582,14 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
             }
             // A `SUPERSEDES` edge: `source` supersedes `target`, so the edge target
             // is the replaced note (the same direction the memory query paths use),
-            // even when the replaced node never materialized `superseded_by`.
+            // even when the replaced node never materialized `superseded_by`. A
+            // retracted (tombstoned) supersession edge must not hide the old note.
             GraphRecord::Edge {
+                id,
                 label: crate::ir::EdgeLabel::Supersedes,
                 target,
                 ..
-            } => {
+            } if !index.tombstone_by_deleted.contains_key(id.as_str()) => {
                 superseded_ids.insert(target.as_str());
             }
             // A `SUPERSEDES` evidence link on the newer note pointing at the old one.
@@ -836,17 +848,24 @@ fn classify_link(
     let anchor_descendants = anchor_commit
         .map(|c| index.descendants_of(c))
         .unwrap_or_default();
-    let trigger =
-        drift_record_trigger(index, cited_id, anchor_commit, anchor_valid_time.as_deref()).or_else(
-            || {
-                content_change_trigger(
-                    versions,
-                    anchor_commit,
-                    anchor_valid_time.as_deref(),
-                    &anchor_descendants,
-                )
-            },
-        );
+    let has_ancestry = index.has_commit_ancestry();
+    let trigger = drift_record_trigger(
+        index,
+        cited_id,
+        anchor_commit,
+        anchor_valid_time.as_deref(),
+        &anchor_descendants,
+        has_ancestry,
+    )
+    .or_else(|| {
+        content_change_trigger(
+            versions,
+            anchor_commit,
+            anchor_valid_time.as_deref(),
+            &anchor_descendants,
+            has_ancestry,
+        )
+    });
 
     cited_handle.anchor_valid_time = anchor_valid_time;
 
@@ -875,6 +894,8 @@ fn drift_record_trigger(
     cited_id: &str,
     anchor_commit: Option<&str>,
     anchor_valid_time: Option<&str>,
+    anchor_descendants: &BTreeSet<&str>,
+    has_ancestry: bool,
 ) -> Option<TriggeringHandle> {
     let candidates = index.drifts_by_prior.get(cited_id)?;
     let mut best: Option<(&str, &SemanticDriftMetadata)> = None;
@@ -884,6 +905,8 @@ fn drift_record_trigger(
             &drift.before_git_commit,
             anchor_commit,
             anchor_valid_time,
+            anchor_descendants,
+            has_ancestry,
         ) {
             continue;
         }
@@ -909,12 +932,14 @@ fn drift_record_trigger(
     })
 }
 
-/// Decides whether a later measurement post-dates the anchor.
+/// Decides whether a drift measurement post-dates the anchor.
 fn after_anchor(
     after_valid_time: &str,
     before_git_commit: &str,
     anchor_commit: Option<&str>,
     anchor_valid_time: Option<&str>,
+    anchor_descendants: &BTreeSet<&str>,
+    has_ancestry: bool,
 ) -> bool {
     // A drift whose "before" state is exactly the anchor commit measured change
     // from the cited version forward — a drift regardless of timestamps. Checked
@@ -923,6 +948,14 @@ fn after_anchor(
     if anchor_commit.is_some_and(|c| before_git_commit == c) {
         return true;
     }
+    // With commit ancestry available, a drift is post-anchor only when it begins
+    // at a descendant of the anchor commit (rebases/clock skew can backdate it, so
+    // reachability — not timestamps — is authoritative). A drift beginning off the
+    // anchored branch is a side branch and does not count.
+    if has_ancestry && anchor_commit.is_some() {
+        return anchor_descendants.contains(before_git_commit);
+    }
+    // No ancestry to trust: fall back to a strictly later valid-time.
     if let Some(anchor_vt) = anchor_valid_time {
         return time_after(after_valid_time, anchor_vt);
     }
@@ -937,6 +970,7 @@ fn content_change_trigger(
     anchor_commit: Option<&str>,
     anchor_valid_time: Option<&str>,
     anchor_descendants: &BTreeSet<&str>,
+    has_ancestry: bool,
 ) -> Option<TriggeringHandle> {
     let anchor_vt = anchor_valid_time?;
     let anchor_version = anchor_commit
@@ -945,19 +979,24 @@ fn content_change_trigger(
         .or_else(|| at_or_before(versions, anchor_vt))?;
     let anchor_hash = content_hash(anchor_version);
 
+    let commit_anchored = anchor_commit.is_some() && has_ancestry;
     let mut later: Vec<&GraphRecord> = versions
         .iter()
         .copied()
         .filter(|r| {
-            // Any descendant of the anchor commit is a later code state regardless
-            // of committer-timestamp direction — consecutive commits can share a
-            // timestamp, and rebases/clock skew can backdate a child or grandchild.
-            // Commit ancestry wins for commit-anchored comparisons; otherwise fall
-            // back to a strictly later valid-time.
-            if version_commit(r).is_some_and(|c| anchor_descendants.contains(c)) {
-                return true;
+            if commit_anchored {
+                // Ancestry is authoritative: only true descendants of the anchor
+                // commit are later code states. A non-descendant later-timestamp
+                // version (a side branch or a future-dated parent) is not, and must
+                // not produce a false `drifted`. Descendant reachability already
+                // covers rebased/backdated children and grandchildren.
+                version_commit(r).is_some_and(|c| anchor_descendants.contains(c))
+            } else {
+                // No commit anchor, or no ancestry to trust: a strictly later
+                // valid-time is the only signal, keeping drift detectable on
+                // current-tree and partial graphs.
+                version_valid(r).is_some_and(|vt| time_after(vt, anchor_vt))
             }
-            version_valid(r).is_some_and(|vt| time_after(vt, anchor_vt))
         })
         .collect();
     later.sort_by(|a, b| {

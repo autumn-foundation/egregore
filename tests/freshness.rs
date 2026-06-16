@@ -2295,3 +2295,138 @@ fn supersedes_edge_excludes_old_observation() {
         "a note superseded via a SUPERSEDES edge must not be classified"
     );
 }
+
+/// Symbol version with explicit parent commits, for building commit DAGs.
+fn symbol_version_p(
+    sym_id: &str,
+    path: &str,
+    body: &str,
+    commit: &str,
+    parents: &[&str],
+    valid_time: &str,
+) -> GraphRecord {
+    let mut v = symbol_version(sym_id, path, "f", span(1, 5), body, commit, valid_time);
+    if let GraphRecord::Node {
+        temporal: Some(t), ..
+    } = &mut v
+    {
+        t.git_parent_commits = parents.iter().map(|p| (*p).to_owned()).collect();
+    }
+    v
+}
+
+// ── Drift beginning at a descendant commit is post-anchor (full ancestry) ─────
+
+#[test]
+fn descendant_drift_is_post_anchor_via_ancestry() {
+    // Body identical across commits, so only a drift record can flag it. The drift
+    // is recorded for B→C where B is a *descendant* of the anchor commit A, and is
+    // backdated (after_valid_time not later than the anchor). Commit reachability,
+    // not timestamps, must recognize it as post-anchor → `drifted`.
+    let path = "src/da.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let t_anchor = "2026-02-01T00:00:00Z";
+    let t_back = "2026-01-01T00:00:00Z"; // backdated descendants
+    let records = vec![
+        symbol_version_p(&sym, path, "same", "commit_a", &[], t_anchor),
+        symbol_version_p(&sym, path, "same", "commit_b", &["commit_a"], t_back),
+        symbol_version_p(&sym, path, "same", "commit_c", &["commit_b"], t_back),
+        GraphRecord::node(
+            semantic_stable_id(&["drift", "desc"]),
+            NodeKind::SemanticDrift,
+            None,
+            None,
+            None,
+            "Drift".to_owned(),
+        )
+        .with_domain("semantic", SEMANTIC_SCHEMA_VERSION)
+        .with_semantic_drift(SemanticDriftMetadata {
+            embedding_model: EmbeddingModel {
+                provider: "p".to_owned(),
+                name: "m".to_owned(),
+                version: "v".to_owned(),
+                dim: 8,
+                content_hash: "h".to_owned(),
+            },
+            target_record_id: sym.clone(),
+            prior_record_id: sym.clone(),
+            before_git_commit: "commit_b".to_owned(),
+            after_git_commit: "commit_c".to_owned(),
+            before_valid_time: t_back.to_owned(),
+            after_valid_time: t_back.to_owned(),
+            metric_kind: MetricKind::CosineDistance,
+            score: 0.7,
+            selection_threshold: 0.2,
+            selection_basis: SelectionBasis::ThresholdOnly,
+        }),
+        observation(
+            &agent_memory_stable_id(&["obs", "da"]),
+            "f at commit_a",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "da"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(entry.verdict, FreshnessVerdict::Drifted);
+    assert!(matches!(
+        entry.triggering_handle,
+        Some(freshness::TriggeringHandle::DriftRecord { .. })
+    ));
+}
+
+// ── A side-branch version is not a later state of the anchored branch ─────────
+
+#[test]
+fn side_branch_version_does_not_falsely_drift() {
+    // Commit A (anchored) and S are siblings — both children of P. S carries a
+    // later timestamp and different content, but it is not a descendant of A, so a
+    // note anchored at A must be `current`, not falsely `drifted`.
+    let path = "src/sb.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let records = vec![
+        symbol_version_p(
+            &sym,
+            path,
+            "body_a",
+            "commit_a",
+            &["commit_p"],
+            "2026-01-01T00:00:00Z",
+        ),
+        symbol_version_p(
+            &sym,
+            path,
+            "body_s",
+            "commit_s",
+            &["commit_p"],
+            "2026-02-01T00:00:00Z",
+        ),
+        observation(
+            &agent_memory_stable_id(&["obs", "sb"]),
+            "f on branch A",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "sb"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(
+        entry.verdict,
+        FreshnessVerdict::Current,
+        "a sibling side-branch change is not drift of the anchored branch"
+    );
+}
