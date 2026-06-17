@@ -1995,3 +1995,81 @@ fn freshness_data_dir_ignores_untracked_companion_graph_jsonl() {
         "an untracked companion graph.jsonl must not make a data-dir store read stale_dirty: {report}"
     );
 }
+
+/// `SS1`: in a combined store where `--repo` selects a legacy/pre-stamping repo
+/// but the checkout's auto-detected identity is ALSO present and stamped, the
+/// selected repo must remain the verdict owner. The old hint branch fell back to
+/// the auto-detected identity's snapshot, so `stamp_freshness` compared a
+/// different owner and omitted the field; the selected legacy rows must instead
+/// be stamped `unknown`.
+#[test]
+fn freshness_unknown_stamped_on_legacy_rows_when_identity_also_stamped() {
+    let fx = Fixture::committed();
+
+    // (1) Normal scan → the checkout's auto-detected identity, stamped.
+    let stamped_graph = fx.work.path().join("stamped.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&stamped_graph)
+        .assert()
+        .success();
+
+    // (2) Override-ID scan → a second repo; strip its source_snapshot to simulate
+    //     legacy/pre-stamping rows that have no stamped snapshot.
+    let legacy_graph = fx.work.path().join("legacy.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&legacy_graph)
+        .args(["--repo-id-override", "legacy-override-repo"])
+        .assert()
+        .success();
+    let legacy_stripped: String = std::fs::read_to_string(&legacy_graph)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let Ok(mut v) = serde_json::from_str::<Value>(line) else {
+                return line.to_owned();
+            };
+            if v["kind"] == "Repository" {
+                v.as_object_mut().map(|o| o.remove("source_snapshot"));
+            }
+            serde_json::to_string(&v).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // (3) Combine: stamped auto-detected identity repo + legacy (unstamped) repo.
+    let combined = fx.work.path().join("combined.jsonl");
+    let stamped_raw = std::fs::read_to_string(&stamped_graph).unwrap();
+    std::fs::write(
+        &combined,
+        format!("{}\n{}\n", stamped_raw.trim_end(), legacy_stripped),
+    )
+    .unwrap();
+
+    // (4) Query the legacy repo with --repo-path: the verdict must be owned by the
+    //     selected legacy repo and stamped `unknown`, not borrowed from the
+    //     stamped auto-detected identity (which would omit the field).
+    let out = eg()
+        .args(["query", "symbol", "hello"])
+        .arg("--graph")
+        .arg(&combined)
+        .arg("--repo-path")
+        .arg(fx.repo())
+        .args(["--repo", "legacy-override-repo"])
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let row: Value = serde_json::from_str(stdout.lines().next().unwrap_or("{}")).unwrap();
+    assert!(
+        row.get("freshness").is_some(),
+        "the selected legacy rows must still carry a freshness field: {row}"
+    );
+    assert_eq!(
+        row["freshness"], "unknown",
+        "the selected legacy repo (no snapshot) must report unknown, not borrow the stamped identity's verdict: {row}"
+    );
+}

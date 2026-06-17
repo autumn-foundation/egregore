@@ -1996,16 +1996,14 @@ fn query_freshness_code_inner(
     // rows `stale_dirty` when the graph itself was scanned from a clean tree.
     let exclusions = store_exclusions_including_egregore(repo_path, artifacts);
     let (head, dirty) = identity::working_tree_snapshot_excluding(repo_path, &exclusions);
-    // When the caller supplies an explicit hint (a resolved `--repo` scope or
-    // `--repo-id-override` value that differs from the auto-detected identity),
-    // try the hint FIRST.  This ensures that an operator-pinned override ID wins
-    // over the auto-detected identity in a multi-repo store — the identity-first
-    // order would silently return the wrong snapshot when both IDs are present.
-    // When the caller supplies an explicit hint (a resolved `--repo` scope or
-    // `--repo-id-override` value that differs from the auto-detected identity),
-    // try the hint FIRST.  This ensures that an operator-pinned override ID wins
-    // over the auto-detected identity in a multi-repo store — the identity-first
-    // order would silently return the wrong snapshot when both IDs are present.
+    // An explicit hint (a resolved `--repo` scope or context owner that differs
+    // from the auto-detected identity) is authoritative: the verdict must be owned
+    // by the selected repository. Look up ONLY its snapshot — never fall back to
+    // the auto-detected identity's snapshot, which belongs to a different repo and
+    // would mislabel the verdict's owner. When the selected repo has no snapshot
+    // (legacy/pre-stamping rows in a combined store), `matched` stays `None` and
+    // the owner below is still the hint, so `stamp_freshness` stamps `unknown` on
+    // the selected rows rather than omitting the field (PR #186 follow-up SS1).
     //
     // When no hint is given and the identity probe fails, try a sole-stamped
     // fallback: if exactly one Repository node in the store carries a snapshot,
@@ -2013,8 +2011,7 @@ fn query_freshness_code_inner(
     // stores where --repo-id-override was used on the scanned checkout but no
     // --repo flag was passed to the query command (PR #186 follow-up Z1).
     let matched = match repo_id_hint.filter(|h| *h != identity.id.as_str()) {
-        Some(h) => freshness::stored_snapshot_with_owner(records, h)
-            .or_else(|| freshness::stored_snapshot_with_owner(records, &identity.id)),
+        Some(h) => freshness::stored_snapshot_with_owner(records, h),
         None => freshness::stored_snapshot_with_owner(records, &identity.id)
             .or_else(|| freshness::stored_snapshot_sole_stamped(records)),
     };
