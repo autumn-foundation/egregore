@@ -2394,8 +2394,8 @@ fn ingest(
 /// Machine-readable report emitted by `eg refresh`.
 ///
 /// All counts are integers; file lists are sorted repository-relative paths.
-/// `freshness_after_refresh` is always `"fresh"` after a successful refresh
-/// (the counterpart to the read-only staleness signal in issue #82).
+/// `freshness_after_refresh` reports the verdict a follow-up `eg freshness`
+/// would give (the write-side counterpart to the read-only signal in issue #82).
 #[cfg(feature = "embedded-aletheiadb")]
 #[derive(Debug, Serialize)]
 struct RefreshReport {
@@ -2428,8 +2428,11 @@ struct RefreshReport {
     embed_status: String,
     /// Freshness of the store with respect to the working tree after this refresh.
     ///
-    /// Always `"fresh"` on success: the store now reflects the current working tree.
-    /// This is the write counterpart to the read-only staleness signal (issue #82).
+    /// The verdict `eg freshness --data-dir` would report for the rebuilt store:
+    /// `"fresh"` for a clean tree at the stamped HEAD, or `"stale_dirty"` when the
+    /// refresh captured uncommitted `.rs` edits (the store reflects an uncommitted
+    /// state). This is the write counterpart to the read-only staleness signal
+    /// (issue #82) and stays consistent with a follow-up freshness check (OO1).
     freshness_after_refresh: String,
 }
 
@@ -2542,6 +2545,21 @@ fn scan_refresh_cmd(
     let reused_count = reused_files.len();
     let tombstoned_count = tombstoned_files.len();
 
+    // Report the verdict `eg freshness --data-dir` would compute, not an
+    // unconditional "fresh" (OO1 / PR #186 follow-up). When the working tree had
+    // uncommitted `.rs` edits the refreshed snapshot is stamped `dirty`, so the
+    // store is `stale_dirty` even immediately after rebuild — exactly as a full
+    // scan of a dirty tree behaves. The snapshot was just computed from the
+    // current tree, so classifying it against itself yields the same verdict a
+    // follow-up freshness check would, without re-probing Git.
+    let refresh_identity = identity::compute_repository_identity(repo_path, None);
+    let freshness_after_refresh = freshness::stored_snapshot(&records, &refresh_identity.id)
+        .map_or(Freshness::Unknown, |snapshot| {
+            freshness::classify(Some(snapshot), &snapshot.head, snapshot.dirty)
+        })
+        .code()
+        .to_owned();
+
     let refresh_report = RefreshReport {
         rebuilt_files,
         rebuilt_count,
@@ -2553,8 +2571,7 @@ fn scan_refresh_cmd(
         ingest_succeeded: ingest_report.succeeded,
         ingest_failed: ingest_report.failed,
         embed_status,
-        // AC6: A successful refresh means the store now matches the working tree.
-        freshness_after_refresh: "fresh".to_owned(),
+        freshness_after_refresh,
     };
 
     match format {

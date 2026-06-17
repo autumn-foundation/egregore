@@ -1905,78 +1905,93 @@ fn query_symbol_repo_path_stamps_freshness_on_history_graph() {
     assert_eq!(row["freshness"], "fresh");
 }
 
-/// `KK1`: a `.rs` file ignored only by the clone-local `.git/info/exclude` must
-/// still be indexed, while one ignored by a versioned `.gitignore` is dropped.
-/// `info/exclude` is not shared across clones, so honoring it would make the
-/// same worktree produce different graphs in different checkouts.
+/// OO1: `eg refresh` must report the freshness verdict a follow-up
+/// `eg freshness --data-dir` would compute, not an unconditional `"fresh"`.
+/// When the working tree has uncommitted `.rs` edits, the refreshed store is
+/// stamped dirty, so both must agree on `stale_dirty`.
+#[cfg(feature = "embedded-aletheiadb")]
 #[test]
-fn scanner_indexes_rust_file_ignored_only_by_info_exclude() {
+fn refresh_reports_stale_dirty_when_tree_has_uncommitted_edits() {
     let fx = Fixture::committed();
-    std::fs::write(fx.repo().join(".gitignore"), "ignored_versioned.rs\n").unwrap();
-    std::fs::write(
-        fx.repo().join(".git").join("info").join("exclude"),
-        "ignored_local.rs\n",
-    )
-    .unwrap();
-    commit_all(fx.repo(), "add gitignore");
-    std::fs::write(
-        fx.repo().join("src").join("ignored_versioned.rs"),
-        "pub fn sym_versioned() {}\n",
-    )
-    .unwrap();
-    std::fs::write(
-        fx.repo().join("src").join("ignored_local.rs"),
-        "pub fn sym_localonly() {}\n",
-    )
-    .unwrap();
-
-    let out_graph = fx.work.path().join("graph.jsonl");
-    eg().args(["scan"])
-        .arg(fx.repo())
-        .arg("--out")
-        .arg(&out_graph)
+    fx.scan();
+    let data_dir = fx.work.path().join("store");
+    eg().args(["ingest"])
+        .arg(fx.graph())
+        .args(["--adapter", "embedded"])
+        .arg("--data-dir")
+        .arg(&data_dir)
         .assert()
         .success();
-    let jsonl = std::fs::read_to_string(&out_graph).unwrap();
-    assert!(
-        !jsonl.contains("sym_versioned"),
-        "a file ignored by versioned .gitignore must still be dropped: {jsonl}"
+
+    // Uncommitted edit to a tracked .rs file → dirty working tree.
+    write_lib(fx.repo(), "pub fn hello() {}\npub fn scratch() {}\n");
+
+    let out = eg()
+        .args(["refresh"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        report["freshness_after_refresh"], "stale_dirty",
+        "refresh must report the real verdict for a dirty tree, not always fresh: {report}"
     );
-    assert!(
-        jsonl.contains("sym_localonly"),
-        "a file ignored only by .git/info/exclude must still be indexed (clone-local excludes must not change scans): {jsonl}"
+
+    // A follow-up freshness check must agree with the refresh report.
+    let out2 = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report2: Value = serde_json::from_slice(&out2.get_output().stdout).unwrap();
+    assert_eq!(
+        report2["freshness"], "stale_dirty",
+        "follow-up freshness must agree with the refresh report: {report2}"
     );
 }
 
-/// `KK1`: a directory ignored only by `.git/info/exclude` must still be
-/// traversed and indexed — the traversal-pruning pass must honor only versioned
-/// `.gitignore`.
+/// RR1: `eg freshness --data-dir` cannot name the sibling `graph.jsonl` produced
+/// by the documented scan→ingest workflow, so an untracked, non-gitignored
+/// companion graph output must not make the store read `stale_dirty`. JSONL
+/// outputs are never indexed as Rust source, so they are excluded from the probe.
+#[cfg(feature = "embedded-aletheiadb")]
 #[test]
-fn scanner_indexes_directory_ignored_only_by_info_exclude() {
+fn freshness_data_dir_ignores_untracked_companion_graph_jsonl() {
     let fx = Fixture::committed();
-    std::fs::create_dir_all(fx.repo().join("localdir")).unwrap();
-    std::fs::write(
-        fx.repo().join("localdir").join("mod.rs"),
-        "pub fn in_local_dir() {}\n",
-    )
-    .unwrap();
-    // Ignored only via clone-local info/exclude (no versioned .gitignore entry).
-    std::fs::write(
-        fx.repo().join(".git").join("info").join("exclude"),
-        "localdir/\n",
-    )
-    .unwrap();
-
-    let out_graph = fx.work.path().join("graph.jsonl");
+    // In-tree graph output, deliberately NOT gitignored.
+    let in_tree_graph = fx.repo().join("graph.jsonl");
     eg().args(["scan"])
         .arg(fx.repo())
         .arg("--out")
-        .arg(&out_graph)
+        .arg(&in_tree_graph)
         .assert()
         .success();
-    let jsonl = std::fs::read_to_string(&out_graph).unwrap();
-    assert!(
-        jsonl.contains("in_local_dir"),
-        "a directory ignored only by .git/info/exclude must still be traversed and indexed: {jsonl}"
+    let data_dir = fx.repo().join(".egregore");
+    eg().args(["ingest"])
+        .arg(&in_tree_graph)
+        .args(["--adapter", "embedded"])
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let out = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "an untracked companion graph.jsonl must not make a data-dir store read stale_dirty: {report}"
     );
 }

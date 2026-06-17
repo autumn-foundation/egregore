@@ -113,20 +113,20 @@ fn should_descend(path: &Path) -> bool {
     !path.join(".git").is_file()
 }
 
-/// Runs `git ls-files --others --ignored --directory --exclude-per-directory=.gitignore`
-/// to obtain the set of gitignored top-level directories.  Returns their absolute
+/// Runs `git ls-files --others --ignored --directory --exclude-standard` to
+/// obtain the set of gitignored top-level directories.  Returns their absolute
 /// paths so callers can skip them during traversal without descending into
 /// potentially unreadable or very large subtrees.
-///
-/// Only versioned `.gitignore` files are honoured: `--exclude-per-directory`
-/// (unlike `--exclude-standard`) consults neither the global `core.excludesFile`
-/// nor the clone-local `.git/info/exclude`, so the indexed set is reproducible
-/// across clones and developer environments (PR #186 follow-up KK1).
 ///
 /// Returns an empty set when Git is unavailable or `repo_root` is not a Git
 /// work tree, preserving the filesystem-local behavior for non-Git trees.
 fn git_ignored_dir_prefixes(repo_root: &Path) -> HashSet<PathBuf> {
     let Ok(output) = Command::new("git")
+        // Override core.excludesFile to suppress user/system-level global gitignore
+        // patterns (PR #186 follow-up AA1): scans must be reproducible across
+        // different developer environments and must only honour repository-controlled
+        // ignore rules (.gitignore, .git/info/exclude), not operator-specific globals.
+        .args(["-c", "core.excludesFile="])
         .arg("-C")
         .arg(repo_root)
         .args([
@@ -134,7 +134,7 @@ fn git_ignored_dir_prefixes(repo_root: &Path) -> HashSet<PathBuf> {
             "--others",
             "--ignored",
             "--directory",
-            "--exclude-per-directory=.gitignore",
+            "--exclude-standard",
         ])
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stderr(Stdio::null())
@@ -201,15 +201,8 @@ fn filter_git_ignored(repo_root: &Path, files: &mut Vec<PathBuf>) {
     *files = kept;
 }
 
-/// Runs `git check-ignore -v -z --stdin` for `rels` under `repo_root`, returning
-/// the set of paths ignored by a versioned `.gitignore` file.
-///
-/// Only matches whose deciding pattern comes from a `.gitignore` file are
-/// honoured. Matches sourced from the clone-local `.git/info/exclude` (and the
-/// global `core.excludesFile`, also suppressed via `-c`) are disregarded so the
-/// same worktree yields the same graph across clones and environments — Git has
-/// no flag to drop `info/exclude`, but `-v` reports each match's source file so
-/// it can be filtered here (PR #186 follow-up KK1).
+/// Runs `git check-ignore -z --stdin` for `rels` under `repo_root`, returning the
+/// set of ignored relative paths.
 ///
 /// Returns `None` when Git is unavailable or `repo_root` is not a Git work tree
 /// (exit code 128), in which case no filtering is applied. Exit code 1 ("nothing
@@ -217,13 +210,12 @@ fn filter_git_ignored(repo_root: &Path, files: &mut Vec<PathBuf>) {
 fn git_check_ignored(repo_root: &Path, rels: &[String]) -> Option<HashSet<String>> {
     let mut child = Command::new("git")
         // Suppress user/system-level global gitignore (core.excludesFile) so the
-        // scan is reproducible across developer environments (AA1/KK1).
+        // scan is reproducible across developer environments; only honour
+        // repository-controlled rules (.gitignore, .git/info/exclude) (AA1).
         .args(["-c", "core.excludesFile="])
         .arg("-C")
         .arg(repo_root)
-        // `-v` prints `<source> <line> <pattern> <pathname>` per match so the
-        // clone-local `.git/info/exclude` source can be filtered out below (KK1).
-        .args(["check-ignore", "-v", "-z", "--stdin"])
+        .args(["check-ignore", "-z", "--stdin"])
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -252,19 +244,10 @@ fn git_check_ignored(repo_root: &Path, rels: &[String]) -> Option<HashSet<String
         return None;
     }
     let text = String::from_utf8(output.stdout).ok()?;
-    // `-v -z` emits four NUL-separated fields per matched path:
-    // `<source> NUL <linenum> NUL <pattern> NUL <pathname> NUL`. Non-matching
-    // paths produce no record. Honour a match only when its source file is a
-    // versioned `.gitignore`, dropping `.git/info/exclude` (basename `exclude`)
-    // matches so clone-local rules do not change the indexed set (KK1).
-    let fields: Vec<&str> = text.split('\0').collect();
-    let mut ignored = HashSet::new();
-    for record in fields.chunks_exact(4) {
-        let source = record[0];
-        let pathname = record[3];
-        if Path::new(source).file_name() == Some(OsStr::new(".gitignore")) {
-            ignored.insert(pathname.to_owned());
-        }
-    }
-    Some(ignored)
+    Some(
+        text.split('\0')
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
 }

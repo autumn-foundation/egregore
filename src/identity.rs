@@ -448,7 +448,20 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
     // `:(exclude)target` drops the root `target/`; `:(exclude,glob)**/target/**`
     // drops nested per-crate `target/` output in a workspace (a plain `:(exclude)`
     // pathspec is anchored at the root and would miss `crates/*/target/`).
-    command.args(["--", ".", ":(exclude)target", ":(exclude,glob)**/target/**"]);
+    //
+    // `:(exclude,glob)**/*.jsonl` drops graph outputs (`eg scan --out graph.jsonl`,
+    // `eg scan-history`): a JSONL store artifact is never indexed as Rust source
+    // and so can never invalidate a cited span. Excluding it everywhere means a
+    // companion graph output cannot make the tree read `stale_dirty` even when its
+    // path is unknown to the caller — e.g. `eg freshness --data-dir` cannot name
+    // the sibling `graph.jsonl` (RR1 / PR #186 follow-up).
+    command.args([
+        "--",
+        ".",
+        ":(exclude)target",
+        ":(exclude,glob)**/target/**",
+        ":(exclude,glob)**/*.jsonl",
+    ]);
     for rel in exclude_rel {
         command.arg(format!(":(exclude){rel}"));
     }
