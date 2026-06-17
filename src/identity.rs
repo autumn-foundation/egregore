@@ -383,6 +383,22 @@ pub fn working_tree_snapshot_excluding(
     })
 }
 
+/// Returns the current `HEAD` state without probing working-tree dirtiness.
+///
+/// History replay records committed state only (its snapshot is always
+/// `dirty=false`), so it needs just the committed HEAD and must not pay the full
+/// `git status` worktree walk that [`working_tree_snapshot_excluding`] performs —
+/// which is wasteful in repositories with large untracked/generated trees
+/// (VV1 / PR #186 follow-up).
+#[must_use]
+pub fn working_tree_head(repo_root: &Path) -> SnapshotHead {
+    if !git_is_repo_root(repo_root) {
+        return SnapshotHead::NoGit;
+    }
+    git_head_commit_sha(repo_root)
+        .map_or(SnapshotHead::UnbornHead, |sha| SnapshotHead::Commit { sha })
+}
+
 /// Builds a `git` command rooted at `repo_root` that never writes the index.
 ///
 /// `GIT_OPTIONAL_LOCKS=0` disables the optional index-refresh write `git status`
@@ -442,25 +458,24 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
         "--untracked-files=all",
         "--ignore-submodules=all",
     ]);
-    // A positive `.` pathspec is required for the `:(exclude)` magic to apply. The
-    // scanner skips every `target` directory at any depth (`fs::should_descend`),
-    // so an unignored build tree there must not register as dirtiness (HH1/JJ1).
-    // `:(exclude)target` drops the root `target/`; `:(exclude,glob)**/target/**`
-    // drops nested per-crate `target/` output in a workspace (a plain `:(exclude)`
-    // pathspec is anchored at the root and would miss `crates/*/target/`).
-    //
-    // `:(exclude,glob)**/*.jsonl` drops graph outputs (`eg scan --out graph.jsonl`,
-    // `eg scan-history`): a JSONL store artifact is never indexed as Rust source
-    // and so can never invalidate a cited span. Excluding it everywhere means a
-    // companion graph output cannot make the tree read `stale_dirty` even when its
-    // path is unknown to the caller — e.g. `eg freshness --data-dir` cannot name
-    // the sibling `graph.jsonl` (RR1 / PR #186 follow-up).
+    // Scope the probe to the indexed source set: only `.rs` files can produce
+    // cited graph spans, so the freshness verdict must ignore every non-source
+    // artifact in the working tree — graph/JSONL outputs, embedded-store
+    // directories, refresh caches (including custom out-of-tree ones the caller
+    // cannot name), and build output — regardless of name or location (RR1/XX1).
+    // The positive `:(glob)**/*.rs` pathspec matches `.rs` files at any depth
+    // (root included); deletions and renames of tracked `.rs` files still surface.
+    // Build output under any `target/` directory is pruned by the scanner
+    // (`fs::should_descend`), so it is excluded here too (HH1/JJ1):
+    // `:(exclude)target` drops the root `target/` and `:(exclude,glob)**/target/**`
+    // drops nested per-crate `target/`. `exclude_rel` still drops any explicitly
+    // named store artifact a caller passes (redundant under `.rs` scoping, but
+    // harmless).
     command.args([
         "--",
-        ".",
+        ":(glob)**/*.rs",
         ":(exclude)target",
         ":(exclude,glob)**/target/**",
-        ":(exclude,glob)**/*.jsonl",
     ]);
     for rel in exclude_rel {
         command.arg(format!(":(exclude){rel}"));
@@ -506,9 +521,15 @@ fn git_index_hidden_rust_sources(repo_root: &Path) -> bool {
             return false;
         }
         // Format is `<tag><space><path>`, so the path starts at byte 2.
-        let path = line.get(2..).unwrap_or("");
-        Path::new(path)
-            .extension()
+        let path = Path::new(line.get(2..).unwrap_or(""));
+        // Match the scanner's source set: skip files under any `target` directory
+        // (pruned by `fs::should_descend` and excluded from the status pathspec
+        // above), so unindexed build output cannot stale an otherwise fresh store
+        // (WW1 / PR #186 follow-up).
+        if path.components().any(|c| c.as_os_str() == "target") {
+            return false;
+        }
+        path.extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
     })
 }

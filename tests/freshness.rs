@@ -2222,3 +2222,95 @@ fn freshness_unknown_when_explicit_repo_matches_auto_identity_but_is_legacy() {
         "must report unknown for the selected legacy repo, not borrow the other stamped repo's verdict: {row}"
     );
 }
+
+/// `WW1`: the index-hidden check (assume-unchanged/skip-worktree) must apply the
+/// scanner's `target/` pruning. A tracked `.rs` under `target/` is never indexed,
+/// so an index-hidden flag on it must not force `stale_dirty`.
+#[test]
+fn freshness_ignores_index_hidden_rust_under_target() {
+    let fx = Fixture::committed();
+    let target = fx.repo().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("gen.rs"), "pub fn gen() {}\n").unwrap();
+    commit_all(fx.repo(), "add target rs");
+    fx.scan();
+    // Hide the target .rs from `git status`; the scanner never indexed it.
+    git(
+        fx.repo(),
+        ["update-index", "--assume-unchanged", "target/gen.rs"],
+    );
+
+    let report = fx.freshness_graph();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "an index-hidden .rs under target/ must not stale the store (it is never indexed): {report}"
+    );
+}
+
+/// `YY1`: `eg freshness --repo-id-override <wrong>` against a single-repo store
+/// must report `unknown`, not borrow the sole repository's snapshot via the
+/// single-repository fallback (which could even report `fresh`).
+#[test]
+fn freshness_unknown_for_wrong_explicit_override_in_single_repo_store() {
+    let fx = Fixture::committed();
+    fx.scan();
+
+    let out = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--graph")
+        .arg(fx.graph())
+        .args(["--repo-id-override", "totally-unrelated-id"])
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        report["freshness"], "unknown",
+        "a wrong explicit override must report unknown, not borrow the sole repo's snapshot: {report}"
+    );
+}
+
+/// `XX1`: a custom in-tree `--cache` path outside `--data-dir` (which the
+/// follow-up `eg freshness --data-dir` cannot name) must not make the store read
+/// `stale_dirty`. A cache file is never indexed source, so the dirty probe ignores
+/// every non-`.rs` artifact regardless of name.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn freshness_data_dir_ignores_untracked_custom_cache() {
+    let fx = Fixture::committed();
+    fx.scan();
+    let data_dir = fx.repo().join(".egregore");
+    eg().args(["ingest"])
+        .arg(fx.graph())
+        .args(["--adapter", "embedded"])
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    // Custom cache placed in-tree, OUTSIDE data_dir, deliberately not gitignored.
+    let custom_cache = fx.repo().join("my-refresh-cache.json");
+    eg().args(["refresh"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--cache")
+        .arg(&custom_cache)
+        .assert()
+        .success();
+
+    let out = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "an untracked custom refresh cache must not make the store read stale_dirty: {report}"
+    );
+}

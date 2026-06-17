@@ -142,6 +142,34 @@ pub fn stored_snapshot_with_owner<'a>(
     matched.or_else(|| (repository_nodes == 1).then_some(sole).flatten())
 }
 
+/// Like [`stored_snapshot`] but requires an exact `repository_id` match, with no
+/// single-repository fallback.
+///
+/// Used when the caller pinned an explicit identity (`eg freshness
+/// --repo-id-override`): a wrong or typo'd override against a single-repo store
+/// must report `unknown` rather than silently classifying an unrelated
+/// repository's snapshot (which could even read `fresh`) under the caller's
+/// unmatched identity (PR #186 follow-up YY1).
+#[must_use]
+pub fn stored_snapshot_exact<'a>(
+    records: &'a [GraphRecord],
+    repository_id: &str,
+) -> Option<&'a SourceSnapshotPayload> {
+    records.iter().find_map(|record| {
+        if let GraphRecord::Node {
+            kind: NodeKind::Repository,
+            id,
+            source_snapshot,
+            ..
+        } = record
+            && id == repository_id
+        {
+            return source_snapshot.as_deref();
+        }
+        None
+    })
+}
+
 /// Returns the stored snapshot and its owner when exactly **one** `Repository`
 /// node in the store carries a `source_snapshot`, regardless of how many
 /// `Repository` nodes exist in total.

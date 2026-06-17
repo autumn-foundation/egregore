@@ -74,7 +74,7 @@ fn scan_repository_history_inner(
     // The transaction time is derived from HEAD's committer date, not wall-clock,
     // so repeated scans of an unchanged repository stay byte-stable across a
     // seconds boundary (TT3 / the history replay determinism contract).
-    let (head, _) = identity::working_tree_snapshot_excluding(repo_root, &[]);
+    let head = identity::working_tree_head(repo_root);
     let transaction_time = match &head {
         SnapshotHead::Commit { sha } => commit_metadata(repo_root, sha)?.committed_at,
         _ => PROCESS_STARTED_AT.clone(),

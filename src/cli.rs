@@ -1914,7 +1914,17 @@ fn freshness_cmd(
         Some(dir) => load_records_from_data_dir_readonly(dir)?,
         None => load_query_records(graph, None)?,
     };
-    let stored = freshness::stored_snapshot(&records, &identity.id);
+    // An explicit `--repo-id-override` pins the identity used to locate the stored
+    // snapshot, so it must match exactly: a wrong/typo'd override must not borrow an
+    // unrelated sole repository's snapshot via `stored_snapshot`'s single-repo
+    // fallback (which could even report `fresh` under the caller's unmatched ID).
+    // Without an override, the auto-detected identity keeps that fallback so legacy
+    // single-repo stores still classify (PR #186 follow-up YY1).
+    let stored = if repo_id_override.is_some() {
+        freshness::stored_snapshot_exact(&records, &identity.id)
+    } else {
+        freshness::stored_snapshot(&records, &identity.id)
+    };
     let verdict = freshness::classify(stored, &current_head, current_dirty);
 
     let report = FreshnessReport {
