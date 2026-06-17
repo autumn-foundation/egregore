@@ -1933,7 +1933,15 @@ fn freshness_cmd(
             freshness::stored_snapshot_exact(&records, &identity.id),
         )
     } else {
-        match freshness::stored_snapshot_with_owner(&records, &identity.id) {
+        // Mirror the per-row query freshness path (Z1): when the identity probe
+        // misses, fall back to the sole STAMPED repository so a combined store with
+        // exactly one stamped Repository (e.g. an override-scanned repo alongside a
+        // legacy unstamped node) classifies unambiguously instead of reporting
+        // `unknown` — and `eg freshness` agrees with `eg query ... --repo-path` on
+        // the same store (PR #186 follow-up DDD1).
+        match freshness::stored_snapshot_with_owner(&records, &identity.id)
+            .or_else(|| freshness::stored_snapshot_sole_stamped(&records))
+        {
             Some((owner, snapshot)) => (owner.to_owned(), Some(snapshot)),
             None => (identity.id.clone(), None),
         }

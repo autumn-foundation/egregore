@@ -496,19 +496,25 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
     // or `skip-worktree` (e.g. after a sparse-checkout change). The scanner reads
     // those files when present, so a graph built from a full checkout would read
     // `fresh` after sparse checkout removes a cited `.rs` file. Treat any such
-    // index-hidden Rust source as dirtiness so the verdict stays conservative
+    // index-hidden source input as dirtiness so the verdict stays conservative
     // (PR #186 follow-up LL1).
-    Some(!text.trim().is_empty() || git_index_hidden_rust_sources(repo_root))
+    Some(!text.trim().is_empty() || git_index_hidden_source_inputs(repo_root))
 }
 
-/// Returns `true` when any tracked `.rs` file that is **present in the working
-/// tree** carries an index flag hiding its state from `git status`:
-/// `skip-worktree` or `assume-unchanged` (PR #186 follow-up LL1).
+/// Returns `true` when any tracked file that influences the indexed source set —
+/// a `.rs` source or a versioned `.gitignore` — is **present in the working tree**
+/// but carries an index flag hiding its state from `git status`: `skip-worktree`
+/// or `assume-unchanged` (PR #186 follow-up LL1/EEE1).
 ///
 /// Reads `git ls-files -v` (strictly read-only): each line is `<tag> <path>`.
 /// `assume-unchanged` lowercases the tag; `skip-worktree` is reported as `S`
 /// (or `s` when also assume-unchanged). Returns `false` when Git is unavailable
 /// or the listing fails, leaving the porcelain probe's verdict unchanged.
+///
+/// `.gitignore` is included because the indexed set depends on it (BBB1): a hidden
+/// `.gitignore` edited to ignore a previously-indexed untracked `.rs` directory
+/// leaves `git status` empty for both the ignore file and the now-ignored sources,
+/// which would otherwise read `fresh` (EEE1).
 ///
 /// The file must exist on disk to count: a clean sparse checkout marks omitted
 /// files `skip-worktree` AND leaves them absent, so the scanner never indexed
@@ -516,7 +522,7 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
 /// `eg scan` of a sparse checkout immediately read `stale_dirty` (AAA1). A
 /// present index-hidden file (e.g. `assume-unchanged`) WAS scannable, so hidden
 /// edits to it still warrant the conservative dirty verdict.
-fn git_index_hidden_rust_sources(repo_root: &Path) -> bool {
+fn git_index_hidden_source_inputs(repo_root: &Path) -> bool {
     let Ok(output) = read_only_git(repo_root).args(["ls-files", "-v"]).output() else {
         return false;
     };
@@ -543,10 +549,13 @@ fn git_index_hidden_rust_sources(repo_root: &Path) -> bool {
         if path.components().any(|c| c.as_os_str() == "target") {
             return false;
         }
-        if !path
+        // Only files that shape the indexed source set: `.rs` sources and the
+        // versioned `.gitignore` rules that decide which untracked `.rs` are indexed.
+        let is_source_input = path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
-        {
+            || path.file_name().and_then(|n| n.to_str()) == Some(".gitignore");
+        if !is_source_input {
             return false;
         }
         // Present on disk → part of the scanned source set (AAA1). A sparse-checkout

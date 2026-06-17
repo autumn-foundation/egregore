@@ -2427,3 +2427,102 @@ fn freshness_detects_gitignore_changes() {
         "a post-scan .gitignore change must not read fresh (the indexed source set depends on it): {report}"
     );
 }
+
+/// `DDD1`: `eg freshness --graph` on a combined store with exactly one stamped
+/// Repository (e.g. an override-scanned repo alongside a legacy unstamped node)
+/// must classify via the sole-stamped fallback, matching the per-row query path,
+/// instead of reporting `unknown`.
+#[test]
+fn freshness_uses_sole_stamped_fallback_in_combined_store() {
+    let fx = Fixture::committed();
+    // Stamped repo via override.
+    let stamped = fx.work.path().join("stamped.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&stamped)
+        .args(["--repo-id-override", "stamped-repo"])
+        .assert()
+        .success();
+    let stamped_raw = std::fs::read_to_string(&stamped).unwrap();
+    let stamped_id = stamped_raw
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["kind"] == "Repository")
+        .and_then(|v| v["id"].as_str().map(str::to_owned))
+        .expect("stamped Repository id");
+
+    // Legacy repo (the checkout's auto identity): normal scan, snapshot stripped.
+    let legacy = fx.work.path().join("legacy.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&legacy)
+        .assert()
+        .success();
+    let legacy_stripped: String = std::fs::read_to_string(&legacy)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let Ok(mut v) = serde_json::from_str::<Value>(line) else {
+                return line.to_owned();
+            };
+            if v["kind"] == "Repository" {
+                v.as_object_mut().map(|o| o.remove("source_snapshot"));
+            }
+            serde_json::to_string(&v).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let combined = fx.work.path().join("combined.jsonl");
+    std::fs::write(
+        &combined,
+        format!("{}\n{}\n", stamped_raw.trim_end(), legacy_stripped),
+    )
+    .unwrap();
+
+    let out = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--graph")
+        .arg(&combined)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "a combined store with exactly one stamped repo must classify via the sole-stamped fallback, not report unknown: {report}"
+    );
+    assert_eq!(
+        report["repository_id"],
+        Value::String(stamped_id),
+        "the verdict must be owned by the stamped repository: {report}"
+    );
+}
+
+/// `EEE1`: a tracked `.gitignore` marked assume-unchanged (hidden from
+/// `git status`) and then edited changes the indexed source set, so the
+/// index-hidden check must include `.gitignore` files — not just `.rs` — or the
+/// store would read `fresh` despite the ignore-rule change.
+#[test]
+fn freshness_detects_hidden_gitignore_edit() {
+    let fx = Fixture::committed();
+    std::fs::write(fx.repo().join(".gitignore"), "/old/\n").unwrap();
+    commit_all(fx.repo(), "add gitignore");
+    fx.scan();
+
+    // Hide the .gitignore from git status, then edit it (changes the source set).
+    git(
+        fx.repo(),
+        ["update-index", "--assume-unchanged", ".gitignore"],
+    );
+    std::fs::write(fx.repo().join(".gitignore"), "/old/\n/gen/\n").unwrap();
+
+    let report = fx.freshness_graph();
+    assert_eq!(
+        report["freshness"], "stale_dirty",
+        "a hidden (assume-unchanged) .gitignore edit must be detected as dirty (it changes the indexed source set): {report}"
+    );
+}
