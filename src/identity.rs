@@ -465,6 +465,12 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
     // cannot name), and build output — regardless of name or location (RR1/XX1).
     // The positive `:(glob)**/*.rs` pathspec matches `.rs` files at any depth
     // (root included); deletions and renames of tracked `.rs` files still surface.
+    //
+    // `:(glob)**/.gitignore` also includes versioned ignore files: the indexed set
+    // depends on them (the scanner drops gitignored untracked `.rs`), so adding or
+    // changing an ignore rule after a scan changes which sources belong in the
+    // graph and must read as dirty rather than `fresh` (BBB1 / PR #186 follow-up).
+    //
     // Build output under any `target/` directory is pruned by the scanner
     // (`fs::should_descend`), so it is excluded here too (HH1/JJ1):
     // `:(exclude)target` drops the root `target/` and `:(exclude,glob)**/target/**`
@@ -474,6 +480,7 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
     command.args([
         "--",
         ":(glob)**/*.rs",
+        ":(glob)**/.gitignore",
         ":(exclude)target",
         ":(exclude,glob)**/target/**",
     ]);

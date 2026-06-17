@@ -2131,6 +2131,25 @@ fn scan_history_snapshot_timestamp_is_deterministic_from_head_commit() {
         "history scanned_at must derive from HEAD committer date (deterministic), not wall-clock: {repo_node}"
     );
 
+    // CCC1: the producer timestamp must also be deterministic (HEAD committer
+    // date), not wall-clock `PROCESS_STARTED_AT`, or cross-process scans differ.
+    // The within-process byte-stability check below cannot catch this, so assert
+    // the value directly.
+    let producer_started_at = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| {
+            v.get("producer")
+                .and_then(|p| p.get("producer_started_at"))
+                .and_then(|t| t.as_str())
+                .map(str::to_owned)
+        })
+        .expect("a producer_started_at in the history graph");
+    assert_eq!(
+        producer_started_at, "2026-01-01T00:00:00Z",
+        "history producer_started_at must be the deterministic HEAD committer date, not wall-clock"
+    );
+
     // Determinism: a second scan of the unchanged repository is byte-identical.
     let history_graph_2 = fx.work.path().join("history.graph.2.jsonl");
     eg().args(["scan-history"])
@@ -2387,5 +2406,24 @@ fn freshness_fresh_for_clean_sparse_checkout_omission() {
     assert_eq!(
         report["freshness"], "fresh",
         "a clean sparse-checkout omission (skip-worktree + absent) must not stale a just-built store: {report}"
+    );
+}
+
+/// `BBB1`: the indexed `.rs` source set depends on versioned `.gitignore` rules
+/// (the scanner drops gitignored untracked `.rs`). A `.gitignore` change after a
+/// scan can therefore leave now-ignored sources in the graph, so the dirty probe
+/// must include `.gitignore` edits rather than reporting `fresh`.
+#[test]
+fn freshness_detects_gitignore_changes() {
+    let fx = Fixture::committed();
+    fx.scan();
+    // Add an ignore rule after the scan: this changes which untracked .rs the
+    // scanner would index, so the store is no longer guaranteed to match.
+    std::fs::write(fx.repo().join(".gitignore"), "/gen/\n").unwrap();
+
+    let report = fx.freshness_graph();
+    assert_eq!(
+        report["freshness"], "stale_dirty",
+        "a post-scan .gitignore change must not read fresh (the indexed source set depends on it): {report}"
     );
 }

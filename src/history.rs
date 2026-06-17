@@ -187,6 +187,12 @@ fn scan_repository_history_inner(
 
     let mut producer = code_graph_producer();
     producer.producer_kind = ProducerKind::HistoryReplay;
+    // Make the producer fully deterministic too (CCC1): `code_graph_producer`
+    // sets `producer_started_at` from the wall-clock `PROCESS_STARTED_AT`, which
+    // would make two `eg scan-history` runs of the same unchanged repository in
+    // separate processes differ. History replay is committed-state-only, so anchor
+    // it to the same deterministic HEAD-committer transaction time as the snapshot.
+    producer.producer_started_at = transaction_time;
     Ok(graph.stamp_producer(&producer))
 }
 
