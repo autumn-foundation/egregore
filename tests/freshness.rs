@@ -2679,3 +2679,36 @@ fn freshness_detects_cited_source_behind_new_nested_git() {
         "a cited source behind a newly nested .git must read stale_dirty: {report}"
     );
 }
+
+/// `HHH1`: the scanner indexes real `.rs` files only. `DirEntry::metadata()` does
+/// not traverse symlinks, and Git stores a symlink as link text (not the target's
+/// bytes), so a symlinked `link.rs` is never followed into its target. The
+/// target's contents are therefore never cited, and editing an external/non-`.rs`
+/// symlink target cannot leave stale spans the freshness probe would miss. This
+/// locks that behavior in (the premise that the scanner follows symlinks is false).
+#[cfg(unix)]
+#[test]
+fn scan_does_not_index_symlinked_rust_sources() {
+    let fx = Fixture::committed();
+    // A non-.rs payload containing Rust code, and a symlinked `.rs` pointing at it.
+    std::fs::write(
+        fx.repo().join("payload.txt"),
+        "pub fn symlink_target_fn() {}\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("../payload.txt", fx.repo().join("src").join("link.rs")).unwrap();
+    commit_all(fx.repo(), "add symlinked rs");
+
+    let out_graph = fx.work.path().join("graph.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&out_graph)
+        .assert()
+        .success();
+    let jsonl = std::fs::read_to_string(&out_graph).unwrap();
+    assert!(
+        !jsonl.contains("symlink_target_fn"),
+        "the scanner must not follow a symlinked .rs into its target's bytes: {jsonl}"
+    );
+}
