@@ -2314,3 +2314,49 @@ fn freshness_data_dir_ignores_untracked_custom_cache() {
         "an untracked custom refresh cache must not make the store read stale_dirty: {report}"
     );
 }
+
+/// `ZZ1`: when a store scanned with `--repo-id-override` is checked by
+/// `eg freshness` WITHOUT repeating the override, the sole-repository fallback
+/// classifies the right snapshot — and the reported `repository_id` must be that
+/// stored Repository's owning ID, not the auto-detected checkout identity, so
+/// consumers keying the verdict by repository are not misled.
+#[test]
+fn freshness_reports_snapshot_owner_for_override_store_without_override() {
+    let fx = Fixture::committed();
+    // Scan with an override id → a single-repo store owned by the override.
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(fx.graph())
+        .args(["--repo-id-override", "override-repo"])
+        .assert()
+        .success();
+    let owner_id = std::fs::read_to_string(fx.graph())
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["kind"] == "Repository")
+        .and_then(|v| v["id"].as_str().map(str::to_owned))
+        .expect("Repository id");
+
+    // Run freshness WITHOUT the override: the auto-detected identity differs, so the
+    // verdict comes from the sole-repository fallback.
+    let out = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--graph")
+        .arg(fx.graph())
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        report["repository_id"],
+        Value::String(owner_id),
+        "freshness must report the snapshot's owning Repository id, not the auto-detected identity: {report}"
+    );
+    assert_eq!(
+        report["freshness"], "fresh",
+        "the override-scanned clean store must still classify fresh via the sole-repo fallback: {report}"
+    );
+}

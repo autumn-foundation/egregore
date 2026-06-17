@@ -1916,21 +1916,34 @@ fn freshness_cmd(
     };
     // An explicit `--repo-id-override` pins the identity used to locate the stored
     // snapshot, so it must match exactly: a wrong/typo'd override must not borrow an
-    // unrelated sole repository's snapshot via `stored_snapshot`'s single-repo
-    // fallback (which could even report `fresh` under the caller's unmatched ID).
-    // Without an override, the auto-detected identity keeps that fallback so legacy
-    // single-repo stores still classify (PR #186 follow-up YY1).
-    let stored = if repo_id_override.is_some() {
-        freshness::stored_snapshot_exact(&records, &identity.id)
+    // unrelated sole repository's snapshot via the single-repository fallback (which
+    // could even report `fresh` under the caller's unmatched ID). Without an
+    // override, the auto-detected identity keeps that fallback so legacy single-repo
+    // stores still classify (PR #186 follow-up YY1).
+    //
+    // Report the repository that actually OWNS the matched snapshot, not the
+    // recomputed checkout identity: a store scanned with `--repo-id-override` and
+    // checked without it classifies the sole repository via the fallback, and the
+    // JSON `repository_id` must be that stored Repository's ID so consumers keying
+    // the verdict by repository are not misled (PR #186 follow-up ZZ1).
+    let (report_repository_id, stored) = if repo_id_override.is_some() {
+        // Exact match required; when found, the owner is the requested identity.
+        (
+            identity.id.clone(),
+            freshness::stored_snapshot_exact(&records, &identity.id),
+        )
     } else {
-        freshness::stored_snapshot(&records, &identity.id)
+        match freshness::stored_snapshot_with_owner(&records, &identity.id) {
+            Some((owner, snapshot)) => (owner.to_owned(), Some(snapshot)),
+            None => (identity.id.clone(), None),
+        }
     };
     let verdict = freshness::classify(stored, &current_head, current_dirty);
 
     let report = FreshnessReport {
         freshness: verdict.code().to_owned(),
         fresh: verdict.is_fresh(),
-        repository_id: identity.id.clone(),
+        repository_id: report_repository_id,
         store_kind: store_kind.to_owned(),
         current_head,
         current_dirty,
