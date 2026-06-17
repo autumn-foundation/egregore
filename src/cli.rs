@@ -1990,7 +1990,11 @@ fn query_freshness_code_inner(
 ) -> Option<(String, &'static str)> {
     let repo_path = repo_path?;
     let identity = identity::compute_repository_identity(repo_path, None);
-    let exclusions = store_artifact_exclusions(repo_path, artifacts);
+    // Mirror `freshness_cmd`/`scan` and also exclude any in-tree `.egregore*`
+    // companion store (PR #186 follow-up II1): the documented workflow leaves an
+    // untracked `.egregore` data-dir beside the graph, which must not stamp query
+    // rows `stale_dirty` when the graph itself was scanned from a clean tree.
+    let exclusions = store_exclusions_including_egregore(repo_path, artifacts);
     let (head, dirty) = identity::working_tree_snapshot_excluding(repo_path, &exclusions);
     // When the caller supplies an explicit hint (a resolved `--repo` scope or
     // `--repo-id-override` value that differs from the auto-detected identity),
@@ -2477,12 +2481,12 @@ fn scan_refresh_cmd(
     }
 
     // Perform the incremental scan (reads cache, hashes files, rebuilds changed ones).
-    // Exclude both the data-dir and the cache file from the dirty probe (PR #186 A,
-    // follow-up): both are refresh artifacts; counting either as dirty would stamp
-    // `dirty = true` on the snapshot and make a follow-up `eg freshness --data-dir`
-    // report `stale_dirty` even when no source changed.
+    // Exclude the data-dir, the cache file, and any in-tree `.egregore*` companion
+    // store from the dirty probe (PR #186 A/MM1): all are refresh/store artifacts;
+    // counting any as dirty would stamp `dirty = true` on the snapshot and make a
+    // follow-up `eg freshness --data-dir` report `stale_dirty` with no source change.
     let snapshot_exclusions =
-        store_artifact_exclusions(repo_path, &[Some(data_dir), Some(cache_path)]);
+        store_exclusions_including_egregore(repo_path, &[Some(data_dir), Some(cache_path)]);
     let scan = scan_repository_incremental_excluding(repo_path, cache_path, &snapshot_exclusions)
         .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
 

@@ -1706,3 +1706,110 @@ fn freshness_ignores_dirty_submodule() {
         "a dirty submodule must not make the superproject read stale_dirty: {report}"
     );
 }
+
+/// II1: `query symbol --repo-path` must exclude an unignored in-tree `.egregore`
+/// companion store from the dirty probe, exactly as `freshness_cmd` does.
+/// Otherwise rows are stamped `stale_dirty` solely because the store exists,
+/// even though the graph was scanned from a clean tree.
+#[test]
+fn query_symbol_repo_path_ignores_untracked_egregore_store_dir() {
+    let fx = Fixture::committed();
+    // Graph lives outside the tree; the only in-tree untracked artifact is the
+    // (not gitignored) `.egregore` store.
+    fx.scan();
+    let store = fx.repo().join(".egregore");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("records.bin"), b"\x00\x01embedded-store").unwrap();
+
+    let out = eg()
+        .args(["query", "symbol", "hello"])
+        .arg("--graph")
+        .arg(fx.graph())
+        .arg("--repo-path")
+        .arg(fx.repo())
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let line = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let row: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        row["freshness"], "fresh",
+        "an untracked in-tree .egregore store must not stamp query rows stale_dirty: {row}"
+    );
+}
+
+/// `JJ1`: unignored per-crate `target/` build output in a workspace must not
+/// count as source dirtiness.  `fs::should_descend` skips every `target`
+/// directory at any depth, so a nested `crates/*/target/` tree is invisible to
+/// the scanner and must be excluded from the dirty probe too (the root-only
+/// `:(exclude)target` pathspec would otherwise miss it).
+#[test]
+fn freshness_ignores_unignored_nested_target_build_output() {
+    let fx = Fixture::committed();
+    // Nested per-crate build output, present before the scan and not gitignored.
+    let nested = fx
+        .repo()
+        .join("crates")
+        .join("a")
+        .join("target")
+        .join("debug");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("out.txt"), b"artifact").unwrap();
+
+    fx.scan();
+    let report = fx.freshness_graph();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "unignored nested target/ build output must not be counted as source dirtiness: {report}"
+    );
+}
+
+/// MM1: `eg refresh --data-dir <out-of-tree>` must exclude an unignored default
+/// in-tree `.egregore` store left by a prior ingest from the dirty probe, so the
+/// re-stamped snapshot is not `dirty=true` and a later freshness check is not
+/// spuriously `stale_dirty`.
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn refresh_ignores_untracked_default_egregore_store_dir() {
+    let fx = Fixture::committed();
+    fx.scan();
+
+    // Establish the out-of-tree refresh target via the documented scan→ingest
+    // workflow (`eg refresh` requires a prior ingest into the data-dir).
+    let out_of_tree = fx.work.path().join("store");
+    eg().args(["ingest"])
+        .arg(fx.graph())
+        .args(["--adapter", "embedded"])
+        .arg("--data-dir")
+        .arg(&out_of_tree)
+        .assert()
+        .success();
+
+    // A leftover untracked default `.egregore` store inside the repo (not the
+    // refresh target, which is the out-of-tree work dir).
+    let stale_store = fx.repo().join(".egregore");
+    std::fs::create_dir_all(&stale_store).unwrap();
+    std::fs::write(stale_store.join("records.bin"), b"\x00\x01old-store").unwrap();
+
+    // Refresh into the out-of-tree data-dir.
+    eg().args(["refresh"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&out_of_tree)
+        .assert()
+        .success();
+
+    let out = eg()
+        .args(["freshness"])
+        .arg(fx.repo())
+        .arg("--data-dir")
+        .arg(&out_of_tree)
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "a leftover in-tree .egregore store must not make a refreshed out-of-tree store stale_dirty: {report}"
+    );
+}

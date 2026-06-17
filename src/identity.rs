@@ -443,10 +443,12 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
         "--ignore-submodules=all",
     ]);
     // A positive `.` pathspec is required for the `:(exclude)` magic to apply. The
-    // scanner skips every `target` directory, so an unignored build tree there must
-    // not register as dirtiness (HH1); `:(exclude)` of a directory drops everything
-    // beneath it, matching the per-artifact exclusions in `exclude_rel`.
-    command.args(["--", ".", ":(exclude)target"]);
+    // scanner skips every `target` directory at any depth (`fs::should_descend`),
+    // so an unignored build tree there must not register as dirtiness (HH1/JJ1).
+    // `:(exclude)target` drops the root `target/`; `:(exclude,glob)**/target/**`
+    // drops nested per-crate `target/` output in a workspace (a plain `:(exclude)`
+    // pathspec is anchored at the root and would miss `crates/*/target/`).
+    command.args(["--", ".", ":(exclude)target", ":(exclude,glob)**/target/**"]);
     for rel in exclude_rel {
         command.arg(format!(":(exclude){rel}"));
     }
