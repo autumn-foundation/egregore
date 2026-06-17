@@ -72,10 +72,7 @@ pub use claude_code::import_claude_code;
 pub use codex::import_codex;
 pub use decide::{DecideRequest, decide_candidate};
 pub use error::{CodegraphError, Result};
-pub use history::{
-    scan_repository_history, scan_repository_history_excluding,
-    scan_repository_history_with_override,
-};
+pub use history::{scan_repository_history, scan_repository_history_with_override};
 pub use ir::{
     AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, Domain, EdgeLabel, EgregoreGit,
     EmbeddingModel, EvidenceLink, Graph, GraphRecord, IdentitySource, MetricKind, NodeKind,

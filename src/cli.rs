@@ -22,8 +22,7 @@ use crate::{
     identity,
     ir::{EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SnapshotHead, SourceSpan},
     link_evidence::{self, LinkOptions},
-    local_project, query, scan_repository_history_excluding, scan_repository_history_with_override,
-    scan_repository_with_exclusions,
+    local_project, query, scan_repository_history_with_override, scan_repository_with_exclusions,
     schema_version::{RecordVersion, record_version},
     traj::{self, ImportOptions},
 };
@@ -1807,13 +1806,11 @@ fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<
 }
 
 fn scan_history(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<()> {
-    // Exclude the output file and any in-tree egregore store from the dirty probe
-    // (CC1/GG1 / PR #186 follow-up): neither a pre-existing in-tree
-    // history.graph.jsonl nor a companion `.egregore` store written by a prior
-    // `eg ingest` must stamp dirty=true on the freshly replayed snapshot, just as
-    // `scan` excludes its own store artifacts.
-    let exclusions = store_exclusions_including_egregore(repo_path, &[Some(out)]);
-    let graph = scan_repository_history_excluding(repo_path, repo_id_override, &exclusions)
+    // History replay reads only committed Git objects, so the stamped snapshot is
+    // always `dirty=false` (committed HEAD state); a pre-existing in-tree output or
+    // companion store cannot affect it, and no dirty-probe exclusions are needed
+    // (TT1 supersedes the earlier CC1/GG1 exclusion machinery).
+    let graph = scan_repository_history_with_override(repo_path, repo_id_override)
         .with_context(|| format!("failed to scan Git history for {}", repo_path.display()))?;
     let jsonl = graph
         .to_jsonl()
@@ -1996,21 +1993,22 @@ fn query_freshness_code_inner(
     // rows `stale_dirty` when the graph itself was scanned from a clean tree.
     let exclusions = store_exclusions_including_egregore(repo_path, artifacts);
     let (head, dirty) = identity::working_tree_snapshot_excluding(repo_path, &exclusions);
-    // An explicit hint (a resolved `--repo` scope or context owner that differs
-    // from the auto-detected identity) is authoritative: the verdict must be owned
-    // by the selected repository. Look up ONLY its snapshot — never fall back to
-    // the auto-detected identity's snapshot, which belongs to a different repo and
-    // would mislabel the verdict's owner. When the selected repo has no snapshot
-    // (legacy/pre-stamping rows in a combined store), `matched` stays `None` and
-    // the owner below is still the hint, so `stamp_freshness` stamps `unknown` on
-    // the selected rows rather than omitting the field (PR #186 follow-up SS1).
+    // Any explicit hint (a resolved `--repo` scope or context owner) is
+    // authoritative: the verdict must be owned by the selected repository, even
+    // when the hint equals the auto-detected identity. Look up ONLY its snapshot —
+    // never fall back to the auto-detected identity's snapshot or the sole-stamped
+    // repo, which may belong to a different repository and would mislabel the
+    // verdict's owner. When the selected repo has no snapshot (legacy/pre-stamping
+    // rows in a combined store), `matched` stays `None` and the owner below is
+    // still the hint, so `stamp_freshness` stamps `unknown` on the selected rows
+    // rather than omitting the field (PR #186 follow-up SS1/UU1).
     //
-    // When no hint is given and the identity probe fails, try a sole-stamped
+    // Only when NO hint is given does the identity probe run with a sole-stamped
     // fallback: if exactly one Repository node in the store carries a snapshot,
-    // that snapshot is unambiguous and should be used.  This handles combined
+    // that snapshot is unambiguous and should be used. This handles combined
     // stores where --repo-id-override was used on the scanned checkout but no
     // --repo flag was passed to the query command (PR #186 follow-up Z1).
-    let matched = match repo_id_hint.filter(|h| *h != identity.id.as_str()) {
+    let matched = match repo_id_hint {
         Some(h) => freshness::stored_snapshot_with_owner(records, h),
         None => freshness::stored_snapshot_with_owner(records, &identity.id)
             .or_else(|| freshness::stored_snapshot_sole_stamped(records)),
@@ -2022,10 +2020,7 @@ fn query_freshness_code_inner(
     let (owner_id, stored) = match matched {
         Some((owner, snapshot)) => (owner.to_owned(), Some(snapshot)),
         None => (
-            repo_id_hint
-                .filter(|h| *h != identity.id.as_str())
-                .map(ToOwned::to_owned)
-                .unwrap_or(identity.id),
+            repo_id_hint.map(ToOwned::to_owned).unwrap_or(identity.id),
             None,
         ),
     };

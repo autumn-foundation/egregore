@@ -12,7 +12,7 @@ use crate::{
     fs::SourceFile,
     identity,
     ir::{
-        EdgeLabel, Graph, GraphRecord, NodeKind, ProducerKind, SourceSnapshotPayload,
+        EdgeLabel, Graph, GraphRecord, NodeKind, ProducerKind, SnapshotHead, SourceSnapshotPayload,
         TemporalMetadata, stable_id,
     },
     repository_record_from_identity, scan_source_text_records, validate_repository,
@@ -44,33 +44,13 @@ pub fn scan_repository_history_with_override(
     repo_path: impl AsRef<Path>,
     repo_id_override: Option<&str>,
 ) -> Result<Graph> {
-    scan_repository_history_inner(repo_path, repo_id_override, &[])
-}
-
-/// Like [`scan_repository_history_with_override`] but excludes repo-relative
-/// paths from the dirty probe when stamping the snapshot.
-///
-/// Pass the history graph output path (if inside the repository) so a
-/// pre-existing `history.graph.jsonl` from a previous run is not counted as a
-/// source change (CC1 / PR #186 follow-up).
-///
-/// # Errors
-///
-/// Returns an error when the repository path is invalid, Git is unavailable, or
-/// a reachable Rust source blob cannot be parsed.
-pub fn scan_repository_history_excluding(
-    repo_path: impl AsRef<Path>,
-    repo_id_override: Option<&str>,
-    snapshot_exclusions: &[String],
-) -> Result<Graph> {
-    scan_repository_history_inner(repo_path, repo_id_override, snapshot_exclusions)
+    scan_repository_history_inner(repo_path, repo_id_override)
 }
 
 #[allow(clippy::too_many_lines)]
 fn scan_repository_history_inner(
     repo_path: impl AsRef<Path>,
     repo_id_override: Option<&str>,
-    snapshot_exclusions: &[String],
 ) -> Result<Graph> {
     std::sync::LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
@@ -79,18 +59,29 @@ fn scan_repository_history_inner(
     let repo_identity = identity::compute_repository_identity(repo_root, repo_id_override);
     let (repository_id, repository) = repository_record_from_identity(&repo_identity);
 
-    // Stamp the current working-tree snapshot on the Repository node (BB1 /
-    // PR #186 follow-up): without this, `eg freshness --graph history.graph.jsonl`
-    // and `--at` queries with `--repo-path` always report `unknown` because the
-    // Repository node carries no `source_snapshot`.  The stamped HEAD lets
-    // freshness detect `stale_head` after new commits are added.
-    // Exclude the output artifact from the dirty probe so a pre-existing
-    // in-tree history graph does not stamp dirty=true (CC1).
-    let transaction_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let (head, dirty) = identity::working_tree_snapshot_excluding(repo_root, snapshot_exclusions);
+    // Stamp a source snapshot on the Repository node (BB1 / PR #186 follow-up):
+    // without it, `eg freshness --graph history.graph.jsonl` and `--at` queries
+    // with `--repo-path` always report `unknown`. The stamped HEAD lets freshness
+    // detect `stale_head` after new commits are added.
+    //
+    // History replay reads only committed Git objects, so the snapshot records the
+    // committed HEAD state with `dirty = false` (TT1): uncommitted working-tree
+    // edits never enter the replayed graph, and stamping them dirty would leave the
+    // store permanently `stale_dirty` even after the edits are reverted with HEAD
+    // unchanged. Current working-tree dirtiness is detected live at freshness-check
+    // time instead.
+    //
+    // The transaction time is derived from HEAD's committer date, not wall-clock,
+    // so repeated scans of an unchanged repository stay byte-stable across a
+    // seconds boundary (TT3 / the history replay determinism contract).
+    let (head, _) = identity::working_tree_snapshot_excluding(repo_root, &[]);
+    let transaction_time = match &head {
+        SnapshotHead::Commit { sha } => commit_metadata(repo_root, sha)?.committed_at,
+        _ => PROCESS_STARTED_AT.clone(),
+    };
     let snapshot = SourceSnapshotPayload {
         head,
-        dirty,
+        dirty: false,
         repository_id: repository_id.clone(),
         scanned_at: transaction_time.clone(),
     };

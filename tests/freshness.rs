@@ -2073,3 +2073,152 @@ fn freshness_unknown_stamped_on_legacy_rows_when_identity_also_stamped() {
         "the selected legacy repo (no snapshot) must report unknown, not borrow the stamped identity's verdict: {row}"
     );
 }
+
+/// `TT1`: history replay reflects committed Git objects only, so the stamped
+/// snapshot records the committed HEAD with `dirty=false` even when the working
+/// tree has uncommitted edits. Otherwise reverting those edits (HEAD unchanged)
+/// would leave the replayed graph permanently `stale_dirty`.
+#[test]
+fn scan_history_stamps_committed_state_not_worktree_dirt() {
+    let fx = Fixture::committed();
+    // Uncommitted edit to a tracked .rs file — must not enter the history snapshot.
+    write_lib(fx.repo(), "pub fn hello() {}\npub fn scratch() {}\n");
+
+    let history_graph = fx.work.path().join("history.graph.jsonl");
+    eg().args(["scan-history"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&history_graph)
+        .assert()
+        .success();
+
+    let jsonl = std::fs::read_to_string(&history_graph).unwrap();
+    let repo_node = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["record_type"] == "node" && v["kind"] == "Repository")
+        .expect("Repository node in history graph");
+    assert_eq!(
+        repo_node["source_snapshot"]["dirty"],
+        Value::Bool(false),
+        "history snapshot must record committed state (dirty=false) regardless of worktree edits: {repo_node}"
+    );
+}
+
+/// `TT3`: the history snapshot timestamp is derived from HEAD's committer date
+/// (deterministic), not wall-clock, so repeated scans of an unchanged repository
+/// are byte-stable even across a seconds boundary. The fixture commits at a fixed
+/// committer date, so `scanned_at` must equal it.
+#[test]
+fn scan_history_snapshot_timestamp_is_deterministic_from_head_commit() {
+    let fx = Fixture::committed();
+    let history_graph = fx.work.path().join("history.graph.jsonl");
+    eg().args(["scan-history"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&history_graph)
+        .assert()
+        .success();
+
+    let jsonl = std::fs::read_to_string(&history_graph).unwrap();
+    let repo_node = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["record_type"] == "node" && v["kind"] == "Repository")
+        .expect("Repository node in history graph");
+    assert_eq!(
+        repo_node["source_snapshot"]["scanned_at"], "2026-01-01T00:00:00Z",
+        "history scanned_at must derive from HEAD committer date (deterministic), not wall-clock: {repo_node}"
+    );
+
+    // Determinism: a second scan of the unchanged repository is byte-identical.
+    let history_graph_2 = fx.work.path().join("history.graph.2.jsonl");
+    eg().args(["scan-history"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&history_graph_2)
+        .assert()
+        .success();
+    assert_eq!(
+        jsonl,
+        std::fs::read_to_string(&history_graph_2).unwrap(),
+        "repeated history scans of an unchanged repository must be byte-identical"
+    );
+}
+
+/// `UU1`: an explicit `--repo` that matches the checkout's auto-detected identity
+/// must remain authoritative. If that selected repo is legacy/pre-stamping and a
+/// different repo in the combined store is stamped, the verdict must be `unknown`
+/// owned by the selected repo — not borrowed from the other stamped repo via the
+/// sole-stamped fallback (which would omit the field from the selected rows).
+#[test]
+fn freshness_unknown_when_explicit_repo_matches_auto_identity_but_is_legacy() {
+    let fx = Fixture::committed();
+
+    // (1) Normal scan → the checkout's auto-detected identity B, stamped. Capture
+    //     its stable record id to select it explicitly, then strip its snapshot.
+    let b_graph = fx.work.path().join("b.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&b_graph)
+        .assert()
+        .success();
+    let b_raw = std::fs::read_to_string(&b_graph).unwrap();
+    let b_id = b_raw
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["kind"] == "Repository")
+        .and_then(|v| v["id"].as_str().map(str::to_owned))
+        .expect("B repository id");
+    let b_stripped: String = b_raw
+        .lines()
+        .map(|line| {
+            let Ok(mut v) = serde_json::from_str::<Value>(line) else {
+                return line.to_owned();
+            };
+            if v["kind"] == "Repository" {
+                v.as_object_mut().map(|o| o.remove("source_snapshot"));
+            }
+            serde_json::to_string(&v).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // (2) A second, stamped repo C (override id), so a sole-stamped repo exists.
+    let c_graph = fx.work.path().join("c.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&c_graph)
+        .args(["--repo-id-override", "other-stamped-repo"])
+        .assert()
+        .success();
+    let c_raw = std::fs::read_to_string(&c_graph).unwrap();
+
+    // (3) Combine: legacy (selected) B + stamped C.
+    let combined = fx.work.path().join("combined.jsonl");
+    std::fs::write(&combined, format!("{}\n{}\n", b_stripped, c_raw.trim_end())).unwrap();
+
+    // (4) Explicitly select B (== the auto-detected identity) by its record id.
+    let out = eg()
+        .args(["query", "symbol", "hello"])
+        .arg("--graph")
+        .arg(&combined)
+        .arg("--repo-path")
+        .arg(fx.repo())
+        .args(["--repo", &b_id])
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let row: Value = serde_json::from_str(stdout.lines().next().unwrap_or("{}")).unwrap();
+    assert!(
+        row.get("freshness").is_some(),
+        "explicitly selecting the auto-identity (legacy) repo must still stamp freshness: {row}"
+    );
+    assert_eq!(
+        row["freshness"], "unknown",
+        "must report unknown for the selected legacy repo, not borrow the other stamped repo's verdict: {row}"
+    );
+}
