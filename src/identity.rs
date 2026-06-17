@@ -535,9 +535,7 @@ fn hidden_source_input_path(line: &str) -> Option<&str> {
     if path.components().any(|c| c.as_os_str() == "target") {
         return None;
     }
-    let is_source_input = path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+    let is_source_input = path.extension().and_then(|ext| ext.to_str()) == Some("rs")
         || path.file_name().and_then(|n| n.to_str()) == Some(".gitignore");
     is_source_input.then_some(rel)
 }

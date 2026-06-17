@@ -1954,11 +1954,10 @@ fn freshness_cmd(
     // store already requires a re-scan.
     if verdict.is_fresh() {
         let removed = identity::index_hidden_absent_source_inputs(repo_path);
-        if !removed.is_empty() {
-            let index = query::RepositoryIndex::build(&records);
-            if cited_source_removed(&records, &index, &report_repository_id, &removed) {
-                verdict = Freshness::StaleDirty;
-            }
+        let index = query::RepositoryIndex::build(&records);
+        if cited_source_stale_on_disk(&records, &index, &report_repository_id, repo_path, &removed)
+        {
+            verdict = Freshness::StaleDirty;
         }
     }
 
@@ -2077,7 +2076,7 @@ fn query_freshness_code_inner(
     let code = if code == "fresh" {
         let removed = identity::index_hidden_absent_source_inputs(repo_path);
         let index = query::RepositoryIndex::build(records);
-        if cited_source_removed(records, &index, &owner_id, &removed) {
+        if cited_source_stale_on_disk(records, &index, &owner_id, repo_path, &removed) {
             "stale_dirty"
         } else {
             code
@@ -2198,25 +2197,48 @@ fn dir_has_rust_sources(dir: &Path) -> bool {
     false
 }
 
-/// Returns `true` when the store cites a `File` (owned by `owner_id`) whose
-/// repo-relative path is in `removed` — a source the graph indexed but that the
-/// working tree no longer contains.
+/// Returns `true` when an ancestor directory of `repo_path/rel` (below the repo
+/// root) contains a nested `.git` sentinel, so the scanner would no longer reach
+/// `rel`.
 ///
-/// `removed` is the set of index-hidden (`skip-worktree`/`assume-unchanged`) yet
-/// absent source paths from [`identity::index_hidden_absent_source_inputs`]. Such
-/// a path matters only when the store actually cites it: that distinguishes a
-/// sparse-checkout cone change that removed a *previously scanned* file (stale,
-/// FFF1) from a sparse *baseline omission never scanned* (fresh, AAA1), which the
-/// pure working-tree probe cannot tell apart.
-fn cited_source_removed(
+/// Walks the parents of the cited file up to — but not including — `repo_path`, so
+/// the repository's own `.git` never counts. A submodule/worktree (`.git` file) or
+/// nested clone (`.git` directory) appearing over a previously scanned tree makes
+/// `fs::should_descend` skip it, yet `git status` cannot see that conversion
+/// (GGG3 / PR #186 follow-up).
+fn path_behind_nested_git(repo_path: &Path, rel: &str) -> bool {
+    let full = repo_path.join(rel);
+    let mut dir = full.parent();
+    while let Some(d) = dir {
+        if d == repo_path || !d.starts_with(repo_path) {
+            break;
+        }
+        if d.join(".git").exists() {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
+}
+
+/// Returns `true` when the store cites a `File` (owned by `owner_id`) that the
+/// working tree no longer makes available to the scanner — a source the graph
+/// indexed but that `git status` cannot flag.
+///
+/// Two cases, both keyed off the store's actual contents (so a path matters only
+/// when cited — distinguishing a change to a *previously scanned* file from one
+/// that was never indexed, which the pure working-tree probe cannot tell apart):
+/// - `removed`: index-hidden (`skip-worktree`/`assume-unchanged`) yet absent
+///   paths from [`identity::index_hidden_absent_source_inputs`] — a sparse-checkout
+///   cone change removed a scanned file (FFF1) vs. a baseline omission (AAA1);
+/// - a cited file now sitting behind a nested `.git` sentinel (GGG3).
+fn cited_source_stale_on_disk(
     records: &[GraphRecord],
     index: &query::RepositoryIndex,
     owner_id: &str,
+    repo_path: &Path,
     removed: &[String],
 ) -> bool {
-    if removed.is_empty() {
-        return false;
-    }
     let removed: std::collections::HashSet<&str> = removed.iter().map(String::as_str).collect();
     records.iter().any(|record| {
         matches!(
@@ -2226,7 +2248,8 @@ fn cited_source_removed(
                 id,
                 repo_relative_path: Some(path),
                 ..
-            } if removed.contains(path.as_str()) && index.owner_of(id) == Some(owner_id)
+            } if index.owner_of(id) == Some(owner_id)
+                && (removed.contains(path.as_str()) || path_behind_nested_git(repo_path, path))
         )
     })
 }

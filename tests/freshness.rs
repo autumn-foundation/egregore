@@ -2593,3 +2593,89 @@ fn freshness_detects_sparse_removal_of_scanned_file() {
         "a sparse-removed file the store still cites must read stale_dirty: {report}"
     );
 }
+
+/// `GGG2`: history replay must apply the live scanner's `target/` pruning, so a
+/// committed `.rs` under `target/` is not indexed (and stays consistent with the
+/// freshness probe, which excludes `target/`).
+#[test]
+fn scan_history_skips_target_rust_files() {
+    let fx = Fixture::committed();
+    std::fs::create_dir_all(fx.repo().join("target")).unwrap();
+    std::fs::write(
+        fx.repo().join("target").join("out.rs"),
+        "pub fn build_artifact() {}\n",
+    )
+    .unwrap();
+    commit_all(fx.repo(), "commit target rs");
+
+    let hg = fx.work.path().join("history.graph.jsonl");
+    eg().args(["scan-history"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&hg)
+        .assert()
+        .success();
+    let jsonl = std::fs::read_to_string(&hg).unwrap();
+    assert!(
+        !jsonl.contains("build_artifact"),
+        "history replay must not index committed target/ build output: {jsonl}"
+    );
+}
+
+/// `GGG1`: history replay must match the case-sensitive `.rs` source set the live
+/// scanner uses, so an uppercase-extension `UPPER.RS` (which the case-sensitive
+/// dirty probe also ignores) is not indexed.
+#[test]
+fn scan_history_skips_uppercase_rs_extension() {
+    let fx = Fixture::committed();
+    std::fs::write(
+        fx.repo().join("src").join("UPPER.RS"),
+        "pub fn upper_ext_fn() {}\n",
+    )
+    .unwrap();
+    commit_all(fx.repo(), "commit uppercase ext");
+
+    let hg = fx.work.path().join("history.graph.jsonl");
+    eg().args(["scan-history"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&hg)
+        .assert()
+        .success();
+    let jsonl = std::fs::read_to_string(&hg).unwrap();
+    assert!(
+        !jsonl.contains("upper_ext_fn"),
+        "history replay must match the case-sensitive .rs source set (no UPPER.RS): {jsonl}"
+    );
+}
+
+/// `GGG3`: a previously scanned, tracked source tree that later gains a nested
+/// `.git` sentinel is skipped by future scans, but `git status` cannot see the
+/// conversion. While the store still cites those files, `eg freshness` must report
+/// `stale_dirty` rather than `fresh`.
+#[test]
+fn freshness_detects_cited_source_behind_new_nested_git() {
+    let fx = Fixture::committed();
+    std::fs::create_dir_all(fx.repo().join("dep").join("src")).unwrap();
+    std::fs::write(
+        fx.repo().join("dep").join("src").join("lib.rs"),
+        "pub fn dep_fn() {}\n",
+    )
+    .unwrap();
+    commit_all(fx.repo(), "add dep tree");
+    fx.scan(); // the store cites dep/src/lib.rs
+
+    // dep/ becomes a nested checkout: a `.git` sentinel appears over a scanned tree.
+    std::fs::create_dir_all(fx.repo().join("dep").join(".git")).unwrap();
+    std::fs::write(
+        fx.repo().join("dep").join(".git").join("HEAD"),
+        "ref: refs/heads/main\n",
+    )
+    .unwrap();
+
+    let report = fx.freshness_graph();
+    assert_eq!(
+        report["freshness"], "stale_dirty",
+        "a cited source behind a newly nested .git must read stale_dirty: {report}"
+    );
+}

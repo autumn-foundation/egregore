@@ -310,15 +310,23 @@ fn list_rust_files(repo_root: &Path, sha: &str) -> Result<Vec<String>> {
     let mut files = output
         .lines()
         .map(str::trim)
-        .filter(|path| {
-            Path::new(path)
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
-        })
+        .filter(|path| is_indexed_rust_source(Path::new(path)))
         .map(normalize_git_path)
         .collect::<Vec<_>>();
     files.sort();
     Ok(files)
+}
+
+/// Matches the live scanner's source set (`fs::discover_rust_source_files`) so
+/// history replay indexes exactly what `eg scan` would, keeping it consistent
+/// with the freshness dirty probe (which is scoped the same way):
+/// - a **case-sensitive** lowercase `.rs` extension — the scanner uses
+///   `extension() == "rs"`, so an uppercase `LIB.RS` is not a source (GGG1);
+/// - never under a `target/` build directory, which `fs::should_descend` prunes,
+///   so committed build output is not indexed (GGG2).
+fn is_indexed_rust_source(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+        && !path.components().any(|c| c.as_os_str() == "target")
 }
 
 fn git_blob(repo_root: &Path, sha: &str, path: &str) -> Result<String> {
