@@ -501,67 +501,88 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
     Some(!text.trim().is_empty() || git_index_hidden_source_inputs(repo_root))
 }
 
-/// Returns `true` when any tracked file that influences the indexed source set —
-/// a `.rs` source or a versioned `.gitignore` — is **present in the working tree**
-/// but carries an index flag hiding its state from `git status`: `skip-worktree`
-/// or `assume-unchanged` (PR #186 follow-up LL1/EEE1).
+/// Runs `git ls-files -v` (strictly read-only) and returns its stdout, or `None`
+/// when Git is unavailable or the listing fails. `-c core.quotePath=false` keeps
+/// non-ASCII paths verbatim so they match graph `repo_relative_path` values.
+fn git_ls_files_v(repo_root: &Path) -> Option<String> {
+    let output = read_only_git(repo_root)
+        .args(["-c", "core.quotePath=false", "ls-files", "-v"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Parses one `git ls-files -v` line, returning the repo-relative path of a
+/// source-set input — a `.rs` source or a versioned `.gitignore`, outside any
+/// `target/` directory — that carries an index flag hiding its state from
+/// `git status` (`skip-worktree` = `S`, `assume-unchanged` = a lowercase tag).
+/// Returns `None` for any other line.
 ///
-/// Reads `git ls-files -v` (strictly read-only): each line is `<tag> <path>`.
-/// `assume-unchanged` lowercases the tag; `skip-worktree` is reported as `S`
-/// (or `s` when also assume-unchanged). Returns `false` when Git is unavailable
-/// or the listing fails, leaving the porcelain probe's verdict unchanged.
-///
-/// `.gitignore` is included because the indexed set depends on it (BBB1): a hidden
-/// `.gitignore` edited to ignore a previously-indexed untracked `.rs` directory
-/// leaves `git status` empty for both the ignore file and the now-ignored sources,
-/// which would otherwise read `fresh` (EEE1).
+/// `.gitignore` counts because the indexed set depends on it (BBB1/EEE1); files
+/// under `target/` are excluded to match the scanner's pruning (WW1).
+fn hidden_source_input_path(line: &str) -> Option<&str> {
+    let tag = line.chars().next()?;
+    // Uppercase `S` = skip-worktree; any lowercase tag = assume-unchanged.
+    if tag != 'S' && !tag.is_ascii_lowercase() {
+        return None;
+    }
+    // Format is `<tag><space><path>`, so the path starts at byte 2.
+    let rel = line.get(2..)?;
+    let path = Path::new(rel);
+    if path.components().any(|c| c.as_os_str() == "target") {
+        return None;
+    }
+    let is_source_input = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+        || path.file_name().and_then(|n| n.to_str()) == Some(".gitignore");
+    is_source_input.then_some(rel)
+}
+
+/// Returns `true` when any source-set input (`.rs` or versioned `.gitignore`)
+/// that is **present in the working tree** carries an index flag hiding its state
+/// from `git status` (PR #186 follow-up LL1/EEE1).
 ///
 /// The file must exist on disk to count: a clean sparse checkout marks omitted
 /// files `skip-worktree` AND leaves them absent, so the scanner never indexed
 /// them and they are not part of the stored source set — flagging them would make
-/// `eg scan` of a sparse checkout immediately read `stale_dirty` (AAA1). A
-/// present index-hidden file (e.g. `assume-unchanged`) WAS scannable, so hidden
-/// edits to it still warrant the conservative dirty verdict.
+/// `eg scan` of a sparse checkout immediately read `stale_dirty` (AAA1). A present
+/// index-hidden file (e.g. `assume-unchanged`) WAS scannable, so hidden edits to
+/// it still warrant the conservative dirty verdict. (Absent index-hidden inputs
+/// are surfaced separately by [`index_hidden_absent_source_inputs`] for the
+/// store-aware removal check.)
 fn git_index_hidden_source_inputs(repo_root: &Path) -> bool {
-    let Ok(output) = read_only_git(repo_root).args(["ls-files", "-v"]).output() else {
+    let Some(text) = git_ls_files_v(repo_root) else {
         return false;
     };
-    if !output.status.success() {
-        return false;
-    }
-    let Ok(text) = String::from_utf8(output.stdout) else {
-        return false;
+    text.lines()
+        .filter_map(hidden_source_input_path)
+        .any(|rel| repo_root.join(rel).is_file())
+}
+
+/// Returns the repo-relative paths of source-set inputs (`.rs` / versioned
+/// `.gitignore`) that are index-hidden (`skip-worktree`/`assume-unchanged`) AND
+/// absent from the working tree.
+///
+/// These are exactly the omissions [`git_index_hidden_source_inputs`] skips at
+/// scan time (AAA1). At freshness time a caller cross-references them against the
+/// stored graph: an absent path the store still cites is a previously scanned
+/// source that a sparse-checkout cone change removed while `git status` stays
+/// blind to it, so the store is stale (FFF1). Returns an empty vec when Git is
+/// unavailable or there are no such omissions.
+#[must_use]
+pub fn index_hidden_absent_source_inputs(repo_root: &Path) -> Vec<String> {
+    let Some(text) = git_ls_files_v(repo_root) else {
+        return Vec::new();
     };
-    text.lines().any(|line| {
-        let Some(tag) = line.chars().next() else {
-            return false;
-        };
-        // Uppercase `S` = skip-worktree; any lowercase tag = assume-unchanged.
-        if tag != 'S' && !tag.is_ascii_lowercase() {
-            return false;
-        }
-        // Format is `<tag><space><path>`, so the path starts at byte 2.
-        let path = Path::new(line.get(2..).unwrap_or(""));
-        // Match the scanner's source set: skip files under any `target` directory
-        // (pruned by `fs::should_descend` and excluded from the status pathspec
-        // above), so unindexed build output cannot stale an otherwise fresh store
-        // (WW1 / PR #186 follow-up).
-        if path.components().any(|c| c.as_os_str() == "target") {
-            return false;
-        }
-        // Only files that shape the indexed source set: `.rs` sources and the
-        // versioned `.gitignore` rules that decide which untracked `.rs` are indexed.
-        let is_source_input = path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
-            || path.file_name().and_then(|n| n.to_str()) == Some(".gitignore");
-        if !is_source_input {
-            return false;
-        }
-        // Present on disk → part of the scanned source set (AAA1). A sparse-checkout
-        // baseline omission is skip-worktree AND absent, so it never entered the graph.
-        repo_root.join(path).is_file()
-    })
+    text.lines()
+        .filter_map(hidden_source_input_path)
+        .filter(|rel| !repo_root.join(rel).is_file())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 /// Normalizes a git remote URL to its canonical `https` form.

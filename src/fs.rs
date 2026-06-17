@@ -106,11 +106,16 @@ fn should_descend(path: &Path) -> bool {
     {
         return false;
     }
-    // Submodules (and linked worktrees) store .git as a FILE rather than a
-    // directory; don't descend into them.  Without this guard, paths inside the
-    // submodule reach `git check-ignore --stdin` and can trigger a fatal exit 128
-    // that disables gitignore filtering for the entire superproject scan.
-    !path.join(".git").is_file()
+    // Don't descend into any nested Git working tree, whose files belong to a
+    // different repository and are invisible to the superproject's `git status`:
+    // - submodules and linked worktrees store `.git` as a FILE (EE1); without this
+    //   guard their paths also reach `git check-ignore --stdin` and can trigger a
+    //   fatal exit 128 that disables gitignore filtering for the whole scan;
+    // - an untracked nested clone (e.g. `vendor/`) has a `.git` DIRECTORY. Git
+    //   reports it only as one untracked directory and emits no per-file status, so
+    //   indexing its sources would create spans the freshness probe cannot verify
+    //   (FFF2 / PR #186 follow-up).
+    !path.join(".git").exists()
 }
 
 /// Runs `git ls-files --others --ignored --directory --exclude-standard` to

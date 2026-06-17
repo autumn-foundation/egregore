@@ -1946,7 +1946,21 @@ fn freshness_cmd(
             None => (identity.id.clone(), None),
         }
     };
-    let verdict = freshness::classify(stored, &current_head, current_dirty);
+    let mut verdict = freshness::classify(stored, &current_head, current_dirty);
+    // A `fresh` verdict still misses a previously scanned source that a
+    // sparse-checkout cone change removed: such a file is `skip-worktree` + absent,
+    // so `git status` stays blind to it. Downgrade to `stale_dirty` when the store
+    // cites such a removed path (FFF1). Only `fresh` is overridden: a `stale_head`
+    // store already requires a re-scan.
+    if verdict.is_fresh() {
+        let removed = identity::index_hidden_absent_source_inputs(repo_path);
+        if !removed.is_empty() {
+            let index = query::RepositoryIndex::build(&records);
+            if cited_source_removed(&records, &index, &report_repository_id, &removed) {
+                verdict = Freshness::StaleDirty;
+            }
+        }
+    }
 
     let report = FreshnessReport {
         freshness: verdict.code().to_owned(),
@@ -2056,6 +2070,21 @@ fn query_freshness_code_inner(
         ),
     };
     let code = freshness::classify(stored, &head, dirty).code();
+    // Downgrade `fresh` to `stale_dirty` when a previously scanned source owned by
+    // this repository was removed by a sparse-checkout cone change (skip-worktree +
+    // absent, invisible to `git status`) but the store still cites it (FFF1),
+    // matching `freshness_cmd`.
+    let code = if code == "fresh" {
+        let removed = identity::index_hidden_absent_source_inputs(repo_path);
+        let index = query::RepositoryIndex::build(records);
+        if cited_source_removed(records, &index, &owner_id, &removed) {
+            "stale_dirty"
+        } else {
+            code
+        }
+    } else {
+        code
+    };
     Some((owner_id, code))
 }
 
@@ -2167,6 +2196,39 @@ fn dir_has_rust_sources(dir: &Path) -> bool {
         }
     }
     false
+}
+
+/// Returns `true` when the store cites a `File` (owned by `owner_id`) whose
+/// repo-relative path is in `removed` — a source the graph indexed but that the
+/// working tree no longer contains.
+///
+/// `removed` is the set of index-hidden (`skip-worktree`/`assume-unchanged`) yet
+/// absent source paths from [`identity::index_hidden_absent_source_inputs`]. Such
+/// a path matters only when the store actually cites it: that distinguishes a
+/// sparse-checkout cone change that removed a *previously scanned* file (stale,
+/// FFF1) from a sparse *baseline omission never scanned* (fresh, AAA1), which the
+/// pure working-tree probe cannot tell apart.
+fn cited_source_removed(
+    records: &[GraphRecord],
+    index: &query::RepositoryIndex,
+    owner_id: &str,
+    removed: &[String],
+) -> bool {
+    if removed.is_empty() {
+        return false;
+    }
+    let removed: std::collections::HashSet<&str> = removed.iter().map(String::as_str).collect();
+    records.iter().any(|record| {
+        matches!(
+            record,
+            GraphRecord::Node {
+                kind: NodeKind::File,
+                id,
+                repo_relative_path: Some(path),
+                ..
+            } if removed.contains(path.as_str()) && index.owner_of(id) == Some(owner_id)
+        )
+    })
 }
 
 /// Stamps the freshness `code` on each result whose repository matches the

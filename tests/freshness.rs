@@ -2526,3 +2526,70 @@ fn freshness_detects_hidden_gitignore_edit() {
         "a hidden (assume-unchanged) .gitignore edit must be detected as dirty (it changes the indexed source set): {report}"
     );
 }
+
+/// `FFF2`: the scanner must not descend into a nested independent Git checkout
+/// (an untracked directory with its own `.git` directory). Its files belong to a
+/// different repository and are invisible to the superproject's `git status`, so
+/// indexing them would create unverifiable spans.
+#[test]
+fn scan_does_not_descend_into_nested_git_checkout() {
+    let fx = Fixture::committed();
+    // A nested clone: a directory with a real `.git` DIRECTORY (not a submodule
+    // `.git` file) and Rust sources inside.
+    let nested = fx.repo().join("vendor");
+    std::fs::create_dir_all(nested.join(".git")).unwrap();
+    std::fs::write(nested.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::create_dir_all(nested.join("src")).unwrap();
+    std::fs::write(
+        nested.join("src").join("lib.rs"),
+        "pub fn vendored_fn() {}\n",
+    )
+    .unwrap();
+
+    let out_graph = fx.work.path().join("graph.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&out_graph)
+        .assert()
+        .success();
+    let jsonl = std::fs::read_to_string(&out_graph).unwrap();
+    assert!(
+        !jsonl.contains("vendored_fn"),
+        "scanner must not descend into a nested Git checkout: {jsonl}"
+    );
+    assert!(
+        jsonl.contains("hello"),
+        "superproject sources must still be indexed: {jsonl}"
+    );
+}
+
+/// `FFF1`: a previously scanned source removed by a sparse-checkout cone change
+/// becomes `skip-worktree` + absent, so `git status` stays blind to it. When the
+/// store still cites that file the graph is stale, so `eg freshness` must report
+/// `stale_dirty` — the store-aware counterpart to the AAA1 sparse-omission case.
+#[test]
+fn freshness_detects_sparse_removal_of_scanned_file() {
+    let fx = Fixture::committed();
+    // A second source file, committed and indexed by the full scan below.
+    std::fs::write(
+        fx.repo().join("src").join("drop.rs"),
+        "pub fn dropped() {}\n",
+    )
+    .unwrap();
+    commit_all(fx.repo(), "add drop.rs");
+    fx.scan(); // the store now cites src/drop.rs
+
+    // Sparse-remove drop.rs: skip-worktree + remove from disk (git status blind).
+    git(
+        fx.repo(),
+        ["update-index", "--skip-worktree", "src/drop.rs"],
+    );
+    std::fs::remove_file(fx.repo().join("src").join("drop.rs")).unwrap();
+
+    let report = fx.freshness_graph();
+    assert_eq!(
+        report["freshness"], "stale_dirty",
+        "a sparse-removed file the store still cites must read stale_dirty: {report}"
+    );
+}
