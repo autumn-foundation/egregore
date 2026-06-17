@@ -2360,3 +2360,32 @@ fn freshness_reports_snapshot_owner_for_override_store_without_override() {
         "the override-scanned clean store must still classify fresh via the sole-repo fallback: {report}"
     );
 }
+
+/// `AAA1`: a clean sparse checkout marks omitted tracked files `skip-worktree`
+/// and leaves them absent on disk. The scanner never indexes them, so they must
+/// not make `eg scan` (and an immediate `eg freshness`) read `stale_dirty`. Only
+/// index-hidden `.rs` files actually present on disk count as dirtiness.
+#[test]
+fn freshness_fresh_for_clean_sparse_checkout_omission() {
+    let fx = Fixture::committed();
+    // A second tracked .rs file, committed, then "sparse-omitted": marked
+    // skip-worktree and removed from disk (git status stays clean; index-only).
+    std::fs::write(
+        fx.repo().join("src").join("drop.rs"),
+        "pub fn dropped() {}\n",
+    )
+    .unwrap();
+    commit_all(fx.repo(), "add drop.rs");
+    git(
+        fx.repo(),
+        ["update-index", "--skip-worktree", "src/drop.rs"],
+    );
+    std::fs::remove_file(fx.repo().join("src").join("drop.rs")).unwrap();
+
+    fx.scan();
+    let report = fx.freshness_graph();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "a clean sparse-checkout omission (skip-worktree + absent) must not stale a just-built store: {report}"
+    );
+}

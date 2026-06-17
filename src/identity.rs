@@ -494,14 +494,21 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
     Some(!text.trim().is_empty() || git_index_hidden_rust_sources(repo_root))
 }
 
-/// Returns `true` when any tracked `.rs` file carries an index flag that hides
-/// its working-tree state from `git status`: `skip-worktree` or
-/// `assume-unchanged` (PR #186 follow-up LL1).
+/// Returns `true` when any tracked `.rs` file that is **present in the working
+/// tree** carries an index flag hiding its state from `git status`:
+/// `skip-worktree` or `assume-unchanged` (PR #186 follow-up LL1).
 ///
 /// Reads `git ls-files -v` (strictly read-only): each line is `<tag> <path>`.
 /// `assume-unchanged` lowercases the tag; `skip-worktree` is reported as `S`
 /// (or `s` when also assume-unchanged). Returns `false` when Git is unavailable
 /// or the listing fails, leaving the porcelain probe's verdict unchanged.
+///
+/// The file must exist on disk to count: a clean sparse checkout marks omitted
+/// files `skip-worktree` AND leaves them absent, so the scanner never indexed
+/// them and they are not part of the stored source set — flagging them would make
+/// `eg scan` of a sparse checkout immediately read `stale_dirty` (AAA1). A
+/// present index-hidden file (e.g. `assume-unchanged`) WAS scannable, so hidden
+/// edits to it still warrant the conservative dirty verdict.
 fn git_index_hidden_rust_sources(repo_root: &Path) -> bool {
     let Ok(output) = read_only_git(repo_root).args(["ls-files", "-v"]).output() else {
         return false;
@@ -529,8 +536,15 @@ fn git_index_hidden_rust_sources(repo_root: &Path) -> bool {
         if path.components().any(|c| c.as_os_str() == "target") {
             return false;
         }
-        path.extension()
+        if !path
+            .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+        {
+            return false;
+        }
+        // Present on disk → part of the scanned source set (AAA1). A sparse-checkout
+        // baseline omission is skip-worktree AND absent, so it never entered the graph.
+        repo_root.join(path).is_file()
     })
 }
 
