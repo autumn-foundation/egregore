@@ -1592,3 +1592,117 @@ fn scan_does_not_descend_into_submodule_directory() {
         "superproject symbols must still appear in the graph: {jsonl}"
     );
 }
+
+/// FF1: `eg freshness --graph graph.jsonl` must exclude an unignored in-tree
+/// `.egregore` embedded store (the companion of the documented ingest workflow)
+/// from the dirty probe, just as `eg scan` does.  Otherwise the same freshly
+/// scanned graph reads `stale_dirty` solely because the store directory exists.
+#[test]
+fn freshness_graph_ignores_untracked_egregore_store_dir() {
+    let fx = Fixture::committed();
+    // Graph lives in the work dir (outside the tree); the only in-tree untracked
+    // artifact is the `.egregore` store, which is NOT gitignored here.
+    fx.scan();
+    let store = fx.repo().join(".egregore");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("records.bin"), b"\x00\x01embedded-store").unwrap();
+
+    let report = fx.freshness_graph();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "an untracked in-tree .egregore store must not make a graph store read stale_dirty: {report}"
+    );
+}
+
+/// GG1: re-running `scan-history` in a repository that already holds an unignored
+/// in-tree `.egregore` store must not stamp `dirty=true` on the replayed
+/// snapshot.  History replay reads only Git objects, so a companion store is not
+/// source dirtiness.
+#[test]
+fn scan_history_ignores_untracked_egregore_store_dir() {
+    let fx = Fixture::committed();
+    let store = fx.repo().join(".egregore");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("records.bin"), b"\x00\x01embedded-store").unwrap();
+
+    let history_graph = fx.work.path().join("history.graph.jsonl");
+    eg().args(["scan-history"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&history_graph)
+        .assert()
+        .success();
+
+    let jsonl = std::fs::read_to_string(&history_graph).unwrap();
+    let repo_node = jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["record_type"] == "node" && v["kind"] == "Repository")
+        .expect("Repository node in history graph");
+    assert_eq!(
+        repo_node["source_snapshot"]["dirty"],
+        Value::Bool(false),
+        "an untracked in-tree .egregore store must not stamp scan-history dirty=true: {repo_node}"
+    );
+}
+
+/// `HH1a`: unignored build output under `target/` must not count as source
+/// dirtiness.  `discover_rust_source_files` skips every `target` directory
+/// (`fs::should_descend`), so neither the stamped snapshot nor the freshness
+/// probe may treat it as a working-tree change.
+#[test]
+fn freshness_ignores_unignored_target_build_output() {
+    let fx = Fixture::committed();
+    // Build output present before the scan — `target/` is not gitignored here.
+    let target = fx.repo().join("target").join("debug");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("app"), b"binary-artifact").unwrap();
+
+    fx.scan();
+    let report = fx.freshness_graph();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "unignored target/ build output must not be counted as source dirtiness: {report}"
+    );
+}
+
+/// `HH1b`: a dirty submodule must not make the superproject read `stale_dirty`.
+/// The scanner never descends into submodules (`fs::should_descend` skips
+/// `.git`-file directories), so `--ignore-submodules=all` keeps the dirty probe
+/// scoped to the indexed source set.
+#[test]
+fn freshness_ignores_dirty_submodule() {
+    let fx = Fixture::committed();
+
+    // A separate repo to register as a submodule.
+    let sub_src = tempfile::tempdir().unwrap();
+    git_init(sub_src.path());
+    std::fs::write(sub_src.path().join("README.md"), "sub\n").unwrap();
+    commit_all(sub_src.path(), "sub initial");
+
+    // Local-path submodule adds require protocol.file.allow on modern Git.
+    git(
+        fx.repo(),
+        [
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub_src.path().to_str().unwrap(),
+            "sub",
+        ],
+    );
+    commit_all(fx.repo(), "add submodule");
+
+    fx.scan();
+
+    // Dirty the submodule working tree; the superproject's `git status` now shows
+    // the submodule as modified by default.
+    std::fs::write(fx.repo().join("sub").join("README.md"), "sub changed\n").unwrap();
+
+    let report = fx.freshness_graph();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "a dirty submodule must not make the superproject read stale_dirty: {report}"
+    );
+}

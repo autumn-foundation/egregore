@@ -1793,50 +1793,9 @@ fn link_evidence_cmd(code_graph_path: &Path, evidence_path: &Path, out: &Path) -
 
 fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<()> {
     // Exclude the graph output and any in-tree egregore store from the dirty probe
-    // (PR #186 E, follow-up): a pre-existing graph.jsonl or .egregore data-dir from
-    // a previous workflow must not stamp `dirty = true` on the new scan output.
-    let mut artifact_paths: Vec<Option<&Path>> = vec![Some(out)];
-    let mut egregore_dirs: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(repo_path) {
-        for entry in entries.flatten() {
-            let name_matches = entry
-                .file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with(".egregore"));
-            // Only exclude directories, not regular files such as `.egregore.rs`.
-            // Also skip directories that contain tracked content — those are source
-            // directories that happen to share the prefix, not store outputs.
-            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-            if name_matches && is_dir {
-                let path = entry.path();
-                // `git ls-files` returns tracked paths under the directory; an empty
-                // result means the entire subtree is untracked / gitignored, which is
-                // the hallmark of a store output rather than a source directory.
-                // Use the entry name directly so `git ls-files` receives a
-                // repo-relative path regardless of whether `repo_path` itself is
-                // absolute or relative, avoiding double-prefix issues on some platforms.
-                let name = entry.file_name();
-                let has_tracked = std::process::Command::new("git")
-                    .env("GIT_OPTIONAL_LOCKS", "0")
-                    .current_dir(repo_path)
-                    .args(["ls-files", "--", name.to_str().unwrap_or("")])
-                    .output()
-                    .map(|out| !out.stdout.is_empty())
-                    .unwrap_or(false);
-                // Even when no content is tracked, an untracked directory that
-                // contains `.rs` files is a source directory, not a store output:
-                // its files appear in the graph but are outside `git status`, so
-                // excluding it from the dirty probe would mask deletions.
-                if !has_tracked && !dir_has_rust_sources(&path) {
-                    egregore_dirs.push(path);
-                }
-            }
-        }
-    }
-    for dir in &egregore_dirs {
-        artifact_paths.push(Some(dir.as_path()));
-    }
-    let exclusions = store_artifact_exclusions(repo_path, &artifact_paths);
+    // (PR #186 E/FF1): a pre-existing graph.jsonl or .egregore data-dir from a
+    // previous workflow must not stamp `dirty = true` on the new scan output.
+    let exclusions = store_exclusions_including_egregore(repo_path, &[Some(out)]);
     let graph = scan_repository_with_exclusions(repo_path, repo_id_override, &exclusions)
         .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
     let jsonl = graph
@@ -1848,10 +1807,12 @@ fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<
 }
 
 fn scan_history(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<()> {
-    // Exclude the output file from the dirty probe (CC1 / PR #186 follow-up):
-    // a pre-existing in-tree history.graph.jsonl must not stamp dirty=true on
-    // the new snapshot, just as `scan` excludes its graph output.
-    let exclusions = store_artifact_exclusions(repo_path, &[Some(out)]);
+    // Exclude the output file and any in-tree egregore store from the dirty probe
+    // (CC1/GG1 / PR #186 follow-up): neither a pre-existing in-tree
+    // history.graph.jsonl nor a companion `.egregore` store written by a prior
+    // `eg ingest` must stamp dirty=true on the freshly replayed snapshot, just as
+    // `scan` excludes its own store artifacts.
+    let exclusions = store_exclusions_including_egregore(repo_path, &[Some(out)]);
     let graph = scan_repository_history_excluding(repo_path, repo_id_override, &exclusions)
         .with_context(|| format!("failed to scan Git history for {}", repo_path.display()))?;
     let jsonl = graph
@@ -1937,11 +1898,13 @@ fn freshness_cmd(
 ) -> Result<()> {
     let store_kind = if graph.is_some() { "graph" } else { "data_dir" };
     let identity = identity::compute_repository_identity(repo_path, repo_id_override);
-    // Exclude both known store artifacts from the dirty probe (PR #186 E/F): when
-    // checking `--data-dir`, `graph.jsonl` from the same workflow may sit untracked
-    // and vice versa; excluding both prevents a just-written store from reading as
+    // Exclude both known store artifacts plus any in-tree `.egregore` store from
+    // the dirty probe (PR #186 E/F/FF1): when checking `--graph`, the companion
+    // `.egregore` data-dir created by the documented ingest workflow sits untracked
+    // (and vice versa for `--data-dir` + `graph.jsonl`). Mirroring `scan`'s
+    // store-artifact exclusions keeps a just-written store from reading as
     // `stale_dirty` before the user gitignores or deletes the intermediate output.
-    let exclusions = store_artifact_exclusions(repo_path, &[graph, data_dir]);
+    let exclusions = store_exclusions_including_egregore(repo_path, &[graph, data_dir]);
     let (current_head, current_dirty) =
         identity::working_tree_snapshot_excluding(repo_path, &exclusions);
 
@@ -2089,6 +2052,72 @@ fn store_artifact_exclusions(repo_path: &Path, artifacts: &[Option<&Path>]) -> V
             (!s.is_empty()).then_some(s)
         })
         .collect()
+}
+
+/// Discovers untracked in-tree `.egregore*` embedded-store directories that must
+/// be excluded from the dirty probe (PR #186 follow-up FF1/GG1).
+///
+/// A directory qualifies only when it is fully untracked (`git ls-files` reports
+/// no content under it) and contains no `.rs` sources — the hallmark of a store
+/// output (`eg ingest ... --data-dir .egregore`) rather than a source directory
+/// that merely shares the prefix. The scanner never indexes such a store, so the
+/// freshness dirty probe must not count it as source dirtiness.
+fn egregore_store_dirs(repo_path: &Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    let Ok(entries) = std::fs::read_dir(repo_path) else {
+        return dirs;
+    };
+    for entry in entries.flatten() {
+        let name_matches = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(".egregore"));
+        // Only directories, not regular files such as `.egregore.rs`.
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        if !(name_matches && is_dir) {
+            continue;
+        }
+        let path = entry.path();
+        // `git ls-files` returns tracked paths under the directory; an empty
+        // result means the entire subtree is untracked / gitignored, which is the
+        // hallmark of a store output rather than a source directory. Use the entry
+        // name directly so `git ls-files` receives a repo-relative path regardless
+        // of whether `repo_path` is absolute or relative.
+        let name = entry.file_name();
+        let has_tracked = std::process::Command::new("git")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(repo_path)
+            .args(["ls-files", "--", name.to_str().unwrap_or("")])
+            .output()
+            .map(|out| !out.stdout.is_empty())
+            .unwrap_or(false);
+        // Even when no content is tracked, an untracked directory containing `.rs`
+        // files is a source directory, not a store output: its files appear in the
+        // graph but are outside `git status`, so excluding it would mask deletions.
+        if !has_tracked && !dir_has_rust_sources(&path) {
+            dirs.push(path);
+        }
+    }
+    dirs
+}
+
+/// Builds dirty-probe exclusions for the explicit store `artifacts` plus any
+/// in-tree `.egregore*` embedded-store directories discovered under `repo_path`
+/// (PR #186 follow-up FF1/GG1).
+///
+/// All three store-producing/checking entry points (`scan`, `scan-history`,
+/// `freshness`) share this so a companion store written by one workflow never
+/// makes another's output read `stale_dirty`.
+fn store_exclusions_including_egregore(
+    repo_path: &Path,
+    artifacts: &[Option<&Path>],
+) -> Vec<String> {
+    let egregore_dirs = egregore_store_dirs(repo_path);
+    let mut all: Vec<Option<&Path>> = artifacts.to_vec();
+    for dir in &egregore_dirs {
+        all.push(Some(dir.as_path()));
+    }
+    store_artifact_exclusions(repo_path, &all)
 }
 
 /// Returns `true` if `dir` or any subdirectory contains a `.rs` file.

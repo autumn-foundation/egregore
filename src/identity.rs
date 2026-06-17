@@ -422,20 +422,33 @@ fn git_head_commit_sha(repo_root: &Path) -> Option<String> {
 /// (`GIT_OPTIONAL_LOCKS=0`, so Git never writes the index). `exclude_rel` paths
 /// are dropped from consideration via `:(exclude)` pathspecs. Returns `None` when
 /// Git is unavailable or the status probe fails, which callers treat as dirty.
+///
+/// The probe is scoped to the same source set the scanner actually indexes
+/// (PR #186 follow-up HH1): `discover_rust_source_files` skips every `target`
+/// directory and never descends into submodules (`fs::should_descend`), so an
+/// unignored `target/` build tree or a dirty/out-of-date submodule must not count
+/// as source dirtiness here either — neither can produce a cited span.
 fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
     let mut command = read_only_git(repo_root);
     // `--untracked-files=all` overrides any `status.showUntrackedFiles=no` user
     // config that would suppress `??` rows for untracked files. The scanner
     // indexes untracked `.rs` files, so silently hiding them here would make a
     // freshly added untracked source read as `fresh` (PR #186 follow-up).
-    command.args(["status", "--porcelain", "--untracked-files=all"]);
-    if !exclude_rel.is_empty() {
-        // A positive `.` pathspec plus `:(exclude)<path>` magic drops the store
-        // artifact (and, for a directory, everything beneath it) from the probe.
-        command.args(["--", "."]);
-        for rel in exclude_rel {
-            command.arg(format!(":(exclude){rel}"));
-        }
+    // `--ignore-submodules=all` drops submodule state, which `git status` reports
+    // by default but the scanner never indexes (HH1).
+    command.args([
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--ignore-submodules=all",
+    ]);
+    // A positive `.` pathspec is required for the `:(exclude)` magic to apply. The
+    // scanner skips every `target` directory, so an unignored build tree there must
+    // not register as dirtiness (HH1); `:(exclude)` of a directory drops everything
+    // beneath it, matching the per-artifact exclusions in `exclude_rel`.
+    command.args(["--", ".", ":(exclude)target"]);
+    for rel in exclude_rel {
+        command.arg(format!(":(exclude){rel}"));
     }
     let output = command.output().ok()?;
     if !output.status.success() {
