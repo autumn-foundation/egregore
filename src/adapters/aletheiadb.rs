@@ -1435,6 +1435,7 @@ impl EmbeddedAletheiaSink {
             semantic_drift,
             evidence_links,
             repository_identity,
+            source_snapshot,
             text,
             superseded_by,
             agent_id,
@@ -1591,6 +1592,11 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(identity.as_ref())
         {
             builder = builder.insert("repository_identity_json", json.as_str());
+        }
+        if let Some(snapshot) = source_snapshot
+            && let Ok(json) = serde_json::to_string(snapshot.as_ref())
+        {
+            builder = builder.insert("source_snapshot_json", json.as_str());
         }
         builder = insert_optional(builder, "text", text.as_deref());
         builder = insert_optional(builder, "superseded_by", superseded_by.as_deref());
@@ -2241,6 +2247,16 @@ impl EmbeddedAletheiaSink {
             .map_err(|e| {
                 read_back_error(record_id, format!("repository_identity_json invalid: {e}"))
             })?
+            .map(Box::new),
+            source_snapshot: optional_str_property(
+                record_id,
+                "source_snapshot_json",
+                node.get_property("source_snapshot_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::SourceSnapshotPayload>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("source_snapshot_json invalid: {e}")))?
             .map(Box::new),
             valid_time: optional_str_property(
                 record_id,

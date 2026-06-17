@@ -325,6 +325,52 @@ pub struct RepositoryIdentityPayload {
     pub basename: String,
 }
 
+/// HEAD commit state captured in a [`SourceSnapshotPayload`] at scan time.
+///
+/// Mirrors the repository-identity module's git-root gate: a commit SHA is only
+/// recorded when the scanned path is the actual Git repository root. Sub-directories
+/// of a repo and non-Git directories serialize as `no_git`; a repository with no
+/// commits yet serializes as `unborn_head`. Documented in
+/// `docs/schema/source-snapshot.md` (issue #82).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SnapshotHead {
+    /// HEAD resolved to a commit; carries the full commit SHA.
+    Commit {
+        /// Full commit SHA the working tree was scanned at.
+        sha: String,
+    },
+    /// The scanned path is not a Git repository root (or Git is unavailable).
+    NoGit,
+    /// The scanned path is a Git repository whose HEAD has no commits yet.
+    UnbornHead,
+}
+
+/// Store-level source-snapshot identity stamped on the `Repository` node.
+///
+/// Records *which* working-tree snapshot a store was built from so a reader can
+/// detect staleness against the live working tree without re-scanning. The
+/// deterministic portion (`head` + `dirty`) is reproducible for an unchanged clean
+/// tree at a fixed commit; `scanned_at` flows through the same transaction-time
+/// override path as `valid_time`, so it never breaks JSONL determinism.
+///
+/// Documented in `docs/schema/source-snapshot.md` (issue #82).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceSnapshotPayload {
+    /// HEAD commit state at scan time.
+    pub head: SnapshotHead,
+    /// `true` when the working tree had uncommitted or untracked changes at scan
+    /// time. Always `false` when `head` is `no_git` / `unborn_head` (no committed
+    /// baseline to be dirty against).
+    pub dirty: bool,
+    /// Stable `Repository` record ID this snapshot describes — the repository
+    /// identity already used by the graph.
+    pub repository_id: String,
+    /// RFC 3339 wall-clock scan time, carried through the transaction-time
+    /// override path for deterministic JSONL.
+    pub scanned_at: String,
+}
+
 /// A typed citation from an agent-memory node to another graph record.
 ///
 /// Evidence links are stored both on the source node (for fast read) and as
@@ -600,6 +646,10 @@ pub enum GraphRecord {
         /// Identity payload for `Repository` nodes; absent on all other kinds.
         #[serde(skip_serializing_if = "Option::is_none")]
         repository_identity: Option<Box<RepositoryIdentityPayload>>,
+        /// Source-snapshot identity for `Repository` nodes (issue #82); absent on
+        /// all other kinds and on stores produced before snapshot stamping.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_snapshot: Option<Box<SourceSnapshotPayload>>,
         // ── Agent-memory provenance fields (absent for code-graph nodes) ─────
         /// Observation body text (Observation nodes).
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -930,6 +980,7 @@ impl GraphRecord {
             semantic_drift: None,
             evidence_links: None,
             repository_identity: None,
+            source_snapshot: None,
             text: None,
             superseded_by: None,
             agent_id: None,
@@ -1034,6 +1085,7 @@ impl GraphRecord {
             semantic_drift: None,
             evidence_links: None,
             repository_identity: None,
+            source_snapshot: None,
             text: None,
             superseded_by: None,
             agent_id: None,
@@ -1137,6 +1189,7 @@ impl GraphRecord {
             semantic_drift: None,
             evidence_links: None,
             repository_identity: None,
+            source_snapshot: None,
             text: None,
             superseded_by: None,
             agent_id: None,
@@ -1310,6 +1363,34 @@ impl GraphRecord {
             *repository_identity = Some(Box::new(payload));
         }
         self
+    }
+
+    /// Stamps a store-level [`SourceSnapshotPayload`] on a `Repository` node (issue #82).
+    ///
+    /// No-op on non-node records. The snapshot records the HEAD commit, dirty
+    /// flag, repository identity, and scan time so readers can classify store
+    /// freshness against the live working tree.
+    #[must_use]
+    pub fn with_source_snapshot(mut self, snapshot: SourceSnapshotPayload) -> Self {
+        if let Self::Node {
+            source_snapshot, ..
+        } = &mut self
+        {
+            *source_snapshot = Some(Box::new(snapshot));
+        }
+        self
+    }
+
+    /// Returns the source-snapshot payload when this record is a `Repository` node
+    /// carrying one; `None` otherwise (issue #82).
+    #[must_use]
+    pub fn source_snapshot(&self) -> Option<&SourceSnapshotPayload> {
+        match self {
+            Self::Node {
+                source_snapshot, ..
+            } => source_snapshot.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
     }
 
     /// Stamps inferred `valid_time` and `valid_time_source` on current-tree scan records.

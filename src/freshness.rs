@@ -1,0 +1,382 @@
+//! Read-only store freshness classification (issue #82).
+//!
+//! A `scan`/`ingest` store is a snapshot of one working-tree state. Each store
+//! stamps a [`SourceSnapshotPayload`](crate::ir::SourceSnapshotPayload) on its
+//! `Repository` node recording the HEAD commit and dirty flag it was built from.
+//! This module compares that stored snapshot against the *current* working tree
+//! and classifies the store as `fresh`, `stale_head`, `stale_dirty`, or
+//! `unknown` so an agent never cites file/span handles the live code has already
+//! invalidated.
+//!
+//! The classification is a pure, deterministic function of the stored snapshot
+//! and the current working-tree state; the probing of the working tree
+//! (`crate::identity::working_tree_snapshot`) and the loading of the store are
+//! strictly read-only.
+//!
+//! Documented in `docs/cli/freshness.md` and `docs/schema/source-snapshot.md`.
+
+use crate::ir::{GraphRecord, NodeKind, SnapshotHead, SourceSnapshotPayload};
+
+/// Freshness of a store relative to the current working tree.
+///
+/// Codes are stable and machine-readable; see `docs/cli/freshness.md`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Freshness {
+    /// Stored commit equals the current HEAD and the tree is clean.
+    Fresh,
+    /// The current HEAD differs from the stored commit.
+    StaleHead,
+    /// HEAD matches but the tree carries uncommitted changes relative to the
+    /// stored snapshot (either the live tree is dirty now, or the store itself
+    /// was built from a dirty tree that cannot be reproduced).
+    StaleDirty,
+    /// The store predates snapshot stamping, or no Git context exists on either
+    /// the stored side or the current working tree.
+    Unknown,
+}
+
+impl Freshness {
+    /// Returns the stable machine-readable code for this freshness state.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::StaleHead => "stale_head",
+            Self::StaleDirty => "stale_dirty",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Returns `true` only for [`Freshness::Fresh`].
+    #[must_use]
+    pub const fn is_fresh(self) -> bool {
+        matches!(self, Self::Fresh)
+    }
+}
+
+/// Classifies store freshness from the stored snapshot and the current working
+/// tree's head + dirty state.
+///
+/// Precedence:
+/// 1. No stored snapshot, or either side lacks a committed Git head → `unknown`.
+/// 2. Stored commit differs from the current HEAD → `stale_head`.
+/// 3. HEAD matches but the live tree is dirty, or the store was built from a
+///    dirty tree → `stale_dirty`.
+/// 4. Otherwise → `fresh`.
+#[must_use]
+pub fn classify(
+    stored: Option<&SourceSnapshotPayload>,
+    current_head: &SnapshotHead,
+    current_dirty: bool,
+) -> Freshness {
+    let Some(stored) = stored else {
+        return Freshness::Unknown;
+    };
+    match (&stored.head, current_head) {
+        (SnapshotHead::Commit { sha: stored_sha }, SnapshotHead::Commit { sha: current_sha }) => {
+            if stored_sha != current_sha {
+                Freshness::StaleHead
+            } else if current_dirty || stored.dirty {
+                Freshness::StaleDirty
+            } else {
+                Freshness::Fresh
+            }
+        }
+        // A `no_git` / `unborn_head` head on either side cannot be commit-compared.
+        _ => Freshness::Unknown,
+    }
+}
+
+/// Finds the source snapshot a store recorded for the given repository ID.
+///
+/// Prefers the snapshot stamped on the `Repository` node whose stable ID matches
+/// `repository_id`. As a fallback it returns the sole repository's snapshot, but
+/// **only when the store contains exactly one `Repository` node** — never in a
+/// multi-repository store, where returning an unrelated repository's snapshot
+/// would misclassify a legacy/pre-stamping target against an unrelated checkout.
+/// Returns `None` when the matched (or sole) repository carries no snapshot
+/// (pre-stamping stores).
+#[must_use]
+pub fn stored_snapshot<'a>(
+    records: &'a [GraphRecord],
+    repository_id: &str,
+) -> Option<&'a SourceSnapshotPayload> {
+    stored_snapshot_with_owner(records, repository_id).map(|(_, snapshot)| snapshot)
+}
+
+/// Like [`stored_snapshot`], but also returns the stable ID of the `Repository`
+/// node the snapshot belongs to.
+///
+/// Callers that stamp per-result freshness (the query commands) need the owning
+/// repository ID, not the caller's recomputed identity: when the match comes from
+/// the single-repository fallback — e.g. a store scanned with
+/// `--repo-id-override`, whose rows are owned by the overridden ID — stamping
+/// against the recomputed identity would leave every row unstamped (PR #186).
+#[must_use]
+pub fn stored_snapshot_with_owner<'a>(
+    records: &'a [GraphRecord],
+    repository_id: &str,
+) -> Option<(&'a str, &'a SourceSnapshotPayload)> {
+    let mut repository_nodes = 0usize;
+    let mut matched: Option<(&'a str, &'a SourceSnapshotPayload)> = None;
+    let mut sole: Option<(&'a str, &'a SourceSnapshotPayload)> = None;
+    for record in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Repository,
+            id,
+            source_snapshot,
+            ..
+        } = record
+        {
+            repository_nodes += 1;
+            if let Some(snapshot) = source_snapshot.as_deref() {
+                if id == repository_id {
+                    matched = Some((id.as_str(), snapshot));
+                }
+                sole = Some((id.as_str(), snapshot));
+            }
+        }
+    }
+    // Exact identity match wins. Otherwise fall back to the sole repository's
+    // snapshot only when the store holds exactly one Repository node.
+    matched.or_else(|| (repository_nodes == 1).then_some(sole).flatten())
+}
+
+/// Like [`stored_snapshot`] but requires an exact `repository_id` match, with no
+/// single-repository fallback.
+///
+/// Used when the caller pinned an explicit identity (`eg freshness
+/// --repo-id-override`): a wrong or typo'd override against a single-repo store
+/// must report `unknown` rather than silently classifying an unrelated
+/// repository's snapshot (which could even read `fresh`) under the caller's
+/// unmatched identity (PR #186 follow-up YY1).
+#[must_use]
+pub fn stored_snapshot_exact<'a>(
+    records: &'a [GraphRecord],
+    repository_id: &str,
+) -> Option<&'a SourceSnapshotPayload> {
+    records.iter().find_map(|record| {
+        if let GraphRecord::Node {
+            kind: NodeKind::Repository,
+            id,
+            source_snapshot,
+            ..
+        } = record
+            && id == repository_id
+        {
+            return source_snapshot.as_deref();
+        }
+        None
+    })
+}
+
+/// Returns the stored snapshot and its owner when exactly **one** `Repository`
+/// node in the store carries a `source_snapshot`, regardless of how many
+/// `Repository` nodes exist in total.
+///
+/// This is a last-resort fallback for combined stores where `--repo-id-override`
+/// was used (so the identity probe misses) and no `--repo` scope is given: if
+/// only one stamped repository exists its snapshot is unambiguous and should be
+/// used. When multiple stamped repositories are present the caller must require
+/// an explicit repository selector.
+#[must_use]
+pub fn stored_snapshot_sole_stamped<'a>(
+    records: &'a [GraphRecord],
+) -> Option<(&'a str, &'a SourceSnapshotPayload)> {
+    let mut stamped: Option<(&'a str, &'a SourceSnapshotPayload)> = None;
+    for record in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Repository,
+            id,
+            source_snapshot: Some(snapshot),
+            ..
+        } = record
+        {
+            if stamped.is_some() {
+                // More than one stamped repository — result is ambiguous.
+                return None;
+            }
+            stamped = Some((id.as_str(), snapshot));
+        }
+    }
+    stamped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Freshness, classify, stored_snapshot};
+    use crate::ir::{GraphRecord, NodeKind, SnapshotHead, SourceSnapshotPayload};
+
+    fn snapshot(head: SnapshotHead, dirty: bool) -> SourceSnapshotPayload {
+        SourceSnapshotPayload {
+            head,
+            dirty,
+            repository_id: "codegraph:v3:repo".to_owned(),
+            scanned_at: "2026-05-19T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn commit(sha: &str) -> SnapshotHead {
+        SnapshotHead::Commit {
+            sha: sha.to_owned(),
+        }
+    }
+
+    #[test]
+    fn clean_tree_at_head_is_fresh() {
+        let stored = snapshot(commit("abc"), false);
+        assert_eq!(
+            classify(Some(&stored), &commit("abc"), false),
+            Freshness::Fresh
+        );
+    }
+
+    #[test]
+    fn moved_head_is_stale_head() {
+        let stored = snapshot(commit("abc"), false);
+        assert_eq!(
+            classify(Some(&stored), &commit("def"), false),
+            Freshness::StaleHead
+        );
+    }
+
+    #[test]
+    fn dirty_tree_at_head_is_stale_dirty() {
+        let stored = snapshot(commit("abc"), false);
+        assert_eq!(
+            classify(Some(&stored), &commit("abc"), true),
+            Freshness::StaleDirty
+        );
+    }
+
+    #[test]
+    fn store_built_from_dirty_tree_is_never_fresh() {
+        let stored = snapshot(commit("abc"), true);
+        assert_eq!(
+            classify(Some(&stored), &commit("abc"), false),
+            Freshness::StaleDirty
+        );
+    }
+
+    #[test]
+    fn missing_snapshot_is_unknown() {
+        assert_eq!(classify(None, &commit("abc"), false), Freshness::Unknown);
+    }
+
+    #[test]
+    fn no_git_on_either_side_is_unknown() {
+        let stored = snapshot(SnapshotHead::NoGit, false);
+        assert_eq!(
+            classify(Some(&stored), &commit("abc"), false),
+            Freshness::Unknown
+        );
+        let stored = snapshot(commit("abc"), false);
+        assert_eq!(
+            classify(Some(&stored), &SnapshotHead::NoGit, false),
+            Freshness::Unknown
+        );
+    }
+
+    #[test]
+    fn unborn_head_is_unknown() {
+        let stored = snapshot(SnapshotHead::UnbornHead, false);
+        assert_eq!(
+            classify(Some(&stored), &SnapshotHead::UnbornHead, false),
+            Freshness::Unknown
+        );
+    }
+
+    #[test]
+    fn codes_are_stable() {
+        assert_eq!(Freshness::Fresh.code(), "fresh");
+        assert_eq!(Freshness::StaleHead.code(), "stale_head");
+        assert_eq!(Freshness::StaleDirty.code(), "stale_dirty");
+        assert_eq!(Freshness::Unknown.code(), "unknown");
+    }
+
+    fn repo_node(id: &str, snapshot: Option<SourceSnapshotPayload>) -> GraphRecord {
+        let node = GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(id.to_owned()),
+            format!("Repository {id}"),
+        );
+        match snapshot {
+            Some(s) => node.with_source_snapshot(s),
+            None => node,
+        }
+    }
+
+    #[test]
+    fn stored_snapshot_matches_by_repository_id() {
+        let records = vec![
+            repo_node("repo-a", Some(snapshot(commit("aaa"), false))),
+            repo_node("repo-b", Some(snapshot(commit("bbb"), false))),
+        ];
+        let found = stored_snapshot(&records, "repo-b").expect("repo-b snapshot");
+        assert_eq!(found.head, commit("bbb"));
+    }
+
+    #[test]
+    fn stored_snapshot_no_cross_repo_fallback_in_multi_repo_store() {
+        // Requested repo is a legacy/pre-stamping node (no snapshot); another repo
+        // has one. The unrelated snapshot must NOT be returned.
+        let records = vec![
+            repo_node("legacy", None),
+            repo_node("other", Some(snapshot(commit("ccc"), false))),
+        ];
+        assert!(stored_snapshot(&records, "legacy").is_none());
+    }
+
+    #[test]
+    fn stored_snapshot_single_repo_fallback_allows_id_mismatch() {
+        // Exactly one Repository node: fall back to its snapshot even if the
+        // requested id differs (e.g. identity recomputed differently).
+        let records = vec![repo_node("only", Some(snapshot(commit("ddd"), false)))];
+        let found = stored_snapshot(&records, "different-id").expect("sole snapshot");
+        assert_eq!(found.head, commit("ddd"));
+    }
+
+    #[test]
+    fn stored_snapshot_single_pre_stamping_repo_is_none() {
+        let records = vec![repo_node("only", None)];
+        assert!(stored_snapshot(&records, "only").is_none());
+    }
+
+    #[test]
+    fn stored_snapshot_sole_stamped_returns_when_exactly_one_stamped() {
+        // Multi-repo store: one stamped, one legacy (no snapshot).  The sole-stamped
+        // fallback should return the stamped repo's snapshot regardless of which ID
+        // is queried.
+        use super::stored_snapshot_sole_stamped;
+        let records = vec![
+            repo_node("override-id", Some(snapshot(commit("eee"), false))),
+            repo_node("legacy-id", None),
+        ];
+        let (owner, snap) = stored_snapshot_sole_stamped(&records).expect("sole stamped");
+        assert_eq!(owner, "override-id");
+        assert_eq!(snap.head, commit("eee"));
+    }
+
+    #[test]
+    fn stored_snapshot_sole_stamped_returns_none_when_multiple_stamped() {
+        use super::stored_snapshot_sole_stamped;
+        let records = vec![
+            repo_node("repo-a", Some(snapshot(commit("aaa"), false))),
+            repo_node("repo-b", Some(snapshot(commit("bbb"), false))),
+        ];
+        assert!(
+            stored_snapshot_sole_stamped(&records).is_none(),
+            "ambiguous: two stamped repos must not fall back"
+        );
+    }
+
+    #[test]
+    fn stored_snapshot_sole_stamped_returns_none_when_none_stamped() {
+        use super::stored_snapshot_sole_stamped;
+        let records = vec![repo_node("legacy", None)];
+        assert!(stored_snapshot_sole_stamped(&records).is_none());
+    }
+}

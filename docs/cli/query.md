@@ -5,16 +5,16 @@ Query an existing graph JSONL for symbols, files, semantic drift records, or by 
 ## Synopsis
 
 ```text
-eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] [--format json|text]
-eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--format json|text]
-eg query file     <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--format json|text]
-eg query file     <PATH>  --data-dir <DIR>  [--repo <SELECTOR>] [--format json|text]
+eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query file     <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query file     <PATH>  --data-dir <DIR>  [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query drift            --graph <PATH>    [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query drift            --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query semantic-context <QUERY> --data-dir <DIR> [--limit N] [--min-score F] [--repo <SELECTOR>]
 eg query semantic-memory <QUERY> --data-dir <DIR> [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
-eg query context  <NAME>  --graph <PATH>
+eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>]
 eg query task     <HANDLE> --graph <PATH>
 eg query memory   <HANDLE> --graph <PATH>   [--verified-only]
 eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>]
@@ -59,6 +59,21 @@ One JSON object per line (JSONL). Field names are stable across releases. Machin
 ### `--format text`
 
 One human-readable line per result for terminal use. The exact format is not stable and must not be parsed by scripts.
+
+---
+
+## Store freshness (`--repo-path`, issue #82)
+
+`eg query symbol`, `eg query file`, and `eg query context` accept an optional
+`--repo-path <DIR>` pointing at a working tree. When set, each result carries a
+non-fatal `freshness` field with a stable code (`fresh` / `stale_head` /
+`stale_dirty` / `unknown`) computed by comparing the store's stamped
+[source snapshot](../schema/source-snapshot.md) against that working tree, so an
+agent can downgrade trust in a cited `repo_relative_path` + `span` handle. The
+result is **never suppressed** on a non-`fresh` verdict.
+
+Without `--repo-path` the `freshness` field is absent and output is unchanged.
+See [`freshness.md`](freshness.md) for the standalone store-level report.
 
 ---
 

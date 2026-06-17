@@ -11,7 +11,10 @@ use crate::{
     error::{CodegraphError, Result},
     fs::SourceFile,
     identity,
-    ir::{EdgeLabel, Graph, GraphRecord, NodeKind, ProducerKind, TemporalMetadata, stable_id},
+    ir::{
+        EdgeLabel, Graph, GraphRecord, NodeKind, ProducerKind, SnapshotHead, SourceSnapshotPayload,
+        TemporalMetadata, stable_id,
+    },
     repository_record_from_identity, scan_source_text_records, validate_repository,
 };
 
@@ -41,6 +44,14 @@ pub fn scan_repository_history_with_override(
     repo_path: impl AsRef<Path>,
     repo_id_override: Option<&str>,
 ) -> Result<Graph> {
+    scan_repository_history_inner(repo_path, repo_id_override)
+}
+
+#[allow(clippy::too_many_lines)]
+fn scan_repository_history_inner(
+    repo_path: impl AsRef<Path>,
+    repo_id_override: Option<&str>,
+) -> Result<Graph> {
     std::sync::LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
     validate_repository(repo_root)?;
@@ -48,8 +59,38 @@ pub fn scan_repository_history_with_override(
     let repo_identity = identity::compute_repository_identity(repo_root, repo_id_override);
     let (repository_id, repository) = repository_record_from_identity(&repo_identity);
 
+    // Stamp a source snapshot on the Repository node (BB1 / PR #186 follow-up):
+    // without it, `eg freshness --graph history.graph.jsonl` and `--at` queries
+    // with `--repo-path` always report `unknown`. The stamped HEAD lets freshness
+    // detect `stale_head` after new commits are added.
+    //
+    // History replay reads only committed Git objects, so the snapshot records the
+    // committed HEAD state with `dirty = false` (TT1): uncommitted working-tree
+    // edits never enter the replayed graph, and stamping them dirty would leave the
+    // store permanently `stale_dirty` even after the edits are reverted with HEAD
+    // unchanged. Current working-tree dirtiness is detected live at freshness-check
+    // time instead.
+    //
+    // The transaction time is derived from HEAD's committer date, not wall-clock,
+    // so repeated scans of an unchanged repository stay byte-stable across a
+    // seconds boundary (TT3 / the history replay determinism contract).
+    let head = identity::working_tree_head(repo_root);
+    let transaction_time = match &head {
+        SnapshotHead::Commit { sha } => commit_metadata(repo_root, sha)?.committed_at,
+        _ => PROCESS_STARTED_AT.clone(),
+    };
+    let snapshot = SourceSnapshotPayload {
+        head,
+        dirty: false,
+        repository_id: repository_id.clone(),
+        scanned_at: transaction_time.clone(),
+    };
     let mut graph = Graph::new();
-    graph.push(repository);
+    graph.push(
+        repository
+            .with_valid_time_inferred(&transaction_time)
+            .with_source_snapshot(snapshot),
+    );
 
     for commit in list_commits(repo_root)? {
         let commit_record = commit_record(&repository_id, &commit);
@@ -146,6 +187,12 @@ pub fn scan_repository_history_with_override(
 
     let mut producer = code_graph_producer();
     producer.producer_kind = ProducerKind::HistoryReplay;
+    // Make the producer fully deterministic too (CCC1): `code_graph_producer`
+    // sets `producer_started_at` from the wall-clock `PROCESS_STARTED_AT`, which
+    // would make two `eg scan-history` runs of the same unchanged repository in
+    // separate processes differ. History replay is committed-state-only, so anchor
+    // it to the same deterministic HEAD-committer transaction time as the snapshot.
+    producer.producer_started_at = transaction_time;
     Ok(graph.stamp_producer(&producer))
 }
 
@@ -263,15 +310,23 @@ fn list_rust_files(repo_root: &Path, sha: &str) -> Result<Vec<String>> {
     let mut files = output
         .lines()
         .map(str::trim)
-        .filter(|path| {
-            Path::new(path)
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
-        })
+        .filter(|path| is_indexed_rust_source(Path::new(path)))
         .map(normalize_git_path)
         .collect::<Vec<_>>();
     files.sort();
     Ok(files)
+}
+
+/// Matches the live scanner's source set (`fs::discover_rust_source_files`) so
+/// history replay indexes exactly what `eg scan` would, keeping it consistent
+/// with the freshness dirty probe (which is scoped the same way):
+/// - a **case-sensitive** lowercase `.rs` extension — the scanner uses
+///   `extension() == "rs"`, so an uppercase `LIB.RS` is not a source (GGG1);
+/// - never under a `target/` build directory, which `fs::should_descend` prunes,
+///   so committed build output is not indexed (GGG2).
+fn is_indexed_rust_source(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+        && !path.components().any(|c| c.as_os_str() == "target")
 }
 
 fn git_blob(repo_root: &Path, sha: &str, path: &str) -> Result<String> {

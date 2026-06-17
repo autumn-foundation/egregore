@@ -18,9 +18,11 @@ use crate::{
         VerificationRequest, build_artifact_records, build_command_evidence_records,
         build_observation_records, build_verification_records,
     },
-    ir::{EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SourceSpan},
+    freshness::{self, Freshness},
+    identity,
+    ir::{EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SnapshotHead, SourceSpan},
     link_evidence::{self, LinkOptions},
-    local_project, query, scan_repository_history_with_override, scan_repository_with_override,
+    local_project, query, scan_repository_history_with_override, scan_repository_with_exclusions,
     schema_version::{RecordVersion, record_version},
     traj::{self, ImportOptions},
 };
@@ -32,7 +34,7 @@ use crate::adapters::SemanticMatch;
 #[cfg(feature = "embedded-aletheiadb")]
 use crate::daemon::{DaemonClient, DaemonConfig};
 #[cfg(feature = "embedded-aletheiadb")]
-use crate::incremental::scan_repository_incremental;
+use crate::incremental::scan_repository_incremental_excluding;
 #[cfg(feature = "embedded-aletheiadb")]
 use crate::repair;
 
@@ -127,6 +129,42 @@ enum Commands {
         /// Embedded `AletheiaDB` data directory.
         #[arg(long, conflicts_with = "graph")]
         data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Report whether a store still matches the current working tree (issue #82).
+    ///
+    /// Reads the store-level source-snapshot identity stamped by `scan`/`ingest`
+    /// (HEAD commit + dirty flag) and compares it against the live working tree,
+    /// classifying the store as `fresh`, `stale_head`, `stale_dirty`, or
+    /// `unknown`. An agent uses this to avoid citing file/span handles the live
+    /// code has already invalidated.
+    ///
+    /// Strictly read-only and fully offline: it never creates, modifies, or
+    /// deletes any graph record, runtime file, index, or idempotency receipt, and
+    /// never accesses the network.
+    ///
+    /// Both human-readable text (`--format text`, default) and machine-readable
+    /// JSON (`--format json`) are supported; the JSON `freshness` code is stable.
+    ///
+    /// Exits 0 regardless of the freshness verdict (the verdict is the payload,
+    /// not an error); exits non-zero only on I/O or store-read failure.
+    ///
+    /// See `docs/cli/freshness.md`.
+    Freshness {
+        /// Working-tree path to compare the store against (defaults to the current directory).
+        #[arg(default_value = ".")]
+        repo_path: PathBuf,
+        /// Graph JSONL store to check (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory to check (mutually exclusive with --graph).
+        #[arg(long, conflicts_with = "graph")]
+        data_dir: Option<PathBuf>,
+        /// Override the auto-detected repository identity used to locate the stored snapshot.
+        #[arg(long)]
+        repo_id_override: Option<String>,
         /// Output format.
         #[arg(long, default_value = "text")]
         format: OutputFormat,
@@ -512,6 +550,13 @@ enum QuerySubcommand {
         /// a machine-readable diagnostic.
         #[arg(long)]
         repo: Option<String>,
+        /// Working-tree path to compute store freshness against (issue #82).
+        ///
+        /// When set, each result carries a non-fatal `freshness` code
+        /// (`fresh` / `stale_head` / `stale_dirty` / `unknown`) so an agent can
+        /// downgrade trust in the cited handle. Omitted → no freshness field.
+        #[arg(long)]
+        repo_path: Option<PathBuf>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -535,6 +580,12 @@ enum QuerySubcommand {
         /// a stderr diagnostic, never mixed into the result set.
         #[arg(long)]
         repo: Option<String>,
+        /// Working-tree path to compute store freshness against (issue #82).
+        ///
+        /// When set, each result carries a non-fatal `freshness` code; omitted →
+        /// no freshness field. See `eg query symbol --help`.
+        #[arg(long)]
+        repo_path: Option<PathBuf>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -667,6 +718,13 @@ enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Working-tree path to compute store freshness against (issue #82).
+        ///
+        /// When set, the response carries a non-fatal top-level `freshness` code
+        /// so an agent can downgrade trust in the returned handles; omitted → no
+        /// freshness field. See `eg query symbol --help`.
+        #[arg(long)]
+        repo_path: Option<PathBuf>,
     },
     /// Retrieve evidence-backed context for a task.
     Task {
@@ -1122,6 +1180,19 @@ fn run_cli(cli: Cli) -> Result<()> {
             let daemon = false;
             inspect(graph.as_deref(), daemon, data_dir.as_deref(), format)
         }
+        Commands::Freshness {
+            repo_path,
+            graph,
+            data_dir,
+            repo_id_override,
+            format,
+        } => freshness_cmd(
+            &repo_path,
+            graph.as_deref(),
+            data_dir.as_deref(),
+            repo_id_override.as_deref(),
+            format,
+        ),
         Commands::Ingest {
             graph,
             adapter,
@@ -1720,7 +1791,11 @@ fn link_evidence_cmd(code_graph_path: &Path, evidence_path: &Path, out: &Path) -
 }
 
 fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<()> {
-    let graph = scan_repository_with_override(repo_path, repo_id_override)
+    // Exclude the graph output and any in-tree egregore store from the dirty probe
+    // (PR #186 E/FF1): a pre-existing graph.jsonl or .egregore data-dir from a
+    // previous workflow must not stamp `dirty = true` on the new scan output.
+    let exclusions = store_exclusions_including_egregore(repo_path, &[Some(out)]);
+    let graph = scan_repository_with_exclusions(repo_path, repo_id_override, &exclusions)
         .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
     let jsonl = graph
         .to_jsonl()
@@ -1731,6 +1806,10 @@ fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<
 }
 
 fn scan_history(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<()> {
+    // History replay reads only committed Git objects, so the stamped snapshot is
+    // always `dirty=false` (committed HEAD state); a pre-existing in-tree output or
+    // companion store cannot affect it, and no dirty-probe exclusions are needed
+    // (TT1 supersedes the earlier CC1/GG1 exclusion machinery).
     let graph = scan_repository_history_with_override(repo_path, repo_id_override)
         .with_context(|| format!("failed to scan Git history for {}", repo_path.display()))?;
     let jsonl = graph
@@ -1739,6 +1818,460 @@ fn scan_history(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) ->
     fs::write(out, jsonl)
         .with_context(|| format!("failed to write history graph JSONL to {}", out.display()))?;
     Ok(())
+}
+
+/// Machine-readable report emitted by `eg freshness`.
+///
+/// `freshness` carries the stable code (`fresh` / `stale_head` / `stale_dirty` /
+/// `unknown`); `current_head` and `stored_snapshot` reuse the on-disk snapshot
+/// serialization so the report is self-describing.
+#[derive(Debug, Serialize)]
+struct FreshnessReport {
+    /// Stable freshness code.
+    freshness: String,
+    /// Convenience boolean: `true` only when `freshness == "fresh"`.
+    fresh: bool,
+    /// Stable `Repository` record ID the freshness was computed for.
+    repository_id: String,
+    /// Where the store was read from: `"graph"` or `"data_dir"`.
+    store_kind: String,
+    /// Current working-tree HEAD state.
+    current_head: SnapshotHead,
+    /// Current working-tree dirty flag.
+    current_dirty: bool,
+    /// The snapshot the store was built from; absent for pre-stamping stores.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stored_snapshot: Option<crate::ir::SourceSnapshotPayload>,
+    /// Human-oriented one-line explanation of the verdict.
+    message: String,
+}
+
+/// Renders a [`SnapshotHead`] for human-readable output.
+fn head_display(head: &SnapshotHead) -> String {
+    match head {
+        SnapshotHead::Commit { sha } => format!("commit {sha}"),
+        SnapshotHead::NoGit => "no_git".to_owned(),
+        SnapshotHead::UnbornHead => "unborn_head".to_owned(),
+    }
+}
+
+/// Builds the human-oriented explanation for a freshness verdict.
+fn freshness_message(verdict: Freshness) -> String {
+    match verdict {
+        Freshness::Fresh => {
+            "store matches the current working tree (HEAD unchanged, tree clean)".to_owned()
+        }
+        Freshness::StaleHead => {
+            "current HEAD differs from the stored snapshot; queried file/span handles may be \
+             invalid — re-scan before citing them"
+                .to_owned()
+        }
+        Freshness::StaleDirty => {
+            "working tree has uncommitted changes relative to the stored snapshot; queried \
+             file/span handles may be invalid — re-scan before citing them"
+                .to_owned()
+        }
+        Freshness::Unknown => {
+            "store predates snapshot stamping or no Git context exists; freshness cannot be \
+             determined"
+                .to_owned()
+        }
+    }
+}
+
+/// Handles `eg freshness [repo_path] (--graph <p> | --data-dir <d>) [--format ...]`.
+///
+/// Strictly read-only (issue #82 AC4): loads the store through the same
+/// read-only path queries use, probes the working tree with `git rev-parse` /
+/// `git status`, and never writes anything. Always returns `Ok(())` once a
+/// verdict is produced; the verdict (including `unknown`) is the payload, not an
+/// error.
+fn freshness_cmd(
+    repo_path: &Path,
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+    repo_id_override: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let store_kind = if graph.is_some() { "graph" } else { "data_dir" };
+    let identity = identity::compute_repository_identity(repo_path, repo_id_override);
+    // Exclude both known store artifacts plus any in-tree `.egregore` store from
+    // the dirty probe (PR #186 E/F/FF1): when checking `--graph`, the companion
+    // `.egregore` data-dir created by the documented ingest workflow sits untracked
+    // (and vice versa for `--data-dir` + `graph.jsonl`). Mirroring `scan`'s
+    // store-artifact exclusions keeps a just-written store from reading as
+    // `stale_dirty` before the user gitignores or deletes the intermediate output.
+    let exclusions = store_exclusions_including_egregore(repo_path, &[graph, data_dir]);
+    let (current_head, current_dirty) =
+        identity::working_tree_snapshot_excluding(repo_path, &exclusions);
+
+    // AC4: strictly read-only. A `--graph` JSONL is read directly (a plain file
+    // read). A `--data-dir` embedded store is read through a throwaway copy,
+    // because the embedded engine re-persists its on-disk index files on open;
+    // operating on a copy guarantees the live store's records, indexes, runtime
+    // files, and receipts are never created, modified, or deleted.
+    let records = match data_dir {
+        Some(dir) => load_records_from_data_dir_readonly(dir)?,
+        None => load_query_records(graph, None)?,
+    };
+    // An explicit `--repo-id-override` pins the identity used to locate the stored
+    // snapshot, so it must match exactly: a wrong/typo'd override must not borrow an
+    // unrelated sole repository's snapshot via the single-repository fallback (which
+    // could even report `fresh` under the caller's unmatched ID). Without an
+    // override, the auto-detected identity keeps that fallback so legacy single-repo
+    // stores still classify (PR #186 follow-up YY1).
+    //
+    // Report the repository that actually OWNS the matched snapshot, not the
+    // recomputed checkout identity: a store scanned with `--repo-id-override` and
+    // checked without it classifies the sole repository via the fallback, and the
+    // JSON `repository_id` must be that stored Repository's ID so consumers keying
+    // the verdict by repository are not misled (PR #186 follow-up ZZ1).
+    let (report_repository_id, stored) = if repo_id_override.is_some() {
+        // Exact match required; when found, the owner is the requested identity.
+        (
+            identity.id.clone(),
+            freshness::stored_snapshot_exact(&records, &identity.id),
+        )
+    } else {
+        // Mirror the per-row query freshness path (Z1): when the identity probe
+        // misses, fall back to the sole STAMPED repository so a combined store with
+        // exactly one stamped Repository (e.g. an override-scanned repo alongside a
+        // legacy unstamped node) classifies unambiguously instead of reporting
+        // `unknown` — and `eg freshness` agrees with `eg query ... --repo-path` on
+        // the same store (PR #186 follow-up DDD1).
+        match freshness::stored_snapshot_with_owner(&records, &identity.id)
+            .or_else(|| freshness::stored_snapshot_sole_stamped(&records))
+        {
+            Some((owner, snapshot)) => (owner.to_owned(), Some(snapshot)),
+            None => (identity.id.clone(), None),
+        }
+    };
+    let mut verdict = freshness::classify(stored, &current_head, current_dirty);
+    // A `fresh` verdict still misses a previously scanned source that a
+    // sparse-checkout cone change removed: such a file is `skip-worktree` + absent,
+    // so `git status` stays blind to it. Downgrade to `stale_dirty` when the store
+    // cites such a removed path (FFF1). Only `fresh` is overridden: a `stale_head`
+    // store already requires a re-scan.
+    if verdict.is_fresh() {
+        let removed = identity::index_hidden_absent_source_inputs(repo_path);
+        let index = query::RepositoryIndex::build(&records);
+        if cited_source_stale_on_disk(&records, &index, &report_repository_id, repo_path, &removed)
+        {
+            verdict = Freshness::StaleDirty;
+        }
+    }
+
+    let report = FreshnessReport {
+        freshness: verdict.code().to_owned(),
+        fresh: verdict.is_fresh(),
+        repository_id: report_repository_id,
+        store_kind: store_kind.to_owned(),
+        current_head,
+        current_dirty,
+        stored_snapshot: stored.cloned(),
+        message: freshness_message(verdict),
+    };
+
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&report).context("failed to serialize freshness report")?
+            );
+        }
+        OutputFormat::Text => {
+            println!("freshness: {}", report.freshness);
+            println!("repository_id: {}", report.repository_id);
+            println!("store: {store_kind}");
+            println!(
+                "current_head: {} (dirty: {})",
+                head_display(&report.current_head),
+                report.current_dirty
+            );
+            match &report.stored_snapshot {
+                Some(snapshot) => println!(
+                    "stored_head: {} (dirty: {})",
+                    head_display(&snapshot.head),
+                    snapshot.dirty
+                ),
+                None => println!("stored_head: (none — store predates snapshot stamping)"),
+            }
+            println!("message: {}", report.message);
+        }
+    }
+    Ok(())
+}
+
+/// Computes the store-freshness code for a query against `repo_path` (issue #82).
+///
+/// Returns `None` when `repo_path` is absent, so freshness-unaware queries emit
+/// byte-identical output to before this feature. When present, returns the stable
+/// freshness code (including `"fresh"`) so an agent always sees the signal it asked
+/// for and the result is never silently suppressed.
+///
+/// `repo_id_hint` is an optional known repository ID from the already-resolved
+/// `--repo` scope or context owner; when provided and distinct from the
+/// auto-detected identity it is tried first so that operator-override IDs win in
+/// a multi-repo store, and used as the owner ID when no snapshot is found so that
+/// `stamp_freshness` can match selected rows (PR #186 follow-up).
+fn query_freshness_code_with_hint(
+    records: &[GraphRecord],
+    repo_path: Option<&Path>,
+    artifacts: &[Option<&Path>],
+    repo_id_hint: Option<&str>,
+) -> Option<(String, &'static str)> {
+    query_freshness_code_inner(records, repo_path, artifacts, repo_id_hint)
+}
+
+fn query_freshness_code_inner(
+    records: &[GraphRecord],
+    repo_path: Option<&Path>,
+    artifacts: &[Option<&Path>],
+    repo_id_hint: Option<&str>,
+) -> Option<(String, &'static str)> {
+    let repo_path = repo_path?;
+    let identity = identity::compute_repository_identity(repo_path, None);
+    // Mirror `freshness_cmd`/`scan` and also exclude any in-tree `.egregore*`
+    // companion store (PR #186 follow-up II1): the documented workflow leaves an
+    // untracked `.egregore` data-dir beside the graph, which must not stamp query
+    // rows `stale_dirty` when the graph itself was scanned from a clean tree.
+    let exclusions = store_exclusions_including_egregore(repo_path, artifacts);
+    let (head, dirty) = identity::working_tree_snapshot_excluding(repo_path, &exclusions);
+    // Any explicit hint (a resolved `--repo` scope or context owner) is
+    // authoritative: the verdict must be owned by the selected repository, even
+    // when the hint equals the auto-detected identity. Look up ONLY its snapshot —
+    // never fall back to the auto-detected identity's snapshot or the sole-stamped
+    // repo, which may belong to a different repository and would mislabel the
+    // verdict's owner. When the selected repo has no snapshot (legacy/pre-stamping
+    // rows in a combined store), `matched` stays `None` and the owner below is
+    // still the hint, so `stamp_freshness` stamps `unknown` on the selected rows
+    // rather than omitting the field (PR #186 follow-up SS1/UU1).
+    //
+    // Only when NO hint is given does the identity probe run with a sole-stamped
+    // fallback: if exactly one Repository node in the store carries a snapshot,
+    // that snapshot is unambiguous and should be used. This handles combined
+    // stores where --repo-id-override was used on the scanned checkout but no
+    // --repo flag was passed to the query command (PR #186 follow-up Z1).
+    let matched = match repo_id_hint {
+        Some(h) => freshness::stored_snapshot_with_owner(records, h),
+        None => freshness::stored_snapshot_with_owner(records, &identity.id)
+            .or_else(|| freshness::stored_snapshot_sole_stamped(records)),
+    };
+    // When no snapshot is found but the caller supplied an explicit hint (from
+    // `--repo`), use the hint as the owner ID so `stamp_freshness` can match
+    // the selected rows.  Falling back to `identity.id` would emit the unknown
+    // verdict under the wrong owner, making freshness invisible on those rows.
+    let (owner_id, stored) = match matched {
+        Some((owner, snapshot)) => (owner.to_owned(), Some(snapshot)),
+        None => (
+            repo_id_hint.map(ToOwned::to_owned).unwrap_or(identity.id),
+            None,
+        ),
+    };
+    let code = freshness::classify(stored, &head, dirty).code();
+    // Downgrade `fresh` to `stale_dirty` when a previously scanned source owned by
+    // this repository was removed by a sparse-checkout cone change (skip-worktree +
+    // absent, invisible to `git status`) but the store still cites it (FFF1),
+    // matching `freshness_cmd`.
+    let code = if code == "fresh" {
+        let removed = identity::index_hidden_absent_source_inputs(repo_path);
+        let index = query::RepositoryIndex::build(records);
+        if cited_source_stale_on_disk(records, &index, &owner_id, repo_path, &removed) {
+            "stale_dirty"
+        } else {
+            code
+        }
+    } else {
+        code
+    };
+    Some((owner_id, code))
+}
+
+/// Computes repo-relative dirty-probe exclusions for the store artifact being
+/// read (issue #82 / PR #186).
+///
+/// When the `--graph` file or `--data-dir` directory lives under `repo_path`, it
+/// is returned as a repo-relative pathspec so the freshness dirty probe ignores
+/// it — an in-tree store the workflow just wrote must not by itself make the tree
+/// look `stale_dirty`. Returns empty when there is no artifact or it lives
+/// outside the working tree.
+fn store_artifact_exclusions(repo_path: &Path, artifacts: &[Option<&Path>]) -> Vec<String> {
+    let repo_abs = fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    artifacts
+        .iter()
+        .filter_map(|a| *a)
+        .filter_map(|artifact| {
+            let abs = fs::canonicalize(artifact).unwrap_or_else(|_| artifact.to_path_buf());
+            let rel = abs.strip_prefix(&repo_abs).ok()?;
+            let s = rel.to_string_lossy().replace('\\', "/");
+            (!s.is_empty()).then_some(s)
+        })
+        .collect()
+}
+
+/// Discovers untracked in-tree `.egregore*` embedded-store directories that must
+/// be excluded from the dirty probe (PR #186 follow-up FF1/GG1).
+///
+/// A directory qualifies only when it is fully untracked (`git ls-files` reports
+/// no content under it) and contains no `.rs` sources — the hallmark of a store
+/// output (`eg ingest ... --data-dir .egregore`) rather than a source directory
+/// that merely shares the prefix. The scanner never indexes such a store, so the
+/// freshness dirty probe must not count it as source dirtiness.
+fn egregore_store_dirs(repo_path: &Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    let Ok(entries) = std::fs::read_dir(repo_path) else {
+        return dirs;
+    };
+    for entry in entries.flatten() {
+        let name_matches = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(".egregore"));
+        // Only directories, not regular files such as `.egregore.rs`.
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        if !(name_matches && is_dir) {
+            continue;
+        }
+        let path = entry.path();
+        // `git ls-files` returns tracked paths under the directory; an empty
+        // result means the entire subtree is untracked / gitignored, which is the
+        // hallmark of a store output rather than a source directory. Use the entry
+        // name directly so `git ls-files` receives a repo-relative path regardless
+        // of whether `repo_path` is absolute or relative.
+        let name = entry.file_name();
+        let has_tracked = std::process::Command::new("git")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(repo_path)
+            .args(["ls-files", "--", name.to_str().unwrap_or("")])
+            .output()
+            .map(|out| !out.stdout.is_empty())
+            .unwrap_or(false);
+        // Even when no content is tracked, an untracked directory containing `.rs`
+        // files is a source directory, not a store output: its files appear in the
+        // graph but are outside `git status`, so excluding it would mask deletions.
+        if !has_tracked && !dir_has_rust_sources(&path) {
+            dirs.push(path);
+        }
+    }
+    dirs
+}
+
+/// Builds dirty-probe exclusions for the explicit store `artifacts` plus any
+/// in-tree `.egregore*` embedded-store directories discovered under `repo_path`
+/// (PR #186 follow-up FF1/GG1).
+///
+/// All three store-producing/checking entry points (`scan`, `scan-history`,
+/// `freshness`) share this so a companion store written by one workflow never
+/// makes another's output read `stale_dirty`.
+fn store_exclusions_including_egregore(
+    repo_path: &Path,
+    artifacts: &[Option<&Path>],
+) -> Vec<String> {
+    let egregore_dirs = egregore_store_dirs(repo_path);
+    let mut all: Vec<Option<&Path>> = artifacts.to_vec();
+    for dir in &egregore_dirs {
+        all.push(Some(dir.as_path()));
+    }
+    store_artifact_exclusions(repo_path, &all)
+}
+
+/// Returns `true` if `dir` or any subdirectory contains a `.rs` file.
+///
+/// Used in the `.egregore*` auto-exclusion check: an untracked directory whose
+/// subtree contains `.rs` source files is a source directory, not a store output,
+/// and must not be excluded from the snapshot dirty probe.
+fn dir_has_rust_sources(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if dir_has_rust_sources(&path) {
+                return true;
+            }
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns `true` when an ancestor directory of `repo_path/rel` (below the repo
+/// root) contains a nested `.git` sentinel, so the scanner would no longer reach
+/// `rel`.
+///
+/// Walks the parents of the cited file up to — but not including — `repo_path`, so
+/// the repository's own `.git` never counts. A submodule/worktree (`.git` file) or
+/// nested clone (`.git` directory) appearing over a previously scanned tree makes
+/// `fs::should_descend` skip it, yet `git status` cannot see that conversion
+/// (GGG3 / PR #186 follow-up).
+fn path_behind_nested_git(repo_path: &Path, rel: &str) -> bool {
+    let full = repo_path.join(rel);
+    let mut dir = full.parent();
+    while let Some(d) = dir {
+        if d == repo_path || !d.starts_with(repo_path) {
+            break;
+        }
+        if d.join(".git").exists() {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
+}
+
+/// Returns `true` when the store cites a `File` (owned by `owner_id`) that the
+/// working tree no longer makes available to the scanner — a source the graph
+/// indexed but that `git status` cannot flag.
+///
+/// Two cases, both keyed off the store's actual contents (so a path matters only
+/// when cited — distinguishing a change to a *previously scanned* file from one
+/// that was never indexed, which the pure working-tree probe cannot tell apart):
+/// - `removed`: index-hidden (`skip-worktree`/`assume-unchanged`) yet absent
+///   paths from [`identity::index_hidden_absent_source_inputs`] — a sparse-checkout
+///   cone change removed a scanned file (FFF1) vs. a baseline omission (AAA1);
+/// - a cited file now sitting behind a nested `.git` sentinel (GGG3).
+fn cited_source_stale_on_disk(
+    records: &[GraphRecord],
+    index: &query::RepositoryIndex,
+    owner_id: &str,
+    repo_path: &Path,
+    removed: &[String],
+) -> bool {
+    let removed: std::collections::HashSet<&str> = removed.iter().map(String::as_str).collect();
+    records.iter().any(|record| {
+        matches!(
+            record,
+            GraphRecord::Node {
+                kind: NodeKind::File,
+                id,
+                repo_relative_path: Some(path),
+                ..
+            } if index.owner_of(id) == Some(owner_id)
+                && (removed.contains(path.as_str()) || path_behind_nested_git(repo_path, path))
+        )
+    })
+}
+
+/// Stamps the freshness `code` on each result whose repository matches the
+/// checkout the code was computed for (issue #82). Rows owned by a different
+/// repository (multi-repo stores) are left unstamped rather than mislabeled.
+///
+/// History (`scan-history`) source rows are attributed to their repository the
+/// same way `scan` rows are: replay emits `Repository CONTAINS File` and
+/// `File DEFINES Symbol` edges per commit, so `RepositoryIndex::owner_of`
+/// resolves them and the verdict attaches via the normal ownership match
+/// (verified by `query_symbol_repo_path_stamps_freshness_on_history_graph`).
+fn stamp_freshness(results: &mut [SymbolResult<'_>], freshness: Option<&(String, &'static str)>) {
+    let Some((repo_id, code)) = freshness else {
+        return;
+    };
+    for result in results.iter_mut() {
+        if result.repository_id == Some(repo_id.as_str()) {
+            result.freshness = Some(code);
+        }
+    }
 }
 
 fn print_counts_text(counts: &InspectCounts) {
@@ -1969,8 +2502,8 @@ fn ingest(
 /// Machine-readable report emitted by `eg refresh`.
 ///
 /// All counts are integers; file lists are sorted repository-relative paths.
-/// `freshness_after_refresh` is always `"fresh"` after a successful refresh
-/// (the counterpart to the read-only staleness signal in issue #82).
+/// `freshness_after_refresh` reports the verdict a follow-up `eg freshness`
+/// would give (the write-side counterpart to the read-only signal in issue #82).
 #[cfg(feature = "embedded-aletheiadb")]
 #[derive(Debug, Serialize)]
 struct RefreshReport {
@@ -2003,8 +2536,11 @@ struct RefreshReport {
     embed_status: String,
     /// Freshness of the store with respect to the working tree after this refresh.
     ///
-    /// Always `"fresh"` on success: the store now reflects the current working tree.
-    /// This is the write counterpart to the read-only staleness signal (issue #82).
+    /// The verdict `eg freshness --data-dir` would report for the rebuilt store:
+    /// `"fresh"` for a clean tree at the stamped HEAD, or `"stale_dirty"` when the
+    /// refresh captured uncommitted `.rs` edits (the store reflects an uncommitted
+    /// state). This is the write counterpart to the read-only staleness signal
+    /// (issue #82) and stays consistent with a follow-up freshness check (OO1).
     freshness_after_refresh: String,
 }
 
@@ -2062,7 +2598,13 @@ fn scan_refresh_cmd(
     }
 
     // Perform the incremental scan (reads cache, hashes files, rebuilds changed ones).
-    let scan = scan_repository_incremental(repo_path, cache_path)
+    // Exclude the data-dir, the cache file, and any in-tree `.egregore*` companion
+    // store from the dirty probe (PR #186 A/MM1): all are refresh/store artifacts;
+    // counting any as dirty would stamp `dirty = true` on the snapshot and make a
+    // follow-up `eg freshness --data-dir` report `stale_dirty` with no source change.
+    let snapshot_exclusions =
+        store_exclusions_including_egregore(repo_path, &[Some(data_dir), Some(cache_path)]);
+    let scan = scan_repository_incremental_excluding(repo_path, cache_path, &snapshot_exclusions)
         .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
 
     let records = scan.graph.records().to_vec();
@@ -2111,6 +2653,21 @@ fn scan_refresh_cmd(
     let reused_count = reused_files.len();
     let tombstoned_count = tombstoned_files.len();
 
+    // Report the verdict `eg freshness --data-dir` would compute, not an
+    // unconditional "fresh" (OO1 / PR #186 follow-up). When the working tree had
+    // uncommitted `.rs` edits the refreshed snapshot is stamped `dirty`, so the
+    // store is `stale_dirty` even immediately after rebuild — exactly as a full
+    // scan of a dirty tree behaves. The snapshot was just computed from the
+    // current tree, so classifying it against itself yields the same verdict a
+    // follow-up freshness check would, without re-probing Git.
+    let refresh_identity = identity::compute_repository_identity(repo_path, None);
+    let freshness_after_refresh = freshness::stored_snapshot(&records, &refresh_identity.id)
+        .map_or(Freshness::Unknown, |snapshot| {
+            freshness::classify(Some(snapshot), &snapshot.head, snapshot.dirty)
+        })
+        .code()
+        .to_owned();
+
     let refresh_report = RefreshReport {
         rebuilt_files,
         rebuilt_count,
@@ -2122,8 +2679,7 @@ fn scan_refresh_cmd(
         ingest_succeeded: ingest_report.succeeded,
         ingest_failed: ingest_report.failed,
         embed_status,
-        // AC6: A successful refresh means the store now matches the working tree.
-        freshness_after_refresh: "fresh".to_owned(),
+        freshness_after_refresh,
     };
 
     match format {
@@ -2319,6 +2875,13 @@ struct SymbolResult<'a> {
     /// Human-usable repository identity handle (e.g. `owner/name`).
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<&'a str>,
+    /// Non-fatal store-freshness code relative to a working tree (issue #82).
+    ///
+    /// Present only when `--repo-path` was supplied so an agent can downgrade
+    /// trust in the cited `repo_relative_path` + `span` handle. Absent (and the
+    /// result never suppressed) when freshness was not requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -2601,6 +3164,13 @@ struct ContextTopologyEdge<'a> {
 struct ContextResponse<'a> {
     ok: bool,
     symbol_name: &'a str,
+    /// Non-fatal store-freshness code relative to a working tree (issue #82).
+    ///
+    /// Present only when `--repo-path` was supplied; the context is never
+    /// suppressed on a non-`fresh` verdict so an agent can downgrade trust in the
+    /// returned handles instead of losing them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness: Option<&'static str>,
     source_facts: Vec<ContextSourceFact<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     topology_edges: Vec<ContextTopologyEdge<'a>>,
@@ -2946,9 +3516,23 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             as_of,
             tx_as_of,
             repo,
+            repo_path,
             format,
         } => {
             if let Some(tx) = tx_as_of.as_deref() {
+                // --repo-path is used to stamp freshness onto results.  TxSymbolRow
+                // has no freshness field and the tx-as-of path never computes one,
+                // so accepting --repo-path here would silently drop the signal.
+                // Reject the combination early so users see a clear error rather
+                // than a result that looks correct but carries no freshness stamp.
+                if repo_path.is_some() {
+                    print_tx_error(
+                        "unsupported_combination",
+                        "--repo-path cannot be used with --tx-as-of; \
+                         freshness stamping is not available for transaction-time queries",
+                    )?;
+                    std::process::exit(1);
+                }
                 // --at keys the valid-time axis to a commit; combining it with a
                 // transaction-time selector is an unsupported workflow (AC6).
                 if at.is_some() {
@@ -3008,6 +3592,16 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             }
             #[cfg(feature = "embedded-aletheiadb")]
             if daemon {
+                if repo_path.is_some() {
+                    // Daemon-routed results bypass the local freshness probe entirely;
+                    // accepting --repo-path here would silently emit results without
+                    // the promised `freshness` field (PR #186 follow-up).
+                    eprintln!(
+                        "error: --repo-path cannot be used with --daemon; \
+                         run without --daemon to get freshness stamping"
+                    );
+                    std::process::exit(1);
+                }
                 let dir = data_dir
                     .as_deref()
                     .expect("clap requires --data-dir with --daemon");
@@ -3024,16 +3618,49 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             let selected = selected.as_deref();
+            let freshness_code = query_freshness_code_with_hint(
+                &records,
+                repo_path.as_deref(),
+                &[graph.as_deref(), data_dir.as_deref()],
+                selected,
+            );
             as_of.map_or_else(
                 || {
                     at.map_or_else(
-                        || query_symbol_all(&records, &name, format, &index, selected),
+                        || {
+                            query_symbol_all(
+                                &records,
+                                &name,
+                                format,
+                                &index,
+                                selected,
+                                freshness_code.as_ref(),
+                            )
+                        },
                         |prefix| {
-                            query_symbol_at(&records, &name, &prefix, format, &index, selected)
+                            query_symbol_at(
+                                &records,
+                                &name,
+                                &prefix,
+                                format,
+                                &index,
+                                selected,
+                                freshness_code.as_ref(),
+                            )
                         },
                     )
                 },
-                |instant| query_symbol_as_of(&records, &name, &instant, format, &index, selected),
+                |instant| {
+                    query_symbol_as_of(
+                        &records,
+                        &name,
+                        &instant,
+                        format,
+                        &index,
+                        selected,
+                        freshness_code.as_ref(),
+                    )
+                },
             )
         }
         QuerySubcommand::File {
@@ -3043,10 +3670,18 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             #[cfg(feature = "embedded-aletheiadb")]
             daemon,
             repo,
+            repo_path,
             format,
         } => {
             #[cfg(feature = "embedded-aletheiadb")]
             if daemon {
+                if repo_path.is_some() {
+                    eprintln!(
+                        "error: --repo-path cannot be used with --daemon; \
+                         run without --daemon to get freshness stamping"
+                    );
+                    std::process::exit(1);
+                }
                 let dir = data_dir
                     .as_deref()
                     .expect("clap requires --data-dir with --daemon");
@@ -3055,7 +3690,20 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
-            query_file(&records, &path, format, &index, selected.as_deref())
+            let freshness_code = query_freshness_code_with_hint(
+                &records,
+                repo_path.as_deref(),
+                &[graph.as_deref(), data_dir.as_deref()],
+                selected.as_deref(),
+            );
+            query_file(
+                &records,
+                &path,
+                format,
+                &index,
+                selected.as_deref(),
+                freshness_code.as_ref(),
+            )
         }
         QuerySubcommand::Drift {
             graph,
@@ -3121,9 +3769,39 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             name,
             graph,
             data_dir,
+            repo_path,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            query_context_cmd(&records, &name)
+            // Pre-compute the context owner so the freshness hint matches the
+            // repository that actually owns the returned source facts.  Without this,
+            // `query_freshness_code` auto-detects the identity from `repo_path`, which
+            // can differ from an operator-override ID: the snapshot lookup then fails
+            // (no match for the auto-detected ID in a single-override-ID store), the
+            // single-repo fallback is disabled, and the verdict is `unknown` even
+            // though all facts are from one stamped repository (PR #186 follow-up).
+            let owner_hint = if repo_path.is_some() {
+                let index = query::RepositoryIndex::build(&records);
+                let ctx = query::symbol_context(&records, &name);
+                let owners: std::collections::BTreeSet<Option<&str>> = ctx
+                    .source_facts
+                    .iter()
+                    .map(|r| index.owner_of(r.id()))
+                    .collect();
+                if owners.len() == 1 {
+                    owners.into_iter().next().flatten().map(ToOwned::to_owned)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let freshness = query_freshness_code_with_hint(
+                &records,
+                repo_path.as_deref(),
+                &[graph.as_deref(), data_dir.as_deref()],
+                owner_hint.as_deref(),
+            );
+            query_context_cmd(&records, &name, freshness)
         }
         QuerySubcommand::Task {
             id_or_handle,
@@ -3522,6 +4200,55 @@ fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
         let _ = data_dir;
         anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
     }
+}
+
+/// Loads records from an embedded `--data-dir` store without mutating it (issue #82).
+///
+/// The embedded engine re-persists its index files on open, so a freshness check
+/// that opened the live store directly would modify it — violating the read-only
+/// guarantee. This copies the store to a throwaway temporary directory and reads
+/// the copy, leaving the original byte-for-byte untouched.
+fn load_records_from_data_dir_readonly(data_dir: &Path) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let temp =
+            tempfile::tempdir().context("failed to create temporary read-only store copy")?;
+        let copy_root = temp.path().join("store");
+        copy_dir_recursive(data_dir, &copy_root).with_context(|| {
+            format!(
+                "failed to copy store {} for read-only inspection",
+                data_dir.display()
+            )
+        })?;
+        load_records_from_db(&copy_root)
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// Recursively copies the regular files and directories under `src` into `dst`.
+///
+/// Symlinks and other non-regular entries are skipped; this is used only to make
+/// a read-only working copy of an embedded store directory.
+#[cfg(feature = "embedded-aletheiadb")]
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// Loads query records for a transaction-time query (issue #66).
@@ -4982,6 +5709,7 @@ fn query_symbol_all(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
     let mut results: Vec<SymbolResult<'_>> = records
@@ -5008,6 +5736,7 @@ fn query_symbol_all(
     }
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
+    stamp_freshness(&mut results, freshness_code);
     for result in &results {
         print_result(result, format)?;
     }
@@ -5046,6 +5775,7 @@ fn symbol_result<'a>(
         git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
         repository_id,
         repository: repository_id.and_then(|repo| index.display_of(repo)),
+        freshness: None,
     })
 }
 
@@ -5060,6 +5790,7 @@ fn query_symbol_as_of(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     match query::symbol_as_of_valid_time_by_repo(records, name, as_of, index, selected_repo) {
         Err(msg) => {
@@ -5081,10 +5812,13 @@ fn query_symbol_as_of(
                     exit_ambiguous_repository(&groups);
                 }
             }
-            for record in results {
-                if let Some(result) = symbol_result(record, name, index) {
-                    print_result(&result, format)?;
-                }
+            let mut symbol_results: Vec<SymbolResult<'_>> = results
+                .iter()
+                .filter_map(|r| symbol_result(r, name, index))
+                .collect();
+            stamp_freshness(&mut symbol_results, freshness_code);
+            for result in &symbol_results {
+                print_result(result, format)?;
             }
         }
     }
@@ -5425,6 +6159,7 @@ fn query_symbol_at(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     // The ambiguity check is repository-scoped: a prefix that collides only
     // across the repository boundary is unambiguous within the selected repo.
@@ -5464,7 +6199,8 @@ fn query_symbol_at(
             std::process::exit(2);
         }
         Some(record) => {
-            if let Some(result) = symbol_result(record, name, index) {
+            if let Some(mut result) = symbol_result(record, name, index) {
+                stamp_freshness(std::slice::from_mut(&mut result), freshness_code);
                 print_result(&result, format)?;
             }
         }
@@ -5516,6 +6252,7 @@ fn query_file(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
 
@@ -5580,6 +6317,7 @@ fn query_file(
             git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
             repository_id,
             repository: repository_id.and_then(|repo| index.display_of(repo)),
+            freshness: None,
         });
     }
 
@@ -5599,6 +6337,7 @@ fn query_file(
     }
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
+    stamp_freshness(&mut results, freshness_code);
     for result in &results {
         print_result(result, format)?;
     }
@@ -5779,7 +6518,11 @@ fn build_context_sections<'a>(ctx: &'a query::SymbolContext<'a>) -> ContextSecti
     }
 }
 
-fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
+fn query_context_cmd(
+    records: &[GraphRecord],
+    symbol_name: &str,
+    freshness: Option<(String, &'static str)>,
+) -> Result<()> {
     let ctx = query::symbol_context(records, symbol_name);
 
     if ctx.is_no_match() {
@@ -5795,9 +6538,26 @@ fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
     }
 
     let sections = build_context_sections(&ctx);
+
+    // Attach the freshness verdict only when every source fact belongs to the
+    // repository the verdict was computed for (PR #186): `query context` has no
+    // repository selector, so in a multi-repo store the same symbol can collect
+    // facts from several repositories — presenting one checkout's verdict across
+    // all of them would be misleading. Omit it when the response spans repos.
+    let freshness_code = freshness.and_then(|(owner_id, code)| {
+        let index = query::RepositoryIndex::build(records);
+        let owners: std::collections::BTreeSet<Option<&str>> = ctx
+            .source_facts
+            .iter()
+            .map(|record| index.owner_of(record.id()))
+            .collect();
+        (owners.len() == 1 && owners.contains(&Some(owner_id.as_str()))).then_some(code)
+    });
+
     let response = ContextResponse {
         ok: true,
         symbol_name,
+        freshness: freshness_code,
         source_facts: sections.source_facts,
         topology_edges: sections.topology_edges,
         observations: sections.observations,
@@ -7081,7 +7841,13 @@ impl PrintText for SymbolResult<'_> {
         let path = self.repo_relative_path.unwrap_or("(unknown)");
         let line = self.span.map_or(0, |s| s.start_line);
         let commit = self.git_commit.map_or(String::new(), |c| format!(" [{c}]"));
-        format!("{} ({}) @ {path}:{line}{commit}", self.name, self.kind)
+        let freshness = self
+            .freshness
+            .map_or(String::new(), |code| format!(" (freshness: {code})"));
+        format!(
+            "{} ({}) @ {path}:{line}{commit}{freshness}",
+            self.name, self.kind
+        )
     }
 }
 
