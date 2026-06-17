@@ -1813,3 +1813,94 @@ fn refresh_ignores_untracked_default_egregore_store_dir() {
         "a leftover in-tree .egregore store must not make a refreshed out-of-tree store stale_dirty: {report}"
     );
 }
+
+/// `LL1`: a tracked `.rs` file marked `assume-unchanged` hides its working-tree
+/// state from `git status`, so the dirty probe must conservatively report the
+/// tree dirty — otherwise a graph built from a full checkout could read `fresh`
+/// after the file is edited or removed.
+#[test]
+fn freshness_treats_assume_unchanged_rust_source_as_dirty() {
+    let fx = Fixture::committed();
+    fx.scan();
+    // After this, `git status` can no longer see edits/removal of src/lib.rs.
+    git(
+        fx.repo(),
+        ["update-index", "--assume-unchanged", "src/lib.rs"],
+    );
+
+    let report = fx.freshness_graph();
+    assert_eq!(
+        report["freshness"], "stale_dirty",
+        "an assume-unchanged tracked .rs file must make the probe conservatively dirty: {report}"
+    );
+}
+
+/// `LL1`: same conservative treatment for `skip-worktree`, the flag sparse
+/// checkout sets to keep files index-only.
+#[test]
+fn freshness_treats_skip_worktree_rust_source_as_dirty() {
+    let fx = Fixture::committed();
+    fx.scan();
+    git(fx.repo(), ["update-index", "--skip-worktree", "src/lib.rs"]);
+
+    let report = fx.freshness_graph();
+    assert_eq!(
+        report["freshness"], "stale_dirty",
+        "a skip-worktree tracked .rs file must make the probe conservatively dirty: {report}"
+    );
+}
+
+/// `LL1`: the index-flag check is scoped to `.rs` files (the only files the
+/// scanner indexes), so an `assume-unchanged` non-source file must not flip the
+/// verdict to dirty.
+#[test]
+fn freshness_ignores_assume_unchanged_non_rust_file() {
+    let fx = Fixture::committed();
+    // A tracked non-source file, committed before the scan stamps the snapshot.
+    std::fs::write(fx.repo().join("README.md"), "docs\n").unwrap();
+    commit_all(fx.repo(), "add readme");
+    fx.scan();
+    git(
+        fx.repo(),
+        ["update-index", "--assume-unchanged", "README.md"],
+    );
+
+    let report = fx.freshness_graph();
+    assert_eq!(
+        report["freshness"], "fresh",
+        "assume-unchanged on a non-.rs file must not affect freshness: {report}"
+    );
+}
+
+/// NN1: a `query symbol --repo-path` against a `scan-history` graph must carry a
+/// freshness verdict.  History File/Symbol rows have no repository ownership in
+/// the topology the index uses, so the verdict is stamped via the unambiguous
+/// single-repo path rather than left absent.
+#[test]
+fn query_symbol_repo_path_stamps_freshness_on_history_graph() {
+    let fx = Fixture::committed();
+    let history_graph = fx.work.path().join("history.graph.jsonl");
+    eg().args(["scan-history"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&history_graph)
+        .assert()
+        .success();
+
+    let out = eg()
+        .args(["query", "symbol", "hello"])
+        .arg("--graph")
+        .arg(&history_graph)
+        .arg("--repo-path")
+        .arg(fx.repo())
+        .args(["--format", "json"])
+        .assert()
+        .success();
+    let line = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let row: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+    assert!(
+        row.get("freshness").is_some(),
+        "history-graph query rows must carry a freshness verdict in a single-repo store: {row}"
+    );
+    assert_eq!(row["freshness"], "fresh");
+}
