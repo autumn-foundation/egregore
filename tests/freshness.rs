@@ -1904,3 +1904,79 @@ fn query_symbol_repo_path_stamps_freshness_on_history_graph() {
     );
     assert_eq!(row["freshness"], "fresh");
 }
+
+/// `KK1`: a `.rs` file ignored only by the clone-local `.git/info/exclude` must
+/// still be indexed, while one ignored by a versioned `.gitignore` is dropped.
+/// `info/exclude` is not shared across clones, so honoring it would make the
+/// same worktree produce different graphs in different checkouts.
+#[test]
+fn scanner_indexes_rust_file_ignored_only_by_info_exclude() {
+    let fx = Fixture::committed();
+    std::fs::write(fx.repo().join(".gitignore"), "ignored_versioned.rs\n").unwrap();
+    std::fs::write(
+        fx.repo().join(".git").join("info").join("exclude"),
+        "ignored_local.rs\n",
+    )
+    .unwrap();
+    commit_all(fx.repo(), "add gitignore");
+    std::fs::write(
+        fx.repo().join("src").join("ignored_versioned.rs"),
+        "pub fn sym_versioned() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fx.repo().join("src").join("ignored_local.rs"),
+        "pub fn sym_localonly() {}\n",
+    )
+    .unwrap();
+
+    let out_graph = fx.work.path().join("graph.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&out_graph)
+        .assert()
+        .success();
+    let jsonl = std::fs::read_to_string(&out_graph).unwrap();
+    assert!(
+        !jsonl.contains("sym_versioned"),
+        "a file ignored by versioned .gitignore must still be dropped: {jsonl}"
+    );
+    assert!(
+        jsonl.contains("sym_localonly"),
+        "a file ignored only by .git/info/exclude must still be indexed (clone-local excludes must not change scans): {jsonl}"
+    );
+}
+
+/// `KK1`: a directory ignored only by `.git/info/exclude` must still be
+/// traversed and indexed — the traversal-pruning pass must honor only versioned
+/// `.gitignore`.
+#[test]
+fn scanner_indexes_directory_ignored_only_by_info_exclude() {
+    let fx = Fixture::committed();
+    std::fs::create_dir_all(fx.repo().join("localdir")).unwrap();
+    std::fs::write(
+        fx.repo().join("localdir").join("mod.rs"),
+        "pub fn in_local_dir() {}\n",
+    )
+    .unwrap();
+    // Ignored only via clone-local info/exclude (no versioned .gitignore entry).
+    std::fs::write(
+        fx.repo().join(".git").join("info").join("exclude"),
+        "localdir/\n",
+    )
+    .unwrap();
+
+    let out_graph = fx.work.path().join("graph.jsonl");
+    eg().args(["scan"])
+        .arg(fx.repo())
+        .arg("--out")
+        .arg(&out_graph)
+        .assert()
+        .success();
+    let jsonl = std::fs::read_to_string(&out_graph).unwrap();
+    assert!(
+        jsonl.contains("in_local_dir"),
+        "a directory ignored only by .git/info/exclude must still be traversed and indexed: {jsonl}"
+    );
+}

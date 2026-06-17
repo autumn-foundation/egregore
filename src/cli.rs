@@ -2150,23 +2150,17 @@ fn dir_has_rust_sources(dir: &Path) -> bool {
 /// checkout the code was computed for (issue #82). Rows owned by a different
 /// repository (multi-repo stores) are left unstamped rather than mislabeled.
 ///
-/// `single_repo` is `true` when the store holds exactly one repository. History
-/// (`scan-history`) source rows carry no repository ownership in the topology the
-/// index uses, so `repository_id` is `None`; when the store is single-repo the
-/// verdict is unambiguous and is stamped on those rows too, matching the
-/// sole-stamped freshness fallback (PR #186 follow-up NN1).
-fn stamp_freshness(
-    results: &mut [SymbolResult<'_>],
-    freshness: Option<&(String, &'static str)>,
-    single_repo: bool,
-) {
+/// History (`scan-history`) source rows are attributed to their repository the
+/// same way `scan` rows are: replay emits `Repository CONTAINS File` and
+/// `File DEFINES Symbol` edges per commit, so `RepositoryIndex::owner_of`
+/// resolves them and the verdict attaches via the normal ownership match
+/// (verified by `query_symbol_repo_path_stamps_freshness_on_history_graph`).
+fn stamp_freshness(results: &mut [SymbolResult<'_>], freshness: Option<&(String, &'static str)>) {
     let Some((repo_id, code)) = freshness else {
         return;
     };
     for result in results.iter_mut() {
-        let owned_match = result.repository_id == Some(repo_id.as_str());
-        let unambiguous_unowned = result.repository_id.is_none() && single_repo;
-        if owned_match || unambiguous_unowned {
+        if result.repository_id == Some(repo_id.as_str()) {
             result.freshness = Some(code);
         }
     }
@@ -5617,11 +5611,7 @@ fn query_symbol_all(
     }
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
-    stamp_freshness(
-        &mut results,
-        freshness_code,
-        index.repository_ids().len() == 1,
-    );
+    stamp_freshness(&mut results, freshness_code);
     for result in &results {
         print_result(result, format)?;
     }
@@ -5701,11 +5691,7 @@ fn query_symbol_as_of(
                 .iter()
                 .filter_map(|r| symbol_result(r, name, index))
                 .collect();
-            stamp_freshness(
-                &mut symbol_results,
-                freshness_code,
-                index.repository_ids().len() == 1,
-            );
+            stamp_freshness(&mut symbol_results, freshness_code);
             for result in &symbol_results {
                 print_result(result, format)?;
             }
@@ -6089,11 +6075,7 @@ fn query_symbol_at(
         }
         Some(record) => {
             if let Some(mut result) = symbol_result(record, name, index) {
-                stamp_freshness(
-                    std::slice::from_mut(&mut result),
-                    freshness_code,
-                    index.repository_ids().len() == 1,
-                );
+                stamp_freshness(std::slice::from_mut(&mut result), freshness_code);
                 print_result(&result, format)?;
             }
         }
@@ -6230,11 +6212,7 @@ fn query_file(
     }
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
-    stamp_freshness(
-        &mut results,
-        freshness_code,
-        index.repository_ids().len() == 1,
-    );
+    stamp_freshness(&mut results, freshness_code);
     for result in &results {
         print_result(result, format)?;
     }
