@@ -84,6 +84,33 @@ fn query_semantic_missing_data_dir_exits_1_without_creating_store() {
     );
 }
 
+#[cfg(all(feature = "embedded-aletheiadb", feature = "embeddings"))]
+#[test]
+fn query_semantic_context_missing_data_dir_exits_1_without_creating_store() {
+    // Mirrors the `query semantic` contract: a missing store is reported before
+    // the embedding model is loaded, and the read-only workflow never creates a
+    // store as a side effect of a typo'd path (AC9 read-only).
+    let temp = tempfile::tempdir().expect("temp dir");
+    let missing = temp.path().join("semantic-context-typo-store");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .args(["query", "semantic-context", "anything", "--data-dir"])
+        .arg(&missing)
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(
+            predicate::str::contains("embedded store not found")
+                .and(predicate::str::contains("ingest")),
+        );
+
+    assert!(
+        !missing.exists(),
+        "semantic-context query must not create a missing --data-dir"
+    );
+}
+
 fn fixture_graph_with_temporal_symbols() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("temp dir");
     let path = temp.path().join("history.jsonl");

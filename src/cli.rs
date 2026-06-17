@@ -582,6 +582,38 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Answer a natural-language query with evidence-backed context for the
+    /// top-N semantic matches in one call (issue #90).
+    ///
+    /// Bridges semantic discovery and the symbol-context lane: it embeds the
+    /// query locally, ranks matches against the embedded store, then returns —
+    /// per match — the stable record ID, repo-relative file/span handle, the
+    /// relevance score, and the same five trust-separated context sections
+    /// produced by `eg query context`. File-typed matches are first-class
+    /// (their defined symbols are seeded); an ambiguous symbol name reports all
+    /// candidate record IDs instead of silently picking one.
+    ///
+    /// Read-only and deterministic. On no semantic hit clearing `--min-score`:
+    /// emits `{"ok":false,"error":{"code":"no_match",...}}` to stdout and exits
+    /// with code 2. Documented in `docs/cli/semantic-search-guidance.md`.
+    #[cfg(feature = "embeddings")]
+    SemanticContext {
+        /// Natural-language query text.
+        query: String,
+        /// Embedded `AletheiaDB` data directory (must be ingested with `--embed`).
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum number of matches to expand (bounded; safe default 5).
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Relevance floor in `[0.0, 1.0]`; matches scoring below it are
+        /// dropped, and an all-below result is a no-match (default 0.0).
+        #[arg(long, default_value_t = 0.0)]
+        min_score: f32,
+    },
     /// Recall prior agent memory by meaning (issue #91).
     ///
     /// Returns agent-authored observations, decisions, and failures ranked by
@@ -2626,6 +2658,58 @@ struct SubsystemResponse<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// semantic → context bridge (issue #90)
+// ---------------------------------------------------------------------------
+
+/// One semantic match expanded into evidence-backed context.
+///
+/// Carries the retrieval-lead handle (record ID, repo-relative path, span,
+/// score, repository identity) and the same five trust-separated context
+/// sections produced by `eg query context`. `match_kind` documents whether the
+/// match anchored on a `symbol`, a `file` (its defined symbols are seeded into
+/// `source_facts`), or some `other` node. When `ambiguous` is true the match
+/// name resolved to more than one live symbol and `candidate_record_ids` lists
+/// every candidate instead of silently picking one.
+#[cfg(feature = "embeddings")]
+#[derive(Serialize)]
+struct SemanticContextMatch<'a> {
+    record_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+    score: f32,
+    match_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
+    ambiguous: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    candidate_record_ids: Vec<&'a str>,
+    source_facts: Vec<ContextSourceFact<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    topology_edges: Vec<ContextTopologyEdge<'a>>,
+    observations: Vec<ContextObservation<'a>>,
+    project_state: Vec<ContextLinkedItem<'a>>,
+    artifacts: Vec<ContextLinkedItem<'a>>,
+    verification_evidence: Vec<ContextLinkedItem<'a>>,
+    unresolved: Vec<ContextUnresolved<'a>>,
+}
+
+/// Full `eg query semantic-context` response envelope.
+#[cfg(feature = "embeddings")]
+#[derive(Serialize)]
+struct SemanticContextResponse<'a> {
+    ok: bool,
+    query: &'a str,
+    min_score: f32,
+    matches: Vec<SemanticContextMatch<'a>>,
+}
+
+// ---------------------------------------------------------------------------
 // memory evidence audit (issue #64)
 // ---------------------------------------------------------------------------
 
@@ -3009,6 +3093,14 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 query_semantic(&query, &data_dir, limit, repo.as_deref(), format)
             }
         }
+        #[cfg(feature = "embeddings")]
+        QuerySubcommand::SemanticContext {
+            query,
+            data_dir,
+            repo,
+            limit,
+            min_score,
+        } => query_semantic_context(&query, &data_dir, limit, min_score, repo.as_deref()),
         #[cfg(feature = "embeddings")]
         QuerySubcommand::SemanticMemory {
             query,
@@ -3924,9 +4016,7 @@ fn query_semantic_memory(
         // above guarantees it is among `owners`), so a memory citing code in
         // several repositories is never misattributed to a different one than the
         // user selected; otherwise fall back to the first owner deterministically.
-        let repository_id = selected
-            .as_deref()
-            .or_else(|| owners.first().copied());
+        let repository_id = selected.as_deref().or_else(|| owners.first().copied());
         rows.push(MemoryRecallResult {
             record_id: record.id(),
             kind: record.node_kind_name().unwrap_or("Observation"),
@@ -4032,6 +4122,147 @@ fn print_daemon_semantic_record(rec: &serde_json::Value, format: OutputFormat) -
             println!("{record_id} score={score:.4} @ {location}");
         }
     }
+    Ok(())
+}
+
+/// Natural-language query → evidence-backed context for the top-N semantic
+/// matches, in a single read-only call (issue #90).
+///
+/// Embeds the query locally, ranks matches against the embedded store, then —
+/// for each match clearing `min_score` — resolves the same trust-separated
+/// context sections as `eg query context`, anchored on the match's record ID so
+/// File-typed matches are first-class. A no-match (no hit clears the floor)
+/// emits a stable diagnostic to stdout and exits 2.
+#[cfg(feature = "embeddings")]
+fn query_semantic_context(
+    query: &str,
+    data_dir: &Path,
+    limit: usize,
+    min_score: f32,
+    repo: Option<&str>,
+) -> Result<()> {
+    validate_existing_embedded_store(data_dir)?;
+
+    let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+        .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+
+    let records = sink
+        .read_all_records()
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+    let index = query::RepositoryIndex::build(&records);
+    let selected = resolve_repo_scope(&index, repo);
+
+    let query_vector = embed_query_text(query)?;
+
+    // Over-fetch the whole index, not just `limit` raw hits: the shared vector
+    // index also embeds agent-memory nodes (issue #91), so a query whose top
+    // `limit` raw matches are memory would otherwise drop the code hits ranked
+    // just behind them. Fetch the full pool so the code-kind filter below
+    // recovers those code hits; the limit then bounds the filtered set.
+    let fetch = records.len().max(limit);
+    let mut matches = sink
+        .semantic_search(&query_vector, fetch)
+        .with_context(|| "semantic search failed — was the store ingested with --embed?")?;
+    // `semantic-context` is a code-context bridge: never expand agent-authored
+    // memory hits (issue #91). Mirror `query semantic` and keep only
+    // deterministic code kinds before building leads.
+    matches.retain(|m| {
+        m.kind
+            .as_deref()
+            .is_some_and(|k| k == "File" || k == "Symbol")
+    });
+    if let Some(repo) = selected.as_deref() {
+        matches.retain(|m| index.owner_of(&m.record_id) == Some(repo));
+    }
+    // Canonical ordering before truncation: equal-score ANN results can be
+    // returned in arbitrary order, so sort by score descending then record ID
+    // ascending so repeated runs choose the same rows at the `limit` boundary
+    // and emit byte-identical output.
+    matches.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.record_id.cmp(&b.record_id))
+    });
+    matches.truncate(limit);
+
+    let leads: Vec<query::SemanticLead> = matches
+        .iter()
+        .map(|m| query::SemanticLead {
+            record_id: m.record_id.clone(),
+            name: m.name.clone(),
+            repo_relative_path: m.repo_relative_path.clone(),
+            score: m.score,
+            span: m.span,
+        })
+        .collect();
+
+    // Scope the record slice for context expansion when a repo is selected so
+    // that ambiguity detection (candidate_record_ids) and the path-based file
+    // fallback in record_context don't return IDs from other repos. Cross-
+    // domain records (observations, artifacts, verification) are unowned and
+    // always kept so that context sections remain fully populated.
+    let records: Vec<GraphRecord> = if let Some(repo) = selected.as_deref() {
+        records
+            .into_iter()
+            .filter(|r| index.owner_of(r.id()).is_none_or(|o| o == repo))
+            .collect()
+    } else {
+        records
+    };
+
+    let bundle = query::semantic_context_bundle(&records, &leads, min_score);
+
+    if bundle.is_no_match() {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "no_match",
+                "query": query,
+                "min_score": min_score,
+            }
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(2);
+    }
+
+    let match_rows: Vec<SemanticContextMatch<'_>> = bundle
+        .matches
+        .iter()
+        .map(|m| {
+            let sections = build_context_sections(&m.context);
+            let repository_id = index.owner_of(&m.lead.record_id);
+            SemanticContextMatch {
+                record_id: &m.lead.record_id,
+                name: m.lead.name.as_deref(),
+                repo_relative_path: m.lead.repo_relative_path.as_deref(),
+                span: m.lead.span,
+                score: m.lead.score,
+                match_kind: m.anchor_kind.as_str(),
+                repository_id,
+                repository: repository_id.and_then(|id| index.display_of(id)),
+                ambiguous: !m.candidate_record_ids.is_empty(),
+                candidate_record_ids: m.candidate_record_ids.iter().map(String::as_str).collect(),
+                source_facts: sections.source_facts,
+                topology_edges: sections.topology_edges,
+                observations: sections.observations,
+                project_state: sections.project_state,
+                artifacts: sections.artifacts,
+                verification_evidence: sections.verification_evidence,
+                unresolved: sections.unresolved,
+            }
+        })
+        .collect();
+
+    let response = SemanticContextResponse {
+        ok: true,
+        query,
+        min_score,
+        matches: match_rows,
+    };
+
+    let output =
+        serde_json::to_string_pretty(&response).context("failed to serialize semantic context")?;
+    println!("{output}");
     Ok(())
 }
 
@@ -5454,6 +5685,100 @@ fn query_drift(
 // query context (issue #38)
 // ---------------------------------------------------------------------------
 
+/// The five trust-separated context sections (plus topology edges and
+/// unresolved references) rendered from a [`query::SymbolContext`].
+///
+/// Shared by `eg query context` and `eg query semantic-context` so both emit
+/// byte-identical section shapes from the same builders.
+struct ContextSections<'a> {
+    source_facts: Vec<ContextSourceFact<'a>>,
+    topology_edges: Vec<ContextTopologyEdge<'a>>,
+    observations: Vec<ContextObservation<'a>>,
+    project_state: Vec<ContextLinkedItem<'a>>,
+    artifacts: Vec<ContextLinkedItem<'a>>,
+    verification_evidence: Vec<ContextLinkedItem<'a>>,
+    unresolved: Vec<ContextUnresolved<'a>>,
+}
+
+/// Renders a resolved [`query::SymbolContext`] into the serializable section
+/// views, reusing the existing per-record builders (`context_source_fact`,
+/// `context_observation`, `context_linked_item`). `.copied()` collapses the
+/// `&&GraphRecord` from `iter()` so each view borrows the record slice directly.
+fn build_context_sections<'a>(ctx: &'a query::SymbolContext<'a>) -> ContextSections<'a> {
+    ContextSections {
+        source_facts: ctx
+            .source_facts
+            .iter()
+            .copied()
+            .filter_map(context_source_fact)
+            .collect(),
+        topology_edges: ctx
+            .topology_edges
+            .iter()
+            .copied()
+            .filter_map(|r| {
+                if let GraphRecord::Edge {
+                    id,
+                    label,
+                    source,
+                    target,
+                    summary,
+                    temporal,
+                    ..
+                } = r
+                {
+                    Some(ContextTopologyEdge {
+                        record_id: id,
+                        label: label.as_str(),
+                        source_id: source,
+                        target_id: target,
+                        summary,
+                        git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+                        valid_time: temporal.as_ref().map(|t| t.valid_time.as_str()),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        observations: ctx
+            .observations
+            .iter()
+            .copied()
+            .filter_map(context_observation)
+            .collect(),
+        project_state: ctx
+            .project_state
+            .iter()
+            .copied()
+            .filter_map(context_linked_item)
+            .collect(),
+        artifacts: ctx
+            .artifacts
+            .iter()
+            .copied()
+            .filter_map(context_linked_item)
+            .collect(),
+        verification_evidence: ctx
+            .verification_evidence
+            .iter()
+            .copied()
+            .filter_map(context_linked_item)
+            .collect(),
+        unresolved: ctx
+            .unresolved
+            .iter()
+            .map(|u| ContextUnresolved {
+                source_record_id: &u.source_record_id,
+                target_handle: &u.target_handle,
+                relation: &u.relation,
+                target_domain: &u.target_domain,
+                verification_status: "unresolved",
+            })
+            .collect(),
+    }
+}
+
 fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
     let ctx = query::symbol_context(records, symbol_name);
 
@@ -5469,87 +5794,17 @@ fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
         std::process::exit(2);
     }
 
-    let source_facts: Vec<ContextSourceFact<'_>> = ctx
-        .source_facts
-        .iter()
-        .filter_map(|r| context_source_fact(r))
-        .collect();
-
-    let observations: Vec<ContextObservation<'_>> = ctx
-        .observations
-        .iter()
-        .filter_map(|r| context_observation(r))
-        .collect();
-
-    let project_state: Vec<ContextLinkedItem<'_>> = ctx
-        .project_state
-        .iter()
-        .filter_map(|r| context_linked_item(r))
-        .collect();
-
-    let artifacts: Vec<ContextLinkedItem<'_>> = ctx
-        .artifacts
-        .iter()
-        .filter_map(|r| context_linked_item(r))
-        .collect();
-
-    let verification_evidence: Vec<ContextLinkedItem<'_>> = ctx
-        .verification_evidence
-        .iter()
-        .filter_map(|r| context_linked_item(r))
-        .collect();
-
-    let unresolved: Vec<ContextUnresolved<'_>> = ctx
-        .unresolved
-        .iter()
-        .map(|u| ContextUnresolved {
-            source_record_id: &u.source_record_id,
-            target_handle: &u.target_handle,
-            relation: &u.relation,
-            target_domain: &u.target_domain,
-            verification_status: "unresolved",
-        })
-        .collect();
-
-    let topology_edges: Vec<ContextTopologyEdge<'_>> = ctx
-        .topology_edges
-        .iter()
-        .filter_map(|r| {
-            if let GraphRecord::Edge {
-                id,
-                label,
-                source,
-                target,
-                summary,
-                temporal,
-                ..
-            } = r
-            {
-                Some(ContextTopologyEdge {
-                    record_id: id,
-                    label: label.as_str(),
-                    source_id: source,
-                    target_id: target,
-                    summary,
-                    git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
-                    valid_time: temporal.as_ref().map(|t| t.valid_time.as_str()),
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
-
+    let sections = build_context_sections(&ctx);
     let response = ContextResponse {
         ok: true,
         symbol_name,
-        source_facts,
-        topology_edges,
-        observations,
-        project_state,
-        artifacts,
-        verification_evidence,
-        unresolved,
+        source_facts: sections.source_facts,
+        topology_edges: sections.topology_edges,
+        observations: sections.observations,
+        project_state: sections.project_state,
+        artifacts: sections.artifacts,
+        verification_evidence: sections.verification_evidence,
+        unresolved: sections.unresolved,
     };
 
     let output = serde_json::to_string_pretty(&response).context("failed to serialize context")?;

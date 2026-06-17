@@ -4420,3 +4420,478 @@ fn subsystem_context_ordering_is_deterministic() {
         "observations ordering must be deterministic (AC7)"
     );
 }
+
+// ── record_context + semantic_context_bundle (issue #90) ─────────────────────
+
+use aletheia_egregore::ir::{ARTIFACT_SCHEMA_VERSION, artifact_stable_id, stable_id};
+use aletheia_egregore::query::{AnchorKind, SemanticLead, record_context, semantic_context_bundle};
+
+/// Build a File node and return its stable id alongside the record.
+fn ctx_file(path: &str) -> (String, GraphRecord) {
+    let file_id = stable_id(&["file", path]);
+    let file = GraphRecord::node(
+        file_id.clone(),
+        NodeKind::File,
+        Some(path.to_owned()),
+        None,
+        None,
+        path.to_owned(),
+    );
+    (file_id, file)
+}
+
+/// Build a DEFINES edge (source defines target).
+fn ctx_defines(source_id: &str, target_id: &str) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::Defines,
+        source_id.to_owned(),
+        target_id.to_owned(),
+        None,
+        "defines".to_owned(),
+    )
+}
+
+/// Build a CONTAINS edge (source contains target — used for file→module).
+fn ctx_contains(source_id: &str, target_id: &str) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::Contains,
+        source_id.to_owned(),
+        target_id.to_owned(),
+        None,
+        "contains".to_owned(),
+    )
+}
+
+/// Build an Artifact node linked to a symbol via an evidence link.
+fn ctx_artifact(id: &str, symbol_id: &str) -> GraphRecord {
+    let mut record = GraphRecord::node(
+        artifact_stable_id(&["artifact", id]),
+        NodeKind::Artifact,
+        None,
+        None,
+        None,
+        format!("Artifact {id}"),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = record
+    {
+        *schema_version = ARTIFACT_SCHEMA_VERSION;
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(symbol_id.to_owned()),
+            target_domain: "codegraph".to_owned(),
+            relation: "RELATES_TO".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+    record
+}
+
+/// A fixture with one file, the symbol it defines, plus an observation, task,
+/// verification, and artifact all linked to that symbol.
+fn bridge_fixture() -> (Vec<GraphRecord>, String, String) {
+    let sym_id = "codegraph:v4:bridge_sym001".to_owned();
+    let sym = ctx_symbol(&sym_id, "compute_answer", "src/calc.rs", 10);
+    let (file_id, file) = ctx_file("src/calc.rs");
+    let defines = ctx_defines(&file_id, &sym_id);
+    let obs = ctx_observation(
+        "bobs1",
+        "compute_answer needs doc",
+        &sym_id,
+        "MENTIONS_SYMBOL",
+        "0.9",
+    );
+    let task = ctx_task("btask1", "Document compute_answer", &sym_id);
+    let verification = ctx_verification("bver1", &sym_id);
+    let artifact = ctx_artifact("bart1", &sym_id);
+    let records = vec![sym, file, defines, obs, task, verification, artifact];
+    (records, sym_id, file_id)
+}
+
+fn symbol_lead(record_id: &str, name: &str, score: f32) -> SemanticLead {
+    SemanticLead {
+        record_id: record_id.to_owned(),
+        name: Some(name.to_owned()),
+        repo_relative_path: Some("src/calc.rs".to_owned()),
+        score,
+        span: Some(span(10, 15)),
+    }
+}
+
+#[test]
+fn record_context_symbol_anchor_returns_all_sections() {
+    let (records, sym_id, file_id) = bridge_fixture();
+    let ctx = record_context(&records, &sym_id);
+
+    assert!(!ctx.is_no_match(), "symbol anchor must resolve context");
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == sym_id),
+        "anchor symbol must be in source_facts"
+    );
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == file_id),
+        "co-located file (via DEFINES) must be in source_facts"
+    );
+    assert!(
+        !ctx.observations.is_empty(),
+        "linked observation must appear"
+    );
+    assert!(!ctx.project_state.is_empty(), "linked task must appear");
+    assert!(
+        !ctx.verification_evidence.is_empty(),
+        "linked verification must appear"
+    );
+    assert!(!ctx.artifacts.is_empty(), "linked artifact must appear");
+}
+
+#[test]
+fn record_context_file_anchor_includes_defined_symbols_and_context() {
+    // AC3: a File-typed match is first-class — its defined symbols and the
+    // context attached to them are returned, not dropped or errored.
+    let (records, sym_id, file_id) = bridge_fixture();
+    let ctx = record_context(&records, &file_id);
+
+    assert!(!ctx.is_no_match(), "file anchor must resolve context");
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == file_id),
+        "anchor file must be in source_facts"
+    );
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == sym_id),
+        "symbol DEFINED by the file must be seeded into source_facts"
+    );
+    assert!(
+        !ctx.observations.is_empty(),
+        "observation on the defined symbol must be reachable from a file anchor"
+    );
+    assert!(
+        !ctx.verification_evidence.is_empty(),
+        "verification on the defined symbol must be reachable from a file anchor"
+    );
+}
+
+#[test]
+fn record_context_file_anchor_traverses_contains_and_defines() {
+    // The Rust extractor emits File → CONTAINS → Module and
+    // Module → DEFINES → Symbol. The BFS must follow both edge types to reach
+    // module-nested symbols, and the Module itself (NodeKind::Module, a
+    // SourceFact) must appear in source_facts alongside its defined symbols.
+    let file_path = "src/lib.rs";
+    let (file_id, file) = ctx_file(file_path);
+
+    // Module node (NodeKind::Module, not Symbol) — extractor uses CONTAINS
+    let module_id = "codegraph:v4:module-m001".to_owned();
+    let module_node = GraphRecord::node(
+        module_id.clone(),
+        NodeKind::Module,
+        Some(file_path.to_owned()),
+        None,
+        Some("my_module".to_owned()),
+        "Rust module my_module".to_owned(),
+    );
+    let file_contains_module = ctx_contains(&file_id, &module_id);
+
+    // Symbol inside the module — extractor uses Module → DEFINES → Symbol
+    let nested_id = "codegraph:v4:sym-nested001".to_owned();
+    let nested = ctx_symbol(&nested_id, "my_module::nested_fn", file_path, 5);
+    let module_defines_nested = ctx_defines(&module_id, &nested_id);
+
+    // Symbol at top level — extractor uses File → DEFINES → Symbol
+    let top_id = "codegraph:v4:sym-top001".to_owned();
+    let top = ctx_symbol(&top_id, "top_fn", file_path, 1);
+    let file_defines_top = ctx_defines(&file_id, &top_id);
+
+    let records = vec![
+        file,
+        module_node,
+        file_contains_module,
+        nested,
+        module_defines_nested,
+        top,
+        file_defines_top,
+    ];
+
+    let ctx = record_context(&records, &file_id);
+
+    assert!(!ctx.is_no_match(), "file anchor must resolve context");
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == module_id),
+        "Module node (via CONTAINS) must be in source_facts"
+    );
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == nested_id),
+        "module-nested symbol (Module → DEFINES) must be in source_facts"
+    );
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == top_id),
+        "top-level symbol (File → DEFINES) must be in source_facts"
+    );
+}
+
+#[test]
+fn record_context_file_anchor_seeds_imports_via_imports_edge() {
+    // The Rust extractor emits use-declarations as Import nodes linked by
+    // EdgeLabel::Imports (owner → IMPORTS → Import). A File semantic anchor must
+    // follow IMPORTS so import source facts (and anything attached to them) are
+    // reachable, not just DEFINES/CONTAINS targets.
+    let file_path = "src/lib.rs";
+    let (file_id, file) = ctx_file(file_path);
+
+    let import_id = "codegraph:v4:import-i001".to_owned();
+    let import_node = GraphRecord::node(
+        import_id.clone(),
+        NodeKind::Import,
+        Some(file_path.to_owned()),
+        None,
+        Some("std::collections::BTreeMap".to_owned()),
+        "Rust import std::collections::BTreeMap".to_owned(),
+    );
+    let file_imports = GraphRecord::edge(
+        EdgeLabel::Imports,
+        file_id.clone(),
+        import_id.clone(),
+        None,
+        "imports".to_owned(),
+    );
+
+    let records = vec![file, import_node, file_imports];
+
+    let ctx = record_context(&records, &file_id);
+
+    assert!(!ctx.is_no_match(), "file anchor must resolve context");
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == import_id),
+        "Import node (via IMPORTS) must be seeded into source_facts"
+    );
+}
+
+#[test]
+fn record_context_symbol_anchor_finds_file_via_module_contains_chain() {
+    // When a symbol is nested inside a module (File → CONTAINS → Module →
+    // DEFINES → Symbol), the Symbol anchor must still find the owning File via
+    // the backward-BFS through DEFINES + CONTAINS edges rather than a path
+    // fallback that would bleed in same-path files from other repos.
+    let file_path = "src/lib.rs";
+    let (file_id, file) = ctx_file(file_path);
+
+    let module_id = "codegraph:v4:module-m002".to_owned();
+    let module_node = GraphRecord::node(
+        module_id.clone(),
+        NodeKind::Module,
+        Some(file_path.to_owned()),
+        None,
+        Some("inner".to_owned()),
+        "Rust module inner".to_owned(),
+    );
+    let file_contains_module = ctx_contains(&file_id, &module_id);
+
+    let nested_id = "codegraph:v4:sym-nested002".to_owned();
+    let nested = ctx_symbol(&nested_id, "inner::nested_fn", file_path, 5);
+    // Only edge to the symbol is from the module, NOT from the file
+    let module_defines_nested = ctx_defines(&module_id, &nested_id);
+
+    let records = vec![
+        file,
+        module_node,
+        file_contains_module,
+        nested,
+        module_defines_nested,
+    ];
+
+    let ctx = record_context(&records, &nested_id);
+
+    assert!(
+        !ctx.is_no_match(),
+        "nested symbol anchor must resolve context"
+    );
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == nested_id),
+        "anchor symbol must be in source_facts"
+    );
+    assert!(
+        ctx.source_facts.iter().any(|r| r.id() == file_id),
+        "owning File must be seeded via backward BFS (File → CONTAINS → Module → DEFINES → Symbol)"
+    );
+}
+
+#[test]
+fn record_context_absent_anchor_is_no_match() {
+    let (records, _sym_id, _file_id) = bridge_fixture();
+    let ctx = record_context(&records, "codegraph:v4:does_not_exist");
+    assert!(ctx.is_no_match(), "absent anchor must be a no-match");
+}
+
+#[test]
+fn record_context_tombstoned_current_anchor_is_no_match() {
+    let (mut records, sym_id, _file_id) = bridge_fixture();
+    records.push(GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &sym_id]),
+        schema_version: aletheia_egregore::ir::SCHEMA_VERSION,
+        deleted_id: sym_id.clone(),
+        summary: "deleted".to_owned(),
+        producer: None,
+    });
+    let ctx = record_context(&records, &sym_id);
+    assert!(
+        ctx.is_no_match(),
+        "tombstoned current-state anchor must be a no-match"
+    );
+}
+
+#[test]
+fn semantic_context_bundle_expands_each_lead_with_context() {
+    // AC2: per match — record id + handle + score + the trust-separated sections.
+    let (records, sym_id, _file_id) = bridge_fixture();
+    let leads = vec![symbol_lead(&sym_id, "compute_answer", 0.9)];
+    let bundle = semantic_context_bundle(&records, &leads, 0.0);
+
+    assert!(!bundle.is_no_match());
+    assert_eq!(bundle.matches.len(), 1);
+    let m = &bundle.matches[0];
+    assert_eq!(m.lead.record_id, sym_id);
+    assert!((m.lead.score - 0.9).abs() < f32::EPSILON);
+    assert_eq!(m.anchor_kind, AnchorKind::Symbol);
+    assert!(
+        m.context.source_facts.iter().any(|r| r.id() == sym_id),
+        "match context must carry the source-facts section"
+    );
+    assert!(!m.context.observations.is_empty());
+}
+
+#[test]
+fn semantic_context_bundle_file_lead_is_first_class() {
+    // AC3: a File lead (no symbol name) is expanded, not dropped.
+    let (records, sym_id, file_id) = bridge_fixture();
+    let leads = vec![SemanticLead {
+        record_id: file_id,
+        name: None,
+        repo_relative_path: Some("src/calc.rs".to_owned()),
+        score: 0.8,
+        span: None,
+    }];
+    let bundle = semantic_context_bundle(&records, &leads, 0.0);
+
+    assert_eq!(bundle.matches.len(), 1, "file lead must not be dropped");
+    let m = &bundle.matches[0];
+    assert_eq!(m.anchor_kind, AnchorKind::File);
+    assert!(m.candidate_record_ids.is_empty(), "no name → no ambiguity");
+    assert!(
+        m.context.source_facts.iter().any(|r| r.id() == sym_id),
+        "file lead context must include its defined symbol"
+    );
+}
+
+#[test]
+fn semantic_context_bundle_below_floor_is_no_match() {
+    // AC7: no lead clears the relevance floor → distinct no-match (no empty success).
+    let (records, sym_id, _file_id) = bridge_fixture();
+    let leads = vec![symbol_lead(&sym_id, "compute_answer", 0.10)];
+    let bundle = semantic_context_bundle(&records, &leads, 0.50);
+    assert!(
+        bundle.is_no_match(),
+        "a lead below min_score must yield a no-match bundle"
+    );
+}
+
+#[test]
+fn semantic_context_bundle_surfaces_name_ambiguity() {
+    // AC4: a name resolving to >1 live symbol surfaces every candidate id.
+    let sym_a = "codegraph:v4:dup_a".to_owned();
+    let sym_b = "codegraph:v4:dup_b".to_owned();
+    let records = vec![
+        ctx_symbol(&sym_a, "dup", "src/a.rs", 1),
+        ctx_symbol(&sym_b, "dup", "src/b.rs", 1),
+    ];
+    let leads = vec![symbol_lead(&sym_a, "dup", 0.9)];
+    let bundle = semantic_context_bundle(&records, &leads, 0.0);
+
+    assert_eq!(bundle.matches.len(), 1);
+    let m = &bundle.matches[0];
+    assert_eq!(
+        m.candidate_record_ids,
+        vec![sym_a, sym_b],
+        "both same-named symbol ids must be surfaced, sorted, not silently picked"
+    );
+}
+
+#[test]
+fn semantic_context_bundle_observation_never_in_source_facts() {
+    // AC5: trust separation — agent-authored observations stay out of source facts.
+    let (records, sym_id, _file_id) = bridge_fixture();
+    let leads = vec![symbol_lead(&sym_id, "compute_answer", 0.9)];
+    let bundle = semantic_context_bundle(&records, &leads, 0.0);
+    let m = &bundle.matches[0];
+    for obs in &m.context.observations {
+        assert!(
+            !m.context.source_facts.iter().any(|sf| sf.id() == obs.id()),
+            "observation {} must not appear in source_facts",
+            obs.id()
+        );
+        let GraphRecord::Node {
+            agent_id,
+            observed_at,
+            confidence,
+            ..
+        } = obs
+        else {
+            panic!("observation must be a node");
+        };
+        assert!(
+            agent_id.is_some(),
+            "observation must carry agent provenance"
+        );
+        assert!(observed_at.is_some(), "observation must carry observed_at");
+        assert!(confidence.is_some(), "observation must carry confidence");
+    }
+}
+
+#[test]
+fn semantic_context_bundle_preserves_lead_order_and_is_deterministic() {
+    // AC9: deterministic — identical input yields identical match order and
+    // identical per-section record-id ordering across repeated runs.
+    let (records, sym_id, file_id) = bridge_fixture();
+    let leads = vec![
+        symbol_lead(&sym_id, "compute_answer", 0.9),
+        SemanticLead {
+            record_id: file_id.clone(),
+            name: None,
+            repo_relative_path: Some("src/calc.rs".to_owned()),
+            score: 0.7,
+            span: None,
+        },
+    ];
+
+    let project = || -> Vec<(String, Vec<String>)> {
+        let bundle = semantic_context_bundle(&records, &leads, 0.0);
+        bundle
+            .matches
+            .iter()
+            .map(|m| {
+                (
+                    m.lead.record_id.clone(),
+                    m.context
+                        .source_facts
+                        .iter()
+                        .map(|r| r.id().to_owned())
+                        .collect(),
+                )
+            })
+            .collect()
+    };
+
+    let first = project();
+    assert_eq!(
+        first.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+        vec![sym_id, file_id],
+        "matches must preserve the lead ranking order"
+    );
+    for _ in 0..5 {
+        assert_eq!(project(), first, "bundle output must be deterministic");
+    }
+}
