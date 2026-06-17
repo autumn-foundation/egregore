@@ -37,6 +37,10 @@ const SEMANTIC_MAX_CANDIDATE_MULTIPLIER: usize = 64;
 pub struct SemanticMatch {
     /// Stable codegraph record ID.
     pub record_id: String,
+    /// Node kind name (e.g. `File`, `Symbol`, `Observation`), enabling
+    /// trust-class separation between deterministic code hits and agent-authored
+    /// memory hits at query time (issue #91).
+    pub kind: Option<String>,
     /// Human-readable name when available.
     pub name: Option<String>,
     /// Repository-relative path when available.
@@ -429,6 +433,10 @@ impl EmbeddedAletheiaSink {
                 if !seen_record_ids.insert(record_id.clone()) {
                     continue;
                 }
+                let kind = node
+                    .get_property("kind")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
                 let name = node
                     .get_property("name")
                     .and_then(|v| v.as_str())
@@ -440,6 +448,7 @@ impl EmbeddedAletheiaSink {
                 let span = span_from_properties(|key| node.get_property(key));
                 results.push(SemanticMatch {
                     record_id,
+                    kind,
                     name,
                     repo_relative_path,
                     score,

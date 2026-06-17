@@ -331,6 +331,29 @@ enum Commands {
         #[arg(long, default_value = "0.20", value_parser = parse_threshold)]
         threshold: f64,
     },
+    /// Run the agent-memory recall evaluation against a corpus file (issue #91).
+    ///
+    /// Requires a pre-built embedded store seeded with imported memory and
+    /// ingested with `--embed`. Exits 0 if top-3 recall meets the threshold,
+    /// 1 with a diagnostic if missed.
+    #[cfg(feature = "embeddings")]
+    EvalMemoryRecall {
+        /// Path to the agent-memory recall corpus JSON file.
+        #[arg(long, default_value = "corpus/agent_memory_recall_corpus.json")]
+        corpus: PathBuf,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Number of top memory results to retrieve per question.
+        #[arg(long, default_value = "3")]
+        top_k: usize,
+        /// Minimum top-3 recall fraction required to pass (0.0–1.0, default 0.80).
+        #[arg(long, default_value = "0.8", value_parser = parse_threshold)]
+        threshold: f64,
+        /// Exclude unverified observations from recall, as the trust filter does.
+        #[arg(long)]
+        verified_only: bool,
+    },
     /// Manage the local Egregore daemon.
     #[cfg(feature = "embedded-aletheiadb")]
     Daemon {
@@ -611,6 +634,72 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Answer a natural-language query with evidence-backed context for the
+    /// top-N semantic matches in one call (issue #90).
+    ///
+    /// Bridges semantic discovery and the symbol-context lane: it embeds the
+    /// query locally, ranks matches against the embedded store, then returns —
+    /// per match — the stable record ID, repo-relative file/span handle, the
+    /// relevance score, and the same five trust-separated context sections
+    /// produced by `eg query context`. File-typed matches are first-class
+    /// (their defined symbols are seeded); an ambiguous symbol name reports all
+    /// candidate record IDs instead of silently picking one.
+    ///
+    /// Read-only and deterministic. On no semantic hit clearing `--min-score`:
+    /// emits `{"ok":false,"error":{"code":"no_match",...}}` to stdout and exits
+    /// with code 2. Documented in `docs/cli/semantic-search-guidance.md`.
+    #[cfg(feature = "embeddings")]
+    SemanticContext {
+        /// Natural-language query text.
+        query: String,
+        /// Embedded `AletheiaDB` data directory (must be ingested with `--embed`).
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum number of matches to expand (bounded; safe default 5).
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Relevance floor in `[0.0, 1.0]`; matches scoring below it are
+        /// dropped, and an all-below result is a no-match (default 0.0).
+        #[arg(long, default_value_t = 0.0)]
+        min_score: f32,
+    },
+    /// Recall prior agent memory by meaning (issue #91).
+    ///
+    /// Returns agent-authored observations, decisions, and failures ranked by
+    /// semantic similarity to the natural-language query — each carrying its
+    /// provenance handle: record ID, kind, source transcript/session handle,
+    /// authoring agent, confidence, observed time, and any linked code handle.
+    ///
+    /// Results are typed `agent_authored` and are NEVER blended with
+    /// deterministic code hits (use `eg query semantic` for code). A memory hit
+    /// that cannot cite where it came from is excluded, not returned. A semantic
+    /// match is recall, not verification: a returned lesson is a prior agent's
+    /// subjective claim, not source truth.
+    ///
+    /// Documented in `docs/cli/semantic-memory-recall.md`.
+    #[cfg(feature = "embeddings")]
+    SemanticMemory {
+        /// Natural-language question to recall memory by meaning.
+        query: String,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum number of results (default 10).
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Exclude unverified agent observations (no cited verification evidence).
+        #[arg(long)]
+        verified_only: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Retrieve evidence-backed context for a named symbol.
     ///
     /// Returns a structured JSON object with five trust-separated sections:
@@ -756,6 +845,34 @@ enum QuerySubcommand {
         /// Restrict symbol/file handle resolution to one repository (issue #67).
         #[arg(long)]
         repo: Option<String>,
+    },
+    /// Retrieve cross-domain context for a repo-relative directory or module prefix (issue #83).
+    ///
+    /// Returns a structured JSON object with six trust-separated sections:
+    /// `source_facts` (code-graph files and symbols under the prefix),
+    /// `observations` (agent-authored), `project_state` (tasks/ACs),
+    /// `artifacts`, `verification_evidence`, and `semantic_drift`.
+    /// Missing evidence links are surfaced as `unresolved` items.
+    ///
+    /// Both the bare form (`src/alpha`) and the trailing-slash form
+    /// (`src/alpha/`) resolve to the same record set. Prefix matching is
+    /// segment-aware: `src/alpha` never bleeds into `src/alphabet/`.
+    ///
+    /// On no-match: emits `{"ok":false,"error":{"code":"no_match",...}}` to
+    /// stdout and exits 2. On malformed/empty prefix: exits 1 with
+    /// `{"ok":false,"error":{"code":"malformed_prefix",...}}`.
+    Subsystem {
+        /// Repo-relative directory or module path prefix (e.g. `src/parser` or `src/parser/`).
+        prefix: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
 }
 
@@ -1165,6 +1282,14 @@ fn run_cli(cli: Cli) -> Result<()> {
                 anyhow::bail!("eval-drift requires the 'embeddings' feature")
             }
         }
+        #[cfg(feature = "embeddings")]
+        Commands::EvalMemoryRecall {
+            corpus,
+            data_dir,
+            top_k,
+            threshold,
+            verified_only,
+        } => eval_memory_recall_cmd(&corpus, &data_dir, top_k, threshold, verified_only),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Daemon { action } => daemon(action),
         Commands::Decide {
@@ -2909,6 +3034,87 @@ struct TaskContextResponse<'a> {
     unresolved: Vec<ContextUnresolved<'a>>,
 }
 
+/// One semantic drift item in the `semantic_drift` section of a subsystem response.
+#[derive(Serialize)]
+struct SubsystemDrift<'a> {
+    record_id: &'a str,
+    score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_span: Option<crate::ir::SourceSpan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_git_commit: Option<&'a str>,
+}
+
+/// Full subsystem context query response envelope (issue #83).
+#[derive(Serialize)]
+struct SubsystemResponse<'a> {
+    ok: bool,
+    prefix: &'a str,
+    source_facts: Vec<ContextSourceFact<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    topology_edges: Vec<ContextTopologyEdge<'a>>,
+    observations: Vec<ContextObservation<'a>>,
+    project_state: Vec<ContextLinkedItem<'a>>,
+    artifacts: Vec<ContextLinkedItem<'a>>,
+    verification_evidence: Vec<ContextLinkedItem<'a>>,
+    semantic_drift: Vec<SubsystemDrift<'a>>,
+    unresolved: Vec<ContextUnresolved<'a>>,
+}
+
+// ---------------------------------------------------------------------------
+// semantic → context bridge (issue #90)
+// ---------------------------------------------------------------------------
+
+/// One semantic match expanded into evidence-backed context.
+///
+/// Carries the retrieval-lead handle (record ID, repo-relative path, span,
+/// score, repository identity) and the same five trust-separated context
+/// sections produced by `eg query context`. `match_kind` documents whether the
+/// match anchored on a `symbol`, a `file` (its defined symbols are seeded into
+/// `source_facts`), or some `other` node. When `ambiguous` is true the match
+/// name resolved to more than one live symbol and `candidate_record_ids` lists
+/// every candidate instead of silently picking one.
+#[cfg(feature = "embeddings")]
+#[derive(Serialize)]
+struct SemanticContextMatch<'a> {
+    record_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+    score: f32,
+    match_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
+    ambiguous: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    candidate_record_ids: Vec<&'a str>,
+    source_facts: Vec<ContextSourceFact<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    topology_edges: Vec<ContextTopologyEdge<'a>>,
+    observations: Vec<ContextObservation<'a>>,
+    project_state: Vec<ContextLinkedItem<'a>>,
+    artifacts: Vec<ContextLinkedItem<'a>>,
+    verification_evidence: Vec<ContextLinkedItem<'a>>,
+    unresolved: Vec<ContextUnresolved<'a>>,
+}
+
+/// Full `eg query semantic-context` response envelope.
+#[cfg(feature = "embeddings")]
+#[derive(Serialize)]
+struct SemanticContextResponse<'a> {
+    ok: bool,
+    query: &'a str,
+    min_score: f32,
+    matches: Vec<SemanticContextMatch<'a>>,
+}
+
 // ---------------------------------------------------------------------------
 // memory evidence audit (issue #64)
 // ---------------------------------------------------------------------------
@@ -3371,6 +3577,30 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 query_semantic(&query, &data_dir, limit, repo.as_deref(), format)
             }
         }
+        #[cfg(feature = "embeddings")]
+        QuerySubcommand::SemanticContext {
+            query,
+            data_dir,
+            repo,
+            limit,
+            min_score,
+        } => query_semantic_context(&query, &data_dir, limit, min_score, repo.as_deref()),
+        #[cfg(feature = "embeddings")]
+        QuerySubcommand::SemanticMemory {
+            query,
+            data_dir,
+            repo,
+            limit,
+            verified_only,
+            format,
+        } => query_semantic_memory(
+            &query,
+            &data_dir,
+            limit,
+            repo.as_deref(),
+            verified_only,
+            format,
+        ),
         QuerySubcommand::Context {
             name,
             graph,
@@ -3480,6 +3710,29 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_failures_cmd(&records, &handle, &index, selected.as_deref())
+        }
+        QuerySubcommand::Subsystem {
+            prefix,
+            graph,
+            data_dir,
+            format,
+        } => {
+            // Validate the prefix before loading records so malformed input fails
+            // fast with a machine-readable diagnostic, not a store I/O error.
+            if prefix.trim_end_matches('/').is_empty() {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "malformed_prefix",
+                        "prefix": prefix,
+                        "message": "prefix must be non-empty after stripping trailing slashes"
+                    }
+                });
+                println!("{}", serde_json::to_string(&envelope)?);
+                std::process::exit(1);
+            }
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_subsystem_cmd(&records, &prefix, format)
         }
     }
 }
@@ -3989,21 +4242,28 @@ fn query_semantic(
 
     let query_vector = embed_query_text(query)?;
 
-    // When scoped, search the whole index so higher-scoring hits from other
-    // repositories can never crowd the selected repository's matches out of
-    // the candidate set; the limit then bounds the scoped result set.
-    let fetch = if selected.is_some() {
-        records.len().max(limit)
-    } else {
-        limit
-    };
+    // Over-fetch the whole index, not just `limit` raw hits: the shared vector
+    // index now also embeds agent-memory nodes (issue #91), so a query whose top
+    // `limit` raw matches are memory would otherwise drop them all and never see
+    // the code hits ranked just behind them. Fetching the full pool lets the
+    // code-kind filter below recover those code hits; the limit then bounds the
+    // filtered result set. Scoping needs the full pool for the same reason.
+    let fetch = records.len().max(limit);
     let mut matches = sink
         .semantic_search(&query_vector, fetch)
         .with_context(|| "semantic search failed — was the store ingested with --embed?")?;
+    // Code search must never blend agent-authored memory hits into deterministic
+    // code results (issue #91): the shared vector index now also embeds
+    // observation-class memory nodes, recalled only via `eg query semantic-memory`.
+    matches.retain(|m| {
+        m.kind
+            .as_deref()
+            .is_some_and(|k| k == "File" || k == "Symbol")
+    });
     if let Some(repo) = selected.as_deref() {
         matches.retain(|m| index.owner_of(&m.record_id) == Some(repo));
-        matches.truncate(limit);
     }
+    matches.truncate(limit);
 
     if matches.is_empty() {
         eprintln!("no results — store may not have embeddings (re-run ingest with --embed)");
@@ -4012,6 +4272,356 @@ fn query_semantic(
 
     for m in &matches {
         print_result(&SemanticResult::from_match(m, &index), format)?;
+    }
+    Ok(())
+}
+
+/// One agent-authored memory record recalled by meaning (issue #91).
+///
+/// Typed `agent_authored` so a consuming agent can never mistake a recalled
+/// lesson for deterministic source truth. Every emitted row carries a citable
+/// `source_handle`; a hit lacking provenance is excluded upstream, never
+/// returned with empty provenance.
+#[cfg(feature = "embeddings")]
+#[derive(Serialize)]
+struct MemoryRecallResult<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    trust_class: &'static str,
+    retrieval_score: f32,
+    /// Citable source transcript / session / turn handle proving where the
+    /// memory came from.
+    source_handle: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingested_at: Option<&'a str>,
+    /// `verified` when the claim cites present verification evidence, else
+    /// `unverified` — a structural, non-inferential trust signal (issue #64).
+    review_state: &'static str,
+    redacted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<&'a str>,
+    /// Resolved code handles this memory cites (`OBSERVES`/`MENTIONS_SYMBOL`/…).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    linked_code_handles: Vec<String>,
+    /// The recalled memory body (post-redaction stored text).
+    memory_text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
+}
+
+#[cfg(feature = "embeddings")]
+impl PrintText for MemoryRecallResult<'_> {
+    fn as_text(&self) -> String {
+        format!(
+            "{} [{}] {} score={:.4} author={} source={} review={}\n  {}",
+            self.record_id,
+            self.kind,
+            self.trust_class,
+            self.retrieval_score,
+            self.agent_id.unwrap_or("(unknown)"),
+            self.source_handle,
+            self.review_state,
+            self.memory_text,
+        )
+    }
+}
+
+/// Returns a trimmed, non-empty string slice, or `None` for a missing or
+/// blank-only value. Used so an imported memory record carrying
+/// `source_handle: ""` is treated as having no provenance rather than passing
+/// the recall gate and being emitted with an empty handle (issue #91).
+#[cfg(feature = "embeddings")]
+fn non_empty(value: Option<&String>) -> Option<&str> {
+    value.map(String::as_str).filter(|s| !s.trim().is_empty())
+}
+
+/// Resolves the repositories a memory record belongs to (issue #91).
+///
+/// Agent-memory nodes are not part of the code-graph containment topology, so
+/// [`query::RepositoryIndex::owner_of`] returns `None` for them directly. A
+/// memory record is attributed to a repository through the code it cites: any
+/// cited code target that resolves to a repository-owned node scopes the memory
+/// to that repository. Both citation shapes are honored — inline
+/// `evidence_links` and standalone outgoing `GraphRecord::Edge` records (e.g.
+/// the `link-evidence` `MENTIONS_SYMBOL` / `FAILED_ON` / `TOUCHED_FILE` edges) —
+/// so imported memory that stores normalized edges is not dropped under `--repo`.
+/// Returned sorted and deduplicated for deterministic selection.
+#[cfg(feature = "embeddings")]
+fn memory_repo_owners<'a>(
+    record_id: &str,
+    links: Option<&Vec<EvidenceLink>>,
+    edges_from: &query::OutgoingEdgeIndex<'_>,
+    index: &'a query::RepositoryIndex,
+) -> Vec<&'a str> {
+    if let Some(owner) = index.owner_of(record_id) {
+        return vec![owner];
+    }
+    let mut owners: Vec<&str> = Vec::new();
+    if let Some(links) = links {
+        owners.extend(
+            links
+                .iter()
+                .filter_map(|l| l.target_record_id.as_deref())
+                .filter_map(|target| index.owner_of(target)),
+        );
+    }
+    if let Some(out) = edges_from.get(record_id) {
+        owners.extend(out.iter().filter_map(|(_, target)| index.owner_of(target)));
+    }
+    owners.sort_unstable();
+    owners.dedup();
+    owners
+}
+
+/// Resolves one evidence link to a citable code handle string when it points at
+/// the code-graph domain.
+#[cfg(feature = "embeddings")]
+fn code_handle_from_link(
+    link: &EvidenceLink,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+) -> Option<String> {
+    let is_code = link.target_domain == "codegraph"
+        || matches!(
+            link.relation.as_str(),
+            "OBSERVES" | "MENTIONS_SYMBOL" | "TOUCHED_FILE"
+        );
+    if !is_code {
+        return None;
+    }
+    if let Some(target_id) = link.target_record_id.as_deref()
+        && let Some(GraphRecord::Node {
+            repo_relative_path,
+            name,
+            ..
+        }) = by_id.get(target_id).copied()
+    {
+        if let Some(path) = repo_relative_path {
+            return Some(
+                name.as_ref()
+                    .map_or_else(|| path.clone(), |n| format!("{path}::{n}")),
+            );
+        }
+        return Some(target_id.to_owned());
+    }
+    link.target_repo_relative_path
+        .clone()
+        .or_else(|| link.target_record_id.clone())
+}
+
+/// Decides whether a semantic hit is a recallable agent-memory record (issue #91).
+///
+/// A hit qualifies only when it is an agent-memory observation-class kind, can
+/// cite where it came from (a `source_handle`, source artifact path, or session
+/// handle), and — under `verified_only` — cites present verification evidence.
+/// A hit lacking provenance is rejected here so it is excluded, never returned.
+#[cfg(feature = "embeddings")]
+fn is_recallable_memory(
+    m: &SemanticMatch,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+    edges_from: &query::OutgoingEdgeIndex<'_>,
+    tombstoned: &query::TombstonedSet<'_>,
+    verified_only: bool,
+) -> bool {
+    if !m
+        .kind
+        .as_deref()
+        .is_some_and(|k| matches!(k, "Observation" | "Decision" | "Failure"))
+    {
+        return false;
+    }
+    let Some(record) = by_id.get(m.record_id.as_str()).copied() else {
+        return false;
+    };
+    let GraphRecord::Node {
+        session_id,
+        source_handle,
+        source_artifact_path,
+        ..
+    } = record
+    else {
+        return false;
+    };
+    // Provenance must be a present, non-blank handle: a record carrying only
+    // empty strings is excluded, never emitted with an empty `source_handle`.
+    let has_provenance = non_empty(source_handle.as_ref()).is_some()
+        || non_empty(source_artifact_path.as_ref()).is_some()
+        || non_empty(session_id.as_ref()).is_some();
+    if !has_provenance {
+        return false;
+    }
+    // Verified-only reuses the memory-audit structural rule (issue #64): a
+    // resolvable, non-tombstoned verification record cited via VALIDATED_BY /
+    // HAS_EVIDENCE / PRODUCED_EVIDENCE, on either an inline evidence link or an
+    // outgoing edge. A triple-only citation stub never counts as verified.
+    if verified_only && !query::is_verified_claim(record, by_id, edges_from, tombstoned) {
+        return false;
+    }
+    true
+}
+
+/// Recalls prior agent memory by meaning, trust-separated from code (issue #91).
+///
+/// Embeds the natural-language query with the local model, runs the same vector
+/// search the code path uses, then keeps only agent-memory observation-class
+/// hits — each enriched with its provenance handle. A hit that cannot cite
+/// where it came from is excluded, not returned. With `--verified-only`,
+/// observations lacking cited verification evidence are excluded too.
+#[cfg(feature = "embeddings")]
+#[allow(clippy::too_many_lines)]
+fn query_semantic_memory(
+    query: &str,
+    data_dir: &Path,
+    limit: usize,
+    repo: Option<&str>,
+    verified_only: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    validate_existing_embedded_store(data_dir)?;
+
+    let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+        .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+
+    let records = sink
+        .read_all_records()
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+    let index = query::RepositoryIndex::build(&records);
+    let selected = resolve_repo_scope(&index, repo);
+
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let (edges_from, tombstoned) = query::verification_support_indexes(&records);
+
+    let query_vector = embed_query_text(query)?;
+
+    // The shared vector index holds both code and memory; fetch a generous pool
+    // and filter to memory so the `limit` bounds recalled memory, not the blend.
+    let fetch = records.len().max(limit);
+    let matches = sink
+        .semantic_search(&query_vector, fetch)
+        .with_context(|| "semantic search failed — was the store ingested with --embed?")?;
+
+    let mut rows: Vec<MemoryRecallResult> = Vec::new();
+    for m in &matches {
+        // Trust separation + provenance exclusion (AC3): keep only agent-memory
+        // observation-class hits that can cite where they came from.
+        if !is_recallable_memory(m, &by_id, &edges_from, &tombstoned, verified_only) {
+            continue;
+        }
+        let Some(record) = by_id.get(m.record_id.as_str()).copied() else {
+            continue;
+        };
+        let GraphRecord::Node {
+            text,
+            summary,
+            agent_id,
+            agent_kind,
+            session_id,
+            observed_at,
+            ingested_at,
+            confidence,
+            source_handle,
+            source_artifact_path,
+            redaction_policy_version,
+            superseded_by,
+            evidence_links,
+            ..
+        } = record
+        else {
+            continue;
+        };
+
+        // Scope through the code this memory cites: memory nodes are not in the
+        // containment topology, so a `--repo` filter must resolve the repository
+        // from the linked code handles (inline links and outgoing edges), not the
+        // memory record ID directly.
+        let owners = memory_repo_owners(&m.record_id, evidence_links.as_ref(), &edges_from, &index);
+        if let Some(repo) = selected.as_deref()
+            && !owners.contains(&repo)
+        {
+            continue;
+        }
+
+        // `is_recallable_memory` guarantees a present, non-blank handle; pick the
+        // first non-empty among source handle, artifact path, and session ID.
+        let source_handle_value = non_empty(source_handle.as_ref())
+            .or_else(|| non_empty(source_artifact_path.as_ref()))
+            .or_else(|| non_empty(session_id.as_ref()))
+            .unwrap_or_default()
+            .to_owned();
+
+        let verified = query::is_verified_claim(record, &by_id, &edges_from, &tombstoned);
+
+        let linked_code_handles: Vec<String> = evidence_links
+            .as_ref()
+            .map(|links| {
+                let mut handles: Vec<String> = links
+                    .iter()
+                    .filter_map(|l| code_handle_from_link(l, &by_id))
+                    .collect();
+                handles.sort();
+                handles.dedup();
+                handles
+            })
+            .unwrap_or_default();
+
+        // Label with the selected repository when scoped (the membership filter
+        // above guarantees it is among `owners`), so a memory citing code in
+        // several repositories is never misattributed to a different one than the
+        // user selected; otherwise fall back to the first owner deterministically.
+        let repository_id = selected.as_deref().or_else(|| owners.first().copied());
+        rows.push(MemoryRecallResult {
+            record_id: record.id(),
+            kind: record.node_kind_name().unwrap_or("Observation"),
+            trust_class: "agent_authored",
+            retrieval_score: m.score,
+            source_handle: source_handle_value,
+            agent_id: agent_id.as_deref(),
+            agent_kind: agent_kind.as_deref(),
+            session_id: session_id.as_deref(),
+            confidence: confidence.as_deref(),
+            observed_at: observed_at.as_deref(),
+            ingested_at: ingested_at.as_deref(),
+            review_state: if verified { "verified" } else { "unverified" },
+            redacted: redaction_policy_version.is_some(),
+            superseded_by: superseded_by.as_deref(),
+            linked_code_handles,
+            memory_text: text.as_deref().unwrap_or(summary.as_str()),
+            repository_id,
+            repository: repository_id.and_then(|id| index.display_of(id)),
+        });
+    }
+
+    // Canonical ordering before truncation (AC7): equal-score ANN results can be
+    // returned in arbitrary order, so sort by score descending then record ID
+    // ascending so repeated runs print byte-identical output and the row chosen
+    // at the `limit` boundary is stable.
+    rows.sort_by(|a, b| {
+        b.retrieval_score
+            .total_cmp(&a.retrieval_score)
+            .then_with(|| a.record_id.cmp(b.record_id))
+    });
+    rows.truncate(limit);
+
+    if rows.is_empty() {
+        eprintln!(
+            "no memory results — store may lack embedded memory (re-run ingest with --embed) or all hits were filtered"
+        );
+        std::process::exit(2);
+    }
+
+    for row in &rows {
+        print_result(row, format)?;
     }
     Ok(())
 }
@@ -4078,6 +4688,147 @@ fn print_daemon_semantic_record(rec: &serde_json::Value, format: OutputFormat) -
     Ok(())
 }
 
+/// Natural-language query → evidence-backed context for the top-N semantic
+/// matches, in a single read-only call (issue #90).
+///
+/// Embeds the query locally, ranks matches against the embedded store, then —
+/// for each match clearing `min_score` — resolves the same trust-separated
+/// context sections as `eg query context`, anchored on the match's record ID so
+/// File-typed matches are first-class. A no-match (no hit clears the floor)
+/// emits a stable diagnostic to stdout and exits 2.
+#[cfg(feature = "embeddings")]
+fn query_semantic_context(
+    query: &str,
+    data_dir: &Path,
+    limit: usize,
+    min_score: f32,
+    repo: Option<&str>,
+) -> Result<()> {
+    validate_existing_embedded_store(data_dir)?;
+
+    let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+        .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+
+    let records = sink
+        .read_all_records()
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+    let index = query::RepositoryIndex::build(&records);
+    let selected = resolve_repo_scope(&index, repo);
+
+    let query_vector = embed_query_text(query)?;
+
+    // Over-fetch the whole index, not just `limit` raw hits: the shared vector
+    // index also embeds agent-memory nodes (issue #91), so a query whose top
+    // `limit` raw matches are memory would otherwise drop the code hits ranked
+    // just behind them. Fetch the full pool so the code-kind filter below
+    // recovers those code hits; the limit then bounds the filtered set.
+    let fetch = records.len().max(limit);
+    let mut matches = sink
+        .semantic_search(&query_vector, fetch)
+        .with_context(|| "semantic search failed — was the store ingested with --embed?")?;
+    // `semantic-context` is a code-context bridge: never expand agent-authored
+    // memory hits (issue #91). Mirror `query semantic` and keep only
+    // deterministic code kinds before building leads.
+    matches.retain(|m| {
+        m.kind
+            .as_deref()
+            .is_some_and(|k| k == "File" || k == "Symbol")
+    });
+    if let Some(repo) = selected.as_deref() {
+        matches.retain(|m| index.owner_of(&m.record_id) == Some(repo));
+    }
+    // Canonical ordering before truncation: equal-score ANN results can be
+    // returned in arbitrary order, so sort by score descending then record ID
+    // ascending so repeated runs choose the same rows at the `limit` boundary
+    // and emit byte-identical output.
+    matches.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.record_id.cmp(&b.record_id))
+    });
+    matches.truncate(limit);
+
+    let leads: Vec<query::SemanticLead> = matches
+        .iter()
+        .map(|m| query::SemanticLead {
+            record_id: m.record_id.clone(),
+            name: m.name.clone(),
+            repo_relative_path: m.repo_relative_path.clone(),
+            score: m.score,
+            span: m.span,
+        })
+        .collect();
+
+    // Scope the record slice for context expansion when a repo is selected so
+    // that ambiguity detection (candidate_record_ids) and the path-based file
+    // fallback in record_context don't return IDs from other repos. Cross-
+    // domain records (observations, artifacts, verification) are unowned and
+    // always kept so that context sections remain fully populated.
+    let records: Vec<GraphRecord> = if let Some(repo) = selected.as_deref() {
+        records
+            .into_iter()
+            .filter(|r| index.owner_of(r.id()).is_none_or(|o| o == repo))
+            .collect()
+    } else {
+        records
+    };
+
+    let bundle = query::semantic_context_bundle(&records, &leads, min_score);
+
+    if bundle.is_no_match() {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "no_match",
+                "query": query,
+                "min_score": min_score,
+            }
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(2);
+    }
+
+    let match_rows: Vec<SemanticContextMatch<'_>> = bundle
+        .matches
+        .iter()
+        .map(|m| {
+            let sections = build_context_sections(&m.context);
+            let repository_id = index.owner_of(&m.lead.record_id);
+            SemanticContextMatch {
+                record_id: &m.lead.record_id,
+                name: m.lead.name.as_deref(),
+                repo_relative_path: m.lead.repo_relative_path.as_deref(),
+                span: m.lead.span,
+                score: m.lead.score,
+                match_kind: m.anchor_kind.as_str(),
+                repository_id,
+                repository: repository_id.and_then(|id| index.display_of(id)),
+                ambiguous: !m.candidate_record_ids.is_empty(),
+                candidate_record_ids: m.candidate_record_ids.iter().map(String::as_str).collect(),
+                source_facts: sections.source_facts,
+                topology_edges: sections.topology_edges,
+                observations: sections.observations,
+                project_state: sections.project_state,
+                artifacts: sections.artifacts,
+                verification_evidence: sections.verification_evidence,
+                unresolved: sections.unresolved,
+            }
+        })
+        .collect();
+
+    let response = SemanticContextResponse {
+        ok: true,
+        query,
+        min_score,
+        matches: match_rows,
+    };
+
+    let output =
+        serde_json::to_string_pretty(&response).context("failed to serialize semantic context")?;
+    println!("{output}");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // eval-semantic command
 // ---------------------------------------------------------------------------
@@ -4128,6 +4879,16 @@ fn eval_semantic_cmd(
     let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
         .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
 
+    // The shared vector index may also hold agent-memory nodes (issue #91). The
+    // code-relevance gate must score only deterministic code hits, exactly like
+    // `eg query semantic`, so over-fetch the full pool and filter to File/Symbol
+    // before scoring; otherwise embedded memory could occupy top-k slots or
+    // count as ambiguous-query false positives and corrupt the gate.
+    let total_records = sink
+        .read_all_records()
+        .map(|r| r.len())
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
 
     let mut results = Vec::new();
@@ -4147,7 +4908,7 @@ fn eval_semantic_cmd(
             .embedding;
 
         let matches = sink
-            .semantic_search(&query_vector, top_k.max(3))
+            .semantic_search(&query_vector, total_records.max(top_k.max(3)))
             .with_context(|| {
                 format!(
                     "semantic search failed for query {} — was the store ingested with --embed?",
@@ -4155,9 +4916,123 @@ fn eval_semantic_cmd(
                 )
             })?;
 
-        let hits: Vec<SearchHit> = matches.iter().map(SearchHit::from).collect();
+        let hits: Vec<SearchHit> = matches
+            .iter()
+            .filter(|m| {
+                m.kind
+                    .as_deref()
+                    .is_some_and(|k| k == "File" || k == "Symbol")
+            })
+            .take(top_k.max(3))
+            .map(SearchHit::from)
+            .collect();
         #[allow(clippy::cast_possible_truncation)]
         results.push(evaluate_query(query, &hits, fp_threshold as f32));
+    }
+
+    let report = build_report(results, threshold);
+    print_report(&report, std::io::stdout())?;
+
+    if !report.passed {
+        eprintln!("{}", format_diagnostic(&report));
+        process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Runs the agent-memory recall corpus evaluation against an embedded store
+/// seeded with imported memory records (issue #91).
+///
+/// Reads each natural-language question, embeds it with the local model, runs
+/// semantic search, keeps only recallable agent-memory hits (trust-separated
+/// from code, provenance-bearing), then evaluates top-1/top-3/MRR against the
+/// reviewed expected memory record IDs. Exits 1 with a diagnostic if the top-3
+/// recall threshold is missed.
+#[cfg(feature = "embeddings")]
+fn eval_memory_recall_cmd(
+    corpus_path: &Path,
+    data_dir: &Path,
+    top_k: usize,
+    threshold: f64,
+    verified_only: bool,
+) -> Result<()> {
+    use crate::embeddings::{
+        DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_NAME, aletheia_embeddings,
+    };
+    use crate::memory_recall_eval::{
+        MemoryHit, MemoryRecallCorpus, build_report, evaluate_query, format_diagnostic,
+        print_report,
+    };
+
+    validate_existing_embedded_store(data_dir)?;
+
+    let corpus = MemoryRecallCorpus::from_json_file(corpus_path)?;
+
+    let embedder = aletheia_embeddings::EmbedderBuilder::new()
+        .model_architecture(DEFAULT_EMBEDDING_MODEL_ARCHITECTURE)
+        .model_id(Some(DEFAULT_EMBEDDING_MODEL_NAME))
+        .from_pretrained_hf()
+        .context("failed to load embedding model")?;
+
+    let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+        .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+
+    let records = sink
+        .read_all_records()
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let (edges_from, tombstoned) = query::verification_support_indexes(&records);
+
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+
+    let mut results = Vec::new();
+    for question in &corpus.questions {
+        let embed_data = rt
+            .block_on(aletheia_embeddings::embed_query(
+                &[question.text.as_str()],
+                &embedder,
+                None,
+            ))
+            .with_context(|| format!("failed to embed question {}", question.id))?;
+
+        let query_vector = aletheia_embeddings::embed_data_to_dense_iter(embed_data, Some(1))
+            .next()
+            .with_context(|| format!("no embedding returned for question {}", question.id))?
+            .with_context(|| format!("embedding result not dense for question {}", question.id))?
+            .embedding;
+
+        // Fetch a generous pool, then narrow to recallable memory so `top_k`
+        // bounds memory hits rather than the code+memory blend.
+        let matches = sink
+            .semantic_search(&query_vector, records.len().max(top_k))
+            .with_context(|| {
+                format!(
+                    "semantic search failed for question {} — was the store ingested with --embed?",
+                    question.id
+                )
+            })?;
+
+        // Collect every recallable hit, then apply the canonical score/record-id
+        // ordering before truncating to top-k: truncating the raw ANN order first
+        // could drop a record that belongs in the canonical top 3 when scores tie
+        // (and vary between runs). `evaluate_query` re-applies canonical ordering.
+        let mut hits: Vec<MemoryHit> = matches
+            .iter()
+            .filter(|m| is_recallable_memory(m, &by_id, &edges_from, &tombstoned, verified_only))
+            .map(|m| MemoryHit {
+                record_id: m.record_id.clone(),
+                score: m.score,
+            })
+            .collect();
+        hits.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.record_id.cmp(&b.record_id))
+        });
+        hits.truncate(top_k.max(3));
+
+        results.push(evaluate_query(question, &hits));
     }
 
     let report = build_report(results, threshold);
@@ -5385,6 +6260,100 @@ fn query_drift(
 // query context (issue #38)
 // ---------------------------------------------------------------------------
 
+/// The five trust-separated context sections (plus topology edges and
+/// unresolved references) rendered from a [`query::SymbolContext`].
+///
+/// Shared by `eg query context` and `eg query semantic-context` so both emit
+/// byte-identical section shapes from the same builders.
+struct ContextSections<'a> {
+    source_facts: Vec<ContextSourceFact<'a>>,
+    topology_edges: Vec<ContextTopologyEdge<'a>>,
+    observations: Vec<ContextObservation<'a>>,
+    project_state: Vec<ContextLinkedItem<'a>>,
+    artifacts: Vec<ContextLinkedItem<'a>>,
+    verification_evidence: Vec<ContextLinkedItem<'a>>,
+    unresolved: Vec<ContextUnresolved<'a>>,
+}
+
+/// Renders a resolved [`query::SymbolContext`] into the serializable section
+/// views, reusing the existing per-record builders (`context_source_fact`,
+/// `context_observation`, `context_linked_item`). `.copied()` collapses the
+/// `&&GraphRecord` from `iter()` so each view borrows the record slice directly.
+fn build_context_sections<'a>(ctx: &'a query::SymbolContext<'a>) -> ContextSections<'a> {
+    ContextSections {
+        source_facts: ctx
+            .source_facts
+            .iter()
+            .copied()
+            .filter_map(context_source_fact)
+            .collect(),
+        topology_edges: ctx
+            .topology_edges
+            .iter()
+            .copied()
+            .filter_map(|r| {
+                if let GraphRecord::Edge {
+                    id,
+                    label,
+                    source,
+                    target,
+                    summary,
+                    temporal,
+                    ..
+                } = r
+                {
+                    Some(ContextTopologyEdge {
+                        record_id: id,
+                        label: label.as_str(),
+                        source_id: source,
+                        target_id: target,
+                        summary,
+                        git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+                        valid_time: temporal.as_ref().map(|t| t.valid_time.as_str()),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        observations: ctx
+            .observations
+            .iter()
+            .copied()
+            .filter_map(context_observation)
+            .collect(),
+        project_state: ctx
+            .project_state
+            .iter()
+            .copied()
+            .filter_map(context_linked_item)
+            .collect(),
+        artifacts: ctx
+            .artifacts
+            .iter()
+            .copied()
+            .filter_map(context_linked_item)
+            .collect(),
+        verification_evidence: ctx
+            .verification_evidence
+            .iter()
+            .copied()
+            .filter_map(context_linked_item)
+            .collect(),
+        unresolved: ctx
+            .unresolved
+            .iter()
+            .map(|u| ContextUnresolved {
+                source_record_id: &u.source_record_id,
+                target_handle: &u.target_handle,
+                relation: &u.relation,
+                target_domain: &u.target_domain,
+                verification_status: "unresolved",
+            })
+            .collect(),
+    }
+}
+
 fn query_context_cmd(
     records: &[GraphRecord],
     symbol_name: &str,
@@ -5398,6 +6367,72 @@ fn query_context_cmd(
             "error": {
                 "code": "no_match",
                 "symbol_name": symbol_name
+            }
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(2);
+    }
+
+    let sections = build_context_sections(&ctx);
+
+    // Attach the freshness verdict only when every source fact belongs to the
+    // repository the verdict was computed for (PR #186): `query context` has no
+    // repository selector, so in a multi-repo store the same symbol can collect
+    // facts from several repositories — presenting one checkout's verdict across
+    // all of them would be misleading. Omit it when the response spans repos.
+    let freshness_code = freshness.and_then(|(owner_id, code)| {
+        let index = query::RepositoryIndex::build(records);
+        let owners: std::collections::BTreeSet<Option<&str>> = ctx
+            .source_facts
+            .iter()
+            .map(|record| index.owner_of(record.id()))
+            .collect();
+        (owners.len() == 1 && owners.contains(&Some(owner_id.as_str()))).then_some(code)
+    });
+
+    let response = ContextResponse {
+        ok: true,
+        symbol_name,
+        freshness: freshness_code,
+        source_facts: sections.source_facts,
+        topology_edges: sections.topology_edges,
+        observations: sections.observations,
+        project_state: sections.project_state,
+        artifacts: sections.artifacts,
+        verification_evidence: sections.verification_evidence,
+        unresolved: sections.unresolved,
+    };
+
+    let output = serde_json::to_string_pretty(&response).context("failed to serialize context")?;
+    println!("{output}");
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn query_subsystem_cmd(records: &[GraphRecord], prefix: &str, _format: OutputFormat) -> Result<()> {
+    let ctx = match query::subsystem_context(records, prefix) {
+        Ok(ctx) => ctx,
+        Err(query::SubsystemPrefixError::Malformed { prefix: p }) => {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "malformed_prefix",
+                    "prefix": p,
+                    "message": "prefix must be non-empty after stripping trailing slashes"
+                }
+            });
+            println!("{}", serde_json::to_string(&envelope)?);
+            std::process::exit(1);
+        }
+    };
+
+    if ctx.is_no_match() {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "no_match",
+                "prefix": prefix,
+                "message": "no records found under the given prefix"
             }
         });
         println!("{}", serde_json::to_string(&envelope)?);
@@ -5475,35 +6510,44 @@ fn query_context_cmd(
         })
         .collect();
 
-    // Attach the freshness verdict only when every source fact belongs to the
-    // repository the verdict was computed for (PR #186): `query context` has no
-    // repository selector, so in a multi-repo store the same symbol can collect
-    // facts from several repositories — presenting one checkout's verdict across
-    // all of them would be misleading. Omit it when the response spans repos.
-    let freshness_code = freshness.and_then(|(owner_id, code)| {
-        let index = query::RepositoryIndex::build(records);
-        let owners: std::collections::BTreeSet<Option<&str>> = ctx
-            .source_facts
-            .iter()
-            .map(|record| index.owner_of(record.id()))
-            .collect();
-        (owners.len() == 1 && owners.contains(&Some(owner_id.as_str()))).then_some(code)
-    });
+    let semantic_drift: Vec<SubsystemDrift<'_>> = ctx
+        .semantic_drift
+        .iter()
+        .filter_map(|r| {
+            let GraphRecord::Node {
+                id,
+                semantic_drift: Some(drift_meta),
+                ..
+            } = r
+            else {
+                return None;
+            };
+            let (path, _, span) = query::resolve_drift_target(records, id, drift_meta, None, None);
+            Some(SubsystemDrift {
+                record_id: id,
+                score: drift_meta.score,
+                target_repo_relative_path: path,
+                target_span: span,
+                after_git_commit: Some(drift_meta.after_git_commit.as_str()),
+            })
+        })
+        .collect();
 
-    let response = ContextResponse {
+    let response = SubsystemResponse {
         ok: true,
-        symbol_name,
-        freshness: freshness_code,
+        prefix: ctx.prefix.as_str(),
         source_facts,
         topology_edges,
         observations,
         project_state,
         artifacts,
         verification_evidence,
+        semantic_drift,
         unresolved,
     };
 
-    let output = serde_json::to_string_pretty(&response).context("failed to serialize context")?;
+    let output =
+        serde_json::to_string_pretty(&response).context("failed to serialize subsystem context")?;
     println!("{output}");
     Ok(())
 }
