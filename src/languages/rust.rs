@@ -522,21 +522,16 @@ fn contains_identifier(text: &str, name: &str) -> bool {
     }
     let bytes = text.as_bytes();
     let nlen = name.len();
-    let mut search_from = 0;
-    while let Some(offset) = text[search_from..].find(name) {
-        let idx = search_from + offset;
+    // `match_indices` yields byte offsets at valid char boundaries, so no manual
+    // slicing can split a multi-byte UTF-8 character (Unicode identifiers would
+    // otherwise panic during a scan). A non-identifier flanking byte — including
+    // any UTF-8 continuation/lead byte — counts as a token boundary.
+    text.match_indices(name).any(|(idx, _)| {
         let before_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
         let end = idx + nlen;
         let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
-        if before_ok && after_ok {
-            return true;
-        }
-        search_from = idx + 1;
-        if search_from >= text.len() {
-            break;
-        }
-    }
-    false
+        before_ok && after_ok
+    })
 }
 
 fn file_module_path(repo_relative_path: &str) -> Vec<String> {
@@ -1326,6 +1321,10 @@ mod tests {
         assert!(!contains_identifier("let e: ParseError = x;", "Error"));
         assert!(!contains_identifier("Errorhandler::run()", "Error"));
         assert!(!contains_identifier("my_widget", "widget"));
+        // A multi-byte Unicode identifier appearing only inside a larger
+        // identifier must be rejected without panicking on a char boundary.
+        assert!(!contains_identifier("xéx", "é"));
+        assert!(contains_identifier("call(é)", "é"));
     }
 
     #[test]

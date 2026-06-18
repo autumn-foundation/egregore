@@ -7697,8 +7697,10 @@ pub fn change_impact_unsupported_anchor_kind(
 /// full handle resolution contract for AC2). The traversal is bounded by
 /// `depth` hops from the anchor set. Every result group is canonically sorted
 /// for determinism (AC7); missing edge targets produce diagnostics rather than
-/// silently dropping relationship classes (AC6/AC8). `repo_index` scopes the
-/// name-based import resolution to the queried anchors' repositories.
+/// silently dropping relationship classes (AC6/AC8). When `repo_scope` is set
+/// (the caller passed `--repo`), `repo_index` constrains the name-based import
+/// resolution to the queried anchors' repositories; an unscoped query does not
+/// repo-filter imports.
 #[must_use]
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 pub fn change_impact_context<'a>(
@@ -7706,6 +7708,7 @@ pub fn change_impact_context<'a>(
     target: &ResolvedFailureTarget,
     depth: usize,
     repo_index: &RepositoryIndex,
+    repo_scope: Option<&str>,
 ) -> ChangeImpactContext<'a> {
     fn drain_sorted<'a>(
         map: BTreeMap<(&'a str, &'a str), ImpactLead<'a>>,
@@ -8301,11 +8304,14 @@ pub fn change_impact_context<'a>(
                 {
                     continue;
                 }
-                // Repo scope: when the query is scoped to a repository, the owner
-                // must resolve to one of the anchors' repositories. An owner with
-                // no repository attribution is out of scope and is skipped, so an
-                // unattributed legacy/generated file cannot leak a cross-repo lead.
-                if !anchor_repos.is_empty()
+                // Repo scope applies only when the caller passed `--repo`. For a
+                // scoped query the owner must resolve to one of the anchors'
+                // repositories — an owner with no repository attribution is out of
+                // scope and skipped, so an unattributed legacy/generated file
+                // cannot leak a cross-repo lead. An unscoped query does not filter,
+                // so legitimate cross-repo importers are still reported.
+                if repo_scope.is_some()
+                    && !anchor_repos.is_empty()
                     && !repo_index
                         .owner_of(owner.id())
                         .is_some_and(|repo| anchor_repos.contains(repo))
