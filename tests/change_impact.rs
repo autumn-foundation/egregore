@@ -2965,3 +2965,133 @@ fn repo_scope_excludes_unattributed_import_owner() {
         "an unattributed import owner must not leak under --repo; got: {refs:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Import repo-scoping applies only to --repo-scoped queries. An unscoped query
+// must still report legitimate cross-repo importers.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn unscoped_query_reports_cross_repo_importers() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("unscoped_cross_repo.jsonl");
+    let mut graph = Graph::new();
+
+    // repo-a defines Widget (unique across the store).
+    let repo_a = stable_id(&["node", "Repository", "repo-a"]);
+    graph.push(GraphRecord::node(
+        repo_a.clone(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo-a".to_owned()),
+        "Repository repo-a".to_owned(),
+    ));
+    let a_path = "src/a.rs";
+    let a_file_id = file_id(a_path);
+    graph.push(GraphRecord::syntax_node(
+        a_file_id.clone(),
+        NodeKind::File,
+        a_path.to_owned(),
+        span(1, 50),
+        "a.rs".to_owned(),
+        "rust",
+        "file a".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_a,
+        a_file_id.clone(),
+        None,
+        "repo-a contains a".to_owned(),
+    ));
+    let widget_id = sym_id(a_path, "Widget");
+    graph.push(GraphRecord::syntax_node(
+        widget_id.clone(),
+        NodeKind::Symbol,
+        a_path.to_owned(),
+        span(5, 10),
+        "Widget".to_owned(),
+        "rust",
+        "struct Widget".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Defines,
+        a_file_id,
+        widget_id,
+        None,
+        "a defines Widget".to_owned(),
+    ));
+
+    // repo-b only imports Widget (does not define it).
+    let repo_b = stable_id(&["node", "Repository", "repo-b"]);
+    graph.push(GraphRecord::node(
+        repo_b.clone(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo-b".to_owned()),
+        "Repository repo-b".to_owned(),
+    ));
+    let b_path = "src/b.rs";
+    let b_file_id = file_id(b_path);
+    graph.push(GraphRecord::syntax_node(
+        b_file_id.clone(),
+        NodeKind::File,
+        b_path.to_owned(),
+        span(1, 50),
+        "b.rs".to_owned(),
+        "rust",
+        "file b".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_b,
+        b_file_id.clone(),
+        None,
+        "repo-b contains b".to_owned(),
+    ));
+    let b_imp = stable_id(&["node", "import", b_path, "Widget"]);
+    graph.push(GraphRecord::syntax_node(
+        b_imp.clone(),
+        NodeKind::Import,
+        b_path.to_owned(),
+        span(1, 1),
+        "crate::a::Widget".to_owned(),
+        "rust",
+        "import Widget".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Imports,
+        b_file_id.clone(),
+        b_imp,
+        None,
+        "b imports Widget".to_owned(),
+    ));
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    // No --repo: the cross-repo importer in repo-b must still be reported.
+    let stdout = egregore()
+        .args(["query", "change-impact", "Widget", "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    let refs: Vec<&str> = v["referencing_files"]
+        .as_array()
+        .expect("referencing_files")
+        .iter()
+        .filter_map(|c| c["record_id"].as_str())
+        .collect();
+    assert!(
+        refs.contains(&b_file_id.as_str()),
+        "an unscoped query must report a cross-repo importer; got: {refs:?}"
+    );
+}
