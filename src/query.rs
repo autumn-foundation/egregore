@@ -5389,6 +5389,38 @@ fn import_item_name(item: &str) -> Option<&str> {
     }
 }
 
+/// Climb inbound `Defines`/`Contains` edges from an owner node until a File or
+/// Module is reached, returning that owner and the edge connecting to it. Used
+/// so a method owned by an impl-block `Symbol` resolves to its containing file
+/// for `containing_context`. Returns `None` if no File/Module owner is found.
+fn containing_file_or_module<'a>(
+    start: &'a GraphRecord,
+    start_edge: &'a GraphRecord,
+    by_id: &BTreeMap<&'a str, &'a GraphRecord>,
+    inbound_edges: &BTreeMap<&'a str, Vec<(&'a str, &'a EdgeLabel, &'a str)>>,
+) -> Option<(&'a GraphRecord, &'a GraphRecord)> {
+    let mut node = start;
+    let mut edge = start_edge;
+    // Bound the climb so a malformed cyclic ownership chain cannot loop forever.
+    for _ in 0..16 {
+        match record_node_kind(node) {
+            Some(NodeKind::File | NodeKind::Module) => return Some((node, edge)),
+            Some(NodeKind::Symbol) => {
+                let (parent, parent_edge) = inbound_edges
+                    .get(node.id())
+                    .into_iter()
+                    .flatten()
+                    .find(|&&(_, l, _)| matches!(l, EdgeLabel::Defines | EdgeLabel::Contains))
+                    .and_then(|&(eid, _, pid)| Some((*by_id.get(pid)?, *by_id.get(eid)?)))?;
+                node = parent;
+                edge = parent_edge;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Imported symbol names from a `use` path, expanding a brace group and
 /// stripping aliases. `a::b::{X, Y as Z}` → `[X, Y]`; `a::b::C` → `[C]`.
 fn imported_symbol_names(import_path: &str) -> Vec<&str> {
@@ -8044,26 +8076,34 @@ pub fn change_impact_context<'a>(
                         // reports each owner once.
                         if seed_set.contains(anchor_id) {
                             match by_id.get(source_id) {
-                                Some(&node)
-                                    if matches!(
-                                        record_node_kind(node),
-                                        Some(NodeKind::File | NodeKind::Module)
-                                    ) =>
-                                {
-                                    containing_context.entry((node.id(), node.id())).or_insert(
-                                        ImpactLead {
-                                            record: node,
-                                            edge: edge_record,
-                                            relation: label.as_str(),
-                                            direction: ImpactDirection::Inbound,
-                                            anchor_id,
-                                            hop,
-                                        },
-                                    );
+                                Some(&node) => {
+                                    // Resolve the owner to its File/Module context,
+                                    // climbing an impl-block Symbol owner up to the
+                                    // file that contains it (a method's container is
+                                    // its file, not the impl). A Repository owner
+                                    // resolves to nothing and is not reported.
+                                    if let Some((ctx, ctx_edge)) = containing_file_or_module(
+                                        node,
+                                        edge_record,
+                                        &by_id,
+                                        &inbound_edges,
+                                    ) {
+                                        let relation = match ctx_edge {
+                                            GraphRecord::Edge { label: l, .. } => l.as_str(),
+                                            _ => label.as_str(),
+                                        };
+                                        containing_context.entry((ctx.id(), ctx.id())).or_insert(
+                                            ImpactLead {
+                                                record: ctx,
+                                                edge: ctx_edge,
+                                                relation,
+                                                direction: ImpactDirection::Inbound,
+                                                anchor_id,
+                                                hop,
+                                            },
+                                        );
+                                    }
                                 }
-                                // Non file/module owner (e.g. Repository): not
-                                // containing code context.
-                                Some(_) => {}
                                 None => {
                                     diagnostics.push(MemoryAuditDiagnostic {
                                         code: "unresolved_edge_target".to_owned(),
@@ -8210,7 +8250,9 @@ pub fn change_impact_context<'a>(
             anchor_names.entry(last_path_segment(name)).or_insert(*id);
         }
     }
-    if !anchor_names.is_empty() {
+    // Import leads are hop-1 neighbours, so they are only produced when at least
+    // one hop is requested (a `--depth 0` query reports no impact leads at all).
+    if depth >= 1 && !anchor_names.is_empty() {
         // Repositories of the queried anchors. Empty when the store has no
         // repository attribution, in which case import owners are not filtered.
         let anchor_repos: BTreeSet<&str> = original_targets
@@ -8259,11 +8301,14 @@ pub fn change_impact_context<'a>(
                 {
                     continue;
                 }
-                // Repo scope: skip an owner attributed to a different repository.
+                // Repo scope: when the query is scoped to a repository, the owner
+                // must resolve to one of the anchors' repositories. An owner with
+                // no repository attribution is out of scope and is skipped, so an
+                // unattributed legacy/generated file cannot leak a cross-repo lead.
                 if !anchor_repos.is_empty()
-                    && repo_index
+                    && !repo_index
                         .owner_of(owner.id())
-                        .is_some_and(|repo| !anchor_repos.contains(repo))
+                        .is_some_and(|repo| anchor_repos.contains(repo))
                 {
                     continue;
                 }

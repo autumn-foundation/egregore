@@ -2682,3 +2682,286 @@ fn import_resolution_respects_repo_scope() {
         "repo-b importer must not appear under --repo repo-a; got: {refs:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// containing_context for a method resolves to its file by climbing the impl
+// Symbol owner; import resolution honours --depth 0 and repo attribution.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn method_containing_context_resolves_to_file() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("method_ctx.jsonl");
+    let mut graph = Graph::new();
+    let p = "src/lib.rs";
+
+    let lib_file_id = file_id(p);
+    graph.push(GraphRecord::syntax_node(
+        lib_file_id.clone(),
+        NodeKind::File,
+        p.to_owned(),
+        span(1, 100),
+        "lib.rs".to_owned(),
+        "rust",
+        "Source file src/lib.rs".to_owned(),
+    ));
+    let impl_id = sym_id(p, "impl Foo");
+    graph.push(GraphRecord::syntax_node(
+        impl_id.clone(),
+        NodeKind::Symbol,
+        p.to_owned(),
+        span(5, 40),
+        "impl Foo".to_owned(),
+        "rust",
+        "impl Foo".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Contains,
+        lib_file_id.clone(),
+        impl_id.clone(),
+        None,
+        "file contains impl".to_owned(),
+    ));
+    let method_id = sym_id(p, "Foo::bar");
+    graph.push(GraphRecord::syntax_node(
+        method_id.clone(),
+        NodeKind::Symbol,
+        p.to_owned(),
+        span(10, 20),
+        "Foo::bar".to_owned(),
+        "rust",
+        "fn bar".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Defines,
+        impl_id,
+        method_id.clone(),
+        None,
+        "impl defines bar".to_owned(),
+    ));
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    let stdout = egregore()
+        .args(["query", "change-impact", &method_id, "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    let owners: Vec<&str> = v["containing_context"]
+        .as_array()
+        .expect("containing_context")
+        .iter()
+        .filter_map(|c| c["record_id"].as_str())
+        .collect();
+    assert!(
+        owners.contains(&lib_file_id.as_str()),
+        "a method's containing_context must climb to its file; got: {owners:?}"
+    );
+}
+
+#[test]
+fn depth_zero_emits_no_import_leads() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("depth_zero.jsonl");
+    let mut graph = Graph::new();
+
+    let a_path = "src/a.rs";
+    let widget_id = sym_id(a_path, "Widget");
+    graph.push(GraphRecord::syntax_node(
+        widget_id.clone(),
+        NodeKind::Symbol,
+        a_path.to_owned(),
+        span(1, 10),
+        "Widget".to_owned(),
+        "rust",
+        "struct Widget".to_owned(),
+    ));
+    let b_path = "src/b.rs";
+    let b_file_id = file_id(b_path);
+    graph.push(GraphRecord::syntax_node(
+        b_file_id,
+        NodeKind::File,
+        b_path.to_owned(),
+        span(1, 50),
+        "b.rs".to_owned(),
+        "rust",
+        "Source file src/b.rs".to_owned(),
+    ));
+    let import_id = stable_id(&["node", "import", b_path, "Widget"]);
+    graph.push(GraphRecord::syntax_node(
+        import_id.clone(),
+        NodeKind::Import,
+        b_path.to_owned(),
+        span(1, 1),
+        "crate::a::Widget".to_owned(),
+        "rust",
+        "import Widget".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Imports,
+        file_id(b_path),
+        import_id,
+        None,
+        "b imports Widget".to_owned(),
+    ));
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    let stdout = egregore()
+        .args(["query", "change-impact", &widget_id, "--graph"])
+        .arg(&path)
+        .args(["--depth", "0"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert!(
+        v["referencing_files"]
+            .as_array()
+            .expect("referencing_files")
+            .is_empty(),
+        "--depth 0 must not emit import leads (hop-1 rows beyond the bound)"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn repo_scope_excludes_unattributed_import_owner() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("import_unattributed.jsonl");
+    let mut graph = Graph::new();
+
+    // repo-a contains Widget and an importer of Widget.
+    let repo_id = stable_id(&["node", "Repository", "repo-a"]);
+    graph.push(GraphRecord::node(
+        repo_id.clone(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo-a".to_owned()),
+        "Repository repo-a".to_owned(),
+    ));
+    let a_path = "src/a.rs";
+    let a_file_id = file_id(a_path);
+    graph.push(GraphRecord::syntax_node(
+        a_file_id.clone(),
+        NodeKind::File,
+        a_path.to_owned(),
+        span(1, 50),
+        "a.rs".to_owned(),
+        "rust",
+        "file a".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id,
+        a_file_id.clone(),
+        None,
+        "repo contains a".to_owned(),
+    ));
+    let widget_id = sym_id(a_path, "Widget");
+    graph.push(GraphRecord::syntax_node(
+        widget_id.clone(),
+        NodeKind::Symbol,
+        a_path.to_owned(),
+        span(5, 10),
+        "Widget".to_owned(),
+        "rust",
+        "struct Widget".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Defines,
+        a_file_id.clone(),
+        widget_id,
+        None,
+        "a defines Widget".to_owned(),
+    ));
+    let a_imp = stable_id(&["node", "import", a_path, "Widget"]);
+    graph.push(GraphRecord::syntax_node(
+        a_imp.clone(),
+        NodeKind::Import,
+        a_path.to_owned(),
+        span(1, 1),
+        "crate::Widget".to_owned(),
+        "rust",
+        "import".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Imports,
+        a_file_id,
+        a_imp,
+        None,
+        "a imports Widget".to_owned(),
+    ));
+
+    // An orphan file with no Repository owner that also imports Widget.
+    let orphan_path = "src/orphan.rs";
+    let orphan_id = file_id(orphan_path);
+    graph.push(GraphRecord::syntax_node(
+        orphan_id.clone(),
+        NodeKind::File,
+        orphan_path.to_owned(),
+        span(1, 50),
+        "orphan.rs".to_owned(),
+        "rust",
+        "orphan file".to_owned(),
+    ));
+    let orphan_imp = stable_id(&["node", "import", orphan_path, "Widget"]);
+    graph.push(GraphRecord::syntax_node(
+        orphan_imp.clone(),
+        NodeKind::Import,
+        orphan_path.to_owned(),
+        span(1, 1),
+        "crate::Widget".to_owned(),
+        "rust",
+        "import".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Imports,
+        orphan_id,
+        orphan_imp,
+        None,
+        "orphan imports Widget".to_owned(),
+    ));
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    let stdout = egregore()
+        .args([
+            "query",
+            "change-impact",
+            "Widget",
+            "--repo",
+            "repo-a",
+            "--graph",
+        ])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    let refs: Vec<&str> = v["referencing_files"]
+        .as_array()
+        .expect("referencing_files")
+        .iter()
+        .filter_map(|c| c["repo_relative_path"].as_str())
+        .collect();
+    assert!(
+        refs.iter().all(|p| !p.contains("orphan")),
+        "an unattributed import owner must not leak under --repo; got: {refs:?}"
+    );
+}
