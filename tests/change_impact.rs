@@ -2423,3 +2423,262 @@ fn symbol_handle_does_not_seed_descendants() {
         "querying a Symbol must not seed its descendants' callers; got: {callers:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Import resolution handles grouped/aliased `use` trees, impl-local (Symbol)
+// import owners, and respects repository scope.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn grouped_imports_resolved_by_name() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("grouped_imports.jsonl");
+    let mut graph = Graph::new();
+
+    let a_path = "src/a.rs";
+    let widget_id = sym_id(a_path, "Widget");
+    graph.push(GraphRecord::syntax_node(
+        widget_id.clone(),
+        NodeKind::Symbol,
+        a_path.to_owned(),
+        span(1, 10),
+        "Widget".to_owned(),
+        "rust",
+        "struct Widget".to_owned(),
+    ));
+
+    // src/b.rs imports a grouped, aliased use tree containing Widget.
+    let b_path = "src/b.rs";
+    let b_file_id = file_id(b_path);
+    graph.push(GraphRecord::syntax_node(
+        b_file_id.clone(),
+        NodeKind::File,
+        b_path.to_owned(),
+        span(1, 50),
+        "b.rs".to_owned(),
+        "rust",
+        "Source file src/b.rs".to_owned(),
+    ));
+    let import_id = stable_id(&["node", "import", b_path, "grouped"]);
+    graph.push(GraphRecord::syntax_node(
+        import_id.clone(),
+        NodeKind::Import,
+        b_path.to_owned(),
+        span(1, 1),
+        "crate::a::{Gadget, Widget as W}".to_owned(),
+        "rust",
+        "Rust import group".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Imports,
+        b_file_id.clone(),
+        import_id,
+        None,
+        "src/b.rs imports a group".to_owned(),
+    ));
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    let stdout = egregore()
+        .args(["query", "change-impact", &widget_id, "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    let refs: Vec<&str> = v["referencing_files"]
+        .as_array()
+        .expect("referencing_files")
+        .iter()
+        .filter_map(|c| c["record_id"].as_str())
+        .collect();
+    assert!(
+        refs.contains(&b_file_id.as_str()),
+        "a grouped/aliased import of the symbol must resolve to the importing file; got: {refs:?}"
+    );
+}
+
+#[test]
+fn impl_local_imports_report_symbol_owner() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("impl_local_import.jsonl");
+    let mut graph = Graph::new();
+
+    let a_path = "src/a.rs";
+    let widget_id = sym_id(a_path, "Widget");
+    graph.push(GraphRecord::syntax_node(
+        widget_id.clone(),
+        NodeKind::Symbol,
+        a_path.to_owned(),
+        span(1, 10),
+        "Widget".to_owned(),
+        "rust",
+        "struct Widget".to_owned(),
+    ));
+
+    // An impl block (Symbol) owns a local `use` of Widget.
+    let b_path = "src/b.rs";
+    let impl_id = sym_id(b_path, "impl Thing");
+    graph.push(GraphRecord::syntax_node(
+        impl_id.clone(),
+        NodeKind::Symbol,
+        b_path.to_owned(),
+        span(1, 40),
+        "impl Thing".to_owned(),
+        "rust",
+        "impl Thing".to_owned(),
+    ));
+    let import_id = stable_id(&["node", "import", b_path, "Widget"]);
+    graph.push(GraphRecord::syntax_node(
+        import_id.clone(),
+        NodeKind::Import,
+        b_path.to_owned(),
+        span(2, 2),
+        "crate::a::Widget".to_owned(),
+        "rust",
+        "Rust import Widget".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Imports,
+        impl_id.clone(),
+        import_id,
+        None,
+        "impl Thing imports Widget".to_owned(),
+    ));
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    let stdout = egregore()
+        .args(["query", "change-impact", &widget_id, "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    let refs: Vec<&str> = v["referencing_files"]
+        .as_array()
+        .expect("referencing_files")
+        .iter()
+        .filter_map(|c| c["record_id"].as_str())
+        .collect();
+    assert!(
+        refs.contains(&impl_id.as_str()),
+        "an impl-local import (Symbol owner) must be reported as a referencing lead; got: {refs:?}"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn import_resolution_respects_repo_scope() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("import_repo_scope.jsonl");
+    let mut graph = Graph::new();
+
+    for repo in ["repo-a", "repo-b"] {
+        let repo_id = stable_id(&["node", "Repository", repo]);
+        graph.push(GraphRecord::node(
+            repo_id.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(repo.to_owned()),
+            format!("Repository {repo}"),
+        ));
+        let fpath = format!("src/{repo}_mod.rs");
+        let f_id = file_id(&fpath);
+        graph.push(GraphRecord::syntax_node(
+            f_id.clone(),
+            NodeKind::File,
+            fpath.clone(),
+            span(1, 50),
+            "mod.rs".to_owned(),
+            "rust",
+            format!("file {fpath}"),
+        ));
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id,
+            f_id.clone(),
+            None,
+            "repo contains file".to_owned(),
+        ));
+        let w_id = sym_id(&fpath, "Widget");
+        graph.push(GraphRecord::syntax_node(
+            w_id.clone(),
+            NodeKind::Symbol,
+            fpath.clone(),
+            span(5, 10),
+            "Widget".to_owned(),
+            "rust",
+            "struct Widget".to_owned(),
+        ));
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Defines,
+            f_id.clone(),
+            w_id,
+            None,
+            "defines Widget".to_owned(),
+        ));
+        let imp_id = stable_id(&["node", "import", &fpath, "Widget"]);
+        graph.push(GraphRecord::syntax_node(
+            imp_id.clone(),
+            NodeKind::Import,
+            fpath.clone(),
+            span(1, 1),
+            "crate::Widget".to_owned(),
+            "rust",
+            "import Widget".to_owned(),
+        ));
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Imports,
+            f_id,
+            imp_id,
+            None,
+            "imports Widget".to_owned(),
+        ));
+    }
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    // Query Widget scoped to repo-a: only repo-a's importing file may appear.
+    let stdout = egregore()
+        .args([
+            "query",
+            "change-impact",
+            "Widget",
+            "--repo",
+            "repo-a",
+            "--graph",
+        ])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    let refs: Vec<&str> = v["referencing_files"]
+        .as_array()
+        .expect("referencing_files")
+        .iter()
+        .filter_map(|c| c["repo_relative_path"].as_str())
+        .collect();
+    assert!(
+        refs.iter().any(|p| p.contains("repo-a")),
+        "repo-a importer should appear; got: {refs:?}"
+    );
+    assert!(
+        refs.iter().all(|p| !p.contains("repo-b")),
+        "repo-b importer must not appear under --repo repo-a; got: {refs:?}"
+    );
+}

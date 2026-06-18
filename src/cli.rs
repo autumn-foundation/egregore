@@ -6953,7 +6953,7 @@ fn query_change_impact_cmd(
         std::process::exit(2);
     }
 
-    let ctx = query::change_impact_context(records, &target, depth);
+    let ctx = query::change_impact_context(records, &target, depth, index);
 
     let mut diagnostics: Vec<AuditDiagnostic<'_>> = ctx
         .diagnostics

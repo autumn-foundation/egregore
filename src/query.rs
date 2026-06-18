@@ -5376,6 +5376,33 @@ fn last_path_segment(name: &str) -> &str {
     name.rsplit("::").next().unwrap_or(name)
 }
 
+/// Final segment of one import item, stripping a trailing `as` alias.
+/// Returns `None` for globs (`*`), `self`, or empty items.
+fn import_item_name(item: &str) -> Option<&str> {
+    let base = item.trim();
+    let base = base.split(" as ").next().unwrap_or(base).trim();
+    let seg = last_path_segment(base).trim();
+    if seg.is_empty() || seg == "*" || seg == "self" {
+        None
+    } else {
+        Some(seg)
+    }
+}
+
+/// Imported symbol names from a `use` path, expanding a brace group and
+/// stripping aliases. `a::b::{X, Y as Z}` → `[X, Y]`; `a::b::C` → `[C]`.
+fn imported_symbol_names(import_path: &str) -> Vec<&str> {
+    let trimmed = import_path.trim();
+    trimmed.find('{').map_or_else(
+        || import_item_name(trimmed).into_iter().collect(),
+        |open| {
+            let inner = &trimmed[open + 1..];
+            let inner = inner.strip_suffix('}').unwrap_or(inner);
+            inner.split(',').filter_map(import_item_name).collect()
+        },
+    )
+}
+
 /// A claim is **verified** when it cites at least one present verification-domain
 /// record through an evidence link (`VALIDATED_BY`, `HAS_EVIDENCE`,
 /// `PRODUCED_EVIDENCE`) or an equivalent outgoing edge. This is a structural,
@@ -7638,13 +7665,15 @@ pub fn change_impact_unsupported_anchor_kind(
 /// full handle resolution contract for AC2). The traversal is bounded by
 /// `depth` hops from the anchor set. Every result group is canonically sorted
 /// for determinism (AC7); missing edge targets produce diagnostics rather than
-/// silently dropping relationship classes (AC6/AC8).
+/// silently dropping relationship classes (AC6/AC8). `repo_index` scopes the
+/// name-based import resolution to the queried anchors' repositories.
 #[must_use]
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 pub fn change_impact_context<'a>(
     records: &'a [GraphRecord],
     target: &ResolvedFailureTarget,
     depth: usize,
+    repo_index: &RepositoryIndex,
 ) -> ChangeImpactContext<'a> {
     fn drain_sorted<'a>(
         map: BTreeMap<(&'a str, &'a str), ImpactLead<'a>>,
@@ -8161,12 +8190,15 @@ pub fn change_impact_context<'a>(
 
     // ── Import resolution (name-based) ─────────────────────────────────────────
     // The Rust extractor records `use` imports as `File/Module --IMPORTS--> Import`
-    // nodes whose name is the imported path; there is no structural edge from the
-    // Import node to the symbol it imports. Connect them to the queried symbol by
-    // matching the import's final path segment to a seeded anchor symbol's name,
-    // then report the importing file/module as a `referencing_files` lead. This is
-    // name-based, so same-name collisions can surface extra leads — consistent
-    // with the "leads, not proof" contract.
+    // nodes (and `Symbol --IMPORTS--> Import` for imports local to an impl), whose
+    // name is the imported path; there is no structural edge from the Import node
+    // to the symbol it imports. Connect them by matching each imported final path
+    // segment — grouped (`a::{X, Y}`) and aliased (`X as Y`) imports expanded — to
+    // a seeded anchor symbol's name, then report the importing file/module/symbol
+    // as a `referencing_files` lead. Owners are constrained to the queried
+    // anchors' repositories so a `--repo`-scoped query never reports a same-named
+    // import from another repository. Name-based, so same-name collisions can
+    // surface extra leads — consistent with the "leads, not proof" contract.
     let mut anchor_names: BTreeMap<&str, &str> = BTreeMap::new();
     for id in &seed_set {
         if let Some(&node) = by_id.get(*id)
@@ -8179,6 +8211,12 @@ pub fn change_impact_context<'a>(
         }
     }
     if !anchor_names.is_empty() {
+        // Repositories of the queried anchors. Empty when the store has no
+        // repository attribution, in which case import owners are not filtered.
+        let anchor_repos: BTreeSet<&str> = original_targets
+            .iter()
+            .filter_map(|id| repo_index.owner_of(id))
+            .collect();
         for r in records {
             let GraphRecord::Node {
                 id: import_id,
@@ -8192,7 +8230,10 @@ pub fn change_impact_context<'a>(
             if deleted(import_id.as_str()) {
                 continue;
             }
-            let Some(&anchor) = anchor_names.get(last_path_segment(import_name)) else {
+            let Some(&anchor) = imported_symbol_names(import_name)
+                .into_iter()
+                .find_map(|seg| anchor_names.get(seg))
+            else {
                 continue;
             };
             #[allow(clippy::map_unwrap_or)]
@@ -8208,21 +8249,34 @@ pub fn change_impact_context<'a>(
                 else {
                     continue;
                 };
-                if matches!(
+                // The owner is the importing file/module, or the owning Symbol
+                // for an import local to an impl method. Never report the queried
+                // target itself.
+                if !matches!(
                     record_node_kind(owner),
-                    Some(NodeKind::File | NodeKind::Module)
-                ) {
-                    referencing_files
-                        .entry((owner.id(), edge_id))
-                        .or_insert(ImpactLead {
-                            record: owner,
-                            edge: edge_record,
-                            relation: "IMPORTS",
-                            direction: ImpactDirection::Inbound,
-                            anchor_id: anchor,
-                            hop: 1,
-                        });
+                    Some(NodeKind::File | NodeKind::Module | NodeKind::Symbol)
+                ) || original_targets.contains(owner.id())
+                {
+                    continue;
                 }
+                // Repo scope: skip an owner attributed to a different repository.
+                if !anchor_repos.is_empty()
+                    && repo_index
+                        .owner_of(owner.id())
+                        .is_some_and(|repo| !anchor_repos.contains(repo))
+                {
+                    continue;
+                }
+                referencing_files
+                    .entry((owner.id(), edge_id))
+                    .or_insert(ImpactLead {
+                        record: owner,
+                        edge: edge_record,
+                        relation: "IMPORTS",
+                        direction: ImpactDirection::Inbound,
+                        anchor_id: anchor,
+                        hop: 1,
+                    });
             }
         }
     }
