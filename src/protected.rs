@@ -319,6 +319,51 @@ fn is_valid_blake3_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+// ── Filesystem helpers with private permissions ────────────────────────────────
+
+/// Creates a directory (and all parents) with owner-only permissions.
+///
+/// On Unix, the directory is created with mode `0o700`.  On other platforms
+/// the system default is used; operators must provision filesystem ACLs
+/// themselves.
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+/// Writes `data` to `path` with owner-only permissions.
+///
+/// On Unix, the file is created (or overwritten) with mode `0o600`.  On
+/// other platforms the system default is used.
+fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(data)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, data)
+    }
+}
+
 // ── Protected store ────────────────────────────────────────────────────────────
 
 /// Content-addressed store for protected raw artifact payloads.
@@ -391,7 +436,7 @@ impl ProtectedStore {
     /// Writes the manifest as canonical-sorted JSONL.
     fn write_manifest(&self, handles: &[ProtectedHandle]) -> io::Result<()> {
         let dir = &self.root;
-        fs::create_dir_all(dir)?;
+        create_private_dir(dir)?;
         let mut lines: Vec<String> = handles
             .iter()
             .map(|h| serde_json::to_string(h).expect("ProtectedHandle serialisation is infallible"))
@@ -399,7 +444,7 @@ impl ProtectedStore {
         lines.sort_unstable();
         lines.dedup();
         let content = format!("{}\n", lines.join("\n"));
-        fs::write(self.manifest_path(), content)
+        write_private_file(&self.manifest_path(), content.as_bytes())
     }
 
     /// Reads the canonical operators file, returning the set of authorised IDs.
@@ -441,7 +486,7 @@ impl ProtectedStore {
     /// Writes the canonical operators file.
     fn write_operators(&self, ops: &[String]) -> io::Result<()> {
         let dir = &self.root;
-        fs::create_dir_all(dir)?;
+        create_private_dir(dir)?;
         let mut lines: Vec<String> = ops
             .iter()
             .map(|o| serde_json::to_string(o).expect("operator serialisation is infallible"))
@@ -449,7 +494,7 @@ impl ProtectedStore {
         lines.sort_unstable();
         lines.dedup();
         let content = format!("{}\n", lines.join("\n"));
-        fs::write(self.operators_path(), content)
+        write_private_file(&self.operators_path(), content.as_bytes())
     }
 
     // ── Public API ─────────────────────────────────────────────────────────────
@@ -623,13 +668,13 @@ impl ProtectedStore {
                         blake3::hash(&existing).to_hex().to_string() != content_hash
                     });
                 if needs_repair {
-                    fs::create_dir_all(self.blobs_dir())?;
-                    fs::write(&blob, &bytes)?;
+                    create_private_dir(&self.blobs_dir())?;
+                    write_private_file(&blob, &bytes)?;
                 }
             } else {
                 // New handle: write blob and register.
-                fs::create_dir_all(self.blobs_dir())?;
-                fs::write(self.blob_path(&content_hash), &bytes)?;
+                create_private_dir(&self.blobs_dir())?;
+                write_private_file(&self.blob_path(&content_hash), &bytes)?;
 
                 let record = ProtectedHandle {
                     handle: handle.clone(),
@@ -708,7 +753,14 @@ impl ProtectedStore {
         }
 
         // 3. Handle format check.
-        if !handle.starts_with(PROTECTED_HANDLE_PREFIX) {
+        // A valid handle is `protected:v1:` + exactly 64 lowercase hex chars.
+        // A prefixed-but-malformed value (e.g. `protected:v1:abc`) must be
+        // rejected as MalformedHandle rather than falling through to a
+        // PayloadNotFound (exit 2) which misclassifies bad caller input.
+        let suffix_valid = handle
+            .strip_prefix(PROTECTED_HANDLE_PREFIX)
+            .is_some_and(is_valid_blake3_hex);
+        if !suffix_valid {
             return Err(GetError::MalformedHandle {
                 handle: handle.to_owned(),
             });
@@ -754,13 +806,38 @@ impl ProtectedStore {
             });
         }
 
-        // 5. Blob presence check.
+        // 5. Blob presence and safety check.
+        //
+        // `symlink_metadata` inspects the path WITHOUT following symlinks, so a
+        // tampered store that replaced a blob with a symlink to `/dev/zero` (or a
+        // FIFO / device node) is caught here rather than after an unbounded read.
+        // Only regular files are accepted.
         let blob_path = self.blob_path(&record.content_hash);
         let expected_path = blob_path.display().to_string();
-        if !blob_path.exists() {
+        let blob_meta =
+            blob_path
+                .symlink_metadata()
+                .map_err(|_| GetError::MissingProtectedPayload {
+                    handle: handle.to_owned(),
+                    expected_path: expected_path.clone(),
+                })?;
+        if !blob_meta.file_type().is_file() {
             return Err(GetError::MissingProtectedPayload {
                 handle: handle.to_owned(),
                 expected_path,
+            });
+        }
+        // Pre-check file size against the manifest byte_len before reading to
+        // avoid loading a truncated or unexpectedly large file into memory.
+        if blob_meta.len() != record.byte_len {
+            return Err(GetError::HashMismatch {
+                handle: handle.to_owned(),
+                expected: record.content_hash.clone(),
+                actual: format!(
+                    "(blob size {} B does not match manifest byte_len {} B — not read)",
+                    blob_meta.len(),
+                    record.byte_len
+                ),
             });
         }
 
@@ -1429,6 +1506,54 @@ mod tests {
         assert_eq!(
             after[0].byte_len, real_byte_len,
             "byte_len must be correct after repair"
+        );
+    }
+
+    #[test]
+    fn get_handle_with_short_suffix_is_malformed_not_not_found() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
+        store.write_operators(&["op-1".to_owned()]).unwrap();
+
+        // `protected:v1:abc` has the right prefix but a 3-char suffix (not 64 hex).
+        let err = store.get("protected:v1:abc", "op-1").unwrap_err();
+        assert_eq!(
+            err.code(),
+            "malformed_handle",
+            "prefixed-but-short handle must be MalformedHandle, not PayloadNotFound"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_symlink_is_rejected_before_read() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"symlink test").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "transcript".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        let report = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        let content_hash = report.entries[0].content_hash.clone();
+        let handle = report.entries[0].handle.clone();
+
+        // Replace the real blob with a symlink to /dev/null.
+        let blob_path = dir.path().join("blobs").join(&content_hash);
+        fs::remove_file(&blob_path).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &blob_path).unwrap();
+
+        // get() must reject the symlink before reading, not follow it.
+        let err = store.get(&handle, "op-1").unwrap_err();
+        assert_eq!(
+            err.code(),
+            "missing_protected_payload",
+            "symlink blob must be rejected as MissingProtectedPayload"
         );
     }
 }
