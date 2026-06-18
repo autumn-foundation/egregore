@@ -233,7 +233,12 @@ pub enum GetError {
     },
     /// The handle string does not have the `protected:v1:` prefix.
     MalformedHandle {
-        /// The invalid handle string (no payload bytes echoed).
+        /// The invalid handle string.
+        ///
+        /// Intentionally not serialized: the `--handle` argument position may
+        /// accidentally receive a bearer token or other secret, and echoing it
+        /// to stderr violates the diagnostic invariant.
+        #[serde(skip)]
         handle: String,
     },
     /// The handle is not present in the manifest.
@@ -301,6 +306,17 @@ impl GetError {
         });
         serde_json::to_string(&envelope).expect("envelope serialisation is infallible")
     }
+}
+
+// ── BLAKE3 hex validation ──────────────────────────────────────────────────────
+
+/// Returns `true` iff `s` is a valid 64-character lowercase BLAKE3 hex string.
+///
+/// Used to guard against path-traversal attacks where a tampered `content_hash`
+/// in `manifest.jsonl` (e.g. `"../../../etc/passwd"`) would otherwise be joined
+/// directly onto the blobs directory path.
+fn is_valid_blake3_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 // ── Protected store ────────────────────────────────────────────────────────────
@@ -393,11 +409,14 @@ impl ProtectedStore {
             return Ok(Vec::new());
         }
         let content = fs::read_to_string(&path)?;
+        // Fail-closed: skip lines that do not parse as a JSON string rather than
+        // falling back to the raw line, which would authorize an attacker-controlled
+        // value found in a corrupted or hand-edited operators.jsonl.
         let mut ops: Vec<String> = content
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
-            .map(|l| serde_json::from_str::<String>(l).unwrap_or_else(|_| l.to_owned()))
+            .filter_map(|l| serde_json::from_str::<String>(l).ok())
             .collect();
         ops.sort_unstable();
         ops.dedup();
@@ -444,6 +463,15 @@ impl ProtectedStore {
         captured_at: &str,
         enabled: bool,
     ) -> io::Result<CaptureReport> {
+        // Validate at the store API boundary, not just the CLI, so embedded
+        // callers cannot write "" into operators.jsonl and authorize get("", "").
+        if enabled && producer_id.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "producer_id must not be empty when capture is enabled",
+            ));
+        }
+
         let mut outcomes: Vec<CaptureEntryOutcome> = Vec::new();
         let mut stored_count = 0usize;
         let mut skipped_count = 0usize;
@@ -528,13 +556,18 @@ impl ProtectedStore {
             // Enabled: store blob + register in manifest.
             let already_exists = existing.iter().any(|h| h.handle == handle);
             if already_exists {
-                // Handle already registered: repair a missing blob while the
-                // source is still available so `get` does not fail with
-                // `missing_protected_payload` after a partial store deletion.
+                // Handle already registered: repair the blob if it is missing
+                // *or* its contents no longer match the expected hash (corruption).
+                // This ensures `get` succeeds after a partial store deletion or
+                // silent blob corruption while the source file is still available.
                 let blob = self.blob_path(&content_hash);
-                if !blob.exists() {
+                let needs_repair = !blob.exists()
+                    || fs::read(&blob).map_or(true, |existing| {
+                        blake3::hash(&existing).to_hex().to_string() != content_hash
+                    });
+                if needs_repair {
                     fs::create_dir_all(self.blobs_dir())?;
-                    fs::write(blob, &bytes)?;
+                    fs::write(&blob, &bytes)?;
                 }
             } else {
                 // New handle: write blob and register.
@@ -569,8 +602,10 @@ impl ProtectedStore {
         if enabled {
             // Persist de-duplicated manifest.
             self.write_manifest(&existing)?;
-            // Record producer as an authorised operator.
-            let mut ops = self.read_operators().unwrap_or_default();
+            // Record producer as an authorised operator.  Propagate read errors
+            // rather than falling back to an empty list, which would silently
+            // revoke all previously authorised operators.
+            let mut ops = self.read_operators()?;
             ops.push(producer_id.to_owned());
             self.write_operators(&ops)?;
         }
@@ -620,9 +655,13 @@ impl ProtectedStore {
         }
 
         // 4. Manifest lookup.
+        // `is_initialised()` above confirmed the manifest exists, so a read
+        // error here is store corruption — not "mode disabled".
         let manifest = self
             .read_manifest()
-            .map_err(|_| GetError::RawArtifactModeDisabled)?;
+            .map_err(|_| GetError::CorruptManifestRecord {
+                handle: handle.to_owned(),
+            })?;
         let record = manifest
             .iter()
             .find(|h| h.handle == handle)
@@ -639,6 +678,17 @@ impl ProtectedStore {
             record.source_path.as_deref(),
         );
         if expected_handle != record.handle {
+            return Err(GetError::CorruptManifestRecord {
+                handle: handle.to_owned(),
+            });
+        }
+
+        // 4b. Validate content_hash format before constructing the blob path.
+        // `PathBuf::join` accepts absolute paths and `..` components, so a
+        // tampered manifest entry with e.g. `content_hash = "../../../etc/passwd"`
+        // could escape the blobs directory.  A valid BLAKE3 hex is exactly 64
+        // lowercase hex characters, so anything else is corrupt.
+        if !is_valid_blake3_hex(&record.content_hash) {
             return Err(GetError::CorruptManifestRecord {
                 handle: handle.to_owned(),
             });
@@ -975,6 +1025,179 @@ mod tests {
         assert!(
             result.is_err(),
             "capture must fail when manifest is corrupt"
+        );
+    }
+
+    #[test]
+    fn malformed_handle_not_echoed_in_error_json() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
+        store.write_operators(&["op-1".to_owned()]).unwrap();
+
+        // Simulate accidentally passing a bearer token in the handle position.
+        let err = store
+            .get("Bearer sk-secret-handle-value", "op-1")
+            .unwrap_err();
+        assert_eq!(err.code(), "malformed_handle");
+        let json = err.to_json();
+        assert!(
+            !json.contains("sk-secret-handle-value"),
+            "handle value must not be echoed in error JSON: {json}"
+        );
+    }
+
+    #[test]
+    fn capture_rejects_empty_producer_id_at_store_api() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"hello").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "transcript".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        let result = store.capture(&entries, "", "0.1.0", fixed_ts(), true);
+        assert!(result.is_err(), "empty producer_id must be rejected");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "must return InvalidInput for empty producer_id"
+        );
+
+        // Whitespace-only producer should also be rejected.
+        let result2 = store.capture(&entries, "   ", "0.1.0", fixed_ts(), true);
+        assert!(
+            result2.is_err(),
+            "whitespace-only producer_id must be rejected"
+        );
+    }
+
+    #[test]
+    fn capture_repairs_corrupted_blob() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"original content").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        // Initial capture.
+        let report = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        let content_hash = report.entries[0].content_hash.clone();
+        let handle = report.entries[0].handle.clone();
+
+        // Corrupt the blob (file exists but content is wrong).
+        fs::write(dir.path().join("blobs").join(&content_hash), b"corrupted").unwrap();
+
+        // Re-capture with source still present — must repair corrupted blob.
+        store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+
+        // get() must now return the original content.
+        let bytes = store
+            .get(&handle, "op-1")
+            .expect("get after corruption repair");
+        assert_eq!(bytes, b"original content");
+    }
+
+    #[test]
+    fn get_manifest_read_error_returns_corrupt_manifest_record() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        // Initialise with a valid manifest so is_initialised() returns true.
+        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
+        store.write_operators(&["op-1".to_owned()]).unwrap();
+
+        // Overwrite manifest with invalid JSON so read_manifest() fails.
+        fs::write(dir.path().join("manifest.jsonl"), "not valid json\n").unwrap();
+
+        let err = store
+            .get(
+                "protected:v1:0000000000000000000000000000000000000000000000000000000000000000",
+                "op-1",
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            "corrupt_manifest_record",
+            "manifest read failure must return corrupt_manifest_record, not raw_artifact_mode_disabled"
+        );
+    }
+
+    #[test]
+    fn get_rejects_content_hash_path_traversal() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"path traversal test").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "patch".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+        store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+
+        // Tamper: set content_hash to a path-traversal string and compute a
+        // matching handle so the integrity check passes.
+        let manifest_path = dir.path().join("manifest.jsonl");
+        let content = fs::read_to_string(&manifest_path).unwrap();
+        let mut rec: serde_json::Value = serde_json::from_str(content.trim()).expect("parse");
+        let traversal_hash =
+            "../../../etc/passwd/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        rec["content_hash"] = serde_json::json!(traversal_hash);
+        // Re-compute handle so integrity check passes.
+        let class: crate::protected::ProtectedPayloadClass =
+            serde_json::from_value(rec["source_class"].clone()).unwrap();
+        let new_handle =
+            ProtectedHandle::compute_handle(&class, traversal_hash, rec["source_path"].as_str());
+        rec["handle"] = serde_json::json!(&new_handle);
+        fs::write(&manifest_path, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
+
+        let err = store.get(&new_handle, "op-1").unwrap_err();
+        assert_eq!(
+            err.code(),
+            "corrupt_manifest_record",
+            "path-traversal content_hash must be rejected before building blob path"
+        );
+    }
+
+    #[test]
+    fn malformed_operator_record_not_authorized() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        // Write operators.jsonl with one valid JSON string and one bare/unquoted line.
+        fs::write(
+            dir.path().join("operators.jsonl"),
+            "\"op-valid\"\nbare-not-json-string\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
+
+        // The valid operator must still be authorised.
+        let err_valid = store.get("protected:v1:abc", "op-valid").unwrap_err();
+        assert_ne!(
+            err_valid.code(),
+            "unauthorized",
+            "valid JSON-string operator must remain authorised"
+        );
+
+        // The bare line must NOT grant access (fail-closed).
+        let err_bare = store
+            .get("protected:v1:abc", "bare-not-json-string")
+            .unwrap_err();
+        assert_eq!(
+            err_bare.code(),
+            "unauthorized",
+            "bare/unquoted operator record must not grant access"
         );
     }
 }

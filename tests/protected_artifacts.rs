@@ -806,6 +806,33 @@ fn get_corrupt_manifest_record() {
     assert_eq!(json["error"]["code"], "corrupt_manifest_record");
 }
 
+/// Capturing the same payloads again after a blob is **corrupted** (not just
+/// absent) must repair the store.  This extends the missing-blob repair test
+/// to cover the case where the file exists but the content hash no longer matches.
+#[test]
+fn capture_repairs_corrupted_blob_on_recapture() {
+    let (_guard, store) = tmp_store();
+    let first = run_capture_enabled(&store, "op-1");
+    let handle = first["entries"][0]["handle"].as_str().expect("handle");
+    let content_hash = first["entries"][0]["content_hash"].as_str().expect("hash");
+
+    // Corrupt the blob (overwrite with wrong bytes — file still exists).
+    fs::write(store.join("blobs").join(content_hash), b"corrupted data").expect("corrupt blob");
+
+    // Re-capture with sources still present — must repair the corrupted blob.
+    run_capture_enabled(&store, "op-1");
+
+    // get must now succeed and return valid content.
+    eg().args(["protected", "get"])
+        .arg(handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .success();
+}
+
 /// Capturing the same payloads again after a blob is deleted must repair the
 /// store: `eg protected get` must succeed after re-capture while the source
 /// is still available (fix for missing-blob re-capture scenario).
@@ -840,4 +867,58 @@ fn capture_repairs_missing_blob_on_recapture() {
         .arg("op-1")
         .assert()
         .success();
+}
+
+/// Capture manifest file read failure must emit a JSON error envelope (not
+/// plain-text anyhow error) so automation can parse the diagnostic.
+#[test]
+fn capture_manifest_read_error_emits_json_envelope() {
+    let (_guard, store) = tmp_store();
+    let stderr = eg()
+        .args(["protected", "capture"])
+        .arg("--manifest")
+        .arg("/tmp/egregore_test_nonexistent_manifest_file.jsonl")
+        .arg("--store")
+        .arg(&store)
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&stderr).expect("manifest read error must produce JSON envelope");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["code"], "manifest_read_error");
+}
+
+/// Capture manifest parse failure must emit a JSON error envelope with code
+/// `invalid_manifest` and the failing line number so automation can locate it.
+#[test]
+fn capture_manifest_parse_error_emits_json_envelope() {
+    let (_guard, store) = tmp_store();
+    let src = tempfile::tempdir().expect("src");
+    let bad_manifest = src.path().join("bad.jsonl");
+    fs::write(&bad_manifest, "this is not json\n").unwrap();
+
+    let stderr = eg()
+        .args(["protected", "capture"])
+        .arg("--manifest")
+        .arg(&bad_manifest)
+        .arg("--store")
+        .arg(&store)
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&stderr).expect("parse error must produce JSON envelope");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["code"], "invalid_manifest");
+    assert!(
+        json["error"]["line"].as_u64().is_some(),
+        "line number must be present"
+    );
 }

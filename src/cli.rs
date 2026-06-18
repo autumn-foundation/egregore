@@ -9205,21 +9205,43 @@ fn protected_capture_cmd(
         process::exit(1);
     }
 
-    // Read manifest.
-    let manifest_content = fs::read_to_string(manifest_path).with_context(|| {
-        format!(
-            "failed to read capture manifest at {}",
-            manifest_path.display()
-        )
-    })?;
+    // Read manifest — emit JSON envelope on failure so automation can distinguish
+    // manifest errors from other stderr output.
+    let manifest_content = match fs::read_to_string(manifest_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "manifest_read_error",
+                    "message": format!("failed to read capture manifest at {}: {e}", manifest_path.display())
+                }
+            });
+            eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+            process::exit(1);
+        }
+    };
     let mut entries: Vec<CaptureEntry> = Vec::new();
     for (i, line) in manifest_content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let entry: CaptureEntry = serde_json::from_str(line)
-            .with_context(|| format!("manifest line {}: failed to parse JSON: {line}", i + 1))?;
+        let entry: CaptureEntry = match serde_json::from_str(line) {
+            Ok(e) => e,
+            Err(e) => {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "invalid_manifest",
+                        "line": i + 1,
+                        "message": format!("manifest line {}: failed to parse JSON: {e}", i + 1)
+                    }
+                });
+                eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+                process::exit(1);
+            }
+        };
         entries.push(entry);
     }
 
