@@ -1889,3 +1889,146 @@ fn queried_target_is_not_its_own_lead() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// `--depth` is a wider BFS over code-topology edges: reached symbol leads of
+// every relation (not just CALLS) expand to the next hop, so callers/callees of
+// a referencing symbol or an implementation are reached at depth 2.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn depth_expands_through_references_and_implementations() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("depth_expand.jsonl");
+    let mut graph = Graph::new();
+    let p = "src/m.rs";
+
+    // anchor (a trait), its implementation, and a symbol that references it.
+    let anchor_id = sym_id(p, "anchor_trait");
+    graph.push(GraphRecord::syntax_node(
+        anchor_id.clone(),
+        NodeKind::Symbol,
+        p.to_owned(),
+        span(1, 10),
+        "anchor_trait".to_owned(),
+        "rust",
+        "trait anchor_trait".to_owned(),
+    ));
+    let impl_id = sym_id(p, "impl_sym");
+    graph.push(GraphRecord::syntax_node(
+        impl_id.clone(),
+        NodeKind::Symbol,
+        p.to_owned(),
+        span(12, 20),
+        "impl_sym".to_owned(),
+        "rust",
+        "impl anchor_trait for impl_sym".to_owned(),
+    ));
+    let ref_id = sym_id(p, "ref_sym");
+    graph.push(GraphRecord::syntax_node(
+        ref_id.clone(),
+        NodeKind::Symbol,
+        p.to_owned(),
+        span(22, 30),
+        "ref_sym".to_owned(),
+        "rust",
+        "fn ref_sym references anchor_trait".to_owned(),
+    ));
+    // Second-hop neighbours: a caller of the implementation and a caller of the
+    // referencing symbol. Neither touches the anchor directly.
+    let caller_of_impl_id = sym_id(p, "caller_of_impl");
+    graph.push(GraphRecord::syntax_node(
+        caller_of_impl_id.clone(),
+        NodeKind::Symbol,
+        p.to_owned(),
+        span(32, 40),
+        "caller_of_impl".to_owned(),
+        "rust",
+        "fn caller_of_impl".to_owned(),
+    ));
+    let caller_of_ref_id = sym_id(p, "caller_of_ref");
+    graph.push(GraphRecord::syntax_node(
+        caller_of_ref_id.clone(),
+        NodeKind::Symbol,
+        p.to_owned(),
+        span(42, 50),
+        "caller_of_ref".to_owned(),
+        "rust",
+        "fn caller_of_ref".to_owned(),
+    ));
+
+    // impl_sym IMPLEMENTS anchor_trait; ref_sym REFERENCES anchor_trait.
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Implements,
+        impl_id.clone(),
+        anchor_id.clone(),
+        None,
+        "impl_sym implements anchor_trait".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::References,
+        ref_id.clone(),
+        anchor_id.clone(),
+        None,
+        "ref_sym references anchor_trait".to_owned(),
+    ));
+    // Second-hop CALLS edges into the impl and the referencing symbol.
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Calls,
+        caller_of_impl_id.clone(),
+        impl_id,
+        None,
+        "caller_of_impl calls impl_sym".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Calls,
+        caller_of_ref_id.clone(),
+        ref_id,
+        None,
+        "caller_of_ref calls ref_sym".to_owned(),
+    ));
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    let callers = |depth: &str| -> Vec<String> {
+        let stdout = egregore()
+            .args(["query", "change-impact", &anchor_id, "--graph"])
+            .arg(&path)
+            .args(["--depth", depth])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let out = String::from_utf8(stdout).expect("utf8");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        v["direct_callers"]
+            .as_array()
+            .expect("direct_callers")
+            .iter()
+            .filter_map(|c| c["record_id"].as_str().map(str::to_owned))
+            .collect()
+    };
+
+    // At depth 1, only the direct implementation/reference leads exist; their
+    // callers are one hop further out and must not appear yet.
+    let d1 = callers("1");
+    assert!(
+        !d1.contains(&caller_of_impl_id) && !d1.contains(&caller_of_ref_id),
+        "second-hop callers must be absent at depth 1; got: {d1:?}"
+    );
+
+    // At depth 2, the implementation and referencing symbols expand, surfacing
+    // their callers.
+    let d2 = callers("2");
+    assert!(
+        d2.contains(&caller_of_impl_id),
+        "caller of the implementation must be reached at depth 2; got: {d2:?}"
+    );
+    assert!(
+        d2.contains(&caller_of_ref_id),
+        "caller of the referencing symbol must be reached at depth 2; got: {d2:?}"
+    );
+}

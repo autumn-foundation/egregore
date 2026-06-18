@@ -7875,6 +7875,18 @@ pub fn change_impact_context<'a>(
                                         hop,
                                     },
                                 );
+                                // Expand referencing symbols at the next hop so a
+                                // wider `--depth` reaches their callers/referrers
+                                // (reached symbol nodes expand; file/module owners
+                                // do not).
+                                if hop < depth
+                                    && matches!(
+                                        record_node_kind(node),
+                                        Some(NodeKind::Symbol | NodeKind::Module)
+                                    )
+                                {
+                                    next_frontier.insert(node.id());
+                                }
                             }
                             Some(_) => {}
                             None => {
@@ -7943,6 +7955,16 @@ pub fn change_impact_context<'a>(
                                         anchor_id,
                                         hop,
                                     });
+                                // Expand implementation symbols at the next hop so
+                                // a wider `--depth` reaches their callers/callees.
+                                if hop < depth
+                                    && matches!(
+                                        record_node_kind(node),
+                                        Some(NodeKind::Symbol | NodeKind::Module)
+                                    )
+                                {
+                                    next_frontier.insert(node.id());
+                                }
                             }
                             Some(_) => {}
                             None => {
@@ -8080,6 +8102,16 @@ pub fn change_impact_context<'a>(
                                         anchor_id,
                                         hop,
                                     });
+                                // Expand implementation/trait symbols at the next
+                                // hop so a wider `--depth` reaches their neighbors.
+                                if hop < depth
+                                    && matches!(
+                                        record_node_kind(node),
+                                        Some(NodeKind::Symbol | NodeKind::Module)
+                                    )
+                                {
+                                    next_frontier.insert(node.id());
+                                }
                             }
                             Some(_) => {}
                             None => {
