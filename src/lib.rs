@@ -52,6 +52,8 @@ pub mod memory_recall_eval;
 pub mod parser;
 /// Local setup preflight report for the `eg doctor` command (issue #75).
 pub mod preflight;
+/// Protected raw-artifact capture and retrieval (issue #60).
+pub mod protected;
 /// Agent-facing graph query helpers.
 pub mod query;
 /// Redaction policy engine (`docs/schema/redaction.md` v1).

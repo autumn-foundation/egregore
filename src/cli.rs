@@ -423,6 +423,20 @@ enum Commands {
         #[arg(long, default_value = ".egregore")]
         data_dir: PathBuf,
     },
+    /// Capture and retrieve protected raw artifact payloads (issue #60).
+    ///
+    /// By default Egregore stores only content hashes and handles for raw payloads
+    /// such as transcripts, command output, patches, task narratives, and reports.
+    /// This command gives operators an opt-in workflow to also retain the original
+    /// raw bytes in a local, content-addressed protected store that the graph, query,
+    /// and semantic surfaces never read.
+    ///
+    /// See `docs/cli/protected-artifacts.md` for the full operator workflow.
+    Protected {
+        /// Protected-artifact subcommand.
+        #[command(subcommand)]
+        subcommand: ProtectedSubcommand,
+    },
     /// Report local setup readiness for the scan → ingest → semantic-search workflow.
     ///
     /// Read-only by default: does not download models, create graph records, mutate
@@ -1187,6 +1201,69 @@ enum WriteKind {
     },
 }
 
+/// Subcommands for `protected`.
+#[derive(Debug, Subcommand)]
+enum ProtectedSubcommand {
+    /// Capture raw payloads listed in a manifest JSONL into the protected store.
+    ///
+    /// Without `--protected-raw-artifacts`: preview mode — computes and prints
+    /// content hashes and handles but writes **nothing** to disk.
+    ///
+    /// With `--protected-raw-artifacts`: enabled mode — stores blobs, updates the
+    /// manifest, and records the producer as an authorised operator.
+    ///
+    /// Exit codes:
+    ///   0 — capture complete (or preview complete in disabled mode).
+    ///   1 — manifest file I/O or parse error.
+    Capture {
+        /// Path to the capture manifest JSONL (one `{class,source_path}` per line).
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Protected store directory.
+        #[arg(long)]
+        store: PathBuf,
+        /// Enable protected-raw-artifact mode; without this flag no bytes are stored.
+        #[arg(long)]
+        protected_raw_artifacts: bool,
+        /// Stable producer identity (required when `--protected-raw-artifacts` is set).
+        #[arg(long)]
+        producer: Option<String>,
+        /// Override capture timestamp (RFC 3339) for deterministic tests.
+        #[arg(long)]
+        captured_at: Option<String>,
+    },
+    /// Retrieve raw bytes for a protected handle, verifying the content hash.
+    ///
+    /// Exit codes:
+    ///   0 — bytes written (to `--out` or stdout).
+    ///   1 — store absent / operator unauthorized / malformed handle / blob missing
+    ///       / hash mismatch.
+    ///   2 — handle not found in manifest.
+    Get {
+        /// Protected handle string (`protected:v1:<hex>`).
+        handle: String,
+        /// Protected store directory.
+        #[arg(long)]
+        store: PathBuf,
+        /// Operator identity (must be in the store's authorised set).
+        #[arg(long)]
+        operator: String,
+        /// Write raw bytes to this path instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// List all protected handles (metadata only — no raw bytes).
+    ///
+    /// Exit codes:
+    ///   0 — list emitted (may be empty when store is not yet initialised).
+    ///   1 — manifest I/O or parse error.
+    List {
+        /// Protected store directory.
+        #[arg(long)]
+        store: PathBuf,
+    },
+}
+
 /// Parses process arguments and runs the CLI.
 ///
 /// # Errors
@@ -1358,6 +1435,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         Commands::Repair { action } => repair_cmd(action),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Mcp { data_dir } => crate::mcp::run_stdio(&data_dir),
+        Commands::Protected { subcommand } => protected_cmd(subcommand),
         Commands::Doctor {
             path,
             out,
@@ -9022,6 +9100,149 @@ fn decide_cmd(
         }
     }
 
+    Ok(())
+}
+
+// ── eg protected ──────────────────────────────────────────────────────────────
+
+/// Dispatches `eg protected <subcommand>` (issue #60).
+fn protected_cmd(subcommand: ProtectedSubcommand) -> Result<()> {
+    use crate::protected::ProtectedStore;
+    match subcommand {
+        ProtectedSubcommand::Capture {
+            manifest,
+            store,
+            protected_raw_artifacts,
+            producer,
+            captured_at,
+        } => protected_capture_cmd(
+            &manifest,
+            &store,
+            protected_raw_artifacts,
+            producer.as_deref(),
+            captured_at.as_deref(),
+        ),
+        ProtectedSubcommand::Get {
+            handle,
+            store,
+            operator,
+            out,
+        } => {
+            let ps = ProtectedStore::new(&store);
+            match ps.get(&handle, &operator) {
+                Ok(bytes) => {
+                    if let Some(out_path) = out {
+                        fs::write(&out_path, &bytes).with_context(|| {
+                            format!("failed to write bytes to {}", out_path.display())
+                        })?;
+                    } else {
+                        std::io::Write::write_all(&mut std::io::stdout(), &bytes)
+                            .context("failed to write bytes to stdout")?;
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    let is_not_found = e.code() == "payload_not_found";
+                    eprintln!("{}", e.to_json()); // to_json() is not Display; format is deliberate
+                    process::exit(if is_not_found { 2 } else { 1 });
+                }
+            }
+        }
+        ProtectedSubcommand::List { store } => {
+            let ps = ProtectedStore::new(&store);
+            let handles = ps.list().with_context(|| {
+                format!("failed to read protected store at {}", store.display())
+            })?;
+            let envelope = serde_json::json!({
+                "ok": true,
+                "count": handles.len(),
+                "handles": handles,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&envelope)
+                    .context("failed to serialise list response")?
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Implements `eg protected capture`.
+#[allow(clippy::too_many_lines)]
+fn protected_capture_cmd(
+    manifest_path: &Path,
+    store_path: &Path,
+    enabled: bool,
+    producer: Option<&str>,
+    captured_at_override: Option<&str>,
+) -> Result<()> {
+    use crate::protected::{CaptureEntry, ProtectedStore};
+
+    // Validate: enabled mode requires --producer.
+    if enabled && producer.is_none() {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "missing_field",
+                "field": "producer",
+                "message": "--producer is required when --protected-raw-artifacts is set"
+            }
+        });
+        eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+        process::exit(1);
+    }
+
+    // Read manifest.
+    let manifest_content = fs::read_to_string(manifest_path).with_context(|| {
+        format!(
+            "failed to read capture manifest at {}",
+            manifest_path.display()
+        )
+    })?;
+    let mut entries: Vec<CaptureEntry> = Vec::new();
+    for (i, line) in manifest_content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: CaptureEntry = serde_json::from_str(line)
+            .with_context(|| format!("manifest line {}: failed to parse JSON: {line}", i + 1))?;
+        entries.push(entry);
+    }
+
+    let producer_id = producer.unwrap_or("preview");
+    let producer_version = env!("CARGO_PKG_VERSION");
+    let ts: String;
+    let captured_at = if let Some(ov) = captured_at_override {
+        ov
+    } else {
+        ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        &ts
+    };
+
+    let ps = ProtectedStore::new(store_path);
+    let report = ps
+        .capture(
+            &entries,
+            producer_id,
+            producer_version,
+            captured_at,
+            enabled,
+        )
+        .with_context(|| format!("protected store I/O failed at {}", store_path.display()))?;
+
+    let envelope = serde_json::json!({
+        "ok": true,
+        "enabled": report.enabled,
+        "stored_count": report.stored_count,
+        "skipped_count": report.skipped_count,
+        "entries": report.entries,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&envelope).context("failed to serialise capture response")?
+    );
     Ok(())
 }
 
