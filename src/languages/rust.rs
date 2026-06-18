@@ -360,23 +360,33 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let bodies = self.symbol_bodies.clone();
         for body in bodies {
             for (name, target_id) in &definitions {
-                if body.id == *target_id || name == &body.name || !body.text.contains(name) {
+                if body.id == *target_id
+                    || name == &body.name
+                    || !contains_identifier(&body.text, name)
+                {
                     continue;
                 }
 
-                self.add_edge(
-                    EdgeLabel::Mentions,
-                    body.id.clone(),
-                    target_id.clone(),
-                    format!("{} mentions {name}", body.name),
-                );
-
+                // A code reference between two symbols. Type it as `Calls` when
+                // it looks like an invocation, otherwise as `References` (type
+                // and value uses, trait bounds, constructors). Both are
+                // deterministic code-topology edges that downstream queries
+                // (change-impact, context) consume; emitting `References` here
+                // makes non-call code references first-class instead of hiding
+                // them in untyped `Mentions` edges.
                 if looks_like_call(&body.text, name) {
                     self.add_edge(
                         EdgeLabel::Calls,
                         body.id.clone(),
                         target_id.clone(),
                         format!("{} calls {name}", body.name),
+                    );
+                } else {
+                    self.add_edge(
+                        EdgeLabel::References,
+                        body.id.clone(),
+                        target_id.clone(),
+                        format!("{} references {name}", body.name),
                     );
                 }
             }
@@ -496,6 +506,37 @@ fn looks_like_call(text: &str, name: &str) -> bool {
     let associated = format!("::{simple_name}(");
     let method = format!(".{simple_name}(");
     text.contains(&direct) || text.contains(&associated) || text.contains(&method)
+}
+
+const fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// True when `name` occurs in `text` as a standalone identifier path — i.e. each
+/// occurrence is not flanked by identifier characters. Avoids substring false
+/// positives such as `Error` matching inside `ParseError`, which would otherwise
+/// promote an unrelated symbol to a first-class code reference.
+fn contains_identifier(text: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let nlen = name.len();
+    let mut search_from = 0;
+    while let Some(offset) = text[search_from..].find(name) {
+        let idx = search_from + offset;
+        let before_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
+        let end = idx + nlen;
+        let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        search_from = idx + 1;
+        if search_from >= text.len() {
+            break;
+        }
+    }
+    false
 }
 
 fn file_module_path(repo_relative_path: &str) -> Vec<String> {
@@ -1274,6 +1315,18 @@ pub fn normalize_file_code(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contains_identifier_requires_token_boundaries() {
+        // Whole-identifier matches are accepted, including qualified paths.
+        assert!(contains_identifier("let x: Error = make();", "Error"));
+        assert!(contains_identifier("foo::Error::new()", "Error"));
+        assert!(contains_identifier("-> Widget {", "Widget"));
+        // Substrings of a larger identifier are rejected.
+        assert!(!contains_identifier("let e: ParseError = x;", "Error"));
+        assert!(!contains_identifier("Errorhandler::run()", "Error"));
+        assert!(!contains_identifier("my_widget", "widget"));
+    }
 
     #[test]
     fn test_normalize_raw_strings() {

@@ -18,6 +18,7 @@ eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>]
 eg query task     <HANDLE> --graph <PATH>
 eg query memory   <HANDLE> --graph <PATH>   [--verified-only]
 eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>]
+eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N]
 ```
 
 Evidence-backed audit subcommands have their own pages:
@@ -34,6 +35,9 @@ Evidence-backed audit subcommands have their own pages:
   ([semantic-memory-recall.md](semantic-memory-recall.md), issue #91).
 - `eg query failures` — **prior failed attempts** linked to a code or task
   handle ([failure-history.md](failure-history.md), issue #63).
+- `eg query change-impact` — **graph-derived impact leads** grouped by relation
+  for a symbol or file handle, for blast-radius triage before editing
+  ([change-impact.md](change-impact.md), issue #76).
 
 Most subcommands accept exactly one input source:
 
