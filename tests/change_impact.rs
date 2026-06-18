@@ -2032,3 +2032,307 @@ fn depth_expands_through_references_and_implementations() {
         "caller of the referencing symbol must be reached at depth 2; got: {d2:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A file handle seeds symbols nested under impl-block Symbols (Rust methods are
+// emitted beneath the impl symbol via `owner_id()`), so callers of those
+// methods are reached.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn file_handle_seeds_methods_inside_impl_symbols() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("impl_methods.jsonl");
+    let mut graph = Graph::new();
+    let p = "src/lib.rs";
+
+    let lib_file_id = file_id(p);
+    graph.push(GraphRecord::syntax_node(
+        lib_file_id.clone(),
+        NodeKind::File,
+        p.to_owned(),
+        span(1, 100),
+        "lib.rs".to_owned(),
+        "rust",
+        "Source file src/lib.rs".to_owned(),
+    ));
+
+    // The impl block is itself a Symbol contained by the file.
+    let impl_id = sym_id(p, "impl Foo");
+    graph.push(GraphRecord::syntax_node(
+        impl_id.clone(),
+        NodeKind::Symbol,
+        p.to_owned(),
+        span(5, 40),
+        "impl Foo".to_owned(),
+        "rust",
+        "impl Foo".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Contains,
+        lib_file_id,
+        impl_id.clone(),
+        None,
+        "src/lib.rs contains impl Foo".to_owned(),
+    ));
+
+    // A method defined beneath the impl Symbol.
+    let method_id = sym_id(p, "Foo::bar");
+    graph.push(GraphRecord::syntax_node(
+        method_id.clone(),
+        NodeKind::Symbol,
+        p.to_owned(),
+        span(10, 20),
+        "Foo::bar".to_owned(),
+        "rust",
+        "fn bar".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Defines,
+        impl_id,
+        method_id.clone(),
+        None,
+        "impl Foo defines bar".to_owned(),
+    ));
+
+    // A caller of the method in another file.
+    let caller_path = "src/caller.rs";
+    let caller_file_id = file_id(caller_path);
+    graph.push(GraphRecord::syntax_node(
+        caller_file_id.clone(),
+        NodeKind::File,
+        caller_path.to_owned(),
+        span(1, 30),
+        "caller.rs".to_owned(),
+        "rust",
+        "Source file src/caller.rs".to_owned(),
+    ));
+    let caller_id = sym_id(caller_path, "calls_bar");
+    graph.push(GraphRecord::syntax_node(
+        caller_id.clone(),
+        NodeKind::Symbol,
+        caller_path.to_owned(),
+        span(5, 15),
+        "calls_bar".to_owned(),
+        "rust",
+        "fn calls_bar".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Defines,
+        caller_file_id,
+        caller_id.clone(),
+        None,
+        "src/caller.rs defines calls_bar".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Calls,
+        caller_id.clone(),
+        method_id,
+        None,
+        "calls_bar calls Foo::bar".to_owned(),
+    ));
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    let stdout = egregore()
+        .args(["query", "change-impact", p, "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    let callers: Vec<&str> = v["direct_callers"]
+        .as_array()
+        .expect("direct_callers")
+        .iter()
+        .filter_map(|c| c["record_id"].as_str())
+        .collect();
+    assert!(
+        callers.contains(&caller_id.as_str()),
+        "file handle must seed methods inside impl-block symbols so their callers are reached; got: {callers:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `use` imports (File/Module --IMPORTS--> Import node) are resolved to the
+// queried symbol by name, so the importing file appears in referencing_files.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn imports_resolved_to_referencing_files_by_name() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("imports.jsonl");
+    let mut graph = Graph::new();
+
+    let a_path = "src/a.rs";
+    let widget_id = sym_id(a_path, "Widget");
+    graph.push(GraphRecord::syntax_node(
+        widget_id.clone(),
+        NodeKind::Symbol,
+        a_path.to_owned(),
+        span(1, 10),
+        "Widget".to_owned(),
+        "rust",
+        "struct Widget".to_owned(),
+    ));
+
+    // src/b.rs imports it: b_file --IMPORTS--> Import node (path crate::a::Widget).
+    let b_path = "src/b.rs";
+    let b_file_id = file_id(b_path);
+    graph.push(GraphRecord::syntax_node(
+        b_file_id.clone(),
+        NodeKind::File,
+        b_path.to_owned(),
+        span(1, 50),
+        "b.rs".to_owned(),
+        "rust",
+        "Source file src/b.rs".to_owned(),
+    ));
+    let import_id = stable_id(&["node", "import", b_path, "crate::a::Widget"]);
+    graph.push(GraphRecord::syntax_node(
+        import_id.clone(),
+        NodeKind::Import,
+        b_path.to_owned(),
+        span(1, 1),
+        "crate::a::Widget".to_owned(),
+        "rust",
+        "Rust import crate::a::Widget".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Imports,
+        b_file_id.clone(),
+        import_id,
+        None,
+        "src/b.rs imports crate::a::Widget".to_owned(),
+    ));
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    let stdout = egregore()
+        .args(["query", "change-impact", &widget_id, "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    let refs = v["referencing_files"]
+        .as_array()
+        .expect("referencing_files");
+    let importing = refs
+        .iter()
+        .find(|c| c["record_id"].as_str() == Some(b_file_id.as_str()))
+        .expect("file importing the symbol (by name) must appear in referencing_files");
+    assert_eq!(
+        importing["relation"], "IMPORTS",
+        "import-resolved lead must be tagged IMPORTS"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// When a group exceeds the per-group cap, nearer (hop-1) leads are preserved
+// instead of being evicted by a larger further-out neighborhood.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn truncation_preserves_nearer_hops() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("trunc_hop.jsonl");
+    let mut graph = Graph::new();
+    let p = "src/big.rs";
+
+    let anchor_id = sym_id(p, "anchor");
+    graph.push(GraphRecord::syntax_node(
+        anchor_id.clone(),
+        NodeKind::Symbol,
+        p.to_owned(),
+        span(1, 2),
+        "anchor".to_owned(),
+        "rust",
+        "fn anchor".to_owned(),
+    ));
+
+    // 150 direct (hop-1) callers of anchor.
+    let mut hop1_ids: Vec<String> = Vec::new();
+    for i in 0..150usize {
+        let name = format!("h1_{i}");
+        let id = sym_id(p, &name);
+        graph.push(GraphRecord::syntax_node(
+            id.clone(),
+            NodeKind::Symbol,
+            p.to_owned(),
+            span(i + 3, i + 4),
+            name,
+            "rust",
+            "hop1 caller".to_owned(),
+        ));
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Calls,
+            id.clone(),
+            anchor_id.clone(),
+            None,
+            "calls anchor".to_owned(),
+        ));
+        hop1_ids.push(id);
+    }
+
+    // 150 hop-2 callers, all calling the first hop-1 caller.
+    let pivot = hop1_ids[0].clone();
+    for i in 0..150usize {
+        let name = format!("h2_{i}");
+        let id = sym_id(p, &name);
+        graph.push(GraphRecord::syntax_node(
+            id.clone(),
+            NodeKind::Symbol,
+            p.to_owned(),
+            span(i + 200, i + 201),
+            name,
+            "rust",
+            "hop2 caller".to_owned(),
+        ));
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Calls,
+            id,
+            pivot.clone(),
+            None,
+            "calls pivot".to_owned(),
+        ));
+    }
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    let stdout = egregore()
+        .args(["query", "change-impact", &anchor_id, "--graph"])
+        .arg(&path)
+        .args(["--depth", "2"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+
+    let callers = v["direct_callers"].as_array().expect("direct_callers");
+    assert_eq!(callers.len(), 200, "group capped at 200");
+    let caller_ids: Vec<&str> = callers
+        .iter()
+        .filter_map(|c| c["record_id"].as_str())
+        .collect();
+    for id in &hop1_ids {
+        assert!(
+            caller_ids.contains(&id.as_str()),
+            "hop-1 caller {id} must be preserved when truncating a deeper neighborhood"
+        );
+    }
+}

@@ -5370,6 +5370,12 @@ const fn record_node_kind(record: &GraphRecord) -> Option<NodeKind> {
     }
 }
 
+/// Final `::`-delimited segment of a symbol name or import path, used for the
+/// name-based import resolution in change-impact.
+fn last_path_segment(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
 /// A claim is **verified** when it cites at least one present verification-domain
 /// record through an evidence link (`VALIDATED_BY`, `HAS_EVIDENCE`,
 /// `PRODUCED_EVIDENCE`) or an equivalent outgoing edge. This is a structural,
@@ -7648,7 +7654,17 @@ pub fn change_impact_context<'a>(
         truncations: &mut Vec<ImpactTruncation>,
     ) -> Vec<ImpactLead<'a>> {
         let total = map.len();
-        let leads: Vec<ImpactLead<'a>> = map.into_values().collect();
+        let mut leads: Vec<ImpactLead<'a>> = map.into_values().collect();
+        // Order by hop distance first so that, when a group exceeds the cap, the
+        // nearest (most immediate) impact leads are preserved and a large
+        // further-out neighborhood cannot evict first-hop callers/callees.
+        // `(record_id, edge_id)` breaks ties for byte-stable output.
+        leads.sort_by(|a, b| {
+            a.hop
+                .cmp(&b.hop)
+                .then_with(|| a.record.id().cmp(b.record.id()))
+                .then_with(|| a.edge.id().cmp(b.edge.id()))
+        });
         let returned = leads.len().min(cap);
         if total > cap {
             truncations.push(ImpactTruncation {
@@ -7775,16 +7791,16 @@ pub fn change_impact_context<'a>(
                     if !matches!(label, EdgeLabel::Defines | EdgeLabel::Contains) {
                         continue;
                     }
-                    match by_id.get(child_id).copied().and_then(record_node_kind) {
-                        Some(NodeKind::Symbol) => {
-                            frontier.insert(child_id);
-                        }
-                        Some(NodeKind::Module) => {
-                            // Seed the module and recurse into the symbols it owns.
-                            frontier.insert(child_id);
-                            containers.push(child_id);
-                        }
-                        _ => {}
+                    // Seed the child and recurse into anything it owns. Modules
+                    // own nested symbols; impl-block Symbols own their method
+                    // Symbols (emitted via `owner_id()`), so a file handle reaches
+                    // methods defined in the file.
+                    if matches!(
+                        by_id.get(child_id).copied().and_then(record_node_kind),
+                        Some(NodeKind::Symbol | NodeKind::Module)
+                    ) {
+                        frontier.insert(child_id);
+                        containers.push(child_id);
                     }
                 }
             }
@@ -8133,6 +8149,74 @@ pub fn change_impact_context<'a>(
         }
 
         frontier = next_frontier;
+    }
+
+    // ── Import resolution (name-based) ─────────────────────────────────────────
+    // The Rust extractor records `use` imports as `File/Module --IMPORTS--> Import`
+    // nodes whose name is the imported path; there is no structural edge from the
+    // Import node to the symbol it imports. Connect them to the queried symbol by
+    // matching the import's final path segment to a seeded anchor symbol's name,
+    // then report the importing file/module as a `referencing_files` lead. This is
+    // name-based, so same-name collisions can surface extra leads — consistent
+    // with the "leads, not proof" contract.
+    let mut anchor_names: BTreeMap<&str, &str> = BTreeMap::new();
+    for id in &seed_set {
+        if let Some(&node) = by_id.get(*id)
+            && matches!(record_node_kind(node), Some(NodeKind::Symbol))
+            && let GraphRecord::Node {
+                name: Some(name), ..
+            } = node
+        {
+            anchor_names.entry(last_path_segment(name)).or_insert(*id);
+        }
+    }
+    if !anchor_names.is_empty() {
+        for r in records {
+            let GraphRecord::Node {
+                id: import_id,
+                kind: NodeKind::Import,
+                name: Some(import_name),
+                ..
+            } = r
+            else {
+                continue;
+            };
+            if deleted(import_id.as_str()) {
+                continue;
+            }
+            let Some(&anchor) = anchor_names.get(last_path_segment(import_name)) else {
+                continue;
+            };
+            #[allow(clippy::map_unwrap_or)]
+            for &(edge_id, label, owner_id) in inbound_edges
+                .get(import_id.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+            {
+                if !matches!(label, EdgeLabel::Imports) {
+                    continue;
+                }
+                let (Some(&owner), Some(&edge_record)) = (by_id.get(owner_id), by_id.get(edge_id))
+                else {
+                    continue;
+                };
+                if matches!(
+                    record_node_kind(owner),
+                    Some(NodeKind::File | NodeKind::Module)
+                ) {
+                    referencing_files
+                        .entry((owner.id(), edge_id))
+                        .or_insert(ImpactLead {
+                            record: owner,
+                            edge: edge_record,
+                            relation: "IMPORTS",
+                            direction: ImpactDirection::Inbound,
+                            anchor_id: anchor,
+                            hop: 1,
+                        });
+                }
+            }
+        }
     }
 
     // ── Sort all groups canonically and apply per-group cap (AC6/AC7) ──────────
