@@ -425,6 +425,12 @@ impl ProtectedStore {
                     format!("operators.jsonl contains a malformed record: {e}"),
                 )
             })?;
+            if op.trim().is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "operators.jsonl contains an empty operator identity",
+                ));
+            }
             ops.push(op);
         }
         ops.sort_unstable();
@@ -479,6 +485,17 @@ impl ProtectedStore {
                 io::ErrorKind::InvalidInput,
                 "producer_id must not be empty when capture is enabled",
             ));
+        }
+
+        // Validate captured_at is RFC3339 before constructing any ProtectedHandle,
+        // so manifest.jsonl never contains a non-conforming timestamp.
+        if enabled {
+            chrono::DateTime::parse_from_rfc3339(captured_at).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("captured_at must be RFC 3339 (got {captured_at:?}): {e}"),
+                )
+            })?;
         }
 
         let mut outcomes: Vec<CaptureEntryOutcome> = Vec::new();
@@ -576,12 +593,23 @@ impl ProtectedStore {
             // Retaining a corrupt record would make `already_exists = true` and
             // skip the write, leaving `eg protected get` broken for that handle.
             existing.retain(|h| {
-                h.handle != handle
-                    || ProtectedHandle::compute_handle(
-                        &h.source_class,
-                        &h.content_hash,
-                        h.source_path.as_deref(),
-                    ) == h.handle
+                if h.handle != handle {
+                    return true; // different handle — always keep
+                }
+                // Same handle: require all metadata fields to be internally
+                // consistent.  Fields in the handle identity (class, content_hash,
+                // source_path) are verified by recomputing the handle; fields
+                // outside that identity (byte_len, schema_version) are checked
+                // directly against the ground-truth values from the source read.
+                // A tampered byte_len or schema_version causes the record to be
+                // dropped so re-capture replaces it with a valid copy.
+                ProtectedHandle::compute_handle(
+                    &h.source_class,
+                    &h.content_hash,
+                    h.source_path.as_deref(),
+                ) == h.handle
+                    && h.byte_len == byte_len
+                    && h.schema_version == PROTECTED_SCHEMA_VERSION
             });
             let already_exists = existing.iter().any(|h| h.handle == handle);
             if already_exists {
@@ -1311,6 +1339,96 @@ mod tests {
         assert!(
             !dir.path().join("blobs").exists(),
             "blobs directory must not be created when operators.jsonl is corrupt"
+        );
+    }
+
+    #[test]
+    fn empty_operator_identity_is_rejected_by_read_operators() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        // Write operators.jsonl containing a valid JSON empty string.
+        fs::write(dir.path().join("operators.jsonl"), "\"\"\n").unwrap();
+        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
+
+        // An empty operator identity must be rejected, not authorized.
+        let err = store.get("protected:v1:abc", "").unwrap_err();
+        assert_eq!(
+            err.code(),
+            "unauthorized",
+            "empty operator identity must be denied even if present in operators.jsonl"
+        );
+    }
+
+    #[test]
+    fn capture_rejects_non_rfc3339_captured_at() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"hello").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "transcript".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        let result = store.capture(&entries, "op-1", "0.1.0", "not-a-date", true);
+        assert!(result.is_err(), "non-RFC3339 captured_at must be rejected");
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput,
+            "must return InvalidInput for invalid captured_at"
+        );
+
+        // Disabled mode must not validate captured_at (preview never persists).
+        let result2 = store.capture(&entries, "op-1", "0.1.0", "not-a-date", false);
+        assert!(
+            result2.is_ok(),
+            "non-RFC3339 captured_at must be accepted in disabled (preview) mode"
+        );
+    }
+
+    #[test]
+    fn capture_replaces_tampered_byte_len_or_schema_version() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"test content").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        // Initial capture.
+        let report = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        let real_byte_len = report.entries[0].byte_len;
+
+        // Tamper: corrupt byte_len while keeping handle valid (integrity check passes).
+        let manifest_path = dir.path().join("manifest.jsonl");
+        let content = fs::read_to_string(&manifest_path).unwrap();
+        let mut rec: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        rec["byte_len"] = serde_json::json!(9999u64);
+        fs::write(&manifest_path, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
+
+        // list() reports the tampered byte_len.
+        let before = store.list().unwrap();
+        assert_eq!(before[0].byte_len, 9999, "tampered record is in manifest");
+
+        // Re-capture with source available — must replace the tampered record.
+        store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+
+        // list() must now report the correct byte_len.
+        let after = store.list().unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "manifest must have exactly one record after repair"
+        );
+        assert_eq!(
+            after[0].byte_len, real_byte_len,
+            "byte_len must be correct after repair"
         );
     }
 }

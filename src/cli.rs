@@ -9132,9 +9132,20 @@ fn protected_cmd(subcommand: ProtectedSubcommand) -> Result<()> {
             match ps.get(&handle, &operator) {
                 Ok(bytes) => {
                     if let Some(out_path) = out {
-                        fs::write(&out_path, &bytes).with_context(|| {
-                            format!("failed to write bytes to {}", out_path.display())
-                        })?;
+                        if let Err(e) = fs::write(&out_path, &bytes) {
+                            let envelope = serde_json::json!({
+                                "ok": false,
+                                "error": {
+                                    "code": "output_write_error",
+                                    "message": format!(
+                                        "failed to write bytes to {}: {e}",
+                                        out_path.display()
+                                    )
+                                }
+                            });
+                            eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+                            process::exit(1);
+                        }
                     } else {
                         std::io::Write::write_all(&mut std::io::stdout(), &bytes)
                             .context("failed to write bytes to stdout")?;
@@ -9150,9 +9161,23 @@ fn protected_cmd(subcommand: ProtectedSubcommand) -> Result<()> {
         }
         ProtectedSubcommand::List { store } => {
             let ps = ProtectedStore::new(&store);
-            let handles = ps.list().with_context(|| {
-                format!("failed to read protected store at {}", store.display())
-            })?;
+            let handles = match ps.list() {
+                Ok(h) => h,
+                Err(e) => {
+                    let envelope = serde_json::json!({
+                        "ok": false,
+                        "error": {
+                            "code": "store_io_error",
+                            "message": format!(
+                                "failed to read protected store at {}: {e}",
+                                store.display()
+                            )
+                        }
+                    });
+                    eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+                    process::exit(1);
+                }
+            };
             let envelope = serde_json::json!({
                 "ok": true,
                 "count": handles.len(),

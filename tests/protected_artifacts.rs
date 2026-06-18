@@ -1065,3 +1065,122 @@ fn capture_replaces_corrupt_manifest_record_on_recapture() {
         .assert()
         .success();
 }
+
+/// An empty string operator identity in operators.jsonl must be rejected even
+/// though it parses as a valid JSON string.
+#[test]
+fn get_empty_operator_identity_denied() {
+    let (_guard, store) = tmp_store();
+    // Capture first; save the handle before corrupting operators.jsonl.
+    let first = run_capture_enabled(&store, "op-1");
+    let handle = first["entries"][0]["handle"].as_str().expect("handle");
+
+    // Append an empty JSON string to operators.jsonl — simulates manual corruption.
+    let ops_path = store.join("operators.jsonl");
+    let mut content = fs::read_to_string(&ops_path).expect("read operators");
+    content.push_str("\"\"\n");
+    fs::write(&ops_path, &content).expect("write operators");
+
+    // A corrupt operators.jsonl (empty identity) must deny all authorization.
+    let stderr = eg()
+        .args(["protected", "get"])
+        .arg(handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&stderr).expect("JSON envelope");
+    assert_eq!(json["error"]["code"], "unauthorized");
+}
+
+/// `eg protected capture --captured-at not-a-date` must exit 1 with a JSON
+/// envelope and write nothing to the store.
+#[test]
+fn capture_invalid_captured_at_exits_1_with_json() {
+    let (_guard, store) = tmp_store();
+    let stderr = eg()
+        .args(["protected", "capture"])
+        .arg("--manifest")
+        .arg(capture_manifest())
+        .arg("--store")
+        .arg(&store)
+        .arg("--protected-raw-artifacts")
+        .arg("--producer")
+        .arg("op-1")
+        .arg("--captured-at")
+        .arg("not-a-date")
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&stderr).expect("must emit JSON envelope");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["code"], "store_io_error");
+    assert!(
+        !store.join("blobs").exists(),
+        "no blobs on invalid timestamp"
+    );
+}
+
+/// `eg protected get --out <unwritable>` must exit 1 with a JSON envelope
+/// (code: `output_write_error`) instead of a plain anyhow error.
+#[test]
+fn get_unwritable_out_path_emits_json_envelope() {
+    let (_guard, store) = tmp_store();
+    let first = run_capture_enabled(&store, "op-1");
+    let handle = first["entries"][0]["handle"].as_str().expect("handle");
+
+    // Use a path whose parent directory does not exist.
+    let bad_out = store.join("nonexistent_dir").join("out.txt");
+
+    let stderr = eg()
+        .args(["protected", "get"])
+        .arg(handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .arg("--out")
+        .arg(&bad_out)
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&stderr).expect("must emit JSON envelope");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["code"], "output_write_error");
+}
+
+/// `eg protected list` on a store with a corrupt manifest must exit 1 with a
+/// JSON envelope (code: `store_io_error`) instead of a plain anyhow error.
+#[test]
+fn list_corrupt_manifest_emits_json_envelope() {
+    let (_guard, store) = tmp_store();
+    run_capture_enabled(&store, "op-1");
+    // Corrupt the manifest.
+    fs::write(store.join("manifest.jsonl"), "not valid json\n").expect("corrupt manifest");
+
+    let stderr = eg()
+        .args(["protected", "list"])
+        .arg("--store")
+        .arg(&store)
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&stderr).expect("must emit JSON envelope");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["code"], "store_io_error");
+}
