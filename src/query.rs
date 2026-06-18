@@ -7747,6 +7747,11 @@ pub fn change_impact_context<'a>(
     let mut visited: BTreeSet<&str> = BTreeSet::new();
 
     for hop in 1..=depth {
+        // Stop as soon as the frontier is exhausted so a very large `--depth`
+        // does not spin through empty iterations after traversal is complete.
+        if frontier.is_empty() {
+            break;
+        }
         let current_frontier: Vec<&str> = frontier.iter().copied().collect();
         let mut next_frontier: BTreeSet<&str> = BTreeSet::new();
 
@@ -7896,10 +7901,13 @@ pub fn change_impact_context<'a>(
                         }
                     }
                     EdgeLabel::Defines | EdgeLabel::Contains => {
-                        // owner → anchor: containing file/module context
+                        // owner → anchor: containing file/module context.
+                        // Key by owner record id (not edge id) so that a file
+                        // handle, which seeds every defined symbol, reports each
+                        // owner once instead of repeating it per DEFINES edge.
                         match by_id.get(source_id) {
                             Some(&node) => {
-                                containing_context.entry((node.id(), edge_id)).or_insert(
+                                containing_context.entry((node.id(), node.id())).or_insert(
                                     ImpactLead {
                                         record: node,
                                         edge: edge_record,
@@ -7980,32 +7988,10 @@ pub fn change_impact_context<'a>(
                             }
                         }
                     }
-                    EdgeLabel::References => {
-                        // anchor → referenced symbol (outbound reference)
-                        match by_id.get(target_id) {
-                            Some(&node) => {
-                                referencing_files.entry((node.id(), edge_id)).or_insert(
-                                    ImpactLead {
-                                        record: node,
-                                        edge: edge_record,
-                                        relation: "REFERENCES",
-                                        direction: ImpactDirection::Outbound,
-                                        anchor_id,
-                                        hop,
-                                    },
-                                );
-                            }
-                            None => {
-                                diagnostics.push(MemoryAuditDiagnostic {
-                                    code: "unresolved_edge_target".to_owned(),
-                                    source_record_id: edge_id.to_owned(),
-                                    target_handle: target_id.to_owned(),
-                                    relation: "REFERENCES".to_owned(),
-                                    target_domain: "codegraph".to_owned(),
-                                });
-                            }
-                        }
-                    }
+                    // Outbound References are the anchor's own dependencies, not
+                    // code that points at it. referencing_files is documented as
+                    // inbound-only, so outbound references are intentionally not
+                    // emitted there (they fall through to the `_` arm below).
                     EdgeLabel::Implements => {
                         // anchor → trait (anchor is an impl block)
                         match by_id.get(target_id) {

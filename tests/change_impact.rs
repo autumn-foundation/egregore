@@ -5,7 +5,7 @@ use std::{fs, path::PathBuf};
 
 use aletheia_egregore::{
     EdgeLabel, GraphRecord, NodeKind, SourceSpan,
-    ir::{Graph, SCHEMA_VERSION, stable_id},
+    ir::{Graph, PROJECT_SCHEMA_VERSION, SCHEMA_VERSION, project_stable_id, stable_id},
 };
 use assert_cmd::Command;
 
@@ -1483,5 +1483,175 @@ fn implementation_symbols_from_impl_side() {
     assert!(
         impl_ids.contains(&f.trait_sym_id.as_str()),
         "trait_sym must appear in implementation_symbols when querying impl_sym; got: {impl_ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Outbound REFERENCES must NOT be reported under referencing_files.
+// referencing_files is documented as inbound code that points at the anchor;
+// the anchor's own outgoing dependencies belong to the other side.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn outbound_reference_excluded_from_referencing_files() {
+    let f = seed();
+    // ref_sym has an outbound References edge ref_sym -> anchor_fn. Querying
+    // ref_sym must NOT list anchor_fn under referencing_files (that would
+    // mislabel a dependency as a referrer).
+    let stdout = egregore()
+        .args(["query", "change-impact", &f.ref_sym_id, "--graph"])
+        .arg(&f.graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+
+    let refs = v["referencing_files"]
+        .as_array()
+        .expect("referencing_files array");
+    assert!(
+        refs.iter()
+            .all(|r| r["record_id"].as_str() != Some(f.anchor_fn_id.as_str())),
+        "anchor_fn (outbound reference target) must not appear in ref_sym's referencing_files; got: {refs:?}"
+    );
+    assert!(
+        refs.iter()
+            .all(|r| r["direction"].as_str() != Some("outbound")),
+        "referencing_files must contain only inbound leads; got: {refs:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// containing_context must deduplicate by owner. A file handle seeds every
+// defined symbol, so the owner file would otherwise repeat once per DEFINES
+// edge; each owner must appear exactly once.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn containing_context_dedups_owner() {
+    let f = seed();
+    // Query the file handle src/a.rs, whose file defines several symbols.
+    let stdout = egregore()
+        .args(["query", "change-impact", &f.anchor_fn_path, "--graph"])
+        .arg(&f.graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+
+    let ids: Vec<&str> = v["containing_context"]
+        .as_array()
+        .expect("containing_context array")
+        .iter()
+        .filter_map(|c| c["record_id"].as_str())
+        .collect();
+
+    let mut unique = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        ids.len(),
+        unique.len(),
+        "containing_context must not repeat an owner record; got: {ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A very large --depth must terminate quickly (frontier-empty break) and
+// produce results identical to any depth that already exhausts the graph.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn huge_depth_terminates_and_is_stable() {
+    let f = seed();
+
+    let groups = |depth: &str| -> serde_json::Value {
+        let stdout = egregore()
+            .args([
+                "query",
+                "change-impact",
+                &f.anchor_fn_id,
+                "--graph",
+                f.graph.to_str().unwrap(),
+                "--depth",
+                depth,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let out = String::from_utf8(stdout).expect("utf8");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        serde_json::json!({
+            "direct_callers": v["direct_callers"],
+            "direct_callees": v["direct_callees"],
+            "referencing_files": v["referencing_files"],
+            "implementation_symbols": v["implementation_symbols"],
+            "containing_context": v["containing_context"],
+        })
+    };
+
+    // Both depths fully exhaust this small graph; results must match, and the
+    // billion-hop run must return promptly rather than spin on empty hops.
+    assert_eq!(
+        groups("10"),
+        groups("1000000000"),
+        "huge depth must yield the same exhausted-graph result as a smaller exhausting depth"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// change-impact only accepts code handles (symbol or file). A handle that
+// resolves to a task/project target must be rejected with exit 1, not
+// misclassified as an empty symbol result.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn task_handle_rejected_exit1() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("task_handle.jsonl");
+    let mut graph = Graph::new();
+
+    let task_id = project_stable_id(&["task", "ci_task"]);
+    let mut task = GraphRecord::node(
+        task_id.clone(),
+        NodeKind::Task,
+        None,
+        None,
+        Some("CI task".to_owned()),
+        "Task".to_owned(),
+    );
+    if let GraphRecord::Node { schema_version, .. } = &mut task {
+        *schema_version = PROJECT_SCHEMA_VERSION;
+    }
+    graph.push(task);
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    let stderr = egregore()
+        .args(["query", "change-impact", &task_id, "--graph"])
+        .arg(&path)
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+
+    let err = String::from_utf8(stderr).expect("utf8");
+    let v: serde_json::Value =
+        serde_json::from_str(err.trim()).expect("task handle rejection must emit JSON on stderr");
+    assert!(
+        v.get("Unsupported").is_some(),
+        "task/project handle must produce Unsupported diagnostic; got: {v}"
     );
 }

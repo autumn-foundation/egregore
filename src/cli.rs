@@ -6906,6 +6906,24 @@ fn query_change_impact_cmd(
         }
     };
 
+    // change-impact only operates on code handles (symbol or file). A handle that
+    // resolves to a task or source/provenance record is out of scope and must be
+    // rejected rather than misclassified as an empty symbol result.
+    if matches!(
+        target.kind,
+        query::FailureTargetKind::Task | query::FailureTargetKind::Source
+    ) {
+        let err = query::FailureHandleError::Unsupported {
+            handle: handle.to_owned(),
+            message: format!(
+                "handle resolved to a {} target; change-impact accepts only code symbol or file handles",
+                target.kind.as_str()
+            ),
+        };
+        eprintln!("{}", serde_json::to_string(&err)?);
+        std::process::exit(1);
+    }
+
     if target.is_empty() {
         let code = if target.stale {
             "stale_handle"
