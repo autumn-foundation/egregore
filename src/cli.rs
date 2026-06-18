@@ -6924,6 +6924,21 @@ fn query_change_impact_cmd(
         std::process::exit(1);
     }
 
+    // A canonical codegraph ID can resolve to a non-File/Symbol node kind
+    // (Repository, Module, Import, Commit, Change, …) while still mapping to a
+    // `Symbol` target kind. Such handles are out of scope for change-impact and
+    // must be rejected rather than traversed as an empty symbol result.
+    if let Some(kind) = query::change_impact_unsupported_anchor_kind(records, &target) {
+        let err = query::FailureHandleError::Unsupported {
+            handle: handle.to_owned(),
+            message: format!(
+                "handle resolved to a {kind:?} node; change-impact accepts only code symbol or file handles"
+            ),
+        };
+        eprintln!("{}", serde_json::to_string(&err)?);
+        std::process::exit(1);
+    }
+
     if target.is_empty() {
         let code = if target.stale {
             "stale_handle"

@@ -1655,3 +1655,237 @@ fn task_handle_rejected_exit1() {
         "task/project handle must produce Unsupported diagnostic; got: {v}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A file handle seeds the symbols it defines so their callers/callees are
+// reachable — including symbols declared inside `mod` blocks
+// (File CONTAINS Module DEFINES fn), which must be followed transitively.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn file_handle_seeds_symbols_nested_in_modules() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("module_nesting.jsonl");
+    let mut graph = Graph::new();
+
+    let lib_path = "src/lib.rs";
+    let lib_file_id = file_id(lib_path);
+    graph.push(GraphRecord::syntax_node(
+        lib_file_id.clone(),
+        NodeKind::File,
+        lib_path.to_owned(),
+        span(1, 100),
+        "lib.rs".to_owned(),
+        "rust",
+        "Source file src/lib.rs".to_owned(),
+    ));
+
+    // File CONTAINS Module `inner`
+    let module_id = stable_id(&["node", "Module", lib_path, "inner"]);
+    graph.push(GraphRecord::syntax_node(
+        module_id.clone(),
+        NodeKind::Module,
+        lib_path.to_owned(),
+        span(5, 40),
+        "inner".to_owned(),
+        "rust",
+        "mod inner in src/lib.rs".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Contains,
+        lib_file_id,
+        module_id.clone(),
+        None,
+        "src/lib.rs contains module inner".to_owned(),
+    ));
+
+    // Module DEFINES nested_fn (the symbol nested one level below the file)
+    let nested_fn_id = sym_id(lib_path, "nested_fn");
+    graph.push(GraphRecord::syntax_node(
+        nested_fn_id.clone(),
+        NodeKind::Symbol,
+        lib_path.to_owned(),
+        span(10, 20),
+        "nested_fn".to_owned(),
+        "rust",
+        "fn nested_fn inside mod inner".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Defines,
+        module_id,
+        nested_fn_id.clone(),
+        None,
+        "module inner defines nested_fn".to_owned(),
+    ));
+
+    // A symbol in another file calls the nested function.
+    let caller_path = "src/caller.rs";
+    let caller_file_id = file_id(caller_path);
+    graph.push(GraphRecord::syntax_node(
+        caller_file_id.clone(),
+        NodeKind::File,
+        caller_path.to_owned(),
+        span(1, 30),
+        "caller.rs".to_owned(),
+        "rust",
+        "Source file src/caller.rs".to_owned(),
+    ));
+    let outer_caller_id = sym_id(caller_path, "outer_caller");
+    graph.push(GraphRecord::syntax_node(
+        outer_caller_id.clone(),
+        NodeKind::Symbol,
+        caller_path.to_owned(),
+        span(5, 15),
+        "outer_caller".to_owned(),
+        "rust",
+        "fn outer_caller calls nested_fn".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Defines,
+        caller_file_id,
+        outer_caller_id.clone(),
+        None,
+        "src/caller.rs defines outer_caller".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Calls,
+        outer_caller_id.clone(),
+        nested_fn_id,
+        None,
+        "outer_caller calls nested_fn".to_owned(),
+    ));
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    let stdout = egregore()
+        .args(["query", "change-impact", lib_path, "--graph"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    let caller_ids: Vec<&str> = v["direct_callers"]
+        .as_array()
+        .expect("direct_callers")
+        .iter()
+        .filter_map(|c| c["record_id"].as_str())
+        .collect();
+    assert!(
+        caller_ids.contains(&outer_caller_id.as_str()),
+        "file handle must seed module-nested symbols so their callers are reached; got: {caller_ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `containing_context` reports the queried target's own File/Module owner only.
+// Intermediate caller/callee files reached at depth >= 2, and non-code owners
+// (Repository CONTAINS File), must not crowd the group.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn containing_context_scoped_to_target_owner() {
+    let f = seed();
+    let stdout = egregore()
+        .args(["query", "change-impact", &f.anchor_fn_id, "--graph"])
+        .arg(&f.graph)
+        .args(["--depth", "2"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    let owners: Vec<&str> = v["containing_context"]
+        .as_array()
+        .expect("containing_context")
+        .iter()
+        .filter_map(|c| c["record_id"].as_str())
+        .collect();
+
+    let a_file = file_id("src/a.rs");
+    let repo = stable_id(&["node", "Repository", "repo-ci"]);
+    assert!(
+        !owners.contains(&repo.as_str()),
+        "repository must not appear as containing_context; got: {owners:?}"
+    );
+    assert_eq!(
+        owners,
+        vec![a_file.as_str()],
+        "containing_context must be scoped to the queried target's own owner; got: {owners:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A canonical codegraph ID that resolves to a non-Symbol/File node (e.g. a
+// Repository) must be rejected as Unsupported, not traversed as an empty
+// "symbol" result.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn repository_id_rejected_exit1() {
+    let f = seed();
+    let repo_id = stable_id(&["node", "Repository", "repo-ci"]);
+    let stderr = egregore()
+        .args(["query", "change-impact", &repo_id, "--graph"])
+        .arg(&f.graph)
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+
+    let err = String::from_utf8(stderr).expect("utf8");
+    let v: serde_json::Value =
+        serde_json::from_str(err.trim()).expect("repository ID rejection must emit JSON on stderr");
+    assert!(
+        v.get("Unsupported").is_some(),
+        "a canonical Repository ID must be rejected as Unsupported; got: {v}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The queried target is never a lead about itself: at depth >= 2 a back-edge
+// (caller -> anchor) must not surface the anchor under direct_callees, etc.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn queried_target_is_not_its_own_lead() {
+    let f = seed();
+    let stdout = egregore()
+        .args(["query", "change-impact", &f.anchor_fn_id, "--graph"])
+        .arg(&f.graph)
+        .args(["--depth", "2"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    for group in &[
+        "direct_callers",
+        "direct_callees",
+        "referencing_files",
+        "implementation_symbols",
+    ] {
+        let ids: Vec<&str> = v[group]
+            .as_array()
+            .expect("group array")
+            .iter()
+            .filter_map(|c| c["record_id"].as_str())
+            .collect();
+        assert!(
+            !ids.contains(&f.anchor_fn_id.as_str()),
+            "queried target must not appear as its own lead in {group}; got: {ids:?}"
+        );
+    }
+}

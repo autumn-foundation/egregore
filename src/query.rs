@@ -7604,6 +7604,28 @@ const IMPACT_LABELS: &[EdgeLabel] = &[
     EdgeLabel::Contains,
 ];
 
+/// First resolved change-impact anchor whose node kind is **not** a code
+/// `Symbol` or `File`, if any.
+///
+/// `change-impact` accepts only symbol and file handles. A canonical codegraph
+/// ID that resolves to a `Repository`, `Module`, `Import`, `Commit`, `Change`,
+/// or any other node kind maps to [`FailureTargetKind::Symbol`] during handle
+/// resolution, so it must be rejected here rather than traversed as an empty
+/// `symbol` result. Returns `None` when every anchor is a `Symbol` or `File`.
+#[must_use]
+pub fn change_impact_unsupported_anchor_kind(
+    records: &[GraphRecord],
+    target: &ResolvedFailureTarget,
+) -> Option<NodeKind> {
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    target
+        .anchor_ids
+        .iter()
+        .filter_map(|id| by_id.get(id.as_str()).copied())
+        .filter_map(record_node_kind)
+        .find(|kind| !matches!(kind, NodeKind::Symbol | NodeKind::File))
+}
+
 /// Compute graph-derived change-impact leads for a resolved code handle.
 ///
 /// `target` is produced by [`resolve_failure_handle`] (which implements the
@@ -7719,30 +7741,60 @@ pub fn change_impact_context<'a>(
     let mut containing_context: BTreeMap<(&str, &str), ImpactLead<'_>> = BTreeMap::new();
     let mut diagnostics: Vec<MemoryAuditDiagnostic> = Vec::new();
 
+    // The queried target's own resolved anchor(s). These are never reported as
+    // their own impact leads — a back-edge such as a `caller → anchor` CALLS
+    // edge, traversed at depth ≥ 2, would otherwise surface the anchor under
+    // `direct_callees`, which is not a lead to inspect.
+    let original_targets: BTreeSet<&str> = target
+        .anchor_ids
+        .iter()
+        .filter_map(|id| by_id.get(id.as_str()).map(|r| r.id()))
+        .collect();
+
     // ── BFS frontier ──────────────────────────────────────────────────────────
-    // For a File anchor, seed its defined/contained symbols so that callers of
+    // For a File anchor, seed the symbols it defines/contains so that callers of
     // those symbols are reachable at hop 1 (mirrors subsystem/semantic-context).
+    // Follow nested modules transitively (File CONTAINS Module DEFINES fn) so
+    // symbols declared inside `mod` blocks are seeded too.
     let mut frontier: BTreeSet<&str> = BTreeSet::new();
     for anchor_id in &target.anchor_ids {
         if let Some(id_ref) = by_id.get(anchor_id.as_str()).map(|r| r.id()) {
             frontier.insert(id_ref);
-            // Expand File anchors to defined/contained symbols
-            #[allow(clippy::map_unwrap_or)]
-            for (_, label, child_id) in outbound_edges.get(id_ref).map(Vec::as_slice).unwrap_or(&[])
-            {
-                if matches!(label, EdgeLabel::Defines | EdgeLabel::Contains) {
-                    if let Some(child_record) = by_id.get(child_id) {
-                        if matches!(
-                            record_node_kind(child_record),
-                            Some(NodeKind::Symbol | NodeKind::Module)
-                        ) {
+            let mut containers: Vec<&str> = vec![id_ref];
+            let mut expanded: BTreeSet<&str> = BTreeSet::new();
+            while let Some(container) = containers.pop() {
+                if !expanded.insert(container) {
+                    continue;
+                }
+                #[allow(clippy::map_unwrap_or)]
+                for &(_, label, child_id) in outbound_edges
+                    .get(container)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                {
+                    if !matches!(label, EdgeLabel::Defines | EdgeLabel::Contains) {
+                        continue;
+                    }
+                    match by_id.get(child_id).copied().and_then(record_node_kind) {
+                        Some(NodeKind::Symbol) => {
                             frontier.insert(child_id);
                         }
+                        Some(NodeKind::Module) => {
+                            // Seed the module and recurse into the symbols it owns.
+                            frontier.insert(child_id);
+                            containers.push(child_id);
+                        }
+                        _ => {}
                     }
                 }
             }
         }
     }
+
+    // The target's own anchors and seeded symbols. `containing_context` is
+    // reported only for these so the group reflects the target's container,
+    // never an intermediate caller/callee file reached at depth ≥ 2.
+    let seed_set: BTreeSet<&str> = frontier.iter().copied().collect();
 
     let mut visited: BTreeSet<&str> = BTreeSet::new();
 
@@ -7775,7 +7827,7 @@ pub fn change_impact_context<'a>(
                     EdgeLabel::Calls => {
                         // caller → anchor: the source is a direct caller
                         match by_id.get(source_id) {
-                            Some(&node) => {
+                            Some(&node) if !original_targets.contains(node.id()) => {
                                 direct_callers
                                     .entry((node.id(), edge_id))
                                     .or_insert(ImpactLead {
@@ -7796,6 +7848,8 @@ pub fn change_impact_context<'a>(
                                     next_frontier.insert(node.id());
                                 }
                             }
+                            // The queried target itself is not a lead about itself.
+                            Some(_) => {}
                             None => {
                                 diagnostics.push(MemoryAuditDiagnostic {
                                     code: "unresolved_edge_target".to_owned(),
@@ -7810,7 +7864,7 @@ pub fn change_impact_context<'a>(
                     EdgeLabel::References => {
                         // referencing symbol → anchor
                         match by_id.get(source_id) {
-                            Some(&node) => {
+                            Some(&node) if !original_targets.contains(node.id()) => {
                                 referencing_files.entry((node.id(), edge_id)).or_insert(
                                     ImpactLead {
                                         record: node,
@@ -7822,6 +7876,7 @@ pub fn change_impact_context<'a>(
                                     },
                                 );
                             }
+                            Some(_) => {}
                             None => {
                                 diagnostics.push(MemoryAuditDiagnostic {
                                     code: "unresolved_edge_target".to_owned(),
@@ -7877,7 +7932,7 @@ pub fn change_impact_context<'a>(
                     EdgeLabel::Implements => {
                         // impl_sym → anchor (anchor is the trait)
                         match by_id.get(source_id) {
-                            Some(&node) => {
+                            Some(&node) if !original_targets.contains(node.id()) => {
                                 implementation_symbols
                                     .entry((node.id(), edge_id))
                                     .or_insert(ImpactLead {
@@ -7889,6 +7944,7 @@ pub fn change_impact_context<'a>(
                                         hop,
                                     });
                             }
+                            Some(_) => {}
                             None => {
                                 diagnostics.push(MemoryAuditDiagnostic {
                                     code: "unresolved_edge_target".to_owned(),
@@ -7902,30 +7958,46 @@ pub fn change_impact_context<'a>(
                     }
                     EdgeLabel::Defines | EdgeLabel::Contains => {
                         // owner → anchor: containing file/module context.
-                        // Key by owner record id (not edge id) so that a file
-                        // handle, which seeds every defined symbol, reports each
-                        // owner once instead of repeating it per DEFINES edge.
-                        match by_id.get(source_id) {
-                            Some(&node) => {
-                                containing_context.entry((node.id(), node.id())).or_insert(
-                                    ImpactLead {
-                                        record: node,
-                                        edge: edge_record,
-                                        relation: label.as_str(),
-                                        direction: ImpactDirection::Inbound,
-                                        anchor_id,
-                                        hop,
-                                    },
-                                );
-                            }
-                            None => {
-                                diagnostics.push(MemoryAuditDiagnostic {
-                                    code: "unresolved_edge_target".to_owned(),
-                                    source_record_id: edge_id.to_owned(),
-                                    target_handle: source_id.to_owned(),
-                                    relation: label.as_str().to_owned(),
-                                    target_domain: "codegraph".to_owned(),
-                                });
+                        //
+                        // Only report the container of the *queried target*
+                        // (its own anchors/seeded symbols), never of an
+                        // intermediate caller/callee reached at depth ≥ 2, and
+                        // only when the owner is a File or Module (a
+                        // `Repository CONTAINS File` owner is not containing
+                        // code context). Key by owner record id (not edge id)
+                        // so a file handle that seeds every defined symbol
+                        // reports each owner once.
+                        if seed_set.contains(anchor_id) {
+                            match by_id.get(source_id) {
+                                Some(&node)
+                                    if matches!(
+                                        record_node_kind(node),
+                                        Some(NodeKind::File | NodeKind::Module)
+                                    ) =>
+                                {
+                                    containing_context.entry((node.id(), node.id())).or_insert(
+                                        ImpactLead {
+                                            record: node,
+                                            edge: edge_record,
+                                            relation: label.as_str(),
+                                            direction: ImpactDirection::Inbound,
+                                            anchor_id,
+                                            hop,
+                                        },
+                                    );
+                                }
+                                // Non file/module owner (e.g. Repository): not
+                                // containing code context.
+                                Some(_) => {}
+                                None => {
+                                    diagnostics.push(MemoryAuditDiagnostic {
+                                        code: "unresolved_edge_target".to_owned(),
+                                        source_record_id: edge_id.to_owned(),
+                                        target_handle: source_id.to_owned(),
+                                        relation: label.as_str().to_owned(),
+                                        target_domain: "codegraph".to_owned(),
+                                    });
+                                }
                             }
                         }
                     }
@@ -7956,7 +8028,7 @@ pub fn change_impact_context<'a>(
                     EdgeLabel::Calls => {
                         // anchor → callee
                         match by_id.get(target_id) {
-                            Some(&node) => {
+                            Some(&node) if !original_targets.contains(node.id()) => {
                                 direct_callees
                                     .entry((node.id(), edge_id))
                                     .or_insert(ImpactLead {
@@ -7977,6 +8049,8 @@ pub fn change_impact_context<'a>(
                                     next_frontier.insert(node.id());
                                 }
                             }
+                            // The queried target itself is not a lead about itself.
+                            Some(_) => {}
                             None => {
                                 diagnostics.push(MemoryAuditDiagnostic {
                                     code: "unresolved_edge_target".to_owned(),
@@ -7995,7 +8069,7 @@ pub fn change_impact_context<'a>(
                     EdgeLabel::Implements => {
                         // anchor → trait (anchor is an impl block)
                         match by_id.get(target_id) {
-                            Some(&node) => {
+                            Some(&node) if !original_targets.contains(node.id()) => {
                                 implementation_symbols
                                     .entry((node.id(), edge_id))
                                     .or_insert(ImpactLead {
@@ -8007,6 +8081,7 @@ pub fn change_impact_context<'a>(
                                         hop,
                                     });
                             }
+                            Some(_) => {}
                             None => {
                                 diagnostics.push(MemoryAuditDiagnostic {
                                     code: "unresolved_edge_target".to_owned(),
