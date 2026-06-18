@@ -31,12 +31,26 @@ cargo run -- query context <symbol_name> --graph graph.jsonl
 cargo run -- query subsystem src/adapters --graph graph.jsonl   # exit 0 on match
 cargo run -- query subsystem src/nonexistent --graph graph.jsonl  # exit 2 (no_match)
 cargo run -- query subsystem "" --graph graph.jsonl               # exit 1 (malformed_prefix)
+
+# Change-impact blast-radius leads for a symbol or file (issue #76)
+cargo run -- query change-impact <symbol_name> --graph graph.jsonl        # exit 0 on match
+cargo run -- query change-impact src/lib.rs --graph graph.jsonl           # file handle
+cargo run -- query change-impact codegraph:v1:zzz --graph graph.jsonl     # exit 1 (Unsupported)
+cargo run -- query change-impact does_not_exist --graph graph.jsonl        # exit 2 (no_match)
+cargo run -- query change-impact <symbol_name> --graph graph.jsonl --depth 2  # wider neighborhood
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
 verification evidence, and semantic drift for everything under a repo-relative directory prefix.
 Path matching is segment-aware: `src/alpha` never bleeds into `src/alphabet`.
 Output is a deterministic JSON envelope with trust-separated sections.
+
+`eg query change-impact <handle>` returns graph-derived impact leads grouped by relation
+(`direct_callers`, `direct_callees`, `referencing_files`, `implementation_symbols`,
+`containing_context`) for a symbol name, canonical record ID, or repo-relative file path.
+Rows are leads to inspect before editing, not proof of breakage. The response is deterministic
+and byte-identical across runs. Default depth is 1 (direct neighbors only); use `--depth 2`
+for a wider BFS neighborhood. Output is a JSON envelope with an always-present disclaimer.
 
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
 
