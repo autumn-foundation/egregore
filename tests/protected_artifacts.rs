@@ -922,3 +922,146 @@ fn capture_manifest_parse_error_emits_json_envelope() {
         "line number must be present"
     );
 }
+
+/// A corrupt `operators.jsonl` (any malformed line) must deny ALL authorization,
+/// even for operators whose IDs appear on valid lines in the same file.
+#[test]
+fn get_corrupt_operators_file_denies_all_authorization() {
+    let (_guard, store) = tmp_store();
+    // Capture first to populate the store with a valid handle.
+    let first = run_capture_enabled(&store, "op-1");
+    let handle = first["entries"][0]["handle"].as_str().expect("handle");
+
+    // Inject a malformed line into operators.jsonl.
+    let ops_path = store.join("operators.jsonl");
+    let mut content = fs::read_to_string(&ops_path).expect("read operators");
+    content.push_str("not-a-json-string\n");
+    fs::write(&ops_path, &content).expect("write operators");
+
+    // get() must deny even the valid operator because the file is corrupt.
+    let stderr = eg()
+        .args(["protected", "get"])
+        .arg(handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&stderr).expect("must emit JSON envelope");
+    assert_eq!(json["error"]["code"], "unauthorized");
+}
+
+/// A corrupt `operators.jsonl` must cause `eg protected capture --protected-raw-artifacts`
+/// to fail before writing any blobs, emitting a JSON error envelope.
+#[test]
+fn capture_corrupt_operators_file_emits_json_and_writes_no_blobs() {
+    let (_guard, store) = tmp_store();
+    // Prime the store with a valid manifest so is_initialised() is true.
+    run_capture_enabled(&store, "op-1");
+    // Clear blobs so we can verify none are written.
+    let blobs_dir = store.join("blobs");
+    if blobs_dir.exists() {
+        for entry in fs::read_dir(&blobs_dir).expect("read blobs") {
+            fs::remove_file(entry.expect("entry").path()).expect("rm blob");
+        }
+    }
+
+    // Corrupt operators.jsonl.
+    let ops_path = store.join("operators.jsonl");
+    fs::write(&ops_path, "not-a-json-string\n").expect("corrupt operators");
+
+    let fixture_manifest = capture_manifest();
+    let stderr = eg()
+        .args(["protected", "capture"])
+        .arg("--manifest")
+        .arg(&fixture_manifest)
+        .arg("--store")
+        .arg(&store)
+        .arg("--protected-raw-artifacts")
+        .arg("--producer")
+        .arg("op-2")
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&stderr).expect("must emit JSON envelope");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["code"], "store_io_error");
+
+    // No blobs must have been written.
+    assert!(
+        !blobs_dir.exists() || fs::read_dir(&blobs_dir).expect("read").count() == 0,
+        "blobs must not be written when operators.jsonl is corrupt"
+    );
+}
+
+/// Re-capturing sources after a manifest record's metadata is corrupted must
+/// replace the corrupt record and make `eg protected get` succeed again.
+#[test]
+fn capture_replaces_corrupt_manifest_record_on_recapture() {
+    let (_guard, store) = tmp_store();
+    let first = run_capture_enabled(&store, "op-1");
+    let handle = first["entries"][0]["handle"].as_str().expect("handle");
+
+    // get() succeeds with the valid record.
+    eg().args(["protected", "get"])
+        .arg(handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .success();
+
+    // Tamper with manifest: corrupt content_hash in the target record (keep
+    // handle unchanged).  The manifest is multi-line JSONL — find and replace
+    // only the line that corresponds to `handle`.
+    let manifest = store.join("manifest.jsonl");
+    let content = fs::read_to_string(&manifest).unwrap();
+    let fake_hash = "a".repeat(64);
+    let new_content: String = content
+        .lines()
+        .map(|line| {
+            if line.contains(handle) {
+                let mut rec: serde_json::Value = serde_json::from_str(line).unwrap();
+                rec["content_hash"] = serde_json::json!(&fake_hash);
+                serde_json::to_string(&rec).unwrap()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&manifest, &new_content).unwrap();
+
+    // get() must fail now — integrity check catches the tampered record.
+    eg().args(["protected", "get"])
+        .arg(handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .failure();
+
+    // Re-capture with sources still present — must replace the corrupt record.
+    run_capture_enabled(&store, "op-1");
+
+    // get() must succeed again.
+    eg().args(["protected", "get"])
+        .arg(handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .success();
+}

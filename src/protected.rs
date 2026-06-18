@@ -409,15 +409,24 @@ impl ProtectedStore {
             return Ok(Vec::new());
         }
         let content = fs::read_to_string(&path)?;
-        // Fail-closed: skip lines that do not parse as a JSON string rather than
-        // falling back to the raw line, which would authorize an attacker-controlled
-        // value found in a corrupted or hand-edited operators.jsonl.
-        let mut ops: Vec<String> = content
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .filter_map(|l| serde_json::from_str::<String>(l).ok())
-            .collect();
+        // Fail-closed: return an error if ANY line fails to parse as a JSON string.
+        // Silently skipping malformed lines would normalize a partially corrupted ACL
+        // and could allow a future write to silently revoke the discarded operators.
+        // An operators.jsonl with any malformed line must be treated as corrupt.
+        let mut ops = Vec::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let op: String = serde_json::from_str(line).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("operators.jsonl contains a malformed record: {e}"),
+                )
+            })?;
+            ops.push(op);
+        }
         ops.sort_unstable();
         ops.dedup();
         Ok(ops)
@@ -476,11 +485,17 @@ impl ProtectedStore {
         let mut stored_count = 0usize;
         let mut skipped_count = 0usize;
 
-        // Load existing manifest so we can dedup (AC7).
-        // Propagate parse/IO errors rather than silently treating a corrupt
-        // manifest as empty — that would overwrite previously captured handles.
+        // Load existing manifest and validate the operators file *before* any
+        // blob or manifest writes.  This ensures that a corrupt operators.jsonl
+        // causes an early failure rather than leaving orphaned blobs and manifest
+        // records that the caller cannot retrieve until ACL state is repaired.
         let mut existing: Vec<ProtectedHandle> = if enabled {
             self.read_manifest()?
+        } else {
+            Vec::new()
+        };
+        let mut ops: Vec<String> = if enabled {
+            self.read_operators()?
         } else {
             Vec::new()
         };
@@ -554,6 +569,20 @@ impl ProtectedStore {
             }
 
             // Enabled: store blob + register in manifest.
+            //
+            // Before deduplication, remove any existing record that carries the
+            // same handle string but whose metadata no longer recomputes to that
+            // handle (content_hash or source_path was corrupted / tampered with).
+            // Retaining a corrupt record would make `already_exists = true` and
+            // skip the write, leaving `eg protected get` broken for that handle.
+            existing.retain(|h| {
+                h.handle != handle
+                    || ProtectedHandle::compute_handle(
+                        &h.source_class,
+                        &h.content_hash,
+                        h.source_path.as_deref(),
+                    ) == h.handle
+            });
             let already_exists = existing.iter().any(|h| h.handle == handle);
             if already_exists {
                 // Handle already registered: repair the blob if it is missing
@@ -602,10 +631,9 @@ impl ProtectedStore {
         if enabled {
             // Persist de-duplicated manifest.
             self.write_manifest(&existing)?;
-            // Record producer as an authorised operator.  Propagate read errors
-            // rather than falling back to an empty list, which would silently
-            // revoke all previously authorised operators.
-            let mut ops = self.read_operators()?;
+            // Record producer as an authorised operator.  The operators list was
+            // loaded upfront (before any blob/manifest writes) so a corrupt
+            // operators.jsonl is caught before the store is mutated.
             ops.push(producer_id.to_owned());
             self.write_operators(&ops)?;
         }
@@ -640,7 +668,11 @@ impl ProtectedStore {
         }
 
         // 2. Auth check.
-        let ops = self.read_operators().unwrap_or_default();
+        // A corrupt operators.jsonl (any malformed line) fails closed: deny all
+        // authorization rather than partially normalizing the ACL.
+        let ops = self.read_operators().map_err(|_| GetError::Unauthorized {
+            operator: operator.to_owned(),
+        })?;
         if !ops.contains(&operator.to_owned()) {
             return Err(GetError::Unauthorized {
                 operator: operator.to_owned(),
@@ -1182,15 +1214,17 @@ mod tests {
         .unwrap();
         fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
 
-        // The valid operator must still be authorised.
+        // Any malformed line in operators.jsonl causes ALL authorization to fail.
+        // This is stricter than silently skipping malformed lines: a partially
+        // corrupt ACL file must deny everyone, not just unknown callers.
         let err_valid = store.get("protected:v1:abc", "op-valid").unwrap_err();
-        assert_ne!(
+        assert_eq!(
             err_valid.code(),
             "unauthorized",
-            "valid JSON-string operator must remain authorised"
+            "corrupt operators.jsonl must deny even operators that appear on valid lines"
         );
 
-        // The bare line must NOT grant access (fail-closed).
+        // The bare line must also NOT grant access.
         let err_bare = store
             .get("protected:v1:abc", "bare-not-json-string")
             .unwrap_err();
@@ -1198,6 +1232,85 @@ mod tests {
             err_bare.code(),
             "unauthorized",
             "bare/unquoted operator record must not grant access"
+        );
+    }
+
+    #[test]
+    fn capture_replaces_corrupt_manifest_record_on_recapture() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"real content").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        // Initial capture produces a valid record.
+        let report = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        let real_hash = report.entries[0].content_hash.clone();
+        let handle = report.entries[0].handle.clone();
+
+        // Tamper with the manifest: corrupt content_hash while keeping the handle
+        // field unchanged (so handle != compute_handle(class, fake_hash, path)).
+        let manifest_path = dir.path().join("manifest.jsonl");
+        let content = fs::read_to_string(&manifest_path).unwrap();
+        let mut rec: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        let fake_hash = "a".repeat(64);
+        rec["content_hash"] = serde_json::json!(&fake_hash);
+        fs::write(&manifest_path, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
+
+        // get() must fail now — integrity check catches the tampered record.
+        let err = store.get(&handle, "op-1").unwrap_err();
+        assert_eq!(err.code(), "corrupt_manifest_record");
+
+        // Re-capture while the source is still present — must replace the corrupt
+        // record with a valid one.
+        store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+
+        // get() must now succeed and return the original bytes.
+        let bytes = store
+            .get(&handle, "op-1")
+            .expect("get after corrupt-record repair");
+        assert_eq!(bytes, b"real content");
+
+        // Manifest must contain only one record for this handle (no duplicates).
+        let handles = store.list().unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].content_hash, real_hash);
+    }
+
+    #[test]
+    fn capture_fails_before_writes_when_operators_file_is_corrupt() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        // Write a corrupt operators.jsonl (bare non-JSON line).
+        fs::write(dir.path().join("operators.jsonl"), "not-a-json-string\n").unwrap();
+        // Write a valid (empty) manifest so the store appears initialised.
+        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
+
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"hello").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "transcript".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        // Capture must fail early — before writing any blobs.
+        let result = store.capture(&entries, "op-1", "0.1.0", fixed_ts(), true);
+        assert!(
+            result.is_err(),
+            "corrupt operators.jsonl must abort capture"
+        );
+
+        // No blobs must have been written.
+        assert!(
+            !dir.path().join("blobs").exists(),
+            "blobs directory must not be created when operators.jsonl is corrupt"
         );
     }
 }

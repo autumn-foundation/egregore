@@ -9256,15 +9256,29 @@ fn protected_capture_cmd(
     };
 
     let ps = ProtectedStore::new(store_path);
-    let report = ps
-        .capture(
-            &entries,
-            producer_id,
-            producer_version,
-            captured_at,
-            enabled,
-        )
-        .with_context(|| format!("protected store I/O failed at {}", store_path.display()))?;
+    let report = match ps.capture(
+        &entries,
+        producer_id,
+        producer_version,
+        captured_at,
+        enabled,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "store_io_error",
+                    "message": format!(
+                        "protected store I/O failed at {}: {e}",
+                        store_path.display()
+                    )
+                }
+            });
+            eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+            process::exit(1);
+        }
+    };
 
     let envelope = serde_json::json!({
         "ok": true,
