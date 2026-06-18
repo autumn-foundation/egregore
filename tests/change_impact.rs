@@ -2336,3 +2336,90 @@ fn truncation_preserves_nearer_hops() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Descendant seeding is a file-handle behaviour. Querying a Symbol that owns
+// children (e.g. an impl block) must NOT pull its methods' callers/callees into
+// the result, since those are not connected to the queried symbol itself.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn symbol_handle_does_not_seed_descendants() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("symbol_no_descendants.jsonl");
+    let mut graph = Graph::new();
+    let p = "src/lib.rs";
+
+    // impl block Symbol with a method defined beneath it.
+    let impl_id = sym_id(p, "impl Foo");
+    graph.push(GraphRecord::syntax_node(
+        impl_id.clone(),
+        NodeKind::Symbol,
+        p.to_owned(),
+        span(5, 40),
+        "impl Foo".to_owned(),
+        "rust",
+        "impl Foo".to_owned(),
+    ));
+    let method_id = sym_id(p, "Foo::bar");
+    graph.push(GraphRecord::syntax_node(
+        method_id.clone(),
+        NodeKind::Symbol,
+        p.to_owned(),
+        span(10, 20),
+        "Foo::bar".to_owned(),
+        "rust",
+        "fn bar".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Defines,
+        impl_id.clone(),
+        method_id.clone(),
+        None,
+        "impl Foo defines bar".to_owned(),
+    ));
+    // A caller of the method (not of the impl block itself).
+    let caller_id = sym_id(p, "calls_bar");
+    graph.push(GraphRecord::syntax_node(
+        caller_id.clone(),
+        NodeKind::Symbol,
+        p.to_owned(),
+        span(50, 60),
+        "calls_bar".to_owned(),
+        "rust",
+        "fn calls_bar".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Calls,
+        caller_id.clone(),
+        method_id,
+        None,
+        "calls_bar calls Foo::bar".to_owned(),
+    ));
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    // Query the impl Symbol at depth 2: the method's caller must not appear.
+    let stdout = egregore()
+        .args(["query", "change-impact", &impl_id, "--graph"])
+        .arg(&path)
+        .args(["--depth", "2"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    let callers: Vec<&str> = v["direct_callers"]
+        .as_array()
+        .expect("direct_callers")
+        .iter()
+        .filter_map(|c| c["record_id"].as_str())
+        .collect();
+    assert!(
+        !callers.contains(&caller_id.as_str()),
+        "querying a Symbol must not seed its descendants' callers; got: {callers:?}"
+    );
+}

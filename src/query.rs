@@ -7768,14 +7768,22 @@ pub fn change_impact_context<'a>(
         .collect();
 
     // ── BFS frontier ──────────────────────────────────────────────────────────
-    // For a File anchor, seed the symbols it defines/contains so that callers of
+    // For a File handle, seed the symbols it defines/contains so that callers of
     // those symbols are reachable at hop 1 (mirrors subsystem/semantic-context).
-    // Follow nested modules transitively (File CONTAINS Module DEFINES fn) so
-    // symbols declared inside `mod` blocks are seeded too.
+    // Follow nested containers transitively — modules (File CONTAINS Module
+    // DEFINES fn) and impl-block Symbols whose methods are emitted beneath them —
+    // so every symbol declared in the file is seeded. A Symbol handle seeds only
+    // itself: its owned children (e.g. an impl block's methods) are not the
+    // queried symbol, so their callers/callees must not be reported as direct
+    // leads.
+    let seed_descendants = matches!(target.kind, FailureTargetKind::File);
     let mut frontier: BTreeSet<&str> = BTreeSet::new();
     for anchor_id in &target.anchor_ids {
         if let Some(id_ref) = by_id.get(anchor_id.as_str()).map(|r| r.id()) {
             frontier.insert(id_ref);
+            if !seed_descendants {
+                continue;
+            }
             let mut containers: Vec<&str> = vec![id_ref];
             let mut expanded: BTreeSet<&str> = BTreeSet::new();
             while let Some(container) = containers.pop() {
