@@ -343,9 +343,27 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
 
 /// Writes `data` to `path` with owner-only permissions.
 ///
-/// On Unix, the file is created (or overwritten) with mode `0o600`.  On
-/// other platforms the system default is used.
+/// On Unix, the file is created with mode `0o600`.  On other platforms the
+/// system default is used.
+///
+/// Uses a write-to-temp-then-rename strategy so that a pre-existing symlink
+/// at `path` is atomically replaced (not followed): on Unix `rename(2)` and
+/// on Windows `MoveFileExW` both replace the destination entry without
+/// following it, preventing a tampered store from redirecting the write to a
+/// file outside the protected-store boundary.
 fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    // Build a sibling temp path in the same directory.  Same-directory
+    // placement guarantees the rename is on the same filesystem (required for
+    // atomicity on most platforms).
+    let file_name = path
+        .file_name()
+        .map_or_else(|| "write".to_owned(), |n| n.to_string_lossy().into_owned());
+    let tmp_name = format!(".{file_name}.wip");
+    let tmp_path = path.parent().map_or_else(
+        || std::path::PathBuf::from(&tmp_name),
+        |p| p.join(&tmp_name),
+    );
+
     #[cfg(unix)]
     {
         use std::io::Write as _;
@@ -355,13 +373,17 @@ fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(path)?;
-        f.write_all(data)
+            .open(&tmp_path)?;
+        f.write_all(data)?;
     }
     #[cfg(not(unix))]
     {
-        fs::write(path, data)
+        fs::write(&tmp_path, data)?;
     }
+    // Atomically replace `path` (including any symlink at that path) with the
+    // temp file.  On Unix this is `rename(2)`, which replaces the directory
+    // entry without following a symlink at the destination.
+    fs::rename(&tmp_path, path)
 }
 
 // ── Protected store ────────────────────────────────────────────────────────────
@@ -434,15 +456,27 @@ impl ProtectedStore {
     }
 
     /// Writes the manifest as canonical-sorted JSONL.
+    ///
+    /// When two records share the same handle but differ on metadata outside
+    /// the handle identity (e.g. `captured_at`, `producer_id`), the first
+    /// record in `handles` wins (first-capture-wins contract).  Byte-identical
+    /// deduplication alone would leave both records if they differed on any
+    /// such field.
     fn write_manifest(&self, handles: &[ProtectedHandle]) -> io::Result<()> {
         let dir = &self.root;
         create_private_dir(dir)?;
-        let mut lines: Vec<String> = handles
-            .iter()
+        // Collapse by handle: insert-order preserves first-capture-wins because
+        // callers build `handles` with existing manifest records first.
+        let mut by_handle: std::collections::BTreeMap<&str, &ProtectedHandle> =
+            std::collections::BTreeMap::new();
+        for h in handles {
+            by_handle.entry(h.handle.as_str()).or_insert(h);
+        }
+        let mut lines: Vec<String> = by_handle
+            .values()
             .map(|h| serde_json::to_string(h).expect("ProtectedHandle serialisation is infallible"))
             .collect();
         lines.sort_unstable();
-        lines.dedup();
         let content = format!("{}\n", lines.join("\n"));
         write_private_file(&self.manifest_path(), content.as_bytes())
     }
@@ -589,7 +623,44 @@ impl ProtectedStore {
                 continue;
             };
 
-            // Read source bytes.
+            // Check that the source path is a regular file before reading.
+            // `fs::read` follows symlinks and reads FIFOs/character-devices to
+            // EOF, which can block indefinitely (FIFO) or exhaust memory
+            // (`/dev/zero`).  Stat with `symlink_metadata` (no follow) first
+            // and require a regular file, emitting `stale_source_path` for
+            // anything else so capture continues to the next entry.
+            let source_meta = fs::symlink_metadata(&entry.source_path);
+            let source_is_regular = source_meta.as_ref().is_ok_and(|m| m.file_type().is_file());
+            if !source_is_regular {
+                skipped_count += 1;
+                let fallback_hash = blake3::hash(entry.source_path.as_bytes());
+                let fallback_hash_str = fallback_hash.to_hex().to_string();
+                let src = &entry.source_path;
+                let not_found = source_meta.is_err();
+                outcomes.push(CaptureEntryOutcome {
+                    source_path: entry.source_path.clone(),
+                    handle: format!("{PROTECTED_HANDLE_PREFIX}{fallback_hash_str}"),
+                    content_hash: fallback_hash_str,
+                    byte_len: 0,
+                    stored: false,
+                    diagnostic: Some(EntryDiagnostic {
+                        code: "stale_source_path".to_owned(),
+                        message: if not_found {
+                            format!(
+                                "source path {src:?} is not readable; \
+                                 the file may have moved or been deleted",
+                            )
+                        } else {
+                            format!(
+                                "source path {src:?} is not a regular file; \
+                                 FIFOs, symlinks, and device nodes are not accepted",
+                            )
+                        },
+                    }),
+                });
+                continue;
+            }
+            // Read source bytes (known-regular file; no symlink follow risk).
             let Ok(bytes) = fs::read(&entry.source_path) else {
                 skipped_count += 1;
                 let fallback_hash = blake3::hash(entry.source_path.as_bytes());
@@ -658,15 +729,20 @@ impl ProtectedStore {
             });
             let already_exists = existing.iter().any(|h| h.handle == handle);
             if already_exists {
-                // Handle already registered: repair the blob if it is missing
-                // *or* its contents no longer match the expected hash (corruption).
-                // This ensures `get` succeeds after a partial store deletion or
-                // silent blob corruption while the source file is still available.
+                // Handle already registered: repair the blob if it is missing,
+                // non-regular (symlink / FIFO / device), or its hash no longer
+                // matches.  Using `symlink_metadata` (no follow) avoids blocking
+                // on a FIFO or exhausting memory via a symlink to `/dev/zero`;
+                // non-regular paths are unconditionally treated as needing repair
+                // so `get` cannot later block on the same path.
                 let blob = self.blob_path(&content_hash);
-                let needs_repair = !blob.exists()
-                    || fs::read(&blob).map_or(true, |existing| {
+                let needs_repair = match blob.symlink_metadata() {
+                    Err(_) => true,                            // missing
+                    Ok(m) if !m.file_type().is_file() => true, // symlink / FIFO / device
+                    Ok(_) => fs::read(&blob).map_or(true, |existing| {
                         blake3::hash(&existing).to_hex().to_string() != content_hash
-                    });
+                    }),
+                };
                 if needs_repair {
                     create_private_dir(&self.blobs_dir())?;
                     write_private_file(&blob, &bytes)?;
@@ -1555,5 +1631,181 @@ mod tests {
             "missing_protected_payload",
             "symlink blob must be rejected as MissingProtectedPayload"
         );
+    }
+
+    // ── Unit: write_private_file symlink safety ────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_file_replaces_symlink_not_target() {
+        let dir = tempdir().unwrap();
+        // Create a "sensitive" file outside the store that a symlink might
+        // redirect to.
+        let target = dir.path().join("sensitive.txt");
+        fs::write(&target, b"original sensitive data").unwrap();
+
+        // Place a symlink at the intended write path pointing at the sensitive
+        // file.
+        let write_path = dir.path().join("store_file.txt");
+        std::os::unix::fs::symlink(&target, &write_path).unwrap();
+
+        // write_private_file must replace the symlink, not follow it, so the
+        // sensitive file is untouched and `store_file.txt` becomes a regular
+        // file containing the new data.
+        write_private_file(&write_path, b"new data").unwrap();
+
+        // The symlink itself was replaced — write_path is now a regular file.
+        let meta = write_path.symlink_metadata().unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "write path must be a regular file after write, not a symlink"
+        );
+        assert_eq!(fs::read(&write_path).unwrap(), b"new data");
+
+        // The sensitive file must not have been overwritten.
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"original sensitive data",
+            "symlink target must not be overwritten"
+        );
+    }
+
+    // ── Unit: write_manifest handle dedup (first-capture-wins) ────────────────
+
+    #[test]
+    fn write_manifest_deduplicates_by_handle_first_capture_wins() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"deduplicate test").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        // First capture — establishes producer "op-first".
+        store
+            .capture(&entries, "op-first", "0.1.0", "2026-01-01T00:00:00Z", true)
+            .unwrap();
+
+        // Second capture with a different producer and timestamp.
+        store
+            .capture(&entries, "op-second", "0.1.0", "2026-06-18T00:00:00Z", true)
+            .unwrap();
+
+        let handles = store.list().unwrap();
+        assert_eq!(
+            handles.len(),
+            1,
+            "manifest must not contain duplicate handles"
+        );
+        assert_eq!(
+            handles[0].producer_id, "op-first",
+            "first-capture-wins: producer_id of earliest capture must be retained"
+        );
+        assert_eq!(
+            handles[0].captured_at, "2026-01-01T00:00:00Z",
+            "first-capture-wins: captured_at of earliest capture must be retained"
+        );
+    }
+
+    // ── Unit: source file type check ──────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_rejects_fifo_source_as_stale_source_path() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+
+        // Create a FIFO (named pipe) as the source path.
+        let fifo_path = dir.path().join("source.fifo");
+        nix_mkfifo(&fifo_path);
+
+        let entries = vec![CaptureEntry {
+            class: "transcript".to_owned(),
+            source_path: fifo_path.to_string_lossy().into_owned(),
+        }];
+
+        // Disabled mode: must emit stale_source_path diagnostic (not block).
+        let report = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), false)
+            .unwrap();
+        assert_eq!(
+            report.entries[0].diagnostic.as_ref().unwrap().code,
+            "stale_source_path"
+        );
+        assert!(!report.entries[0].stored);
+
+        // Enabled mode: same — must not block on the FIFO.
+        let report2 = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        assert_eq!(
+            report2.entries[0].diagnostic.as_ref().unwrap().code,
+            "stale_source_path",
+            "FIFO source must produce stale_source_path diagnostic"
+        );
+        assert!(!report2.entries[0].stored);
+        // No blobs must have been written.
+        assert!(
+            !dir.path().join("blobs").exists(),
+            "no blobs for FIFO source"
+        );
+    }
+
+    // ── Unit: blob repair replaces symlink ────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_repair_replaces_symlink_blob() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"repair symlink blob").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "transcript".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        // Initial capture.
+        let report = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        let content_hash = report.entries[0].content_hash.clone();
+        let handle = report.entries[0].handle.clone();
+
+        // Replace the blob with a symlink to /dev/null.
+        let blob_path = dir.path().join("blobs").join(&content_hash);
+        fs::remove_file(&blob_path).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &blob_path).unwrap();
+
+        // Re-capture while source is still present — must repair (replace
+        // symlink with real blob via write-to-temp-and-rename).
+        store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+
+        // Blob must now be a regular file containing the original bytes.
+        let meta = blob_path.symlink_metadata().unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "blob must be a regular file after repair"
+        );
+        let bytes = store
+            .get(&handle, "op-1")
+            .expect("get after symlink repair");
+        assert_eq!(bytes, b"repair symlink blob");
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Creates a FIFO (named pipe) at `path` using the `mkfifo` shell command.
+    #[cfg(unix)]
+    fn nix_mkfifo(path: &std::path::Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo command must be available on Unix");
+        assert!(status.success(), "mkfifo failed");
     }
 }

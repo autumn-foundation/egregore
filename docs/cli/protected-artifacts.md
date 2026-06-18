@@ -190,7 +190,7 @@ Protected mode is **not** a substitute for:
 ```sh
 # 1. Write a capture manifest (one entry per payload)
 cat > evidence.jsonl <<'EOF'
-{"class":"transcript","source_path":"~/.claude/projects/foo/session.jsonl"}
+{"class":"transcript","source_path":"$HOME/.claude/projects/foo/session.jsonl"}
 {"class":"command_output","source_path":"/tmp/test-run-2026-06-18.log"}
 {"class":"patch","source_path":"feature.patch"}
 {"class":"task_narrative","source_path":".egregore/tasks/issue-60.md"}

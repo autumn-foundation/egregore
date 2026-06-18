@@ -918,8 +918,8 @@ fn capture_manifest_parse_error_emits_json_envelope() {
     assert_eq!(json["ok"], false);
     assert_eq!(json["error"]["code"], "invalid_manifest");
     assert!(
-        json["error"]["line"].as_u64().is_some(),
-        "line number must be present"
+        json["error"]["detail"]["line"].as_u64().is_some(),
+        "line number must be present in detail"
     );
 }
 

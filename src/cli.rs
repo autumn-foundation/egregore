@@ -9137,18 +9137,30 @@ fn protected_cmd(subcommand: ProtectedSubcommand) -> Result<()> {
                                 "ok": false,
                                 "error": {
                                     "code": "output_write_error",
-                                    "message": format!(
-                                        "failed to write bytes to {}: {e}",
-                                        out_path.display()
-                                    )
+                                    "detail": {
+                                        "message": format!(
+                                            "failed to write bytes to {}: {e}",
+                                            out_path.display()
+                                        )
+                                    }
                                 }
                             });
                             eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
                             process::exit(1);
                         }
-                    } else {
-                        std::io::Write::write_all(&mut std::io::stdout(), &bytes)
-                            .context("failed to write bytes to stdout")?;
+                    } else if let Err(e) = std::io::Write::write_all(&mut std::io::stdout(), &bytes)
+                    {
+                        let envelope = serde_json::json!({
+                            "ok": false,
+                            "error": {
+                                "code": "stdout_write_error",
+                                "detail": {
+                                    "message": format!("failed to write bytes to stdout: {e}")
+                                }
+                            }
+                        });
+                        eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+                        process::exit(1);
                     }
                     Ok(())
                 }
@@ -9168,10 +9180,12 @@ fn protected_cmd(subcommand: ProtectedSubcommand) -> Result<()> {
                         "ok": false,
                         "error": {
                             "code": "store_io_error",
-                            "message": format!(
-                                "failed to read protected store at {}: {e}",
-                                store.display()
-                            )
+                            "detail": {
+                                "message": format!(
+                                    "failed to read protected store at {}: {e}",
+                                    store.display()
+                                )
+                            }
                         }
                     });
                     eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
@@ -9210,8 +9224,10 @@ fn protected_capture_cmd(
             "ok": false,
             "error": {
                 "code": "missing_field",
-                "field": "producer",
-                "message": "--producer is required when --protected-raw-artifacts is set"
+                "detail": {
+                    "field": "producer",
+                    "message": "--producer is required when --protected-raw-artifacts is set"
+                }
             }
         });
         eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
@@ -9222,8 +9238,10 @@ fn protected_capture_cmd(
             "ok": false,
             "error": {
                 "code": "invalid_field",
-                "field": "producer",
-                "message": "--producer must not be empty when --protected-raw-artifacts is set"
+                "detail": {
+                    "field": "producer",
+                    "message": "--producer must not be empty when --protected-raw-artifacts is set"
+                }
             }
         });
         eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
@@ -9239,7 +9257,12 @@ fn protected_capture_cmd(
                 "ok": false,
                 "error": {
                     "code": "manifest_read_error",
-                    "message": format!("failed to read capture manifest at {}: {e}", manifest_path.display())
+                    "detail": {
+                        "message": format!(
+                            "failed to read capture manifest at {}: {e}",
+                            manifest_path.display()
+                        )
+                    }
                 }
             });
             eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
@@ -9259,8 +9282,13 @@ fn protected_capture_cmd(
                     "ok": false,
                     "error": {
                         "code": "invalid_manifest",
-                        "line": i + 1,
-                        "message": format!("manifest line {}: failed to parse JSON: {e}", i + 1)
+                        "detail": {
+                            "line": i + 1,
+                            "message": format!(
+                                "manifest line {}: failed to parse JSON: {e}",
+                                i + 1
+                            )
+                        }
                     }
                 });
                 eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
@@ -9294,10 +9322,12 @@ fn protected_capture_cmd(
                 "ok": false,
                 "error": {
                     "code": "store_io_error",
-                    "message": format!(
-                        "protected store I/O failed at {}: {e}",
-                        store_path.display()
-                    )
+                    "detail": {
+                        "message": format!(
+                            "protected store I/O failed at {}: {e}",
+                            store_path.display()
+                        )
+                    }
                 }
             });
             eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
