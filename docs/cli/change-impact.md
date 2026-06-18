@@ -106,8 +106,10 @@ The top-level envelope always includes all five groups (even when empty) so
 
 Only `Symbol` nodes expand the frontier for subsequent hops; `File` and
 `Module` owners stop expanding (prevents whole-repo blow-up at depth ≥ 2).
-`Mentions` edges (cross-domain, not code topology) are excluded from
-traversal.
+Non-call code references (type and value uses, trait bounds) are recorded by
+the extractor as `REFERENCES` edges and surface under `referencing_files`;
+the agent-domain `MentionsSymbol` edge (an observation referencing a symbol)
+is cross-domain and is not part of this code-topology traversal.
 
 ## Per-row fields (provenance — AC4)
 

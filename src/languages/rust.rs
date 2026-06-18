@@ -364,19 +364,26 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                     continue;
                 }
 
-                self.add_edge(
-                    EdgeLabel::Mentions,
-                    body.id.clone(),
-                    target_id.clone(),
-                    format!("{} mentions {name}", body.name),
-                );
-
+                // A code reference between two symbols. Type it as `Calls` when
+                // it looks like an invocation, otherwise as `References` (type
+                // and value uses, trait bounds, constructors). Both are
+                // deterministic code-topology edges that downstream queries
+                // (change-impact, context) consume; emitting `References` here
+                // makes non-call code references first-class instead of hiding
+                // them in untyped `Mentions` edges.
                 if looks_like_call(&body.text, name) {
                     self.add_edge(
                         EdgeLabel::Calls,
                         body.id.clone(),
                         target_id.clone(),
                         format!("{} calls {name}", body.name),
+                    );
+                } else {
+                    self.add_edge(
+                        EdgeLabel::References,
+                        body.id.clone(),
+                        target_id.clone(),
+                        format!("{} references {name}", body.name),
                     );
                 }
             }
