@@ -515,6 +515,12 @@ fn get_unauthorized() {
     let json: serde_json::Value =
         serde_json::from_slice(&stderr).expect("error output must be JSON");
     assert_eq!(json["error"]["code"], "unauthorized");
+    // Operator value must not be echoed (it could be a secret/bearer token).
+    let stderr_str = String::from_utf8_lossy(&stderr);
+    assert!(
+        !stderr_str.contains("op-not-authorised"),
+        "operator ID must not appear in error output: {stderr_str}"
+    );
 }
 
 /// AC5: Handle not found in manifest yields `payload_not_found` (exit 2).
@@ -737,4 +743,101 @@ fn capture_enabled_without_producer_exits_1() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("missing_field"));
+}
+
+/// Empty `--producer ""` must be rejected (exit 1) to prevent bypassing the
+/// access gate via an accidentally unset env-var like `$(git config user.email)`.
+#[test]
+fn capture_enabled_with_empty_producer_exits_1() {
+    let (_guard, store) = tmp_store();
+    eg().args(["protected", "capture"])
+        .arg("--manifest")
+        .arg(capture_manifest())
+        .arg("--store")
+        .arg(&store)
+        .arg("--protected-raw-artifacts")
+        .arg("--producer")
+        .arg("") // empty string
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("invalid_field"));
+}
+
+/// `eg protected get` must return `corrupt_manifest_record` when the stored
+/// `handle` field does not match the handle recomputed from the record's
+/// class / `content_hash` / `source_path`.
+#[test]
+fn get_corrupt_manifest_record() {
+    let (_guard, store) = tmp_store();
+    run_capture_enabled(&store, "op-1");
+
+    // Tamper with the first manifest record's `handle` field.
+    let manifest_path = store.join("manifest.jsonl");
+    let content = fs::read_to_string(&manifest_path).expect("manifest");
+    let first_line = content.lines().next().expect("at least one record");
+    let mut rec: serde_json::Value =
+        serde_json::from_str(first_line).expect("manifest line is JSON");
+    let tampered_handle =
+        "protected:v1:0000000000000000000000000000000000000000000000000000000000000000";
+    rec["handle"] = serde_json::json!(tampered_handle);
+    // Replace just the first line.
+    let rest: Vec<&str> = content.lines().skip(1).collect();
+    let new_content = std::iter::once(serde_json::to_string(&rec).unwrap().as_str())
+        .chain(rest)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&manifest_path, new_content).expect("write tampered manifest");
+
+    let stderr = eg()
+        .args(["protected", "get", tampered_handle])
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&stderr).expect("error output must be JSON");
+    assert_eq!(json["error"]["code"], "corrupt_manifest_record");
+}
+
+/// Capturing the same payloads again after a blob is deleted must repair the
+/// store: `eg protected get` must succeed after re-capture while the source
+/// is still available (fix for missing-blob re-capture scenario).
+#[test]
+fn capture_repairs_missing_blob_on_recapture() {
+    let (_guard, store) = tmp_store();
+    let first = run_capture_enabled(&store, "op-1");
+    let handle = first["entries"][0]["handle"].as_str().expect("handle");
+    let content_hash = first["entries"][0]["content_hash"].as_str().expect("hash");
+
+    // Delete the blob.
+    fs::remove_file(store.join("blobs").join(content_hash)).expect("delete blob");
+    assert!(
+        !store.join("blobs").join(content_hash).exists(),
+        "blob must be gone"
+    );
+
+    // Re-capture with sources still present — must repair the blob.
+    run_capture_enabled(&store, "op-1");
+
+    assert!(
+        store.join("blobs").join(content_hash).exists(),
+        "blob must be restored after re-capture"
+    );
+
+    // get must now succeed.
+    eg().args(["protected", "get"])
+        .arg(handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .success();
 }

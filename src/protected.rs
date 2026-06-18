@@ -224,6 +224,11 @@ pub enum GetError {
     /// The requesting operator ID is not in the authorised set.
     Unauthorized {
         /// The operator ID that was rejected.
+        ///
+        /// Intentionally not serialized to avoid leaking bearer tokens or
+        /// other secrets that a caller might accidentally supply as an
+        /// operator identifier.
+        #[serde(skip)]
         operator: String,
     },
     /// The handle string does not have the `protected:v1:` prefix.
@@ -252,6 +257,13 @@ pub enum GetError {
         /// The hash computed from the stored blob.
         actual: String,
     },
+    /// The manifest record's `handle` field does not match the handle computed
+    /// from its own class, content hash, and source path.  The manifest has
+    /// been corrupted or tampered with.
+    CorruptManifestRecord {
+        /// The requested handle.
+        handle: String,
+    },
 }
 
 impl GetError {
@@ -265,6 +277,7 @@ impl GetError {
             Self::PayloadNotFound { .. } => "payload_not_found",
             Self::MissingProtectedPayload { .. } => "missing_protected_payload",
             Self::HashMismatch { .. } => "hash_mismatch",
+            Self::CorruptManifestRecord { .. } => "corrupt_manifest_record",
         }
     }
 
@@ -436,8 +449,10 @@ impl ProtectedStore {
         let mut skipped_count = 0usize;
 
         // Load existing manifest so we can dedup (AC7).
+        // Propagate parse/IO errors rather than silently treating a corrupt
+        // manifest as empty — that would overwrite previously captured handles.
         let mut existing: Vec<ProtectedHandle> = if enabled {
-            self.read_manifest().unwrap_or_default()
+            self.read_manifest()?
         } else {
             Vec::new()
         };
@@ -512,8 +527,17 @@ impl ProtectedStore {
 
             // Enabled: store blob + register in manifest.
             let already_exists = existing.iter().any(|h| h.handle == handle);
-            if !already_exists {
-                // Write blob.
+            if already_exists {
+                // Handle already registered: repair a missing blob while the
+                // source is still available so `get` does not fail with
+                // `missing_protected_payload` after a partial store deletion.
+                let blob = self.blob_path(&content_hash);
+                if !blob.exists() {
+                    fs::create_dir_all(self.blobs_dir())?;
+                    fs::write(blob, &bytes)?;
+                }
+            } else {
+                // New handle: write blob and register.
                 fs::create_dir_all(self.blobs_dir())?;
                 fs::write(self.blob_path(&content_hash), &bytes)?;
 
@@ -605,6 +629,20 @@ impl ProtectedStore {
             .ok_or_else(|| GetError::PayloadNotFound {
                 handle: handle.to_owned(),
             })?;
+
+        // 4a. Handle integrity check: the stored `handle` field must agree with
+        // the handle recomputed from the record's own class/content_hash/path.
+        // A mismatch means the manifest was corrupted or tampered with.
+        let expected_handle = ProtectedHandle::compute_handle(
+            &record.source_class,
+            &record.content_hash,
+            record.source_path.as_deref(),
+        );
+        if expected_handle != record.handle {
+            return Err(GetError::CorruptManifestRecord {
+                handle: handle.to_owned(),
+            });
+        }
 
         // 5. Blob presence check.
         let blob_path = self.blob_path(&record.content_hash);
@@ -825,5 +863,118 @@ mod tests {
 
         let err = store.get("notaprotectedhandle:abc", "op-1").unwrap_err();
         assert_eq!(err.code(), "malformed_handle");
+    }
+
+    #[test]
+    fn unauthorized_operator_not_echoed_in_error_json() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        fs::create_dir_all(dir.path()).unwrap();
+        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
+        store.write_operators(&["op-allowed".to_owned()]).unwrap();
+
+        let err = store
+            .get("protected:v1:abc", "bearer-secret-token")
+            .unwrap_err();
+        assert_eq!(err.code(), "unauthorized");
+        let json = err.to_json();
+        assert!(json.contains("unauthorized"), "code must be present");
+        assert!(
+            !json.contains("bearer-secret-token"),
+            "operator must not be echoed in error JSON"
+        );
+    }
+
+    #[test]
+    fn corrupt_manifest_handle_rejected() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"hello world").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "transcript".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+        store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+
+        // Tamper with the handle field in manifest.jsonl.
+        let manifest_path = dir.path().join("manifest.jsonl");
+        let content = fs::read_to_string(&manifest_path).unwrap();
+        let mut rec: serde_json::Value =
+            serde_json::from_str(content.trim()).expect("manifest must parse");
+        let tampered =
+            "protected:v1:0000000000000000000000000000000000000000000000000000000000000000";
+        rec["handle"] = serde_json::json!(tampered);
+        fs::write(&manifest_path, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
+
+        let err = store.get(tampered, "op-1").unwrap_err();
+        assert_eq!(
+            err.code(),
+            "corrupt_manifest_record",
+            "tampered handle must surface store corruption"
+        );
+    }
+
+    #[test]
+    fn capture_repairs_missing_blob() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"repair test content").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "transcript".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        // Initial capture.
+        let report = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        let content_hash = report.entries[0].content_hash.clone();
+        let handle = report.entries[0].handle.clone();
+
+        // Delete the blob.
+        fs::remove_file(dir.path().join("blobs").join(&content_hash)).unwrap();
+        assert!(
+            !dir.path().join("blobs").join(&content_hash).exists(),
+            "blob deleted"
+        );
+
+        // Re-capture with source still present — should repair.
+        store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        assert!(
+            dir.path().join("blobs").join(&content_hash).exists(),
+            "blob must be repaired by re-capture"
+        );
+
+        // get() must now succeed.
+        let bytes = store.get(&handle, "op-1").expect("get after repair");
+        assert_eq!(bytes, b"repair test content");
+    }
+
+    #[test]
+    fn capture_corrupt_manifest_returns_error() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        fs::create_dir_all(dir.path()).unwrap();
+        // Write a corrupt (non-JSON) manifest.
+        fs::write(dir.path().join("manifest.jsonl"), "this is not json\n").unwrap();
+
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"hello").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "transcript".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        let result = store.capture(&entries, "op-1", "0.1.0", fixed_ts(), true);
+        assert!(
+            result.is_err(),
+            "capture must fail when manifest is corrupt"
+        );
     }
 }

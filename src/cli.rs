@@ -9179,7 +9179,7 @@ fn protected_capture_cmd(
 ) -> Result<()> {
     use crate::protected::{CaptureEntry, ProtectedStore};
 
-    // Validate: enabled mode requires --producer.
+    // Validate: enabled mode requires a non-empty --producer.
     if enabled && producer.is_none() {
         let envelope = serde_json::json!({
             "ok": false,
@@ -9187,6 +9187,18 @@ fn protected_capture_cmd(
                 "code": "missing_field",
                 "field": "producer",
                 "message": "--producer is required when --protected-raw-artifacts is set"
+            }
+        });
+        eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+        process::exit(1);
+    }
+    if enabled && producer.is_some_and(|p| p.trim().is_empty()) {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "invalid_field",
+                "field": "producer",
+                "message": "--producer must not be empty when --protected-raw-artifacts is set"
             }
         });
         eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
