@@ -334,6 +334,31 @@ fn is_valid_blake3_hex(s: &str) -> bool {
 /// On Unix, the directory is created with mode `0o700`.  On other platforms
 /// the system default is used; operators must provision filesystem ACLs
 /// themselves.
+/// Returns an error when serialized metadata `content` would exceed the read
+/// cap that [`ProtectedStore::read_manifest`] / `read_operators` enforce.
+///
+/// Without this guard, a large-but-successful enabled capture could write a
+/// `manifest.jsonl` (or `operators.jsonl`) bigger than [`MAX_STORE_FILE_BYTES`],
+/// after which every subsequent `list`, `get`, and `capture` would reject the
+/// store as corrupt — a successful write silently rendering the store
+/// unreadable.  Failing the write keeps read and write consistent and leaves
+/// the prior (readable) file in place, since the caller writes via
+/// temp-then-rename only after this check passes.
+fn check_within_read_cap(content: &str, what: &str) -> io::Result<()> {
+    if content.len() as u64 > MAX_STORE_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{what} would be {} B, exceeding the {} B read cap; \
+                 refusing to write a file that later reads would reject",
+                content.len(),
+                MAX_STORE_FILE_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn create_private_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -512,6 +537,35 @@ impl ProtectedStore {
         self.blobs_dir().join(content_hash)
     }
 
+    /// Returns the blobs directory path after verifying it is a real directory.
+    ///
+    /// A tampered or shared store could replace `<store>/blobs` with a symlink
+    /// to an attacker-controlled directory.  Directory path components are
+    /// followed transparently by the OS, so the per-blob `symlink_metadata`
+    /// check on the leaf file does **not** catch a symlinked parent — writes
+    /// would stage payloads, and reads would resolve, outside the protected
+    /// store boundary.  Rejecting anything at the `blobs` path that is not a
+    /// genuine directory (symlink, regular file, FIFO, device) closes that gap.
+    ///
+    /// A genuinely absent `blobs` directory (`NotFound`) is allowed — it is
+    /// created lazily by [`create_private_dir`] on first write.
+    fn checked_blobs_dir(&self) -> io::Result<PathBuf> {
+        let dir = self.blobs_dir();
+        match dir.symlink_metadata() {
+            Ok(m) if m.file_type().is_dir() => Ok(dir),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "blobs path at {} is not a real directory (symlink/file/device); \
+                     the store may have been tampered with",
+                    dir.display()
+                ),
+            )),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(dir),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Returns `true` when the manifest path exists in any form.
     ///
     /// Distinguishes a genuinely absent store (`NotFound` → `false`) from one
@@ -605,6 +659,7 @@ impl ProtectedStore {
             .collect();
         lines.sort_unstable();
         let content = format!("{}\n", lines.join("\n"));
+        check_within_read_cap(&content, "manifest.jsonl")?;
         write_private_file(&self.manifest_path(), content.as_bytes())
     }
 
@@ -680,6 +735,7 @@ impl ProtectedStore {
         lines.sort_unstable();
         lines.dedup();
         let content = format!("{}\n", lines.join("\n"));
+        check_within_read_cap(&content, "operators.jsonl")?;
         write_private_file(&self.operators_path(), content.as_bytes())
     }
 
@@ -910,18 +966,26 @@ impl ProtectedStore {
                 let needs_repair = match blob.symlink_metadata() {
                     Err(_) => true,                            // missing
                     Ok(m) if !m.file_type().is_file() => true, // symlink / FIFO / device
+                    // Size mismatch ⇒ definitely not the expected content, so
+                    // repair without reading the (possibly huge / tampered) blob
+                    // into memory.  Only when the size already equals the
+                    // known-good source `byte_len` do we read to verify the hash,
+                    // bounding the read to the legitimate payload size.
+                    Ok(m) if m.len() != byte_len => true,
                     Ok(_) => fs::read(&blob).map_or(true, |existing| {
                         blake3::hash(&existing).to_hex().to_string() != content_hash
                     }),
                 };
                 if needs_repair {
-                    create_private_dir(&self.blobs_dir())?;
+                    let blobs = self.checked_blobs_dir()?;
+                    create_private_dir(&blobs)?;
                     write_private_file(&blob, &bytes)?;
                 }
             } else {
                 // New handle: write blob and register.
-                create_private_dir(&self.blobs_dir())?;
-                write_private_file(&self.blob_path(&content_hash), &bytes)?;
+                let blobs = self.checked_blobs_dir()?;
+                create_private_dir(&blobs)?;
+                write_private_file(&blobs.join(&content_hash), &bytes)?;
 
                 let record = ProtectedHandle {
                     handle: handle.clone(),
@@ -1059,7 +1123,16 @@ impl ProtectedStore {
         // tampered store that replaced a blob with a symlink to `/dev/zero` (or a
         // FIFO / device node) is caught here rather than after an unbounded read.
         // Only regular files are accepted.
-        let blob_path = self.blob_path(&record.content_hash);
+        // Reject a symlinked/non-directory `blobs` parent before resolving the
+        // leaf path, so a tampered store cannot redirect reads outside the
+        // protected-store boundary via a symlinked `blobs` directory.
+        let blob_path = self
+            .checked_blobs_dir()
+            .map(|d| d.join(&record.content_hash))
+            .map_err(|_| GetError::MissingProtectedPayload {
+                handle: handle.to_owned(),
+                expected_path: self.blob_path(&record.content_hash).display().to_string(),
+            })?;
         let expected_path = blob_path.display().to_string();
         let blob_meta =
             blob_path
@@ -2100,6 +2173,130 @@ mod tests {
         assert!(
             err.to_string().contains("not a regular file"),
             "error message must mention 'not a regular file': {err}"
+        );
+    }
+
+    // ── Unit: read-cap guard on writes (finding 3) ───────────────────────────
+
+    #[test]
+    fn check_within_read_cap_rejects_oversized_content() {
+        // Within the cap → Ok.
+        assert!(check_within_read_cap("small", "manifest.jsonl").is_ok());
+
+        // Exactly at the cap → Ok.
+        let cap = usize::try_from(MAX_STORE_FILE_BYTES).expect("cap fits in usize");
+        let at_cap = "x".repeat(cap);
+        assert!(check_within_read_cap(&at_cap, "manifest.jsonl").is_ok());
+
+        // One byte over the cap → InvalidData error, so write_manifest /
+        // write_operators never commit a file later reads would reject.
+        let over_cap = "x".repeat(cap + 1);
+        let err = check_within_read_cap(&over_cap, "manifest.jsonl").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("exceeding the"),
+            "error must explain the cap: {err}"
+        );
+    }
+
+    // ── Unit: repair skips reading a wrong-sized blob (finding 1) ─────────────
+
+    #[test]
+    fn capture_repairs_blob_with_mismatched_size_without_hash_read() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"small original").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        let report = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        let content_hash = report.entries[0].content_hash.clone();
+        let handle = report.entries[0].handle.clone();
+
+        // Replace the blob with a much LARGER wrong-sized regular file.  The
+        // size-mismatch arm must mark it for repair without reading the whole
+        // (here oversized) blob to hash it.
+        let big = vec![b'Z'; 5 * 1024 * 1024];
+        fs::write(dir.path().join("blobs").join(&content_hash), &big).unwrap();
+
+        store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+
+        let bytes = store.get(&handle, "op-1").expect("get after size repair");
+        assert_eq!(bytes, b"small original");
+    }
+
+    // ── Unit: symlinked blobs directory is rejected (finding 2) ───────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn enabled_capture_rejects_symlinked_blobs_dir() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("store");
+        fs::create_dir_all(&root).unwrap();
+        // Point <store>/blobs at an attacker-controlled directory outside the store.
+        let evil = dir.path().join("evil");
+        fs::create_dir_all(&evil).unwrap();
+        std::os::unix::fs::symlink(&evil, root.join("blobs")).unwrap();
+
+        let store = ProtectedStore::new(&root);
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"secret bytes").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        let err = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .expect_err("capture must refuse a symlinked blobs directory");
+        assert!(
+            err.to_string().contains("not a real directory"),
+            "error must explain the symlinked blobs dir: {err}"
+        );
+        // No payload may have been staged inside the symlink target.
+        assert!(
+            fs::read_dir(&evil).unwrap().next().is_none(),
+            "no blob may be written through the symlinked blobs directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn get_rejects_symlinked_blobs_dir() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"original content").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+        let report = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        let handle = report.entries[0].handle.clone();
+
+        // Replace the real blobs directory with a symlink to a copy of itself.
+        // The blob is still reachable through the symlink, but get() must refuse
+        // to resolve through a symlinked parent.
+        let real_blobs = dir.path().join("blobs");
+        let moved = dir.path().join("blobs_real");
+        fs::rename(&real_blobs, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &real_blobs).unwrap();
+
+        let err = store
+            .get(&handle, "op-1")
+            .expect_err("get must refuse a symlinked blobs directory");
+        assert!(
+            matches!(err, GetError::MissingProtectedPayload { .. }),
+            "symlinked blobs dir must map to MissingProtectedPayload, got {err:?}"
         );
     }
 
