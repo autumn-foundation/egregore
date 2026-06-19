@@ -9105,6 +9105,69 @@ fn decide_cmd(
 
 // ── eg protected ──────────────────────────────────────────────────────────────
 
+/// Implements `eg protected get`: streams the verified payload to `out` (a file)
+/// or stdout without buffering the whole payload in memory.
+///
+/// Exits the process on any failure (with the documented JSON envelope and exit
+/// code); returns normally on success.
+fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Path>) {
+    use crate::protected::{GetStreamError, ProtectedStore};
+    let ps = ProtectedStore::new(store);
+
+    // Stream the verified payload directly to the destination so a multi-GB
+    // payload never has to be buffered in memory.
+    let stream_result = out.map_or_else(
+        || {
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            ps.get_to_writer(handle, operator, &mut lock)
+        },
+        |out_path| match fs::File::create(out_path) {
+            Ok(mut f) => ps.get_to_writer(handle, operator, &mut f),
+            Err(e) => Err(GetStreamError::Output(e)),
+        },
+    );
+
+    match stream_result {
+        Ok(_) => {}
+        Err(GetStreamError::Get(e)) => {
+            // A retrieval/verification failure: nothing was written.  If a --out
+            // file was created, remove the now-empty/partial file so a failed get
+            // never leaves a misleading output artifact.
+            if let Some(out_path) = out {
+                let _ = fs::remove_file(out_path);
+            }
+            let is_not_found = e.code() == "payload_not_found";
+            eprintln!("{}", e.to_json()); // to_json() is not Display; format is deliberate
+            process::exit(if is_not_found { 2 } else { 1 });
+        }
+        Err(GetStreamError::Output(e)) => {
+            // Remove any partially written --out file.
+            let (code, message) = out.map_or_else(
+                || {
+                    (
+                        "stdout_write_error",
+                        format!("failed to write bytes to stdout: {e}"),
+                    )
+                },
+                |out_path| {
+                    let _ = fs::remove_file(out_path);
+                    (
+                        "output_write_error",
+                        format!("failed to write bytes to {}: {e}", out_path.display()),
+                    )
+                },
+            );
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": { "code": code, "detail": { "message": message } }
+            });
+            eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+            process::exit(1);
+        }
+    }
+}
+
 /// Dispatches `eg protected <subcommand>` (issue #60).
 fn protected_cmd(subcommand: ProtectedSubcommand) -> Result<()> {
     use crate::protected::ProtectedStore;
@@ -9128,48 +9191,8 @@ fn protected_cmd(subcommand: ProtectedSubcommand) -> Result<()> {
             operator,
             out,
         } => {
-            let ps = ProtectedStore::new(&store);
-            match ps.get(&handle, &operator) {
-                Ok(bytes) => {
-                    if let Some(out_path) = out {
-                        if let Err(e) = fs::write(&out_path, &bytes) {
-                            let envelope = serde_json::json!({
-                                "ok": false,
-                                "error": {
-                                    "code": "output_write_error",
-                                    "detail": {
-                                        "message": format!(
-                                            "failed to write bytes to {}: {e}",
-                                            out_path.display()
-                                        )
-                                    }
-                                }
-                            });
-                            eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
-                            process::exit(1);
-                        }
-                    } else if let Err(e) = std::io::Write::write_all(&mut std::io::stdout(), &bytes)
-                    {
-                        let envelope = serde_json::json!({
-                            "ok": false,
-                            "error": {
-                                "code": "stdout_write_error",
-                                "detail": {
-                                    "message": format!("failed to write bytes to stdout: {e}")
-                                }
-                            }
-                        });
-                        eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
-                        process::exit(1);
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    let is_not_found = e.code() == "payload_not_found";
-                    eprintln!("{}", e.to_json()); // to_json() is not Display; format is deliberate
-                    process::exit(if is_not_found { 2 } else { 1 });
-                }
-            }
+            protected_get_cmd(&handle, &store, &operator, out.as_deref());
+            Ok(())
         }
         ProtectedSubcommand::List { store } => {
             let ps = ProtectedStore::new(&store);

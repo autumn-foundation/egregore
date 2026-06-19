@@ -343,6 +343,20 @@ impl GetError {
     }
 }
 
+/// Error from [`ProtectedStore::get_to_writer`], separating a retrieval or
+/// integrity failure from a failure writing the verified bytes to the sink.
+///
+/// The distinction lets the CLI emit a `get`-style diagnostic envelope for a
+/// retrieval failure but an `output_write_error` envelope when the destination
+/// (a `--out` file or stdout) cannot be written.
+#[derive(Debug)]
+pub enum GetStreamError {
+    /// Retrieval or integrity verification failed; nothing was written to `out`.
+    Get(GetError),
+    /// Writing the verified bytes to the destination sink failed.
+    Output(io::Error),
+}
+
 // ── BLAKE3 hex validation ──────────────────────────────────────────────────────
 
 /// Returns `true` iff `s` is a valid 64-character lowercase BLAKE3 hex string.
@@ -1329,6 +1343,34 @@ impl ProtectedStore {
 
     /// Retrieves the raw bytes for `handle`, verifying the content hash.
     ///
+    /// This buffers the whole payload in memory; prefer [`Self::get_to_writer`]
+    /// for large payloads.  Provided for in-memory and embedded callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`GetError`] for every failure mode.  The error JSON never
+    /// includes raw payload bytes, secrets, or bearer tokens.
+    pub fn get(&self, handle: &str, operator: &str) -> Result<Vec<u8>, GetError> {
+        // Delegate to the streaming path with an in-memory sink.  Writing to a
+        // `Vec` is infallible, so the `Output` channel is unreachable here.
+        let mut buf = Vec::new();
+        match self.get_to_writer(handle, operator, &mut buf) {
+            Ok(_) => Ok(buf),
+            Err(GetStreamError::Get(e)) => Err(e),
+            Err(GetStreamError::Output(e)) => {
+                unreachable!("in-memory Vec sink cannot fail: {e}")
+            }
+        }
+    }
+
+    /// Streams the verified payload for `handle` to `out` after authorizing
+    /// `operator`, without buffering the whole payload in memory.
+    ///
+    /// Two passes over the blob: the first verifies the BLAKE3 hash (so no
+    /// unverified bytes are ever released), the second copies the bytes to
+    /// `out` in bounded chunks.  Returns the number of bytes written.  This
+    /// keeps memory flat for the multi-GB payloads that capture now streams.
+    ///
     /// Check order (auth before existence disclosure):
     /// 1. Store / manifest absent → [`GetError::RawArtifactModeDisabled`].
     /// 2. `operator` not in authorised set → [`GetError::Unauthorized`].
@@ -1336,13 +1378,70 @@ impl ProtectedStore {
     /// 4. `handle` not in manifest → [`GetError::PayloadNotFound`].
     /// 5. Blob file absent → [`GetError::MissingProtectedPayload`].
     /// 6. BLAKE3 mismatch → [`GetError::HashMismatch`].
-    /// 7. Else → `Ok(bytes)`.
     ///
     /// # Errors
     ///
-    /// Returns a [`GetError`] for every failure mode.  The error JSON never
-    /// includes raw payload bytes, secrets, or bearer tokens.
-    pub fn get(&self, handle: &str, operator: &str) -> Result<Vec<u8>, GetError> {
+    /// [`GetStreamError::Get`] for any retrieval or integrity failure (nothing
+    /// is written to `out`); [`GetStreamError::Output`] if writing to `out`
+    /// fails after verification.
+    pub fn get_to_writer<W: io::Write>(
+        &self,
+        handle: &str,
+        operator: &str,
+        out: &mut W,
+    ) -> Result<u64, GetStreamError> {
+        use std::io::Read as _;
+
+        let (blob_path, content_hash) = self
+            .resolve_blob(handle, operator)
+            .map_err(GetStreamError::Get)?;
+
+        // Pass 1: verify the hash by streaming the blob (bounded memory) BEFORE
+        // emitting any bytes, preserving the verify-before-release guarantee.
+        let (actual_hash, _) = hash_source_streaming(&blob_path).map_err(|_| {
+            GetStreamError::Get(GetError::MissingProtectedPayload {
+                handle: handle.to_owned(),
+                expected_path: blob_path.display().to_string(),
+            })
+        })?;
+        if actual_hash != content_hash {
+            return Err(GetStreamError::Get(GetError::HashMismatch {
+                handle: handle.to_owned(),
+                expected: content_hash,
+                actual: actual_hash,
+            }));
+        }
+
+        // Pass 2: stream the verified bytes to the destination in bounded chunks.
+        let mut f = fs::File::open(&blob_path).map_err(|_| {
+            GetStreamError::Get(GetError::MissingProtectedPayload {
+                handle: handle.to_owned(),
+                expected_path: blob_path.display().to_string(),
+            })
+        })?;
+        // Heap-allocated so the 64 KiB chunk buffer does not sit on the stack.
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = f.read(&mut buf).map_err(|_| {
+                GetStreamError::Get(GetError::MissingProtectedPayload {
+                    handle: handle.to_owned(),
+                    expected_path: blob_path.display().to_string(),
+                })
+            })?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).map_err(GetStreamError::Output)?;
+            total += n as u64;
+        }
+        Ok(total)
+    }
+
+    /// Resolves and validates the content-addressed blob path for `handle` after
+    /// authorizing `operator`.  Returns the verified-safe blob path and its
+    /// expected content hash; the caller reads and hash-verifies the bytes.
+    fn resolve_blob(&self, handle: &str, operator: &str) -> Result<(PathBuf, String), GetError> {
         // 1. Mode check.
         if !self.is_initialised() {
             return Err(GetError::RawArtifactModeDisabled);
@@ -1469,23 +1568,8 @@ impl ProtectedStore {
             });
         }
 
-        // Read blob.
-        let bytes = fs::read(&blob_path).map_err(|_| GetError::MissingProtectedPayload {
-            handle: handle.to_owned(),
-            expected_path: blob_path.display().to_string(),
-        })?;
-
-        // 6. Hash verification.
-        let actual_hash = blake3::hash(&bytes).to_hex().to_string();
-        if actual_hash != record.content_hash {
-            return Err(GetError::HashMismatch {
-                handle: handle.to_owned(),
-                expected: record.content_hash.clone(),
-                actual: actual_hash,
-            });
-        }
-
-        Ok(bytes)
+        // The caller reads/streams the blob and hash-verifies against this.
+        Ok((blob_path, record.content_hash.clone()))
     }
 
     /// Lists all protected handles (metadata only — no raw bytes).
@@ -3129,6 +3213,95 @@ mod tests {
         assert!(
             !dir.path().join("operators.jsonl").exists(),
             "the ACL must not be reinitialized on failure"
+        );
+    }
+
+    // ── Unit: get_to_writer streams + verifies before emitting (B) ────────────
+
+    /// A sink that always fails, to exercise the `Output` error channel.
+    struct FailingWriter;
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "sink failed"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_one(store: &ProtectedStore, dir: &Path, bytes: &[u8]) -> (String, String) {
+        let src = dir.join("payload.txt");
+        fs::write(&src, bytes).unwrap();
+        let r = store
+            .capture(
+                &[CaptureEntry {
+                    class: "report".to_owned(),
+                    source_path: src.to_string_lossy().into_owned(),
+                }],
+                "op-1",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap();
+        (
+            r.entries[0].handle.clone(),
+            r.entries[0].content_hash.clone(),
+        )
+    }
+
+    #[test]
+    fn get_to_writer_streams_verified_bytes() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let (handle, _) = capture_one(&store, dir.path(), b"streamed payload bytes");
+
+        let mut out: Vec<u8> = Vec::new();
+        let n = store
+            .get_to_writer(&handle, "op-1", &mut out)
+            .expect("streaming get must succeed");
+        assert_eq!(out, b"streamed payload bytes");
+        assert_eq!(n, out.len() as u64);
+    }
+
+    #[test]
+    fn get_to_writer_emits_nothing_on_hash_mismatch() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let (handle, content_hash) = capture_one(&store, dir.path(), b"good bytes");
+
+        // Corrupt the blob with same-length wrong bytes so the size pre-check
+        // passes and the pass-1 hash verification fails.
+        let blob = dir.path().join("blobs").join(&content_hash);
+        fs::write(&blob, b"BAD bytes!").unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        let err = store
+            .get_to_writer(&handle, "op-1", &mut out)
+            .expect_err("hash mismatch must fail");
+        assert!(
+            matches!(err, GetStreamError::Get(GetError::HashMismatch { .. })),
+            "expected Get(HashMismatch), got {err:?}"
+        );
+        assert!(
+            out.is_empty(),
+            "no bytes may be emitted to the sink on verification failure"
+        );
+    }
+
+    #[test]
+    fn get_to_writer_maps_sink_failure_to_output() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let (handle, _) = capture_one(&store, dir.path(), b"some payload bytes");
+
+        let mut sink = FailingWriter;
+        let err = store
+            .get_to_writer(&handle, "op-1", &mut sink)
+            .expect_err("a failing sink must surface an error");
+        assert!(
+            matches!(err, GetStreamError::Output(_)),
+            "sink write failure must map to Output, got {err:?}"
         );
     }
 
