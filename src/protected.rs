@@ -1673,37 +1673,20 @@ impl ProtectedStore {
                 handle: handle.to_owned(),
             })?;
 
-        // 4a. Handle integrity check: the stored `handle` field must agree with
-        // the handle recomputed from the record's own class/content_hash/path.
-        // A mismatch means the manifest was corrupted or tampered with.
-        let expected_handle = ProtectedHandle::compute_handle(
-            &record.source_class,
-            &record.content_hash,
-            record.source_path.as_deref(),
-        );
-        if expected_handle != record.handle {
-            return Err(GetError::CorruptManifestRecord {
-                handle: handle.to_owned(),
-            });
-        }
-
-        // 4a-bis. Schema-version check.  The contract is explicitly v1; a record
-        // whose `schema_version` was tampered to another value must be rejected
-        // before releasing bytes rather than accepting whatever layout happened
-        // to deserialize into the current struct.  (The capture path likewise
-        // drops non-v1 records during recapture.)
-        if record.schema_version != PROTECTED_SCHEMA_VERSION {
-            return Err(GetError::CorruptManifestRecord {
-                handle: handle.to_owned(),
-            });
-        }
-
-        // 4b. Validate content_hash format before constructing the blob path.
-        // `PathBuf::join` accepts absolute paths and `..` components, so a
-        // tampered manifest entry with e.g. `content_hash = "../../../etc/passwd"`
-        // could escape the blobs directory.  A valid BLAKE3 hex is exactly 64
-        // lowercase hex characters, so anything else is corrupt.
-        if !is_valid_blake3_hex(&record.content_hash) {
+        // 4a. Full self-consistency check on the resolved record before any blob
+        // path is constructed or bytes released.  This is the SAME validation
+        // `canonical_valid_records` applies for authorization, so `get` can never
+        // release bytes for a record the store would never have committed:
+        //   - the stored `handle` recomputes from class/content_hash/source_path
+        //     (a mismatch is manifest corruption/tampering);
+        //   - `schema_version` is v1 (the contract is explicitly v1);
+        //   - `content_hash` is a valid 64-char BLAKE3 hex, so the later
+        //     `blobs_dir().join(content_hash)` cannot escape the store via an
+        //     absolute path or `..` components (e.g. `../../../etc/passwd`);
+        //   - `producer_id` is non-empty and `captured_at` parses as RFC 3339,
+        //     so a tampered line with a blank producer or bad timestamp — which
+        //     capture would reject — is not honored on read either.
+        if !record_is_self_consistent(record) {
             return Err(GetError::CorruptManifestRecord {
                 handle: handle.to_owned(),
             });
@@ -3990,6 +3973,57 @@ mod tests {
         assert!(
             store.get(&real_handle, "op-real").is_ok(),
             "the legitimate owner stays authorized"
+        );
+    }
+
+    // ── Unit: get rejects a self-inconsistent resolved record (round 27 #1695) ─
+
+    #[test]
+    fn get_rejects_resolved_record_with_invalid_metadata() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        // A separate valid record keeps op-1 authorized, so the get reaches the
+        // resolved-record validation rather than stopping at the auth check.
+        seed_producer(&store, dir.path(), "op-1");
+        let src = dir.path().join("target.txt");
+        fs::write(&src, b"target payload").unwrap();
+        let handle = store
+            .capture(
+                &[CaptureEntry {
+                    class: "report".to_owned(),
+                    source_path: src.to_string_lossy().into_owned(),
+                }],
+                "op-1",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap()
+            .entries[0]
+            .handle
+            .clone();
+
+        // Tamper ONLY the target record's captured_at to a non-RFC3339 value,
+        // leaving its handle and blob intact.  capture/canonical_valid_records
+        // treat such a record as invalid; get must too, rather than releasing
+        // bytes for a record the store would never commit.
+        let manifest_path = dir.path().join("manifest.jsonl");
+        let content = fs::read_to_string(&manifest_path).unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        for line in content.lines() {
+            let mut rec: ProtectedHandle = serde_json::from_str(line).unwrap();
+            if rec.handle == handle {
+                rec.captured_at = "not-a-date".to_owned();
+            }
+            lines.push(serde_json::to_string(&rec).unwrap());
+        }
+        fs::write(&manifest_path, lines.join("\n") + "\n").unwrap();
+
+        let err = store.get(&handle, "op-1").unwrap_err();
+        assert_eq!(
+            err.code(),
+            "corrupt_manifest_record",
+            "a resolved record with a non-RFC3339 captured_at must be rejected"
         );
     }
 
