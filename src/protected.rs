@@ -525,6 +525,21 @@ fn hash_source_streaming(source: &Path) -> io::Result<(String, u64)> {
     Ok((hasher.finalize().to_hex().to_string(), byte_len))
 }
 
+/// Distinguishes why [`stream_source_to_temp`] failed.
+///
+/// Capture must skip an unreadable *source* with a per-entry `stale_source_path`
+/// diagnostic, but a *store* I/O error while staging the temp blob (disk full,
+/// permissions, a stale directory at the temp path) must fail the whole capture
+/// rather than be misreported as a stale source.
+enum StageError {
+    /// Reading the source file failed — treat as a per-entry stale source.
+    /// (The specific error is not surfaced; `stale_read_outcome` builds the
+    /// per-entry diagnostic.)
+    Source,
+    /// Creating or writing the temp blob in the store failed — fail the capture.
+    Store(io::Error),
+}
+
 /// Streams `source` into a temp file under `blobs_dir`, hashing as it goes.
 ///
 /// Returns `(hex_hash, byte_len, temp_path)`; the caller either renames the temp
@@ -532,7 +547,10 @@ fn hash_source_streaming(source: &Path) -> io::Result<(String, u64)> {
 /// it.  Reading in bounded chunks keeps memory flat regardless of payload size,
 /// so a multi-GB transcript or CI log cannot exhaust memory.  The temp file is
 /// removed on any streaming error.
-fn stream_source_to_temp(source: &Path, blobs_dir: &Path) -> io::Result<(String, u64, PathBuf)> {
+fn stream_source_to_temp(
+    source: &Path,
+    blobs_dir: &Path,
+) -> Result<(String, u64, PathBuf), StageError> {
     use std::io::{Read as _, Write as _};
 
     let tmp_path = blobs_dir.join(".incoming.wip");
@@ -540,23 +558,23 @@ fn stream_source_to_temp(source: &Path, blobs_dir: &Path) -> io::Result<(String,
     // no-follow `create_new` open below.
     let _ = fs::remove_file(&tmp_path);
 
-    let streamed = (|| -> io::Result<(String, u64)> {
-        let mut src = fs::File::open(source)?;
-        let mut tmp = open_private_create_new(&tmp_path)?;
+    let streamed = (|| -> Result<(String, u64), StageError> {
+        let mut src = fs::File::open(source).map_err(|_| StageError::Source)?;
+        let mut tmp = open_private_create_new(&tmp_path).map_err(StageError::Store)?;
         let mut hasher = blake3::Hasher::new();
         // Heap-allocated so the 64 KiB chunk buffer does not sit on the stack.
         let mut buf = vec![0u8; 64 * 1024];
         let mut byte_len: u64 = 0;
         loop {
-            let n = src.read(&mut buf)?;
+            let n = src.read(&mut buf).map_err(|_| StageError::Source)?;
             if n == 0 {
                 break;
             }
-            tmp.write_all(&buf[..n])?;
+            tmp.write_all(&buf[..n]).map_err(StageError::Store)?;
             hasher.update(&buf[..n]);
             byte_len += n as u64;
         }
-        tmp.flush()?;
+        tmp.flush().map_err(StageError::Store)?;
         Ok((hasher.finalize().to_hex().to_string(), byte_len))
     })();
 
@@ -996,6 +1014,27 @@ impl ProtectedStore {
             Vec::new()
         };
         let ops: Vec<String> = if enabled {
+            // Fail closed: an initialized store (manifest present) whose
+            // operators.jsonl is absent must NOT be silently reinitialized with
+            // only the current producer — that would authorize them to retrieve
+            // every previously captured handle.  A missing ACL on an initialized
+            // store is treated as tampering.  (A brand-new store has no manifest
+            // yet, so both files are created together on first capture.)
+            if self.is_initialised()
+                && matches!(
+                    self.operators_path().symlink_metadata(),
+                    Err(ref e) if e.kind() == io::ErrorKind::NotFound
+                )
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "operators.jsonl is missing from an initialized store at {}; \
+                         refusing to reinitialize the ACL (the store may have been tampered with)",
+                        self.root.display()
+                    ),
+                ));
+            }
             self.read_operators()?
         } else {
             Vec::new()
@@ -1127,13 +1166,20 @@ impl ProtectedStore {
             // rejected consistently with `get`.
             let blobs = self.checked_blobs_dir()?;
             create_private_dir(&blobs)?;
-            let Ok((content_hash, byte_len, tmp)) =
-                stream_source_to_temp(Path::new(&entry.source_path), &blobs)
-            else {
-                skipped_count += 1;
-                outcomes.push(stale_read_outcome(&entry.source_path));
-                continue;
-            };
+            let (content_hash, byte_len, tmp) =
+                match stream_source_to_temp(Path::new(&entry.source_path), &blobs) {
+                    Ok(staged) => staged,
+                    // Unreadable source — skip this entry with a diagnostic.
+                    Err(StageError::Source) => {
+                        skipped_count += 1;
+                        outcomes.push(stale_read_outcome(&entry.source_path));
+                        continue;
+                    }
+                    // Store I/O error staging the blob (disk full, permissions,
+                    // stale temp path) — fail the capture rather than misreport
+                    // it as a stale source and commit a partial capture.
+                    Err(StageError::Store(e)) => return Err(e),
+                };
             let handle = ProtectedHandle::compute_handle(
                 &class,
                 &content_hash,
@@ -1179,45 +1225,44 @@ impl ProtectedStore {
             });
             let blob = blobs.join(&content_hash);
             let already_exists = existing.iter().any(|h| h.handle == handle);
-            if already_exists {
-                // Handle already registered: repair the blob if it is missing,
-                // non-regular (symlink / FIFO / device), or its hash no longer
-                // matches.  `symlink_metadata` (no follow) avoids blocking on a
-                // FIFO; the size-mismatch arm avoids reading a huge/tampered blob
-                // — only an equal-sized blob is read to verify the hash.
-                let needs_repair = match blob.symlink_metadata() {
-                    Err(_) => true,                            // missing
-                    Ok(m) if !m.file_type().is_file() => true, // symlink / FIFO / device
-                    Ok(m) if m.len() != byte_len => true,      // size mismatch
-                    Ok(_) => fs::read(&blob).map_or(true, |existing| {
-                        blake3::hash(&existing).to_hex().to_string() != content_hash
-                    }),
-                };
-                if needs_repair {
-                    // Promote the freshly streamed temp blob into place.
-                    if let Err(e) = rename_into_place(&tmp, &blob) {
-                        let _ = fs::remove_file(&tmp);
-                        return Err(e);
-                    }
-                } else {
-                    // Existing blob is already valid — discard the streamed temp.
-                    let _ = fs::remove_file(&tmp);
-                }
+
+            // Decide whether a VALID content-addressed blob already exists at
+            // this path, then either keep it (discard the streamed temp) or
+            // promote the temp to repair a missing / corrupt / non-regular /
+            // wrong-sized / wrong-hash blob.  This runs for BOTH an
+            // already-registered handle AND a new handle whose bytes hash to an
+            // existing blob path, so a shared blob whose bytes were corrupted is
+            // repaired rather than silently reused (which would leave `get`
+            // failing for the freshly committed handle).  `symlink_metadata` (no
+            // follow) avoids blocking on a FIFO; the size guard avoids reading a
+            // huge/tampered blob — only an equal-sized blob is read to verify.
+            let blob_meta = blob.symlink_metadata();
+            let blob_existed = blob_meta.is_ok();
+            let blob_valid = match &blob_meta {
+                Ok(m) if m.file_type().is_file() && m.len() == byte_len => fs::read(&blob)
+                    .is_ok_and(|b| blake3::hash(&b).to_hex().to_string() == content_hash),
+                _ => false,
+            };
+            if blob_valid {
+                // On-disk blob already matches — discard the streamed temp.
+                let _ = fs::remove_file(&tmp);
             } else {
-                // New handle.  Two handles can share one content-addressed blob
-                // (identical bytes from a different source path/class), so only
-                // promote and track the temp when the blob did not already exist;
-                // a blob that already backs an existing handle must survive a
-                // rollback of this capture.
-                if blob.symlink_metadata().is_ok() {
-                    let _ = fs::remove_file(&tmp);
-                } else if let Err(e) = rename_into_place(&tmp, &blob) {
+                // Promote the freshly streamed temp, repairing a missing/corrupt
+                // blob.
+                if let Err(e) = rename_into_place(&tmp, &blob) {
                     let _ = fs::remove_file(&tmp);
                     return Err(e);
-                } else {
+                }
+                // Track for rollback only when this capture introduces a NEW
+                // handle backed by a blob that did not exist before.  A repaired
+                // blob that an existing (retained) record already references must
+                // survive rollback, or the prior on-disk manifest would dangle.
+                if !already_exists && !blob_existed {
                     blob_txn.track(blob.clone());
                 }
+            }
 
+            if !already_exists {
                 let record = ProtectedHandle {
                     handle: handle.clone(),
                     schema_version: PROTECTED_SCHEMA_VERSION,
@@ -2966,6 +3011,125 @@ mod tests {
 
         let got = store.get(&handle, "op-1").expect("get large payload");
         assert_eq!(got, data, "streamed blob must round-trip byte-for-byte");
+    }
+
+    // ── Unit: a corrupt shared blob is repaired for a new handle (A) ──────────
+
+    #[test]
+    fn new_handle_repairs_corrupt_shared_blob() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+
+        // Capture P1 → handle1 backed by blob H (bytes "shared payload").
+        let p1 = dir.path().join("p1.txt");
+        fs::write(&p1, b"shared payload").unwrap();
+        let r1 = store
+            .capture(
+                &[CaptureEntry {
+                    class: "report".to_owned(),
+                    source_path: p1.to_string_lossy().into_owned(),
+                }],
+                "op-1",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap();
+        let blob = dir.path().join("blobs").join(&r1.entries[0].content_hash);
+
+        // Corrupt blob H in place with same-length wrong bytes (exercises the
+        // hash-read arm, not just the size guard).
+        fs::write(&blob, b"XXXXXXXXXXXXXX").unwrap();
+
+        // Capture P2 — same bytes from a different source path → new handle that
+        // hashes to blob H.  The corrupt shared blob must be repaired, not reused.
+        let p2 = dir.path().join("p2.txt");
+        fs::write(&p2, b"shared payload").unwrap();
+        let r2 = store
+            .capture(
+                &[CaptureEntry {
+                    class: "report".to_owned(),
+                    source_path: p2.to_string_lossy().into_owned(),
+                }],
+                "op-1",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap();
+        let handle2 = r2.entries[0].handle.clone();
+
+        let bytes = store
+            .get(&handle2, "op-1")
+            .expect("get must succeed for the new handle after the shared blob is repaired");
+        assert_eq!(bytes, b"shared payload");
+    }
+
+    // ── Unit: a blob staging (store I/O) error fails the capture (C) ──────────
+
+    #[test]
+    fn capture_fails_on_blob_staging_error_not_stale_source() {
+        let dir = tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        fs::create_dir_all(&store_root).unwrap();
+        let store = ProtectedStore::new(&store_root);
+
+        // Place a directory at the temp blob path so the no-follow create_new
+        // open fails — a store I/O error, not an unreadable source.
+        let blobs = store_root.join("blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        fs::create_dir(blobs.join(".incoming.wip")).unwrap();
+
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"readable source").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        let result = store.capture(&entries, "op-1", "0.1.0", fixed_ts(), true);
+        assert!(
+            result.is_err(),
+            "a blob staging error must fail the capture, not be skipped as a stale source"
+        );
+    }
+
+    // ── Unit: missing ACL on an initialized store fails closed (D) ────────────
+
+    #[test]
+    fn capture_fails_closed_when_acl_missing_on_initialized_store() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"content").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        // First capture initializes the store (manifest + operators).
+        store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+
+        // Delete the ACL while the manifest remains (tampering).
+        fs::remove_file(dir.path().join("operators.jsonl")).unwrap();
+
+        // A second enabled capture by a different producer must FAIL closed,
+        // not silently reinitialize the ACL and authorize op-2 for op-1's data.
+        let err = store
+            .capture(&entries, "op-2", "0.1.0", fixed_ts(), true)
+            .expect_err("capture must fail closed when the ACL is missing");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("missing from an initialized store"),
+            "err must explain the missing ACL: {err}"
+        );
+        assert!(
+            !dir.path().join("operators.jsonl").exists(),
+            "the ACL must not be reinitialized on failure"
+        );
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
