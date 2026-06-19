@@ -38,6 +38,12 @@ pub const PROTECTED_SCHEMA_VERSION: u32 = 1;
 /// Stable prefix for protected-artifact handle strings.
 pub const PROTECTED_HANDLE_PREFIX: &str = "protected:v1:";
 
+/// Maximum byte size accepted when reading store metadata files (`manifest.jsonl`,
+/// `operators.jsonl`).  Prevents memory exhaustion from unexpectedly large or
+/// device-backed files (e.g. a symlink to `/dev/zero` that slips past the
+/// regular-file check on a platform without `symlink_metadata`).
+const MAX_STORE_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
+
 // ── Payload class ──────────────────────────────────────────────────────────────
 
 /// The five protected payload classes recognised by this slice.
@@ -364,26 +370,104 @@ fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
         |p| p.join(&tmp_name),
     );
 
+    // Remove any pre-existing temp file (including symlinks) before opening.
+    // This prevents a pre-placed symlink at `tmp_path` from being followed by
+    // the open below.  Errors are ignored: if the path does not exist that is
+    // fine; if removal fails for another reason, the `create_new` open below
+    // will fail instead.
+    let _ = fs::remove_file(&tmp_path);
+
+    // Open the temp file with O_CREAT|O_EXCL (create_new) so the open fails
+    // rather than following a symlink that appears between the remove and this
+    // open.  On Unix we also set mode 0o600 (owner-only).
     #[cfg(unix)]
     {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&tmp_path)?;
         f.write_all(data)?;
     }
     #[cfg(not(unix))]
     {
-        fs::write(&tmp_path, data)?;
+        use std::io::Write as _;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        f.write_all(data)?;
     }
-    // Atomically replace `path` (including any symlink at that path) with the
-    // temp file.  On Unix this is `rename(2)`, which replaces the directory
-    // entry without following a symlink at the destination.
+
+    // Atomically replace `path` with the temp file.
+    //
+    // On Unix, rename(2) replaces the destination entry (including any symlink
+    // at that path) without following it.
+    //
+    // On Windows, std::fs::rename fails if the destination already exists, so
+    // we remove it first.  The remove-then-rename window is not atomic on
+    // Windows, but this is acceptable for a single-writer CLI tool; concurrent
+    // writers serialize via the store lock.
+    #[cfg(windows)]
+    {
+        let _ = fs::remove_file(path);
+    }
     fs::rename(&tmp_path, path)
+}
+
+// ── Store-level advisory lock ──────────────────────────────────────────────────
+
+/// Advisory lock for the protected store's write phase.
+///
+/// Created with `O_CREAT | O_EXCL` semantics so it never follows a symlink.
+/// Dropped (and the lock file deleted) when the guard goes out of scope.
+///
+/// Two concurrent enabled captures against the same store would otherwise
+/// both read the same manifest snapshot and the later writer would drop
+/// handles added by the earlier one; this lock serializes the read-modify-
+/// write cycle.
+#[derive(Debug)]
+struct StoreLock {
+    path: PathBuf,
+}
+
+impl StoreLock {
+    /// Acquires an exclusive advisory lock by creating a sentinel file.
+    ///
+    /// Returns `WouldBlock` if the lock is already held by another process.
+    fn acquire(store_root: &Path) -> io::Result<Self> {
+        let path = store_root.join(".store.lock");
+        // `create_new` maps to O_CREAT|O_EXCL on Unix — no-follow, atomic.
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "protected store at {} is locked by another process; \
+                             retry after the other capture completes, or remove \
+                             {} if the locking process has exited",
+                            store_root.display(),
+                            path.display()
+                        ),
+                    )
+                } else {
+                    e
+                }
+            })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 // ── Protected store ────────────────────────────────────────────────────────────
@@ -426,16 +510,48 @@ impl ProtectedStore {
         self.blobs_dir().join(content_hash)
     }
 
-    /// Returns `true` when the store root and manifest both exist.
+    /// Returns `true` when the store root and manifest exist as regular files.
+    ///
+    /// Uses `symlink_metadata` (no-follow) so a symlink at the manifest path
+    /// is not treated as an initialised store.
     fn is_initialised(&self) -> bool {
-        self.manifest_path().exists()
+        self.manifest_path()
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_file())
     }
 
     /// Reads the canonical manifest, returning the de-duplicated set of handles.
+    ///
+    /// Rejects non-regular files (symlinks, FIFOs, devices) before reading to
+    /// prevent memory exhaustion via e.g. a symlink to `/dev/zero`.  Also
+    /// bounds the read to [`MAX_STORE_FILE_BYTES`].
     fn read_manifest(&self) -> io::Result<Vec<ProtectedHandle>> {
         let path = self.manifest_path();
-        if !path.exists() {
-            return Ok(Vec::new());
+        let meta = match path.symlink_metadata() {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        if !meta.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "manifest.jsonl is not a regular file at {}; \
+                     the store may have been tampered with",
+                    path.display()
+                ),
+            ));
+        }
+        if meta.len() > MAX_STORE_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "manifest.jsonl is unexpectedly large ({} B > {} B); \
+                     the store may have been corrupted",
+                    meta.len(),
+                    MAX_STORE_FILE_BYTES
+                ),
+            ));
         }
         let content = fs::read_to_string(&path)?;
         let mut handles = Vec::new();
@@ -482,10 +598,35 @@ impl ProtectedStore {
     }
 
     /// Reads the canonical operators file, returning the set of authorised IDs.
+    ///
+    /// Applies the same regular-file and size checks as [`Self::read_manifest`].
     fn read_operators(&self) -> io::Result<Vec<String>> {
         let path = self.operators_path();
-        if !path.exists() {
-            return Ok(Vec::new());
+        let meta = match path.symlink_metadata() {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        if !meta.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "operators.jsonl is not a regular file at {}; \
+                     the store may have been tampered with",
+                    path.display()
+                ),
+            ));
+        }
+        if meta.len() > MAX_STORE_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "operators.jsonl is unexpectedly large ({} B > {} B); \
+                     the store may have been corrupted",
+                    meta.len(),
+                    MAX_STORE_FILE_BYTES
+                ),
+            ));
         }
         let content = fs::read_to_string(&path)?;
         // Fail-closed: return an error if ANY line fails to parse as a JSON string.
@@ -580,6 +721,25 @@ impl ProtectedStore {
         let mut outcomes: Vec<CaptureEntryOutcome> = Vec::new();
         let mut stored_count = 0usize;
         let mut skipped_count = 0usize;
+
+        // Acquire a store-level advisory lock before reading the manifest and
+        // operators files.  Two concurrent enabled captures against the same
+        // store would otherwise each read a stale manifest snapshot, write
+        // their blobs, and then overwrite each other's manifest; the later
+        // writer would drop handles written by the earlier one, leaving stored
+        // blobs unreachable via `protected list` / `get`.
+        //
+        // The lock is held until `_lock` is dropped at the end of this
+        // function.  On process kill, the lock file (.store.lock) is left
+        // behind; the operator can remove it manually.
+        if enabled {
+            create_private_dir(&self.root)?;
+        }
+        let _lock: Option<StoreLock> = if enabled {
+            Some(StoreLock::acquire(&self.root)?)
+        } else {
+            None
+        };
 
         // Load existing manifest and validate the operators file *before* any
         // blob or manifest writes.  This ensures that a corrupt operators.jsonl
@@ -1795,6 +1955,107 @@ mod tests {
             .get(&handle, "op-1")
             .expect("get after symlink repair");
         assert_eq!(bytes, b"repair symlink blob");
+    }
+
+    // ── Unit: StoreLock advisory locking ─────────────────────────────────────
+
+    #[test]
+    fn store_lock_prevents_concurrent_acquire() {
+        let dir = tempdir().unwrap();
+        create_private_dir(dir.path()).unwrap();
+
+        // First acquire succeeds.
+        let lock1 = StoreLock::acquire(dir.path()).expect("first acquire must succeed");
+
+        // Second acquire must fail with WouldBlock while first lock is held.
+        let err = StoreLock::acquire(dir.path()).expect_err("second acquire must fail");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "second acquire must return WouldBlock, not another error kind"
+        );
+
+        // Dropping the first lock must allow a third acquire to succeed.
+        drop(lock1);
+        let _lock3 =
+            StoreLock::acquire(dir.path()).expect("acquire after lock release must succeed");
+    }
+
+    #[test]
+    fn store_lock_cleanup_on_drop() {
+        let dir = tempdir().unwrap();
+        create_private_dir(dir.path()).unwrap();
+
+        let lock_path = dir.path().join(".store.lock");
+        {
+            let _lock = StoreLock::acquire(dir.path()).unwrap();
+            assert!(
+                lock_path.exists(),
+                "lock file must exist while lock is held"
+            );
+        } // lock dropped here
+        assert!(
+            !lock_path.exists(),
+            "lock file must be removed when lock is dropped"
+        );
+    }
+
+    // ── Unit: read_manifest rejects non-regular files ─────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn read_manifest_rejects_symlink_at_manifest_path() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+
+        // Create a real file elsewhere and place a symlink at the manifest path.
+        let real_file = dir.path().join("real.jsonl");
+        fs::write(&real_file, "\n").unwrap();
+        let manifest_path = dir.path().join("manifest.jsonl");
+        std::os::unix::fs::symlink(&real_file, &manifest_path).unwrap();
+
+        // is_initialised() must return false — symlink is not a regular file.
+        assert!(
+            !store.is_initialised(),
+            "is_initialised must return false when manifest.jsonl is a symlink"
+        );
+
+        // read_manifest() must return an error, not silently follow the symlink.
+        let err = store.read_manifest().unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "read_manifest must return InvalidData for a symlink at manifest path"
+        );
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "error message must mention 'not a regular file': {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_operators_rejects_symlink_at_operators_path() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+
+        // Place a symlink at the operators path pointing at a real file.
+        let real_file = dir.path().join("real_ops.jsonl");
+        fs::write(&real_file, "\"op-1\"\n").unwrap();
+        let ops_path = dir.path().join("operators.jsonl");
+        std::os::unix::fs::symlink(&real_file, &ops_path).unwrap();
+
+        // read_operators() must reject the symlink.
+        let err = store.read_operators().unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "read_operators must return InvalidData for a symlink at operators path"
+        );
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "error message must mention 'not a regular file': {err}"
+        );
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
