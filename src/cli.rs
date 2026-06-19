@@ -9105,16 +9105,26 @@ fn decide_cmd(
 
 // ── eg protected ──────────────────────────────────────────────────────────────
 
-/// Implements `eg protected get`: streams the verified payload to `out` (a file)
-/// or stdout without buffering the whole payload in memory.
+/// Streams the verified `temp_path` snapshot to stdout.
+fn deliver_to_stdout(temp_path: &Path) -> std::io::Result<()> {
+    let mut f = fs::File::open(temp_path)?;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    std::io::copy(&mut f, &mut lock)?;
+    Ok(())
+}
+
+/// Implements `eg protected get`: retrieves the verified payload to `out` (a
+/// file) or stdout without buffering the whole payload in memory.
 ///
-/// For a `--out` file the bytes are staged to a uniquely named, exclusively
-/// created temp in the destination directory (via `tempfile`, which uses
-/// `O_CREAT|O_EXCL` and never follows a symlink) and renamed onto `out_path`
-/// only after a fully verified copy.  A failed get therefore never truncates or
-/// destroys an existing destination file, and the predictable-temp symlink race
-/// is closed.  Exits the process on any failure (with the documented JSON
-/// envelope and exit code); returns normally on success.
+/// The bytes are ALWAYS staged to a uniquely named, exclusively created temp
+/// (via `tempfile`: `O_CREAT|O_EXCL`, never follows a symlink) and only released
+/// to the destination after a fully verified copy — for `--out` by renaming the
+/// temp into place, for stdout by streaming the verified temp out.  This
+/// preserves verify-before-release for both destinations (a failed get never
+/// truncates a `--out` file and never emits unverified bytes to stdout) and the
+/// temp is removed on every path, including the `process::exit` error paths.
+/// Exits the process on any failure with the documented JSON envelope/exit code.
 fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Path>) {
     use crate::protected::{GetStreamError, ProtectedStore};
     let ps = ProtectedStore::new(store);
@@ -9132,41 +9142,29 @@ fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Pa
         eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
         process::exit(1);
     };
-    let output_err_for = |out_path: &Path, e: &dyn std::fmt::Display| -> String {
-        format!("failed to write bytes to {}: {e}", out_path.display())
-    };
+    // Error code + human label for the destination.
+    let (err_code, dest_label): (&str, String) = out.map_or_else(
+        || ("stdout_write_error", "stdout".to_owned()),
+        |p| ("output_write_error", p.display().to_string()),
+    );
 
-    // stdout: stream directly (no staging — bytes are consumed as written).
-    let Some(out_path) = out else {
-        let stdout = std::io::stdout();
-        let mut lock = stdout.lock();
-        match ps.get_to_writer(handle, operator, &mut lock) {
-            Ok(_) => {}
-            Err(GetStreamError::Get(e)) => exit_get_error(e),
-            Err(GetStreamError::Output(e)) => {
-                exit_output_error(
-                    "stdout_write_error",
-                    format!("failed to write bytes to stdout: {e}"),
-                );
-            }
-        }
-        return;
-    };
-
-    // --out: stage to a uniquely named, exclusively created temp in the
-    // destination directory, then rename onto the destination only after a fully
-    // verified copy.  The temp auto-removes on drop, covering every error path.
-    let dir = out_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+    // Stage into the destination directory for --out (so the final move is an
+    // in-directory rename) or the system temp dir for stdout.
+    let stage_dir = out.map_or_else(std::env::temp_dir, |p| {
+        p.parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf)
+    });
     let mut tmp = match tempfile::Builder::new()
         .prefix(".eg-")
         .suffix(".partial")
-        .tempfile_in(&dir)
+        .tempfile_in(&stage_dir)
     {
         Ok(t) => t,
-        Err(e) => exit_output_error("output_write_error", output_err_for(out_path, &e)),
+        Err(e) => exit_output_error(
+            err_code,
+            format!("failed to stage bytes for {dest_label}: {e}"),
+        ),
     };
 
     let write_result = ps.get_to_writer(handle, operator, tmp.as_file_mut());
@@ -9174,21 +9172,30 @@ fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Pa
     // `process::exit` (which would otherwise skip the destructor and leak the
     // staged `.eg-*.partial` file containing verified raw payload bytes).
     let temp_path = tmp.into_temp_path();
+
     match write_result {
+        Ok(_) if out.is_some() => {
+            // --out: rename the verified temp onto the destination.
+            let out_path = out.expect("out.is_some() checked");
+            if let Err(e) = crate::protected::rename_into_place(&temp_path, out_path) {
+                let _ = fs::remove_file(&temp_path);
+                exit_output_error(
+                    err_code,
+                    format!("failed to write bytes to {dest_label}: {e}"),
+                );
+            }
+            // Renamed away; disarm the temp's auto-delete.
+            let _ = temp_path.keep();
+        }
         Ok(_) => {
-            // Move the verified temp onto the destination, replacing any existing
-            // file without losing it on failure (cross-platform; on Windows the
-            // existing file is backed up and restored if the rename fails, rather
-            // than `rename` erroring out because the destination exists).
-            match crate::protected::rename_into_place(&temp_path, out_path) {
-                Ok(()) => {
-                    // The temp was renamed away; disarm its auto-delete.
-                    let _ = temp_path.keep();
-                }
-                Err(e) => {
-                    let _ = fs::remove_file(&temp_path);
-                    exit_output_error("output_write_error", output_err_for(out_path, &e));
-                }
+            // stdout: stream the verified temp out, then remove it.
+            let result = deliver_to_stdout(&temp_path);
+            let _ = fs::remove_file(&temp_path);
+            if let Err(e) = result {
+                exit_output_error(
+                    err_code,
+                    format!("failed to write bytes to {dest_label}: {e}"),
+                );
             }
         }
         Err(GetStreamError::Get(e)) => {
@@ -9197,7 +9204,10 @@ fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Pa
         }
         Err(GetStreamError::Output(e)) => {
             let _ = fs::remove_file(&temp_path);
-            exit_output_error("output_write_error", output_err_for(out_path, &e));
+            exit_output_error(
+                err_code,
+                format!("failed to write bytes to {dest_label}: {e}"),
+            );
         }
     }
 }

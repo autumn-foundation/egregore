@@ -512,55 +512,18 @@ fn open_private_create_new(path: &Path) -> io::Result<fs::File> {
     }
 }
 
-/// Renames `tmp_path` onto `path`, replacing any existing file without losing it
-/// on failure.
+/// Atomically renames `tmp_path` onto `path`, replacing an existing file.
 ///
-/// On Unix this is a single `rename(2)`, which atomically replaces the
-/// destination entry (including a symlink at that path) without following it.
-///
-/// On Windows `std::fs::rename` fails when the destination already exists, and a
-/// plain remove-then-rename would destroy the previous file if the rename then
-/// failed (AV/permission interference) — leaving an initialized store unreadable
-/// or missing payloads.  So any existing destination is first moved to a
-/// sibling backup; on a successful rename the backup is deleted, and on failure
-/// the backup is restored, so the previous file is never lost.  The caller
-/// removes `tmp_path` on error.
+/// `std::fs::rename` replaces an existing destination FILE atomically on both
+/// Unix (`rename(2)`, which replaces a symlink at the destination without
+/// following it) and Windows (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`),
+/// so there is no remove-then-rename window in which the previous file could be
+/// lost.  When the destination is a directory the rename FAILS rather than
+/// replacing it, so a tampered store with a directory at a metadata path — or
+/// `eg protected get --out <dir>` — surfaces an error instead of clobbering the
+/// directory.  The caller removes `tmp_path` on error.
 pub(crate) fn rename_into_place(tmp_path: &Path, path: &Path) -> io::Result<()> {
-    #[cfg(not(windows))]
-    {
-        fs::rename(tmp_path, path)
-    }
-    #[cfg(windows)]
-    {
-        if fs::symlink_metadata(path).is_err() {
-            // No existing destination — a straight rename suffices.
-            return fs::rename(tmp_path, path);
-        }
-        // Move the existing destination aside to a sibling backup first.
-        let backup = {
-            let mut name = std::ffi::OsString::from(".");
-            name.push(
-                path.file_name()
-                    .unwrap_or_else(|| std::ffi::OsStr::new("file")),
-            );
-            name.push(".eg-bak");
-            path.parent()
-                .map_or_else(|| PathBuf::from(&name), |p| p.join(&name))
-        };
-        let _ = fs::remove_file(&backup);
-        fs::rename(path, &backup)?;
-        match fs::rename(tmp_path, path) {
-            Ok(()) => {
-                let _ = fs::remove_file(&backup);
-                Ok(())
-            }
-            Err(e) => {
-                // Restore the previous destination file.
-                let _ = fs::rename(&backup, path);
-                Err(e)
-            }
-        }
-    }
+    fs::rename(tmp_path, path)
 }
 
 /// Opens `path` for reading and binds validation to the opened descriptor.
@@ -582,7 +545,22 @@ fn open_source_checked(path: &Path) -> io::Result<fs::File> {
             .open(path)?
     };
     #[cfg(not(unix))]
-    let file = fs::File::open(path)?;
+    let file = {
+        // No portable no-follow open without platform APIs; reject a final-
+        // component symlink/reparse point (best effort, small TOCTOU) so a
+        // symlinked leaf is not followed and silently accepted, keeping this
+        // consistent with the `symlink_metadata` rejection elsewhere.
+        if path
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is a symlink",
+            ));
+        }
+        fs::File::open(path)?
+    };
 
     if !file.metadata()?.file_type().is_file() {
         return Err(io::Error::new(
@@ -1086,6 +1064,11 @@ impl ProtectedStore {
         let mut outcomes: Vec<CaptureEntryOutcome> = Vec::new();
         let mut stored_count = 0usize;
         let mut skipped_count = 0usize;
+        // Whether this capture durably changed the store (wrote/repaired a blob or
+        // registered a new handle).  A pure no-op reuse of already-valid payloads
+        // must NOT trigger the ACL extension, or a producer could replay an
+        // already-captured payload and gain access to every existing handle.
+        let mut mutated = false;
 
         // Acquire a store-level advisory lock before reading the manifest and
         // operators files.  Two concurrent enabled captures against the same
@@ -1392,6 +1375,12 @@ impl ProtectedStore {
                 existing.push(record);
             }
 
+            // The store is mutated when a blob was written/repaired (!blob_valid)
+            // or a new handle was registered (!already_exists).  A no-op reuse of
+            // an already-valid blob for an already-registered handle is not.
+            if !blob_valid || !already_exists {
+                mutated = true;
+            }
             stored_count += 1;
             outcomes.push(CaptureEntryOutcome {
                 source_path: entry.source_path.clone(),
@@ -1403,41 +1392,34 @@ impl ProtectedStore {
             });
         }
 
-        // Only mutate the store — including extending the ACL — when at least one
-        // payload was actually captured or repaired.  An enabled capture with an
-        // empty manifest or only unsupported/stale entries leaves `stored_count`
-        // at 0; rewriting operators.jsonl with this producer would otherwise
-        // authorize them to retrieve every previously captured handle without
-        // storing anything.
-        if enabled && stored_count > 0 {
-            // Preflight the ACL (operators) growth BEFORE committing the
-            // manifest.  Adding this producer to a near-cap operators.jsonl could
-            // push it over MAX_STORE_FILE_BYTES; without this check the manifest
-            // (and blobs) would commit and only the final ACL write would fail,
-            // leaving retrievable handles that do not authorize the producer.
-            // On failure here `blob_txn` rolls back the new blobs.
+        // Only mutate the store — including extending the ACL — when this capture
+        // actually wrote or repaired something.  An empty/all-stale capture, or a
+        // pure no-op reuse of already-valid payloads, leaves `mutated` false;
+        // rewriting operators.jsonl with this producer would otherwise authorize
+        // them to retrieve every previously captured handle without storing
+        // anything new.
+        if enabled && mutated {
+            // Preflight the ACL (operators) growth, then write the ACL BEFORE the
+            // manifest.  Handle registration (the manifest) is the LAST durable
+            // commit, so the new producer's authorization is durable before the
+            // handles exist: if the manifest write then fails, `blob_txn` rolls
+            // back the new blobs and the handles simply do not exist, rather than
+            // leaving committed-but-unauthorizable handles that a rerun with
+            // since-deleted (ephemeral) sources could never repair.
             let mut projected_ops = ops;
             projected_ops.push(producer_id.to_owned());
             check_within_read_cap(
                 &Self::serialize_operators(&projected_ops),
                 "operators.jsonl",
             )?;
-
-            // Persist de-duplicated manifest.  If this fails (including the
-            // manifest exceeding the read cap), `blob_txn`'s drop removes the
-            // blobs newly written by this capture so the store is never left with
-            // orphaned payload bytes that no manifest record references.
-            self.write_manifest(&existing)?;
-
-            // Manifest is durable and references the new blobs — they must
-            // persist now, so commit the transaction before the ACL write.
-            blob_txn.commit();
-
-            // Record producer as an authorised operator.  Size was preflighted
-            // above, so this can only fail on a genuine I/O error; the manifest +
-            // blobs are already committed and an idempotent re-run retries the
-            // ACL write, so they are left in place rather than orphaned.
             self.write_operators(&projected_ops)?;
+
+            // Persist the de-duplicated manifest last.  If this fails (including
+            // the manifest exceeding the read cap), `blob_txn`'s drop removes the
+            // blobs newly written by this capture, so no orphaned payload bytes
+            // are left behind and the new handles are simply absent.
+            self.write_manifest(&existing)?;
+            blob_txn.commit();
         }
 
         Ok(CaptureReport {
@@ -3613,6 +3595,40 @@ mod tests {
             store.get(&handle, "op-1").is_ok(),
             "the original producer remains authorized"
         );
+    }
+
+    // ── Unit: replaying an existing payload does not authorize a producer ─────
+
+    #[test]
+    fn replaying_existing_payload_does_not_authorize_new_producer() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"shared content").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        let r = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        let handle = r.entries[0].handle.clone();
+
+        // op-2 replays the identical entry while the source is still present and
+        // the blob is already valid — a pure no-op that stores/repairs nothing.
+        store
+            .capture(&entries, "op-2", "0.1.0", fixed_ts(), true)
+            .unwrap();
+
+        assert!(
+            matches!(
+                store.get(&handle, "op-2"),
+                Err(GetError::Unauthorized { .. })
+            ),
+            "a no-op replay must not authorize the new producer"
+        );
+        assert!(store.get(&handle, "op-1").is_ok());
     }
 
     // ── Unit: an orphaned ACL (no manifest) is ignored on a new store ─────────
