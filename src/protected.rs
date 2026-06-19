@@ -512,19 +512,55 @@ fn open_private_create_new(path: &Path) -> io::Result<fs::File> {
     }
 }
 
-/// Atomically renames `tmp_path` over `path`.
+/// Renames `tmp_path` onto `path`, replacing any existing file without losing it
+/// on failure.
 ///
-/// On Unix, `rename(2)` replaces the destination entry (including any symlink at
-/// that path) without following it.  On Windows, `std::fs::rename` fails if the
-/// destination already exists, so it is removed first; the remove-then-rename
-/// window is acceptable for a single-writer CLI tool whose writers serialize via
-/// the store lock.  The caller removes `tmp_path` on error.
-fn rename_into_place(tmp_path: &Path, path: &Path) -> io::Result<()> {
+/// On Unix this is a single `rename(2)`, which atomically replaces the
+/// destination entry (including a symlink at that path) without following it.
+///
+/// On Windows `std::fs::rename` fails when the destination already exists, and a
+/// plain remove-then-rename would destroy the previous file if the rename then
+/// failed (AV/permission interference) — leaving an initialized store unreadable
+/// or missing payloads.  So any existing destination is first moved to a
+/// sibling backup; on a successful rename the backup is deleted, and on failure
+/// the backup is restored, so the previous file is never lost.  The caller
+/// removes `tmp_path` on error.
+pub(crate) fn rename_into_place(tmp_path: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        fs::rename(tmp_path, path)
+    }
     #[cfg(windows)]
     {
-        let _ = fs::remove_file(path);
+        if fs::symlink_metadata(path).is_err() {
+            // No existing destination — a straight rename suffices.
+            return fs::rename(tmp_path, path);
+        }
+        // Move the existing destination aside to a sibling backup first.
+        let backup = {
+            let mut name = std::ffi::OsString::from(".");
+            name.push(
+                path.file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("file")),
+            );
+            name.push(".eg-bak");
+            path.parent()
+                .map_or_else(|| PathBuf::from(&name), |p| p.join(&name))
+        };
+        let _ = fs::remove_file(&backup);
+        fs::rename(path, &backup)?;
+        match fs::rename(tmp_path, path) {
+            Ok(()) => {
+                let _ = fs::remove_file(&backup);
+                Ok(())
+            }
+            Err(e) => {
+                // Restore the previous destination file.
+                let _ = fs::rename(&backup, path);
+                Err(e)
+            }
+        }
     }
-    fs::rename(tmp_path, path)
 }
 
 /// Opens `path` for reading and binds validation to the opened descriptor.

@@ -1259,3 +1259,39 @@ fn failed_get_preserves_existing_out_file() {
         "a failed get must not truncate or destroy the existing --out file"
     );
 }
+
+// ── Get: a successful --out get replaces an existing file ──────────────────────
+
+/// A successful `eg protected get --out existing.bin` must overwrite the
+/// existing destination with the verified payload (cross-platform replace).
+#[test]
+fn get_out_replaces_existing_file_on_success() {
+    let (_guard, store) = tmp_store();
+    let json = run_capture_enabled(&store, "op-1");
+    let handle = json["entries"][0]["handle"]
+        .as_str()
+        .expect("handle string")
+        .to_owned();
+
+    let out_dir = tempfile::tempdir().expect("out dir");
+    let out_file = out_dir.path().join("dest.bin");
+    fs::write(&out_file, b"OLD SENTINEL CONTENT").unwrap();
+
+    eg().args(["protected", "get"])
+        .arg(&handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .arg("--out")
+        .arg(&out_file)
+        .assert()
+        .success();
+
+    let after = fs::read(&out_file).expect("destination must exist after success");
+    assert_ne!(
+        after, b"OLD SENTINEL CONTENT",
+        "a successful get must overwrite the existing --out file"
+    );
+    assert!(!after.is_empty(), "destination must contain the payload");
+}

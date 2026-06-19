@@ -9171,9 +9171,17 @@ fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Pa
 
     match ps.get_to_writer(handle, operator, tmp.as_file_mut()) {
         Ok(_) => {
-            // Move the verified temp onto the destination.
-            if let Err(e) = tmp.persist(out_path) {
-                exit_output_error("output_write_error", output_err_for(out_path, &e.error));
+            // Move the verified temp onto the destination, replacing any existing
+            // file without losing it on failure (cross-platform; on Windows the
+            // existing file is backed up and restored if the rename fails, rather
+            // than `rename` erroring out because the destination exists).
+            let temp_path = tmp.into_temp_path();
+            match crate::protected::rename_into_place(&temp_path, out_path) {
+                Ok(()) => {
+                    // The temp was renamed away; disarm its auto-delete.
+                    let _ = temp_path.keep();
+                }
+                Err(e) => exit_output_error("output_write_error", output_err_for(out_path, &e)),
             }
         }
         Err(GetStreamError::Get(e)) => exit_get_error(e), // tmp dropped -> removed
