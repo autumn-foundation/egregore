@@ -294,22 +294,49 @@ impl GetError {
         }
     }
 
+    /// Builds the documented `error.detail` object for this variant.
+    ///
+    /// Constructed per-variant (rather than serializing `self`) so `detail` is
+    /// always the flat object promised by `docs/cli/protected-artifacts.md`
+    /// (e.g. `error.detail.handle`), not serde's externally-tagged form which
+    /// would nest fields under the variant name or emit a bare string for unit
+    /// variants.  Secret-bearing fields (`operator`, the raw `handle` argument)
+    /// are intentionally omitted so they never reach stderr.
+    fn detail(&self) -> serde_json::Value {
+        match self {
+            Self::RawArtifactModeDisabled
+            | Self::Unauthorized { .. }
+            | Self::MalformedHandle { .. } => serde_json::json!({}),
+            Self::PayloadNotFound { handle } | Self::CorruptManifestRecord { handle } => {
+                serde_json::json!({ "handle": handle })
+            }
+            Self::MissingProtectedPayload {
+                handle,
+                expected_path,
+            } => serde_json::json!({ "handle": handle, "expected_path": expected_path }),
+            Self::HashMismatch {
+                handle,
+                expected,
+                actual,
+            } => serde_json::json!({ "handle": handle, "expected": expected, "actual": actual }),
+        }
+    }
+
     /// Serialises the error as a machine-readable JSON envelope.
     ///
     /// Never includes raw payload bytes, secrets, or bearer tokens.
     ///
     /// # Panics
     ///
-    /// Panics only when `serde_json::to_value(self)` fails, which cannot happen
-    /// for this well-formed enum.
+    /// Panics only if serialising the envelope fails, which cannot happen for
+    /// this well-formed JSON value.
     #[must_use]
     pub fn to_json(&self) -> String {
-        let detail = serde_json::to_value(self).expect("GetError serialisation is infallible");
         let envelope = serde_json::json!({
             "ok": false,
             "error": {
                 "code": self.code(),
-                "detail": detail,
+                "detail": self.detail(),
             }
         });
         serde_json::to_string(&envelope).expect("envelope serialisation is infallible")
@@ -442,44 +469,104 @@ fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
 /// Creates `tmp_path` (`O_CREAT`|`O_EXCL`, mode 0o600 on Unix), writes `data`,
 /// and renames it over `path`.  The caller removes `tmp_path` on any error.
 fn stage_and_rename(tmp_path: &Path, path: &Path, data: &[u8]) -> io::Result<()> {
-    // Open the temp file with O_CREAT|O_EXCL (create_new) so the open fails
-    // rather than following a symlink that appears between the remove and this
-    // open.  On Unix we also set mode 0o600 (owner-only).
+    use std::io::Write as _;
+    let mut f = open_private_create_new(tmp_path)?;
+    f.write_all(data)?;
+    rename_into_place(tmp_path, path)
+}
+
+/// Opens `path` for writing with `O_CREAT|O_EXCL` (mode 0o600 on Unix).
+///
+/// `create_new` makes the open fail rather than follow a symlink that appears at
+/// `path` between an earlier `remove_file` and this call.
+fn open_private_create_new(path: &Path) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
-        use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = fs::OpenOptions::new()
+        fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(tmp_path)?;
-        f.write_all(data)?;
+            .open(path)
     }
     #[cfg(not(unix))]
     {
-        use std::io::Write as _;
-        let mut f = fs::OpenOptions::new()
+        fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(tmp_path)?;
-        f.write_all(data)?;
+            .open(path)
     }
+}
 
-    // Atomically replace `path` with the temp file.
-    //
-    // On Unix, rename(2) replaces the destination entry (including any symlink
-    // at that path) without following it.
-    //
-    // On Windows, std::fs::rename fails if the destination already exists, so
-    // we remove it first.  The remove-then-rename window is not atomic on
-    // Windows, but this is acceptable for a single-writer CLI tool; concurrent
-    // writers serialize via the store lock.
+/// Atomically renames `tmp_path` over `path`.
+///
+/// On Unix, `rename(2)` replaces the destination entry (including any symlink at
+/// that path) without following it.  On Windows, `std::fs::rename` fails if the
+/// destination already exists, so it is removed first; the remove-then-rename
+/// window is acceptable for a single-writer CLI tool whose writers serialize via
+/// the store lock.  The caller removes `tmp_path` on error.
+fn rename_into_place(tmp_path: &Path, path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         let _ = fs::remove_file(path);
     }
     fs::rename(tmp_path, path)
+}
+
+/// Streams `source` through a BLAKE3 hasher without buffering the whole file,
+/// returning its `(hex_hash, byte_len)`.  Used by the capture preview path,
+/// which must not write anything to disk.
+fn hash_source_streaming(source: &Path) -> io::Result<(String, u64)> {
+    let mut src = fs::File::open(source)?;
+    // blake3::Hasher implements io::Write, so io::copy streams the file through
+    // it in bounded-size chunks and returns the byte count.
+    let mut hasher = blake3::Hasher::new();
+    let byte_len = io::copy(&mut src, &mut hasher)?;
+    Ok((hasher.finalize().to_hex().to_string(), byte_len))
+}
+
+/// Streams `source` into a temp file under `blobs_dir`, hashing as it goes.
+///
+/// Returns `(hex_hash, byte_len, temp_path)`; the caller either renames the temp
+/// over the content-addressed blob path (via [`rename_into_place`]) or removes
+/// it.  Reading in bounded chunks keeps memory flat regardless of payload size,
+/// so a multi-GB transcript or CI log cannot exhaust memory.  The temp file is
+/// removed on any streaming error.
+fn stream_source_to_temp(source: &Path, blobs_dir: &Path) -> io::Result<(String, u64, PathBuf)> {
+    use std::io::{Read as _, Write as _};
+
+    let tmp_path = blobs_dir.join(".incoming.wip");
+    // Clear any stale temp from a previously interrupted capture before the
+    // no-follow `create_new` open below.
+    let _ = fs::remove_file(&tmp_path);
+
+    let streamed = (|| -> io::Result<(String, u64)> {
+        let mut src = fs::File::open(source)?;
+        let mut tmp = open_private_create_new(&tmp_path)?;
+        let mut hasher = blake3::Hasher::new();
+        // Heap-allocated so the 64 KiB chunk buffer does not sit on the stack.
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut byte_len: u64 = 0;
+        loop {
+            let n = src.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            tmp.write_all(&buf[..n])?;
+            hasher.update(&buf[..n]);
+            byte_len += n as u64;
+        }
+        tmp.flush()?;
+        Ok((hasher.finalize().to_hex().to_string(), byte_len))
+    })();
+
+    match streamed {
+        Ok((hash, byte_len)) => Ok((hash, byte_len, tmp_path)),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
 }
 
 // ── Store-level advisory lock ──────────────────────────────────────────────────
@@ -920,6 +1007,26 @@ impl ProtectedStore {
         // drops — and cleans up — while the store lock is still held.
         let mut blob_txn = BlobTxn::default();
 
+        // Per-entry diagnostic for a source that became unreadable between the
+        // regular-file stat and the streaming read.
+        let stale_read_outcome = |source_path: &str| {
+            let fallback = blake3::hash(source_path.as_bytes()).to_hex().to_string();
+            CaptureEntryOutcome {
+                source_path: source_path.to_owned(),
+                handle: format!("{PROTECTED_HANDLE_PREFIX}{fallback}"),
+                content_hash: fallback,
+                byte_len: 0,
+                stored: false,
+                diagnostic: Some(EntryDiagnostic {
+                    code: "stale_source_path".to_owned(),
+                    message: format!(
+                        "source path {source_path:?} is not readable; \
+                         the file may have moved or been deleted"
+                    ),
+                }),
+            }
+        };
+
         for entry in entries {
             // Validate payload class first.
             let Some(class) = parse_class(&entry.class) else {
@@ -984,36 +1091,23 @@ impl ProtectedStore {
                 });
                 continue;
             }
-            // Read source bytes (known-regular file; no symlink follow risk).
-            let Ok(bytes) = fs::read(&entry.source_path) else {
-                skipped_count += 1;
-                let fallback_hash = blake3::hash(entry.source_path.as_bytes());
-                let fallback_hash_str = fallback_hash.to_hex().to_string();
-                let src = &entry.source_path;
-                outcomes.push(CaptureEntryOutcome {
-                    source_path: entry.source_path.clone(),
-                    handle: format!("{PROTECTED_HANDLE_PREFIX}{fallback_hash_str}"),
-                    content_hash: fallback_hash_str,
-                    byte_len: 0,
-                    stored: false,
-                    diagnostic: Some(EntryDiagnostic {
-                        code: "stale_source_path".to_owned(),
-                        message: format!(
-                            "source path {src:?} is not readable; \
-                             the file may have moved or been deleted",
-                        ),
-                    }),
-                });
-                continue;
-            };
-
-            let byte_len = bytes.len() as u64;
-            let content_hash = blake3::hash(&bytes).to_hex().to_string();
-            let source_path_opt = Some(entry.source_path.as_str());
-            let handle = ProtectedHandle::compute_handle(&class, &content_hash, source_path_opt);
-
+            // Compute the content hash by STREAMING the source rather than
+            // slurping it into one `Vec`, so a multi-GB transcript or CI log
+            // cannot exhaust memory before a diagnostic or blob write.
             if !enabled {
-                // Preview only — do not write anything.
+                // Preview only — hash without writing anything to disk.
+                let Ok((content_hash, byte_len)) =
+                    hash_source_streaming(Path::new(&entry.source_path))
+                else {
+                    skipped_count += 1;
+                    outcomes.push(stale_read_outcome(&entry.source_path));
+                    continue;
+                };
+                let handle = ProtectedHandle::compute_handle(
+                    &class,
+                    &content_hash,
+                    Some(entry.source_path.as_str()),
+                );
                 outcomes.push(CaptureEntryOutcome {
                     source_path: entry.source_path.clone(),
                     handle,
@@ -1025,80 +1119,102 @@ impl ProtectedStore {
                 continue;
             }
 
+            // Enabled: validate the blobs directory (no-follow) and create it,
+            // then stream the source into a temp blob there, hashing as it goes.
+            // The temp is promoted to the content-addressed path (or discarded if
+            // a matching blob already exists) below.  Validating before the
+            // existing-handle fast path keeps a symlinked `<store>/blobs`
+            // rejected consistently with `get`.
+            let blobs = self.checked_blobs_dir()?;
+            create_private_dir(&blobs)?;
+            let Ok((content_hash, byte_len, tmp)) =
+                stream_source_to_temp(Path::new(&entry.source_path), &blobs)
+            else {
+                skipped_count += 1;
+                outcomes.push(stale_read_outcome(&entry.source_path));
+                continue;
+            };
+            let handle = ProtectedHandle::compute_handle(
+                &class,
+                &content_hash,
+                Some(entry.source_path.as_str()),
+            );
+
             // Enabled: store blob + register in manifest.
             //
-            // Before deduplication, remove any existing record that carries the
-            // same handle string but whose metadata no longer recomputes to that
-            // handle (content_hash or source_path was corrupted / tampered with).
-            // Retaining a corrupt record would make `already_exists = true` and
-            // skip the write, leaving `eg protected get` broken for that handle.
+            // Before deduplication, drop any existing record that represents the
+            // SAME payload as this capture unless it is fully valid.  A record is
+            // "the same payload" when either its stored `handle` equals the
+            // current handle OR its recomputed identity equals the current handle
+            // — the latter catches a record whose `handle` field itself was
+            // tampered (its stored handle no longer matches, so a plain
+            // `h.handle == handle` test would treat the corrupt duplicate as
+            // unrelated and leave `protected list` with both it and the repaired
+            // record).  Unrelated payloads are always kept.
             existing.retain(|h| {
-                if h.handle != handle {
-                    return true; // different handle — always keep
-                }
-                // Same handle: require all metadata fields to be internally
-                // consistent AND schema-valid.  Identity fields (class,
-                // content_hash, source_path) are verified by recomputing the
-                // handle; non-identity fields are checked directly against
-                // ground truth (byte_len, schema_version) or for schema validity
-                // (captured_at must be RFC 3339, producer_id must be non-empty).
-                // A record that keeps the right handle but carries an invalid
-                // captured_at or empty producer_id is dropped so re-capture
-                // replaces it with a valid copy, rather than being preserved via
-                // the `already_exists` path and leaving `protected list` emitting
-                // a schema-violating record.
-                ProtectedHandle::compute_handle(
+                let recomputed = ProtectedHandle::compute_handle(
                     &h.source_class,
                     &h.content_hash,
                     h.source_path.as_deref(),
-                ) == h.handle
+                );
+                if h.handle != handle && recomputed != handle {
+                    return true; // genuinely different payload — keep
+                }
+                // Same payload: keep only when every field is internally
+                // consistent AND schema-valid, so the `already_exists` path can
+                // safely short-circuit and preserve the original capture
+                // metadata.  Identity fields (class, content_hash, source_path)
+                // are verified by recomputing the handle and requiring it to
+                // equal both the stored handle and the current handle; the rest
+                // are checked against ground truth (byte_len, schema_version) or
+                // for schema validity (captured_at RFC 3339, producer_id
+                // non-empty).  Any failure drops the record so recapture writes a
+                // single canonical replacement.
+                recomputed == h.handle
+                    && h.handle == handle
                     && h.byte_len == byte_len
                     && h.schema_version == PROTECTED_SCHEMA_VERSION
                     && chrono::DateTime::parse_from_rfc3339(&h.captured_at).is_ok()
                     && !h.producer_id.trim().is_empty()
             });
-            // Validate the blobs directory (no-follow) BEFORE any blob read,
-            // check, or write — including the existing-handle fast path — so a
-            // symlinked `<store>/blobs` is rejected consistently with `get`,
-            // rather than the fast path reading through the symlink and
-            // reporting recapture success for a store `get` still rejects.
-            let blobs = self.checked_blobs_dir()?;
             let blob = blobs.join(&content_hash);
             let already_exists = existing.iter().any(|h| h.handle == handle);
             if already_exists {
                 // Handle already registered: repair the blob if it is missing,
                 // non-regular (symlink / FIFO / device), or its hash no longer
-                // matches.  Using `symlink_metadata` (no follow) avoids blocking
-                // on a FIFO or exhausting memory via a symlink to `/dev/zero`;
-                // non-regular paths are unconditionally treated as needing repair
-                // so `get` cannot later block on the same path.
+                // matches.  `symlink_metadata` (no follow) avoids blocking on a
+                // FIFO; the size-mismatch arm avoids reading a huge/tampered blob
+                // — only an equal-sized blob is read to verify the hash.
                 let needs_repair = match blob.symlink_metadata() {
                     Err(_) => true,                            // missing
                     Ok(m) if !m.file_type().is_file() => true, // symlink / FIFO / device
-                    // Size mismatch ⇒ definitely not the expected content, so
-                    // repair without reading the (possibly huge / tampered) blob
-                    // into memory.  Only when the size already equals the
-                    // known-good source `byte_len` do we read to verify the hash,
-                    // bounding the read to the legitimate payload size.
-                    Ok(m) if m.len() != byte_len => true,
+                    Ok(m) if m.len() != byte_len => true,      // size mismatch
                     Ok(_) => fs::read(&blob).map_or(true, |existing| {
                         blake3::hash(&existing).to_hex().to_string() != content_hash
                     }),
                 };
                 if needs_repair {
-                    create_private_dir(&blobs)?;
-                    write_private_file(&blob, &bytes)?;
+                    // Promote the freshly streamed temp blob into place.
+                    if let Err(e) = rename_into_place(&tmp, &blob) {
+                        let _ = fs::remove_file(&tmp);
+                        return Err(e);
+                    }
+                } else {
+                    // Existing blob is already valid — discard the streamed temp.
+                    let _ = fs::remove_file(&tmp);
                 }
             } else {
-                // New handle: write blob and register.  Only track the blob for
-                // rollback if it did NOT already exist on disk: two handles can
-                // share one content-addressed blob (identical bytes from a
-                // different source path/class), so a blob that already backs an
-                // existing handle must survive a rollback of this capture.
-                create_private_dir(&blobs)?;
-                let blob_preexisting = blob.symlink_metadata().is_ok();
-                write_private_file(&blob, &bytes)?;
-                if !blob_preexisting {
+                // New handle.  Two handles can share one content-addressed blob
+                // (identical bytes from a different source path/class), so only
+                // promote and track the temp when the blob did not already exist;
+                // a blob that already backs an existing handle must survive a
+                // rollback of this capture.
+                if blob.symlink_metadata().is_ok() {
+                    let _ = fs::remove_file(&tmp);
+                } else if let Err(e) = rename_into_place(&tmp, &blob) {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e);
+                } else {
                     blob_txn.track(blob.clone());
                 }
 
@@ -1237,6 +1353,17 @@ impl ProtectedStore {
             record.source_path.as_deref(),
         );
         if expected_handle != record.handle {
+            return Err(GetError::CorruptManifestRecord {
+                handle: handle.to_owned(),
+            });
+        }
+
+        // 4a-bis. Schema-version check.  The contract is explicitly v1; a record
+        // whose `schema_version` was tampered to another value must be rejected
+        // before releasing bytes rather than accepting whatever layout happened
+        // to deserialize into the current struct.  (The capture path likewise
+        // drops non-v1 records during recapture.)
+        if record.schema_version != PROTECTED_SCHEMA_VERSION {
             return Err(GetError::CorruptManifestRecord {
                 handle: handle.to_owned(),
             });
@@ -2702,6 +2829,143 @@ mod tests {
             fs::read_dir(&target).unwrap().next().is_none(),
             "no files may be written through a symlinked store root"
         );
+    }
+
+    // ── Unit: get error detail is the documented flat object (307) ────────────
+
+    #[test]
+    fn get_error_detail_is_flat_documented_object() {
+        // A struct variant must expose its fields flat under `error.detail`,
+        // not nested under the variant name.
+        let err = GetError::MissingProtectedPayload {
+            handle: "protected:v1:aa".to_owned(),
+            expected_path: "/store/blobs/aa".to_owned(),
+        };
+        let v: serde_json::Value = serde_json::from_str(&err.to_json()).unwrap();
+        assert_eq!(v["error"]["code"], "missing_protected_payload");
+        assert_eq!(v["error"]["detail"]["handle"], "protected:v1:aa");
+        assert_eq!(v["error"]["detail"]["expected_path"], "/store/blobs/aa");
+        assert!(
+            v["error"]["detail"]["missing_protected_payload"].is_null(),
+            "detail must not nest fields under the variant name"
+        );
+
+        // A unit variant's detail must still be an object, not a bare string.
+        let v2: serde_json::Value =
+            serde_json::from_str(&GetError::RawArtifactModeDisabled.to_json()).unwrap();
+        assert!(
+            v2["error"]["detail"].is_object(),
+            "detail must always be an object: {v2}"
+        );
+    }
+
+    // ── Unit: get rejects an unsupported schema_version (1239) ────────────────
+
+    #[test]
+    fn get_rejects_unsupported_schema_version() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"data").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+        let r = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        let handle = r.entries[0].handle.clone();
+
+        // Tamper schema_version (not part of the handle identity) to an
+        // unsupported value; get must reject before releasing bytes.
+        let manifest_path = dir.path().join("manifest.jsonl");
+        let mut rec: ProtectedHandle =
+            serde_json::from_str(fs::read_to_string(&manifest_path).unwrap().trim()).unwrap();
+        rec.schema_version = 2;
+        fs::write(&manifest_path, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
+
+        let err = store.get(&handle, "op-1").unwrap_err();
+        assert_eq!(
+            err.code(),
+            "corrupt_manifest_record",
+            "an unsupported schema_version must be rejected by get"
+        );
+    }
+
+    // ── Unit: recapture drops a record with a tampered handle field (1036) ────
+
+    #[test]
+    fn recapture_drops_record_with_tampered_handle_field() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"payload bytes").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+        let r = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        let good_handle = r.entries[0].handle.clone();
+
+        // Tamper ONLY the stored handle field; identity fields stay intact so the
+        // record still recomputes to the canonical handle.
+        let manifest_path = dir.path().join("manifest.jsonl");
+        let mut rec: ProtectedHandle =
+            serde_json::from_str(fs::read_to_string(&manifest_path).unwrap().trim()).unwrap();
+        rec.handle = format!("{}{}", PROTECTED_HANDLE_PREFIX, "0".repeat(64));
+        fs::write(&manifest_path, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
+
+        // Recapture must restore a single canonical record, not leave both the
+        // tampered and the repaired one.
+        store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+
+        let lines: Vec<String> = fs::read_to_string(&manifest_path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "manifest must have exactly one record after recapture, got: {lines:?}"
+        );
+        let after: ProtectedHandle = serde_json::from_str(lines[0].trim()).unwrap();
+        assert_eq!(
+            after.handle, good_handle,
+            "the surviving record must be the canonical one"
+        );
+    }
+
+    // ── Unit: large payloads stream byte-for-byte (C) ─────────────────────────
+
+    #[test]
+    fn capture_streams_large_payload_roundtrip() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("big.bin");
+        // ~200 KiB crosses the 64 KiB streaming buffer several times.
+        let data: Vec<u8> = (0..200 * 1024usize)
+            .map(|i| u8::try_from(i % 251).expect("< 251"))
+            .collect();
+        fs::write(&src, &data).unwrap();
+        let entries = vec![CaptureEntry {
+            class: "command_output".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        let r = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        let handle = r.entries[0].handle.clone();
+        assert_eq!(r.entries[0].byte_len, data.len() as u64);
+
+        let got = store.get(&handle, "op-1").expect("get large payload");
+        assert_eq!(got, data, "streamed blob must round-trip byte-for-byte");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
