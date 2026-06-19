@@ -24,8 +24,11 @@ eg protected list    --store <DIR>
 ```text
 <store>/blobs/<content_hash>   — raw bytes, content-addressed by BLAKE3 hex
 <store>/manifest.jsonl         — canonical-sorted ProtectedHandle records
-<store>/operators.jsonl        — canonical-sorted authorised producer IDs
 ```
+
+Authorization is derived from the manifest: an `--operator` may retrieve payloads iff it is the
+`--producer` of at least one captured record.  There is no separate ACL file (authorization is
+crash-atomic with the manifest write).
 
 The protected store is a **separate directory** from `.egregore`.  The graph extractor, ingest,
 query, inspect, and semantic-search commands never read or write the store.  This structural

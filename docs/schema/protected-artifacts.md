@@ -34,14 +34,20 @@ unchanged source yields the same handle and produces zero duplicate manifest ent
 ```text
 <store>/blobs/<content_hash>   — raw bytes; keyed by BLAKE3 hex of content
 <store>/manifest.jsonl         — one ProtectedHandle JSON per line; canonical-sorted (lexicographic)
-<store>/operators.jsonl        — one quoted producer_id JSON string per line; canonical-sorted
 ```
+
+### Authorization
+
+There is no separate ACL file.  Authorization is **derived from the manifest**: an operator may
+retrieve payloads iff it is the `producer_id` of at least one committed record.  Because the
+authorization and the handle are the same record, a single atomic `manifest.jsonl` write commits
+both — authorization is crash-atomic and cannot desync (no missing/empty/orphaned ACL states).
 
 ### Canonical ordering
 
-`manifest.jsonl` and `operators.jsonl` are sorted **lexicographically by JSON line text**, the
-same rule used by `Graph::to_jsonl` for graph JSONL files.  De-duplication is applied before
-each write.  This ensures byte-identical output across re-imports and is how AC7 is verified.
+`manifest.jsonl` is sorted **lexicographically by JSON line text**, the same rule used by
+`Graph::to_jsonl` for graph JSONL files.  De-duplication is applied before each write.  This
+ensures byte-identical output across re-imports and is how AC7 is verified.
 
 ## Payload classes
 

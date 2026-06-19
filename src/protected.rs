@@ -12,8 +12,11 @@
 //! ```text
 //! <store>/blobs/<content_hash>   — raw bytes, content-addressed by BLAKE3 hex
 //! <store>/manifest.jsonl         — canonical-sorted ProtectedHandle records
-//! <store>/operators.jsonl        — canonical-sorted authorized producer IDs
 //! ```
+//!
+//! Authorization is derived from the manifest: an operator may retrieve payloads
+//! iff it is the `producer_id` of at least one committed record.  There is no
+//! separate ACL file, so authorization is crash-atomic with the manifest write.
 //!
 //! ## Relationship to related slices
 //!
@@ -376,15 +379,15 @@ fn is_valid_blake3_hex(s: &str) -> bool {
 /// the system default is used; operators must provision filesystem ACLs
 /// themselves.
 /// Returns an error when serialized metadata `content` would exceed the read
-/// cap that [`ProtectedStore::read_manifest`] / `read_operators` enforce.
+/// cap that [`ProtectedStore::read_manifest`] enforces.
 ///
 /// Without this guard, a large-but-successful enabled capture could write a
-/// `manifest.jsonl` (or `operators.jsonl`) bigger than [`MAX_STORE_FILE_BYTES`],
-/// after which every subsequent `list`, `get`, and `capture` would reject the
-/// store as corrupt — a successful write silently rendering the store
-/// unreadable.  Failing the write keeps read and write consistent and leaves
-/// the prior (readable) file in place, since the caller writes via
-/// temp-then-rename only after this check passes.
+/// `manifest.jsonl` bigger than [`MAX_STORE_FILE_BYTES`], after which every
+/// subsequent `list`, `get`, and `capture` would reject the store as corrupt —
+/// a successful write silently rendering the store unreadable.  Failing the
+/// write keeps read and write consistent and leaves the prior (readable) file
+/// in place, since the caller writes via temp-then-rename only after this check
+/// passes.
 fn check_within_read_cap(content: &str, what: &str) -> io::Result<()> {
     if content.len() as u64 > MAX_STORE_FILE_BYTES {
         return Err(io::Error::new(
@@ -749,10 +752,10 @@ impl Drop for StoreLock {
 /// Tracks blobs newly written during a single `capture` so they can be rolled
 /// back if the capture fails before it commits.
 ///
-/// A capture writes blobs, then `manifest.jsonl`, then `operators.jsonl`.  If a
-/// commit step fails (e.g. the manifest would exceed the read cap, or an I/O
-/// error), the new blob bytes would otherwise be left in `<store>/blobs` with no
-/// manifest record referencing them.  This guard removes those orphans on drop
+/// A capture writes blobs, then commits `manifest.jsonl`.  If the manifest
+/// commit fails (e.g. it would exceed the read cap, or an I/O error), the new
+/// blob bytes would otherwise be left in `<store>/blobs` with no manifest record
+/// referencing them.  This guard removes those orphans on drop
 /// unless [`Self::commit`] was called once the manifest is durably written.
 ///
 /// Only *new-handle* blobs are tracked.  Repair writes overwrite a blob path
@@ -815,10 +818,6 @@ impl ProtectedStore {
 
     fn manifest_path(&self) -> PathBuf {
         self.root.join("manifest.jsonl")
-    }
-
-    fn operators_path(&self) -> PathBuf {
-        self.root.join("operators.jsonl")
     }
 
     fn blob_path(&self, content_hash: &str) -> PathBuf {
@@ -942,77 +941,18 @@ impl ProtectedStore {
         write_private_file(&self.manifest_path(), content.as_bytes())
     }
 
-    /// Reads the canonical operators file, returning the set of authorised IDs.
+    /// Returns `true` when `operator` is the producer of at least one committed
+    /// record in `manifest`.
     ///
-    /// Applies the same regular-file and size checks as [`Self::read_manifest`].
-    fn read_operators(&self) -> io::Result<Vec<String>> {
-        let path = self.operators_path();
-        // Read through a single no-follow, regular-file, size-capped descriptor
-        // (TOCTOU-safe), mirroring `read_manifest`.
-        let content = match read_capped_regular_file(&path, MAX_STORE_FILE_BYTES) {
-            Ok(c) => c,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "operators.jsonl at {} is not a bounded regular file; \
-                         the store may have been tampered with ({e})",
-                        path.display()
-                    ),
-                ));
-            }
-        };
-        // Fail-closed: return an error if ANY line fails to parse as a JSON string.
-        // Silently skipping malformed lines would normalize a partially corrupted ACL
-        // and could allow a future write to silently revoke the discarded operators.
-        // An operators.jsonl with any malformed line must be treated as corrupt.
-        let mut ops = Vec::new();
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let op: String = serde_json::from_str(line).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("operators.jsonl contains a malformed record: {e}"),
-                )
-            })?;
-            if op.trim().is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "operators.jsonl contains an empty operator identity",
-                ));
-            }
-            ops.push(op);
-        }
-        ops.sort_unstable();
-        ops.dedup();
-        Ok(ops)
-    }
-
-    /// Serializes the operators file's canonical content (sorted, de-duplicated).
-    ///
-    /// Shared by [`Self::write_operators`] and the capture preflight so the size
-    /// checked before committing the manifest matches the bytes actually written.
-    fn serialize_operators(ops: &[String]) -> String {
-        let mut lines: Vec<String> = ops
-            .iter()
-            .map(|o| serde_json::to_string(o).expect("operator serialisation is infallible"))
-            .collect();
-        lines.sort_unstable();
-        lines.dedup();
-        format!("{}\n", lines.join("\n"))
-    }
-
-    /// Writes the canonical operators file.
-    fn write_operators(&self, ops: &[String]) -> io::Result<()> {
-        let dir = &self.root;
-        create_private_dir(dir)?;
-        let content = Self::serialize_operators(ops);
-        check_within_read_cap(&content, "operators.jsonl")?;
-        write_private_file(&self.operators_path(), content.as_bytes())
+    /// The manifest is the SINGLE source of truth for authorization: a producer
+    /// is authorized iff it has a durably captured handle.  This is crash-safe
+    /// with the manifest write (one atomic rename commits both the handle and
+    /// the authorization) and removes the separate `operators.jsonl` ACL file
+    /// along with its missing/empty/orphaned/desync failure modes.  An empty
+    /// `operator` is never authorized (producer IDs are non-empty by capture
+    /// validation), so `get("", "")` is rejected.
+    fn is_authorized(manifest: &[ProtectedHandle], operator: &str) -> bool {
+        !operator.is_empty() && manifest.iter().any(|h| h.producer_id == operator)
     }
 
     // ── Public API ─────────────────────────────────────────────────────────────
@@ -1042,7 +982,8 @@ impl ProtectedStore {
         enabled: bool,
     ) -> io::Result<CaptureReport> {
         // Validate at the store API boundary, not just the CLI, so embedded
-        // callers cannot write "" into operators.jsonl and authorize get("", "").
+        // callers cannot commit an empty `producer_id` (which would authorize
+        // `get("", "")` since authorization is manifest-derived).
         if enabled && producer_id.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1092,10 +1033,9 @@ impl ProtectedStore {
             None
         };
 
-        // Load existing manifest and validate the operators file *before* any
-        // blob or manifest writes.  This ensures that a corrupt operators.jsonl
-        // causes an early failure rather than leaving orphaned blobs and manifest
-        // records that the caller cannot retrieve until ACL state is repaired.
+        // Load the existing manifest before any blob or manifest writes.
+        // Authorization is derived from the manifest's producer IDs (see
+        // `is_authorized`), so there is no separate ACL file to load or validate.
         let mut existing: Vec<ProtectedHandle> = if enabled {
             self.read_manifest()?
         } else {
@@ -1107,49 +1047,6 @@ impl ProtectedStore {
         // while a pre-existing orphan/tampered blob we replace must not.
         let original_blob_hashes: std::collections::HashSet<String> =
             existing.iter().map(|h| h.content_hash.clone()).collect();
-        let ops: Vec<String> = if !enabled {
-            Vec::new()
-        } else if self.is_initialised() {
-            // Initialized store (manifest present): the ACL must exist.  A missing
-            // operators.jsonl must NOT be silently reinitialized with only the
-            // current producer — that would authorize them to retrieve every
-            // previously captured handle.  Treat a missing ACL as tampering.
-            if matches!(
-                self.operators_path().symlink_metadata(),
-                Err(ref e) if e.kind() == io::ErrorKind::NotFound
-            ) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "operators.jsonl is missing from an initialized store at {}; \
-                         refusing to reinitialize the ACL (the store may have been tampered with)",
-                        self.root.display()
-                    ),
-                ));
-            }
-            let loaded = self.read_operators()?;
-            // An EMPTY ACL on a store that already has manifest records is also
-            // treated as tampering: rewriting it with only the current producer
-            // would authorize them for every previously captured handle.
-            if loaded.is_empty() && !existing.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "operators.jsonl is empty on an initialized store with records at {}; \
-                         refusing to reinitialize the ACL (the store may have been tampered with)",
-                        self.root.display()
-                    ),
-                ));
-            }
-            loaded
-        } else {
-            // No manifest → a genuinely new (or being-initialized) store.  Do NOT
-            // import a stale/orphaned operators.jsonl (left by partial deletion or
-            // tampering): starting from an empty ACL prevents old operator IDs
-            // from being re-authorized for the newly captured payloads.  Any
-            // existing operators.jsonl is overwritten with just this producer.
-            Vec::new()
-        };
 
         // Rolls back blobs newly written by this capture if any later step (a
         // subsequent blob write, the manifest commit, or the ACL preflight)
@@ -1422,21 +1319,22 @@ impl ProtectedStore {
         }
 
         // A pure no-op capture (every entry reused an already-valid payload, so
-        // `mutated` is false) does NOT extend the ACL.  If the producer is not
-        // already authorized, it cannot retrieve the returned handles, so
-        // reporting them as `stored: true` would hand it handles that `get`
-        // immediately rejects as `unauthorized`; report them as not stored with
-        // an `already_captured` diagnostic instead, and reset `stored_count`.
-        // (An already-authorized producer re-capturing its own payload CAN
-        // retrieve the handles, so its no-op entries stay `stored: true`.)
-        if enabled && !mutated && !ops.iter().any(|o| o == producer_id) {
+        // `mutated` is false) writes no new manifest record for this producer.
+        // Authorization is manifest-derived, so the producer is authorized only
+        // if it already produced a committed record; otherwise it cannot retrieve
+        // the returned handles, and reporting them as `stored: true` would hand it
+        // handles that `get` immediately rejects as `unauthorized`.  Report those
+        // as not stored with an `already_captured` diagnostic and reset
+        // `stored_count`.  (An already-producing producer re-capturing its own
+        // payload CAN retrieve the handles, so its no-op entries stay stored.)
+        if enabled && !mutated && !Self::is_authorized(&existing, producer_id) {
             for outcome in &mut outcomes {
                 if outcome.stored {
                     outcome.stored = false;
                     outcome.diagnostic = Some(EntryDiagnostic {
                         code: "already_captured".to_owned(),
                         message: "payload already present and valid; nothing was stored \
-                                  and this producer was not authorized"
+                                  and this producer is not authorized"
                             .to_owned(),
                     });
                 }
@@ -1444,35 +1342,16 @@ impl ProtectedStore {
             stored_count = 0;
         }
 
-        // Only mutate the store — including extending the ACL — when this capture
-        // actually wrote or repaired something.  An empty/all-stale capture, or a
-        // pure no-op reuse of already-valid payloads, leaves `mutated` false;
-        // rewriting operators.jsonl with this producer would otherwise authorize
-        // them to retrieve every previously captured handle without storing
-        // anything new.
+        // Persist the manifest only when this capture wrote or repaired
+        // something.  The producer's authorization IS its committed record in the
+        // manifest, so a single atomic manifest rename commits both the handle
+        // and the authorization (crash-safe); on failure `blob_txn` rolls back
+        // the new blobs and neither the handle nor the authorization exists.
         if enabled && mutated {
-            // Write the ACL before the manifest so authorization is durable
-            // before the handles exist, then roll the ACL BACK if the manifest
-            // write fails.  This keeps the ACL and manifest in the same
-            // commit/rollback boundary: on success both are durable; on failure
-            // the blobs roll back, the handles do not exist, AND the producer is
-            // not left authorized for the store's pre-existing handles.
-            let original_ops = ops.clone();
-            let mut projected_ops = ops;
-            projected_ops.push(producer_id.to_owned());
-            check_within_read_cap(
-                &Self::serialize_operators(&projected_ops),
-                "operators.jsonl",
-            )?;
-            self.write_operators(&projected_ops)?;
-
-            if let Err(e) = self.write_manifest(&existing) {
-                // Restore the ACL to its pre-capture state (best effort) so a
-                // failed capture does not leave the producer authorized.  `blob_txn`
-                // drops here and rolls back the newly written blobs.
-                let _ = self.write_operators(&original_ops);
-                return Err(e);
-            }
+            // On failure the early return drops `blob_txn`, rolling back the
+            // newly written blobs; neither the handle nor the authorization
+            // (which is the committed record) exists.
+            self.write_manifest(&existing)?;
             blob_txn.commit();
         }
 
@@ -1609,19 +1488,24 @@ impl ProtectedStore {
             return Err(GetError::RawArtifactModeDisabled);
         }
 
-        // 2. Auth check.
-        // A corrupt operators.jsonl (any malformed line) fails closed: deny all
-        // authorization rather than partially normalizing the ACL.
-        let ops = self.read_operators().map_err(|_| GetError::Unauthorized {
-            operator: operator.to_owned(),
-        })?;
-        if !ops.contains(&operator.to_owned()) {
+        // 2. Read the manifest (the single source of truth for both
+        // authorization and lookup).  A read failure is store corruption.
+        let manifest = self
+            .read_manifest()
+            .map_err(|_| GetError::CorruptManifestRecord {
+                handle: handle.to_owned(),
+            })?;
+
+        // 3. Auth check (manifest-derived): `operator` must be the producer of
+        // at least one committed record.  Checked before any handle existence
+        // disclosure.
+        if !Self::is_authorized(&manifest, operator) {
             return Err(GetError::Unauthorized {
                 operator: operator.to_owned(),
             });
         }
 
-        // 3. Handle format check.
+        // 4. Handle format check.
         // A valid handle is `protected:v1:` + exactly 64 lowercase hex chars.
         // A prefixed-but-malformed value (e.g. `protected:v1:abc`) must be
         // rejected as MalformedHandle rather than falling through to a
@@ -1635,14 +1519,7 @@ impl ProtectedStore {
             });
         }
 
-        // 4. Manifest lookup.
-        // `is_initialised()` above confirmed the manifest exists, so a read
-        // error here is store corruption — not "mode disabled".
-        let manifest = self
-            .read_manifest()
-            .map_err(|_| GetError::CorruptManifestRecord {
-                handle: handle.to_owned(),
-            })?;
+        // 5. Manifest lookup.
         let record = manifest
             .iter()
             .find(|h| h.handle == handle)
@@ -1764,6 +1641,29 @@ mod tests {
 
     fn fixed_ts() -> &'static str {
         "2026-06-18T00:00:00Z"
+    }
+
+    /// Seeds a store with one committed record produced by `producer`, so that
+    /// `producer` is authorized (authorization is manifest-derived).  Returns the
+    /// committed handle.
+    fn seed_producer(store: &ProtectedStore, dir: &Path, producer: &str) -> String {
+        let src = dir.join("seed.txt");
+        fs::write(&src, b"seed payload").unwrap();
+        store
+            .capture(
+                &[CaptureEntry {
+                    class: "report".to_owned(),
+                    source_path: src.to_string_lossy().into_owned(),
+                }],
+                producer,
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap()
+            .entries[0]
+            .handle
+            .clone()
     }
 
     // ── Unit: handle identity ──────────────────────────────────────────────────
@@ -1908,10 +1808,8 @@ mod tests {
     fn get_unauthorized_operator_rejected() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
-        // Initialise store by writing a dummy manifest and operators file.
-        fs::create_dir_all(dir.path()).unwrap();
-        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
-        store.write_operators(&["op-allowed".to_owned()]).unwrap();
+        // Seed a store authorizing `op-allowed`; `op-other` is not a producer.
+        seed_producer(&store, dir.path(), "op-allowed");
 
         let err = store.get("protected:v1:abc", "op-other").unwrap_err();
         assert_eq!(err.code(), "unauthorized");
@@ -1924,8 +1822,7 @@ mod tests {
     fn get_malformed_handle_rejected() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
-        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
-        store.write_operators(&["op-1".to_owned()]).unwrap();
+        seed_producer(&store, dir.path(), "op-1");
 
         let err = store.get("notaprotectedhandle:abc", "op-1").unwrap_err();
         assert_eq!(err.code(), "malformed_handle");
@@ -1935,9 +1832,7 @@ mod tests {
     fn unauthorized_operator_not_echoed_in_error_json() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
-        fs::create_dir_all(dir.path()).unwrap();
-        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
-        store.write_operators(&["op-allowed".to_owned()]).unwrap();
+        seed_producer(&store, dir.path(), "op-allowed");
 
         let err = store
             .get("protected:v1:abc", "bearer-secret-token")
@@ -2048,8 +1943,7 @@ mod tests {
     fn malformed_handle_not_echoed_in_error_json() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
-        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
-        store.write_operators(&["op-1".to_owned()]).unwrap();
+        seed_producer(&store, dir.path(), "op-1");
 
         // Simulate accidentally passing a bearer token in the handle position.
         let err = store
@@ -2128,11 +2022,9 @@ mod tests {
     fn get_manifest_read_error_returns_corrupt_manifest_record() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
-        // Initialise with a valid manifest so is_initialised() returns true.
-        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
-        store.write_operators(&["op-1".to_owned()]).unwrap();
-
-        // Overwrite manifest with invalid JSON so read_manifest() fails.
+        // Seed a valid store, then overwrite the manifest with invalid JSON so
+        // read_manifest() fails.
+        seed_producer(&store, dir.path(), "op-1");
         fs::write(dir.path().join("manifest.jsonl"), "not valid json\n").unwrap();
 
         let err = store
@@ -2187,39 +2079,6 @@ mod tests {
     }
 
     #[test]
-    fn malformed_operator_record_not_authorized() {
-        let dir = tempdir().unwrap();
-        let store = ProtectedStore::new(dir.path());
-        // Write operators.jsonl with one valid JSON string and one bare/unquoted line.
-        fs::write(
-            dir.path().join("operators.jsonl"),
-            "\"op-valid\"\nbare-not-json-string\n",
-        )
-        .unwrap();
-        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
-
-        // Any malformed line in operators.jsonl causes ALL authorization to fail.
-        // This is stricter than silently skipping malformed lines: a partially
-        // corrupt ACL file must deny everyone, not just unknown callers.
-        let err_valid = store.get("protected:v1:abc", "op-valid").unwrap_err();
-        assert_eq!(
-            err_valid.code(),
-            "unauthorized",
-            "corrupt operators.jsonl must deny even operators that appear on valid lines"
-        );
-
-        // The bare line must also NOT grant access.
-        let err_bare = store
-            .get("protected:v1:abc", "bare-not-json-string")
-            .unwrap_err();
-        assert_eq!(
-            err_bare.code(),
-            "unauthorized",
-            "bare/unquoted operator record must not grant access"
-        );
-    }
-
-    #[test]
     fn capture_replaces_corrupt_manifest_record_on_recapture() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
@@ -2269,49 +2128,18 @@ mod tests {
     }
 
     #[test]
-    fn capture_fails_before_writes_when_operators_file_is_corrupt() {
+    fn empty_operator_identity_is_denied() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
-        // Write a corrupt operators.jsonl (bare non-JSON line).
-        fs::write(dir.path().join("operators.jsonl"), "not-a-json-string\n").unwrap();
-        // Write a valid (empty) manifest so the store appears initialised.
-        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
+        let handle = seed_producer(&store, dir.path(), "op-1");
 
-        let src = dir.path().join("payload.txt");
-        fs::write(&src, b"hello").unwrap();
-        let entries = vec![CaptureEntry {
-            class: "transcript".to_owned(),
-            source_path: src.to_string_lossy().into_owned(),
-        }];
-
-        // Capture must fail early — before writing any blobs.
-        let result = store.capture(&entries, "op-1", "0.1.0", fixed_ts(), true);
-        assert!(
-            result.is_err(),
-            "corrupt operators.jsonl must abort capture"
-        );
-
-        // No blobs must have been written.
-        assert!(
-            !dir.path().join("blobs").exists(),
-            "blobs directory must not be created when operators.jsonl is corrupt"
-        );
-    }
-
-    #[test]
-    fn empty_operator_identity_is_rejected_by_read_operators() {
-        let dir = tempdir().unwrap();
-        let store = ProtectedStore::new(dir.path());
-        // Write operators.jsonl containing a valid JSON empty string.
-        fs::write(dir.path().join("operators.jsonl"), "\"\"\n").unwrap();
-        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
-
-        // An empty operator identity must be rejected, not authorized.
-        let err = store.get("protected:v1:abc", "").unwrap_err();
+        // An empty operator identity is never authorized (producer IDs are
+        // non-empty), so `get("", "")` is denied.
+        let err = store.get(&handle, "").unwrap_err();
         assert_eq!(
             err.code(),
             "unauthorized",
-            "empty operator identity must be denied even if present in operators.jsonl"
+            "empty operator identity must be denied"
         );
     }
 
@@ -2392,8 +2220,7 @@ mod tests {
     fn get_handle_with_short_suffix_is_malformed_not_not_found() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
-        fs::write(dir.path().join("manifest.jsonl"), "\n").unwrap();
-        store.write_operators(&["op-1".to_owned()]).unwrap();
+        seed_producer(&store, dir.path(), "op-1");
 
         // `protected:v1:abc` has the right prefix but a 3-char suffix (not 64 hex).
         let err = store.get("protected:v1:abc", "op-1").unwrap_err();
@@ -2707,31 +2534,6 @@ mod tests {
         assert!(
             store.is_initialised(),
             "present regular manifest must report initialised"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn read_operators_rejects_symlink_at_operators_path() {
-        let dir = tempdir().unwrap();
-        let store = ProtectedStore::new(dir.path());
-
-        // Place a symlink at the operators path pointing at a real file.
-        let real_file = dir.path().join("real_ops.jsonl");
-        fs::write(&real_file, "\"op-1\"\n").unwrap();
-        let ops_path = dir.path().join("operators.jsonl");
-        std::os::unix::fs::symlink(&real_file, &ops_path).unwrap();
-
-        // read_operators() must reject the symlink.
-        let err = store.read_operators().unwrap_err();
-        assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::InvalidData,
-            "read_operators must return InvalidData for a symlink at operators path"
-        );
-        assert!(
-            err.to_string().contains("tampered"),
-            "error message must flag tampering: {err}"
         );
     }
 
@@ -3348,66 +3150,28 @@ mod tests {
     // ── Unit: missing ACL on an initialized store fails closed (D) ────────────
 
     #[test]
-    fn capture_fails_closed_when_acl_missing_on_initialized_store() {
+    fn authorization_is_manifest_derived_not_from_operators_file() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
-        let src = dir.path().join("payload.txt");
-        fs::write(&src, b"content").unwrap();
-        let entries = vec![CaptureEntry {
-            class: "report".to_owned(),
-            source_path: src.to_string_lossy().into_owned(),
-        }];
+        let handle = seed_producer(&store, dir.path(), "op-1");
 
-        // First capture initializes the store (manifest + operators).
-        store
-            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
-            .unwrap();
+        // A producer (op-1) is authorized; a non-producer (op-2) is not.
+        assert!(store.get(&handle, "op-1").is_ok());
+        assert!(matches!(
+            store.get(&handle, "op-2"),
+            Err(GetError::Unauthorized { .. })
+        ));
 
-        // Delete the ACL while the manifest remains (tampering).
-        fs::remove_file(dir.path().join("operators.jsonl")).unwrap();
-
-        // A second enabled capture by a different producer must FAIL closed,
-        // not silently reinitialize the ACL and authorize op-2 for op-1's data.
-        let err = store
-            .capture(&entries, "op-2", "0.1.0", fixed_ts(), true)
-            .expect_err("capture must fail closed when the ACL is missing");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // Planting an operators.jsonl authorizing op-2 must have NO effect:
+        // authorization is derived solely from the manifest's producer IDs, so a
+        // missing/empty/tampered operators.jsonl cannot grant or revoke access.
+        fs::write(dir.path().join("operators.jsonl"), "\"op-2\"\n").unwrap();
         assert!(
-            err.to_string()
-                .contains("missing from an initialized store"),
-            "err must explain the missing ACL: {err}"
-        );
-        assert!(
-            !dir.path().join("operators.jsonl").exists(),
-            "the ACL must not be reinitialized on failure"
-        );
-    }
-
-    #[test]
-    fn capture_fails_closed_when_acl_empty_on_initialized_store() {
-        let dir = tempdir().unwrap();
-        let store = ProtectedStore::new(dir.path());
-        let src = dir.path().join("payload.txt");
-        fs::write(&src, b"content").unwrap();
-        let entries = vec![CaptureEntry {
-            class: "report".to_owned(),
-            source_path: src.to_string_lossy().into_owned(),
-        }];
-
-        store
-            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
-            .unwrap();
-
-        // Truncate the ACL to empty while the manifest keeps its records.
-        fs::write(dir.path().join("operators.jsonl"), "").unwrap();
-
-        let err = store
-            .capture(&entries, "op-2", "0.1.0", fixed_ts(), true)
-            .expect_err("capture must fail closed when the ACL is empty");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(
-            err.to_string().contains("empty on an initialized store"),
-            "err must explain the empty ACL: {err}"
+            matches!(
+                store.get(&handle, "op-2"),
+                Err(GetError::Unauthorized { .. })
+            ),
+            "a planted operators.jsonl must not grant access"
         );
     }
 
