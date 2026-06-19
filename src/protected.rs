@@ -42,7 +42,9 @@ pub const PROTECTED_HANDLE_PREFIX: &str = "protected:v1:";
 /// `operators.jsonl`).  Prevents memory exhaustion from unexpectedly large or
 /// device-backed files (e.g. a symlink to `/dev/zero` that slips past the
 /// regular-file check on a platform without `symlink_metadata`).
-const MAX_STORE_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
+///
+/// Also reused by the CLI capture path to bound `--manifest` reads.
+pub(crate) const MAX_STORE_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
 
 // ── Payload class ──────────────────────────────────────────────────────────────
 
@@ -510,14 +512,23 @@ impl ProtectedStore {
         self.blobs_dir().join(content_hash)
     }
 
-    /// Returns `true` when the store root and manifest exist as regular files.
+    /// Returns `true` when the manifest path exists in any form.
     ///
-    /// Uses `symlink_metadata` (no-follow) so a symlink at the manifest path
-    /// is not treated as an initialised store.
+    /// Distinguishes a genuinely absent store (`NotFound` → `false`) from one
+    /// whose manifest exists but is corrupt or tampered (symlink, FIFO, device,
+    /// or a stat error such as permission denied → `true`).  Returning `true`
+    /// for the corrupt cases lets callers proceed to [`Self::read_manifest`],
+    /// which surfaces the "not a regular file" diagnostic — rather than
+    /// silently reporting the store as uninitialised and masking the tampering
+    /// (`protected list` → empty success, `get` → `raw_artifact_mode_disabled`).
+    ///
+    /// Uses `symlink_metadata` (no-follow) so a symlink at the manifest path is
+    /// never followed during the existence check.
     fn is_initialised(&self) -> bool {
-        self.manifest_path()
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_file())
+        match self.manifest_path().symlink_metadata() {
+            Ok(_) => true,
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        }
     }
 
     /// Reads the canonical manifest, returning the de-duplicated set of handles.
@@ -2004,7 +2015,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn read_manifest_rejects_symlink_at_manifest_path() {
+    fn corrupt_symlink_manifest_is_surfaced_not_masked_as_absent() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
 
@@ -2014,10 +2025,12 @@ mod tests {
         let manifest_path = dir.path().join("manifest.jsonl");
         std::os::unix::fs::symlink(&real_file, &manifest_path).unwrap();
 
-        // is_initialised() must return false — symlink is not a regular file.
+        // is_initialised() must treat an existing-but-non-regular manifest as
+        // PRESENT (true), not absent — otherwise list/get silently mask the
+        // tampering as "store uninitialised".
         assert!(
-            !store.is_initialised(),
-            "is_initialised must return false when manifest.jsonl is a symlink"
+            store.is_initialised(),
+            "is_initialised must return true when manifest.jsonl exists as a symlink"
         );
 
         // read_manifest() must return an error, not silently follow the symlink.
@@ -2030,6 +2043,38 @@ mod tests {
         assert!(
             err.to_string().contains("not a regular file"),
             "error message must mention 'not a regular file': {err}"
+        );
+
+        // list() must propagate the corruption error rather than returning an
+        // empty success response that hides the tampered store.
+        let list_err = store.list().unwrap_err();
+        assert_eq!(
+            list_err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "list() must surface the corruption error, not Ok(empty)"
+        );
+        assert!(
+            list_err.to_string().contains("not a regular file"),
+            "list() error must mention 'not a regular file': {list_err}"
+        );
+    }
+
+    #[test]
+    fn is_initialised_false_only_when_manifest_absent() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+
+        // No manifest yet → genuinely uninitialised.
+        assert!(
+            !store.is_initialised(),
+            "absent manifest must report not-initialised"
+        );
+
+        // A regular manifest file → initialised.
+        fs::write(store.manifest_path(), "").unwrap();
+        assert!(
+            store.is_initialised(),
+            "present regular manifest must report initialised"
         );
     }
 

@@ -1184,3 +1184,39 @@ fn list_corrupt_manifest_emits_json_envelope() {
     assert_eq!(json["ok"], false);
     assert_eq!(json["error"]["code"], "store_io_error");
 }
+
+// ── Capture: bound/guard the --manifest read before parsing ────────────────────
+
+/// A `--manifest` that names a non-regular file (here a directory; the same
+/// path covers FIFOs and devices such as `/dev/zero`) must be rejected with a
+/// JSON `manifest_read_error` envelope *before* the file is slurped into
+/// memory — otherwise a FIFO/device would block indefinitely or a huge file
+/// would exhaust memory ahead of any diagnostic.
+#[test]
+fn capture_rejects_non_regular_manifest() {
+    let (_guard, store) = tmp_store();
+    let manifest_dir = tempfile::tempdir().expect("temp dir for non-regular manifest");
+
+    let stderr = eg()
+        .args(["protected", "capture"])
+        .arg("--manifest")
+        .arg(manifest_dir.path())
+        .arg("--store")
+        .arg(&store)
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&stderr).expect("must emit JSON envelope");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["code"], "manifest_read_error");
+    let msg = json["error"]["detail"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        msg.contains("not a regular file"),
+        "message must mention 'not a regular file': {msg}"
+    );
+}

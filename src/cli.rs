@@ -9250,24 +9250,51 @@ fn protected_capture_cmd(
 
     // Read manifest — emit JSON envelope on failure so automation can distinguish
     // manifest errors from other stderr output.
+    //
+    // Emits the `manifest_read_error` envelope and exits 1.  Defined as a
+    // closure so the regular-file/size guard and the read error path share one
+    // emission site.
+    let emit_manifest_error = |message: String| -> ! {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "manifest_read_error",
+                "detail": { "message": message }
+            }
+        });
+        eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+        process::exit(1);
+    };
+
+    // Reject non-regular files (FIFOs, devices, symlinks pointing at such) and
+    // bound the size *before* slurping the manifest into memory.  Without this,
+    // a `--manifest` naming `/dev/zero` blocks indefinitely and a huge regular
+    // file exhausts memory before any JSON diagnostic is produced.  Stat with
+    // `symlink_metadata` (no-follow); a stat failure (NotFound/permission)
+    // falls through to the read below, which surfaces the same envelope.
+    if let Ok(meta) = fs::symlink_metadata(manifest_path) {
+        if !meta.file_type().is_file() {
+            emit_manifest_error(format!(
+                "capture manifest at {} is not a regular file",
+                manifest_path.display()
+            ));
+        }
+        if meta.len() > crate::protected::MAX_STORE_FILE_BYTES {
+            emit_manifest_error(format!(
+                "capture manifest at {} is too large ({} B > {} B)",
+                manifest_path.display(),
+                meta.len(),
+                crate::protected::MAX_STORE_FILE_BYTES
+            ));
+        }
+    }
+
     let manifest_content = match fs::read_to_string(manifest_path) {
         Ok(c) => c,
-        Err(e) => {
-            let envelope = serde_json::json!({
-                "ok": false,
-                "error": {
-                    "code": "manifest_read_error",
-                    "detail": {
-                        "message": format!(
-                            "failed to read capture manifest at {}: {e}",
-                            manifest_path.display()
-                        )
-                    }
-                }
-            });
-            eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
-            process::exit(1);
-        }
+        Err(e) => emit_manifest_error(format!(
+            "failed to read capture manifest at {}: {e}",
+            manifest_path.display()
+        )),
     };
     let mut entries: Vec<CaptureEntry> = Vec::new();
     for (i, line) in manifest_content.lines().enumerate() {
