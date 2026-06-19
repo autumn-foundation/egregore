@@ -373,6 +373,29 @@ fn is_valid_blake3_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Returns `true` when every field a legitimate capture sets is well-formed and
+/// internally consistent.
+///
+/// This is the SAME field validation the `get` path applies to a resolved
+/// record (handle recomputes from its own identity fields, schema is v1,
+/// `content_hash` is a real BLAKE3 hex, `producer_id` is non-empty, `captured_at`
+/// parses as RFC 3339).  Applying it before a record may authorize its producer
+/// or exempt its blob from rollback closes a gap where a recovered/tampered
+/// manifest could carry a *synthetic* record — e.g. a non-BLAKE3 `content_hash`
+/// that still recomputes its handle — which could never resolve to a real blob
+/// yet would otherwise grant its `producer_id` global retrieval authorization.
+fn record_is_self_consistent(h: &ProtectedHandle) -> bool {
+    h.schema_version == PROTECTED_SCHEMA_VERSION
+        && !h.producer_id.trim().is_empty()
+        && is_valid_blake3_hex(&h.content_hash)
+        && ProtectedHandle::compute_handle(
+            &h.source_class,
+            &h.content_hash,
+            h.source_path.as_deref(),
+        ) == h.handle
+        && chrono::DateTime::parse_from_rfc3339(&h.captured_at).is_ok()
+}
+
 // ── Filesystem helpers with private permissions ────────────────────────────────
 
 /// Creates a directory (and all parents) with owner-only permissions.
@@ -918,23 +941,27 @@ impl ProtectedStore {
 
     /// Writes the manifest as canonical-sorted JSONL.
     ///
-    /// When two records share the same handle but differ on metadata outside
-    /// the handle identity (e.g. `captured_at`, `producer_id`), the first
-    /// record in `handles` wins (first-capture-wins contract).  Byte-identical
-    /// deduplication alone would leave both records if they differed on any
-    /// such field.
+    /// A canonical manifest carries at most ONE record per handle.
+    /// `write_manifest` is the only writer and never intends to emit a
+    /// duplicate (the capture path purges duplicate-handle records and first-
+    /// capture-wins for `captured_at` is enforced by the recapture short-circuit,
+    /// not here).  So if `handles` still contains MORE THAN ONE record for a
+    /// handle, that input is corrupt (a recovered/tampered manifest passed
+    /// through): every copy of that handle is DROPPED rather than collapsed
+    /// first-wins.  A first-wins collapse could otherwise promote a prepended
+    /// rogue duplicate to the single canonical, authorizing record.  This matches
+    /// [`Self::canonical_valid_records`], which authorizes nothing for a
+    /// duplicated handle.
     fn write_manifest(&self, handles: &[ProtectedHandle]) -> io::Result<()> {
         let dir = &self.root;
         create_private_dir(dir)?;
-        // Collapse by handle: insert-order preserves first-capture-wins because
-        // callers build `handles` with existing manifest records first.
-        let mut by_handle: std::collections::BTreeMap<&str, &ProtectedHandle> =
-            std::collections::BTreeMap::new();
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for h in handles {
-            by_handle.entry(h.handle.as_str()).or_insert(h);
+            *counts.entry(h.handle.as_str()).or_insert(0) += 1;
         }
-        let mut lines: Vec<String> = by_handle
-            .values()
+        let mut lines: Vec<String> = handles
+            .iter()
+            .filter(|h| counts.get(h.handle.as_str()) == Some(&1))
             .map(|h| serde_json::to_string(h).expect("ProtectedHandle serialisation is infallible"))
             .collect();
         lines.sort_unstable();
@@ -946,14 +973,17 @@ impl ProtectedStore {
     /// The CANONICAL, valid records of `manifest`.
     ///
     /// A record is canonical and valid iff (a) its handle appears EXACTLY ONCE in
-    /// the manifest and (b) it is internally consistent — the stored handle
-    /// recomputes from its own identity fields, the schema is v1, and the
-    /// producer is non-empty.
+    /// the manifest and (b) it is fully self-consistent — see
+    /// [`record_is_self_consistent`] (handle recomputes from its identity fields,
+    /// schema is v1, `content_hash` is a real BLAKE3 hex, `producer_id` is
+    /// non-empty, and `captured_at` parses as RFC 3339).
     ///
     /// `write_manifest` never emits duplicate handles, so a manifest containing
     /// a duplicate handle (recovered or tampered) is non-canonical and that
     /// handle authorizes/exempts NOTHING — independent of line order, so a rogue
     /// producer cannot win merely by prepending or appending a duplicate line.
+    /// Full field validation likewise blocks a synthetic authorizing record that
+    /// recomputes its handle but could never resolve to a real blob.
     fn canonical_valid_records(manifest: &[ProtectedHandle]) -> Vec<&ProtectedHandle> {
         let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for h in manifest {
@@ -961,16 +991,7 @@ impl ProtectedStore {
         }
         manifest
             .iter()
-            .filter(|h| {
-                counts.get(h.handle.as_str()) == Some(&1)
-                    && ProtectedHandle::compute_handle(
-                        &h.source_class,
-                        &h.content_hash,
-                        h.source_path.as_deref(),
-                    ) == h.handle
-                    && h.schema_version == PROTECTED_SCHEMA_VERSION
-                    && !h.producer_id.trim().is_empty()
-            })
+            .filter(|h| counts.get(h.handle.as_str()) == Some(&1) && record_is_self_consistent(h))
             .collect()
     }
 
@@ -1095,6 +1116,29 @@ impl ProtectedStore {
                 .iter()
                 .map(|h| h.content_hash.clone())
                 .collect();
+
+        // Purge corrupt duplicate-handle records up front.  `write_manifest`
+        // never emits a duplicate handle, so any handle appearing more than once
+        // in the on-disk manifest is the result of recovery or tampering.
+        // `canonical_valid_records` already treats such a handle as authorizing
+        // and exempting NOTHING; dropping every copy here makes the next commit
+        // rewrite the manifest into canonical single-record-per-handle form
+        // rather than (a) leaving the duplicates so a later first-wins collapse
+        // could promote a prepended rogue line to the sole authorizing record,
+        // or (b) silently reporting `already_captured` without repairing when the
+        // blob is still valid and the recaptured handle is one of the duplicates.
+        if enabled {
+            let mut counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for h in &existing {
+                *counts.entry(h.handle.clone()).or_insert(0) += 1;
+            }
+            if counts.values().any(|&n| n > 1) {
+                existing.retain(|h| counts.get(&h.handle) == Some(&1));
+                // Force a canonical rewrite even if every entry below is a no-op.
+                mutated = true;
+            }
+        }
 
         // Rolls back blobs newly written by this capture if any later step (a
         // subsequent blob write, the manifest commit, or the ACL preflight)
@@ -2173,31 +2217,49 @@ mod tests {
     fn get_rejects_content_hash_path_traversal() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
+        // A separate valid record keeps op-1 authorized after the other record's
+        // content_hash is tampered — so the get reaches the path-traversal guard
+        // in the resolve path rather than being stopped at the auth check.
+        seed_producer(&store, dir.path(), "op-1");
         let src = dir.path().join("payload.txt");
         fs::write(&src, b"path traversal test").unwrap();
         let entries = vec![CaptureEntry {
             class: "patch".to_owned(),
             source_path: src.to_string_lossy().into_owned(),
         }];
-        store
+        let target_handle = store
             .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
-            .unwrap();
+            .unwrap()
+            .entries[0]
+            .handle
+            .clone();
 
-        // Tamper: set content_hash to a path-traversal string and compute a
-        // matching handle so the integrity check passes.
+        // Tamper ONLY the payload.txt record: set content_hash to a path-traversal
+        // string and recompute its handle so the integrity check would pass.  The
+        // separate seed record is preserved so op-1 stays authorized.
         let manifest_path = dir.path().join("manifest.jsonl");
         let content = fs::read_to_string(&manifest_path).unwrap();
-        let mut rec: serde_json::Value = serde_json::from_str(content.trim()).expect("parse");
         let traversal_hash =
             "../../../etc/passwd/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        rec["content_hash"] = serde_json::json!(traversal_hash);
-        // Re-compute handle so integrity check passes.
-        let class: crate::protected::ProtectedPayloadClass =
-            serde_json::from_value(rec["source_class"].clone()).unwrap();
-        let new_handle =
-            ProtectedHandle::compute_handle(&class, traversal_hash, rec["source_path"].as_str());
-        rec["handle"] = serde_json::json!(&new_handle);
-        fs::write(&manifest_path, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
+        let mut new_handle = String::new();
+        let mut lines: Vec<String> = Vec::new();
+        for line in content.lines() {
+            let mut rec: serde_json::Value = serde_json::from_str(line).expect("parse");
+            if rec["handle"].as_str() == Some(target_handle.as_str()) {
+                rec["content_hash"] = serde_json::json!(traversal_hash);
+                let class: crate::protected::ProtectedPayloadClass =
+                    serde_json::from_value(rec["source_class"].clone()).unwrap();
+                new_handle = ProtectedHandle::compute_handle(
+                    &class,
+                    traversal_hash,
+                    rec["source_path"].as_str(),
+                );
+                rec["handle"] = serde_json::json!(&new_handle);
+            }
+            lines.push(serde_json::to_string(&rec).unwrap());
+        }
+        fs::write(&manifest_path, lines.join("\n") + "\n").unwrap();
+        assert!(!new_handle.is_empty(), "target record must be present");
 
         let err = store.get(&new_handle, "op-1").unwrap_err();
         assert_eq!(
@@ -3876,6 +3938,162 @@ mod tests {
         assert!(
             store.get(&handle, "op-1").is_ok(),
             "op-1 can still resolve the duplicated handle's payload"
+        );
+    }
+
+    // ── Unit: synthetic authorizing record is rejected (round 26 #970) ────────
+
+    #[test]
+    fn synthetic_record_with_bogus_content_hash_does_not_authorize() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        // A legitimate payload owned by op-real.
+        let real_handle = seed_producer(&store, dir.path(), "op-real");
+
+        // Craft a SYNTHETIC record whose handle recomputes from its own identity
+        // fields (so it passes the recompute check) but whose `content_hash` is
+        // NOT a valid BLAKE3 hex — it could never resolve to a real blob. Append
+        // it for a rogue producer.  Because authorization is global, accepting it
+        // would let `rogue` read the unrelated, legitimate `real_handle` payload.
+        let bogus_hash = "not-a-real-blake3-content-hash";
+        let synth_handle = ProtectedHandle::compute_handle(
+            &ProtectedPayloadClass::Report,
+            bogus_hash,
+            Some("synthetic"),
+        );
+        let synth = ProtectedHandle {
+            handle: synth_handle,
+            schema_version: PROTECTED_SCHEMA_VERSION,
+            source_class: ProtectedPayloadClass::Report,
+            source_path: Some("synthetic".to_owned()),
+            content_hash: bogus_hash.to_owned(),
+            byte_len: 0,
+            captured_at: fixed_ts().to_owned(),
+            producer_id: "rogue".to_owned(),
+            producer_version: "0.1.0".to_owned(),
+        };
+        let manifest_path = dir.path().join("manifest.jsonl");
+        let content = fs::read_to_string(&manifest_path).unwrap();
+        fs::write(
+            &manifest_path,
+            format!("{content}{}\n", serde_json::to_string(&synth).unwrap()),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                store.get(&real_handle, "rogue"),
+                Err(GetError::Unauthorized { .. })
+            ),
+            "a synthetic record with a non-BLAKE3 content_hash must not authorize"
+        );
+        assert!(
+            store.get(&real_handle, "op-real").is_ok(),
+            "the legitimate owner stays authorized"
+        );
+    }
+
+    // ── Unit: unrelated capture cannot promote a prepended rogue (round 26 #934)
+
+    #[test]
+    fn unrelated_capture_does_not_promote_prepended_rogue_duplicate() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let handle = seed_producer(&store, dir.path(), "op-1");
+
+        // PREPEND a rogue duplicate of the handle (different producer).  While the
+        // duplicate stands, the handle authorizes nobody; the risk is a later
+        // manifest rewrite collapsing first-wins and leaving the rogue canonical.
+        let manifest_path = dir.path().join("manifest.jsonl");
+        let content = fs::read_to_string(&manifest_path).unwrap();
+        let line = content
+            .lines()
+            .find(|l| l.contains(handle.as_str()))
+            .expect("record line");
+        let mut rogue: ProtectedHandle = serde_json::from_str(line).unwrap();
+        rogue.producer_id = "rogue".to_owned();
+        fs::write(
+            &manifest_path,
+            format!("{}\n{content}", serde_json::to_string(&rogue).unwrap()),
+        )
+        .unwrap();
+
+        // An UNRELATED successful capture by op-1 (a different payload) rewrites
+        // the manifest.  The up-front duplicate purge must drop BOTH copies of the
+        // prepended handle so the rogue is never promoted to a canonical record.
+        let other = dir.path().join("other.txt");
+        fs::write(&other, b"unrelated payload").unwrap();
+        store
+            .capture(
+                &[CaptureEntry {
+                    class: "report".to_owned(),
+                    source_path: other.to_string_lossy().into_owned(),
+                }],
+                "op-1",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap();
+
+        assert!(
+            matches!(
+                store.get(&handle, "rogue"),
+                Err(GetError::Unauthorized { .. })
+            ),
+            "a prepended rogue duplicate must not survive a later manifest rewrite"
+        );
+        assert!(
+            matches!(
+                store.get(&handle, "op-1"),
+                Err(GetError::PayloadNotFound { .. })
+            ),
+            "the corrupt duplicated handle is purged, not silently kept"
+        );
+    }
+
+    // ── Unit: recapture repairs a duplicated manifest record (round 26 #1273) ─
+
+    #[test]
+    fn recapture_repairs_duplicate_manifest_records() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let handle = seed_producer(&store, dir.path(), "op-1");
+
+        // Duplicate the handle's record (blob stays valid).  A duplicated handle
+        // authorizes nobody, so even the legitimate owner is locked out.
+        let manifest_path = dir.path().join("manifest.jsonl");
+        let content = fs::read_to_string(&manifest_path).unwrap();
+        let line = content
+            .lines()
+            .find(|l| l.contains(handle.as_str()))
+            .expect("record line")
+            .to_owned();
+        fs::write(&manifest_path, format!("{content}{line}\n")).unwrap();
+        assert!(
+            matches!(
+                store.get(&handle, "op-1"),
+                Err(GetError::Unauthorized { .. })
+            ),
+            "a duplicated handle locks out even the legitimate owner"
+        );
+
+        // Recapture the SAME source.  The blob is still valid, so without the
+        // repair this would report already_captured and leave the duplicates in
+        // place.  The up-front purge forces a canonical rewrite that restores a
+        // single record and the owner's authorization.
+        let repaired = seed_producer(&store, dir.path(), "op-1");
+        assert_eq!(repaired, handle, "recapture yields the same stable handle");
+
+        let handles = store.list().unwrap();
+        assert_eq!(
+            handles.iter().filter(|h| h.handle == handle).count(),
+            1,
+            "the duplicate is repaired to a single canonical record"
+        );
+        assert!(
+            store.get(&handle, "op-1").is_ok(),
+            "the owner's authorization is restored after the repair"
         );
     }
 
