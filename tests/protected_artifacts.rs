@@ -1295,3 +1295,52 @@ fn get_out_replaces_existing_file_on_success() {
     );
     assert!(!after.is_empty(), "destination must contain the payload");
 }
+
+// ── Get: a failed-verification --out get creates nothing and leaves no temp ────
+
+/// When the blob is tampered so verification fails, `eg protected get --out`
+/// must not create the destination file and must not leave a staging temp.
+#[test]
+fn failed_verification_get_creates_no_out_file_and_no_temp() {
+    let (_guard, store) = tmp_store();
+    let json = run_capture_enabled(&store, "op-1");
+    let handle = json["entries"][0]["handle"]
+        .as_str()
+        .expect("handle")
+        .to_owned();
+    let content_hash = json["entries"][0]["content_hash"]
+        .as_str()
+        .expect("content_hash")
+        .to_owned();
+
+    // Corrupt the blob (wrong size triggers the fd size guard before any emit).
+    fs::write(store.join("blobs").join(&content_hash), b"corrupt").unwrap();
+
+    let out_dir = tempfile::tempdir().expect("out dir");
+    let out_file = out_dir.path().join("new.bin"); // does not exist yet
+
+    eg().args(["protected", "get"])
+        .arg(&handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .arg("--out")
+        .arg(&out_file)
+        .assert()
+        .failure();
+
+    assert!(
+        !out_file.exists(),
+        "no --out file may be created when verification fails"
+    );
+    let leftover: Vec<PathBuf> = fs::read_dir(out_dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "no staging temp may be left behind, found: {leftover:?}"
+    );
+}

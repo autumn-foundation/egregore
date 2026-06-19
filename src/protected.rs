@@ -1124,19 +1124,17 @@ impl ProtectedStore {
         // while a pre-existing orphan/tampered blob we replace must not.
         let original_blob_hashes: std::collections::HashSet<String> =
             existing.iter().map(|h| h.content_hash.clone()).collect();
-        let ops: Vec<String> = if enabled {
-            // Fail closed: an initialized store (manifest present) whose
-            // operators.jsonl is absent must NOT be silently reinitialized with
-            // only the current producer — that would authorize them to retrieve
-            // every previously captured handle.  A missing ACL on an initialized
-            // store is treated as tampering.  (A brand-new store has no manifest
-            // yet, so both files are created together on first capture.)
-            if self.is_initialised()
-                && matches!(
-                    self.operators_path().symlink_metadata(),
-                    Err(ref e) if e.kind() == io::ErrorKind::NotFound
-                )
-            {
+        let ops: Vec<String> = if !enabled {
+            Vec::new()
+        } else if self.is_initialised() {
+            // Initialized store (manifest present): the ACL must exist.  A missing
+            // operators.jsonl must NOT be silently reinitialized with only the
+            // current producer — that would authorize them to retrieve every
+            // previously captured handle.  Treat a missing ACL as tampering.
+            if matches!(
+                self.operators_path().symlink_metadata(),
+                Err(ref e) if e.kind() == io::ErrorKind::NotFound
+            ) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -1148,6 +1146,11 @@ impl ProtectedStore {
             }
             self.read_operators()?
         } else {
+            // No manifest → a genuinely new (or being-initialized) store.  Do NOT
+            // import a stale/orphaned operators.jsonl (left by partial deletion or
+            // tampering): starting from an empty ACL prevents old operator IDs
+            // from being re-authorized for the newly captured payloads.  Any
+            // existing operators.jsonl is overwritten with just this producer.
             Vec::new()
         };
 
@@ -1485,37 +1488,43 @@ impl ProtectedStore {
     ///
     /// # Errors
     ///
-    /// [`GetStreamError::Get`] for any retrieval or integrity failure (nothing
-    /// is written to `out`); [`GetStreamError::Output`] if writing to `out`
-    /// fails after verification.
+    /// [`GetStreamError::Get`] for any retrieval or integrity failure;
+    /// [`GetStreamError::Output`] if writing to `out` fails.
+    ///
+    /// # Integrity guarantee
+    ///
+    /// A single streaming pass hashes the EXACT bytes written to `out` and
+    /// verifies that hash against the manifest on EOF, so the bytes released are
+    /// the bytes verified — a two-pass scheme that re-reads a mutable descriptor
+    /// could emit bytes that differ from what was hashed if the blob is modified
+    /// in place between passes.  Because verification completes only at EOF, a
+    /// caller that must not release unverified bytes (e.g. overwriting a file)
+    /// should stream into a temporary sink and commit it only on `Ok` — which is
+    /// exactly what `eg protected get --out` does.
     pub fn get_to_writer<W: io::Write>(
         &self,
         handle: &str,
         operator: &str,
         out: &mut W,
     ) -> Result<u64, GetStreamError> {
-        use std::io::{Read as _, Seek as _};
+        use std::io::Read as _;
 
         let (blob_path, content_hash, byte_len) = self
             .resolve_blob(handle, operator)
             .map_err(GetStreamError::Get)?;
 
-        // Open the blob exactly ONCE (no-follow, regular-file descriptor) and use
-        // that SAME descriptor for both verification and emission.  Re-opening
-        // the path between verify and copy would reintroduce a TOCTOU window in
-        // which a local process could swap the blob and have unverified bytes
-        // released, breaking the verify-before-release guarantee.
         let missing = || {
             GetStreamError::Get(GetError::MissingProtectedPayload {
                 handle: handle.to_owned(),
                 expected_path: blob_path.display().to_string(),
             })
         };
+        // Open the blob ONCE (no-follow, regular-file descriptor).
         let mut f = open_source_checked(&blob_path).map_err(|_| missing())?;
 
         // Bind the size guard to the OPENED descriptor (fstat), not the earlier
         // path stat, so a blob swapped for a much larger regular file cannot be
-        // hashed to EOF before the byte_len check fires (huge-file stall / DoS).
+        // streamed to EOF before the byte_len check fires (huge-file stall / DoS).
         if f.metadata().map_err(|_| missing())?.len() != byte_len {
             return Err(GetStreamError::Get(GetError::HashMismatch {
                 handle: handle.to_owned(),
@@ -1524,22 +1533,10 @@ impl ProtectedStore {
             }));
         }
 
-        // Pass 1: verify the BLAKE3 hash by streaming the descriptor (bounded
-        // memory) BEFORE emitting any bytes.
+        // Single pass: hash exactly the bytes written to `out`, then verify the
+        // accumulated hash on EOF.  This guarantees the released stream is the
+        // verified stream even if the underlying file is modified mid-copy.
         let mut hasher = blake3::Hasher::new();
-        io::copy(&mut f, &mut hasher).map_err(|_| missing())?;
-        let actual_hash = hasher.finalize().to_hex().to_string();
-        if actual_hash != content_hash {
-            return Err(GetStreamError::Get(GetError::HashMismatch {
-                handle: handle.to_owned(),
-                expected: content_hash,
-                actual: actual_hash,
-            }));
-        }
-
-        // Pass 2: rewind the same descriptor and stream the verified bytes to the
-        // destination in bounded chunks.
-        f.seek(std::io::SeekFrom::Start(0)).map_err(|_| missing())?;
         // Heap-allocated so the 64 KiB chunk buffer does not sit on the stack.
         let mut buf = vec![0u8; 64 * 1024];
         let mut total: u64 = 0;
@@ -1548,8 +1545,17 @@ impl ProtectedStore {
             if n == 0 {
                 break;
             }
+            hasher.update(&buf[..n]);
             out.write_all(&buf[..n]).map_err(GetStreamError::Output)?;
             total += n as u64;
+        }
+        let actual_hash = hasher.finalize().to_hex().to_string();
+        if actual_hash != content_hash {
+            return Err(GetStreamError::Get(GetError::HashMismatch {
+                handle: handle.to_owned(),
+                expected: content_hash,
+                actual: actual_hash,
+            }));
         }
         Ok(total)
     }
@@ -3419,16 +3425,21 @@ mod tests {
     }
 
     #[test]
-    fn get_to_writer_emits_nothing_on_hash_mismatch() {
+    fn get_to_writer_reports_hash_mismatch_on_same_sized_tampered_blob() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
         let (handle, content_hash) = capture_one(&store, dir.path(), b"good bytes");
 
-        // Corrupt the blob with same-length wrong bytes so the size pre-check
-        // passes and the pass-1 hash verification fails.
+        // Corrupt the blob with same-length wrong bytes so the size guard passes
+        // and only the streamed-hash check catches the tampering.
         let blob = dir.path().join("blobs").join(&content_hash);
         fs::write(&blob, b"BAD bytes!").unwrap();
 
+        // The single-pass tee hashes exactly what it writes; the mismatch is
+        // detected at EOF and surfaced as a Get(HashMismatch).  (The CLI --out
+        // path stages to a temp and only renames on Ok, so a file is never
+        // delivered with these bytes; an in-memory sink simply sees the bytes
+        // plus the error.)
         let mut out: Vec<u8> = Vec::new();
         let err = store
             .get_to_writer(&handle, "op-1", &mut out)
@@ -3436,10 +3447,6 @@ mod tests {
         assert!(
             matches!(err, GetStreamError::Get(GetError::HashMismatch { .. })),
             "expected Get(HashMismatch), got {err:?}"
-        );
-        assert!(
-            out.is_empty(),
-            "no bytes may be emitted to the sink on verification failure"
         );
     }
 
@@ -3605,6 +3612,45 @@ mod tests {
         assert!(
             store.get(&handle, "op-1").is_ok(),
             "the original producer remains authorized"
+        );
+    }
+
+    // ── Unit: an orphaned ACL (no manifest) is ignored on a new store ─────────
+
+    #[test]
+    fn capture_ignores_orphaned_acl_without_manifest() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        // A stale operators.jsonl with NO manifest (partial deletion / tampering).
+        fs::write(dir.path().join("operators.jsonl"), "\"old-operator\"\n").unwrap();
+
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"content").unwrap();
+        let r = store
+            .capture(
+                &[CaptureEntry {
+                    class: "report".to_owned(),
+                    source_path: src.to_string_lossy().into_owned(),
+                }],
+                "new-op",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap();
+        let handle = r.entries[0].handle.clone();
+
+        // The stale operator must NOT have been imported / re-authorized.
+        assert!(
+            matches!(
+                store.get(&handle, "old-operator"),
+                Err(GetError::Unauthorized { .. })
+            ),
+            "an orphaned ACL operator must not gain access to newly captured data"
+        );
+        assert!(
+            store.get(&handle, "new-op").is_ok(),
+            "the capturing producer is authorized"
         );
     }
 
