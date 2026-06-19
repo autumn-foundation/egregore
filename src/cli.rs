@@ -9152,10 +9152,22 @@ fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Pa
         .tempfile_in(&stage_dir)
     {
         Ok(t) => t,
-        Err(e) => exit_output_error(
-            err_code,
-            format!("failed to stage bytes for {dest_label}: {e}"),
-        ),
+        Err(create_err) => {
+            // The destination staging directory is unusable (e.g. `--out` has a
+            // missing/unwritable parent).  Surface the RETRIEVAL diagnostic
+            // first — verify into a discard sink — so a store/auth/malformed
+            // handle is reported as such rather than masked by an output error.
+            let mut sink = std::io::sink();
+            match ps.get_to_writer(handle, operator, &mut sink) {
+                Err(GetStreamError::Get(e)) => exit_get_error(e),
+                // Retrieval succeeded (sink writes never fail), so the failure is
+                // genuinely the destination.
+                _ => exit_output_error(
+                    err_code,
+                    format!("failed to stage bytes for {dest_label}: {create_err}"),
+                ),
+            }
+        }
     };
 
     let write_result = ps.get_to_writer(handle, operator, tmp.as_file_mut());

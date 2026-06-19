@@ -346,17 +346,19 @@ impl GetError {
     }
 }
 
-/// Error from [`ProtectedStore::get_to_writer`], separating a retrieval or
+/// Error from [`ProtectedStore::get_streaming`], separating a retrieval or
 /// integrity failure from a failure writing the verified bytes to the sink.
 ///
-/// The distinction lets the CLI emit a `get`-style diagnostic envelope for a
-/// retrieval failure but an `output_write_error` envelope when the destination
-/// (a `--out` file or stdout) cannot be written.
+/// The distinction lets a caller surface a `get`-style diagnostic for a
+/// retrieval failure but an output/destination error when the sink cannot be
+/// written.
 #[derive(Debug)]
-pub(crate) enum GetStreamError {
-    /// Retrieval or integrity verification failed.
+pub enum GetStreamError {
+    /// Retrieval or integrity verification failed; nothing was written to the
+    /// sink.
     Get(GetError),
-    /// Writing the verified bytes to the destination sink failed.
+    /// Writing the verified bytes to the destination sink failed (or staging the
+    /// verified snapshot failed).
     Output(io::Error),
 }
 
@@ -941,18 +943,52 @@ impl ProtectedStore {
         write_private_file(&self.manifest_path(), content.as_bytes())
     }
 
-    /// Returns `true` when `operator` is the producer of at least one committed
-    /// record in `manifest`.
+    /// The set of producers authorized by `manifest`, derived from its
+    /// CANONICAL, validated records.
+    ///
+    /// Records are de-duplicated by handle (first-wins, matching
+    /// [`Self::write_manifest`]) and limited to internally-consistent records
+    /// (the stored handle recomputes from its own identity fields, the schema is
+    /// v1, and the producer is non-empty).  A recovered or tampered manifest
+    /// with a duplicate handle line carrying a DIFFERENT producer therefore
+    /// cannot authorize that producer: the later duplicate is discarded exactly
+    /// as `write_manifest` would discard it, and an internally-inconsistent line
+    /// never authorizes.
+    fn canonical_producers(manifest: &[ProtectedHandle]) -> std::collections::HashSet<String> {
+        let mut seen_handles = std::collections::HashSet::new();
+        let mut producers = std::collections::HashSet::new();
+        for h in manifest {
+            if !seen_handles.insert(h.handle.as_str()) {
+                continue; // first-wins per handle
+            }
+            let recomputed = ProtectedHandle::compute_handle(
+                &h.source_class,
+                &h.content_hash,
+                h.source_path.as_deref(),
+            );
+            if recomputed == h.handle
+                && h.schema_version == PROTECTED_SCHEMA_VERSION
+                && !h.producer_id.trim().is_empty()
+            {
+                producers.insert(h.producer_id.clone());
+            }
+        }
+        producers
+    }
+
+    /// Returns `true` when `operator` is a canonical, validated producer of
+    /// `manifest`.
     ///
     /// The manifest is the SINGLE source of truth for authorization: a producer
-    /// is authorized iff it has a durably captured handle.  This is crash-safe
+    /// is authorized iff it has a durably captured handle that survives
+    /// canonicalization (see [`Self::canonical_producers`]).  This is crash-safe
     /// with the manifest write (one atomic rename commits both the handle and
     /// the authorization) and removes the separate `operators.jsonl` ACL file
     /// along with its missing/empty/orphaned/desync failure modes.  An empty
     /// `operator` is never authorized (producer IDs are non-empty by capture
     /// validation), so `get("", "")` is rejected.
     fn is_authorized(manifest: &[ProtectedHandle], operator: &str) -> bool {
-        !operator.is_empty() && manifest.iter().any(|h| h.producer_id == operator)
+        !operator.is_empty() && Self::canonical_producers(manifest).contains(operator)
     }
 
     // ── Public API ─────────────────────────────────────────────────────────────
@@ -1318,23 +1354,25 @@ impl ProtectedStore {
             });
         }
 
-        // A pure no-op capture (every entry reused an already-valid payload, so
-        // `mutated` is false) writes no new manifest record for this producer.
-        // Authorization is manifest-derived, so the producer is authorized only
-        // if it already produced a committed record; otherwise it cannot retrieve
-        // the returned handles, and reporting them as `stored: true` would hand it
-        // handles that `get` immediately rejects as `unauthorized`.  Report those
-        // as not stored with an `already_captured` diagnostic and reset
-        // `stored_count`.  (An already-producing producer re-capturing its own
-        // payload CAN retrieve the handles, so its no-op entries stay stored.)
-        if enabled && !mutated && !Self::is_authorized(&existing, producer_id) {
+        // Authorization is manifest-derived: the producer can retrieve the
+        // returned handles only if it is a producer of the manifest being
+        // written (`existing`).  A capture that registers a NEW record for the
+        // producer authorizes it; one that only reuses (no-op) or REPAIRS
+        // existing handles adds no record for the producer, so a *different*
+        // producer is left unauthorized even though `mutated` may be true (a
+        // repair).  Reporting such entries as `stored: true` would hand the
+        // producer handles that `get` immediately rejects as `unauthorized`, so
+        // report them as not stored with an `already_captured` diagnostic and
+        // reset `stored_count`.  (Repairs still persist for the legitimate owner;
+        // see the manifest commit below.)
+        if enabled && !Self::is_authorized(&existing, producer_id) {
             for outcome in &mut outcomes {
                 if outcome.stored {
                     outcome.stored = false;
                     outcome.diagnostic = Some(EntryDiagnostic {
                         code: "already_captured".to_owned(),
-                        message: "payload already present and valid; nothing was stored \
-                                  and this producer is not authorized"
+                        message: "payload already present for an existing handle; this \
+                                  producer registered no new record and is not authorized"
                             .to_owned(),
                     });
                 }
@@ -1468,6 +1506,51 @@ impl ProtectedStore {
         Ok(total)
     }
 
+    /// Streams the VERIFIED payload for `handle` to `out`, without buffering the
+    /// whole payload in memory and without releasing any unverified bytes.
+    ///
+    /// The public, streaming counterpart to [`Self::get`] (which buffers the
+    /// payload in a `Vec`): the bytes are staged into a private, anonymous temp
+    /// file and the BLAKE3 hash is verified against the manifest BEFORE any byte
+    /// is written to `out`.  On a retrieval or integrity failure
+    /// ([`GetStreamError::Get`]) nothing is written to `out`, so this is safe for
+    /// large payloads and externally visible sinks (files, sockets, response
+    /// bodies).  Returns the number of bytes written.
+    ///
+    /// # Errors
+    ///
+    /// [`GetStreamError::Get`] for any retrieval or integrity failure;
+    /// [`GetStreamError::Output`] if staging the verified snapshot or writing to
+    /// `out` fails.
+    pub fn get_streaming<W: io::Write>(
+        &self,
+        handle: &str,
+        operator: &str,
+        out: &mut W,
+    ) -> Result<u64, GetStreamError> {
+        use std::io::{Read as _, Seek as _};
+
+        // Stage to a private, anonymous temp (unlinked on Unix — no path to
+        // swap).  `get_to_writer` writes into it and verifies on EOF; on failure
+        // it returns `Get(..)` and `out` is never touched.
+        let mut staged = tempfile::tempfile().map_err(GetStreamError::Output)?;
+        self.get_to_writer(handle, operator, &mut staged)?;
+
+        // Verified: stream the staged snapshot to the caller's sink.
+        staged.rewind().map_err(GetStreamError::Output)?;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = staged.read(&mut buf).map_err(GetStreamError::Output)?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).map_err(GetStreamError::Output)?;
+            total += n as u64;
+        }
+        Ok(total)
+    }
+
     /// Resolves and validates the content-addressed blob path for `handle` after
     /// authorizing `operator`.  Returns the verified-safe blob path and its
     /// expected content hash; the caller reads and hash-verifies the bytes.
@@ -1488,34 +1571,35 @@ impl ProtectedStore {
             return Err(GetError::RawArtifactModeDisabled);
         }
 
-        // 2. Read the manifest (the single source of truth for both
-        // authorization and lookup).  A read failure is store corruption.
-        let manifest = self
-            .read_manifest()
-            .map_err(|_| GetError::CorruptManifestRecord {
-                handle: handle.to_owned(),
-            })?;
-
-        // 3. Auth check (manifest-derived): `operator` must be the producer of
-        // at least one committed record.  Checked before any handle existence
-        // disclosure.
-        if !Self::is_authorized(&manifest, operator) {
-            return Err(GetError::Unauthorized {
-                operator: operator.to_owned(),
-            });
-        }
-
-        // 4. Handle format check.
-        // A valid handle is `protected:v1:` + exactly 64 lowercase hex chars.
-        // A prefixed-but-malformed value (e.g. `protected:v1:abc`) must be
-        // rejected as MalformedHandle rather than falling through to a
-        // PayloadNotFound (exit 2) which misclassifies bad caller input.
+        // 2. Handle format check FIRST, so a malformed handle (which may be a
+        // secret accidentally passed in the handle position) is rejected as
+        // `MalformedHandle` — whose value is never echoed — before any error
+        // that DOES echo the handle (e.g. `CorruptManifestRecord` below) can be
+        // constructed.  A valid handle is `protected:v1:` + exactly 64 lowercase
+        // hex chars, so once validated it is not a secret.
         let suffix_valid = handle
             .strip_prefix(PROTECTED_HANDLE_PREFIX)
             .is_some_and(is_valid_blake3_hex);
         if !suffix_valid {
             return Err(GetError::MalformedHandle {
                 handle: handle.to_owned(),
+            });
+        }
+
+        // 3. Read the manifest (the single source of truth for both
+        // authorization and lookup).  A read failure is store corruption; the
+        // handle echoed here has been validated above, so it is not a secret.
+        let manifest = self
+            .read_manifest()
+            .map_err(|_| GetError::CorruptManifestRecord {
+                handle: handle.to_owned(),
+            })?;
+
+        // 4. Auth check (manifest-derived): `operator` must be a canonical
+        // producer.  Checked before any handle existence disclosure.
+        if !Self::is_authorized(&manifest, operator) {
+            return Err(GetError::Unauthorized {
+                operator: operator.to_owned(),
             });
         }
 
@@ -1811,7 +1895,13 @@ mod tests {
         // Seed a store authorizing `op-allowed`; `op-other` is not a producer.
         seed_producer(&store, dir.path(), "op-allowed");
 
-        let err = store.get("protected:v1:abc", "op-other").unwrap_err();
+        // Valid-format handle so the auth check (not the format check) fires.
+        let err = store
+            .get(
+                "protected:v1:0000000000000000000000000000000000000000000000000000000000000000",
+                "op-other",
+            )
+            .unwrap_err();
         assert_eq!(err.code(), "unauthorized");
         // Must not echo operator token in a way that leaks secrets.
         let json = err.to_json();
@@ -1834,8 +1924,12 @@ mod tests {
         let store = ProtectedStore::new(dir.path());
         seed_producer(&store, dir.path(), "op-allowed");
 
+        // Valid-format handle so the auth check (not the format check) fires.
         let err = store
-            .get("protected:v1:abc", "bearer-secret-token")
+            .get(
+                "protected:v1:0000000000000000000000000000000000000000000000000000000000000000",
+                "bearer-secret-token",
+            )
             .unwrap_err();
         assert_eq!(err.code(), "unauthorized");
         let json = err.to_json();
@@ -1850,6 +1944,9 @@ mod tests {
     fn corrupt_manifest_handle_rejected() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
+        // A separate valid record keeps op-1 authorized after the other record
+        // is tampered (authorization is derived from canonical, valid records).
+        let keep = seed_producer(&store, dir.path(), "op-1");
         let src = dir.path().join("payload.txt");
         fs::write(&src, b"hello world").unwrap();
         let entries = vec![CaptureEntry {
@@ -1860,15 +1957,29 @@ mod tests {
             .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
             .unwrap();
 
-        // Tamper with the handle field in manifest.jsonl.
+        // Tamper with the handle field of the NON-seed record in manifest.jsonl.
         let manifest_path = dir.path().join("manifest.jsonl");
         let content = fs::read_to_string(&manifest_path).unwrap();
-        let mut rec: serde_json::Value =
-            serde_json::from_str(content.trim()).expect("manifest must parse");
+        let line = content
+            .lines()
+            .find(|l| !l.is_empty() && !l.contains(keep.as_str()))
+            .expect("non-seed manifest line");
+        let mut rec: serde_json::Value = serde_json::from_str(line).expect("manifest must parse");
         let tampered =
             "protected:v1:0000000000000000000000000000000000000000000000000000000000000000";
         rec["handle"] = serde_json::json!(tampered);
-        fs::write(&manifest_path, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
+        // Keep the valid seed line (so op-1 stays authorized) and add the
+        // tampered record.
+        let seed_line = content
+            .lines()
+            .find(|l| l.contains(keep.as_str()))
+            .expect("seed line")
+            .to_owned();
+        fs::write(
+            &manifest_path,
+            format!("{seed_line}\n{}\n", serde_json::to_string(&rec).unwrap()),
+        )
+        .unwrap();
 
         let err = store.get(tampered, "op-1").unwrap_err();
         assert_eq!(
@@ -2082,6 +2193,9 @@ mod tests {
     fn capture_replaces_corrupt_manifest_record_on_recapture() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
+        // A separate valid record keeps op-1 authorized after the other record
+        // is tampered.
+        let keep = seed_producer(&store, dir.path(), "op-1");
         let src = dir.path().join("payload.txt");
         fs::write(&src, b"real content").unwrap();
         let entries = vec![CaptureEntry {
@@ -2096,14 +2210,27 @@ mod tests {
         let real_hash = report.entries[0].content_hash.clone();
         let handle = report.entries[0].handle.clone();
 
-        // Tamper with the manifest: corrupt content_hash while keeping the handle
-        // field unchanged (so handle != compute_handle(class, fake_hash, path)).
+        // Tamper the non-seed record: corrupt content_hash while keeping the
+        // handle field (so handle != compute_handle(class, fake_hash, path)).
         let manifest_path = dir.path().join("manifest.jsonl");
         let content = fs::read_to_string(&manifest_path).unwrap();
-        let mut rec: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        let seed_line = content
+            .lines()
+            .find(|l| l.contains(keep.as_str()))
+            .expect("seed line")
+            .to_owned();
+        let target_line = content
+            .lines()
+            .find(|l| !l.is_empty() && !l.contains(keep.as_str()))
+            .expect("target line");
+        let mut rec: serde_json::Value = serde_json::from_str(target_line).unwrap();
         let fake_hash = "a".repeat(64);
         rec["content_hash"] = serde_json::json!(&fake_hash);
-        fs::write(&manifest_path, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
+        fs::write(
+            &manifest_path,
+            format!("{seed_line}\n{}\n", serde_json::to_string(&rec).unwrap()),
+        )
+        .unwrap();
 
         // get() must fail now — integrity check catches the tampered record.
         let err = store.get(&handle, "op-1").unwrap_err();
@@ -2121,10 +2248,15 @@ mod tests {
             .expect("get after corrupt-record repair");
         assert_eq!(bytes, b"real content");
 
-        // Manifest must contain only one record for this handle (no duplicates).
+        // Manifest must contain exactly one record for this handle (no
+        // duplicates) plus the seed record.
         let handles = store.list().unwrap();
-        assert_eq!(handles.len(), 1);
-        assert_eq!(handles[0].content_hash, real_hash);
+        assert_eq!(handles.len(), 2, "seed + the repaired record");
+        let repaired = handles
+            .iter()
+            .find(|h| h.handle == handle)
+            .expect("repaired record present");
+        assert_eq!(repaired.content_hash, real_hash);
     }
 
     #[test]
@@ -2963,6 +3095,8 @@ mod tests {
     fn get_rejects_unsupported_schema_version() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
+        // A separate valid record keeps op-1 authorized.
+        let keep = seed_producer(&store, dir.path(), "op-1");
         let src = dir.path().join("payload.txt");
         fs::write(&src, b"data").unwrap();
         let entries = vec![CaptureEntry {
@@ -2974,13 +3108,26 @@ mod tests {
             .unwrap();
         let handle = r.entries[0].handle.clone();
 
-        // Tamper schema_version (not part of the handle identity) to an
-        // unsupported value; get must reject before releasing bytes.
+        // Tamper schema_version (not part of the handle identity) on the
+        // non-seed record; get must reject before releasing bytes.
         let manifest_path = dir.path().join("manifest.jsonl");
-        let mut rec: ProtectedHandle =
-            serde_json::from_str(fs::read_to_string(&manifest_path).unwrap().trim()).unwrap();
+        let content = fs::read_to_string(&manifest_path).unwrap();
+        let seed_line = content
+            .lines()
+            .find(|l| l.contains(keep.as_str()))
+            .expect("seed line")
+            .to_owned();
+        let target_line = content
+            .lines()
+            .find(|l| !l.is_empty() && !l.contains(keep.as_str()))
+            .expect("target line");
+        let mut rec: ProtectedHandle = serde_json::from_str(target_line).unwrap();
         rec.schema_version = 2;
-        fs::write(&manifest_path, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
+        fs::write(
+            &manifest_path,
+            format!("{seed_line}\n{}\n", serde_json::to_string(&rec).unwrap()),
+        )
+        .unwrap();
 
         let err = store.get(&handle, "op-1").unwrap_err();
         assert_eq!(
@@ -3607,6 +3754,150 @@ mod tests {
         assert!(
             !orphan.exists(),
             "a replaced orphan blob must be rolled back on failure"
+        );
+    }
+
+    // ── Unit: public streaming retrieval API (round 24 #2) ────────────────────
+
+    #[test]
+    fn get_streaming_returns_verified_bytes() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let (handle, _) = capture_one(&store, dir.path(), b"streamed via get_streaming");
+
+        let mut out: Vec<u8> = Vec::new();
+        let n = store
+            .get_streaming(&handle, "op-1", &mut out)
+            .expect("get_streaming must succeed");
+        assert_eq!(out, b"streamed via get_streaming");
+        assert_eq!(n, out.len() as u64);
+    }
+
+    #[test]
+    fn get_streaming_writes_nothing_on_tampered_blob() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let (handle, content_hash) = capture_one(&store, dir.path(), b"good bytes!");
+
+        // Same-length wrong bytes: size guard passes, hash check fails.
+        fs::write(dir.path().join("blobs").join(&content_hash), b"BAD bytes!!").unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        let err = store
+            .get_streaming(&handle, "op-1", &mut out)
+            .expect_err("tampered blob must fail");
+        assert!(matches!(
+            err,
+            GetStreamError::Get(GetError::HashMismatch { .. })
+        ));
+        assert!(
+            out.is_empty(),
+            "verify-before-release: nothing may be written to the sink on tamper"
+        );
+    }
+
+    // ── Unit: canonical/validated authorization (round 24 #4) ─────────────────
+
+    #[test]
+    fn duplicate_handle_with_rogue_producer_does_not_authorize() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let handle = seed_producer(&store, dir.path(), "op-1");
+
+        // Append a DUPLICATE line for the same handle with a different producer
+        // (identity fields unchanged, so it is internally valid but a later
+        // duplicate that first-wins de-dup discards).
+        let manifest_path = dir.path().join("manifest.jsonl");
+        let content = fs::read_to_string(&manifest_path).unwrap();
+        let line = content
+            .lines()
+            .find(|l| l.contains(handle.as_str()))
+            .expect("record line");
+        let mut rec: ProtectedHandle = serde_json::from_str(line).unwrap();
+        rec.producer_id = "rogue".to_owned();
+        fs::write(
+            &manifest_path,
+            format!("{content}{}\n", serde_json::to_string(&rec).unwrap()),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                store.get(&handle, "rogue"),
+                Err(GetError::Unauthorized { .. })
+            ),
+            "a later duplicate handle line must not authorize a rogue producer"
+        );
+        assert!(
+            store.get(&handle, "op-1").is_ok(),
+            "the first producer stays authorized"
+        );
+    }
+
+    // ── Unit: repair-only by a new producer reports not-stored (round 24 #5) ──
+
+    #[test]
+    fn repair_only_capture_by_new_producer_reports_not_stored() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("p.txt");
+        fs::write(&src, b"payload data").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+        let r = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        let handle = r.entries[0].handle.clone();
+        let content_hash = r.entries[0].content_hash.clone();
+
+        // Corrupt the blob so the next capture must REPAIR it (mutated = true) but
+        // adds no new manifest record for the new producer.
+        fs::write(
+            dir.path().join("blobs").join(&content_hash),
+            b"corrupted!!!",
+        )
+        .unwrap();
+
+        let rep = store
+            .capture(&entries, "op-2", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        assert!(
+            !rep.entries[0].stored,
+            "repair-only by a new producer must report stored = false"
+        );
+        assert_eq!(
+            rep.entries[0].diagnostic.as_ref().unwrap().code,
+            "already_captured"
+        );
+        assert!(matches!(
+            store.get(&handle, "op-2"),
+            Err(GetError::Unauthorized { .. })
+        ));
+        // The repair is durable for the authorized owner.
+        assert!(store.get(&handle, "op-1").is_ok());
+    }
+
+    // ── Unit: malformed secret handle not echoed with a corrupt manifest (#3) ─
+
+    #[test]
+    fn malformed_secret_handle_not_echoed_even_with_corrupt_manifest() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        seed_producer(&store, dir.path(), "op-1");
+        // Corrupt the manifest so a manifest read would fail.
+        fs::write(dir.path().join("manifest.jsonl"), "not valid json\n").unwrap();
+
+        // A malformed handle (here a "secret") must be rejected as
+        // malformed_handle — which never echoes the handle — rather than
+        // corrupt_manifest_record, which would include it in error.detail.handle.
+        let secret = "Bearer sk-super-secret-token";
+        let err = store.get(secret, "op-1").unwrap_err();
+        assert_eq!(err.code(), "malformed_handle");
+        assert!(
+            !err.to_json().contains("sk-super-secret-token"),
+            "a malformed secret handle must never be echoed"
         );
     }
 

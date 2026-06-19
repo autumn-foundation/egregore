@@ -1251,3 +1251,41 @@ fn failed_verification_get_creates_no_out_file_and_no_temp() {
         "no staging temp may be left behind, found: {leftover:?}"
     );
 }
+
+// ── Get: retrieval diagnostics take priority over --out staging failures ───────
+
+/// When `--out` has a missing parent AND retrieval would fail (unauthorized
+/// operator), the retrieval diagnostic must be surfaced, not the output error.
+#[test]
+fn failed_out_staging_surfaces_retrieval_diagnostic() {
+    let (_guard, store) = tmp_store();
+    let json = run_capture_enabled(&store, "op-1");
+    let handle = json["entries"][0]["handle"]
+        .as_str()
+        .expect("handle")
+        .to_owned();
+
+    let out_dir = tempfile::tempdir().expect("out dir");
+    let bad_out = out_dir.path().join("missing_subdir").join("out.bin");
+
+    let stderr = eg()
+        .args(["protected", "get"])
+        .arg(&handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("not-authorized")
+        .arg("--out")
+        .arg(&bad_out)
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+
+    let j: serde_json::Value = serde_json::from_slice(&stderr).expect("JSON envelope");
+    assert_eq!(
+        j["error"]["code"], "unauthorized",
+        "the retrieval diagnostic must take priority over the --out staging error"
+    );
+}
