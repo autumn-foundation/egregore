@@ -557,6 +557,30 @@ fn open_source_checked(path: &Path) -> io::Result<fs::File> {
     Ok(file)
 }
 
+/// Returns `true` iff `path` is a regular file of exactly `expected_len` bytes
+/// whose BLAKE3 hash equals `expected_hash`, validating everything on a SINGLE
+/// opened descriptor (no-follow).
+///
+/// Checking the length on the opened descriptor (`fstat`), not a separate path
+/// stat, means a blob swapped for a much larger regular file after an earlier
+/// stat cannot be hashed to EOF before the size guard fires — the size mismatch
+/// is detected on the same fd that would be hashed, so there is no huge-file
+/// stall.
+fn blob_matches(path: &Path, expected_hash: &str, expected_len: u64) -> bool {
+    let Ok(mut f) = open_source_checked(path) else {
+        return false;
+    };
+    match f.metadata() {
+        Ok(m) if m.len() == expected_len => {}
+        _ => return false, // size mismatch (or stat error) on the opened fd — do not hash
+    }
+    let mut hasher = blake3::Hasher::new();
+    if io::copy(&mut f, &mut hasher).is_err() {
+        return false;
+    }
+    hasher.finalize().to_hex().to_string() == expected_hash
+}
+
 /// Reads `path` into a `String`, binding no-follow, regular-file, and size-cap
 /// validation to the opened descriptor.
 ///
@@ -843,33 +867,23 @@ impl ProtectedStore {
     /// bounds the read to [`MAX_STORE_FILE_BYTES`].
     fn read_manifest(&self) -> io::Result<Vec<ProtectedHandle>> {
         let path = self.manifest_path();
-        let meta = match path.symlink_metadata() {
-            Ok(m) => m,
+        // Read through a single no-follow, regular-file, size-capped descriptor
+        // so a manifest swapped/grown after a separate stat cannot make this
+        // follow a symlink/FIFO or read past the cap (TOCTOU-safe).
+        let content = match read_capped_regular_file(&path, MAX_STORE_FILE_BYTES) {
+            Ok(c) => c,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e),
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "manifest.jsonl at {} is not a bounded regular file; \
+                         the store may have been tampered with ({e})",
+                        path.display()
+                    ),
+                ));
+            }
         };
-        if !meta.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "manifest.jsonl is not a regular file at {}; \
-                     the store may have been tampered with",
-                    path.display()
-                ),
-            ));
-        }
-        if meta.len() > MAX_STORE_FILE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "manifest.jsonl is unexpectedly large ({} B > {} B); \
-                     the store may have been corrupted",
-                    meta.len(),
-                    MAX_STORE_FILE_BYTES
-                ),
-            ));
-        }
-        let content = fs::read_to_string(&path)?;
         let mut handles = Vec::new();
         for line in content.lines() {
             let line = line.trim();
@@ -919,33 +933,22 @@ impl ProtectedStore {
     /// Applies the same regular-file and size checks as [`Self::read_manifest`].
     fn read_operators(&self) -> io::Result<Vec<String>> {
         let path = self.operators_path();
-        let meta = match path.symlink_metadata() {
-            Ok(m) => m,
+        // Read through a single no-follow, regular-file, size-capped descriptor
+        // (TOCTOU-safe), mirroring `read_manifest`.
+        let content = match read_capped_regular_file(&path, MAX_STORE_FILE_BYTES) {
+            Ok(c) => c,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e),
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "operators.jsonl at {} is not a bounded regular file; \
+                         the store may have been tampered with ({e})",
+                        path.display()
+                    ),
+                ));
+            }
         };
-        if !meta.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "operators.jsonl is not a regular file at {}; \
-                     the store may have been tampered with",
-                    path.display()
-                ),
-            ));
-        }
-        if meta.len() > MAX_STORE_FILE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "operators.jsonl is unexpectedly large ({} B > {} B); \
-                     the store may have been corrupted",
-                    meta.len(),
-                    MAX_STORE_FILE_BYTES
-                ),
-            ));
-        }
-        let content = fs::read_to_string(&path)?;
         // Fail-closed: return an error if ANY line fails to parse as a JSON string.
         // Silently skipping malformed lines would normalize a partially corrupted ACL
         // and could allow a future write to silently revoke the discarded operators.
@@ -1308,14 +1311,12 @@ impl ProtectedStore {
             // failing for the freshly committed handle).  `symlink_metadata` (no
             // follow) avoids blocking on a FIFO; the size guard avoids reading a
             // huge/tampered blob — only an equal-sized blob is read to verify.
-            // The equal-sized hash check STREAMS the blob in chunks (no `fs::read`)
-            // so a multi-GB existing blob cannot exhaust memory during validation.
-            let blob_valid = match blob.symlink_metadata() {
-                Ok(m) if m.file_type().is_file() && m.len() == byte_len => {
-                    hash_source_streaming(&blob).is_ok_and(|(h, _)| h == content_hash)
-                }
-                _ => false,
-            };
+            // Validate the existing blob on a SINGLE opened descriptor: a
+            // regular file of exactly `byte_len` bytes hashing to `content_hash`.
+            // Binding the size check to the fd (not a separate stat) prevents a
+            // blob swapped for a huge regular file from being hashed to EOF
+            // before the size guard fires, and streaming keeps memory flat.
+            let blob_valid = blob_matches(&blob, &content_hash, byte_len);
             if blob_valid {
                 // On-disk blob already matches — discard the streamed temp.
                 let _ = fs::remove_file(&tmp);
@@ -1459,7 +1460,7 @@ impl ProtectedStore {
     ) -> Result<u64, GetStreamError> {
         use std::io::{Read as _, Seek as _};
 
-        let (blob_path, content_hash) = self
+        let (blob_path, content_hash, byte_len) = self
             .resolve_blob(handle, operator)
             .map_err(GetStreamError::Get)?;
 
@@ -1475,6 +1476,17 @@ impl ProtectedStore {
             })
         };
         let mut f = open_source_checked(&blob_path).map_err(|_| missing())?;
+
+        // Bind the size guard to the OPENED descriptor (fstat), not the earlier
+        // path stat, so a blob swapped for a much larger regular file cannot be
+        // hashed to EOF before the byte_len check fires (huge-file stall / DoS).
+        if f.metadata().map_err(|_| missing())?.len() != byte_len {
+            return Err(GetStreamError::Get(GetError::HashMismatch {
+                handle: handle.to_owned(),
+                expected: content_hash,
+                actual: "(blob size does not match manifest byte_len — not read)".to_owned(),
+            }));
+        }
 
         // Pass 1: verify the BLAKE3 hash by streaming the descriptor (bounded
         // memory) BEFORE emitting any bytes.
@@ -1509,7 +1521,11 @@ impl ProtectedStore {
     /// Resolves and validates the content-addressed blob path for `handle` after
     /// authorizing `operator`.  Returns the verified-safe blob path and its
     /// expected content hash; the caller reads and hash-verifies the bytes.
-    fn resolve_blob(&self, handle: &str, operator: &str) -> Result<(PathBuf, String), GetError> {
+    fn resolve_blob(
+        &self,
+        handle: &str,
+        operator: &str,
+    ) -> Result<(PathBuf, String, u64), GetError> {
         // 0. Reject a symlinked store root (no-follow) before probing any path
         // under it.  Otherwise a configured store path replaced by a symlink
         // would let `get` authorize against and return bytes from outside the
@@ -1643,8 +1659,9 @@ impl ProtectedStore {
             });
         }
 
-        // The caller reads/streams the blob and hash-verifies against this.
-        Ok((blob_path, record.content_hash.clone()))
+        // The caller reads/streams the blob and verifies the size+hash on the
+        // opened descriptor against these expected values.
+        Ok((blob_path, record.content_hash.clone(), record.byte_len))
     }
 
     /// Lists all protected handles (metadata only — no raw bytes).
@@ -2585,8 +2602,8 @@ mod tests {
             "read_manifest must return InvalidData for a symlink at manifest path"
         );
         assert!(
-            err.to_string().contains("not a regular file"),
-            "error message must mention 'not a regular file': {err}"
+            err.to_string().contains("tampered"),
+            "error message must flag tampering: {err}"
         );
 
         // list() must propagate the corruption error rather than returning an
@@ -2598,8 +2615,8 @@ mod tests {
             "list() must surface the corruption error, not Ok(empty)"
         );
         assert!(
-            list_err.to_string().contains("not a regular file"),
-            "list() error must mention 'not a regular file': {list_err}"
+            list_err.to_string().contains("tampered"),
+            "list() error must flag tampering: {list_err}"
         );
     }
 
@@ -2642,8 +2659,8 @@ mod tests {
             "read_operators must return InvalidData for a symlink at operators path"
         );
         assert!(
-            err.to_string().contains("not a regular file"),
-            "error message must mention 'not a regular file': {err}"
+            err.to_string().contains("tampered"),
+            "error message must flag tampering: {err}"
         );
     }
 
@@ -3341,6 +3358,28 @@ mod tests {
             .expect("streaming get must succeed");
         assert_eq!(out, b"streamed payload bytes");
         assert_eq!(n, out.len() as u64);
+    }
+
+    #[test]
+    fn get_to_writer_rejects_size_mismatch_without_hashing() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let (handle, content_hash) = capture_one(&store, dir.path(), b"hello");
+
+        // Replace the blob with a DIFFERENT-sized regular file.  The fd size
+        // guard must reject it (no hashing of the larger file).
+        let blob = dir.path().join("blobs").join(&content_hash);
+        fs::write(&blob, vec![b'Z'; 4096]).unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        let err = store
+            .get_to_writer(&handle, "op-1", &mut out)
+            .expect_err("size mismatch must fail");
+        assert!(
+            matches!(err, GetStreamError::Get(GetError::HashMismatch { .. })),
+            "expected HashMismatch, got {err:?}"
+        );
+        assert!(out.is_empty(), "no bytes may be emitted on size mismatch");
     }
 
     #[test]

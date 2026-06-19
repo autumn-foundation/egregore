@@ -9105,29 +9105,16 @@ fn decide_cmd(
 
 // ── eg protected ──────────────────────────────────────────────────────────────
 
-/// Builds a sibling staging path (`.<name>.eg-partial`) in the same directory as
-/// `out_path`, so the streamed bytes can be renamed atomically onto `out_path`.
-fn out_staging_path(out_path: &Path) -> std::path::PathBuf {
-    let file_name = out_path.file_name().map_or_else(
-        || std::ffi::OsString::from("out"),
-        std::ffi::OsStr::to_os_string,
-    );
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(&file_name);
-    tmp_name.push(".eg-partial");
-    out_path.parent().map_or_else(
-        || std::path::PathBuf::from(&tmp_name),
-        |p| p.join(&tmp_name),
-    )
-}
-
 /// Implements `eg protected get`: streams the verified payload to `out` (a file)
 /// or stdout without buffering the whole payload in memory.
 ///
-/// For a `--out` file the bytes are staged to a sibling temp and renamed only on
-/// a fully verified copy, so a failed get never truncates or destroys an
-/// existing destination file.  Exits the process on any failure (with the
-/// documented JSON envelope and exit code); returns normally on success.
+/// For a `--out` file the bytes are staged to a uniquely named, exclusively
+/// created temp in the destination directory (via `tempfile`, which uses
+/// `O_CREAT|O_EXCL` and never follows a symlink) and renamed onto `out_path`
+/// only after a fully verified copy.  A failed get therefore never truncates or
+/// destroys an existing destination file, and the predictable-temp symlink race
+/// is closed.  Exits the process on any failure (with the documented JSON
+/// envelope and exit code); returns normally on success.
 fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Path>) {
     use crate::protected::{GetStreamError, ProtectedStore};
     let ps = ProtectedStore::new(store);
@@ -9144,6 +9131,9 @@ fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Pa
         });
         eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
         process::exit(1);
+    };
+    let output_err_for = |out_path: &Path, e: &dyn std::fmt::Display| -> String {
+        format!("failed to write bytes to {}: {e}", out_path.display())
     };
 
     // stdout: stream directly (no staging — bytes are consumed as written).
@@ -9163,34 +9153,32 @@ fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Pa
         return;
     };
 
-    // --out: stage to a sibling temp, then rename onto the destination only
-    // after a fully verified copy succeeds.
-    let tmp_path = out_staging_path(out_path);
-    let _ = fs::remove_file(&tmp_path);
-    let result = match fs::File::create(&tmp_path) {
-        Ok(mut f) => ps.get_to_writer(handle, operator, &mut f),
-        Err(e) => Err(GetStreamError::Output(e)),
+    // --out: stage to a uniquely named, exclusively created temp in the
+    // destination directory, then rename onto the destination only after a fully
+    // verified copy.  The temp auto-removes on drop, covering every error path.
+    let dir = out_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+    let mut tmp = match tempfile::Builder::new()
+        .prefix(".eg-")
+        .suffix(".partial")
+        .tempfile_in(&dir)
+    {
+        Ok(t) => t,
+        Err(e) => exit_output_error("output_write_error", output_err_for(out_path, &e)),
     };
-    match result {
+
+    match ps.get_to_writer(handle, operator, tmp.as_file_mut()) {
         Ok(_) => {
-            if let Err(e) = fs::rename(&tmp_path, out_path) {
-                let _ = fs::remove_file(&tmp_path);
-                exit_output_error(
-                    "output_write_error",
-                    format!("failed to write bytes to {}: {e}", out_path.display()),
-                );
+            // Move the verified temp onto the destination.
+            if let Err(e) = tmp.persist(out_path) {
+                exit_output_error("output_write_error", output_err_for(out_path, &e.error));
             }
         }
-        Err(GetStreamError::Get(e)) => {
-            let _ = fs::remove_file(&tmp_path);
-            exit_get_error(e);
-        }
+        Err(GetStreamError::Get(e)) => exit_get_error(e), // tmp dropped -> removed
         Err(GetStreamError::Output(e)) => {
-            let _ = fs::remove_file(&tmp_path);
-            exit_output_error(
-                "output_write_error",
-                format!("failed to write bytes to {}: {e}", out_path.display()),
-            );
+            exit_output_error("output_write_error", output_err_for(out_path, &e));
         }
     }
 }
