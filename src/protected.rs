@@ -350,8 +350,8 @@ impl GetError {
 /// retrieval failure but an `output_write_error` envelope when the destination
 /// (a `--out` file or stdout) cannot be written.
 #[derive(Debug)]
-pub enum GetStreamError {
-    /// Retrieval or integrity verification failed; nothing was written to `out`.
+pub(crate) enum GetStreamError {
+    /// Retrieval or integrity verification failed.
     Get(GetError),
     /// Writing the verified bytes to the destination sink failed.
     Output(io::Error),
@@ -1269,28 +1269,21 @@ impl ProtectedStore {
                 continue;
             }
 
-            // Enabled: validate the blobs directory (no-follow) and create it,
-            // then stream the source into a temp blob there, hashing as it goes.
-            // The temp is promoted to the content-addressed path (or discarded if
-            // a matching blob already exists) below.  Validating before the
-            // existing-handle fast path keeps a symlinked `<store>/blobs`
-            // rejected consistently with `get`.
+            // Enabled: validate the blobs directory (no-follow), then HASH the
+            // source (streamed, no temp) to compute the handle.  The source is
+            // only staged into a temp blob below when a missing/corrupt/new blob
+            // actually has to be promoted — an idempotent re-import of an
+            // already-valid payload writes nothing, so it cannot fail for lack of
+            // free space.  Validating the blobs dir before the existing-handle
+            // fast path keeps a symlinked `<store>/blobs` rejected like `get`.
             let blobs = self.checked_blobs_dir()?;
-            create_private_dir(&blobs)?;
-            let (content_hash, byte_len, tmp) =
-                match stream_source_to_temp(Path::new(&entry.source_path), &blobs) {
-                    Ok(staged) => staged,
-                    // Unreadable source — skip this entry with a diagnostic.
-                    Err(StageError::Source) => {
-                        skipped_count += 1;
-                        outcomes.push(stale_read_outcome(&entry.source_path));
-                        continue;
-                    }
-                    // Store I/O error staging the blob (disk full, permissions,
-                    // stale temp path) — fail the capture rather than misreport
-                    // it as a stale source and commit a partial capture.
-                    Err(StageError::Store(e)) => return Err(e),
-                };
+            // Unreadable source — skip this entry with a diagnostic.
+            let Ok((content_hash, byte_len)) = hash_source_streaming(Path::new(&entry.source_path))
+            else {
+                skipped_count += 1;
+                outcomes.push(stale_read_outcome(&entry.source_path));
+                continue;
+            };
             let handle = ProtectedHandle::compute_handle(
                 &class,
                 &content_hash,
@@ -1353,12 +1346,34 @@ impl ProtectedStore {
             // blob swapped for a huge regular file from being hashed to EOF
             // before the size guard fires, and streaming keeps memory flat.
             let blob_valid = blob_matches(&blob, &content_hash, byte_len);
-            if blob_valid {
-                // On-disk blob already matches — discard the streamed temp.
-                let _ = fs::remove_file(&tmp);
-            } else {
-                // Promote the freshly streamed temp, repairing a missing/corrupt
-                // blob.
+            if !blob_valid {
+                // A missing/corrupt/new blob must be promoted, so stage the
+                // source into a temp blob NOW (only when a write is actually
+                // needed).
+                create_private_dir(&blobs)?;
+                let (staged_hash, _staged_len, tmp) =
+                    match stream_source_to_temp(Path::new(&entry.source_path), &blobs) {
+                        Ok(staged) => staged,
+                        // Source became unreadable between the hash and the stage.
+                        Err(StageError::Source) => {
+                            skipped_count += 1;
+                            outcomes.push(stale_read_outcome(&entry.source_path));
+                            continue;
+                        }
+                        // Store I/O error (disk full, permissions, stale temp
+                        // path) — fail the capture rather than misreport it.
+                        Err(StageError::Store(e)) => return Err(e),
+                    };
+                if staged_hash != content_hash {
+                    // The source changed between hashing and staging, so the
+                    // staged bytes do not match the computed handle; do not
+                    // promote inconsistent bytes under that handle.
+                    let _ = fs::remove_file(&tmp);
+                    skipped_count += 1;
+                    outcomes.push(stale_read_outcome(&entry.source_path));
+                    continue;
+                }
+                // Promote the freshly streamed temp, repairing the blob.
                 if let Err(e) = rename_into_place(&tmp, &blob) {
                     let _ = fs::remove_file(&tmp);
                     return Err(e);
@@ -1404,6 +1419,29 @@ impl ProtectedStore {
                 stored: true,
                 diagnostic: None,
             });
+        }
+
+        // A pure no-op capture (every entry reused an already-valid payload, so
+        // `mutated` is false) does NOT extend the ACL.  If the producer is not
+        // already authorized, it cannot retrieve the returned handles, so
+        // reporting them as `stored: true` would hand it handles that `get`
+        // immediately rejects as `unauthorized`; report them as not stored with
+        // an `already_captured` diagnostic instead, and reset `stored_count`.
+        // (An already-authorized producer re-capturing its own payload CAN
+        // retrieve the handles, so its no-op entries stay `stored: true`.)
+        if enabled && !mutated && !ops.iter().any(|o| o == producer_id) {
+            for outcome in &mut outcomes {
+                if outcome.stored {
+                    outcome.stored = false;
+                    outcome.diagnostic = Some(EntryDiagnostic {
+                        code: "already_captured".to_owned(),
+                        message: "payload already present and valid; nothing was stored \
+                                  and this producer was not authorized"
+                            .to_owned(),
+                    });
+                }
+            }
+            stored_count = 0;
         }
 
         // Only mutate the store — including extending the ACL — when this capture
@@ -1468,13 +1506,17 @@ impl ProtectedStore {
         }
     }
 
-    /// Streams the verified payload for `handle` to `out` after authorizing
-    /// `operator`, without buffering the whole payload in memory.
+    /// Streams the payload for `handle` to `out`, hashing the bytes written and
+    /// verifying that hash against the manifest on EOF.
     ///
-    /// Two passes over the blob: the first verifies the BLAKE3 hash (so no
-    /// unverified bytes are ever released), the second copies the bytes to
-    /// `out` in bounded chunks.  Returns the number of bytes written.  This
-    /// keeps memory flat for the multi-GB payloads that capture now streams.
+    /// This is a `pub(crate)` building block, NOT part of the public API:
+    /// verification completes only at EOF, so a same-length tampered blob is
+    /// written to `out` and only THEN reported as [`GetStreamError::Get`].  A
+    /// caller must therefore not pass an externally visible sink directly; it
+    /// must stream into a private staging sink and release it only on `Ok`,
+    /// which is exactly what `eg protected get` does (`--out` renames the
+    /// verified temp into place; stdout streams the verified temp out).  The
+    /// public, verify-before-return API is [`Self::get`] (in-memory).
     ///
     /// Check order (auth before existence disclosure):
     /// 1. Store / manifest absent → [`GetError::RawArtifactModeDisabled`].
@@ -1488,18 +1530,7 @@ impl ProtectedStore {
     ///
     /// [`GetStreamError::Get`] for any retrieval or integrity failure;
     /// [`GetStreamError::Output`] if writing to `out` fails.
-    ///
-    /// # Integrity guarantee
-    ///
-    /// A single streaming pass hashes the EXACT bytes written to `out` and
-    /// verifies that hash against the manifest on EOF, so the bytes released are
-    /// the bytes verified — a two-pass scheme that re-reads a mutable descriptor
-    /// could emit bytes that differ from what was hashed if the blob is modified
-    /// in place between passes.  Because verification completes only at EOF, a
-    /// caller that must not release unverified bytes (e.g. overwriting a file)
-    /// should stream into a temporary sink and commit it only on `Ok` — which is
-    /// exactly what `eg protected get --out` does.
-    pub fn get_to_writer<W: io::Write>(
+    pub(crate) fn get_to_writer<W: io::Write>(
         &self,
         handle: &str,
         operator: &str,
@@ -3673,6 +3704,48 @@ mod tests {
             "a no-op replay must not authorize the new producer"
         );
         assert!(store.get(&handle, "op-1").is_ok());
+    }
+
+    // ── Unit: a no-op replay reports not-stored for an unauthorized producer ──
+
+    #[test]
+    fn noop_replay_reporting_depends_on_authorization() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"content").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+        store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+
+        // op-2 replays the identical payload — a no-op that does NOT authorize
+        // op-2, so the entry must be reported as not stored with a diagnostic.
+        let rep = store
+            .capture(&entries, "op-2", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        assert_eq!(rep.stored_count, 0, "no-op replay stores nothing");
+        assert!(
+            !rep.entries[0].stored,
+            "unauthorized producer's no-op entry must report stored=false"
+        );
+        assert_eq!(
+            rep.entries[0].diagnostic.as_ref().unwrap().code,
+            "already_captured"
+        );
+
+        // op-1 (already authorized) re-capturing its own payload CAN retrieve it,
+        // so its no-op entry stays stored=true.
+        let rep1 = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+        assert!(
+            rep1.entries[0].stored,
+            "authorized producer's no-op recapture stays stored=true"
+        );
     }
 
     // ── Unit: an orphaned ACL (no manifest) is ignored on a new store ─────────
