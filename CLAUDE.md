@@ -52,6 +52,28 @@ Rows are leads to inspect before editing, not proof of breakage. The response is
 and byte-identical across runs. Default depth is 1 (direct neighbors only); use `--depth 2`
 for a wider BFS neighborhood. Output is a JSON envelope with an always-present disclaimer.
 
+Protected raw-artifact commands (issue #60):
+
+```powershell
+# Preview (no writes) — compute hashes and handles only
+cargo run -- protected capture --manifest evidence.jsonl --store .egregore/protected
+
+# Enabled — store raw bytes for each entry
+cargo run -- protected capture --manifest evidence.jsonl --store .egregore/protected --protected-raw-artifacts --producer op-1
+
+# Retrieve by handle (verifies BLAKE3 hash before returning bytes)
+cargo run -- protected get protected:v1:<hex> --store .egregore/protected --operator op-1 --out retrieved.txt
+
+# List metadata (no raw bytes)
+cargo run -- protected list --store .egregore/protected
+```
+
+`eg protected capture` captures raw transcript text, command output, patch bytes, task/issue
+narratives, and generated reports into a local content-addressed store that the graph, query,
+and semantic surfaces never read. Disabled by default; enabled with `--protected-raw-artifacts`.
+After sources are moved or deleted, payloads remain retrievable by stable handle with BLAKE3
+hash verification. See `docs/cli/protected-artifacts.md` for the full operator workflow.
+
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
 
 ## Working Rules

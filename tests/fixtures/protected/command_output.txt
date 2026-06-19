@@ -1,0 +1,8 @@
+running 42 tests
+test ir::tests::graph_roundtrip ... ok
+test ir::tests::stable_id_is_content_addressed ... ok
+test evidence::tests::observation_idempotent ... ok
+test redaction::tests::api_token_detected ... ok
+test query::tests::subsystem_segment_aware ... ok
+
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out

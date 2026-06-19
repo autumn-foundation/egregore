@@ -1,0 +1,5 @@
+{"class":"transcript","source_path":"tests/fixtures/protected/transcript.txt"}
+{"class":"command_output","source_path":"tests/fixtures/protected/command_output.txt"}
+{"class":"patch","source_path":"tests/fixtures/protected/patch.diff"}
+{"class":"task_narrative","source_path":"tests/fixtures/protected/task_narrative.md"}
+{"class":"report","source_path":"tests/fixtures/protected/report.md"}

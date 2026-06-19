@@ -133,8 +133,39 @@ When starting work on an unfamiliar codebase or planning a refactor:
 
 For detailed patterns — impact analysis, refactoring safety checks, cross-commit comparison, architecture exploration — see `references/query-patterns.md`.
 
+## Protected Raw-Artifact Capture (issue #60)
+
+When evidence sources (transcripts, command output, patches, task narratives, reports) may be
+deleted or moved after the fact, use `eg protected` to retain the raw bytes in a local
+content-addressed store that the graph, query, and semantic surfaces never read.
+
+```powershell
+# Preview only (disabled) — compute hashes and handles, write nothing
+egregore protected capture --manifest evidence.jsonl --store .egregore/protected
+
+# Enable capture — store blobs, register operator
+egregore protected capture \
+  --manifest evidence.jsonl \
+  --store .egregore/protected \
+  --protected-raw-artifacts \
+  --producer "op-alice"
+
+# Retrieve by handle after sources are gone (BLAKE3 hash verified)
+egregore protected get protected:v1:<hex> \
+  --store .egregore/protected \
+  --operator "op-alice" \
+  --out retrieved.txt
+
+# List metadata (no raw bytes)
+egregore protected list --store .egregore/protected
+```
+
+Supported classes: `transcript`, `command_output`, `patch`, `task_narrative`, `report`.
+
+Full workflow and diagnostic codes: `docs/cli/protected-artifacts.md`.
+
 ## Additional Resources
 
 - **`references/query-patterns.md`** — Recipes for impact analysis, refactoring, semantic discovery, drift analysis, and architecture exploration.
-- Project README: `C:\Users\markm\egregore\README.md` — Full setup guide with example output.
-- CLI docs: `C:\Users\markm\egregore\docs\cli\query.md` — Stable output schema.
+- CLI docs: `docs/cli/query.md` — Stable output schema.
+- CLI docs: `docs/cli/protected-artifacts.md` — Protected raw-artifact operator workflow.
