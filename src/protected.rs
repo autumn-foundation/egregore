@@ -527,11 +527,41 @@ fn rename_into_place(tmp_path: &Path, path: &Path) -> io::Result<()> {
     fs::rename(tmp_path, path)
 }
 
+/// Opens `path` for reading and binds validation to the opened descriptor.
+///
+/// On Unix the open sets `O_NOFOLLOW` (fail if the final component is a symlink)
+/// and `O_NONBLOCK` (do not block opening a FIFO before it can be rejected),
+/// then `fstat`s the descriptor and requires a regular file.  This closes the
+/// TOCTOU window between an earlier path-based stat and this open: another
+/// process cannot swap the path for a symlink, FIFO, or device and have bytes
+/// read through it.  Regular files ignore `O_NONBLOCK` for reads, so the
+/// subsequent streaming reads behave normally.
+fn open_source_checked(path: &Path) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = fs::File::open(path)?;
+
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 /// Streams `source` through a BLAKE3 hasher without buffering the whole file,
 /// returning its `(hex_hash, byte_len)`.  Used by the capture preview path,
 /// which must not write anything to disk.
 fn hash_source_streaming(source: &Path) -> io::Result<(String, u64)> {
-    let mut src = fs::File::open(source)?;
+    let mut src = open_source_checked(source)?;
     // blake3::Hasher implements io::Write, so io::copy streams the file through
     // it in bounded-size chunks and returns the byte count.
     let mut hasher = blake3::Hasher::new();
@@ -573,7 +603,7 @@ fn stream_source_to_temp(
     let _ = fs::remove_file(&tmp_path);
 
     let streamed = (|| -> Result<(String, u64), StageError> {
-        let mut src = fs::File::open(source).map_err(|_| StageError::Source)?;
+        let mut src = open_source_checked(source).map_err(|_| StageError::Source)?;
         let mut tmp = open_private_create_new(&tmp_path).map_err(StageError::Store)?;
         let mut hasher = blake3::Hasher::new();
         // Heap-allocated so the 64 KiB chunk buffer does not sit on the stack.
@@ -1027,6 +1057,12 @@ impl ProtectedStore {
         } else {
             Vec::new()
         };
+        // Snapshot the content hashes the ON-DISK manifest references before this
+        // capture mutates `existing`.  Used to decide blob rollback tracking: a
+        // blob already referenced by a committed record must survive rollback,
+        // while a pre-existing orphan/tampered blob we replace must not.
+        let original_blob_hashes: std::collections::HashSet<String> =
+            existing.iter().map(|h| h.content_hash.clone()).collect();
         let ops: Vec<String> = if enabled {
             // Fail closed: an initialized store (manifest present) whose
             // operators.jsonl is absent must NOT be silently reinitialized with
@@ -1250,11 +1286,12 @@ impl ProtectedStore {
             // failing for the freshly committed handle).  `symlink_metadata` (no
             // follow) avoids blocking on a FIFO; the size guard avoids reading a
             // huge/tampered blob — only an equal-sized blob is read to verify.
-            let blob_meta = blob.symlink_metadata();
-            let blob_existed = blob_meta.is_ok();
-            let blob_valid = match &blob_meta {
-                Ok(m) if m.file_type().is_file() && m.len() == byte_len => fs::read(&blob)
-                    .is_ok_and(|b| blake3::hash(&b).to_hex().to_string() == content_hash),
+            // The equal-sized hash check STREAMS the blob in chunks (no `fs::read`)
+            // so a multi-GB existing blob cannot exhaust memory during validation.
+            let blob_valid = match blob.symlink_metadata() {
+                Ok(m) if m.file_type().is_file() && m.len() == byte_len => {
+                    hash_source_streaming(&blob).is_ok_and(|(h, _)| h == content_hash)
+                }
                 _ => false,
             };
             if blob_valid {
@@ -1267,11 +1304,13 @@ impl ProtectedStore {
                     let _ = fs::remove_file(&tmp);
                     return Err(e);
                 }
-                // Track for rollback only when this capture introduces a NEW
-                // handle backed by a blob that did not exist before.  A repaired
-                // blob that an existing (retained) record already references must
-                // survive rollback, or the prior on-disk manifest would dangle.
-                if !already_exists && !blob_existed {
+                // Track for rollback unless the blob is already referenced by the
+                // ORIGINAL on-disk manifest.  Filesystem existence is not enough:
+                // a pre-created/tampered orphan blob (a symlink or corrupt file no
+                // committed record references) is replaced by our streamed bytes
+                // here and must be removed on rollback, while a blob a prior
+                // record references must survive so that record does not dangle.
+                if !original_blob_hashes.contains(&content_hash) {
                     blob_txn.track(blob.clone());
                 }
             }
@@ -1302,7 +1341,13 @@ impl ProtectedStore {
             });
         }
 
-        if enabled {
+        // Only mutate the store — including extending the ACL — when at least one
+        // payload was actually captured or repaired.  An enabled capture with an
+        // empty manifest or only unsupported/stale entries leaves `stored_count`
+        // at 0; rewriting operators.jsonl with this producer would otherwise
+        // authorize them to retrieve every previously captured handle without
+        // storing anything.
+        if enabled && stored_count > 0 {
             // Preflight the ACL (operators) growth BEFORE committing the
             // manifest.  Adding this producer to a near-cap operators.jsonl could
             // push it over MAX_STORE_FILE_BYTES; without this check the manifest
@@ -1412,8 +1457,9 @@ impl ProtectedStore {
             }));
         }
 
-        // Pass 2: stream the verified bytes to the destination in bounded chunks.
-        let mut f = fs::File::open(&blob_path).map_err(|_| {
+        // Pass 2: stream the verified bytes to the destination in bounded chunks
+        // (no-follow open binds the read to a regular-file descriptor).
+        let mut f = open_source_checked(&blob_path).map_err(|_| {
             GetStreamError::Get(GetError::MissingProtectedPayload {
                 handle: handle.to_owned(),
                 expected_path: blob_path.display().to_string(),
@@ -1442,6 +1488,13 @@ impl ProtectedStore {
     /// authorizing `operator`.  Returns the verified-safe blob path and its
     /// expected content hash; the caller reads and hash-verifies the bytes.
     fn resolve_blob(&self, handle: &str, operator: &str) -> Result<(PathBuf, String), GetError> {
+        // 0. Reject a symlinked store root (no-follow) before probing any path
+        // under it.  Otherwise a configured store path replaced by a symlink
+        // would let `get` authorize against and return bytes from outside the
+        // intended store boundary — capture already rejects the same root.
+        self.checked_root()
+            .map_err(|_| GetError::RawArtifactModeDisabled)?;
+
         // 1. Mode check.
         if !self.is_initialised() {
             return Err(GetError::RawArtifactModeDisabled);
@@ -1580,6 +1633,10 @@ impl ProtectedStore {
     ///
     /// Returns an error on manifest I/O failure.
     pub fn list(&self) -> io::Result<Vec<ProtectedHandle>> {
+        // Reject a symlinked store root (no-follow) before probing under it, so
+        // a symlinked store path cannot redirect the listing outside the
+        // intended boundary.
+        self.checked_root()?;
         if !self.is_initialised() {
             return Ok(Vec::new());
         }
@@ -3302,6 +3359,187 @@ mod tests {
         assert!(
             matches!(err, GetStreamError::Output(_)),
             "sink write failure must map to Output, got {err:?}"
+        );
+    }
+
+    // ── Unit: no-follow source open binds validation to the fd (#5) ───────────
+
+    #[cfg(unix)]
+    #[test]
+    fn open_source_checked_rejects_symlink_and_fifo() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real.txt");
+        fs::write(&real, b"x").unwrap();
+        assert!(
+            open_source_checked(&real).is_ok(),
+            "a regular file must open"
+        );
+
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(
+            open_source_checked(&link).is_err(),
+            "a symlink must be rejected by O_NOFOLLOW"
+        );
+
+        let fifo = dir.path().join("pipe.fifo");
+        nix_mkfifo(&fifo);
+        assert!(
+            open_source_checked(&fifo).is_err(),
+            "a FIFO must be rejected after the fstat check"
+        );
+    }
+
+    // ── Unit: get/list reject a symlinked store root (#2) ─────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn get_and_list_reject_symlinked_store_root() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real_store");
+        fs::create_dir_all(&real).unwrap();
+        let store = ProtectedStore::new(&real);
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"content").unwrap();
+        let r = store
+            .capture(
+                &[CaptureEntry {
+                    class: "report".to_owned(),
+                    source_path: src.to_string_lossy().into_owned(),
+                }],
+                "op-1",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap();
+        let handle = r.entries[0].handle.clone();
+
+        // Replace the store path with a symlink to the real store directory.
+        let link = dir.path().join("link_store");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let linked = ProtectedStore::new(&link);
+
+        assert!(
+            matches!(
+                linked.get(&handle, "op-1"),
+                Err(GetError::RawArtifactModeDisabled)
+            ),
+            "get must fail closed on a symlinked store root"
+        );
+        assert!(linked.list().is_err(), "list must reject a symlinked root");
+
+        // The real (non-symlinked) store still resolves.
+        assert!(store.get(&handle, "op-1").is_ok());
+    }
+
+    // ── Unit: a no-op capture does not authorize the producer (#3) ────────────
+
+    #[test]
+    fn empty_or_stale_capture_does_not_authorize_producer() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"alpha").unwrap();
+        let r = store
+            .capture(
+                &[CaptureEntry {
+                    class: "report".to_owned(),
+                    source_path: src.to_string_lossy().into_owned(),
+                }],
+                "op-1",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap();
+        let handle = r.entries[0].handle.clone();
+
+        // op-2 runs an enabled capture with only an unsupported-class entry, so
+        // nothing is stored.
+        let rep = store
+            .capture(
+                &[CaptureEntry {
+                    class: "not_a_real_class".to_owned(),
+                    source_path: src.to_string_lossy().into_owned(),
+                }],
+                "op-2",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(rep.stored_count, 0, "nothing should have been stored");
+
+        assert!(
+            matches!(
+                store.get(&handle, "op-2"),
+                Err(GetError::Unauthorized { .. })
+            ),
+            "op-2 must not be authorized after capturing nothing"
+        );
+        assert!(
+            store.get(&handle, "op-1").is_ok(),
+            "the original producer remains authorized"
+        );
+    }
+
+    // ── Unit: rollback removes a replaced orphan blob (#1) ────────────────────
+
+    #[test]
+    fn rollback_removes_replaced_orphan_blob() {
+        let dir = tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        fs::create_dir_all(&store_root).unwrap();
+        let store = ProtectedStore::new(&store_root);
+
+        // Initialize the store with an unrelated handle.
+        let a = dir.path().join("a.txt");
+        fs::write(&a, b"alpha").unwrap();
+        store
+            .capture(
+                &[CaptureEntry {
+                    class: "report".to_owned(),
+                    source_path: a.to_string_lossy().into_owned(),
+                }],
+                "op-1",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap();
+
+        // Pre-create a CORRUPT orphan blob at the content-addressed path for the
+        // "beta payload" bytes that no manifest record references.
+        let beta_hash = blake3::hash(b"beta payload").to_hex().to_string();
+        let orphan = store_root.join("blobs").join(&beta_hash);
+        fs::write(&orphan, b"corrupt orphan bytes").unwrap();
+
+        // Force the manifest write to fail after the blob step.
+        fs::create_dir(store_root.join(".manifest.jsonl.wip")).unwrap();
+
+        // Capture the "beta payload" bytes — a new handle hashing to the orphan
+        // path.  The corrupt orphan is replaced, then the manifest write fails,
+        // so rollback must remove it (no committed record referenced it).
+        let b = dir.path().join("b.txt");
+        fs::write(&b, b"beta payload").unwrap();
+        let res = store.capture(
+            &[CaptureEntry {
+                class: "report".to_owned(),
+                source_path: b.to_string_lossy().into_owned(),
+            }],
+            "op-1",
+            "0.1.0",
+            fixed_ts(),
+            true,
+        );
+        assert!(
+            res.is_err(),
+            "capture must fail when the manifest write fails"
+        );
+        assert!(
+            !orphan.exists(),
+            "a replaced orphan blob must be rolled back on failure"
         );
     }
 
