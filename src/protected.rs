@@ -557,6 +557,28 @@ fn open_source_checked(path: &Path) -> io::Result<fs::File> {
     Ok(file)
 }
 
+/// Reads `path` into a `String`, binding no-follow, regular-file, and size-cap
+/// validation to the opened descriptor.
+///
+/// Opens once via [`open_source_checked`] (rejecting a symlink/FIFO/device),
+/// then reads at most `cap` bytes from THAT descriptor, so a path swapped after
+/// any earlier stat cannot smuggle in a larger or non-regular file between the
+/// check and the read.  Returns `InvalidData` if the content exceeds `cap`.
+pub(crate) fn read_capped_regular_file(path: &Path, cap: u64) -> io::Result<String> {
+    use std::io::Read as _;
+    let f = open_source_checked(path)?;
+    let mut s = String::new();
+    // `take(cap + 1)` bounds the read; content longer than `cap` is rejected.
+    f.take(cap + 1).read_to_string(&mut s)?;
+    if s.len() as u64 > cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds the maximum allowed size",
+        ));
+    }
+    Ok(s)
+}
+
 /// Streams `source` through a BLAKE3 hasher without buffering the whole file,
 /// returning its `(hex_hash, byte_len)`.  Used by the capture preview path,
 /// which must not write anything to disk.
@@ -1435,20 +1457,30 @@ impl ProtectedStore {
         operator: &str,
         out: &mut W,
     ) -> Result<u64, GetStreamError> {
-        use std::io::Read as _;
+        use std::io::{Read as _, Seek as _};
 
         let (blob_path, content_hash) = self
             .resolve_blob(handle, operator)
             .map_err(GetStreamError::Get)?;
 
-        // Pass 1: verify the hash by streaming the blob (bounded memory) BEFORE
-        // emitting any bytes, preserving the verify-before-release guarantee.
-        let (actual_hash, _) = hash_source_streaming(&blob_path).map_err(|_| {
+        // Open the blob exactly ONCE (no-follow, regular-file descriptor) and use
+        // that SAME descriptor for both verification and emission.  Re-opening
+        // the path between verify and copy would reintroduce a TOCTOU window in
+        // which a local process could swap the blob and have unverified bytes
+        // released, breaking the verify-before-release guarantee.
+        let missing = || {
             GetStreamError::Get(GetError::MissingProtectedPayload {
                 handle: handle.to_owned(),
                 expected_path: blob_path.display().to_string(),
             })
-        })?;
+        };
+        let mut f = open_source_checked(&blob_path).map_err(|_| missing())?;
+
+        // Pass 1: verify the BLAKE3 hash by streaming the descriptor (bounded
+        // memory) BEFORE emitting any bytes.
+        let mut hasher = blake3::Hasher::new();
+        io::copy(&mut f, &mut hasher).map_err(|_| missing())?;
+        let actual_hash = hasher.finalize().to_hex().to_string();
         if actual_hash != content_hash {
             return Err(GetStreamError::Get(GetError::HashMismatch {
                 handle: handle.to_owned(),
@@ -1457,24 +1489,14 @@ impl ProtectedStore {
             }));
         }
 
-        // Pass 2: stream the verified bytes to the destination in bounded chunks
-        // (no-follow open binds the read to a regular-file descriptor).
-        let mut f = open_source_checked(&blob_path).map_err(|_| {
-            GetStreamError::Get(GetError::MissingProtectedPayload {
-                handle: handle.to_owned(),
-                expected_path: blob_path.display().to_string(),
-            })
-        })?;
+        // Pass 2: rewind the same descriptor and stream the verified bytes to the
+        // destination in bounded chunks.
+        f.seek(std::io::SeekFrom::Start(0)).map_err(|_| missing())?;
         // Heap-allocated so the 64 KiB chunk buffer does not sit on the stack.
         let mut buf = vec![0u8; 64 * 1024];
         let mut total: u64 = 0;
         loop {
-            let n = f.read(&mut buf).map_err(|_| {
-                GetStreamError::Get(GetError::MissingProtectedPayload {
-                    handle: handle.to_owned(),
-                    expected_path: blob_path.display().to_string(),
-                })
-            })?;
+            let n = f.read(&mut buf).map_err(|_| missing())?;
             if n == 0 {
                 break;
             }
@@ -3388,6 +3410,33 @@ mod tests {
             open_source_checked(&fifo).is_err(),
             "a FIFO must be rejected after the fstat check"
         );
+    }
+
+    // ── Unit: read_capped_regular_file binds validation to the fd (#2) ────────
+
+    #[test]
+    fn read_capped_regular_file_enforces_cap_and_regular() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("ok.txt");
+        fs::write(&f, b"hello").unwrap();
+        assert_eq!(read_capped_regular_file(&f, 1024).unwrap(), "hello");
+
+        // Content exceeding the cap is rejected.
+        assert!(
+            read_capped_regular_file(&f, 3).is_err(),
+            "content over the cap must be rejected"
+        );
+
+        // A symlink is rejected (no-follow open).
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.txt");
+            std::os::unix::fs::symlink(&f, &link).unwrap();
+            assert!(
+                read_capped_regular_file(&link, 1024).is_err(),
+                "a symlink must be rejected by the no-follow open"
+            );
+        }
     }
 
     // ── Unit: get/list reject a symlinked store root (#2) ─────────────────────

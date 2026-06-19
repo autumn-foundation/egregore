@@ -9105,65 +9105,92 @@ fn decide_cmd(
 
 // ── eg protected ──────────────────────────────────────────────────────────────
 
+/// Builds a sibling staging path (`.<name>.eg-partial`) in the same directory as
+/// `out_path`, so the streamed bytes can be renamed atomically onto `out_path`.
+fn out_staging_path(out_path: &Path) -> std::path::PathBuf {
+    let file_name = out_path.file_name().map_or_else(
+        || std::ffi::OsString::from("out"),
+        std::ffi::OsStr::to_os_string,
+    );
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(&file_name);
+    tmp_name.push(".eg-partial");
+    out_path.parent().map_or_else(
+        || std::path::PathBuf::from(&tmp_name),
+        |p| p.join(&tmp_name),
+    )
+}
+
 /// Implements `eg protected get`: streams the verified payload to `out` (a file)
 /// or stdout without buffering the whole payload in memory.
 ///
-/// Exits the process on any failure (with the documented JSON envelope and exit
-/// code); returns normally on success.
+/// For a `--out` file the bytes are staged to a sibling temp and renamed only on
+/// a fully verified copy, so a failed get never truncates or destroys an
+/// existing destination file.  Exits the process on any failure (with the
+/// documented JSON envelope and exit code); returns normally on success.
 fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Path>) {
     use crate::protected::{GetStreamError, ProtectedStore};
     let ps = ProtectedStore::new(store);
 
-    // Stream the verified payload directly to the destination so a multi-GB
-    // payload never has to be buffered in memory.
-    let stream_result = out.map_or_else(
-        || {
-            let stdout = std::io::stdout();
-            let mut lock = stdout.lock();
-            ps.get_to_writer(handle, operator, &mut lock)
-        },
-        |out_path| match fs::File::create(out_path) {
-            Ok(mut f) => ps.get_to_writer(handle, operator, &mut f),
-            Err(e) => Err(GetStreamError::Output(e)),
-        },
-    );
+    let exit_get_error = |e: crate::protected::GetError| -> ! {
+        let is_not_found = e.code() == "payload_not_found";
+        eprintln!("{}", e.to_json()); // to_json() is not Display; format is deliberate
+        process::exit(if is_not_found { 2 } else { 1 });
+    };
+    let exit_output_error = |code: &str, message: String| -> ! {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": { "code": code, "detail": { "message": message } }
+        });
+        eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+        process::exit(1);
+    };
 
-    match stream_result {
-        Ok(_) => {}
-        Err(GetStreamError::Get(e)) => {
-            // A retrieval/verification failure: nothing was written.  If a --out
-            // file was created, remove the now-empty/partial file so a failed get
-            // never leaves a misleading output artifact.
-            if let Some(out_path) = out {
-                let _ = fs::remove_file(out_path);
+    // stdout: stream directly (no staging — bytes are consumed as written).
+    let Some(out_path) = out else {
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        match ps.get_to_writer(handle, operator, &mut lock) {
+            Ok(_) => {}
+            Err(GetStreamError::Get(e)) => exit_get_error(e),
+            Err(GetStreamError::Output(e)) => {
+                exit_output_error(
+                    "stdout_write_error",
+                    format!("failed to write bytes to stdout: {e}"),
+                );
             }
-            let is_not_found = e.code() == "payload_not_found";
-            eprintln!("{}", e.to_json()); // to_json() is not Display; format is deliberate
-            process::exit(if is_not_found { 2 } else { 1 });
+        }
+        return;
+    };
+
+    // --out: stage to a sibling temp, then rename onto the destination only
+    // after a fully verified copy succeeds.
+    let tmp_path = out_staging_path(out_path);
+    let _ = fs::remove_file(&tmp_path);
+    let result = match fs::File::create(&tmp_path) {
+        Ok(mut f) => ps.get_to_writer(handle, operator, &mut f),
+        Err(e) => Err(GetStreamError::Output(e)),
+    };
+    match result {
+        Ok(_) => {
+            if let Err(e) = fs::rename(&tmp_path, out_path) {
+                let _ = fs::remove_file(&tmp_path);
+                exit_output_error(
+                    "output_write_error",
+                    format!("failed to write bytes to {}: {e}", out_path.display()),
+                );
+            }
+        }
+        Err(GetStreamError::Get(e)) => {
+            let _ = fs::remove_file(&tmp_path);
+            exit_get_error(e);
         }
         Err(GetStreamError::Output(e)) => {
-            // Remove any partially written --out file.
-            let (code, message) = out.map_or_else(
-                || {
-                    (
-                        "stdout_write_error",
-                        format!("failed to write bytes to stdout: {e}"),
-                    )
-                },
-                |out_path| {
-                    let _ = fs::remove_file(out_path);
-                    (
-                        "output_write_error",
-                        format!("failed to write bytes to {}: {e}", out_path.display()),
-                    )
-                },
+            let _ = fs::remove_file(&tmp_path);
+            exit_output_error(
+                "output_write_error",
+                format!("failed to write bytes to {}: {e}", out_path.display()),
             );
-            let envelope = serde_json::json!({
-                "ok": false,
-                "error": { "code": code, "detail": { "message": message } }
-            });
-            eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
-            process::exit(1);
         }
     }
 }
@@ -9289,30 +9316,16 @@ fn protected_capture_cmd(
         process::exit(1);
     };
 
-    // Reject non-regular files (FIFOs, devices, symlinks pointing at such) and
-    // bound the size *before* slurping the manifest into memory.  Without this,
-    // a `--manifest` naming `/dev/zero` blocks indefinitely and a huge regular
-    // file exhausts memory before any JSON diagnostic is produced.  Stat with
-    // `symlink_metadata` (no-follow); a stat failure (NotFound/permission)
-    // falls through to the read below, which surfaces the same envelope.
-    if let Ok(meta) = fs::symlink_metadata(manifest_path) {
-        if !meta.file_type().is_file() {
-            emit_manifest_error(format!(
-                "capture manifest at {} is not a regular file",
-                manifest_path.display()
-            ));
-        }
-        if meta.len() > crate::protected::MAX_STORE_FILE_BYTES {
-            emit_manifest_error(format!(
-                "capture manifest at {} is too large ({} B > {} B)",
-                manifest_path.display(),
-                meta.len(),
-                crate::protected::MAX_STORE_FILE_BYTES
-            ));
-        }
-    }
-
-    let manifest_content = match fs::read_to_string(manifest_path) {
+    // Read the manifest bound to a single no-follow, regular-file, size-capped
+    // descriptor.  Opening once and reading that descriptor (rather than
+    // stat-then-reopen) closes the TOCTOU window: a `--manifest` in a writable
+    // location cannot be swapped for a FIFO, device, symlink, or much larger
+    // file between a check and the read, so capture cannot be made to block or
+    // allocate unbounded memory before emitting the JSON diagnostic.
+    let manifest_content = match crate::protected::read_capped_regular_file(
+        manifest_path,
+        crate::protected::MAX_STORE_FILE_BYTES,
+    ) {
         Ok(c) => c,
         Err(e) => emit_manifest_error(format!(
             "failed to read capture manifest at {}: {e}",

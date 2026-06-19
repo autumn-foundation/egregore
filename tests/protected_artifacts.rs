@@ -1222,3 +1222,40 @@ fn capture_rejects_non_regular_manifest() {
         "message must mention 'not a regular file': {msg}"
     );
 }
+
+// ── Get: a failed --out get must not destroy an existing file ──────────────────
+
+/// When `--out` names an existing file and `eg protected get` fails (here an
+/// unauthorized operator), the existing file must be preserved: the bytes are
+/// staged to a sibling temp and only renamed into place on a verified success.
+#[test]
+fn failed_get_preserves_existing_out_file() {
+    let (_guard, store) = tmp_store();
+    let json = run_capture_enabled(&store, "op-1");
+    let handle = json["entries"][0]["handle"]
+        .as_str()
+        .expect("handle string")
+        .to_owned();
+
+    let out_dir = tempfile::tempdir().expect("out dir");
+    let out_file = out_dir.path().join("existing.bin");
+    fs::write(&out_file, b"PRECIOUS EXISTING DATA").unwrap();
+
+    // Unauthorized operator → get fails; the existing --out file must survive.
+    eg().args(["protected", "get"])
+        .arg(&handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("not-authorized")
+        .arg("--out")
+        .arg(&out_file)
+        .assert()
+        .failure();
+
+    let after = fs::read(&out_file).expect("existing --out file must still exist");
+    assert_eq!(
+        after, b"PRECIOUS EXISTING DATA",
+        "a failed get must not truncate or destroy the existing --out file"
+    );
+}
