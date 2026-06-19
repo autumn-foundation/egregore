@@ -943,52 +943,53 @@ impl ProtectedStore {
         write_private_file(&self.manifest_path(), content.as_bytes())
     }
 
-    /// The set of producers authorized by `manifest`, derived from its
-    /// CANONICAL, validated records.
+    /// The CANONICAL, valid records of `manifest`.
     ///
-    /// Records are de-duplicated by handle (first-wins, matching
-    /// [`Self::write_manifest`]) and limited to internally-consistent records
-    /// (the stored handle recomputes from its own identity fields, the schema is
-    /// v1, and the producer is non-empty).  A recovered or tampered manifest
-    /// with a duplicate handle line carrying a DIFFERENT producer therefore
-    /// cannot authorize that producer: the later duplicate is discarded exactly
-    /// as `write_manifest` would discard it, and an internally-inconsistent line
-    /// never authorizes.
-    fn canonical_producers(manifest: &[ProtectedHandle]) -> std::collections::HashSet<String> {
-        let mut seen_handles = std::collections::HashSet::new();
-        let mut producers = std::collections::HashSet::new();
+    /// A record is canonical and valid iff (a) its handle appears EXACTLY ONCE in
+    /// the manifest and (b) it is internally consistent — the stored handle
+    /// recomputes from its own identity fields, the schema is v1, and the
+    /// producer is non-empty.
+    ///
+    /// `write_manifest` never emits duplicate handles, so a manifest containing
+    /// a duplicate handle (recovered or tampered) is non-canonical and that
+    /// handle authorizes/exempts NOTHING — independent of line order, so a rogue
+    /// producer cannot win merely by prepending or appending a duplicate line.
+    fn canonical_valid_records(manifest: &[ProtectedHandle]) -> Vec<&ProtectedHandle> {
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for h in manifest {
-            if !seen_handles.insert(h.handle.as_str()) {
-                continue; // first-wins per handle
-            }
-            let recomputed = ProtectedHandle::compute_handle(
-                &h.source_class,
-                &h.content_hash,
-                h.source_path.as_deref(),
-            );
-            if recomputed == h.handle
-                && h.schema_version == PROTECTED_SCHEMA_VERSION
-                && !h.producer_id.trim().is_empty()
-            {
-                producers.insert(h.producer_id.clone());
-            }
+            *counts.entry(h.handle.as_str()).or_insert(0) += 1;
         }
-        producers
+        manifest
+            .iter()
+            .filter(|h| {
+                counts.get(h.handle.as_str()) == Some(&1)
+                    && ProtectedHandle::compute_handle(
+                        &h.source_class,
+                        &h.content_hash,
+                        h.source_path.as_deref(),
+                    ) == h.handle
+                    && h.schema_version == PROTECTED_SCHEMA_VERSION
+                    && !h.producer_id.trim().is_empty()
+            })
+            .collect()
     }
 
     /// Returns `true` when `operator` is a canonical, validated producer of
     /// `manifest`.
     ///
     /// The manifest is the SINGLE source of truth for authorization: a producer
-    /// is authorized iff it has a durably captured handle that survives
-    /// canonicalization (see [`Self::canonical_producers`]).  This is crash-safe
-    /// with the manifest write (one atomic rename commits both the handle and
-    /// the authorization) and removes the separate `operators.jsonl` ACL file
-    /// along with its missing/empty/orphaned/desync failure modes.  An empty
-    /// `operator` is never authorized (producer IDs are non-empty by capture
-    /// validation), so `get("", "")` is rejected.
+    /// is authorized iff it produced a canonical, valid record (see
+    /// [`Self::canonical_valid_records`]).  This is crash-safe with the manifest
+    /// write (one atomic rename commits both the handle and the authorization)
+    /// and removes the separate `operators.jsonl` ACL file along with its
+    /// missing/empty/orphaned/desync failure modes.  An empty `operator` is never
+    /// authorized (producer IDs are non-empty by capture validation), so
+    /// `get("", "")` is rejected.
     fn is_authorized(manifest: &[ProtectedHandle], operator: &str) -> bool {
-        !operator.is_empty() && Self::canonical_producers(manifest).contains(operator)
+        !operator.is_empty()
+            && Self::canonical_valid_records(manifest)
+                .iter()
+                .any(|h| h.producer_id == operator)
     }
 
     // ── Public API ─────────────────────────────────────────────────────────────
@@ -1062,6 +1063,11 @@ impl ProtectedStore {
             // lock / manifest / operators / blobs through it.
             self.checked_root()?;
             create_private_dir(&self.root)?;
+            // Re-validate AFTER create: `create_private_dir` is a no-op when the
+            // path already exists, so a symlink planted in the TOCTOU gap between
+            // the check above and this point would otherwise be used as the root.
+            // The post-create check rejects a root that is now a symlink/non-dir.
+            self.checked_root()?;
         }
         let _lock: Option<StoreLock> = if enabled {
             Some(StoreLock::acquire(&self.root)?)
@@ -1077,12 +1083,18 @@ impl ProtectedStore {
         } else {
             Vec::new()
         };
-        // Snapshot the content hashes the ON-DISK manifest references before this
-        // capture mutates `existing`.  Used to decide blob rollback tracking: a
-        // blob already referenced by a committed record must survive rollback,
-        // while a pre-existing orphan/tampered blob we replace must not.
+        // Snapshot the content hashes referenced by the ON-DISK manifest's
+        // CANONICAL valid records before this capture mutates `existing`.  Used
+        // to decide blob rollback tracking: a blob referenced by a committed
+        // VALID record must survive rollback, while a pre-existing
+        // orphan/tampered blob (referenced only by an invalid or duplicated
+        // record) we replace must be removed on rollback so no orphaned raw
+        // bytes are left behind.
         let original_blob_hashes: std::collections::HashSet<String> =
-            existing.iter().map(|h| h.content_hash.clone()).collect();
+            Self::canonical_valid_records(&existing)
+                .iter()
+                .map(|h| h.content_hash.clone())
+                .collect();
 
         // Rolls back blobs newly written by this capture if any later step (a
         // subsequent blob write, the manifest commit, or the ACL preflight)
@@ -1284,6 +1296,12 @@ impl ProtectedStore {
                 // source into a temp blob NOW (only when a write is actually
                 // needed).
                 create_private_dir(&blobs)?;
+                // Re-validate AFTER create: `create_private_dir` is a no-op when
+                // the path already exists, so a symlink planted at `<store>/blobs`
+                // in the TOCTOU gap between the check at the top of the loop and
+                // this point would otherwise be staged/promoted through. Reject a
+                // blobs dir that is now a symlink/non-dir before writing bytes.
+                require_real_dir_or_absent(&blobs, "blobs path")?;
                 let (staged_hash, _staged_len, tmp) =
                     match stream_source_to_temp(Path::new(&entry.source_path), &blobs) {
                         Ok(staged) => staged,
@@ -3802,11 +3820,32 @@ mod tests {
     fn duplicate_handle_with_rogue_producer_does_not_authorize() {
         let dir = tempdir().unwrap();
         let store = ProtectedStore::new(dir.path());
+        // op-1 owns TWO distinct records: `seed.txt` (shared via seed_producer)
+        // and a second `other.txt`.  The second keeps op-1 authorized after the
+        // first handle is duplicated and thereby made non-canonical.
         let handle = seed_producer(&store, dir.path(), "op-1");
+        let other_src = dir.path().join("other.txt");
+        fs::write(&other_src, b"other payload").unwrap();
+        let other_handle = store
+            .capture(
+                &[CaptureEntry {
+                    class: "report".to_owned(),
+                    source_path: other_src.to_string_lossy().into_owned(),
+                }],
+                "op-1",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap()
+            .entries[0]
+            .handle
+            .clone();
 
-        // Append a DUPLICATE line for the same handle with a different producer
-        // (identity fields unchanged, so it is internally valid but a later
-        // duplicate that first-wins de-dup discards).
+        // Append a DUPLICATE line for `handle` with a rogue producer (identity
+        // fields unchanged, so it is internally valid in isolation).  Because the
+        // handle now appears twice, it is non-canonical and authorizes NOBODY —
+        // order-independent, so prepending or appending cannot let the rogue win.
         let manifest_path = dir.path().join("manifest.jsonl");
         let content = fs::read_to_string(&manifest_path).unwrap();
         let line = content
@@ -3826,11 +3865,17 @@ mod tests {
                 store.get(&handle, "rogue"),
                 Err(GetError::Unauthorized { .. })
             ),
-            "a later duplicate handle line must not authorize a rogue producer"
+            "a duplicate handle line must not authorize a rogue producer"
+        );
+        // op-1 stays authorized via its OTHER, still-canonical record — and can
+        // read both its own unique handle and the now-duplicated one.
+        assert!(
+            store.get(&other_handle, "op-1").is_ok(),
+            "op-1 stays authorized through its non-duplicated record"
         );
         assert!(
             store.get(&handle, "op-1").is_ok(),
-            "the first producer stays authorized"
+            "op-1 can still resolve the duplicated handle's payload"
         );
     }
 

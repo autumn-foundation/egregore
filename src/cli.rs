@@ -9108,13 +9108,15 @@ fn decide_cmd(
 /// Implements `eg protected get`: retrieves the verified payload to `out` (a
 /// file) or stdout without buffering the whole payload in memory.
 ///
-/// The bytes are ALWAYS staged to a uniquely named, exclusively created temp
-/// (via `tempfile`: `O_CREAT|O_EXCL`, never follows a symlink) and only released
-/// to the destination after a fully verified copy — for `--out` by renaming the
-/// temp into place, for stdout by streaming the verified temp out.  This
-/// preserves verify-before-release for both destinations (a failed get never
-/// truncates a `--out` file and never emits unverified bytes to stdout) and the
-/// temp is removed on every path, including the `process::exit` error paths.
+/// The bytes are ALWAYS staged to a temp and only released to the destination
+/// after a fully verified copy — for `--out` to a uniquely named, exclusively
+/// created temp in the destination directory (never follows a symlink) that is
+/// renamed into place, and for stdout to an ANONYMOUS (unlinked) temp that is
+/// rewound and streamed out.  This preserves verify-before-release for both
+/// destinations (a failed get never truncates a `--out` file and never emits
+/// unverified bytes to stdout).  The `--out` temp is removed on every path,
+/// including the `process::exit` error paths; the anonymous stdout temp leaves
+/// no named entry to leak and is reclaimed by the OS on process exit.
 /// Exits the process on any failure with the documented JSON envelope/exit code.
 fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Path>) {
     use crate::protected::{GetStreamError, ProtectedStore};
@@ -9139,86 +9141,100 @@ fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Pa
         |p| ("output_write_error", p.display().to_string()),
     );
 
-    // Stage into the destination directory for --out (so the final move is an
-    // in-directory rename) or the system temp dir for stdout.
-    let stage_dir = out.map_or_else(std::env::temp_dir, |p| {
-        p.parent()
-            .filter(|d| !d.as_os_str().is_empty())
-            .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf)
-    });
-    let mut tmp = match tempfile::Builder::new()
-        .prefix(".eg-")
-        .suffix(".partial")
-        .tempfile_in(&stage_dir)
-    {
-        Ok(t) => t,
-        Err(create_err) => {
-            // The destination staging directory is unusable (e.g. `--out` has a
-            // missing/unwritable parent).  Surface the RETRIEVAL diagnostic
-            // first — verify into a discard sink — so a store/auth/malformed
-            // handle is reported as such rather than masked by an output error.
-            let mut sink = std::io::sink();
-            match ps.get_to_writer(handle, operator, &mut sink) {
-                Err(GetStreamError::Get(e)) => exit_get_error(e),
-                // Retrieval succeeded (sink writes never fail), so the failure is
-                // genuinely the destination.
-                _ => exit_output_error(
-                    err_code,
-                    format!("failed to stage bytes for {dest_label}: {create_err}"),
-                ),
-            }
+    // Surfaces the RETRIEVAL diagnostic first when temp creation fails — verify
+    // into a discard sink so a store/auth/malformed handle is reported as such
+    // rather than masked by a staging error.  Returns only when retrieval would
+    // have succeeded; otherwise exits with the get error.
+    let stage_failed = |create_err: std::io::Error| -> ! {
+        let mut sink = std::io::sink();
+        match ps.get_to_writer(handle, operator, &mut sink) {
+            Err(GetStreamError::Get(e)) => exit_get_error(e),
+            // Retrieval succeeded (sink writes never fail), so the failure is
+            // genuinely the staging destination.
+            _ => exit_output_error(
+                err_code,
+                format!("failed to stage bytes for {dest_label}: {create_err}"),
+            ),
         }
     };
 
-    let write_result = ps.get_to_writer(handle, operator, tmp.as_file_mut());
-    // Keep the verified `NamedTempFile` (and its open descriptor) BOUND through
-    // the release step: do not convert it to a bare path and reopen, which would
-    // let another local process swap the staging entry between verification and
-    // release.  `process::exit` skips the destructor, so the temp is removed
-    // explicitly (via `close()`/`PersistError`) on every exit path.
-
-    match write_result {
-        Ok(_) if out.is_some() => {
-            // --out: atomically persist the verified temp onto the destination
-            // (rename of the SAME file object, replacing an existing file).
-            let out_path = out.expect("out.is_some() checked");
-            if let Err(e) = tmp.persist(out_path) {
-                let _ = e.file.close(); // remove the staged temp
-                exit_output_error(
-                    err_code,
-                    format!("failed to write bytes to {dest_label}: {}", e.error),
-                );
+    if let Some(out_path) = out {
+        // --out: stage a NAMED temp in the destination directory so the final
+        // release is an in-directory atomic rename onto the destination.  Keep
+        // the verified `NamedTempFile` (and its open descriptor) BOUND through
+        // the release step: do not convert it to a bare path and reopen, which
+        // would let another local process swap the staging entry between
+        // verification and release.  `process::exit` skips the destructor, so
+        // the temp is removed explicitly (via `close()`/`PersistError`).
+        let stage_dir = out_path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+        let mut tmp = match tempfile::Builder::new()
+            .prefix(".eg-")
+            .suffix(".partial")
+            .tempfile_in(&stage_dir)
+        {
+            Ok(t) => t,
+            Err(create_err) => stage_failed(create_err),
+        };
+        match ps.get_to_writer(handle, operator, tmp.as_file_mut()) {
+            Ok(_) => {
+                // Atomically persist the verified temp onto the destination
+                // (rename of the SAME file object, replacing an existing file).
+                if let Err(e) = tmp.persist(out_path) {
+                    let _ = e.file.close(); // remove the staged temp
+                    exit_output_error(
+                        err_code,
+                        format!("failed to write bytes to {dest_label}: {}", e.error),
+                    );
+                }
             }
-        }
-        Ok(_) => {
-            // stdout: rewind the SAME open descriptor and stream it out (no
-            // reopen by path), then remove the temp.
-            let result = (|| -> std::io::Result<()> {
-                use std::io::Seek as _;
-                tmp.as_file_mut().seek(std::io::SeekFrom::Start(0))?;
-                let stdout = std::io::stdout();
-                let mut lock = stdout.lock();
-                std::io::copy(tmp.as_file_mut(), &mut lock)?;
-                Ok(())
-            })();
-            let _ = tmp.close(); // remove the staged temp
-            if let Err(e) = result {
+            Err(GetStreamError::Get(e)) => {
+                let _ = tmp.close();
+                exit_get_error(e);
+            }
+            Err(GetStreamError::Output(e)) => {
+                let _ = tmp.close();
                 exit_output_error(
                     err_code,
                     format!("failed to write bytes to {dest_label}: {e}"),
                 );
             }
         }
-        Err(GetStreamError::Get(e)) => {
-            let _ = tmp.close();
-            exit_get_error(e);
-        }
-        Err(GetStreamError::Output(e)) => {
-            let _ = tmp.close();
-            exit_output_error(
+    } else {
+        // stdout: stage into an ANONYMOUS temp file (unlinked at creation) so a
+        // crash or kill never leaves a `.eg-*.partial` entry behind in the
+        // system temp dir.  Verify-before-release still holds — nothing reaches
+        // stdout until the full verified copy lands in the temp, which is then
+        // rewound and streamed out.  The anonymous inode is reclaimed by the OS
+        // on process exit, so no explicit cleanup is needed on the exit paths.
+        let mut tmp = match tempfile::tempfile() {
+            Ok(t) => t,
+            Err(create_err) => stage_failed(create_err),
+        };
+        match ps.get_to_writer(handle, operator, &mut tmp) {
+            Ok(_) => {
+                let result = (|| -> std::io::Result<()> {
+                    use std::io::Seek as _;
+                    tmp.seek(std::io::SeekFrom::Start(0))?;
+                    let stdout = std::io::stdout();
+                    let mut lock = stdout.lock();
+                    std::io::copy(&mut tmp, &mut lock)?;
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    exit_output_error(
+                        err_code,
+                        format!("failed to write bytes to {dest_label}: {e}"),
+                    );
+                }
+            }
+            Err(GetStreamError::Get(e)) => exit_get_error(e),
+            Err(GetStreamError::Output(e)) => exit_output_error(
                 err_code,
                 format!("failed to write bytes to {dest_label}: {e}"),
-            );
+            ),
         }
     }
 }
