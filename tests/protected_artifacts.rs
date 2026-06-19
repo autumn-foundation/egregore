@@ -232,7 +232,12 @@ fn get_resolves_after_sources_moved_or_deleted_with_hash_verification() {
     let manifest_lines: Vec<String> = src_paths
         .iter()
         .zip(classes.iter())
-        .map(|(p, c)| format!(r#"{{"class":"{}","source_path":"{}"}}"#, c, p.display()))
+        .map(|(p, c)| {
+            // Serialize with serde_json so the path is JSON-escaped; on Windows a
+            // raw `display()` path (`C:\Users\...`) would produce invalid JSON
+            // escapes and the capture would reject the manifest.
+            serde_json::json!({ "class": c, "source_path": p }).to_string()
+        })
         .collect();
     let manifest_path = src_dir.path().join("capture.jsonl");
     fs::write(&manifest_path, manifest_lines.join("\n") + "\n").unwrap();
@@ -560,14 +565,11 @@ fn capture_unsupported_payload_class() {
     fs::write(&src_file, b"hello world").unwrap();
 
     let manifest_path = src.path().join("manifest.jsonl");
-    fs::write(
-        &manifest_path,
-        format!(
-            r#"{{"class":"llm_inference_log","source_path":"{}"}}"#,
-            src_file.display()
-        ) + "\n",
-    )
-    .unwrap();
+    // Serialize with serde_json so the path is JSON-escaped (Windows backslash
+    // paths would otherwise form invalid JSON escapes).
+    let manifest_line =
+        serde_json::json!({ "class": "llm_inference_log", "source_path": src_file }).to_string();
+    fs::write(&manifest_path, manifest_line + "\n").unwrap();
 
     let output = eg()
         .args(["protected", "capture"])
