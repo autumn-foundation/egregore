@@ -1127,7 +1127,21 @@ impl ProtectedStore {
                     ),
                 ));
             }
-            self.read_operators()?
+            let loaded = self.read_operators()?;
+            // An EMPTY ACL on a store that already has manifest records is also
+            // treated as tampering: rewriting it with only the current producer
+            // would authorize them for every previously captured handle.
+            if loaded.is_empty() && !existing.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "operators.jsonl is empty on an initialized store with records at {}; \
+                         refusing to reinitialize the ACL (the store may have been tampered with)",
+                        self.root.display()
+                    ),
+                ));
+            }
+            loaded
         } else {
             // No manifest → a genuinely new (or being-initialized) store.  Do NOT
             // import a stale/orphaned operators.jsonl (left by partial deletion or
@@ -1399,13 +1413,13 @@ impl ProtectedStore {
         // them to retrieve every previously captured handle without storing
         // anything new.
         if enabled && mutated {
-            // Preflight the ACL (operators) growth, then write the ACL BEFORE the
-            // manifest.  Handle registration (the manifest) is the LAST durable
-            // commit, so the new producer's authorization is durable before the
-            // handles exist: if the manifest write then fails, `blob_txn` rolls
-            // back the new blobs and the handles simply do not exist, rather than
-            // leaving committed-but-unauthorizable handles that a rerun with
-            // since-deleted (ephemeral) sources could never repair.
+            // Write the ACL before the manifest so authorization is durable
+            // before the handles exist, then roll the ACL BACK if the manifest
+            // write fails.  This keeps the ACL and manifest in the same
+            // commit/rollback boundary: on success both are durable; on failure
+            // the blobs roll back, the handles do not exist, AND the producer is
+            // not left authorized for the store's pre-existing handles.
+            let original_ops = ops.clone();
             let mut projected_ops = ops;
             projected_ops.push(producer_id.to_owned());
             check_within_read_cap(
@@ -1414,11 +1428,13 @@ impl ProtectedStore {
             )?;
             self.write_operators(&projected_ops)?;
 
-            // Persist the de-duplicated manifest last.  If this fails (including
-            // the manifest exceeding the read cap), `blob_txn`'s drop removes the
-            // blobs newly written by this capture, so no orphaned payload bytes
-            // are left behind and the new handles are simply absent.
-            self.write_manifest(&existing)?;
+            if let Err(e) = self.write_manifest(&existing) {
+                // Restore the ACL to its pre-capture state (best effort) so a
+                // failed capture does not leave the producer authorized.  `blob_txn`
+                // drops here and rolls back the newly written blobs.
+                let _ = self.write_operators(&original_ops);
+                return Err(e);
+            }
             blob_txn.commit();
         }
 
@@ -3333,6 +3349,34 @@ mod tests {
         assert!(
             !dir.path().join("operators.jsonl").exists(),
             "the ACL must not be reinitialized on failure"
+        );
+    }
+
+    #[test]
+    fn capture_fails_closed_when_acl_empty_on_initialized_store() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"content").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+
+        // Truncate the ACL to empty while the manifest keeps its records.
+        fs::write(dir.path().join("operators.jsonl"), "").unwrap();
+
+        let err = store
+            .capture(&entries, "op-2", "0.1.0", fixed_ts(), true)
+            .expect_err("capture must fail closed when the ACL is empty");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("empty on an initialized store"),
+            "err must explain the empty ACL: {err}"
         );
     }
 

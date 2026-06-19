@@ -9105,15 +9105,6 @@ fn decide_cmd(
 
 // ── eg protected ──────────────────────────────────────────────────────────────
 
-/// Streams the verified `temp_path` snapshot to stdout.
-fn deliver_to_stdout(temp_path: &Path) -> std::io::Result<()> {
-    let mut f = fs::File::open(temp_path)?;
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    std::io::copy(&mut f, &mut lock)?;
-    Ok(())
-}
-
 /// Implements `eg protected get`: retrieves the verified payload to `out` (a
 /// file) or stdout without buffering the whole payload in memory.
 ///
@@ -9168,29 +9159,37 @@ fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Pa
     };
 
     let write_result = ps.get_to_writer(handle, operator, tmp.as_file_mut());
-    // Take ownership of the temp PATH so it can be explicitly removed before any
-    // `process::exit` (which would otherwise skip the destructor and leak the
-    // staged `.eg-*.partial` file containing verified raw payload bytes).
-    let temp_path = tmp.into_temp_path();
+    // Keep the verified `NamedTempFile` (and its open descriptor) BOUND through
+    // the release step: do not convert it to a bare path and reopen, which would
+    // let another local process swap the staging entry between verification and
+    // release.  `process::exit` skips the destructor, so the temp is removed
+    // explicitly (via `close()`/`PersistError`) on every exit path.
 
     match write_result {
         Ok(_) if out.is_some() => {
-            // --out: rename the verified temp onto the destination.
+            // --out: atomically persist the verified temp onto the destination
+            // (rename of the SAME file object, replacing an existing file).
             let out_path = out.expect("out.is_some() checked");
-            if let Err(e) = crate::protected::rename_into_place(&temp_path, out_path) {
-                let _ = fs::remove_file(&temp_path);
+            if let Err(e) = tmp.persist(out_path) {
+                let _ = e.file.close(); // remove the staged temp
                 exit_output_error(
                     err_code,
-                    format!("failed to write bytes to {dest_label}: {e}"),
+                    format!("failed to write bytes to {dest_label}: {}", e.error),
                 );
             }
-            // Renamed away; disarm the temp's auto-delete.
-            let _ = temp_path.keep();
         }
         Ok(_) => {
-            // stdout: stream the verified temp out, then remove it.
-            let result = deliver_to_stdout(&temp_path);
-            let _ = fs::remove_file(&temp_path);
+            // stdout: rewind the SAME open descriptor and stream it out (no
+            // reopen by path), then remove the temp.
+            let result = (|| -> std::io::Result<()> {
+                use std::io::Seek as _;
+                tmp.as_file_mut().seek(std::io::SeekFrom::Start(0))?;
+                let stdout = std::io::stdout();
+                let mut lock = stdout.lock();
+                std::io::copy(tmp.as_file_mut(), &mut lock)?;
+                Ok(())
+            })();
+            let _ = tmp.close(); // remove the staged temp
             if let Err(e) = result {
                 exit_output_error(
                     err_code,
@@ -9199,11 +9198,11 @@ fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Pa
             }
         }
         Err(GetStreamError::Get(e)) => {
-            let _ = fs::remove_file(&temp_path);
+            let _ = tmp.close();
             exit_get_error(e);
         }
         Err(GetStreamError::Output(e)) => {
-            let _ = fs::remove_file(&temp_path);
+            let _ = tmp.close();
             exit_output_error(
                 err_code,
                 format!("failed to write bytes to {dest_label}: {e}"),
