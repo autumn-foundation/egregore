@@ -441,7 +441,16 @@ fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
     {
         let _ = fs::remove_file(path);
     }
-    fs::rename(&tmp_path, path)
+    // On rename failure (e.g. the destination already exists as a directory),
+    // remove the staged temp file before returning.  For protected blob writes
+    // the temp file holds raw payload bytes; leaving `<store>/blobs/.<hash>.wip`
+    // behind would leak payload bytes that no manifest record references even
+    // though capture reports failure.
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 // ── Store-level advisory lock ──────────────────────────────────────────────────
@@ -494,6 +503,47 @@ impl StoreLock {
 impl Drop for StoreLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+// ── Blob write transaction ──────────────────────────────────────────────────────
+
+/// Tracks blobs newly written during a single `capture` so they can be rolled
+/// back if the capture fails before it commits.
+///
+/// A capture writes blobs, then `manifest.jsonl`, then `operators.jsonl`.  If a
+/// commit step fails (e.g. the manifest would exceed the read cap, or an I/O
+/// error), the new blob bytes would otherwise be left in `<store>/blobs` with no
+/// manifest record referencing them.  This guard removes those orphans on drop
+/// unless [`Self::commit`] was called once the manifest is durably written.
+///
+/// Only *new-handle* blobs are tracked.  Repair writes overwrite a blob path
+/// that an existing (retained) manifest record already references, so removing
+/// them on rollback would dangle the prior on-disk manifest.
+#[derive(Debug, Default)]
+struct BlobTxn {
+    blobs: Vec<PathBuf>,
+    committed: bool,
+}
+
+impl BlobTxn {
+    fn track(&mut self, blob: PathBuf) {
+        self.blobs.push(blob);
+    }
+
+    /// Marks the new blobs as durably referenced; suppresses rollback on drop.
+    const fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for BlobTxn {
+    fn drop(&mut self) {
+        if !self.committed {
+            for blob in &self.blobs {
+                let _ = fs::remove_file(blob);
+            }
+        }
     }
 }
 
@@ -724,17 +774,25 @@ impl ProtectedStore {
         Ok(ops)
     }
 
-    /// Writes the canonical operators file.
-    fn write_operators(&self, ops: &[String]) -> io::Result<()> {
-        let dir = &self.root;
-        create_private_dir(dir)?;
+    /// Serializes the operators file's canonical content (sorted, de-duplicated).
+    ///
+    /// Shared by [`Self::write_operators`] and the capture preflight so the size
+    /// checked before committing the manifest matches the bytes actually written.
+    fn serialize_operators(ops: &[String]) -> String {
         let mut lines: Vec<String> = ops
             .iter()
             .map(|o| serde_json::to_string(o).expect("operator serialisation is infallible"))
             .collect();
         lines.sort_unstable();
         lines.dedup();
-        let content = format!("{}\n", lines.join("\n"));
+        format!("{}\n", lines.join("\n"))
+    }
+
+    /// Writes the canonical operators file.
+    fn write_operators(&self, ops: &[String]) -> io::Result<()> {
+        let dir = &self.root;
+        create_private_dir(dir)?;
+        let content = Self::serialize_operators(ops);
         check_within_read_cap(&content, "operators.jsonl")?;
         write_private_file(&self.operators_path(), content.as_bytes())
     }
@@ -817,11 +875,17 @@ impl ProtectedStore {
         } else {
             Vec::new()
         };
-        let mut ops: Vec<String> = if enabled {
+        let ops: Vec<String> = if enabled {
             self.read_operators()?
         } else {
             Vec::new()
         };
+
+        // Rolls back blobs newly written by this capture if any later step (a
+        // subsequent blob write, the manifest commit, or the ACL preflight)
+        // fails before the manifest is durable.  Declared after `_lock` so it
+        // drops — and cleans up — while the store lock is still held.
+        let mut blob_txn = BlobTxn::default();
 
         for entry in entries {
             // Validate payload class first.
@@ -940,12 +1004,16 @@ impl ProtectedStore {
                     return true; // different handle — always keep
                 }
                 // Same handle: require all metadata fields to be internally
-                // consistent.  Fields in the handle identity (class, content_hash,
-                // source_path) are verified by recomputing the handle; fields
-                // outside that identity (byte_len, schema_version) are checked
-                // directly against the ground-truth values from the source read.
-                // A tampered byte_len or schema_version causes the record to be
-                // dropped so re-capture replaces it with a valid copy.
+                // consistent AND schema-valid.  Identity fields (class,
+                // content_hash, source_path) are verified by recomputing the
+                // handle; non-identity fields are checked directly against
+                // ground truth (byte_len, schema_version) or for schema validity
+                // (captured_at must be RFC 3339, producer_id must be non-empty).
+                // A record that keeps the right handle but carries an invalid
+                // captured_at or empty producer_id is dropped so re-capture
+                // replaces it with a valid copy, rather than being preserved via
+                // the `already_exists` path and leaving `protected list` emitting
+                // a schema-violating record.
                 ProtectedHandle::compute_handle(
                     &h.source_class,
                     &h.content_hash,
@@ -953,6 +1021,8 @@ impl ProtectedStore {
                 ) == h.handle
                     && h.byte_len == byte_len
                     && h.schema_version == PROTECTED_SCHEMA_VERSION
+                    && chrono::DateTime::parse_from_rfc3339(&h.captured_at).is_ok()
+                    && !h.producer_id.trim().is_empty()
             });
             let already_exists = existing.iter().any(|h| h.handle == handle);
             if already_exists {
@@ -982,10 +1052,13 @@ impl ProtectedStore {
                     write_private_file(&blob, &bytes)?;
                 }
             } else {
-                // New handle: write blob and register.
+                // New handle: write blob and register.  Track the blob so it is
+                // rolled back if a later step fails before the manifest commits.
                 let blobs = self.checked_blobs_dir()?;
                 create_private_dir(&blobs)?;
-                write_private_file(&blobs.join(&content_hash), &bytes)?;
+                let blob_path = blobs.join(&content_hash);
+                write_private_file(&blob_path, &bytes)?;
+                blob_txn.track(blob_path);
 
                 let record = ProtectedHandle {
                     handle: handle.clone(),
@@ -1013,13 +1086,34 @@ impl ProtectedStore {
         }
 
         if enabled {
-            // Persist de-duplicated manifest.
+            // Preflight the ACL (operators) growth BEFORE committing the
+            // manifest.  Adding this producer to a near-cap operators.jsonl could
+            // push it over MAX_STORE_FILE_BYTES; without this check the manifest
+            // (and blobs) would commit and only the final ACL write would fail,
+            // leaving retrievable handles that do not authorize the producer.
+            // On failure here `blob_txn` rolls back the new blobs.
+            let mut projected_ops = ops;
+            projected_ops.push(producer_id.to_owned());
+            check_within_read_cap(
+                &Self::serialize_operators(&projected_ops),
+                "operators.jsonl",
+            )?;
+
+            // Persist de-duplicated manifest.  If this fails (including the
+            // manifest exceeding the read cap), `blob_txn`'s drop removes the
+            // blobs newly written by this capture so the store is never left with
+            // orphaned payload bytes that no manifest record references.
             self.write_manifest(&existing)?;
-            // Record producer as an authorised operator.  The operators list was
-            // loaded upfront (before any blob/manifest writes) so a corrupt
-            // operators.jsonl is caught before the store is mutated.
-            ops.push(producer_id.to_owned());
-            self.write_operators(&ops)?;
+
+            // Manifest is durable and references the new blobs — they must
+            // persist now, so commit the transaction before the ACL write.
+            blob_txn.commit();
+
+            // Record producer as an authorised operator.  Size was preflighted
+            // above, so this can only fail on a genuine I/O error; the manifest +
+            // blobs are already committed and an idempotent re-run retries the
+            // ACL write, so they are left in place rather than orphaned.
+            self.write_operators(&projected_ops)?;
         }
 
         Ok(CaptureReport {
@@ -2297,6 +2391,147 @@ mod tests {
         assert!(
             matches!(err, GetError::MissingProtectedPayload { .. }),
             "symlinked blobs dir must map to MissingProtectedPayload, got {err:?}"
+        );
+    }
+
+    // ── Unit: invalid non-identity metadata is repaired on recapture (finding 1)
+
+    #[test]
+    fn recapture_replaces_record_with_invalid_captured_at_or_empty_producer() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"hello world").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        // Initial valid capture.
+        store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+
+        // Tamper the record's non-identity fields to schema-invalid values while
+        // leaving the handle / content_hash / source_path / byte_len intact, so
+        // the record still recomputes to the same handle.
+        let manifest_path = dir.path().join("manifest.jsonl");
+        let line = fs::read_to_string(&manifest_path).unwrap();
+        let mut rec: ProtectedHandle = serde_json::from_str(line.trim()).unwrap();
+        rec.captured_at = "not-a-date".to_owned();
+        rec.producer_id = String::new();
+        fs::write(&manifest_path, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
+
+        // Re-capture with a valid producer + timestamp must DROP the invalid
+        // record and replace it, rather than preserving it via already_exists.
+        let valid_ts = "2026-07-01T12:00:00Z";
+        store
+            .capture(&entries, "op-2", "0.1.0", valid_ts, true)
+            .unwrap();
+
+        let after_line = fs::read_to_string(&manifest_path).unwrap();
+        let after: ProtectedHandle = serde_json::from_str(after_line.trim()).unwrap();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&after.captured_at).is_ok(),
+            "captured_at must be repaired to RFC 3339, got {:?}",
+            after.captured_at
+        );
+        assert_eq!(after.captured_at, valid_ts);
+        assert_eq!(
+            after.producer_id, "op-2",
+            "empty producer_id must be repaired on recapture"
+        );
+    }
+
+    // ── Unit: temp file is removed when a protected write fails (finding 3) ────
+
+    #[test]
+    fn write_private_file_cleans_up_temp_on_rename_failure() {
+        let dir = tempdir().unwrap();
+        // Destination already exists as a directory, so rename(file → dir) fails.
+        let dest = dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let err = write_private_file(&dest, b"payload bytes")
+            .expect_err("write must fail when destination is a directory");
+
+        // The staged temp sibling must not leak raw payload bytes.
+        let tmp = dir.path().join(".dest.wip");
+        assert!(
+            !tmp.exists(),
+            "temp file must be removed on rename failure ({err})"
+        );
+    }
+
+    // ── Unit: BlobTxn rolls back uncommitted blobs (findings 2 + 4) ───────────
+
+    #[test]
+    fn blob_txn_rolls_back_uncommitted_and_keeps_committed() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.blob");
+        let b = dir.path().join("b.blob");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+
+        // Dropped without commit → tracked blobs removed.
+        {
+            let mut txn = BlobTxn::default();
+            txn.track(a.clone());
+            txn.track(b.clone());
+        }
+        assert!(!a.exists(), "uncommitted blob a must be rolled back");
+        assert!(!b.exists(), "uncommitted blob b must be rolled back");
+
+        // Committed → blob kept.
+        let c = dir.path().join("c.blob");
+        fs::write(&c, b"c").unwrap();
+        {
+            let mut txn = BlobTxn::default();
+            txn.track(c.clone());
+            txn.commit();
+        }
+        assert!(c.exists(), "committed blob must be kept");
+    }
+
+    // ── Unit: failed manifest commit rolls back the new blob (findings 2 + 4) ─
+
+    #[test]
+    fn capture_rolls_back_new_blob_when_manifest_write_fails() {
+        let dir = tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        fs::create_dir_all(&store_root).unwrap();
+        let store = ProtectedStore::new(&store_root);
+
+        // Place a directory at the manifest temp path so write_manifest's
+        // create_new open fails AFTER the blob has been written and tracked.
+        fs::create_dir(store_root.join(".manifest.jsonl.wip")).unwrap();
+
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"rollback me").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        let result = store.capture(&entries, "op-1", "0.1.0", fixed_ts(), true);
+        assert!(
+            result.is_err(),
+            "capture must fail when the manifest write fails"
+        );
+
+        // No orphaned blob may remain: the new blob must have been rolled back.
+        let blobs = store_root.join("blobs");
+        let remaining: Vec<PathBuf> = fs::read_dir(&blobs)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            remaining.is_empty(),
+            "new blob must be rolled back on manifest write failure, found: {remaining:?}"
         );
     }
 
