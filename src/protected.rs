@@ -359,6 +359,28 @@ fn check_within_read_cap(content: &str, what: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Verifies `path` is a real directory or genuinely absent (no-follow).
+///
+/// Rejects a symlink, regular file, FIFO, or device at `path` with an
+/// `InvalidData` error so a tampered or shared store cannot redirect writes or
+/// reads outside the intended boundary via a symlinked directory component.
+/// `NotFound` is allowed: the directory is created lazily on first write.
+fn require_real_dir_or_absent(path: &Path, what: &str) -> io::Result<()> {
+    match path.symlink_metadata() {
+        Ok(m) if m.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{what} at {} is not a real directory (symlink/file/device); \
+                 the store may have been tampered with",
+                path.display()
+            ),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn create_private_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -404,6 +426,22 @@ fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
     // will fail instead.
     let _ = fs::remove_file(&tmp_path);
 
+    // Stage the bytes into the temp file and atomically rename into place.  Any
+    // error after the temp file is created (a failed `write_all` on a full or
+    // interrupted filesystem, or a failed `rename`) must not leak the staged
+    // temp file: for protected blob writes it holds raw payload bytes, and
+    // leaving `<store>/blobs/.<hash>.wip` behind would persist payload bytes
+    // that no manifest record references even though capture reports failure.
+    let staged = stage_and_rename(&tmp_path, path, data);
+    if staged.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    staged
+}
+
+/// Creates `tmp_path` (`O_CREAT`|`O_EXCL`, mode 0o600 on Unix), writes `data`,
+/// and renames it over `path`.  The caller removes `tmp_path` on any error.
+fn stage_and_rename(tmp_path: &Path, path: &Path, data: &[u8]) -> io::Result<()> {
     // Open the temp file with O_CREAT|O_EXCL (create_new) so the open fails
     // rather than following a symlink that appears between the remove and this
     // open.  On Unix we also set mode 0o600 (owner-only).
@@ -415,7 +453,7 @@ fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&tmp_path)?;
+            .open(tmp_path)?;
         f.write_all(data)?;
     }
     #[cfg(not(unix))]
@@ -424,7 +462,7 @@ fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&tmp_path)?;
+            .open(tmp_path)?;
         f.write_all(data)?;
     }
 
@@ -441,16 +479,7 @@ fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
     {
         let _ = fs::remove_file(path);
     }
-    // On rename failure (e.g. the destination already exists as a directory),
-    // remove the staged temp file before returning.  For protected blob writes
-    // the temp file holds raw payload bytes; leaving `<store>/blobs/.<hash>.wip`
-    // behind would leak payload bytes that no manifest record references even
-    // though capture reports failure.
-    if let Err(e) = fs::rename(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-    Ok(())
+    fs::rename(tmp_path, path)
 }
 
 // ── Store-level advisory lock ──────────────────────────────────────────────────
@@ -601,19 +630,20 @@ impl ProtectedStore {
     /// created lazily by [`create_private_dir`] on first write.
     fn checked_blobs_dir(&self) -> io::Result<PathBuf> {
         let dir = self.blobs_dir();
-        match dir.symlink_metadata() {
-            Ok(m) if m.file_type().is_dir() => Ok(dir),
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "blobs path at {} is not a real directory (symlink/file/device); \
-                     the store may have been tampered with",
-                    dir.display()
-                ),
-            )),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(dir),
-            Err(e) => Err(e),
-        }
+        require_real_dir_or_absent(&dir, "blobs path")?;
+        Ok(dir)
+    }
+
+    /// Verifies the store root is a real directory (not a symlink) before it is
+    /// created or used for the lock, manifest, operators, and blobs.
+    ///
+    /// If `<store>` itself is a symlink to another directory, every nested path
+    /// (`.store.lock`, `manifest.jsonl`, `operators.jsonl`, `blobs/…`) resolves
+    /// through it, so enabled capture would write protected raw bytes outside the
+    /// intended store boundary.  An absent root (`NotFound`) is allowed — it is
+    /// created lazily as a real directory on first write.
+    fn checked_root(&self) -> io::Result<()> {
+        require_real_dir_or_absent(&self.root, "store root")
     }
 
     /// Returns `true` when the manifest path exists in any form.
@@ -858,6 +888,9 @@ impl ProtectedStore {
         // function.  On process kill, the lock file (.store.lock) is left
         // behind; the operator can remove it manually.
         if enabled {
+            // Reject a symlinked store root before creating it or resolving the
+            // lock / manifest / operators / blobs through it.
+            self.checked_root()?;
             create_private_dir(&self.root)?;
         }
         let _lock: Option<StoreLock> = if enabled {
@@ -1024,6 +1057,13 @@ impl ProtectedStore {
                     && chrono::DateTime::parse_from_rfc3339(&h.captured_at).is_ok()
                     && !h.producer_id.trim().is_empty()
             });
+            // Validate the blobs directory (no-follow) BEFORE any blob read,
+            // check, or write — including the existing-handle fast path — so a
+            // symlinked `<store>/blobs` is rejected consistently with `get`,
+            // rather than the fast path reading through the symlink and
+            // reporting recapture success for a store `get` still rejects.
+            let blobs = self.checked_blobs_dir()?;
+            let blob = blobs.join(&content_hash);
             let already_exists = existing.iter().any(|h| h.handle == handle);
             if already_exists {
                 // Handle already registered: repair the blob if it is missing,
@@ -1032,7 +1072,6 @@ impl ProtectedStore {
                 // on a FIFO or exhausting memory via a symlink to `/dev/zero`;
                 // non-regular paths are unconditionally treated as needing repair
                 // so `get` cannot later block on the same path.
-                let blob = self.blob_path(&content_hash);
                 let needs_repair = match blob.symlink_metadata() {
                     Err(_) => true,                            // missing
                     Ok(m) if !m.file_type().is_file() => true, // symlink / FIFO / device
@@ -1047,18 +1086,21 @@ impl ProtectedStore {
                     }),
                 };
                 if needs_repair {
-                    let blobs = self.checked_blobs_dir()?;
                     create_private_dir(&blobs)?;
                     write_private_file(&blob, &bytes)?;
                 }
             } else {
-                // New handle: write blob and register.  Track the blob so it is
-                // rolled back if a later step fails before the manifest commits.
-                let blobs = self.checked_blobs_dir()?;
+                // New handle: write blob and register.  Only track the blob for
+                // rollback if it did NOT already exist on disk: two handles can
+                // share one content-addressed blob (identical bytes from a
+                // different source path/class), so a blob that already backs an
+                // existing handle must survive a rollback of this capture.
                 create_private_dir(&blobs)?;
-                let blob_path = blobs.join(&content_hash);
-                write_private_file(&blob_path, &bytes)?;
-                blob_txn.track(blob_path);
+                let blob_preexisting = blob.symlink_metadata().is_ok();
+                write_private_file(&blob, &bytes)?;
+                if !blob_preexisting {
+                    blob_txn.track(blob.clone());
+                }
 
                 let record = ProtectedHandle {
                     handle: handle.clone(),
@@ -2532,6 +2574,133 @@ mod tests {
         assert!(
             remaining.is_empty(),
             "new blob must be rolled back on manifest write failure, found: {remaining:?}"
+        );
+    }
+
+    // ── Unit: rollback preserves a blob shared with an existing handle (A) ────
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_preserves_blob_shared_with_existing_handle() {
+        let dir = tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        fs::create_dir_all(&store_root).unwrap();
+        let store = ProtectedStore::new(&store_root);
+
+        // Capture P1 → handle1 backed by blob H.
+        let p1 = dir.path().join("p1.txt");
+        fs::write(&p1, b"shared bytes").unwrap();
+        let r1 = store
+            .capture(
+                &[CaptureEntry {
+                    class: "report".to_owned(),
+                    source_path: p1.to_string_lossy().into_owned(),
+                }],
+                "op-1",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap();
+        let handle1 = r1.entries[0].handle.clone();
+        let blob = store_root.join("blobs").join(&r1.entries[0].content_hash);
+        assert!(blob.exists());
+
+        // Force the next manifest write to fail after the blob step.
+        fs::create_dir(store_root.join(".manifest.jsonl.wip")).unwrap();
+
+        // Capture P2 — same bytes, different source path → new handle sharing
+        // blob H.  The manifest write fails and the capture rolls back.
+        let p2 = dir.path().join("p2.txt");
+        fs::write(&p2, b"shared bytes").unwrap();
+        let r2 = store.capture(
+            &[CaptureEntry {
+                class: "report".to_owned(),
+                source_path: p2.to_string_lossy().into_owned(),
+            }],
+            "op-1",
+            "0.1.0",
+            fixed_ts(),
+            true,
+        );
+        assert!(r2.is_err(), "capture must fail when manifest write fails");
+
+        // The shared blob must survive — handle1 stays retrievable.
+        assert!(
+            blob.exists(),
+            "blob shared with handle1 must not be rolled back"
+        );
+        let bytes = store
+            .get(&handle1, "op-1")
+            .expect("handle1 must still resolve");
+        assert_eq!(bytes, b"shared bytes");
+    }
+
+    // ── Unit: recapture rejects a symlinked blobs dir on the fast path (B) ────
+
+    #[cfg(unix)]
+    #[test]
+    fn recapture_rejects_symlinked_blobs_dir_on_fast_path() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"original content").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .unwrap();
+
+        // Replace the real blobs dir with a symlink to a copy of itself.  The
+        // existing blob still matches, so without the fast-path check recapture
+        // would report success even though `get` rejects the symlinked store.
+        let real_blobs = dir.path().join("blobs");
+        let moved = dir.path().join("blobs_real");
+        fs::rename(&real_blobs, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &real_blobs).unwrap();
+
+        let err = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .expect_err("recapture must reject a symlinked blobs directory");
+        assert!(
+            err.to_string().contains("not a real directory"),
+            "err must mention the symlinked blobs dir: {err}"
+        );
+    }
+
+    // ── Unit: capture rejects a symlinked store root (D) ──────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_rejects_symlinked_store_root() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let root = dir.path().join("store");
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+        let store = ProtectedStore::new(&root);
+
+        let src = dir.path().join("payload.txt");
+        fs::write(&src, b"secret bytes").unwrap();
+        let entries = vec![CaptureEntry {
+            class: "report".to_owned(),
+            source_path: src.to_string_lossy().into_owned(),
+        }];
+
+        let err = store
+            .capture(&entries, "op-1", "0.1.0", fixed_ts(), true)
+            .expect_err("capture must reject a symlinked store root");
+        assert!(
+            err.to_string().contains("not a real directory"),
+            "err must mention the symlinked store root: {err}"
+        );
+        // Nothing may be written through the symlink into the target directory.
+        assert!(
+            fs::read_dir(&target).unwrap().next().is_none(),
+            "no files may be written through a symlinked store root"
         );
     }
 
