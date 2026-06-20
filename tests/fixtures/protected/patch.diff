@@ -1,0 +1,18 @@
+diff --git a/src/parser.rs b/src/parser.rs
+index abc1234..def5678 100644
+--- a/src/parser.rs
++++ b/src/parser.rs
+@@ -1,5 +1,12 @@
+ //! Parser orchestration.
+
++use tree_sitter::Parser;
++
+ pub fn parse(source: &[u8], language: &str) -> Option<tree_sitter::Tree> {
+-    None
++    let mut parser = Parser::new();
++    match language {
++        "rust" => parser.set_language(&tree_sitter_rust::LANGUAGE.into()).ok()?,
++        _ => return None,
++    }
++    parser.parse(source, None)
+ }

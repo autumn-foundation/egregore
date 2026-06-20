@@ -37,6 +37,10 @@ const SEMANTIC_MAX_CANDIDATE_MULTIPLIER: usize = 64;
 pub struct SemanticMatch {
     /// Stable codegraph record ID.
     pub record_id: String,
+    /// Node kind name (e.g. `File`, `Symbol`, `Observation`), enabling
+    /// trust-class separation between deterministic code hits and agent-authored
+    /// memory hits at query time (issue #91).
+    pub kind: Option<String>,
     /// Human-readable name when available.
     pub name: Option<String>,
     /// Repository-relative path when available.
@@ -429,6 +433,10 @@ impl EmbeddedAletheiaSink {
                 if !seen_record_ids.insert(record_id.clone()) {
                     continue;
                 }
+                let kind = node
+                    .get_property("kind")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
                 let name = node
                     .get_property("name")
                     .and_then(|v| v.as_str())
@@ -440,6 +448,7 @@ impl EmbeddedAletheiaSink {
                 let span = span_from_properties(|key| node.get_property(key));
                 results.push(SemanticMatch {
                     record_id,
+                    kind,
                     name,
                     repo_relative_path,
                     score,
@@ -1426,6 +1435,7 @@ impl EmbeddedAletheiaSink {
             semantic_drift,
             evidence_links,
             repository_identity,
+            source_snapshot,
             text,
             superseded_by,
             agent_id,
@@ -1582,6 +1592,11 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(identity.as_ref())
         {
             builder = builder.insert("repository_identity_json", json.as_str());
+        }
+        if let Some(snapshot) = source_snapshot
+            && let Ok(json) = serde_json::to_string(snapshot.as_ref())
+        {
+            builder = builder.insert("source_snapshot_json", json.as_str());
         }
         builder = insert_optional(builder, "text", text.as_deref());
         builder = insert_optional(builder, "superseded_by", superseded_by.as_deref());
@@ -2232,6 +2247,16 @@ impl EmbeddedAletheiaSink {
             .map_err(|e| {
                 read_back_error(record_id, format!("repository_identity_json invalid: {e}"))
             })?
+            .map(Box::new),
+            source_snapshot: optional_str_property(
+                record_id,
+                "source_snapshot_json",
+                node.get_property("source_snapshot_json"),
+            )?
+            .as_deref()
+            .map(serde_json::from_str::<crate::ir::SourceSnapshotPayload>)
+            .transpose()
+            .map_err(|e| read_back_error(record_id, format!("source_snapshot_json invalid: {e}")))?
             .map(Box::new),
             valid_time: optional_str_property(
                 record_id,

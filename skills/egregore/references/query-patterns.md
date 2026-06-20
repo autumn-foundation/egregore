@@ -27,7 +27,7 @@ grep '"summary":"daemon::handle_query mentions' graph.jsonl \
 Reading results:
 - **Callers** = scope of breakage if the signature changes
 - **Callees** = what your refactor must preserve behavior for
-- **Mentions** = constants, types, and error constructors your implementation depends on
+- **References** = constants, types, and error constructors your implementation depends on (non-call code uses)
 
 ---
 

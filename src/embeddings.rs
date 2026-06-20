@@ -105,6 +105,12 @@ impl EmbeddingVectorKey {
 }
 
 /// Selects agent-useful file and symbol summaries for semantic embedding.
+///
+/// Issue #91 also selects agent-memory observation-class nodes (`Observation`,
+/// `Decision`, `Failure`) so prior lessons, decisions, and failures become
+/// retrievable by meaning. These memory candidates are embedded into the same
+/// vector index; recall queries (`eg query semantic-memory`) keep them
+/// trust-separated from deterministic code hits at query time by node kind.
 #[must_use]
 pub fn embedding_candidates(records: &[GraphRecord]) -> Vec<EmbeddingCandidate> {
     let mut candidates = records
@@ -117,6 +123,17 @@ pub fn embedding_candidates(records: &[GraphRecord]) -> Vec<EmbeddingCandidate> 
     candidates
 }
 
+/// Returns the memory `target` class for an agent-memory observation-class node,
+/// or `None` for code-graph and other kinds (issue #91).
+const fn memory_target(kind: NodeKind) -> Option<&'static str> {
+    match kind {
+        NodeKind::Observation => Some("observation"),
+        NodeKind::Decision => Some("decision"),
+        NodeKind::Failure => Some("failure"),
+        _ => None,
+    }
+}
+
 fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
     let GraphRecord::Node {
         id,
@@ -125,11 +142,30 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         name,
         temporal,
         summary,
+        text,
         ..
     } = record
     else {
         return None;
     };
+
+    // Agent-memory observation-class nodes embed their authored body text so a
+    // lesson is retrievable by meaning even when it names no symbol (issue #91).
+    if let Some(target) = memory_target(*kind) {
+        let body = text.as_deref().unwrap_or("").trim();
+        if body.is_empty() {
+            // No meaningful content to embed; skip rather than embed a template.
+            return None;
+        }
+        return Some(EmbeddingCandidate {
+            record_id: id.clone(),
+            target: target.to_owned(),
+            text: body.to_owned(),
+            repo_relative_path: repo_relative_path.clone(),
+            name: name.clone(),
+            temporal: temporal.clone(),
+        });
+    }
 
     let target = match kind {
         NodeKind::File => "file",

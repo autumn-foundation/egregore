@@ -47,6 +47,81 @@ Use `eg query file <path>` when:
 
 - You know the file and want every symbol it defines, with record handles — a structural listing, not a ranked approximation.
 
+## Natural-language → evidence-backed context (`eg query semantic-context`, issue #90)
+
+`eg query semantic` *locates* code by meaning but returns only ranked leads.
+`eg query context <NAME>` *contextualizes* code but needs a symbol name you
+already know — and it cannot start from a file-typed hit. `eg query
+semantic-context` bridges the two: one read-only call takes a natural-language
+query and returns, per top-N match, the stable record ID, the repo-relative
+file/span handle, the relevance score, **and** the same five trust-separated
+context sections produced by `eg query context` (`source_facts`,
+`observations`, `project_state`, `artifacts`, `verification_evidence`, plus
+`topology_edges` and `unresolved`).
+
+### Shortest workflow
+
+```sh
+# one-time: build an embedded store with embeddings
+eg scan . --out graph.jsonl
+eg ingest graph.jsonl --adapter embedded --data-dir .egregore --embed
+
+# ask a question; get cited context for the top matches in one call
+eg query semantic-context "where does the tool measure similarity between code versions" --data-dir .egregore
+```
+
+Useful flags:
+
+- `--limit N` — number of matches to expand (bounded; **default 5**, smaller
+  than `eg query semantic` because each match expands to a full context bundle).
+- `--min-score F` — relevance floor in `[0.0, 1.0]` (**default 0.0**). Matches
+  scoring below it are dropped; when *no* match clears the floor the command
+  prints `{"ok":false,"error":{"code":"no_match",...}}` to stdout and exits `2`
+  — never an empty success or a hallucinated fallback. This floor only gates the
+  no-match diagnostic; it does **not** re-tune relevance (that is issue #58).
+
+### How file vs symbol matches differ
+
+Each match carries a `match_kind`:
+
+- `symbol` — anchored on a `Symbol` node; `source_facts` include the symbol and
+  its co-located file.
+- `file` — anchored on a `File` node (no symbol name). File matches are
+  first-class: the file plus the symbols it **defines** are seeded into
+  `source_facts`, and observations / artifacts / verification attached to those
+  are returned rather than the match being dropped.
+- `other` — any other embeddable node kind.
+
+When a match name resolves to more than one live symbol, `ambiguous` is `true`
+and `candidate_record_ids` lists **every** candidate — the workflow surfaces the
+ambiguity instead of silently picking one.
+
+Every returned row carries a stable record ID and a citable handle; rows whose
+evidence link has no resolvable target are surfaced under `unresolved` rather
+than emitting uncited prose. The five context sections carry the same fields as
+`eg query context` — including agent-facing summary text, observation text, and
+`OutputHandle` inline content bounded by the ingest-time 16 KiB ceiling and
+redaction policies applied at ingest. The answer is read-only and deterministic:
+identical queries against an unchanged store return byte-identical matches,
+sections, and ordering.
+
+### When to use which tool
+
+| You want… | Use |
+|---|---|
+| Code **and** what's known about it, from a vague question | **`eg query semantic-context`** |
+| Just *locate* code by meaning (ranked leads, no context) | `eg query semantic` |
+| Context when you **already know the symbol name** | `eg query context <NAME>` |
+| Blast radius of a change from a known symbol | change-impact (issue #76) |
+| Everything under a subsystem path prefix | subsystem scope (issue #83) |
+| An exact identifier or all literal occurrences | `rg` / `git grep`, then read |
+| Interactive navigation from a cursor in an editor | rust-analyzer / LSP |
+
+`eg query semantic-context` is the right default when you do **not** know where
+something lives and you want the cited context bundle, not just a location, and
+not the whole file. It consumes the existing semantic ranking and symbol-context
+contracts; it adds no new domain, schema, model, or LLM-generated answer.
+
 ## How to Run the Relevance Corpus
 
 ### Prerequisites

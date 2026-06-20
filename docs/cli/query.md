@@ -5,34 +5,46 @@ Query an existing graph JSONL for symbols, files, semantic drift records, or by 
 ## Synopsis
 
 ```text
-eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] [--format json|text]
-eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--format json|text]
-eg query file     <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--format json|text]
-eg query file     <PATH>  --data-dir <DIR>  [--repo <SELECTOR>] [--format json|text]
+eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query file     <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query file     <PATH>  --data-dir <DIR>  [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query drift            --graph <PATH>    [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query drift            --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
-eg query context  <NAME>  --graph <PATH>
+eg query semantic-context <QUERY> --data-dir <DIR> [--limit N] [--min-score F] [--repo <SELECTOR>]
+eg query semantic-memory <QUERY> --data-dir <DIR> [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
+eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>]
 eg query task     <HANDLE> --graph <PATH>
 eg query memory   <HANDLE> --graph <PATH>   [--verified-only]
 eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>]
+eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N]
 ```
 
 Evidence-backed audit subcommands have their own pages:
 
 - `eg query context` — evidence-backed context for a **symbol** (issue #38).
+- `eg query semantic-context` — **natural-language query → evidence-backed
+  context** for the top-N semantic matches in one call
+  ([semantic-search-guidance.md](semantic-search-guidance.md), issue #90).
 - `eg query task` — evidence for a **task** ([task-queries.md](task-queries.md), issue #48).
 - `eg query memory` — audit the evidence behind one **agent-authored memory
   claim** ([memory-audit.md](memory-audit.md), issue #64).
+- `eg query semantic-memory` — recall prior **agent memory by meaning** with
+  provenance, trust-separated from code
+  ([semantic-memory-recall.md](semantic-memory-recall.md), issue #91).
 - `eg query failures` — **prior failed attempts** linked to a code or task
   handle ([failure-history.md](failure-history.md), issue #63).
+- `eg query change-impact` — **graph-derived impact leads** grouped by relation
+  for a symbol or file handle, for blast-radius triage before editing
+  ([change-impact.md](change-impact.md), issue #76).
 
 Most subcommands accept exactly one input source:
 
 - `--graph <PATH>` — read from a JSONL file produced by `eg scan` or `eg scan-history`.
 - `--data-dir <DIR>` — read from an embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. Requires the `embedded-aletheiadb` feature (enabled by default). Providing both `--graph` and `--data-dir` is an error.
 
-`eg query semantic` accepts **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results.
+`eg query semantic`, `eg query semantic-context`, and `eg query semantic-memory` accept **only** `--data-dir`. The store must additionally have been populated with the `--embed` flag (`eg ingest --adapter embedded --data-dir <DIR> --embed`); a store without embeddings returns no results. `eg query semantic` returns only deterministic **code** hits; `eg query semantic-memory` returns only **agent-authored** memory hits — the two are never blended (issue #91). `eg query semantic-context` follows the `eg query context` no-match convention: on no semantic hit clearing `--min-score` it prints `{"ok":false,"error":{"code":"no_match",...}}` to **stdout** and exits `2`.
 
 ## Exit codes
 
@@ -51,6 +63,21 @@ One JSON object per line (JSONL). Field names are stable across releases. Machin
 ### `--format text`
 
 One human-readable line per result for terminal use. The exact format is not stable and must not be parsed by scripts.
+
+---
+
+## Store freshness (`--repo-path`, issue #82)
+
+`eg query symbol`, `eg query file`, and `eg query context` accept an optional
+`--repo-path <DIR>` pointing at a working tree. When set, each result carries a
+non-fatal `freshness` field with a stable code (`fresh` / `stale_head` /
+`stale_dirty` / `unknown`) computed by comparing the store's stamped
+[source snapshot](../schema/source-snapshot.md) against that working tree, so an
+agent can downgrade trust in a cited `repo_relative_path` + `span` handle. The
+result is **never suppressed** on a non-`fresh` verdict.
+
+Without `--repo-path` the `freshness` field is absent and output is unchanged.
+See [`freshness.md`](freshness.md) for the standalone store-level report.
 
 ---
 
