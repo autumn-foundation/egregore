@@ -3692,3 +3692,44 @@ fn edge_only_citation_to_absent_handle_is_unresolved() {
         .expect("an edge-only citation to an absent handle must be classified");
     assert_eq!(entry.verdict, FreshnessVerdict::Unresolved);
 }
+
+#[test]
+fn triple_inline_and_materialized_edge_classified_once() {
+    // A triple-only inline link (path/span, no record id) and the daemon-
+    // materialized standalone edge to the resolved record id are the SAME citation.
+    // The triple must resolve to the record id for the covered key so the edge is
+    // recognized as a duplicate and the citation is classified exactly once.
+    let path = "src/tri.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let obs = agent_memory_stable_id(&["obs", "tri_dup"]);
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        observation(
+            &obs,
+            "f does x",
+            "0.9",
+            None, // triple-only inline link
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+        citation_edge(&obs, &sym, EdgeLabel::Observes, "commit_a"),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let count = verdicts.iter().filter(|e| e.observation_id == obs).count();
+    assert_eq!(
+        count, 1,
+        "a triple inline link and its materialized edge are one citation"
+    );
+}

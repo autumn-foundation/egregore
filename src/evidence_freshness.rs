@@ -697,6 +697,55 @@ impl<'a> FreshnessIndex<'a> {
             _ => TripleResolution::Ambiguous,
         }
     }
+
+    /// Resolves a link's cited handle to a code node ID: the explicit
+    /// `target_record_id` first, then a `(path, span)` triple resolved at the
+    /// link's identity commit (falling back to the live frontier). Shared by
+    /// classification and the edge-dedupe key so a triple-only inline link and a
+    /// daemon-materialized record-ID edge for the *same* citation resolve to the
+    /// same ID and are not double-counted.
+    fn resolve_cited_id<'l>(&'l self, link: &'l EvidenceLink) -> Option<&'l str> {
+        let anchor_commit = link
+            .as_of_commit
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| link.target_git_commit.as_deref().filter(|s| !s.is_empty()));
+        let identity_commit = link
+            .target_git_commit
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or(anchor_commit);
+        link.target_record_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                link.target_repo_relative_path.as_deref().and_then(|p| {
+                    let span = link.target_span.as_ref();
+                    match identity_commit
+                        .map(|commit| self.resolve_triple_at_commit(p, span, commit))
+                    {
+                        Some(TripleResolution::Resolved(id)) => Some(id),
+                        Some(TripleResolution::Ambiguous) => None,
+                        Some(TripleResolution::Absent) | None => self.resolve_triple(p, span),
+                    }
+                })
+            })
+    }
+
+    /// Dedupe key identifying one citation by `(resolved_record_id, relation,
+    /// anchor)`, used to skip a synthesized edge that an inline link already
+    /// covers. Resolves triples so a triple-only inline link and a materialized
+    /// record-ID edge for the same citation share a key. `None` when the handle
+    /// does not resolve to any record ID in this slice.
+    fn covered_key(&self, link: &EvidenceLink) -> Option<(String, String, String)> {
+        let rid = self.resolve_cited_id(link)?;
+        let anchor = link
+            .as_of_commit
+            .clone()
+            .or_else(|| link.target_git_commit.clone())
+            .unwrap_or_default();
+        Some((rid.to_owned(), link.relation.clone(), anchor))
+    }
 }
 
 /// Outcome of resolving a triple citation at a specific commit.
@@ -789,20 +838,6 @@ fn is_classifiable_code_link(index: &FreshnessIndex<'_>, link: &EvidenceLink) ->
         .as_deref()
         .filter(|s| !s.is_empty())
         .is_some_and(|rid| index.is_non_handle_target(rid))
-}
-
-/// Dedupe key identifying one citation by `(record_id, relation, anchor)`, used
-/// to skip a synthesized edge that an inline link already covers. `None` for a
-/// triple-only link (no record ID): a synthesized edge always carries a record
-/// ID, so a triple inline link never needs to suppress one.
-fn edge_dedupe_key(link: &EvidenceLink) -> Option<(String, String, String)> {
-    let rid = link.target_record_id.as_deref().filter(|s| !s.is_empty())?;
-    let anchor = link
-        .as_of_commit
-        .clone()
-        .or_else(|| link.target_git_commit.clone())
-        .unwrap_or_default();
-    Some((rid.to_owned(), link.relation.clone(), anchor))
 }
 
 /// Observation kinds whose evidence links are checked for freshness.
@@ -912,7 +947,10 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
             if !is_classifiable_code_link(&index, link) {
                 continue;
             }
-            if let Some(key) = edge_dedupe_key(link) {
+            // Mark this citation covered by its *resolved* record ID — resolving a
+            // triple-only link too, so a daemon-materialized record-ID edge for the
+            // same citation is recognized as a duplicate and not double-counted.
+            if let Some(key) = index.covered_key(link) {
                 edge_covered.insert(key);
             }
             entries.push(classify_link(
@@ -931,7 +969,7 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
             if !is_classifiable_code_link(&index, link) {
                 continue;
             }
-            if let Some(key) = edge_dedupe_key(link)
+            if let Some(key) = index.covered_key(link)
                 && !edge_covered.insert(key)
             {
                 continue;
