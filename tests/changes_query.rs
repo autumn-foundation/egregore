@@ -934,3 +934,131 @@ fn test_redacted_changes_evidence_strips_inline_output() {
     assert_eq!(handle.hash, "blake3hash");
     assert_eq!(handle.bytes, 19);
 }
+
+/// `EXPLAINS_CHANGE` evidence that targets the per-commit `Change` node (not the
+/// File/Symbol) must still be discovered, even though the `Change` is de-duped
+/// from `changed_files` when a File snapshot already covers it.
+#[test]
+fn test_explains_change_evidence_on_change_node_is_seeded() {
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+    // Normal Rust modification: File snapshot + CHANGED_IN edge at bbbb.
+    let f1 = file_node("src/lib.rs", "bbbbbbbb");
+    let changed = changed_in_edge("src/lib.rs", "bbbbbbbb");
+
+    // The per-commit Change node for the same (path, commit).
+    let change_id = "node:change:repo_test:bbbbbbbb:M:src/lib.rs";
+    let change = GraphRecord::node(
+        change_id.to_owned(),
+        NodeKind::Change,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("M src/lib.rs".to_owned()),
+        "Git change M to src/lib.rs".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "bbbbbbbb".to_owned(),
+        git_parent_commits: Vec::new(),
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
+    });
+
+    // Observation explains the Change node only (no link to the File/Symbol).
+    let obs_id = agent_memory_stable_id(&["obs", "explains_change"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Explains the change".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+    }
+    let explains = GraphRecord::edge(
+        EdgeLabel::ExplainsChange,
+        obs_id.clone(),
+        change_id.to_owned(),
+        None,
+        "explains".to_owned(),
+    );
+
+    let records = vec![c1, c2, e1, f1, changed, change, obs, explains];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+
+    let obs_ids: std::collections::BTreeSet<&str> =
+        ctx.observations.iter().map(|o| o.record_id).collect();
+    assert!(
+        obs_ids.contains(obs_id.as_str()),
+        "EXPLAINS_CHANGE evidence on the Change node must be surfaced"
+    );
+}
+
+/// A triple-only citation anchored to a commit outside the queried range must
+/// not be surfaced as context for a later change to the same path.
+#[test]
+fn test_triple_only_citation_out_of_range_commit_is_filtered() {
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+    let f1 = file_node("src/lib.rs", "bbbbbbbb");
+
+    let triple = |id_seed: &str, anchor: &str| {
+        let id = agent_memory_stable_id(&["obs", id_seed]);
+        let mut obs = GraphRecord::node(
+            id.clone(),
+            NodeKind::Observation,
+            None,
+            None,
+            None,
+            "cite".to_owned(),
+        );
+        if let GraphRecord::Node {
+            ref mut schema_version,
+            ref mut evidence_links,
+            ..
+        } = obs
+        {
+            *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+            *evidence_links = Some(vec![EvidenceLink {
+                target_record_id: None,
+                target_domain: "codegraph".to_owned(),
+                relation: "MENTIONS_SYMBOL".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: Some("src/lib.rs".to_owned()),
+                target_span: None,
+                target_git_commit: Some(anchor.to_owned()),
+            }]);
+        }
+        (id, obs)
+    };
+
+    let (fresh_id, fresh) = triple("fresh", "bbbbbbbb"); // in range
+    let (stale_id, stale) = triple("stale", "zzzzzzzz"); // out of range
+
+    let records = vec![c1, c2, e1, f1, fresh, stale];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+
+    let sources: std::collections::BTreeSet<&str> = ctx
+        .unresolved
+        .iter()
+        .map(|u| u.source_record_id.as_str())
+        .collect();
+    assert!(
+        sources.contains(fresh_id.as_str()),
+        "in-range triple citation should surface"
+    );
+    assert!(
+        !sources.contains(stale_id.as_str()),
+        "out-of-range triple citation must be filtered"
+    );
+}

@@ -7026,7 +7026,12 @@ pub fn changes_context<'a>(
         }
     }
 
-    // Pass 2: fallback Change nodes (only if not already added by Pass 1 File nodes)
+    // Pass 2: Change nodes. A `Change` is added to `changed_files` only when a
+    // File snapshot did not already cover its `(path, commit)`, but its stable id
+    // is always recorded as an evidence seed: `EXPLAINS_CHANGE` citations target
+    // the `Change`/`Commit`, so an observation explaining a normal Rust
+    // modification (which also has a File snapshot) must still be discovered.
+    let mut change_seed_ids = BTreeSet::new();
     for r in records {
         if let GraphRecord::Node {
             kind: NodeKind::Change,
@@ -7036,6 +7041,7 @@ pub fn changes_context<'a>(
         } = r
         {
             if range_commit_shas.contains(t.git_commit.as_str()) && in_scope(r.id()) {
+                change_seed_ids.insert(r.id());
                 if added_file_commits.insert((path.as_str(), t.git_commit.as_str())) {
                     changed_files.push(ChangesFileItem {
                         record: r,
@@ -7096,6 +7102,9 @@ pub fn changes_context<'a>(
     for item in &tombstones {
         seed_ids.insert(item.deleted_id);
     }
+    // Change nodes are not output facts, but seeding them lets the BFS reach
+    // EXPLAINS_CHANGE evidence that targets the change rather than the File/Symbol.
+    seed_ids.extend(change_seed_ids.iter().copied());
 
     let mut observations = BTreeSet::new();
     let mut project_state = BTreeSet::new();
@@ -7415,6 +7424,17 @@ pub fn changes_context<'a>(
                     .as_deref()
                     .is_some_and(|p| changed_seed_paths.contains(p))
                 {
+                    continue;
+                }
+                // If the citation is anchored to a specific commit, only surface
+                // it when that commit is within the queried range. A citation to
+                // an out-of-range version of the same path is stale context, not
+                // an explanation of a change in this range.
+                let anchor = link
+                    .target_git_commit
+                    .as_deref()
+                    .or(link.as_of_commit.as_deref());
+                if anchor.is_some_and(|commit| !range_commit_shas.contains(commit)) {
                     continue;
                 }
                 let Some(handle) = evidence_link_triple_handle(link) else {
