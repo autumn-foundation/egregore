@@ -709,8 +709,8 @@ enum QuerySubcommand {
     /// temporal anchors. The verdict attaches to the evidence link and never
     /// rewrites, hides, or marks stale any deterministic code fact.
     ///
-    /// Documented in `docs/cli/freshness.md`.
-    Freshness {
+    /// Documented in `docs/cli/evidence-freshness.md`.
+    EvidenceFreshness {
         /// Graph JSONL path (mutually exclusive with --data-dir).
         #[arg(long)]
         graph: Option<PathBuf>,
@@ -2991,7 +2991,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_failures_cmd(&records, &handle, &index, selected.as_deref())
         }
-        QuerySubcommand::Freshness {
+        QuerySubcommand::EvidenceFreshness {
             graph,
             data_dir,
             stale_only,
@@ -5861,7 +5861,7 @@ fn query_failures_cmd(
     Ok(())
 }
 
-/// Machine-readable report emitted by `eg query freshness` (issue #85).
+/// Machine-readable report emitted by `eg query evidence-freshness` (issue #85).
 #[derive(serde::Serialize)]
 struct FreshnessReport {
     ok: bool,
@@ -5871,21 +5871,21 @@ struct FreshnessReport {
     /// Stable diagnostic so an empty stale-only result is never silent (AC7).
     diagnostic: &'static str,
     /// Per-evidence-link freshness verdicts, deterministically ordered.
-    verdicts: Vec<crate::freshness::FreshnessVerdictEntry>,
+    verdicts: Vec<crate::evidence_freshness::FreshnessVerdictEntry>,
 }
 
-/// Handles `eg query freshness --graph <path> | --data-dir <dir> [--stale-only]`.
+/// Handles `eg query evidence-freshness --graph <path> | --data-dir <dir> [--stale-only]`.
 ///
 /// Strictly read-only: computes verdicts from records already in the store and
 /// never creates, modifies, or deletes anything. Output carries only record IDs,
 /// hashes, handles, spans, confidence, and redaction markers — never raw
 /// observation text or other protected payloads (AC9).
 fn query_freshness_cmd(records: &[GraphRecord], stale_only: bool) -> Result<()> {
-    let all = crate::freshness::evidence_link_freshness(records);
-    let counts = crate::freshness::verdict_counts(&all);
+    let all = crate::evidence_freshness::evidence_link_freshness(records);
+    let counts = crate::evidence_freshness::verdict_counts(&all);
 
     let verdicts = if stale_only {
-        crate::freshness::stale_only(all)
+        crate::evidence_freshness::stale_only(all)
     } else {
         all
     };
@@ -5894,9 +5894,9 @@ fn query_freshness_cmd(records: &[GraphRecord], stale_only: bool) -> Result<()> 
     // never silently as success-with-nothing (AC7).
     let diagnostic = if stale_only {
         if verdicts.is_empty() {
-            crate::freshness::NO_STALE_DIAGNOSTIC
+            crate::evidence_freshness::NO_STALE_DIAGNOSTIC
         } else {
-            crate::freshness::STALE_PRESENT_DIAGNOSTIC
+            crate::evidence_freshness::STALE_PRESENT_DIAGNOSTIC
         }
     } else {
         "freshness_verdicts"

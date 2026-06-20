@@ -24,7 +24,7 @@ pub mod error;
 /// Typed evidence write workflows for observations, command evidence, artifacts, and verification.
 pub mod evidence;
 /// Evidence-link freshness verdicts for agent observations (issue #85).
-pub mod freshness;
+pub mod evidence_freshness;
 /// Filesystem discovery.
 pub mod fs;
 /// GitHub Issues/PRs importer (issue #46).

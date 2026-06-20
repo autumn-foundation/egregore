@@ -38,7 +38,7 @@
 //!   from the anchor version. The triggering handle is the later commit plus the
 //!   content hash.
 //!
-//! Documented in `docs/cli/freshness.md`.
+//! Documented in `docs/cli/evidence-freshness.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 

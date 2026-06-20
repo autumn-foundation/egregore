@@ -1,4 +1,4 @@
-# `eg query freshness` — Evidence-Link Freshness Verdicts
+# `eg query evidence-freshness` — Evidence-Link Freshness Verdicts
 
 **Issue:** #85 — _Flag agent observations whose cited code has drifted since recording_
 
@@ -6,7 +6,7 @@
 
 ## Overview
 
-`eg query freshness` flags each **agent observation** by whether the code it
+`eg query evidence-freshness` flags each **agent observation** by whether the code it
 cites has **drifted** since the observation was recorded. For every
 `Observation` / `Decision` that cites a code handle (file/symbol at a recorded
 commit or valid-time), it returns a per-evidence-link **freshness verdict** so
@@ -24,8 +24,8 @@ The workflow creates, modifies, and deletes **zero** records — re-running it
 against an unchanged store produces byte-identical output.
 
 ```
-eg query freshness --graph <PATH> [--stale-only]
-eg query freshness --data-dir <DIR> [--stale-only]
+eg query evidence-freshness --graph <PATH> [--stale-only]
+eg query evidence-freshness --data-dir <DIR> [--stale-only]
 ```
 
 Reads from either a JSONL graph (`--graph`) or an embedded AletheiaDB store
@@ -42,7 +42,7 @@ eg scan-history . --out history.graph.jsonl
 # 2. … agents write observations citing code handles over time …
 
 # 3. Which of my notes now stand on moved ground?
-eg query freshness --graph history.graph.jsonl --stale-only
+eg query evidence-freshness --graph history.graph.jsonl --stale-only
 ```
 
 `--stale-only` returns only `drifted` + `unresolved` observations. When nothing
@@ -220,7 +220,7 @@ raw `text` body is never surfaced.
 
 | Reach for | When you want |
 |-----------|---------------|
-| **`eg query freshness`** (this) | Whether an **agent note's cited code** has moved since the note was recorded — batch "which of my notes are now stale?" |
+| **`eg query evidence-freshness`** (this) | Whether an **agent note's cited code** has moved since the note was recorded — batch "which of my notes are now stale?" |
 | `eg query memory` (#64) | The **evidence behind a memory claim**: provenance, support, author-written contradictions/supersessions. It surfaces *existing* supersession records; it does not *compute* drift-based link staleness. |
 | `eg refresh` (#82) | Store-vs-working-tree freshness for **code facts** (does the store match the tree?). It excludes memory and per-symbol re-resolution. |
 | `eg query drift` (#55) | The largest **code-only** semantic drifts, ranked by score. It says nothing about which memory cited that code. |

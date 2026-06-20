@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-//! End-to-end + unit tests for `eg query freshness` — the evidence-link
+//! End-to-end + unit tests for `eg query evidence-freshness` — the evidence-link
 //! freshness workflow (issue #85). The workflow flags each agent observation by
 //! whether the code it cites has drifted since the observation was recorded,
 //! returning `current` / `drifted` / `unresolved` / `untemporal` verdicts as a
@@ -11,7 +11,7 @@ use std::{fs, path::PathBuf};
 use aletheia_egregore::{
     EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, MetricKind, NodeKind, SelectionBasis,
     SemanticDriftMetadata, SourceSpan, TemporalMetadata,
-    freshness::{self, FreshnessVerdict},
+    evidence_freshness::{self as freshness, FreshnessVerdict},
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, Graph, SEMANTIC_SCHEMA_VERSION, agent_memory_stable_id,
         semantic_stable_id, stable_id,
@@ -519,7 +519,12 @@ fn seed() -> Fixture {
 }
 
 fn run(path: &std::path::Path, extra: &[&str]) -> (i32, String, String) {
-    let mut args = vec!["query", "freshness", "--graph", path.to_str().unwrap()];
+    let mut args = vec![
+        "query",
+        "evidence-freshness",
+        "--graph",
+        path.to_str().unwrap(),
+    ];
     args.extend_from_slice(extra);
     let assert = egregore().args(&args).assert();
     let out = assert.get_output();

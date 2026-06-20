@@ -213,7 +213,7 @@ eg query file src/lib.rs --data-dir .egregore
 eg query drift --data-dir .egregore --limit 5
 
 # Flag agent notes whose cited code has drifted since recording (freshness lead, not a truth claim)
-eg query freshness --graph history.graph.jsonl --stale-only
+eg query evidence-freshness --graph history.graph.jsonl --stale-only
 ```
 
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
