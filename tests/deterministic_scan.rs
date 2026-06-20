@@ -208,7 +208,9 @@ fn rust_fixture_covers_common_symbols() {
     assert_edge_label(&records, "IMPORTS");
     assert_edge_label(&records, "IMPLEMENTS");
     assert_edge_label(&records, "CALLS");
-    assert_edge_label(&records, "MENTIONS");
+    // Non-call code references (type/value uses, trait bounds) are emitted as
+    // REFERENCES rather than untyped MENTIONS edges.
+    assert_edge_label(&records, "REFERENCES");
 }
 
 #[test]
@@ -227,7 +229,7 @@ fn rust_basic_edges_point_to_valid_endpoint_ids_after_symbol_identity_change() {
         "IMPORTS",
         "IMPLEMENTS",
         "CALLS",
-        "MENTIONS",
+        "REFERENCES",
     ] {
         assert_edge_label(&records, label);
     }

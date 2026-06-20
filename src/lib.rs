@@ -23,6 +23,8 @@ pub mod embeddings;
 pub mod error;
 /// Typed evidence write workflows for observations, command evidence, artifacts, and verification.
 pub mod evidence;
+/// Read-only store freshness classification (issue #82).
+pub mod freshness;
 /// Filesystem discovery.
 pub mod fs;
 /// GitHub Issues/PRs importer (issue #46).
@@ -44,8 +46,14 @@ pub mod local_project;
 /// MCP server exposing read-only evidence-query tools (issue #53).
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod mcp;
+/// Agent-memory recall evaluation harness (issue #91).
+pub mod memory_recall_eval;
 /// Parser orchestration.
 pub mod parser;
+/// Local setup preflight report for the `eg doctor` command (issue #75).
+pub mod preflight;
+/// Protected raw-artifact capture and retrieval (issue #60).
+pub mod protected;
 /// Agent-facing graph query helpers.
 pub mod query;
 /// Redaction policy engine (`docs/schema/redaction.md` v1).
@@ -73,16 +81,17 @@ pub use ir::{
     NodeProvenance, PRODUCER_ENVELOPE_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION, PatchHandle,
     Producer, ProducerKind, RepositoryIdentityPayload, SCHEMA_VERSION,
     SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, SelectionBasis,
-    SemanticDriftMetadata, SourceSpan, TemporalMetadata, USER_CONTEXT_SCHEMA_VERSION,
-    UserContextFields, UserContextScope, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
-    artifact_stable_id, project_stable_id, semantic_stable_id, stable_id, user_context_stable_id,
-    verification_stable_id,
+    SemanticDriftMetadata, SnapshotHead, SourceSnapshotPayload, SourceSpan, TemporalMetadata,
+    USER_CONTEXT_SCHEMA_VERSION, UserContextFields, UserContextScope, VERIFICATION_SCHEMA_VERSION,
+    agent_memory_stable_id, artifact_stable_id, project_stable_id, semantic_stable_id, stable_id,
+    user_context_stable_id, verification_stable_id,
 };
 pub use local_project::import_local_tasks;
 pub use query::{
-    ChangesContext, ChangesError, RepositoryIndex, RepositorySelectorError, SymbolContext,
-    UnresolvedRef, active_policy, audit_trail, changes_context, is_candidate_suppressed,
-    pending_candidates, symbol_context,
+    ChangesContext, ChangesError, RepositoryIndex, RepositorySelectorError, SubsystemContext,
+    SubsystemPrefixError, SymbolContext, UnresolvedRef, active_policy, audit_trail,
+    changes_context, is_candidate_suppressed, path_is_under_prefix, pending_candidates,
+    subsystem_context, symbol_context,
 };
 pub use schema_version::{
     RecordLineRead, RecordReadError, RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE,
@@ -137,6 +146,25 @@ pub fn scan_repository_with_override(
     scan_repository_at_with_override(repo_path, &now, repo_id_override)
 }
 
+/// Like [`scan_repository_with_override`] but excludes repo-relative paths from
+/// the dirty probe when stamping the snapshot.
+///
+/// Pass the output graph path (if inside the repository) so a pre-existing
+/// `graph.jsonl` from a previous run is not counted as a source change (PR #186 E/F).
+///
+/// # Errors
+///
+/// Returns an error when the repository path is missing, is not a directory, or
+/// source discovery cannot read the filesystem.
+pub fn scan_repository_with_exclusions(
+    repo_path: impl AsRef<Path>,
+    repo_id_override: Option<&str>,
+    snapshot_exclusions: &[String],
+) -> Result<Graph> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    scan_repository_at_with_override_inner(repo_path, &now, repo_id_override, snapshot_exclusions)
+}
+
 /// Scans a repository with an explicit `transaction_time` and optional identity override.
 ///
 /// # Errors
@@ -148,6 +176,15 @@ pub fn scan_repository_at_with_override(
     transaction_time: &str,
     repo_id_override: Option<&str>,
 ) -> Result<Graph> {
+    scan_repository_at_with_override_inner(repo_path, transaction_time, repo_id_override, &[])
+}
+
+fn scan_repository_at_with_override_inner(
+    repo_path: impl AsRef<Path>,
+    transaction_time: &str,
+    repo_id_override: Option<&str>,
+    snapshot_exclusions: &[String],
+) -> Result<Graph> {
     LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
     validate_repository(repo_root)?;
@@ -155,7 +192,22 @@ pub fn scan_repository_at_with_override(
     let repo_identity = identity::compute_repository_identity(repo_root, repo_id_override);
     let mut graph = Graph::new();
     let (repository_id, repo_record) = repository_record_from_identity(&repo_identity);
-    graph.push(repo_record.with_valid_time_inferred(transaction_time));
+    // Stamp the store-level source-snapshot identity (issue #82) on the Repository
+    // node. `head` + `dirty` are deterministic for an unchanged clean tree at a
+    // fixed commit; `scanned_at` reuses the transaction-time override so the JSONL
+    // stays byte-for-byte stable.
+    let (head, dirty) = identity::working_tree_snapshot_excluding(repo_root, snapshot_exclusions);
+    let snapshot = ir::SourceSnapshotPayload {
+        head,
+        dirty,
+        repository_id: repository_id.clone(),
+        scanned_at: transaction_time.to_owned(),
+    };
+    graph.push(
+        repo_record
+            .with_valid_time_inferred(transaction_time)
+            .with_source_snapshot(snapshot),
+    );
 
     for source_file in fs::discover_rust_source_files(repo_root)? {
         for record in scan_source_file_records(&source_file, &repository_id)? {

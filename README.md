@@ -42,7 +42,33 @@ egregore ingest graph.jsonl --adapter embedded --data-dir .egregore
 
 This writes the graph into a local AletheiaDB store. The store is self-contained in `.egregore/` and does not require a running server.
 
-### 5. Download the embedding model (first time only)
+### 5. Verify setup before semantic work (`eg doctor`)
+
+Before the semantic embedding step, run the setup preflight to confirm this machine
+has the tools and permissions needed for the next steps:
+
+```powershell
+egregore doctor .
+```
+
+Exit 0 means the structural workflow (scan, ingest) is ready. `semantic_ready: true`
+in the JSON output means Python and the embedding model cache are also in place and
+you can skip to step 7. Consult the `next_command` field in the output for the
+shortest path forward.
+
+```powershell
+# Human-readable version
+egregore doctor . --format text
+```
+
+> **Note:** `eg doctor` is a _setup_ preflight — it runs before ingest and checks
+> whether your local tools and permissions are correct. It is distinct from the
+> post-ingest semantic index readiness report (issue #71), which checks whether an
+> already-ingested store has adequate embedding coverage. See
+> [docs/cli/doctor.md](docs/cli/doctor.md) for the full check matrix, exit codes,
+> and the distinction between the two reports.
+
+### 6. Download the embedding model (first time only)
 
 The semantic search feature uses `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions, ~90 MB). Rust's TLS stack may not share your OS certificate store, so the most reliable way to prime the cache is via Python:
 
@@ -53,7 +79,7 @@ python -c "from sentence_transformers import SentenceTransformer; SentenceTransf
 
 This downloads the model to `~/.cache/huggingface/hub/`, where Rust's `hf-hub` will find it on subsequent runs. You only need to do this once per machine.
 
-### 6. Ingest with semantic embeddings
+### 7. Ingest with semantic embeddings
 
 ```powershell
 egregore ingest graph.jsonl --adapter embedded --data-dir .egregore-semantic --embed
@@ -65,7 +91,7 @@ The `--embed` flag generates a 384-dimensional dense vector for every file and s
 
 > **Tip:** Use a separate `--data-dir` for the embedded store so you can keep a fast structural-only store alongside the larger semantic one.
 
-### 7. Query
+### 8. Query
 
 **Structural queries** (exact name, file, or drift — works with or without `--embed`):
 

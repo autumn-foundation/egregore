@@ -23,6 +23,32 @@ fn egregore() -> Command {
     Command::cargo_bin("egregore").expect("binary should run")
 }
 
+/// Initializes `repo` as a Git repo with one deterministic commit, so the tree
+/// has a clean committed HEAD. `freshness_after_refresh` mirrors `eg freshness`,
+/// which reports `unknown` for a non-Git directory and `fresh` only for a clean
+/// tree at a committed HEAD (OO1).
+fn git_init_commit(repo: &Path) {
+    let run = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
+            .output()
+            .expect("git should run")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    run(&["init"]);
+    run(&["config", "user.email", "test@example.invalid"]);
+    run(&["config", "user.name", "Test"]);
+    run(&["config", "commit.gpgsign", "false"]);
+    run(&["add", "."]);
+    run(&["commit", "-m", "init"]);
+}
+
 /// Bootstrap: full `eg scan` + `eg ingest --adapter embedded` into `data_dir`.
 /// This creates the embedded store that `eg refresh` will later update.
 #[cfg(feature = "embedded-aletheiadb")]
@@ -540,7 +566,8 @@ fn refresh_resurrects_symbol_after_remove_then_readd() {
 
 // ── AC6: Freshness reported after refresh ─────────────────────────────────
 
-/// AC6: Successful refresh reports `freshness_after_refresh = "fresh"`.
+/// AC6: Successful refresh of a clean committed tree reports
+/// `freshness_after_refresh = "fresh"`.
 #[cfg(feature = "embedded-aletheiadb")]
 #[test]
 fn refresh_reports_freshness_after_refresh() {
@@ -548,6 +575,10 @@ fn refresh_reports_freshness_after_refresh() {
     let repo = temp.path().join("repo");
     fs::create_dir_all(repo.join("src")).expect("src dir");
     fs::write(repo.join("src/lib.rs"), "pub fn f() -> usize { 1 }\n").expect("write");
+    // Clean committed Git tree so the verdict is genuinely `fresh` (OO1): a
+    // non-Git directory would now correctly report `unknown`, matching the
+    // verdict `eg freshness` gives.
+    git_init_commit(&repo);
     let data_dir = temp.path().join("store");
     initial_ingest(&temp, &repo, &data_dir);
 

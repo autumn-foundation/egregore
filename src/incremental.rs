@@ -49,17 +49,51 @@ pub fn scan_repository_incremental(
     scan_repository_incremental_at(repo_path, cache_path, &transaction_time)
 }
 
+/// Like [`scan_repository_incremental`] but excludes repo-relative paths from the
+/// dirty probe when stamping the snapshot.
+///
+/// Pass the data-dir path (if inside the repository) so an existing embedded store
+/// is not counted as a source change, keeping `eg freshness --data-dir` clean after
+/// `eg refresh` on an uncommitted-edits tree (PR #186 A).
+///
+/// # Errors
+///
+/// Returns an error when repository discovery, source parsing, cache parsing, or
+/// cache persistence fails.
+pub fn scan_repository_incremental_excluding(
+    repo_path: impl AsRef<Path>,
+    cache_path: impl AsRef<Path>,
+    snapshot_exclusions: &[String],
+) -> Result<IncrementalScan> {
+    let transaction_time = Utc::now().to_rfc3339();
+    scan_repository_incremental_at_inner(
+        repo_path,
+        cache_path,
+        &transaction_time,
+        snapshot_exclusions,
+    )
+}
+
 /// Like [`scan_repository_incremental`] but accepts an explicit `transaction_time` (RFC 3339).
 ///
 /// # Errors
 ///
 /// Returns an error when repository discovery, source parsing, cache parsing, or
 /// cache persistence fails.
-#[allow(clippy::too_many_lines)]
 pub fn scan_repository_incremental_at(
     repo_path: impl AsRef<Path>,
     cache_path: impl AsRef<Path>,
     transaction_time: &str,
+) -> Result<IncrementalScan> {
+    scan_repository_incremental_at_inner(repo_path, cache_path, transaction_time, &[])
+}
+
+#[allow(clippy::too_many_lines)]
+fn scan_repository_incremental_at_inner(
+    repo_path: impl AsRef<Path>,
+    cache_path: impl AsRef<Path>,
+    transaction_time: &str,
+    snapshot_exclusions: &[String],
 ) -> Result<IncrementalScan> {
     std::sync::LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
@@ -79,7 +113,23 @@ pub fn scan_repository_incremental_at(
     let mut reused_files = Vec::new();
     let mut seen_files = BTreeSet::new();
 
-    graph.push(repository.with_valid_time_inferred(transaction_time));
+    // Stamp the store-level source-snapshot identity (issue #82) on the Repository
+    // node, mirroring the full-scan path. Without this, refreshing a stale store
+    // would replace the stamped Repository node with one whose snapshot is absent,
+    // so a follow-up `eg freshness --data-dir` would report `unknown` instead of
+    // confirming the refreshed store is fresh.
+    let (head, dirty) = identity::working_tree_snapshot_excluding(repo_root, snapshot_exclusions);
+    let snapshot = crate::ir::SourceSnapshotPayload {
+        head,
+        dirty,
+        repository_id: repository_id.clone(),
+        scanned_at: transaction_time.to_owned(),
+    };
+    graph.push(
+        repository
+            .with_valid_time_inferred(transaction_time)
+            .with_source_snapshot(snapshot),
+    );
 
     // If the repository identity changed from a previous scan, tombstone the old Repository node
     // so it does not remain live in persisted stores alongside the new identity.  Without this,

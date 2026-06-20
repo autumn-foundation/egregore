@@ -8773,23 +8773,30 @@ fn handle_verb_semantic_search(
         Some(_) => {}
     }
 
-    // When scoped, search the whole index so higher-scoring hits from other
-    // repositories can never crowd the selected repository's matches out of
-    // the candidate set; the response limit still bounds the scoped rows.
-    let fetch = if selected_repo.is_some() {
-        all_records.len().max(effective_limit)
-    } else {
-        effective_limit
-    };
+    // Over-fetch the whole index, not just `effective_limit` raw hits: the
+    // shared vector index now also embeds agent-memory nodes (issue #91), so a
+    // query whose top raw matches are memory would otherwise drop them all and
+    // never see the code hits ranked just behind them. Fetching the full pool
+    // lets the code-kind filter below recover those code hits; the response
+    // limit then bounds the filtered rows. Scoping needs the full pool too.
+    let fetch = all_records.len().max(effective_limit);
     let mut matches = match sink.semantic_search(&query_vector, fetch) {
         Ok(matches) => matches,
         Err(e) => return HttpResponse::error_with_id(request_id, adapter_read_error_to_api(e)),
     };
     drop(sink);
+    // Code search must never blend agent-authored memory hits into deterministic
+    // code results (issue #91): the shared vector index now also embeds
+    // observation-class memory nodes, retrievable only via `semantic_memory`.
+    matches.retain(|m| {
+        m.kind
+            .as_deref()
+            .is_some_and(|k| k == "File" || k == "Symbol")
+    });
     if let Some(repo) = selected_repo.as_deref() {
         matches.retain(|m| repo_index.owner_of(&m.record_id) == Some(repo));
-        matches.truncate(effective_limit);
     }
+    matches.truncate(effective_limit);
 
     // Enforce timeout after the search CPU phase.
     if let Err(e) = check_query_budget(started, budget) {

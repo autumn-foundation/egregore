@@ -18,9 +18,11 @@ use crate::{
         VerificationRequest, build_artifact_records, build_command_evidence_records,
         build_observation_records, build_verification_records,
     },
-    ir::{EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SourceSpan},
+    freshness::{self, Freshness},
+    identity,
+    ir::{EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SnapshotHead, SourceSpan},
     link_evidence::{self, LinkOptions},
-    local_project, query, scan_repository_history_with_override, scan_repository_with_override,
+    local_project, query, scan_repository_history_with_override, scan_repository_with_exclusions,
     schema_version::{RecordVersion, record_version},
     traj::{self, ImportOptions},
 };
@@ -32,7 +34,7 @@ use crate::adapters::SemanticMatch;
 #[cfg(feature = "embedded-aletheiadb")]
 use crate::daemon::{DaemonClient, DaemonConfig};
 #[cfg(feature = "embedded-aletheiadb")]
-use crate::incremental::scan_repository_incremental;
+use crate::incremental::scan_repository_incremental_excluding;
 #[cfg(feature = "embedded-aletheiadb")]
 use crate::repair;
 
@@ -127,6 +129,42 @@ enum Commands {
         /// Embedded `AletheiaDB` data directory.
         #[arg(long, conflicts_with = "graph")]
         data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Report whether a store still matches the current working tree (issue #82).
+    ///
+    /// Reads the store-level source-snapshot identity stamped by `scan`/`ingest`
+    /// (HEAD commit + dirty flag) and compares it against the live working tree,
+    /// classifying the store as `fresh`, `stale_head`, `stale_dirty`, or
+    /// `unknown`. An agent uses this to avoid citing file/span handles the live
+    /// code has already invalidated.
+    ///
+    /// Strictly read-only and fully offline: it never creates, modifies, or
+    /// deletes any graph record, runtime file, index, or idempotency receipt, and
+    /// never accesses the network.
+    ///
+    /// Both human-readable text (`--format text`, default) and machine-readable
+    /// JSON (`--format json`) are supported; the JSON `freshness` code is stable.
+    ///
+    /// Exits 0 regardless of the freshness verdict (the verdict is the payload,
+    /// not an error); exits non-zero only on I/O or store-read failure.
+    ///
+    /// See `docs/cli/freshness.md`.
+    Freshness {
+        /// Working-tree path to compare the store against (defaults to the current directory).
+        #[arg(default_value = ".")]
+        repo_path: PathBuf,
+        /// Graph JSONL store to check (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory to check (mutually exclusive with --graph).
+        #[arg(long, conflicts_with = "graph")]
+        data_dir: Option<PathBuf>,
+        /// Override the auto-detected repository identity used to locate the stored snapshot.
+        #[arg(long)]
+        repo_id_override: Option<String>,
         /// Output format.
         #[arg(long, default_value = "text")]
         format: OutputFormat,
@@ -292,6 +330,29 @@ enum Commands {
         #[arg(long, default_value = "0.20", value_parser = parse_threshold)]
         threshold: f64,
     },
+    /// Run the agent-memory recall evaluation against a corpus file (issue #91).
+    ///
+    /// Requires a pre-built embedded store seeded with imported memory and
+    /// ingested with `--embed`. Exits 0 if top-3 recall meets the threshold,
+    /// 1 with a diagnostic if missed.
+    #[cfg(feature = "embeddings")]
+    EvalMemoryRecall {
+        /// Path to the agent-memory recall corpus JSON file.
+        #[arg(long, default_value = "corpus/agent_memory_recall_corpus.json")]
+        corpus: PathBuf,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Number of top memory results to retrieve per question.
+        #[arg(long, default_value = "3")]
+        top_k: usize,
+        /// Minimum top-3 recall fraction required to pass (0.0–1.0, default 0.80).
+        #[arg(long, default_value = "0.8", value_parser = parse_threshold)]
+        threshold: f64,
+        /// Exclude unverified observations from recall, as the trust filter does.
+        #[arg(long)]
+        verified_only: bool,
+    },
     /// Manage the local Egregore daemon.
     #[cfg(feature = "embedded-aletheiadb")]
     Daemon {
@@ -361,6 +422,60 @@ enum Commands {
         /// `AletheiaDB` data directory (default: `.egregore`).
         #[arg(long, default_value = ".egregore")]
         data_dir: PathBuf,
+    },
+    /// Capture and retrieve protected raw artifact payloads (issue #60).
+    ///
+    /// By default Egregore stores only content hashes and handles for raw payloads
+    /// such as transcripts, command output, patches, task narratives, and reports.
+    /// This command gives operators an opt-in workflow to also retain the original
+    /// raw bytes in a local, content-addressed protected store that the graph, query,
+    /// and semantic surfaces never read.
+    ///
+    /// See `docs/cli/protected-artifacts.md` for the full operator workflow.
+    Protected {
+        /// Protected-artifact subcommand.
+        #[command(subcommand)]
+        subcommand: ProtectedSubcommand,
+    },
+    /// Report local setup readiness for the scan → ingest → semantic-search workflow.
+    ///
+    /// Read-only by default: does not download models, create graph records, mutate
+    /// `.egregore`, start or stop the daemon, or contact hosted services unless
+    /// `--network` is explicitly passed.
+    ///
+    /// Exits 0 when all required structural checks pass; exits 1 when a required
+    /// check fails. Optional and semantic failures (python, model cache) never
+    /// change the exit code.
+    ///
+    /// Both human-readable text (`--format text`) and machine-readable JSON
+    /// (`--format json`, default) are supported. JSON check IDs are stable.
+    ///
+    /// See docs/cli/doctor.md for the full check matrix, exit codes, and the
+    /// distinction from the post-ingest semantic index readiness report (issue #71).
+    ///
+    /// Note: `--out` defaults to `graph.jsonl` here (unlike `scan`/`ingest` where
+    /// it is required). The default is for diagnostic convenience only.
+    Doctor {
+        /// Repository path to inspect.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Output JSONL path whose parent writability is checked.
+        #[arg(long, default_value = "graph.jsonl")]
+        out: PathBuf,
+        /// Embedded data directory whose writability is checked.
+        #[arg(long, default_value = ".egregore")]
+        data_dir: PathBuf,
+        /// Promote git-history readability from optional to required.
+        /// Use when you need `eg scan-history` to work.
+        #[arg(long)]
+        require_history: bool,
+        /// Perform one optional Hugging Face TCP reachability check.
+        /// Without this flag, no hosted services are contacted.
+        #[arg(long)]
+        network: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
 }
 
@@ -449,6 +564,13 @@ enum QuerySubcommand {
         /// a machine-readable diagnostic.
         #[arg(long)]
         repo: Option<String>,
+        /// Working-tree path to compute store freshness against (issue #82).
+        ///
+        /// When set, each result carries a non-fatal `freshness` code
+        /// (`fresh` / `stale_head` / `stale_dirty` / `unknown`) so an agent can
+        /// downgrade trust in the cited handle. Omitted → no freshness field.
+        #[arg(long)]
+        repo_path: Option<PathBuf>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -472,6 +594,12 @@ enum QuerySubcommand {
         /// a stderr diagnostic, never mixed into the result set.
         #[arg(long)]
         repo: Option<String>,
+        /// Working-tree path to compute store freshness against (issue #82).
+        ///
+        /// When set, each result carries a non-fatal `freshness` code; omitted →
+        /// no freshness field. See `eg query symbol --help`.
+        #[arg(long)]
+        repo_path: Option<PathBuf>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -519,6 +647,72 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Answer a natural-language query with evidence-backed context for the
+    /// top-N semantic matches in one call (issue #90).
+    ///
+    /// Bridges semantic discovery and the symbol-context lane: it embeds the
+    /// query locally, ranks matches against the embedded store, then returns —
+    /// per match — the stable record ID, repo-relative file/span handle, the
+    /// relevance score, and the same five trust-separated context sections
+    /// produced by `eg query context`. File-typed matches are first-class
+    /// (their defined symbols are seeded); an ambiguous symbol name reports all
+    /// candidate record IDs instead of silently picking one.
+    ///
+    /// Read-only and deterministic. On no semantic hit clearing `--min-score`:
+    /// emits `{"ok":false,"error":{"code":"no_match",...}}` to stdout and exits
+    /// with code 2. Documented in `docs/cli/semantic-search-guidance.md`.
+    #[cfg(feature = "embeddings")]
+    SemanticContext {
+        /// Natural-language query text.
+        query: String,
+        /// Embedded `AletheiaDB` data directory (must be ingested with `--embed`).
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum number of matches to expand (bounded; safe default 5).
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Relevance floor in `[0.0, 1.0]`; matches scoring below it are
+        /// dropped, and an all-below result is a no-match (default 0.0).
+        #[arg(long, default_value_t = 0.0)]
+        min_score: f32,
+    },
+    /// Recall prior agent memory by meaning (issue #91).
+    ///
+    /// Returns agent-authored observations, decisions, and failures ranked by
+    /// semantic similarity to the natural-language query — each carrying its
+    /// provenance handle: record ID, kind, source transcript/session handle,
+    /// authoring agent, confidence, observed time, and any linked code handle.
+    ///
+    /// Results are typed `agent_authored` and are NEVER blended with
+    /// deterministic code hits (use `eg query semantic` for code). A memory hit
+    /// that cannot cite where it came from is excluded, not returned. A semantic
+    /// match is recall, not verification: a returned lesson is a prior agent's
+    /// subjective claim, not source truth.
+    ///
+    /// Documented in `docs/cli/semantic-memory-recall.md`.
+    #[cfg(feature = "embeddings")]
+    SemanticMemory {
+        /// Natural-language question to recall memory by meaning.
+        query: String,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum number of results (default 10).
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Exclude unverified agent observations (no cited verification evidence).
+        #[arg(long)]
+        verified_only: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Retrieve evidence-backed context for a named symbol.
     ///
     /// Returns a structured JSON object with five trust-separated sections:
@@ -538,6 +732,13 @@ enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Working-tree path to compute store freshness against (issue #82).
+        ///
+        /// When set, the response carries a non-fatal top-level `freshness` code
+        /// so an agent can downgrade trust in the returned handles; omitted → no
+        /// freshness field. See `eg query symbol --help`.
+        #[arg(long)]
+        repo_path: Option<PathBuf>,
     },
     /// Retrieve evidence-backed context for a task.
     Task {
@@ -641,6 +842,103 @@ enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+    },
+    /// Surface prior failed attempts linked to a code or task handle (issue #63).
+    ///
+    /// Starts from a symbol record ID / name, a repo-relative file path, or a
+    /// task / source handle and returns prior FAILED attempts as citable local
+    /// facts — separated into `runtime_failures` (verification-domain evidence,
+    /// trust `verification_evidence`) and `agent_failures` (agent-authored
+    /// `Failure` claims, trust `agent_authored`) so neither is presented as
+    /// source truth. A later passing verification on the same target appears in
+    /// `superseding_successes`, and each failure carries a read-time
+    /// `resolution_status` (`still_failing` | `since_resolved`). Output never
+    /// includes raw transcript text, command output, or patch hunks — only
+    /// hashes, handles, bounded summaries, and redaction markers.
+    ///
+    /// "No prior failure found" is not evidence the code or task is correct.
+    ///
+    /// Documented in `docs/cli/failure-history.md`.
+    Failures {
+        /// Symbol record ID / name, repo-relative file path, or task/source handle.
+        handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict symbol/file handle resolution to one repository (issue #67).
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Retrieve cross-domain context for a repo-relative directory or module prefix (issue #83).
+    ///
+    /// Returns a structured JSON object with six trust-separated sections:
+    /// `source_facts` (code-graph files and symbols under the prefix),
+    /// `observations` (agent-authored), `project_state` (tasks/ACs),
+    /// `artifacts`, `verification_evidence`, and `semantic_drift`.
+    /// Missing evidence links are surfaced as `unresolved` items.
+    ///
+    /// Both the bare form (`src/alpha`) and the trailing-slash form
+    /// (`src/alpha/`) resolve to the same record set. Prefix matching is
+    /// segment-aware: `src/alpha` never bleeds into `src/alphabet/`.
+    ///
+    /// On no-match: emits `{"ok":false,"error":{"code":"no_match",...}}` to
+    /// stdout and exits 2. On malformed/empty prefix: exits 1 with
+    /// `{"ok":false,"error":{"code":"malformed_prefix",...}}`.
+    Subsystem {
+        /// Repo-relative directory or module path prefix (e.g. `src/parser` or `src/parser/`).
+        prefix: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Surface graph-derived change-impact LEADS for a symbol or file handle (issue #76).
+    ///
+    /// Given a symbol record ID / exact name or a repo-relative file path,
+    /// returns nearby code to inspect before editing: direct callers, direct
+    /// callees, importing/referencing files, implementation-related symbols,
+    /// and containing file/module context — grouped, deterministic,
+    /// redaction-safe, bounded by --depth.
+    ///
+    /// Every row is an impact LEAD, not proof of breakage. Absence of a lead
+    /// is not proof a change is safe. Results are code-graph source facts only;
+    /// they are never blended with agent observations or verification verdicts.
+    ///
+    /// Exit codes:
+    ///   0 — leads returned (or resolved target has no relationships).
+    ///   1 — malformed / ambiguous / unsupported handle (machine-readable JSON on stderr).
+    ///   2 — handle resolves to no live record (`no_match` or `stale_handle`).
+    ///
+    /// Documented in `docs/cli/change-impact.md`.
+    ChangeImpact {
+        /// Symbol record ID (`codegraph:vN:<hex>`), exact symbol name, or
+        /// repo-relative file path (e.g. `src/lib.rs`).
+        handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict symbol/file resolution to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Neighborhood hop limit from the resolved anchor(s).
+        /// Exceeding it yields a truncation diagnostic with counts rather than
+        /// silently dropping relationship classes.
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
 }
 
@@ -916,6 +1214,69 @@ enum WriteKind {
     },
 }
 
+/// Subcommands for `protected`.
+#[derive(Debug, Subcommand)]
+enum ProtectedSubcommand {
+    /// Capture raw payloads listed in a manifest JSONL into the protected store.
+    ///
+    /// Without `--protected-raw-artifacts`: preview mode — computes and prints
+    /// content hashes and handles but writes **nothing** to disk.
+    ///
+    /// With `--protected-raw-artifacts`: enabled mode — stores blobs, updates the
+    /// manifest, and records the producer as an authorised operator.
+    ///
+    /// Exit codes:
+    ///   0 — capture complete (or preview complete in disabled mode).
+    ///   1 — manifest file I/O or parse error.
+    Capture {
+        /// Path to the capture manifest JSONL (one `{class,source_path}` per line).
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Protected store directory.
+        #[arg(long)]
+        store: PathBuf,
+        /// Enable protected-raw-artifact mode; without this flag no bytes are stored.
+        #[arg(long)]
+        protected_raw_artifacts: bool,
+        /// Stable producer identity (required when `--protected-raw-artifacts` is set).
+        #[arg(long)]
+        producer: Option<String>,
+        /// Override capture timestamp (RFC 3339) for deterministic tests.
+        #[arg(long)]
+        captured_at: Option<String>,
+    },
+    /// Retrieve raw bytes for a protected handle, verifying the content hash.
+    ///
+    /// Exit codes:
+    ///   0 — bytes written (to `--out` or stdout).
+    ///   1 — store absent / operator unauthorized / malformed handle / blob missing
+    ///       / hash mismatch.
+    ///   2 — handle not found in manifest.
+    Get {
+        /// Protected handle string (`protected:v1:<hex>`).
+        handle: String,
+        /// Protected store directory.
+        #[arg(long)]
+        store: PathBuf,
+        /// Operator identity (must be in the store's authorised set).
+        #[arg(long)]
+        operator: String,
+        /// Write raw bytes to this path instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// List all protected handles (metadata only — no raw bytes).
+    ///
+    /// Exit codes:
+    ///   0 — list emitted (may be empty when store is not yet initialised).
+    ///   1 — manifest I/O or parse error.
+    List {
+        /// Protected store directory.
+        #[arg(long)]
+        store: PathBuf,
+    },
+}
+
 /// Parses process arguments and runs the CLI.
 ///
 /// # Errors
@@ -949,6 +1310,19 @@ fn run_cli(cli: Cli) -> Result<()> {
             let daemon = false;
             inspect(graph.as_deref(), daemon, data_dir.as_deref(), format)
         }
+        Commands::Freshness {
+            repo_path,
+            graph,
+            data_dir,
+            repo_id_override,
+            format,
+        } => freshness_cmd(
+            &repo_path,
+            graph.as_deref(),
+            data_dir.as_deref(),
+            repo_id_override.as_deref(),
+            format,
+        ),
         Commands::Ingest {
             graph,
             adapter,
@@ -1037,6 +1411,14 @@ fn run_cli(cli: Cli) -> Result<()> {
                 anyhow::bail!("eval-drift requires the 'embeddings' feature")
             }
         }
+        #[cfg(feature = "embeddings")]
+        Commands::EvalMemoryRecall {
+            corpus,
+            data_dir,
+            top_k,
+            threshold,
+            verified_only,
+        } => eval_memory_recall_cmd(&corpus, &data_dir, top_k, threshold, verified_only),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Daemon { action } => daemon(action),
         Commands::Decide {
@@ -1066,6 +1448,15 @@ fn run_cli(cli: Cli) -> Result<()> {
         Commands::Repair { action } => repair_cmd(action),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Mcp { data_dir } => crate::mcp::run_stdio(&data_dir),
+        Commands::Protected { subcommand } => protected_cmd(subcommand),
+        Commands::Doctor {
+            path,
+            out,
+            data_dir,
+            require_history,
+            network,
+            format,
+        } => doctor_cmd(path, out, data_dir, require_history, network, format),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Refresh {
             repo_path,
@@ -1531,7 +1922,11 @@ fn link_evidence_cmd(code_graph_path: &Path, evidence_path: &Path, out: &Path) -
 }
 
 fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<()> {
-    let graph = scan_repository_with_override(repo_path, repo_id_override)
+    // Exclude the graph output and any in-tree egregore store from the dirty probe
+    // (PR #186 E/FF1): a pre-existing graph.jsonl or .egregore data-dir from a
+    // previous workflow must not stamp `dirty = true` on the new scan output.
+    let exclusions = store_exclusions_including_egregore(repo_path, &[Some(out)]);
+    let graph = scan_repository_with_exclusions(repo_path, repo_id_override, &exclusions)
         .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
     let jsonl = graph
         .to_jsonl()
@@ -1542,6 +1937,10 @@ fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<
 }
 
 fn scan_history(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<()> {
+    // History replay reads only committed Git objects, so the stamped snapshot is
+    // always `dirty=false` (committed HEAD state); a pre-existing in-tree output or
+    // companion store cannot affect it, and no dirty-probe exclusions are needed
+    // (TT1 supersedes the earlier CC1/GG1 exclusion machinery).
     let graph = scan_repository_history_with_override(repo_path, repo_id_override)
         .with_context(|| format!("failed to scan Git history for {}", repo_path.display()))?;
     let jsonl = graph
@@ -1550,6 +1949,460 @@ fn scan_history(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) ->
     fs::write(out, jsonl)
         .with_context(|| format!("failed to write history graph JSONL to {}", out.display()))?;
     Ok(())
+}
+
+/// Machine-readable report emitted by `eg freshness`.
+///
+/// `freshness` carries the stable code (`fresh` / `stale_head` / `stale_dirty` /
+/// `unknown`); `current_head` and `stored_snapshot` reuse the on-disk snapshot
+/// serialization so the report is self-describing.
+#[derive(Debug, Serialize)]
+struct FreshnessReport {
+    /// Stable freshness code.
+    freshness: String,
+    /// Convenience boolean: `true` only when `freshness == "fresh"`.
+    fresh: bool,
+    /// Stable `Repository` record ID the freshness was computed for.
+    repository_id: String,
+    /// Where the store was read from: `"graph"` or `"data_dir"`.
+    store_kind: String,
+    /// Current working-tree HEAD state.
+    current_head: SnapshotHead,
+    /// Current working-tree dirty flag.
+    current_dirty: bool,
+    /// The snapshot the store was built from; absent for pre-stamping stores.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stored_snapshot: Option<crate::ir::SourceSnapshotPayload>,
+    /// Human-oriented one-line explanation of the verdict.
+    message: String,
+}
+
+/// Renders a [`SnapshotHead`] for human-readable output.
+fn head_display(head: &SnapshotHead) -> String {
+    match head {
+        SnapshotHead::Commit { sha } => format!("commit {sha}"),
+        SnapshotHead::NoGit => "no_git".to_owned(),
+        SnapshotHead::UnbornHead => "unborn_head".to_owned(),
+    }
+}
+
+/// Builds the human-oriented explanation for a freshness verdict.
+fn freshness_message(verdict: Freshness) -> String {
+    match verdict {
+        Freshness::Fresh => {
+            "store matches the current working tree (HEAD unchanged, tree clean)".to_owned()
+        }
+        Freshness::StaleHead => {
+            "current HEAD differs from the stored snapshot; queried file/span handles may be \
+             invalid — re-scan before citing them"
+                .to_owned()
+        }
+        Freshness::StaleDirty => {
+            "working tree has uncommitted changes relative to the stored snapshot; queried \
+             file/span handles may be invalid — re-scan before citing them"
+                .to_owned()
+        }
+        Freshness::Unknown => {
+            "store predates snapshot stamping or no Git context exists; freshness cannot be \
+             determined"
+                .to_owned()
+        }
+    }
+}
+
+/// Handles `eg freshness [repo_path] (--graph <p> | --data-dir <d>) [--format ...]`.
+///
+/// Strictly read-only (issue #82 AC4): loads the store through the same
+/// read-only path queries use, probes the working tree with `git rev-parse` /
+/// `git status`, and never writes anything. Always returns `Ok(())` once a
+/// verdict is produced; the verdict (including `unknown`) is the payload, not an
+/// error.
+fn freshness_cmd(
+    repo_path: &Path,
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+    repo_id_override: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let store_kind = if graph.is_some() { "graph" } else { "data_dir" };
+    let identity = identity::compute_repository_identity(repo_path, repo_id_override);
+    // Exclude both known store artifacts plus any in-tree `.egregore` store from
+    // the dirty probe (PR #186 E/F/FF1): when checking `--graph`, the companion
+    // `.egregore` data-dir created by the documented ingest workflow sits untracked
+    // (and vice versa for `--data-dir` + `graph.jsonl`). Mirroring `scan`'s
+    // store-artifact exclusions keeps a just-written store from reading as
+    // `stale_dirty` before the user gitignores or deletes the intermediate output.
+    let exclusions = store_exclusions_including_egregore(repo_path, &[graph, data_dir]);
+    let (current_head, current_dirty) =
+        identity::working_tree_snapshot_excluding(repo_path, &exclusions);
+
+    // AC4: strictly read-only. A `--graph` JSONL is read directly (a plain file
+    // read). A `--data-dir` embedded store is read through a throwaway copy,
+    // because the embedded engine re-persists its on-disk index files on open;
+    // operating on a copy guarantees the live store's records, indexes, runtime
+    // files, and receipts are never created, modified, or deleted.
+    let records = match data_dir {
+        Some(dir) => load_records_from_data_dir_readonly(dir)?,
+        None => load_query_records(graph, None)?,
+    };
+    // An explicit `--repo-id-override` pins the identity used to locate the stored
+    // snapshot, so it must match exactly: a wrong/typo'd override must not borrow an
+    // unrelated sole repository's snapshot via the single-repository fallback (which
+    // could even report `fresh` under the caller's unmatched ID). Without an
+    // override, the auto-detected identity keeps that fallback so legacy single-repo
+    // stores still classify (PR #186 follow-up YY1).
+    //
+    // Report the repository that actually OWNS the matched snapshot, not the
+    // recomputed checkout identity: a store scanned with `--repo-id-override` and
+    // checked without it classifies the sole repository via the fallback, and the
+    // JSON `repository_id` must be that stored Repository's ID so consumers keying
+    // the verdict by repository are not misled (PR #186 follow-up ZZ1).
+    let (report_repository_id, stored) = if repo_id_override.is_some() {
+        // Exact match required; when found, the owner is the requested identity.
+        (
+            identity.id.clone(),
+            freshness::stored_snapshot_exact(&records, &identity.id),
+        )
+    } else {
+        // Mirror the per-row query freshness path (Z1): when the identity probe
+        // misses, fall back to the sole STAMPED repository so a combined store with
+        // exactly one stamped Repository (e.g. an override-scanned repo alongside a
+        // legacy unstamped node) classifies unambiguously instead of reporting
+        // `unknown` — and `eg freshness` agrees with `eg query ... --repo-path` on
+        // the same store (PR #186 follow-up DDD1).
+        match freshness::stored_snapshot_with_owner(&records, &identity.id)
+            .or_else(|| freshness::stored_snapshot_sole_stamped(&records))
+        {
+            Some((owner, snapshot)) => (owner.to_owned(), Some(snapshot)),
+            None => (identity.id.clone(), None),
+        }
+    };
+    let mut verdict = freshness::classify(stored, &current_head, current_dirty);
+    // A `fresh` verdict still misses a previously scanned source that a
+    // sparse-checkout cone change removed: such a file is `skip-worktree` + absent,
+    // so `git status` stays blind to it. Downgrade to `stale_dirty` when the store
+    // cites such a removed path (FFF1). Only `fresh` is overridden: a `stale_head`
+    // store already requires a re-scan.
+    if verdict.is_fresh() {
+        let removed = identity::index_hidden_absent_source_inputs(repo_path);
+        let index = query::RepositoryIndex::build(&records);
+        if cited_source_stale_on_disk(&records, &index, &report_repository_id, repo_path, &removed)
+        {
+            verdict = Freshness::StaleDirty;
+        }
+    }
+
+    let report = FreshnessReport {
+        freshness: verdict.code().to_owned(),
+        fresh: verdict.is_fresh(),
+        repository_id: report_repository_id,
+        store_kind: store_kind.to_owned(),
+        current_head,
+        current_dirty,
+        stored_snapshot: stored.cloned(),
+        message: freshness_message(verdict),
+    };
+
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&report).context("failed to serialize freshness report")?
+            );
+        }
+        OutputFormat::Text => {
+            println!("freshness: {}", report.freshness);
+            println!("repository_id: {}", report.repository_id);
+            println!("store: {store_kind}");
+            println!(
+                "current_head: {} (dirty: {})",
+                head_display(&report.current_head),
+                report.current_dirty
+            );
+            match &report.stored_snapshot {
+                Some(snapshot) => println!(
+                    "stored_head: {} (dirty: {})",
+                    head_display(&snapshot.head),
+                    snapshot.dirty
+                ),
+                None => println!("stored_head: (none — store predates snapshot stamping)"),
+            }
+            println!("message: {}", report.message);
+        }
+    }
+    Ok(())
+}
+
+/// Computes the store-freshness code for a query against `repo_path` (issue #82).
+///
+/// Returns `None` when `repo_path` is absent, so freshness-unaware queries emit
+/// byte-identical output to before this feature. When present, returns the stable
+/// freshness code (including `"fresh"`) so an agent always sees the signal it asked
+/// for and the result is never silently suppressed.
+///
+/// `repo_id_hint` is an optional known repository ID from the already-resolved
+/// `--repo` scope or context owner; when provided and distinct from the
+/// auto-detected identity it is tried first so that operator-override IDs win in
+/// a multi-repo store, and used as the owner ID when no snapshot is found so that
+/// `stamp_freshness` can match selected rows (PR #186 follow-up).
+fn query_freshness_code_with_hint(
+    records: &[GraphRecord],
+    repo_path: Option<&Path>,
+    artifacts: &[Option<&Path>],
+    repo_id_hint: Option<&str>,
+) -> Option<(String, &'static str)> {
+    query_freshness_code_inner(records, repo_path, artifacts, repo_id_hint)
+}
+
+fn query_freshness_code_inner(
+    records: &[GraphRecord],
+    repo_path: Option<&Path>,
+    artifacts: &[Option<&Path>],
+    repo_id_hint: Option<&str>,
+) -> Option<(String, &'static str)> {
+    let repo_path = repo_path?;
+    let identity = identity::compute_repository_identity(repo_path, None);
+    // Mirror `freshness_cmd`/`scan` and also exclude any in-tree `.egregore*`
+    // companion store (PR #186 follow-up II1): the documented workflow leaves an
+    // untracked `.egregore` data-dir beside the graph, which must not stamp query
+    // rows `stale_dirty` when the graph itself was scanned from a clean tree.
+    let exclusions = store_exclusions_including_egregore(repo_path, artifacts);
+    let (head, dirty) = identity::working_tree_snapshot_excluding(repo_path, &exclusions);
+    // Any explicit hint (a resolved `--repo` scope or context owner) is
+    // authoritative: the verdict must be owned by the selected repository, even
+    // when the hint equals the auto-detected identity. Look up ONLY its snapshot —
+    // never fall back to the auto-detected identity's snapshot or the sole-stamped
+    // repo, which may belong to a different repository and would mislabel the
+    // verdict's owner. When the selected repo has no snapshot (legacy/pre-stamping
+    // rows in a combined store), `matched` stays `None` and the owner below is
+    // still the hint, so `stamp_freshness` stamps `unknown` on the selected rows
+    // rather than omitting the field (PR #186 follow-up SS1/UU1).
+    //
+    // Only when NO hint is given does the identity probe run with a sole-stamped
+    // fallback: if exactly one Repository node in the store carries a snapshot,
+    // that snapshot is unambiguous and should be used. This handles combined
+    // stores where --repo-id-override was used on the scanned checkout but no
+    // --repo flag was passed to the query command (PR #186 follow-up Z1).
+    let matched = match repo_id_hint {
+        Some(h) => freshness::stored_snapshot_with_owner(records, h),
+        None => freshness::stored_snapshot_with_owner(records, &identity.id)
+            .or_else(|| freshness::stored_snapshot_sole_stamped(records)),
+    };
+    // When no snapshot is found but the caller supplied an explicit hint (from
+    // `--repo`), use the hint as the owner ID so `stamp_freshness` can match
+    // the selected rows.  Falling back to `identity.id` would emit the unknown
+    // verdict under the wrong owner, making freshness invisible on those rows.
+    let (owner_id, stored) = match matched {
+        Some((owner, snapshot)) => (owner.to_owned(), Some(snapshot)),
+        None => (
+            repo_id_hint.map(ToOwned::to_owned).unwrap_or(identity.id),
+            None,
+        ),
+    };
+    let code = freshness::classify(stored, &head, dirty).code();
+    // Downgrade `fresh` to `stale_dirty` when a previously scanned source owned by
+    // this repository was removed by a sparse-checkout cone change (skip-worktree +
+    // absent, invisible to `git status`) but the store still cites it (FFF1),
+    // matching `freshness_cmd`.
+    let code = if code == "fresh" {
+        let removed = identity::index_hidden_absent_source_inputs(repo_path);
+        let index = query::RepositoryIndex::build(records);
+        if cited_source_stale_on_disk(records, &index, &owner_id, repo_path, &removed) {
+            "stale_dirty"
+        } else {
+            code
+        }
+    } else {
+        code
+    };
+    Some((owner_id, code))
+}
+
+/// Computes repo-relative dirty-probe exclusions for the store artifact being
+/// read (issue #82 / PR #186).
+///
+/// When the `--graph` file or `--data-dir` directory lives under `repo_path`, it
+/// is returned as a repo-relative pathspec so the freshness dirty probe ignores
+/// it — an in-tree store the workflow just wrote must not by itself make the tree
+/// look `stale_dirty`. Returns empty when there is no artifact or it lives
+/// outside the working tree.
+fn store_artifact_exclusions(repo_path: &Path, artifacts: &[Option<&Path>]) -> Vec<String> {
+    let repo_abs = fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    artifacts
+        .iter()
+        .filter_map(|a| *a)
+        .filter_map(|artifact| {
+            let abs = fs::canonicalize(artifact).unwrap_or_else(|_| artifact.to_path_buf());
+            let rel = abs.strip_prefix(&repo_abs).ok()?;
+            let s = rel.to_string_lossy().replace('\\', "/");
+            (!s.is_empty()).then_some(s)
+        })
+        .collect()
+}
+
+/// Discovers untracked in-tree `.egregore*` embedded-store directories that must
+/// be excluded from the dirty probe (PR #186 follow-up FF1/GG1).
+///
+/// A directory qualifies only when it is fully untracked (`git ls-files` reports
+/// no content under it) and contains no `.rs` sources — the hallmark of a store
+/// output (`eg ingest ... --data-dir .egregore`) rather than a source directory
+/// that merely shares the prefix. The scanner never indexes such a store, so the
+/// freshness dirty probe must not count it as source dirtiness.
+fn egregore_store_dirs(repo_path: &Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    let Ok(entries) = std::fs::read_dir(repo_path) else {
+        return dirs;
+    };
+    for entry in entries.flatten() {
+        let name_matches = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(".egregore"));
+        // Only directories, not regular files such as `.egregore.rs`.
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        if !(name_matches && is_dir) {
+            continue;
+        }
+        let path = entry.path();
+        // `git ls-files` returns tracked paths under the directory; an empty
+        // result means the entire subtree is untracked / gitignored, which is the
+        // hallmark of a store output rather than a source directory. Use the entry
+        // name directly so `git ls-files` receives a repo-relative path regardless
+        // of whether `repo_path` is absolute or relative.
+        let name = entry.file_name();
+        let has_tracked = std::process::Command::new("git")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(repo_path)
+            .args(["ls-files", "--", name.to_str().unwrap_or("")])
+            .output()
+            .map(|out| !out.stdout.is_empty())
+            .unwrap_or(false);
+        // Even when no content is tracked, an untracked directory containing `.rs`
+        // files is a source directory, not a store output: its files appear in the
+        // graph but are outside `git status`, so excluding it would mask deletions.
+        if !has_tracked && !dir_has_rust_sources(&path) {
+            dirs.push(path);
+        }
+    }
+    dirs
+}
+
+/// Builds dirty-probe exclusions for the explicit store `artifacts` plus any
+/// in-tree `.egregore*` embedded-store directories discovered under `repo_path`
+/// (PR #186 follow-up FF1/GG1).
+///
+/// All three store-producing/checking entry points (`scan`, `scan-history`,
+/// `freshness`) share this so a companion store written by one workflow never
+/// makes another's output read `stale_dirty`.
+fn store_exclusions_including_egregore(
+    repo_path: &Path,
+    artifacts: &[Option<&Path>],
+) -> Vec<String> {
+    let egregore_dirs = egregore_store_dirs(repo_path);
+    let mut all: Vec<Option<&Path>> = artifacts.to_vec();
+    for dir in &egregore_dirs {
+        all.push(Some(dir.as_path()));
+    }
+    store_artifact_exclusions(repo_path, &all)
+}
+
+/// Returns `true` if `dir` or any subdirectory contains a `.rs` file.
+///
+/// Used in the `.egregore*` auto-exclusion check: an untracked directory whose
+/// subtree contains `.rs` source files is a source directory, not a store output,
+/// and must not be excluded from the snapshot dirty probe.
+fn dir_has_rust_sources(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if dir_has_rust_sources(&path) {
+                return true;
+            }
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns `true` when an ancestor directory of `repo_path/rel` (below the repo
+/// root) contains a nested `.git` sentinel, so the scanner would no longer reach
+/// `rel`.
+///
+/// Walks the parents of the cited file up to — but not including — `repo_path`, so
+/// the repository's own `.git` never counts. A submodule/worktree (`.git` file) or
+/// nested clone (`.git` directory) appearing over a previously scanned tree makes
+/// `fs::should_descend` skip it, yet `git status` cannot see that conversion
+/// (GGG3 / PR #186 follow-up).
+fn path_behind_nested_git(repo_path: &Path, rel: &str) -> bool {
+    let full = repo_path.join(rel);
+    let mut dir = full.parent();
+    while let Some(d) = dir {
+        if d == repo_path || !d.starts_with(repo_path) {
+            break;
+        }
+        if d.join(".git").exists() {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
+}
+
+/// Returns `true` when the store cites a `File` (owned by `owner_id`) that the
+/// working tree no longer makes available to the scanner — a source the graph
+/// indexed but that `git status` cannot flag.
+///
+/// Two cases, both keyed off the store's actual contents (so a path matters only
+/// when cited — distinguishing a change to a *previously scanned* file from one
+/// that was never indexed, which the pure working-tree probe cannot tell apart):
+/// - `removed`: index-hidden (`skip-worktree`/`assume-unchanged`) yet absent
+///   paths from [`identity::index_hidden_absent_source_inputs`] — a sparse-checkout
+///   cone change removed a scanned file (FFF1) vs. a baseline omission (AAA1);
+/// - a cited file now sitting behind a nested `.git` sentinel (GGG3).
+fn cited_source_stale_on_disk(
+    records: &[GraphRecord],
+    index: &query::RepositoryIndex,
+    owner_id: &str,
+    repo_path: &Path,
+    removed: &[String],
+) -> bool {
+    let removed: std::collections::HashSet<&str> = removed.iter().map(String::as_str).collect();
+    records.iter().any(|record| {
+        matches!(
+            record,
+            GraphRecord::Node {
+                kind: NodeKind::File,
+                id,
+                repo_relative_path: Some(path),
+                ..
+            } if index.owner_of(id) == Some(owner_id)
+                && (removed.contains(path.as_str()) || path_behind_nested_git(repo_path, path))
+        )
+    })
+}
+
+/// Stamps the freshness `code` on each result whose repository matches the
+/// checkout the code was computed for (issue #82). Rows owned by a different
+/// repository (multi-repo stores) are left unstamped rather than mislabeled.
+///
+/// History (`scan-history`) source rows are attributed to their repository the
+/// same way `scan` rows are: replay emits `Repository CONTAINS File` and
+/// `File DEFINES Symbol` edges per commit, so `RepositoryIndex::owner_of`
+/// resolves them and the verdict attaches via the normal ownership match
+/// (verified by `query_symbol_repo_path_stamps_freshness_on_history_graph`).
+fn stamp_freshness(results: &mut [SymbolResult<'_>], freshness: Option<&(String, &'static str)>) {
+    let Some((repo_id, code)) = freshness else {
+        return;
+    };
+    for result in results.iter_mut() {
+        if result.repository_id == Some(repo_id.as_str()) {
+            result.freshness = Some(code);
+        }
+    }
 }
 
 fn print_counts_text(counts: &InspectCounts) {
@@ -1780,8 +2633,8 @@ fn ingest(
 /// Machine-readable report emitted by `eg refresh`.
 ///
 /// All counts are integers; file lists are sorted repository-relative paths.
-/// `freshness_after_refresh` is always `"fresh"` after a successful refresh
-/// (the counterpart to the read-only staleness signal in issue #82).
+/// `freshness_after_refresh` reports the verdict a follow-up `eg freshness`
+/// would give (the write-side counterpart to the read-only signal in issue #82).
 #[cfg(feature = "embedded-aletheiadb")]
 #[derive(Debug, Serialize)]
 struct RefreshReport {
@@ -1814,8 +2667,11 @@ struct RefreshReport {
     embed_status: String,
     /// Freshness of the store with respect to the working tree after this refresh.
     ///
-    /// Always `"fresh"` on success: the store now reflects the current working tree.
-    /// This is the write counterpart to the read-only staleness signal (issue #82).
+    /// The verdict `eg freshness --data-dir` would report for the rebuilt store:
+    /// `"fresh"` for a clean tree at the stamped HEAD, or `"stale_dirty"` when the
+    /// refresh captured uncommitted `.rs` edits (the store reflects an uncommitted
+    /// state). This is the write counterpart to the read-only staleness signal
+    /// (issue #82) and stays consistent with a follow-up freshness check (OO1).
     freshness_after_refresh: String,
 }
 
@@ -1873,7 +2729,13 @@ fn scan_refresh_cmd(
     }
 
     // Perform the incremental scan (reads cache, hashes files, rebuilds changed ones).
-    let scan = scan_repository_incremental(repo_path, cache_path)
+    // Exclude the data-dir, the cache file, and any in-tree `.egregore*` companion
+    // store from the dirty probe (PR #186 A/MM1): all are refresh/store artifacts;
+    // counting any as dirty would stamp `dirty = true` on the snapshot and make a
+    // follow-up `eg freshness --data-dir` report `stale_dirty` with no source change.
+    let snapshot_exclusions =
+        store_exclusions_including_egregore(repo_path, &[Some(data_dir), Some(cache_path)]);
+    let scan = scan_repository_incremental_excluding(repo_path, cache_path, &snapshot_exclusions)
         .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
 
     let records = scan.graph.records().to_vec();
@@ -1922,6 +2784,21 @@ fn scan_refresh_cmd(
     let reused_count = reused_files.len();
     let tombstoned_count = tombstoned_files.len();
 
+    // Report the verdict `eg freshness --data-dir` would compute, not an
+    // unconditional "fresh" (OO1 / PR #186 follow-up). When the working tree had
+    // uncommitted `.rs` edits the refreshed snapshot is stamped `dirty`, so the
+    // store is `stale_dirty` even immediately after rebuild — exactly as a full
+    // scan of a dirty tree behaves. The snapshot was just computed from the
+    // current tree, so classifying it against itself yields the same verdict a
+    // follow-up freshness check would, without re-probing Git.
+    let refresh_identity = identity::compute_repository_identity(repo_path, None);
+    let freshness_after_refresh = freshness::stored_snapshot(&records, &refresh_identity.id)
+        .map_or(Freshness::Unknown, |snapshot| {
+            freshness::classify(Some(snapshot), &snapshot.head, snapshot.dirty)
+        })
+        .code()
+        .to_owned();
+
     let refresh_report = RefreshReport {
         rebuilt_files,
         rebuilt_count,
@@ -1933,8 +2810,7 @@ fn scan_refresh_cmd(
         ingest_succeeded: ingest_report.succeeded,
         ingest_failed: ingest_report.failed,
         embed_status,
-        // AC6: A successful refresh means the store now matches the working tree.
-        freshness_after_refresh: "fresh".to_owned(),
+        freshness_after_refresh,
     };
 
     match format {
@@ -2019,6 +2895,46 @@ fn daemon(action: DaemonAction) -> Result<()> {
     }
 }
 
+/// Handles `eg doctor`: gather environment observations, build the preflight
+/// report, print it, and exit with the appropriate code.
+///
+/// Exits 0 when structural checks all pass; exits 1 otherwise.
+/// Optional/semantic failures never change the exit code.
+fn doctor_cmd(
+    path: PathBuf,
+    out: PathBuf,
+    data_dir: PathBuf,
+    require_history: bool,
+    network: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    use crate::preflight::{DoctorConfig, build_report, gather_observations, render_doctor_text};
+
+    let config = DoctorConfig {
+        repo_path: path,
+        out,
+        data_dir,
+        require_history,
+        network,
+    };
+    let obs = gather_observations(&config);
+    let report = build_report(&config, &obs);
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Text => {
+            print!("{}", render_doctor_text(&report));
+        }
+    }
+
+    if !report.structural_ready {
+        process::exit(1);
+    }
+    Ok(())
+}
+
 /// Handles `eg repair preflight` and `eg repair run`.
 #[cfg(feature = "embedded-aletheiadb")]
 fn repair_cmd(action: RepairCliAction) -> Result<()> {
@@ -2090,6 +3006,13 @@ struct SymbolResult<'a> {
     /// Human-usable repository identity handle (e.g. `owner/name`).
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<&'a str>,
+    /// Non-fatal store-freshness code relative to a working tree (issue #82).
+    ///
+    /// Present only when `--repo-path` was supplied so an agent can downgrade
+    /// trust in the cited `repo_relative_path` + `span` handle. Absent (and the
+    /// result never suppressed) when freshness was not requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -2235,6 +3158,13 @@ struct ContextTopologyEdge<'a> {
 struct ContextResponse<'a> {
     ok: bool,
     symbol_name: &'a str,
+    /// Non-fatal store-freshness code relative to a working tree (issue #82).
+    ///
+    /// Present only when `--repo-path` was supplied; the context is never
+    /// suppressed on a non-`fresh` verdict so an agent can downgrade trust in the
+    /// returned handles instead of losing them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness: Option<&'static str>,
     source_facts: Vec<ContextSourceFact<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     topology_edges: Vec<ContextTopologyEdge<'a>>,
@@ -2260,6 +3190,87 @@ struct TaskContextResponse<'a> {
     reviews: Vec<ContextLinkedItem<'a>>,
     external_links: Vec<ContextLinkedItem<'a>>,
     unresolved: Vec<ContextUnresolved<'a>>,
+}
+
+/// One semantic drift item in the `semantic_drift` section of a subsystem response.
+#[derive(Serialize)]
+struct SubsystemDrift<'a> {
+    record_id: &'a str,
+    score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_span: Option<crate::ir::SourceSpan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_git_commit: Option<&'a str>,
+}
+
+/// Full subsystem context query response envelope (issue #83).
+#[derive(Serialize)]
+struct SubsystemResponse<'a> {
+    ok: bool,
+    prefix: &'a str,
+    source_facts: Vec<ContextSourceFact<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    topology_edges: Vec<ContextTopologyEdge<'a>>,
+    observations: Vec<ContextObservation<'a>>,
+    project_state: Vec<ContextLinkedItem<'a>>,
+    artifacts: Vec<ContextLinkedItem<'a>>,
+    verification_evidence: Vec<ContextLinkedItem<'a>>,
+    semantic_drift: Vec<SubsystemDrift<'a>>,
+    unresolved: Vec<ContextUnresolved<'a>>,
+}
+
+// ---------------------------------------------------------------------------
+// semantic → context bridge (issue #90)
+// ---------------------------------------------------------------------------
+
+/// One semantic match expanded into evidence-backed context.
+///
+/// Carries the retrieval-lead handle (record ID, repo-relative path, span,
+/// score, repository identity) and the same five trust-separated context
+/// sections produced by `eg query context`. `match_kind` documents whether the
+/// match anchored on a `symbol`, a `file` (its defined symbols are seeded into
+/// `source_facts`), or some `other` node. When `ambiguous` is true the match
+/// name resolved to more than one live symbol and `candidate_record_ids` lists
+/// every candidate instead of silently picking one.
+#[cfg(feature = "embeddings")]
+#[derive(Serialize)]
+struct SemanticContextMatch<'a> {
+    record_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+    score: f32,
+    match_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
+    ambiguous: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    candidate_record_ids: Vec<&'a str>,
+    source_facts: Vec<ContextSourceFact<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    topology_edges: Vec<ContextTopologyEdge<'a>>,
+    observations: Vec<ContextObservation<'a>>,
+    project_state: Vec<ContextLinkedItem<'a>>,
+    artifacts: Vec<ContextLinkedItem<'a>>,
+    verification_evidence: Vec<ContextLinkedItem<'a>>,
+    unresolved: Vec<ContextUnresolved<'a>>,
+}
+
+/// Full `eg query semantic-context` response envelope.
+#[cfg(feature = "embeddings")]
+#[derive(Serialize)]
+struct SemanticContextResponse<'a> {
+    ok: bool,
+    query: &'a str,
+    min_score: f32,
+    matches: Vec<SemanticContextMatch<'a>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2438,6 +3449,50 @@ struct MemoryAuditResponse<'a> {
     page: AuditPage,
 }
 
+/// One prior failed attempt: a redaction-safe [`AuditItem`] plus the
+/// failure-specific read-time fields (issue #63).
+#[derive(Serialize)]
+struct FailureAttemptJson<'a> {
+    #[serde(flatten)]
+    item: AuditItem<'a>,
+    /// Read-time `still_failing` / `since_resolved` status (AC5).
+    resolution_status: &'static str,
+    /// Record ID of the later passing verification that resolved it, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_by: Option<&'a str>,
+    /// The target handle (anchor record ID) this attempt linked to.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    matched_target: &'a str,
+    /// `command_failure` / `patch_invalid` for an agent `Failure` claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_kind: Option<&'a str>,
+    /// RFC-3339 execution time for a runtime verification failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executed_at: Option<&'a str>,
+}
+
+/// Full prior-failed-attempt response envelope (issue #63).
+#[derive(Serialize)]
+struct FailureHistoryResponse<'a> {
+    ok: bool,
+    target_handle: &'a str,
+    target_type: &'a str,
+    target_ids: Vec<&'a str>,
+    runtime_failures: Vec<FailureAttemptJson<'a>>,
+    agent_failures: Vec<FailureAttemptJson<'a>>,
+    superseding_successes: Vec<AuditItem<'a>>,
+    patch_artifacts: Vec<AuditItem<'a>>,
+    /// `AgentSession` record IDs reached via `AUTHORED_BY` from a failure — the
+    /// citable provenance when a `Failure` carries no `agent_id`/`session_id`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    agent_sessions: Vec<&'a str>,
+    /// `Agent` record IDs reached via `SESSION_OF`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    agents: Vec<&'a str>,
+    diagnostics: Vec<AuditDiagnostic<'a>>,
+    page: AuditPage,
+}
+
 // ---------------------------------------------------------------------------
 // query_cmd — dispatch
 // ---------------------------------------------------------------------------
@@ -2455,9 +3510,23 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             as_of,
             tx_as_of,
             repo,
+            repo_path,
             format,
         } => {
             if let Some(tx) = tx_as_of.as_deref() {
+                // --repo-path is used to stamp freshness onto results.  TxSymbolRow
+                // has no freshness field and the tx-as-of path never computes one,
+                // so accepting --repo-path here would silently drop the signal.
+                // Reject the combination early so users see a clear error rather
+                // than a result that looks correct but carries no freshness stamp.
+                if repo_path.is_some() {
+                    print_tx_error(
+                        "unsupported_combination",
+                        "--repo-path cannot be used with --tx-as-of; \
+                         freshness stamping is not available for transaction-time queries",
+                    )?;
+                    std::process::exit(1);
+                }
                 // --at keys the valid-time axis to a commit; combining it with a
                 // transaction-time selector is an unsupported workflow (AC6).
                 if at.is_some() {
@@ -2517,6 +3586,16 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             }
             #[cfg(feature = "embedded-aletheiadb")]
             if daemon {
+                if repo_path.is_some() {
+                    // Daemon-routed results bypass the local freshness probe entirely;
+                    // accepting --repo-path here would silently emit results without
+                    // the promised `freshness` field (PR #186 follow-up).
+                    eprintln!(
+                        "error: --repo-path cannot be used with --daemon; \
+                         run without --daemon to get freshness stamping"
+                    );
+                    std::process::exit(1);
+                }
                 let dir = data_dir
                     .as_deref()
                     .expect("clap requires --data-dir with --daemon");
@@ -2533,16 +3612,49 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             let selected = selected.as_deref();
+            let freshness_code = query_freshness_code_with_hint(
+                &records,
+                repo_path.as_deref(),
+                &[graph.as_deref(), data_dir.as_deref()],
+                selected,
+            );
             as_of.map_or_else(
                 || {
                     at.map_or_else(
-                        || query_symbol_all(&records, &name, format, &index, selected),
+                        || {
+                            query_symbol_all(
+                                &records,
+                                &name,
+                                format,
+                                &index,
+                                selected,
+                                freshness_code.as_ref(),
+                            )
+                        },
                         |prefix| {
-                            query_symbol_at(&records, &name, &prefix, format, &index, selected)
+                            query_symbol_at(
+                                &records,
+                                &name,
+                                &prefix,
+                                format,
+                                &index,
+                                selected,
+                                freshness_code.as_ref(),
+                            )
                         },
                     )
                 },
-                |instant| query_symbol_as_of(&records, &name, &instant, format, &index, selected),
+                |instant| {
+                    query_symbol_as_of(
+                        &records,
+                        &name,
+                        &instant,
+                        format,
+                        &index,
+                        selected,
+                        freshness_code.as_ref(),
+                    )
+                },
             )
         }
         QuerySubcommand::File {
@@ -2552,10 +3664,18 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             #[cfg(feature = "embedded-aletheiadb")]
             daemon,
             repo,
+            repo_path,
             format,
         } => {
             #[cfg(feature = "embedded-aletheiadb")]
             if daemon {
+                if repo_path.is_some() {
+                    eprintln!(
+                        "error: --repo-path cannot be used with --daemon; \
+                         run without --daemon to get freshness stamping"
+                    );
+                    std::process::exit(1);
+                }
                 let dir = data_dir
                     .as_deref()
                     .expect("clap requires --data-dir with --daemon");
@@ -2564,7 +3684,20 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
-            query_file(&records, &path, format, &index, selected.as_deref())
+            let freshness_code = query_freshness_code_with_hint(
+                &records,
+                repo_path.as_deref(),
+                &[graph.as_deref(), data_dir.as_deref()],
+                selected.as_deref(),
+            );
+            query_file(
+                &records,
+                &path,
+                format,
+                &index,
+                selected.as_deref(),
+                freshness_code.as_ref(),
+            )
         }
         QuerySubcommand::Drift {
             graph,
@@ -2602,13 +3735,67 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 query_semantic(&query, &data_dir, limit, repo.as_deref(), format)
             }
         }
+        #[cfg(feature = "embeddings")]
+        QuerySubcommand::SemanticContext {
+            query,
+            data_dir,
+            repo,
+            limit,
+            min_score,
+        } => query_semantic_context(&query, &data_dir, limit, min_score, repo.as_deref()),
+        #[cfg(feature = "embeddings")]
+        QuerySubcommand::SemanticMemory {
+            query,
+            data_dir,
+            repo,
+            limit,
+            verified_only,
+            format,
+        } => query_semantic_memory(
+            &query,
+            &data_dir,
+            limit,
+            repo.as_deref(),
+            verified_only,
+            format,
+        ),
         QuerySubcommand::Context {
             name,
             graph,
             data_dir,
+            repo_path,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            query_context_cmd(&records, &name)
+            // Pre-compute the context owner so the freshness hint matches the
+            // repository that actually owns the returned source facts.  Without this,
+            // `query_freshness_code` auto-detects the identity from `repo_path`, which
+            // can differ from an operator-override ID: the snapshot lookup then fails
+            // (no match for the auto-detected ID in a single-override-ID store), the
+            // single-repo fallback is disabled, and the verdict is `unknown` even
+            // though all facts are from one stamped repository (PR #186 follow-up).
+            let owner_hint = if repo_path.is_some() {
+                let index = query::RepositoryIndex::build(&records);
+                let ctx = query::symbol_context(&records, &name);
+                let owners: std::collections::BTreeSet<Option<&str>> = ctx
+                    .source_facts
+                    .iter()
+                    .map(|r| index.owner_of(r.id()))
+                    .collect();
+                if owners.len() == 1 {
+                    owners.into_iter().next().flatten().map(ToOwned::to_owned)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let freshness = query_freshness_code_with_hint(
+                &records,
+                repo_path.as_deref(),
+                &[graph.as_deref(), data_dir.as_deref()],
+                owner_hint.as_deref(),
+            );
+            query_context_cmd(&records, &name, freshness)
         }
         QuerySubcommand::Task {
             id_or_handle,
@@ -2679,6 +3866,53 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_changes_cmd(&records, &base, &head)
+        }
+        QuerySubcommand::Failures {
+            handle,
+            graph,
+            data_dir,
+            repo,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_failures_cmd(&records, &handle, &index, selected.as_deref())
+        }
+        QuerySubcommand::Subsystem {
+            prefix,
+            graph,
+            data_dir,
+            format,
+        } => {
+            // Validate the prefix before loading records so malformed input fails
+            // fast with a machine-readable diagnostic, not a store I/O error.
+            if prefix.trim_end_matches('/').is_empty() {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "malformed_prefix",
+                        "prefix": prefix,
+                        "message": "prefix must be non-empty after stripping trailing slashes"
+                    }
+                });
+                println!("{}", serde_json::to_string(&envelope)?);
+                std::process::exit(1);
+            }
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_subsystem_cmd(&records, &prefix, format)
+        }
+        QuerySubcommand::ChangeImpact {
+            handle,
+            graph,
+            data_dir,
+            repo,
+            depth,
+            format: _format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_change_impact_cmd(&records, &handle, &index, selected.as_deref(), depth)
         }
     }
 }
@@ -2984,6 +4218,55 @@ fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
     }
 }
 
+/// Loads records from an embedded `--data-dir` store without mutating it (issue #82).
+///
+/// The embedded engine re-persists its index files on open, so a freshness check
+/// that opened the live store directly would modify it — violating the read-only
+/// guarantee. This copies the store to a throwaway temporary directory and reads
+/// the copy, leaving the original byte-for-byte untouched.
+fn load_records_from_data_dir_readonly(data_dir: &Path) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let temp =
+            tempfile::tempdir().context("failed to create temporary read-only store copy")?;
+        let copy_root = temp.path().join("store");
+        copy_dir_recursive(data_dir, &copy_root).with_context(|| {
+            format!(
+                "failed to copy store {} for read-only inspection",
+                data_dir.display()
+            )
+        })?;
+        load_records_from_db(&copy_root)
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// Recursively copies the regular files and directories under `src` into `dst`.
+///
+/// Symlinks and other non-regular entries are skipped; this is used only to make
+/// a read-only working copy of an embedded store directory.
+#[cfg(feature = "embedded-aletheiadb")]
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
 /// Loads query records for a transaction-time query (issue #66).
 ///
 /// The `--graph` JSONL path already preserves every written line, so it is used
@@ -3139,21 +4422,28 @@ fn query_semantic(
 
     let query_vector = embed_query_text(query)?;
 
-    // When scoped, search the whole index so higher-scoring hits from other
-    // repositories can never crowd the selected repository's matches out of
-    // the candidate set; the limit then bounds the scoped result set.
-    let fetch = if selected.is_some() {
-        records.len().max(limit)
-    } else {
-        limit
-    };
+    // Over-fetch the whole index, not just `limit` raw hits: the shared vector
+    // index now also embeds agent-memory nodes (issue #91), so a query whose top
+    // `limit` raw matches are memory would otherwise drop them all and never see
+    // the code hits ranked just behind them. Fetching the full pool lets the
+    // code-kind filter below recover those code hits; the limit then bounds the
+    // filtered result set. Scoping needs the full pool for the same reason.
+    let fetch = records.len().max(limit);
     let mut matches = sink
         .semantic_search(&query_vector, fetch)
         .with_context(|| "semantic search failed — was the store ingested with --embed?")?;
+    // Code search must never blend agent-authored memory hits into deterministic
+    // code results (issue #91): the shared vector index now also embeds
+    // observation-class memory nodes, recalled only via `eg query semantic-memory`.
+    matches.retain(|m| {
+        m.kind
+            .as_deref()
+            .is_some_and(|k| k == "File" || k == "Symbol")
+    });
     if let Some(repo) = selected.as_deref() {
         matches.retain(|m| index.owner_of(&m.record_id) == Some(repo));
-        matches.truncate(limit);
     }
+    matches.truncate(limit);
 
     if matches.is_empty() {
         eprintln!("no results — store may not have embeddings (re-run ingest with --embed)");
@@ -3162,6 +4452,356 @@ fn query_semantic(
 
     for m in &matches {
         print_result(&SemanticResult::from_match(m, &index), format)?;
+    }
+    Ok(())
+}
+
+/// One agent-authored memory record recalled by meaning (issue #91).
+///
+/// Typed `agent_authored` so a consuming agent can never mistake a recalled
+/// lesson for deterministic source truth. Every emitted row carries a citable
+/// `source_handle`; a hit lacking provenance is excluded upstream, never
+/// returned with empty provenance.
+#[cfg(feature = "embeddings")]
+#[derive(Serialize)]
+struct MemoryRecallResult<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    trust_class: &'static str,
+    retrieval_score: f32,
+    /// Citable source transcript / session / turn handle proving where the
+    /// memory came from.
+    source_handle: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingested_at: Option<&'a str>,
+    /// `verified` when the claim cites present verification evidence, else
+    /// `unverified` — a structural, non-inferential trust signal (issue #64).
+    review_state: &'static str,
+    redacted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<&'a str>,
+    /// Resolved code handles this memory cites (`OBSERVES`/`MENTIONS_SYMBOL`/…).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    linked_code_handles: Vec<String>,
+    /// The recalled memory body (post-redaction stored text).
+    memory_text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
+}
+
+#[cfg(feature = "embeddings")]
+impl PrintText for MemoryRecallResult<'_> {
+    fn as_text(&self) -> String {
+        format!(
+            "{} [{}] {} score={:.4} author={} source={} review={}\n  {}",
+            self.record_id,
+            self.kind,
+            self.trust_class,
+            self.retrieval_score,
+            self.agent_id.unwrap_or("(unknown)"),
+            self.source_handle,
+            self.review_state,
+            self.memory_text,
+        )
+    }
+}
+
+/// Returns a trimmed, non-empty string slice, or `None` for a missing or
+/// blank-only value. Used so an imported memory record carrying
+/// `source_handle: ""` is treated as having no provenance rather than passing
+/// the recall gate and being emitted with an empty handle (issue #91).
+#[cfg(feature = "embeddings")]
+fn non_empty(value: Option<&String>) -> Option<&str> {
+    value.map(String::as_str).filter(|s| !s.trim().is_empty())
+}
+
+/// Resolves the repositories a memory record belongs to (issue #91).
+///
+/// Agent-memory nodes are not part of the code-graph containment topology, so
+/// [`query::RepositoryIndex::owner_of`] returns `None` for them directly. A
+/// memory record is attributed to a repository through the code it cites: any
+/// cited code target that resolves to a repository-owned node scopes the memory
+/// to that repository. Both citation shapes are honored — inline
+/// `evidence_links` and standalone outgoing `GraphRecord::Edge` records (e.g.
+/// the `link-evidence` `MENTIONS_SYMBOL` / `FAILED_ON` / `TOUCHED_FILE` edges) —
+/// so imported memory that stores normalized edges is not dropped under `--repo`.
+/// Returned sorted and deduplicated for deterministic selection.
+#[cfg(feature = "embeddings")]
+fn memory_repo_owners<'a>(
+    record_id: &str,
+    links: Option<&Vec<EvidenceLink>>,
+    edges_from: &query::OutgoingEdgeIndex<'_>,
+    index: &'a query::RepositoryIndex,
+) -> Vec<&'a str> {
+    if let Some(owner) = index.owner_of(record_id) {
+        return vec![owner];
+    }
+    let mut owners: Vec<&str> = Vec::new();
+    if let Some(links) = links {
+        owners.extend(
+            links
+                .iter()
+                .filter_map(|l| l.target_record_id.as_deref())
+                .filter_map(|target| index.owner_of(target)),
+        );
+    }
+    if let Some(out) = edges_from.get(record_id) {
+        owners.extend(out.iter().filter_map(|(_, target)| index.owner_of(target)));
+    }
+    owners.sort_unstable();
+    owners.dedup();
+    owners
+}
+
+/// Resolves one evidence link to a citable code handle string when it points at
+/// the code-graph domain.
+#[cfg(feature = "embeddings")]
+fn code_handle_from_link(
+    link: &EvidenceLink,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+) -> Option<String> {
+    let is_code = link.target_domain == "codegraph"
+        || matches!(
+            link.relation.as_str(),
+            "OBSERVES" | "MENTIONS_SYMBOL" | "TOUCHED_FILE"
+        );
+    if !is_code {
+        return None;
+    }
+    if let Some(target_id) = link.target_record_id.as_deref()
+        && let Some(GraphRecord::Node {
+            repo_relative_path,
+            name,
+            ..
+        }) = by_id.get(target_id).copied()
+    {
+        if let Some(path) = repo_relative_path {
+            return Some(
+                name.as_ref()
+                    .map_or_else(|| path.clone(), |n| format!("{path}::{n}")),
+            );
+        }
+        return Some(target_id.to_owned());
+    }
+    link.target_repo_relative_path
+        .clone()
+        .or_else(|| link.target_record_id.clone())
+}
+
+/// Decides whether a semantic hit is a recallable agent-memory record (issue #91).
+///
+/// A hit qualifies only when it is an agent-memory observation-class kind, can
+/// cite where it came from (a `source_handle`, source artifact path, or session
+/// handle), and — under `verified_only` — cites present verification evidence.
+/// A hit lacking provenance is rejected here so it is excluded, never returned.
+#[cfg(feature = "embeddings")]
+fn is_recallable_memory(
+    m: &SemanticMatch,
+    by_id: &BTreeMap<&str, &GraphRecord>,
+    edges_from: &query::OutgoingEdgeIndex<'_>,
+    tombstoned: &query::TombstonedSet<'_>,
+    verified_only: bool,
+) -> bool {
+    if !m
+        .kind
+        .as_deref()
+        .is_some_and(|k| matches!(k, "Observation" | "Decision" | "Failure"))
+    {
+        return false;
+    }
+    let Some(record) = by_id.get(m.record_id.as_str()).copied() else {
+        return false;
+    };
+    let GraphRecord::Node {
+        session_id,
+        source_handle,
+        source_artifact_path,
+        ..
+    } = record
+    else {
+        return false;
+    };
+    // Provenance must be a present, non-blank handle: a record carrying only
+    // empty strings is excluded, never emitted with an empty `source_handle`.
+    let has_provenance = non_empty(source_handle.as_ref()).is_some()
+        || non_empty(source_artifact_path.as_ref()).is_some()
+        || non_empty(session_id.as_ref()).is_some();
+    if !has_provenance {
+        return false;
+    }
+    // Verified-only reuses the memory-audit structural rule (issue #64): a
+    // resolvable, non-tombstoned verification record cited via VALIDATED_BY /
+    // HAS_EVIDENCE / PRODUCED_EVIDENCE, on either an inline evidence link or an
+    // outgoing edge. A triple-only citation stub never counts as verified.
+    if verified_only && !query::is_verified_claim(record, by_id, edges_from, tombstoned) {
+        return false;
+    }
+    true
+}
+
+/// Recalls prior agent memory by meaning, trust-separated from code (issue #91).
+///
+/// Embeds the natural-language query with the local model, runs the same vector
+/// search the code path uses, then keeps only agent-memory observation-class
+/// hits — each enriched with its provenance handle. A hit that cannot cite
+/// where it came from is excluded, not returned. With `--verified-only`,
+/// observations lacking cited verification evidence are excluded too.
+#[cfg(feature = "embeddings")]
+#[allow(clippy::too_many_lines)]
+fn query_semantic_memory(
+    query: &str,
+    data_dir: &Path,
+    limit: usize,
+    repo: Option<&str>,
+    verified_only: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    validate_existing_embedded_store(data_dir)?;
+
+    let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+        .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+
+    let records = sink
+        .read_all_records()
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+    let index = query::RepositoryIndex::build(&records);
+    let selected = resolve_repo_scope(&index, repo);
+
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let (edges_from, tombstoned) = query::verification_support_indexes(&records);
+
+    let query_vector = embed_query_text(query)?;
+
+    // The shared vector index holds both code and memory; fetch a generous pool
+    // and filter to memory so the `limit` bounds recalled memory, not the blend.
+    let fetch = records.len().max(limit);
+    let matches = sink
+        .semantic_search(&query_vector, fetch)
+        .with_context(|| "semantic search failed — was the store ingested with --embed?")?;
+
+    let mut rows: Vec<MemoryRecallResult> = Vec::new();
+    for m in &matches {
+        // Trust separation + provenance exclusion (AC3): keep only agent-memory
+        // observation-class hits that can cite where they came from.
+        if !is_recallable_memory(m, &by_id, &edges_from, &tombstoned, verified_only) {
+            continue;
+        }
+        let Some(record) = by_id.get(m.record_id.as_str()).copied() else {
+            continue;
+        };
+        let GraphRecord::Node {
+            text,
+            summary,
+            agent_id,
+            agent_kind,
+            session_id,
+            observed_at,
+            ingested_at,
+            confidence,
+            source_handle,
+            source_artifact_path,
+            redaction_policy_version,
+            superseded_by,
+            evidence_links,
+            ..
+        } = record
+        else {
+            continue;
+        };
+
+        // Scope through the code this memory cites: memory nodes are not in the
+        // containment topology, so a `--repo` filter must resolve the repository
+        // from the linked code handles (inline links and outgoing edges), not the
+        // memory record ID directly.
+        let owners = memory_repo_owners(&m.record_id, evidence_links.as_ref(), &edges_from, &index);
+        if let Some(repo) = selected.as_deref()
+            && !owners.contains(&repo)
+        {
+            continue;
+        }
+
+        // `is_recallable_memory` guarantees a present, non-blank handle; pick the
+        // first non-empty among source handle, artifact path, and session ID.
+        let source_handle_value = non_empty(source_handle.as_ref())
+            .or_else(|| non_empty(source_artifact_path.as_ref()))
+            .or_else(|| non_empty(session_id.as_ref()))
+            .unwrap_or_default()
+            .to_owned();
+
+        let verified = query::is_verified_claim(record, &by_id, &edges_from, &tombstoned);
+
+        let linked_code_handles: Vec<String> = evidence_links
+            .as_ref()
+            .map(|links| {
+                let mut handles: Vec<String> = links
+                    .iter()
+                    .filter_map(|l| code_handle_from_link(l, &by_id))
+                    .collect();
+                handles.sort();
+                handles.dedup();
+                handles
+            })
+            .unwrap_or_default();
+
+        // Label with the selected repository when scoped (the membership filter
+        // above guarantees it is among `owners`), so a memory citing code in
+        // several repositories is never misattributed to a different one than the
+        // user selected; otherwise fall back to the first owner deterministically.
+        let repository_id = selected.as_deref().or_else(|| owners.first().copied());
+        rows.push(MemoryRecallResult {
+            record_id: record.id(),
+            kind: record.node_kind_name().unwrap_or("Observation"),
+            trust_class: "agent_authored",
+            retrieval_score: m.score,
+            source_handle: source_handle_value,
+            agent_id: agent_id.as_deref(),
+            agent_kind: agent_kind.as_deref(),
+            session_id: session_id.as_deref(),
+            confidence: confidence.as_deref(),
+            observed_at: observed_at.as_deref(),
+            ingested_at: ingested_at.as_deref(),
+            review_state: if verified { "verified" } else { "unverified" },
+            redacted: redaction_policy_version.is_some(),
+            superseded_by: superseded_by.as_deref(),
+            linked_code_handles,
+            memory_text: text.as_deref().unwrap_or(summary.as_str()),
+            repository_id,
+            repository: repository_id.and_then(|id| index.display_of(id)),
+        });
+    }
+
+    // Canonical ordering before truncation (AC7): equal-score ANN results can be
+    // returned in arbitrary order, so sort by score descending then record ID
+    // ascending so repeated runs print byte-identical output and the row chosen
+    // at the `limit` boundary is stable.
+    rows.sort_by(|a, b| {
+        b.retrieval_score
+            .total_cmp(&a.retrieval_score)
+            .then_with(|| a.record_id.cmp(b.record_id))
+    });
+    rows.truncate(limit);
+
+    if rows.is_empty() {
+        eprintln!(
+            "no memory results — store may lack embedded memory (re-run ingest with --embed) or all hits were filtered"
+        );
+        std::process::exit(2);
+    }
+
+    for row in &rows {
+        print_result(row, format)?;
     }
     Ok(())
 }
@@ -3228,6 +4868,147 @@ fn print_daemon_semantic_record(rec: &serde_json::Value, format: OutputFormat) -
     Ok(())
 }
 
+/// Natural-language query → evidence-backed context for the top-N semantic
+/// matches, in a single read-only call (issue #90).
+///
+/// Embeds the query locally, ranks matches against the embedded store, then —
+/// for each match clearing `min_score` — resolves the same trust-separated
+/// context sections as `eg query context`, anchored on the match's record ID so
+/// File-typed matches are first-class. A no-match (no hit clears the floor)
+/// emits a stable diagnostic to stdout and exits 2.
+#[cfg(feature = "embeddings")]
+fn query_semantic_context(
+    query: &str,
+    data_dir: &Path,
+    limit: usize,
+    min_score: f32,
+    repo: Option<&str>,
+) -> Result<()> {
+    validate_existing_embedded_store(data_dir)?;
+
+    let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+        .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+
+    let records = sink
+        .read_all_records()
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+    let index = query::RepositoryIndex::build(&records);
+    let selected = resolve_repo_scope(&index, repo);
+
+    let query_vector = embed_query_text(query)?;
+
+    // Over-fetch the whole index, not just `limit` raw hits: the shared vector
+    // index also embeds agent-memory nodes (issue #91), so a query whose top
+    // `limit` raw matches are memory would otherwise drop the code hits ranked
+    // just behind them. Fetch the full pool so the code-kind filter below
+    // recovers those code hits; the limit then bounds the filtered set.
+    let fetch = records.len().max(limit);
+    let mut matches = sink
+        .semantic_search(&query_vector, fetch)
+        .with_context(|| "semantic search failed — was the store ingested with --embed?")?;
+    // `semantic-context` is a code-context bridge: never expand agent-authored
+    // memory hits (issue #91). Mirror `query semantic` and keep only
+    // deterministic code kinds before building leads.
+    matches.retain(|m| {
+        m.kind
+            .as_deref()
+            .is_some_and(|k| k == "File" || k == "Symbol")
+    });
+    if let Some(repo) = selected.as_deref() {
+        matches.retain(|m| index.owner_of(&m.record_id) == Some(repo));
+    }
+    // Canonical ordering before truncation: equal-score ANN results can be
+    // returned in arbitrary order, so sort by score descending then record ID
+    // ascending so repeated runs choose the same rows at the `limit` boundary
+    // and emit byte-identical output.
+    matches.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.record_id.cmp(&b.record_id))
+    });
+    matches.truncate(limit);
+
+    let leads: Vec<query::SemanticLead> = matches
+        .iter()
+        .map(|m| query::SemanticLead {
+            record_id: m.record_id.clone(),
+            name: m.name.clone(),
+            repo_relative_path: m.repo_relative_path.clone(),
+            score: m.score,
+            span: m.span,
+        })
+        .collect();
+
+    // Scope the record slice for context expansion when a repo is selected so
+    // that ambiguity detection (candidate_record_ids) and the path-based file
+    // fallback in record_context don't return IDs from other repos. Cross-
+    // domain records (observations, artifacts, verification) are unowned and
+    // always kept so that context sections remain fully populated.
+    let records: Vec<GraphRecord> = if let Some(repo) = selected.as_deref() {
+        records
+            .into_iter()
+            .filter(|r| index.owner_of(r.id()).is_none_or(|o| o == repo))
+            .collect()
+    } else {
+        records
+    };
+
+    let bundle = query::semantic_context_bundle(&records, &leads, min_score);
+
+    if bundle.is_no_match() {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "no_match",
+                "query": query,
+                "min_score": min_score,
+            }
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(2);
+    }
+
+    let match_rows: Vec<SemanticContextMatch<'_>> = bundle
+        .matches
+        .iter()
+        .map(|m| {
+            let sections = build_context_sections(&m.context);
+            let repository_id = index.owner_of(&m.lead.record_id);
+            SemanticContextMatch {
+                record_id: &m.lead.record_id,
+                name: m.lead.name.as_deref(),
+                repo_relative_path: m.lead.repo_relative_path.as_deref(),
+                span: m.lead.span,
+                score: m.lead.score,
+                match_kind: m.anchor_kind.as_str(),
+                repository_id,
+                repository: repository_id.and_then(|id| index.display_of(id)),
+                ambiguous: !m.candidate_record_ids.is_empty(),
+                candidate_record_ids: m.candidate_record_ids.iter().map(String::as_str).collect(),
+                source_facts: sections.source_facts,
+                topology_edges: sections.topology_edges,
+                observations: sections.observations,
+                project_state: sections.project_state,
+                artifacts: sections.artifacts,
+                verification_evidence: sections.verification_evidence,
+                unresolved: sections.unresolved,
+            }
+        })
+        .collect();
+
+    let response = SemanticContextResponse {
+        ok: true,
+        query,
+        min_score,
+        matches: match_rows,
+    };
+
+    let output =
+        serde_json::to_string_pretty(&response).context("failed to serialize semantic context")?;
+    println!("{output}");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // eval-semantic command
 // ---------------------------------------------------------------------------
@@ -3278,6 +5059,16 @@ fn eval_semantic_cmd(
     let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
         .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
 
+    // The shared vector index may also hold agent-memory nodes (issue #91). The
+    // code-relevance gate must score only deterministic code hits, exactly like
+    // `eg query semantic`, so over-fetch the full pool and filter to File/Symbol
+    // before scoring; otherwise embedded memory could occupy top-k slots or
+    // count as ambiguous-query false positives and corrupt the gate.
+    let total_records = sink
+        .read_all_records()
+        .map(|r| r.len())
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
 
     let mut results = Vec::new();
@@ -3297,7 +5088,7 @@ fn eval_semantic_cmd(
             .embedding;
 
         let matches = sink
-            .semantic_search(&query_vector, top_k.max(3))
+            .semantic_search(&query_vector, total_records.max(top_k.max(3)))
             .with_context(|| {
                 format!(
                     "semantic search failed for query {} — was the store ingested with --embed?",
@@ -3305,9 +5096,123 @@ fn eval_semantic_cmd(
                 )
             })?;
 
-        let hits: Vec<SearchHit> = matches.iter().map(SearchHit::from).collect();
+        let hits: Vec<SearchHit> = matches
+            .iter()
+            .filter(|m| {
+                m.kind
+                    .as_deref()
+                    .is_some_and(|k| k == "File" || k == "Symbol")
+            })
+            .take(top_k.max(3))
+            .map(SearchHit::from)
+            .collect();
         #[allow(clippy::cast_possible_truncation)]
         results.push(evaluate_query(query, &hits, fp_threshold as f32));
+    }
+
+    let report = build_report(results, threshold);
+    print_report(&report, std::io::stdout())?;
+
+    if !report.passed {
+        eprintln!("{}", format_diagnostic(&report));
+        process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Runs the agent-memory recall corpus evaluation against an embedded store
+/// seeded with imported memory records (issue #91).
+///
+/// Reads each natural-language question, embeds it with the local model, runs
+/// semantic search, keeps only recallable agent-memory hits (trust-separated
+/// from code, provenance-bearing), then evaluates top-1/top-3/MRR against the
+/// reviewed expected memory record IDs. Exits 1 with a diagnostic if the top-3
+/// recall threshold is missed.
+#[cfg(feature = "embeddings")]
+fn eval_memory_recall_cmd(
+    corpus_path: &Path,
+    data_dir: &Path,
+    top_k: usize,
+    threshold: f64,
+    verified_only: bool,
+) -> Result<()> {
+    use crate::embeddings::{
+        DEFAULT_EMBEDDING_MODEL_ARCHITECTURE, DEFAULT_EMBEDDING_MODEL_NAME, aletheia_embeddings,
+    };
+    use crate::memory_recall_eval::{
+        MemoryHit, MemoryRecallCorpus, build_report, evaluate_query, format_diagnostic,
+        print_report,
+    };
+
+    validate_existing_embedded_store(data_dir)?;
+
+    let corpus = MemoryRecallCorpus::from_json_file(corpus_path)?;
+
+    let embedder = aletheia_embeddings::EmbedderBuilder::new()
+        .model_architecture(DEFAULT_EMBEDDING_MODEL_ARCHITECTURE)
+        .model_id(Some(DEFAULT_EMBEDDING_MODEL_NAME))
+        .from_pretrained_hf()
+        .context("failed to load embedding model")?;
+
+    let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+        .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+
+    let records = sink
+        .read_all_records()
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let (edges_from, tombstoned) = query::verification_support_indexes(&records);
+
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+
+    let mut results = Vec::new();
+    for question in &corpus.questions {
+        let embed_data = rt
+            .block_on(aletheia_embeddings::embed_query(
+                &[question.text.as_str()],
+                &embedder,
+                None,
+            ))
+            .with_context(|| format!("failed to embed question {}", question.id))?;
+
+        let query_vector = aletheia_embeddings::embed_data_to_dense_iter(embed_data, Some(1))
+            .next()
+            .with_context(|| format!("no embedding returned for question {}", question.id))?
+            .with_context(|| format!("embedding result not dense for question {}", question.id))?
+            .embedding;
+
+        // Fetch a generous pool, then narrow to recallable memory so `top_k`
+        // bounds memory hits rather than the code+memory blend.
+        let matches = sink
+            .semantic_search(&query_vector, records.len().max(top_k))
+            .with_context(|| {
+                format!(
+                    "semantic search failed for question {} — was the store ingested with --embed?",
+                    question.id
+                )
+            })?;
+
+        // Collect every recallable hit, then apply the canonical score/record-id
+        // ordering before truncating to top-k: truncating the raw ANN order first
+        // could drop a record that belongs in the canonical top 3 when scores tie
+        // (and vary between runs). `evaluate_query` re-applies canonical ordering.
+        let mut hits: Vec<MemoryHit> = matches
+            .iter()
+            .filter(|m| is_recallable_memory(m, &by_id, &edges_from, &tombstoned, verified_only))
+            .map(|m| MemoryHit {
+                record_id: m.record_id.clone(),
+                score: m.score,
+            })
+            .collect();
+        hits.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.record_id.cmp(&b.record_id))
+        });
+        hits.truncate(top_k.max(3));
+
+        results.push(evaluate_query(question, &hits));
     }
 
     let report = build_report(results, threshold);
@@ -3820,6 +5725,7 @@ fn query_symbol_all(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
     let mut results: Vec<SymbolResult<'_>> = records
@@ -3846,6 +5752,7 @@ fn query_symbol_all(
     }
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
+    stamp_freshness(&mut results, freshness_code);
     for result in &results {
         print_result(result, format)?;
     }
@@ -3884,6 +5791,7 @@ fn symbol_result<'a>(
         git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
         repository_id,
         repository: repository_id.and_then(|repo| index.display_of(repo)),
+        freshness: None,
     })
 }
 
@@ -3898,6 +5806,7 @@ fn query_symbol_as_of(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     match query::symbol_as_of_valid_time_by_repo(records, name, as_of, index, selected_repo) {
         Err(msg) => {
@@ -3919,10 +5828,13 @@ fn query_symbol_as_of(
                     exit_ambiguous_repository(&groups);
                 }
             }
-            for record in results {
-                if let Some(result) = symbol_result(record, name, index) {
-                    print_result(&result, format)?;
-                }
+            let mut symbol_results: Vec<SymbolResult<'_>> = results
+                .iter()
+                .filter_map(|r| symbol_result(r, name, index))
+                .collect();
+            stamp_freshness(&mut symbol_results, freshness_code);
+            for result in &symbol_results {
+                print_result(result, format)?;
             }
         }
     }
@@ -4263,6 +6175,7 @@ fn query_symbol_at(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     // The ambiguity check is repository-scoped: a prefix that collides only
     // across the repository boundary is unambiguous within the selected repo.
@@ -4302,7 +6215,8 @@ fn query_symbol_at(
             std::process::exit(2);
         }
         Some(record) => {
-            if let Some(result) = symbol_result(record, name, index) {
+            if let Some(mut result) = symbol_result(record, name, index) {
+                stamp_freshness(std::slice::from_mut(&mut result), freshness_code);
                 print_result(&result, format)?;
             }
         }
@@ -4354,6 +6268,7 @@ fn query_file(
     format: OutputFormat,
     index: &query::RepositoryIndex,
     selected_repo: Option<&str>,
+    freshness_code: Option<&(String, &'static str)>,
 ) -> Result<()> {
     let deleted = current_deleted_ids(records);
 
@@ -4418,6 +6333,7 @@ fn query_file(
             git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
             repository_id,
             repository: repository_id.and_then(|repo| index.display_of(repo)),
+            freshness: None,
         });
     }
 
@@ -4437,6 +6353,7 @@ fn query_file(
     }
 
     results.sort_by_key(|r| (r.span.map(|s| s.start_line), r.record_id));
+    stamp_freshness(&mut results, freshness_code);
     for result in &results {
         print_result(result, format)?;
     }
@@ -4523,7 +6440,105 @@ fn query_drift(
 // query context (issue #38)
 // ---------------------------------------------------------------------------
 
-fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
+/// The five trust-separated context sections (plus topology edges and
+/// unresolved references) rendered from a [`query::SymbolContext`].
+///
+/// Shared by `eg query context` and `eg query semantic-context` so both emit
+/// byte-identical section shapes from the same builders.
+struct ContextSections<'a> {
+    source_facts: Vec<ContextSourceFact<'a>>,
+    topology_edges: Vec<ContextTopologyEdge<'a>>,
+    observations: Vec<ContextObservation<'a>>,
+    project_state: Vec<ContextLinkedItem<'a>>,
+    artifacts: Vec<ContextLinkedItem<'a>>,
+    verification_evidence: Vec<ContextLinkedItem<'a>>,
+    unresolved: Vec<ContextUnresolved<'a>>,
+}
+
+/// Renders a resolved [`query::SymbolContext`] into the serializable section
+/// views, reusing the existing per-record builders (`context_source_fact`,
+/// `context_observation`, `context_linked_item`). `.copied()` collapses the
+/// `&&GraphRecord` from `iter()` so each view borrows the record slice directly.
+fn build_context_sections<'a>(ctx: &'a query::SymbolContext<'a>) -> ContextSections<'a> {
+    ContextSections {
+        source_facts: ctx
+            .source_facts
+            .iter()
+            .copied()
+            .filter_map(context_source_fact)
+            .collect(),
+        topology_edges: ctx
+            .topology_edges
+            .iter()
+            .copied()
+            .filter_map(|r| {
+                if let GraphRecord::Edge {
+                    id,
+                    label,
+                    source,
+                    target,
+                    summary,
+                    temporal,
+                    ..
+                } = r
+                {
+                    Some(ContextTopologyEdge {
+                        record_id: id,
+                        label: label.as_str(),
+                        source_id: source,
+                        target_id: target,
+                        summary,
+                        git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+                        valid_time: temporal.as_ref().map(|t| t.valid_time.as_str()),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        observations: ctx
+            .observations
+            .iter()
+            .copied()
+            .filter_map(context_observation)
+            .collect(),
+        project_state: ctx
+            .project_state
+            .iter()
+            .copied()
+            .filter_map(context_linked_item)
+            .collect(),
+        artifacts: ctx
+            .artifacts
+            .iter()
+            .copied()
+            .filter_map(context_linked_item)
+            .collect(),
+        verification_evidence: ctx
+            .verification_evidence
+            .iter()
+            .copied()
+            .filter_map(context_linked_item)
+            .collect(),
+        unresolved: ctx
+            .unresolved
+            .iter()
+            .map(|u| ContextUnresolved {
+                source_record_id: &u.source_record_id,
+                target_handle: &u.target_handle,
+                relation: &u.relation,
+                target_domain: &u.target_domain,
+                verification_status: "unresolved",
+            })
+            .collect(),
+    }
+}
+
+fn query_context_cmd(
+    records: &[GraphRecord],
+    symbol_name: &str,
+    freshness: Option<(String, &'static str)>,
+) -> Result<()> {
     let ctx = query::symbol_context(records, symbol_name);
 
     if ctx.is_no_match() {
@@ -4532,6 +6547,72 @@ fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
             "error": {
                 "code": "no_match",
                 "symbol_name": symbol_name
+            }
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(2);
+    }
+
+    let sections = build_context_sections(&ctx);
+
+    // Attach the freshness verdict only when every source fact belongs to the
+    // repository the verdict was computed for (PR #186): `query context` has no
+    // repository selector, so in a multi-repo store the same symbol can collect
+    // facts from several repositories — presenting one checkout's verdict across
+    // all of them would be misleading. Omit it when the response spans repos.
+    let freshness_code = freshness.and_then(|(owner_id, code)| {
+        let index = query::RepositoryIndex::build(records);
+        let owners: std::collections::BTreeSet<Option<&str>> = ctx
+            .source_facts
+            .iter()
+            .map(|record| index.owner_of(record.id()))
+            .collect();
+        (owners.len() == 1 && owners.contains(&Some(owner_id.as_str()))).then_some(code)
+    });
+
+    let response = ContextResponse {
+        ok: true,
+        symbol_name,
+        freshness: freshness_code,
+        source_facts: sections.source_facts,
+        topology_edges: sections.topology_edges,
+        observations: sections.observations,
+        project_state: sections.project_state,
+        artifacts: sections.artifacts,
+        verification_evidence: sections.verification_evidence,
+        unresolved: sections.unresolved,
+    };
+
+    let output = serde_json::to_string_pretty(&response).context("failed to serialize context")?;
+    println!("{output}");
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn query_subsystem_cmd(records: &[GraphRecord], prefix: &str, _format: OutputFormat) -> Result<()> {
+    let ctx = match query::subsystem_context(records, prefix) {
+        Ok(ctx) => ctx,
+        Err(query::SubsystemPrefixError::Malformed { prefix: p }) => {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "malformed_prefix",
+                    "prefix": p,
+                    "message": "prefix must be non-empty after stripping trailing slashes"
+                }
+            });
+            println!("{}", serde_json::to_string(&envelope)?);
+            std::process::exit(1);
+        }
+    };
+
+    if ctx.is_no_match() {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "no_match",
+                "prefix": prefix,
+                "message": "no records found under the given prefix"
             }
         });
         println!("{}", serde_json::to_string(&envelope)?);
@@ -4609,19 +6690,332 @@ fn query_context_cmd(records: &[GraphRecord], symbol_name: &str) -> Result<()> {
         })
         .collect();
 
-    let response = ContextResponse {
+    let semantic_drift: Vec<SubsystemDrift<'_>> = ctx
+        .semantic_drift
+        .iter()
+        .filter_map(|r| {
+            let GraphRecord::Node {
+                id,
+                semantic_drift: Some(drift_meta),
+                ..
+            } = r
+            else {
+                return None;
+            };
+            let (path, _, span) = query::resolve_drift_target(records, id, drift_meta, None, None);
+            Some(SubsystemDrift {
+                record_id: id,
+                score: drift_meta.score,
+                target_repo_relative_path: path,
+                target_span: span,
+                after_git_commit: Some(drift_meta.after_git_commit.as_str()),
+            })
+        })
+        .collect();
+
+    let response = SubsystemResponse {
         ok: true,
-        symbol_name,
+        prefix: ctx.prefix.as_str(),
         source_facts,
         topology_edges,
         observations,
         project_state,
         artifacts,
         verification_evidence,
+        semantic_drift,
         unresolved,
     };
 
-    let output = serde_json::to_string_pretty(&response).context("failed to serialize context")?;
+    let output =
+        serde_json::to_string_pretty(&response).context("failed to serialize subsystem context")?;
+    println!("{output}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// change-impact query (issue #76)
+// ---------------------------------------------------------------------------
+
+/// One impact lead row in the change-impact response.
+#[derive(Serialize)]
+struct ImpactLeadJson<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    schema_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid_time: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<&'a str>,
+    /// Wire relation label (e.g. "CALLS", "REFERENCES", "IMPLEMENTS").
+    relation: &'static str,
+    /// "inbound" or "outbound" relative to the queried anchor.
+    direction: &'static str,
+    /// Stable edge record ID.
+    edge_record_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edge_git_commit: Option<&'a str>,
+    /// Which anchor record ID reached this lead.
+    anchor_id: &'a str,
+    /// Hop distance from the anchor (1-based).
+    hop: usize,
+    /// Every row is an impact LEAD — not proof of breakage (AC5).
+    trust: &'static str,
+}
+
+/// One truncation record emitted when the per-group cap is hit.
+#[derive(Serialize)]
+struct ImpactTruncationJson {
+    group: &'static str,
+    returned: usize,
+    total: usize,
+    depth: usize,
+}
+
+/// Top-level change-impact response envelope.
+#[derive(Serialize)]
+struct ChangeImpactResponse<'a> {
+    ok: bool,
+    handle: &'a str,
+    target_type: &'a str,
+    target_ids: Vec<&'a str>,
+    depth: usize,
+    /// Per-response disclaimer: rows are LEADS, not proof (AC5).
+    disclaimer: &'static str,
+    direct_callers: Vec<ImpactLeadJson<'a>>,
+    direct_callees: Vec<ImpactLeadJson<'a>>,
+    referencing_files: Vec<ImpactLeadJson<'a>>,
+    implementation_symbols: Vec<ImpactLeadJson<'a>>,
+    containing_context: Vec<ImpactLeadJson<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    truncations: Vec<ImpactTruncationJson>,
+    diagnostics: Vec<AuditDiagnostic<'a>>,
+    page: AuditPage,
+}
+
+const IMPACT_DISCLAIMER: &str = "Rows are impact LEADS to inspect before editing, not proof of breakage. \
+     Absence of a lead is not proof a change is safe.";
+
+fn impact_lead_json<'a>(lead: &'a query::ImpactLead<'a>) -> Option<ImpactLeadJson<'a>> {
+    let GraphRecord::Node {
+        id,
+        kind,
+        schema_version,
+        name,
+        repo_relative_path,
+        span,
+        temporal,
+        valid_time,
+        symbol_kind,
+        language,
+        ..
+    } = lead.record
+    else {
+        return None;
+    };
+    let edge_git_commit = if let GraphRecord::Edge {
+        temporal: Some(t), ..
+    } = lead.edge
+    {
+        Some(t.git_commit.as_str())
+    } else {
+        None
+    };
+    Some(ImpactLeadJson {
+        record_id: id,
+        kind: kind.as_str(),
+        schema_version: *schema_version,
+        name: name.as_deref(),
+        repo_relative_path: repo_relative_path.as_deref(),
+        span: *span,
+        valid_time: valid_time
+            .as_deref()
+            .or_else(|| temporal.as_ref().map(|t| t.valid_time.as_str())),
+        symbol_kind: symbol_kind.as_deref(),
+        language: language.as_deref(),
+        relation: lead.relation,
+        direction: lead.direction.as_str(),
+        edge_record_id: lead.edge.id(),
+        edge_git_commit,
+        anchor_id: lead.anchor_id,
+        hop: lead.hop,
+        trust: "impact_lead",
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn query_change_impact_cmd(
+    records: &[GraphRecord],
+    handle: &str,
+    index: &query::RepositoryIndex,
+    repo_scope: Option<&str>,
+    depth: usize,
+) -> Result<()> {
+    let target = match query::resolve_failure_handle(records, handle, index, repo_scope) {
+        Ok(t) => t,
+        Err(
+            err @ (query::FailureHandleError::Ambiguous { .. }
+            | query::FailureHandleError::Unsupported { .. }),
+        ) => {
+            eprintln!("{}", serde_json::to_string(&err)?);
+            std::process::exit(1);
+        }
+    };
+
+    // change-impact only operates on code handles (symbol or file). A handle that
+    // resolves to a task or source/provenance record is out of scope and must be
+    // rejected rather than misclassified as an empty symbol result.
+    if matches!(
+        target.kind,
+        query::FailureTargetKind::Task | query::FailureTargetKind::Source
+    ) {
+        let err = query::FailureHandleError::Unsupported {
+            handle: handle.to_owned(),
+            message: format!(
+                "handle resolved to a {} target; change-impact accepts only code symbol or file handles",
+                target.kind.as_str()
+            ),
+        };
+        eprintln!("{}", serde_json::to_string(&err)?);
+        std::process::exit(1);
+    }
+
+    // A canonical codegraph ID can resolve to a non-File/Symbol node kind
+    // (Repository, Module, Import, Commit, Change, …) while still mapping to a
+    // `Symbol` target kind. Such handles are out of scope for change-impact and
+    // must be rejected rather than traversed as an empty symbol result.
+    if let Some(kind) = query::change_impact_unsupported_anchor_kind(records, &target) {
+        let err = query::FailureHandleError::Unsupported {
+            handle: handle.to_owned(),
+            message: format!(
+                "handle resolved to a {kind:?} node; change-impact accepts only code symbol or file handles"
+            ),
+        };
+        eprintln!("{}", serde_json::to_string(&err)?);
+        std::process::exit(1);
+    }
+
+    if target.is_empty() {
+        let code = if target.stale {
+            "stale_handle"
+        } else {
+            "no_match"
+        };
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": { "code": code, "handle": handle },
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(2);
+    }
+
+    let ctx = query::change_impact_context(records, &target, depth, index, repo_scope);
+
+    let mut diagnostics: Vec<AuditDiagnostic<'_>> = ctx
+        .diagnostics
+        .iter()
+        .map(|d| AuditDiagnostic {
+            code: &d.code,
+            source_record_id: &d.source_record_id,
+            target_handle: &d.target_handle,
+            relation: &d.relation,
+            target_domain: &d.target_domain,
+        })
+        .collect();
+
+    // Run redaction gate over every reached code-graph record
+    for lead in ctx
+        .direct_callers
+        .iter()
+        .chain(&ctx.direct_callees)
+        .chain(&ctx.referencing_files)
+        .chain(&ctx.implementation_symbols)
+        .chain(&ctx.containing_context)
+    {
+        protected_payload_diagnostics(lead.record, &mut diagnostics);
+    }
+
+    diagnostics.sort_by(|a, b| {
+        a.code
+            .cmp(b.code)
+            .then_with(|| a.source_record_id.cmp(b.source_record_id))
+            .then_with(|| a.target_handle.cmp(b.target_handle))
+            .then_with(|| a.relation.cmp(b.relation))
+    });
+    diagnostics.dedup_by(|a, b| {
+        a.code == b.code
+            && a.source_record_id == b.source_record_id
+            && a.target_handle == b.target_handle
+            && a.relation == b.relation
+    });
+
+    let total_returned = ctx.direct_callers.len()
+        + ctx.direct_callees.len()
+        + ctx.referencing_files.len()
+        + ctx.implementation_symbols.len()
+        + ctx.containing_context.len();
+
+    let truncations: Vec<ImpactTruncationJson> = ctx
+        .truncations
+        .iter()
+        .map(|t| ImpactTruncationJson {
+            group: t.group,
+            returned: t.returned,
+            total: t.total,
+            depth: t.depth,
+        })
+        .collect();
+
+    let response = ChangeImpactResponse {
+        ok: true,
+        handle,
+        target_type: ctx.target_kind,
+        target_ids: ctx.target_ids.iter().map(String::as_str).collect(),
+        depth: ctx.depth,
+        disclaimer: IMPACT_DISCLAIMER,
+        direct_callers: ctx
+            .direct_callers
+            .iter()
+            .filter_map(impact_lead_json)
+            .collect(),
+        direct_callees: ctx
+            .direct_callees
+            .iter()
+            .filter_map(impact_lead_json)
+            .collect(),
+        referencing_files: ctx
+            .referencing_files
+            .iter()
+            .filter_map(impact_lead_json)
+            .collect(),
+        implementation_symbols: ctx
+            .implementation_symbols
+            .iter()
+            .filter_map(impact_lead_json)
+            .collect(),
+        containing_context: ctx
+            .containing_context
+            .iter()
+            .filter_map(impact_lead_json)
+            .collect(),
+        truncations,
+        diagnostics,
+        page: AuditPage {
+            cursor: None,
+            has_more: false,
+            returned: total_returned,
+        },
+    };
+
+    let output = serde_json::to_string_pretty(&response)
+        .context("failed to serialize change-impact context")?;
     println!("{output}");
     Ok(())
 }
@@ -5385,6 +7779,158 @@ fn query_memory_cmd(
     Ok(())
 }
 
+/// Builds one redaction-safe failed-attempt view from a context attempt.
+fn failure_attempt_json<'a>(attempt: &query::FailureAttempt<'a>) -> FailureAttemptJson<'a> {
+    let item = audit_item(&attempt.item);
+    let (failure_kind, executed_at) = match attempt.item.record {
+        GraphRecord::Node {
+            failure_kind,
+            executed_at,
+            ..
+        } => (failure_kind.as_deref(), executed_at.as_deref()),
+        _ => (None, None),
+    };
+    FailureAttemptJson {
+        item,
+        resolution_status: attempt.status.as_str(),
+        resolved_by: attempt.resolved_by,
+        matched_target: attempt.matched_target,
+        failure_kind,
+        executed_at,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn query_failures_cmd(
+    records: &[GraphRecord],
+    handle: &str,
+    index: &query::RepositoryIndex,
+    repo_scope: Option<&str>,
+) -> Result<()> {
+    let target = match query::resolve_failure_handle(records, handle, index, repo_scope) {
+        Ok(t) => t,
+        Err(
+            err @ (query::FailureHandleError::Ambiguous { .. }
+            | query::FailureHandleError::Unsupported { .. }),
+        ) => {
+            eprintln!("{}", serde_json::to_string(&err)?);
+            std::process::exit(1);
+        }
+    };
+
+    // A handle that resolved to nothing live in the store is a no-match (or a
+    // stale handle when it named a tombstoned record). This is distinct from a
+    // resolved target that simply has no recorded failures, which is a real
+    // exit-0 empty answer below (AC6).
+    if target.is_empty() {
+        let code = if target.stale {
+            "stale_handle"
+        } else {
+            "no_match"
+        };
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": { "code": code, "handle": handle },
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        std::process::exit(2);
+    }
+
+    let ctx = query::failure_history_context(records, &target);
+
+    let runtime_failures: Vec<FailureAttemptJson<'_>> = ctx
+        .runtime_failures
+        .iter()
+        .map(failure_attempt_json)
+        .collect();
+    let agent_failures: Vec<FailureAttemptJson<'_>> = ctx
+        .agent_failures
+        .iter()
+        .map(failure_attempt_json)
+        .collect();
+    let superseding_successes: Vec<AuditItem<'_>> =
+        ctx.superseding_successes.iter().map(audit_item).collect();
+    let patch_artifacts: Vec<AuditItem<'_>> = ctx.patch_artifacts.iter().map(audit_item).collect();
+
+    // Diagnostics: context diagnostics + protected-payload + redaction markers
+    // for every reached record, exactly as the memory audit (AC6, AC8).
+    let mut diagnostics: Vec<AuditDiagnostic<'_>> = ctx
+        .diagnostics
+        .iter()
+        .map(|d| AuditDiagnostic {
+            code: &d.code,
+            source_record_id: &d.source_record_id,
+            target_handle: &d.target_handle,
+            relation: &d.relation,
+            target_domain: &d.target_domain,
+        })
+        .collect();
+    for attempt in ctx.agent_failures.iter().chain(&ctx.runtime_failures) {
+        protected_payload_diagnostics(attempt.item.record, &mut diagnostics);
+        if let GraphRecord::Node {
+            id,
+            redaction_policy_version: Some(ver),
+            ..
+        } = attempt.item.record
+        {
+            diagnostics.push(AuditDiagnostic {
+                code: "redacted_payload",
+                source_record_id: id,
+                target_handle: ver,
+                relation: "redaction_policy_version",
+                target_domain: "agent_memory",
+            });
+        }
+    }
+    for item in ctx.superseding_successes.iter().chain(&ctx.patch_artifacts) {
+        protected_payload_diagnostics(item.record, &mut diagnostics);
+    }
+    diagnostics.sort_by(|a, b| {
+        a.code
+            .cmp(b.code)
+            .then_with(|| a.source_record_id.cmp(b.source_record_id))
+            .then_with(|| a.target_handle.cmp(b.target_handle))
+            .then_with(|| a.relation.cmp(b.relation))
+            .then_with(|| a.target_domain.cmp(b.target_domain))
+    });
+    diagnostics.dedup_by(|a, b| {
+        a.code == b.code
+            && a.source_record_id == b.source_record_id
+            && a.target_handle == b.target_handle
+            && a.relation == b.relation
+            && a.target_domain == b.target_domain
+    });
+
+    let returned = runtime_failures.len()
+        + agent_failures.len()
+        + superseding_successes.len()
+        + patch_artifacts.len();
+
+    let response = FailureHistoryResponse {
+        ok: true,
+        target_handle: handle,
+        target_type: ctx.target_kind,
+        target_ids: ctx.target_ids.iter().map(String::as_str).collect(),
+        runtime_failures,
+        agent_failures,
+        superseding_successes,
+        patch_artifacts,
+        agent_sessions: ctx.agent_sessions.iter().map(|r| r.id()).collect(),
+        agents: ctx.agents.iter().map(|r| r.id()).collect(),
+        diagnostics,
+        page: AuditPage {
+            cursor: None,
+            has_more: false,
+            returned,
+        },
+    };
+
+    let output =
+        serde_json::to_string_pretty(&response).context("failed to serialize failure history")?;
+    println!("{output}");
+    Ok(())
+}
+
 #[cfg(feature = "embedded-aletheiadb")]
 fn query_task_via_daemon(id_or_handle: &str, data_dir: &Path) -> Result<()> {
     let client = DaemonClient::from_data_dir(data_dir)
@@ -5518,7 +8064,13 @@ impl PrintText for SymbolResult<'_> {
         let path = self.repo_relative_path.unwrap_or("(unknown)");
         let line = self.span.map_or(0, |s| s.start_line);
         let commit = self.git_commit.map_or(String::new(), |c| format!(" [{c}]"));
-        format!("{} ({}) @ {path}:{line}{commit}", self.name, self.kind)
+        let freshness = self
+            .freshness
+            .map_or(String::new(), |code| format!(" (freshness: {code})"));
+        format!(
+            "{} ({}) @ {path}:{line}{commit}{freshness}",
+            self.name, self.kind
+        )
     }
 }
 
@@ -6352,6 +8904,359 @@ fn decide_cmd(
         }
     }
 
+    Ok(())
+}
+
+// ── eg protected ──────────────────────────────────────────────────────────────
+
+/// Implements `eg protected get`: retrieves the verified payload to `out` (a
+/// file) or stdout without buffering the whole payload in memory.
+///
+/// The bytes are ALWAYS staged to a temp and only released to the destination
+/// after a fully verified copy — for `--out` to a uniquely named, exclusively
+/// created temp in the destination directory (never follows a symlink) that is
+/// renamed into place, and for stdout to an ANONYMOUS (unlinked) temp that is
+/// rewound and streamed out.  This preserves verify-before-release for both
+/// destinations (a failed get never truncates a `--out` file and never emits
+/// unverified bytes to stdout).  The `--out` temp is removed on every path,
+/// including the `process::exit` error paths; the anonymous stdout temp leaves
+/// no named entry to leak and is reclaimed by the OS on process exit.
+/// Exits the process on any failure with the documented JSON envelope/exit code.
+fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Path>) {
+    use crate::protected::{GetStreamError, ProtectedStore};
+    let ps = ProtectedStore::new(store);
+
+    let exit_get_error = |e: crate::protected::GetError| -> ! {
+        let is_not_found = e.code() == "payload_not_found";
+        eprintln!("{}", e.to_json()); // to_json() is not Display; format is deliberate
+        process::exit(if is_not_found { 2 } else { 1 });
+    };
+    let exit_output_error = |code: &str, message: String| -> ! {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": { "code": code, "detail": { "message": message } }
+        });
+        eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+        process::exit(1);
+    };
+    // Error code + human label for the destination.
+    let (err_code, dest_label): (&str, String) = out.map_or_else(
+        || ("stdout_write_error", "stdout".to_owned()),
+        |p| ("output_write_error", p.display().to_string()),
+    );
+
+    // Surfaces the RETRIEVAL diagnostic first when temp creation fails — verify
+    // into a discard sink so a store/auth/malformed handle is reported as such
+    // rather than masked by a staging error.  Returns only when retrieval would
+    // have succeeded; otherwise exits with the get error.
+    let stage_failed = |create_err: std::io::Error| -> ! {
+        let mut sink = std::io::sink();
+        match ps.get_to_writer(handle, operator, &mut sink) {
+            Err(GetStreamError::Get(e)) => exit_get_error(e),
+            // Retrieval succeeded (sink writes never fail), so the failure is
+            // genuinely the staging destination.
+            _ => exit_output_error(
+                err_code,
+                format!("failed to stage bytes for {dest_label}: {create_err}"),
+            ),
+        }
+    };
+
+    if let Some(out_path) = out {
+        // --out: stage a NAMED temp in the destination directory so the final
+        // release is an in-directory atomic rename onto the destination.  Keep
+        // the verified `NamedTempFile` (and its open descriptor) BOUND through
+        // the release step: do not convert it to a bare path and reopen, which
+        // would let another local process swap the staging entry between
+        // verification and release.  `process::exit` skips the destructor, so
+        // the temp is removed explicitly (via `close()`/`PersistError`).
+        let stage_dir = out_path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+        let mut tmp = match tempfile::Builder::new()
+            .prefix(".eg-")
+            .suffix(".partial")
+            .tempfile_in(&stage_dir)
+        {
+            Ok(t) => t,
+            Err(create_err) => stage_failed(create_err),
+        };
+        match ps.get_to_writer(handle, operator, tmp.as_file_mut()) {
+            Ok(_) => {
+                // Atomically persist the verified temp onto the destination
+                // (rename of the SAME file object, replacing an existing file).
+                if let Err(e) = tmp.persist(out_path) {
+                    let _ = e.file.close(); // remove the staged temp
+                    exit_output_error(
+                        err_code,
+                        format!("failed to write bytes to {dest_label}: {}", e.error),
+                    );
+                }
+            }
+            Err(GetStreamError::Get(e)) => {
+                let _ = tmp.close();
+                exit_get_error(e);
+            }
+            Err(GetStreamError::Output(e)) => {
+                let _ = tmp.close();
+                exit_output_error(
+                    err_code,
+                    format!("failed to write bytes to {dest_label}: {e}"),
+                );
+            }
+        }
+    } else {
+        // stdout: stage into an ANONYMOUS temp file (unlinked at creation) so a
+        // crash or kill never leaves a `.eg-*.partial` entry behind in the
+        // system temp dir.  Verify-before-release still holds — nothing reaches
+        // stdout until the full verified copy lands in the temp, which is then
+        // rewound and streamed out.  The anonymous inode is reclaimed by the OS
+        // on process exit, so no explicit cleanup is needed on the exit paths.
+        let mut tmp = match tempfile::tempfile() {
+            Ok(t) => t,
+            Err(create_err) => stage_failed(create_err),
+        };
+        match ps.get_to_writer(handle, operator, &mut tmp) {
+            Ok(_) => {
+                let result = (|| -> std::io::Result<()> {
+                    use std::io::Seek as _;
+                    tmp.seek(std::io::SeekFrom::Start(0))?;
+                    let stdout = std::io::stdout();
+                    let mut lock = stdout.lock();
+                    std::io::copy(&mut tmp, &mut lock)?;
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    exit_output_error(
+                        err_code,
+                        format!("failed to write bytes to {dest_label}: {e}"),
+                    );
+                }
+            }
+            Err(GetStreamError::Get(e)) => exit_get_error(e),
+            Err(GetStreamError::Output(e)) => exit_output_error(
+                err_code,
+                format!("failed to write bytes to {dest_label}: {e}"),
+            ),
+        }
+    }
+}
+
+/// Dispatches `eg protected <subcommand>` (issue #60).
+fn protected_cmd(subcommand: ProtectedSubcommand) -> Result<()> {
+    use crate::protected::ProtectedStore;
+    match subcommand {
+        ProtectedSubcommand::Capture {
+            manifest,
+            store,
+            protected_raw_artifacts,
+            producer,
+            captured_at,
+        } => protected_capture_cmd(
+            &manifest,
+            &store,
+            protected_raw_artifacts,
+            producer.as_deref(),
+            captured_at.as_deref(),
+        ),
+        ProtectedSubcommand::Get {
+            handle,
+            store,
+            operator,
+            out,
+        } => {
+            protected_get_cmd(&handle, &store, &operator, out.as_deref());
+            Ok(())
+        }
+        ProtectedSubcommand::List { store } => {
+            let ps = ProtectedStore::new(&store);
+            let handles = match ps.list() {
+                Ok(h) => h,
+                Err(e) => {
+                    let envelope = serde_json::json!({
+                        "ok": false,
+                        "error": {
+                            "code": "store_io_error",
+                            "detail": {
+                                "message": format!(
+                                    "failed to read protected store at {}: {e}",
+                                    store.display()
+                                )
+                            }
+                        }
+                    });
+                    eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+                    process::exit(1);
+                }
+            };
+            let envelope = serde_json::json!({
+                "ok": true,
+                "count": handles.len(),
+                "handles": handles,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&envelope)
+                    .context("failed to serialise list response")?
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Implements `eg protected capture`.
+#[allow(clippy::too_many_lines)]
+fn protected_capture_cmd(
+    manifest_path: &Path,
+    store_path: &Path,
+    enabled: bool,
+    producer: Option<&str>,
+    captured_at_override: Option<&str>,
+) -> Result<()> {
+    use crate::protected::{CaptureEntry, ProtectedStore};
+
+    // Validate: enabled mode requires a non-empty --producer.
+    if enabled && producer.is_none() {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "missing_field",
+                "detail": {
+                    "field": "producer",
+                    "message": "--producer is required when --protected-raw-artifacts is set"
+                }
+            }
+        });
+        eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+        process::exit(1);
+    }
+    if enabled && producer.is_some_and(|p| p.trim().is_empty()) {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "invalid_field",
+                "detail": {
+                    "field": "producer",
+                    "message": "--producer must not be empty when --protected-raw-artifacts is set"
+                }
+            }
+        });
+        eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+        process::exit(1);
+    }
+
+    // Read manifest — emit JSON envelope on failure so automation can distinguish
+    // manifest errors from other stderr output.
+    //
+    // Emits the `manifest_read_error` envelope and exits 1.  Defined as a
+    // closure so the regular-file/size guard and the read error path share one
+    // emission site.
+    let emit_manifest_error = |message: String| -> ! {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "manifest_read_error",
+                "detail": { "message": message }
+            }
+        });
+        eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+        process::exit(1);
+    };
+
+    // Read the manifest bound to a single no-follow, regular-file, size-capped
+    // descriptor.  Opening once and reading that descriptor (rather than
+    // stat-then-reopen) closes the TOCTOU window: a `--manifest` in a writable
+    // location cannot be swapped for a FIFO, device, symlink, or much larger
+    // file between a check and the read, so capture cannot be made to block or
+    // allocate unbounded memory before emitting the JSON diagnostic.
+    let manifest_content = match crate::protected::read_capped_regular_file(
+        manifest_path,
+        crate::protected::MAX_STORE_FILE_BYTES,
+    ) {
+        Ok(c) => c,
+        Err(e) => emit_manifest_error(format!(
+            "failed to read capture manifest at {}: {e}",
+            manifest_path.display()
+        )),
+    };
+    let mut entries: Vec<CaptureEntry> = Vec::new();
+    for (i, line) in manifest_content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: CaptureEntry = match serde_json::from_str(line) {
+            Ok(e) => e,
+            Err(e) => {
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "invalid_manifest",
+                        "detail": {
+                            "line": i + 1,
+                            "message": format!(
+                                "manifest line {}: failed to parse JSON: {e}",
+                                i + 1
+                            )
+                        }
+                    }
+                });
+                eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+                process::exit(1);
+            }
+        };
+        entries.push(entry);
+    }
+
+    let producer_id = producer.unwrap_or("preview");
+    let producer_version = env!("CARGO_PKG_VERSION");
+    let ts: String;
+    let captured_at = if let Some(ov) = captured_at_override {
+        ov
+    } else {
+        ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        &ts
+    };
+
+    let ps = ProtectedStore::new(store_path);
+    let report = match ps.capture(
+        &entries,
+        producer_id,
+        producer_version,
+        captured_at,
+        enabled,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "store_io_error",
+                    "detail": {
+                        "message": format!(
+                            "protected store I/O failed at {}: {e}",
+                            store_path.display()
+                        )
+                    }
+                }
+            });
+            eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+            process::exit(1);
+        }
+    };
+
+    let envelope = serde_json::json!({
+        "ok": true,
+        "enabled": report.enabled,
+        "stored_count": report.stored_count,
+        "skipped_count": report.skipped_count,
+        "entries": report.entries,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&envelope).context("failed to serialise capture response")?
+    );
     Ok(())
 }
 

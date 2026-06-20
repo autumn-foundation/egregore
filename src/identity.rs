@@ -13,7 +13,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use crate::ir::{IdentitySource, RepositoryIdentityPayload, stable_id};
+use crate::ir::{IdentitySource, RepositoryIdentityPayload, SnapshotHead, stable_id};
 
 /// Computed repository identity, including its stable ID and full payload.
 #[derive(Debug, Clone)]
@@ -137,6 +137,16 @@ fn git_top_level(repo_root: &Path) -> Option<std::path::PathBuf> {
     }
     let path_str = String::from_utf8(output.stdout).ok()?;
     Some(std::path::PathBuf::from(path_str.trim()))
+}
+
+/// Returns `true` if `path` is exactly the root of its git repository (not a
+/// subdirectory of one). Used to gate Git-derived behavior — identity, snapshot
+/// stamping, and gitignore-aware discovery — to the repository root so scans of
+/// in-repo sub-directories stay filesystem-local and independent of the
+/// surrounding checkout.
+#[must_use]
+pub(crate) fn is_repo_root(path: &Path) -> bool {
+    git_is_repo_root(path)
 }
 
 /// Returns `true` if `repo_root` is exactly the root of its git repository
@@ -322,6 +332,255 @@ fn git_root_commit_sha(repo_root: &Path) -> Option<String> {
     let sha = stdout.lines().next()?.trim().to_owned();
 
     if sha.is_empty() { None } else { Some(sha) }
+}
+
+/// Captures the current working-tree source-snapshot head and dirty flag at `repo_root`.
+///
+/// Mirrors the repository-identity module's git-root gate (issue #82): a commit
+/// SHA and dirty flag are reported only when `repo_root` is the actual Git
+/// repository root. Sub-directories of a repository, non-Git directories, and
+/// environments where Git is unavailable return [`SnapshotHead::NoGit`] so that
+/// fixture scans of in-repo sub-directories stay byte-for-byte deterministic and
+/// never leak the surrounding repository's HEAD. A repository root whose HEAD has
+/// no commits yet returns [`SnapshotHead::UnbornHead`].
+///
+/// This function is strictly read-only: it runs `git rev-parse HEAD` and
+/// `git status` with `GIT_OPTIONAL_LOCKS=0` so Git never refreshes/writes the
+/// index or takes the `index.lock` (the freshness check must not mutate the
+/// repository or contend with concurrent Git operations).
+///
+/// A failed dirty probe is treated conservatively as **dirty** so the store can
+/// never be falsely classified `fresh` when the working-tree state could not be
+/// verified (e.g. a locked or unreadable index).
+#[must_use]
+pub fn working_tree_snapshot(repo_root: &Path) -> (SnapshotHead, bool) {
+    working_tree_snapshot_excluding(repo_root, &[])
+}
+
+/// Like [`working_tree_snapshot`], but excludes the given repo-relative paths
+/// from the dirty probe (issue #82 / PR #186).
+///
+/// A freshness check passes the store artifact it is reading (the `--graph` file
+/// or `--data-dir` directory) when that artifact lives under `repo_root`, so the
+/// documented in-tree workflow (`eg scan . --out graph.jsonl`) is not reported
+/// `stale_dirty` merely because the store it just wrote is itself an untracked
+/// change. Excluded paths are matched by Git pathspec, so a directory excludes
+/// everything beneath it.
+#[must_use]
+pub fn working_tree_snapshot_excluding(
+    repo_root: &Path,
+    exclude_rel: &[String],
+) -> (SnapshotHead, bool) {
+    if !git_is_repo_root(repo_root) {
+        return (SnapshotHead::NoGit, false);
+    }
+    // Repository root but `git rev-parse HEAD` failing → HEAD has no commits.
+    git_head_commit_sha(repo_root).map_or((SnapshotHead::UnbornHead, false), |sha| {
+        // Conservative default: an unverifiable dirty state is treated as dirty,
+        // never silently downgraded to clean (which could report a false `fresh`).
+        let dirty = git_tree_dirty(repo_root, exclude_rel).unwrap_or(true);
+        (SnapshotHead::Commit { sha }, dirty)
+    })
+}
+
+/// Returns the current `HEAD` state without probing working-tree dirtiness.
+///
+/// History replay records committed state only (its snapshot is always
+/// `dirty=false`), so it needs just the committed HEAD and must not pay the full
+/// `git status` worktree walk that [`working_tree_snapshot_excluding`] performs —
+/// which is wasteful in repositories with large untracked/generated trees
+/// (VV1 / PR #186 follow-up).
+#[must_use]
+pub fn working_tree_head(repo_root: &Path) -> SnapshotHead {
+    if !git_is_repo_root(repo_root) {
+        return SnapshotHead::NoGit;
+    }
+    git_head_commit_sha(repo_root)
+        .map_or(SnapshotHead::UnbornHead, |sha| SnapshotHead::Commit { sha })
+}
+
+/// Builds a `git` command rooted at `repo_root` that never writes the index.
+///
+/// `GIT_OPTIONAL_LOCKS=0` disables the optional index-refresh write `git status`
+/// performs by default, keeping the freshness probe strictly read-only.
+/// `-c core.excludesFile=` suppresses the user/system-level global gitignore so
+/// probes see the same file set as the scanner (which runs with the same override),
+/// keeping freshness results reproducible across developer environments.
+fn read_only_git(repo_root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "core.excludesFile="])
+        .arg("-C")
+        .arg(repo_root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null());
+    command
+}
+
+/// Returns the full SHA that `HEAD` resolves to, or `None` when HEAD is unborn
+/// (no commits yet), the path is not a repository, or Git is unavailable.
+fn git_head_commit_sha(repo_root: &Path) -> Option<String> {
+    let output = read_only_git(repo_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    if sha.is_empty() { None } else { Some(sha) }
+}
+
+/// Returns `true` when the working tree has uncommitted or untracked changes.
+///
+/// Uses `git status --porcelain`, which reports staged, unstaged, and untracked
+/// changes; a non-empty output means the tree is dirty. Runs read-only
+/// (`GIT_OPTIONAL_LOCKS=0`, so Git never writes the index). `exclude_rel` paths
+/// are dropped from consideration via `:(exclude)` pathspecs. Returns `None` when
+/// Git is unavailable or the status probe fails, which callers treat as dirty.
+///
+/// The probe is scoped to the same source set the scanner actually indexes
+/// (PR #186 follow-up HH1): `discover_rust_source_files` skips every `target`
+/// directory and never descends into submodules (`fs::should_descend`), so an
+/// unignored `target/` build tree or a dirty/out-of-date submodule must not count
+/// as source dirtiness here either — neither can produce a cited span.
+fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
+    let mut command = read_only_git(repo_root);
+    // `--untracked-files=all` overrides any `status.showUntrackedFiles=no` user
+    // config that would suppress `??` rows for untracked files. The scanner
+    // indexes untracked `.rs` files, so silently hiding them here would make a
+    // freshly added untracked source read as `fresh` (PR #186 follow-up).
+    // `--ignore-submodules=all` drops submodule state, which `git status` reports
+    // by default but the scanner never indexes (HH1).
+    command.args([
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--ignore-submodules=all",
+    ]);
+    // Scope the probe to the indexed source set: only `.rs` files can produce
+    // cited graph spans, so the freshness verdict must ignore every non-source
+    // artifact in the working tree — graph/JSONL outputs, embedded-store
+    // directories, refresh caches (including custom out-of-tree ones the caller
+    // cannot name), and build output — regardless of name or location (RR1/XX1).
+    // The positive `:(glob)**/*.rs` pathspec matches `.rs` files at any depth
+    // (root included); deletions and renames of tracked `.rs` files still surface.
+    //
+    // `:(glob)**/.gitignore` also includes versioned ignore files: the indexed set
+    // depends on them (the scanner drops gitignored untracked `.rs`), so adding or
+    // changing an ignore rule after a scan changes which sources belong in the
+    // graph and must read as dirty rather than `fresh` (BBB1 / PR #186 follow-up).
+    //
+    // Build output under any `target/` directory is pruned by the scanner
+    // (`fs::should_descend`), so it is excluded here too (HH1/JJ1):
+    // `:(exclude)target` drops the root `target/` and `:(exclude,glob)**/target/**`
+    // drops nested per-crate `target/`. `exclude_rel` still drops any explicitly
+    // named store artifact a caller passes (redundant under `.rs` scoping, but
+    // harmless).
+    command.args([
+        "--",
+        ":(glob)**/*.rs",
+        ":(glob)**/.gitignore",
+        ":(exclude)target",
+        ":(exclude,glob)**/target/**",
+    ]);
+    for rel in exclude_rel {
+        command.arg(format!(":(exclude){rel}"));
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    // `git status` cannot see edits to tracked files marked `assume-unchanged`
+    // or `skip-worktree` (e.g. after a sparse-checkout change). The scanner reads
+    // those files when present, so a graph built from a full checkout would read
+    // `fresh` after sparse checkout removes a cited `.rs` file. Treat any such
+    // index-hidden source input as dirtiness so the verdict stays conservative
+    // (PR #186 follow-up LL1).
+    Some(!text.trim().is_empty() || git_index_hidden_source_inputs(repo_root))
+}
+
+/// Runs `git ls-files -v` (strictly read-only) and returns its stdout, or `None`
+/// when Git is unavailable or the listing fails. `-c core.quotePath=false` keeps
+/// non-ASCII paths verbatim so they match graph `repo_relative_path` values.
+fn git_ls_files_v(repo_root: &Path) -> Option<String> {
+    let output = read_only_git(repo_root)
+        .args(["-c", "core.quotePath=false", "ls-files", "-v"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Parses one `git ls-files -v` line, returning the repo-relative path of a
+/// source-set input — a `.rs` source or a versioned `.gitignore`, outside any
+/// `target/` directory — that carries an index flag hiding its state from
+/// `git status` (`skip-worktree` = `S`, `assume-unchanged` = a lowercase tag).
+/// Returns `None` for any other line.
+///
+/// `.gitignore` counts because the indexed set depends on it (BBB1/EEE1); files
+/// under `target/` are excluded to match the scanner's pruning (WW1).
+fn hidden_source_input_path(line: &str) -> Option<&str> {
+    let tag = line.chars().next()?;
+    // Uppercase `S` = skip-worktree; any lowercase tag = assume-unchanged.
+    if tag != 'S' && !tag.is_ascii_lowercase() {
+        return None;
+    }
+    // Format is `<tag><space><path>`, so the path starts at byte 2.
+    let rel = line.get(2..)?;
+    let path = Path::new(rel);
+    if path.components().any(|c| c.as_os_str() == "target") {
+        return None;
+    }
+    let is_source_input = path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+        || path.file_name().and_then(|n| n.to_str()) == Some(".gitignore");
+    is_source_input.then_some(rel)
+}
+
+/// Returns `true` when any source-set input (`.rs` or versioned `.gitignore`)
+/// that is **present in the working tree** carries an index flag hiding its state
+/// from `git status` (PR #186 follow-up LL1/EEE1).
+///
+/// The file must exist on disk to count: a clean sparse checkout marks omitted
+/// files `skip-worktree` AND leaves them absent, so the scanner never indexed
+/// them and they are not part of the stored source set — flagging them would make
+/// `eg scan` of a sparse checkout immediately read `stale_dirty` (AAA1). A present
+/// index-hidden file (e.g. `assume-unchanged`) WAS scannable, so hidden edits to
+/// it still warrant the conservative dirty verdict. (Absent index-hidden inputs
+/// are surfaced separately by [`index_hidden_absent_source_inputs`] for the
+/// store-aware removal check.)
+fn git_index_hidden_source_inputs(repo_root: &Path) -> bool {
+    let Some(text) = git_ls_files_v(repo_root) else {
+        return false;
+    };
+    text.lines()
+        .filter_map(hidden_source_input_path)
+        .any(|rel| repo_root.join(rel).is_file())
+}
+
+/// Returns the repo-relative paths of source-set inputs (`.rs` / versioned
+/// `.gitignore`) that are index-hidden (`skip-worktree`/`assume-unchanged`) AND
+/// absent from the working tree.
+///
+/// These are exactly the omissions [`git_index_hidden_source_inputs`] skips at
+/// scan time (AAA1). At freshness time a caller cross-references them against the
+/// stored graph: an absent path the store still cites is a previously scanned
+/// source that a sparse-checkout cone change removed while `git status` stays
+/// blind to it, so the store is stale (FFF1). Returns an empty vec when Git is
+/// unavailable or there are no such omissions.
+#[must_use]
+pub fn index_hidden_absent_source_inputs(repo_root: &Path) -> Vec<String> {
+    let Some(text) = git_ls_files_v(repo_root) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(hidden_source_input_path)
+        .filter(|rel| !repo_root.join(rel).is_file())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 /// Normalizes a git remote URL to its canonical `https` form.
