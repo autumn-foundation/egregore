@@ -23,6 +23,8 @@ pub mod embeddings;
 pub mod error;
 /// Typed evidence write workflows for observations, command evidence, artifacts, and verification.
 pub mod evidence;
+/// Evidence-link freshness verdicts for agent observations (issue #85).
+pub mod evidence_freshness;
 /// Read-only store freshness classification (issue #82).
 pub mod freshness;
 /// Filesystem discovery.

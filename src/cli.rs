@@ -859,6 +859,30 @@ enum QuerySubcommand {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Flag agent observations whose cited code has drifted since recording (issue #85).
+    ///
+    /// For every agent `Observation` / `Decision` citing a code handle, returns a
+    /// per-evidence-link **freshness verdict**: `current`, `drifted`,
+    /// `unresolved`, or `untemporal`. A `drifted` / `unresolved` verdict is a
+    /// **freshness lead, never a truth claim** — it states only that the evidence
+    /// basis moved, never that the observation is now false. Strictly read-only
+    /// and deterministic; reuses existing drift records, content hashes, and
+    /// temporal anchors. The verdict attaches to the evidence link and never
+    /// rewrites, hides, or marks stale any deterministic code fact.
+    ///
+    /// Documented in `docs/cli/evidence-freshness.md`.
+    EvidenceFreshness {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Return only stale observations (`drifted` + `unresolved`). An empty
+        /// result is reported with a stable diagnostic, never silently (AC7).
+        #[arg(long)]
+        stale_only: bool,
+    },
     /// Retrieve cross-domain context for a repo-relative directory or module prefix (issue #83).
     ///
     /// Returns a structured JSON object with six trust-separated sections:
@@ -3993,6 +4017,20 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_failures_cmd(&records, &handle, &index, selected.as_deref())
         }
+        QuerySubcommand::EvidenceFreshness {
+            graph,
+            data_dir,
+            stale_only,
+        } => {
+            // Freshness compares an observation's anchored code version against
+            // later ones, so it needs superseded (pre-change) versions — the
+            // history-inclusive read. It is also strictly read-only, so the
+            // embedded `--data-dir` store is read through a throwaway copy (opening
+            // the live engine re-persists its index files); the `--graph` path is
+            // already read-only.
+            let records = load_evidence_freshness_records(graph.as_deref(), data_dir.as_deref())?;
+            query_freshness_cmd(&records, stale_only)
+        }
         QuerySubcommand::Subsystem {
             prefix,
             graph,
@@ -4414,6 +4452,53 @@ fn load_records_from_db_history(data_dir: &Path) -> Result<Vec<GraphRecord>> {
     {
         let _ = data_dir;
         anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// Loads the history-inclusive view from a store without mutating it (issue #85).
+///
+/// `eg evidence_freshness` is strictly read-only, but opening the embedded engine
+/// re-persists its on-disk index files. This copies the store to a throwaway
+/// temporary directory and reads the history-inclusive view from the copy, leaving
+/// the original byte-for-byte untouched (mirrors `load_records_from_data_dir_readonly`).
+fn load_records_from_db_history_readonly(data_dir: &Path) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let temp =
+            tempfile::tempdir().context("failed to create temporary read-only store copy")?;
+        let copy_root = temp.path().join("store");
+        copy_dir_recursive(data_dir, &copy_root).with_context(|| {
+            format!(
+                "failed to copy store {} for read-only inspection",
+                data_dir.display()
+            )
+        })?;
+        let sink = EmbeddedAletheiaSink::open_unleased(&copy_root)
+            .with_context(|| format!("failed to open embedded store {}", copy_root.display()))?;
+        sink.read_all_records_including_superseded()
+            .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// History-inclusive record load for the strictly read-only evidence-freshness
+/// command. `--graph` is already read-only; `--data-dir` reads a throwaway copy.
+fn load_evidence_freshness_records(
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+) -> Result<Vec<GraphRecord>> {
+    match (graph, data_dir) {
+        (Some(path), None) => load_records_from_jsonl(path),
+        (None, Some(dir)) => load_records_from_db_history_readonly(dir),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("provide only one of --graph or --data-dir, not both")
+        }
+        (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
     }
 }
 
@@ -8042,6 +8127,61 @@ fn query_failures_cmd(
 
     let output =
         serde_json::to_string_pretty(&response).context("failed to serialize failure history")?;
+    println!("{output}");
+    Ok(())
+}
+
+/// Machine-readable report emitted by `eg query evidence-freshness` (issue #85).
+#[derive(serde::Serialize)]
+struct EvidenceFreshnessReport {
+    ok: bool,
+    stale_only: bool,
+    /// Verdict tally across `current` / `drifted` / `unresolved` / `untemporal`.
+    counts: std::collections::BTreeMap<&'static str, usize>,
+    /// Stable diagnostic so an empty stale-only result is never silent (AC7).
+    diagnostic: &'static str,
+    /// Per-evidence-link freshness verdicts, deterministically ordered.
+    verdicts: Vec<crate::evidence_freshness::FreshnessVerdictEntry>,
+}
+
+/// Handles `eg query evidence-freshness --graph <path> | --data-dir <dir> [--stale-only]`.
+///
+/// Strictly read-only: computes verdicts from records already in the store and
+/// never creates, modifies, or deletes anything. Output carries only record IDs,
+/// hashes, handles, spans, confidence, and redaction markers — never raw
+/// observation text or other protected payloads (AC9).
+fn query_freshness_cmd(records: &[GraphRecord], stale_only: bool) -> Result<()> {
+    let all = crate::evidence_freshness::evidence_link_freshness(records);
+    let counts = crate::evidence_freshness::verdict_counts(&all);
+
+    let verdicts = if stale_only {
+        crate::evidence_freshness::stale_only(all)
+    } else {
+        all
+    };
+
+    // In stale-only mode an empty result is reported with a stable diagnostic,
+    // never silently as success-with-nothing (AC7).
+    let diagnostic = if stale_only {
+        if verdicts.is_empty() {
+            crate::evidence_freshness::NO_STALE_DIAGNOSTIC
+        } else {
+            crate::evidence_freshness::STALE_PRESENT_DIAGNOSTIC
+        }
+    } else {
+        "freshness_verdicts"
+    };
+
+    let report = EvidenceFreshnessReport {
+        ok: true,
+        stale_only,
+        counts,
+        diagnostic,
+        verdicts,
+    };
+
+    let output =
+        serde_json::to_string_pretty(&report).context("failed to serialize freshness report")?;
     println!("{output}");
     Ok(())
 }
