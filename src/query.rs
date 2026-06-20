@@ -6171,7 +6171,6 @@ pub fn memory_audit_context<'a>(
     ctx
 }
 
-
 /// Represents a changed file in a commit range.
 #[derive(Debug, Clone, serde::Serialize, Eq, PartialEq)]
 pub struct ChangesFileItem<'a> {
@@ -6673,6 +6672,7 @@ pub fn changes_context<'a>(
     records: &'a [GraphRecord],
     base_prefix: &str,
     head_prefix: &str,
+    repo_scope: Option<&str>,
 ) -> Result<ChangesContext<'a>, ChangesError> {
     // 0. Check for empty history
     let has_any_commits = records
@@ -6681,6 +6681,21 @@ pub fn changes_context<'a>(
     if !has_any_commits {
         return Err(ChangesError::EmptyHistory);
     }
+
+    // Resolve repository ownership only when a scope is requested. In a shared
+    // store two repositories can carry the same commit SHA; scoping commit
+    // resolution and code-fact selection by owning repository keeps one repo's
+    // range from mixing in another's files/symbols/evidence. Cross-domain
+    // evidence (agent memory, verification) is intentionally not repo-owned in
+    // the containment topology, so the BFS that fans out from in-scope seeds is
+    // left unscoped — only the source-fact and commit selection is gated.
+    let repo_index = repo_scope.map(|_| RepositoryIndex::build(records));
+    let in_scope = |id: &str| -> bool {
+        match (repo_scope, repo_index.as_ref()) {
+            (Some(scope), Some(index)) => index.owner_of(id) == Some(scope),
+            _ => true,
+        }
+    };
 
     // 1. Resolve commit prefixes
     let resolve_prefix = |prefix: &str| -> Result<&'a str, ChangesError> {
@@ -6692,7 +6707,7 @@ pub fn changes_context<'a>(
                 ..
             } = r
             {
-                if sha.to_lowercase().starts_with(&prefix.to_lowercase()) {
+                if sha.to_lowercase().starts_with(&prefix.to_lowercase()) && in_scope(r.id()) {
                     matches.push(sha.as_str());
                 }
             }
@@ -6746,7 +6761,10 @@ pub fn changes_context<'a>(
         }
     }
 
-    // Commits specify parents via temporal.git_parent_commits or ParentOf edges
+    // Commits specify parents via temporal.git_parent_commits or ParentOf edges.
+    // When a repository scope is active, only that repository's commit nodes
+    // contribute to the topology so a same-SHA commit owned by another repo
+    // cannot bleed into the range.
     for r in records {
         if let GraphRecord::Node {
             kind: NodeKind::Commit,
@@ -6755,9 +6773,11 @@ pub fn changes_context<'a>(
             ..
         } = r
         {
-            let entry = parent_map.entry(sha.as_str()).or_default();
-            for parent in &t.git_parent_commits {
-                entry.push(parent.as_str());
+            if in_scope(r.id()) {
+                let entry = parent_map.entry(sha.as_str()).or_default();
+                for parent in &t.git_parent_commits {
+                    entry.push(parent.as_str());
+                }
             }
         }
         if let GraphRecord::Edge {
@@ -6767,6 +6787,9 @@ pub fn changes_context<'a>(
             ..
         } = r
         {
+            if !in_scope(source.as_str()) || !in_scope(target.as_str()) {
+                continue;
+            }
             if let (Some(parent_node), Some(child_node)) =
                 (by_id.get(source.as_str()), by_id.get(target.as_str()))
             {
@@ -6838,58 +6861,68 @@ pub fn changes_context<'a>(
         .copied()
         .collect();
 
-    // 5. Gather code facts in the range
-    let has_changed_in_edges = records.iter().any(|r| {
-        matches!(
-            r,
-            GraphRecord::Edge {
-                label: EdgeLabel::ChangedIn,
+    // 5. Gather code facts in the range.
+    //
+    // History graphs emit a `File`/`Symbol` snapshot for every path in every
+    // commit but only attach a `CHANGED_IN` edge when that path actually changed
+    // in the commit. The stable source ID of a `CHANGED_IN` edge is reused by
+    // every temporal snapshot of the same path/symbol, so seeding from the edge's
+    // source ID alone (or gating on a global "any CHANGED_IN edge exists" flag)
+    // would report unchanged base/other-commit snapshots as changed and would
+    // disable the commit-membership fallback for ranges that legitimately lack
+    // those edges.
+    //
+    // To stay precise we record the exact `(stable source id, commit sha)` pairs
+    // that changed, plus the set of range commits that actually carry CHANGED_IN
+    // coverage. A snapshot then counts as changed only when its own
+    // `(id, git_commit)` pair is marked, and the commit-membership fallback is
+    // applied per-commit for range commits that have no CHANGED_IN edges.
+    let mut range_target_commit: BTreeMap<&str, &str> = BTreeMap::new();
+    for r in records {
+        match r {
+            GraphRecord::Node {
+                kind: NodeKind::Commit,
+                name: Some(sha),
                 ..
+            } if range_commit_shas.contains(sha.as_str()) && in_scope(r.id()) => {
+                range_target_commit.insert(r.id(), sha.as_str());
             }
-        )
-    });
-
-    let mut changed_node_ids = BTreeSet::new();
-    if has_changed_in_edges {
-        let mut range_target_ids = BTreeSet::new();
-        for r in records {
-            match r {
-                GraphRecord::Node {
-                    kind: NodeKind::Commit,
-                    name: Some(sha),
-                    ..
-                } if range_commit_shas.contains(sha.as_str()) => {
-                    range_target_ids.insert(r.id());
-                }
-                GraphRecord::Node {
-                    kind: NodeKind::Change,
-                    temporal: Some(t),
-                    ..
-                } if range_commit_shas.contains(t.git_commit.as_str()) => {
-                    range_target_ids.insert(r.id());
-                }
-                _ => {}
+            GraphRecord::Node {
+                kind: NodeKind::Change,
+                temporal: Some(t),
+                ..
+            } if range_commit_shas.contains(t.git_commit.as_str()) && in_scope(r.id()) => {
+                range_target_commit.insert(r.id(), t.git_commit.as_str());
             }
+            _ => {}
         }
-        for r in records {
-            if let GraphRecord::Edge {
-                label: EdgeLabel::ChangedIn,
-                source,
-                target,
-                ..
-            } = r
-            {
-                if range_target_ids.contains(target.as_str()) {
-                    changed_node_ids.insert(source.as_str());
-                }
+    }
+
+    let mut changed_pairs: BTreeSet<(&str, &str)> = BTreeSet::new();
+    let mut commits_with_changed_in: BTreeSet<&str> = BTreeSet::new();
+    for r in records {
+        if let GraphRecord::Edge {
+            label: EdgeLabel::ChangedIn,
+            source,
+            target,
+            ..
+        } = r
+        {
+            if let Some(commit) = range_target_commit.get(target.as_str()) {
+                changed_pairs.insert((source.as_str(), *commit));
+                commits_with_changed_in.insert(*commit);
             }
         }
     }
 
     let is_changed_node = |r: &GraphRecord, t: &TemporalMetadata| -> bool {
-        if has_changed_in_edges {
-            changed_node_ids.contains(r.id())
+        if commits_with_changed_in.contains(t.git_commit.as_str()) {
+            // This range commit carries CHANGED_IN edges: trust them exactly, so
+            // only the snapshots marked changed at this commit qualify.
+            changed_pairs.contains(&(r.id(), t.git_commit.as_str()))
         } else {
+            // No CHANGED_IN coverage for this commit (e.g. history written without
+            // those edges): fall back to commit membership in the range.
             range_commit_shas.contains(t.git_commit.as_str())
         }
     };
@@ -6909,7 +6942,7 @@ pub fn changes_context<'a>(
                 name: Some(sha),
                 temporal,
                 ..
-            } if range_commit_shas.contains(sha.as_str()) => {
+            } if range_commit_shas.contains(sha.as_str()) && in_scope(r.id()) => {
                 commits.push(ChangesCommitItem {
                     record: r,
                     commit: sha,
@@ -6921,7 +6954,7 @@ pub fn changes_context<'a>(
                 repo_relative_path: Some(path),
                 temporal: Some(t),
                 ..
-            } if is_changed_node(r, t) => {
+            } if is_changed_node(r, t) && in_scope(r.id()) => {
                 changed_files.push(ChangesFileItem {
                     record: r,
                     path,
@@ -6936,7 +6969,7 @@ pub fn changes_context<'a>(
                 repo_relative_path: Some(path),
                 temporal: Some(t),
                 ..
-            } if is_changed_node(r, t) => {
+            } if is_changed_node(r, t) && in_scope(r.id()) => {
                 changed_symbols.push(ChangesSymbolItem {
                     record: r,
                     name: sym_name,
@@ -6954,7 +6987,7 @@ pub fn changes_context<'a>(
                     .as_ref()
                     .is_some_and(|t| range_commit_shas.contains(t.git_commit.as_str()))
                     || range_commit_shas.contains(drift.after_git_commit.as_str());
-                if in_range {
+                if in_range && in_scope(r.id()) {
                     drift_records.push(ChangesDriftItem {
                         record: r,
                         target_record_id: &drift.target_record_id,
@@ -6975,7 +7008,7 @@ pub fn changes_context<'a>(
             ..
         } = r
         {
-            if range_commit_shas.contains(t.git_commit.as_str()) {
+            if range_commit_shas.contains(t.git_commit.as_str()) && in_scope(r.id()) {
                 if added_file_commits.insert((path.as_str(), t.git_commit.as_str())) {
                     changed_files.push(ChangesFileItem {
                         record: r,
@@ -6996,9 +7029,20 @@ pub fn changes_context<'a>(
             ..
         } = r
         {
-            if changed_paths
-                .iter()
-                .any(|path| summary.contains(path) || deleted_id.contains(path))
+            // Tombstones carry no commit and cannot be temporally scoped to the
+            // range (tracked separately); but when the deleted node's owning
+            // repository is known it must still match the requested scope so a
+            // sibling repo's deletions never appear.
+            let owner_ok = repo_scope.is_none_or(|scope| {
+                repo_index
+                    .as_ref()
+                    .and_then(|index| index.owner_of(deleted_id))
+                    .is_none_or(|owner| owner == scope)
+            });
+            if owner_ok
+                && changed_paths
+                    .iter()
+                    .any(|path| summary.contains(path) || deleted_id.contains(path))
             {
                 tombstones.push(ChangesTombstoneItem {
                     record: r,
@@ -7209,7 +7253,14 @@ pub fn changes_context<'a>(
                                         &mut artifacts,
                                         &mut verification_evidence,
                                     );
-                                    if was_classified {
+                                    if was_classified
+                                        || is_bfs_relay_node(
+                                            target_id.as_str(),
+                                            &by_id,
+                                            &tombstoned_ids,
+                                            &has_any_temporal_version,
+                                        )
+                                    {
                                         next_frontier.push(target_id.as_str());
                                     }
                                 }
@@ -7243,7 +7294,18 @@ pub fn changes_context<'a>(
                             &mut artifacts,
                             &mut verification_evidence,
                         );
-                        if was_classified {
+                        // A relay such as a ToolCall/AgentTurn can cite a changed
+                        // File/Symbol via its own evidence_links; expand it so its
+                        // forward PRODUCED_EVIDENCE edges still reach the
+                        // CommandRun/TestRun it produced.
+                        if was_classified
+                            || is_bfs_relay_node(
+                                source,
+                                &by_id,
+                                &tombstoned_ids,
+                                &has_any_temporal_version,
+                            )
+                        {
                             next_frontier.push(*source);
                         }
                     }
@@ -7285,6 +7347,58 @@ pub fn changes_context<'a>(
         if let Some(rec) = by_id.get(id) {
             if let Some(item) = redacted_context_linked_item(rec) {
                 output_verification_evidence.push(item);
+            }
+        }
+    }
+
+    // Surface triple-only evidence links (path/span/commit citations with no
+    // resolved `target_record_id`) whose cited path matches a changed file or
+    // symbol. The BFS above only reaches such citations when their source node is
+    // otherwise connected by an edge or a resolved link, so an imported
+    // observation that cites a changed path purely by triple — e.g. before
+    // `link-evidence` materializes the edge — would be invisible and the change
+    // would be reported unexplained even though the graph holds a citation to it.
+    // Mirrors `symbol_context`'s seed-path gating.
+    let changed_seed_paths: BTreeSet<&str> = changed_files
+        .iter()
+        .map(|f| f.path)
+        .chain(changed_symbols.iter().map(|s| s.path))
+        .collect();
+    if !changed_seed_paths.is_empty() {
+        for r in records {
+            let GraphRecord::Node {
+                id,
+                evidence_links: Some(links),
+                ..
+            } = r
+            else {
+                continue;
+            };
+            if tombstoned_ids.contains(id.as_str())
+                && !has_any_temporal_version.contains(id.as_str())
+            {
+                continue;
+            }
+            for link in links {
+                if link.target_record_id.is_some() {
+                    continue;
+                }
+                if !link
+                    .target_repo_relative_path
+                    .as_deref()
+                    .is_some_and(|p| changed_seed_paths.contains(p))
+                {
+                    continue;
+                }
+                let Some(handle) = evidence_link_triple_handle(link) else {
+                    continue;
+                };
+                unresolved.push(UnresolvedRef {
+                    source_record_id: id.clone(),
+                    target_handle: handle,
+                    relation: link.relation.clone(),
+                    target_domain: link.target_domain.clone(),
+                });
             }
         }
     }
@@ -7349,6 +7463,9 @@ pub fn changes_context<'a>(
             .then_with(|| a.relation.cmp(&b.relation))
             .then_with(|| a.target_domain.cmp(&b.target_domain))
     });
+    // The same triple citation can be reached by both the BFS and the seed-path
+    // pass above; collapse exact duplicates after sorting.
+    unresolved.dedup();
 
     Ok(ChangesContext {
         changed_files,
@@ -7365,31 +7482,43 @@ pub fn changes_context<'a>(
     })
 }
 
-fn is_linked_to_evidence(
-    seed_id: &str,
-    by_id: &BTreeMap<&str, &GraphRecord>,
-    edges_from: &BTreeMap<&str, Vec<(EdgeLabel, &str)>>,
-    edges_to: &BTreeMap<&str, Vec<(EdgeLabel, &str)>>,
-    evidence_links_to: &BTreeMap<&str, Vec<&str>>,
-    _tombstoned_ids: &BTreeSet<&str>,
-    _has_any_temporal_version: &BTreeSet<&str>,
+fn is_linked_to_evidence<'a>(
+    seed_id: &'a str,
+    by_id: &BTreeMap<&'a str, &'a GraphRecord>,
+    edges_from: &BTreeMap<&'a str, Vec<(EdgeLabel, &'a str)>>,
+    edges_to: &BTreeMap<&'a str, Vec<(EdgeLabel, &'a str)>>,
+    evidence_links_to: &BTreeMap<&'a str, Vec<&'a str>>,
+    tombstoned_ids: &BTreeSet<&'a str>,
+    has_any_temporal_version: &BTreeSet<&'a str>,
 ) -> bool {
     let mut visited = BTreeSet::new();
     let mut frontier = vec![seed_id];
     visited.insert(seed_id);
 
+    // A node counts as explaining evidence only when it classifies into a
+    // non-source output section AND has not been retracted by a current-state
+    // tombstone — mirroring `classify_and_insert_change` in the output BFS so the
+    // `unexplained` verdict never relies on evidence the output never emits.
     let is_evidence = |node_id: &str| -> bool {
         if node_id == seed_id {
             return false;
         }
+        if tombstoned_ids.contains(node_id) && !has_any_temporal_version.contains(node_id) {
+            return false;
+        }
         if let Some(GraphRecord::Node { kind, .. }) = by_id.get(node_id) {
-            if classify_node(*kind).is_some()
-                && classify_node(*kind) != Some(ContextSection::SourceFact)
-            {
-                return true;
-            }
+            return classify_node(*kind).is_some_and(|s| s != ContextSection::SourceFact);
         }
         false
+    };
+
+    // Only relay nodes (ToolCall/AgentTurn/AgentRun) may bridge to a further hop,
+    // matching the output BFS. A non-relay, non-evidence node such as a Commit or
+    // Repository must not be traversed through here, otherwise this helper could
+    // mark a change explained by an Observation that the output traversal would
+    // never reach (and therefore never emit).
+    let can_relay = |node_id: &str| -> bool {
+        is_bfs_relay_node(node_id, by_id, tombstoned_ids, has_any_temporal_version)
     };
 
     for _hop in 0..3 {
@@ -7405,7 +7534,9 @@ fn is_linked_to_evidence(
                         if is_evidence(target) {
                             return true;
                         }
-                        next_frontier.push(target);
+                        if can_relay(target) {
+                            next_frontier.push(target);
+                        }
                     }
                 }
             }
@@ -7423,7 +7554,9 @@ fn is_linked_to_evidence(
                         if is_evidence(source) {
                             return true;
                         }
-                        next_frontier.push(source);
+                        if can_relay(source) {
+                            next_frontier.push(source);
+                        }
                     }
                 }
             }
@@ -7439,7 +7572,9 @@ fn is_linked_to_evidence(
                             if is_evidence(target_id.as_str()) {
                                 return true;
                             }
-                            next_frontier.push(target_id.as_str());
+                            if can_relay(target_id.as_str()) {
+                                next_frontier.push(target_id.as_str());
+                            }
                         }
                     }
                 }
@@ -7452,7 +7587,9 @@ fn is_linked_to_evidence(
                         if is_evidence(source) {
                             return true;
                         }
-                        next_frontier.push(source);
+                        if can_relay(source) {
+                            next_frontier.push(source);
+                        }
                     }
                 }
             }
@@ -7464,7 +7601,6 @@ fn is_linked_to_evidence(
     }
     false
 }
-
 
 // ── Failure-History Queries (Issue #63) ─────────────────────────────────────
 //

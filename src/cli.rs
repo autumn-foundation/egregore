@@ -842,6 +842,9 @@ enum QuerySubcommand {
         /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Restrict commit resolution and changed-fact selection to one repository.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Surface prior failed attempts linked to a code or task handle (issue #63).
     ///
@@ -3863,9 +3866,10 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             head,
             graph,
             data_dir,
+            repo,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            query_changes_cmd(&records, &base, &head)
+            query_changes_cmd(&records, &base, &head, repo.as_deref())
         }
         QuerySubcommand::Failures {
             handle,
@@ -7964,8 +7968,15 @@ fn query_task_via_daemon(id_or_handle: &str, data_dir: &Path) -> Result<()> {
     }
 }
 
-fn query_changes_cmd(records: &[GraphRecord], base: &str, head: &str) -> Result<()> {
-    match query::changes_context(records, base, head) {
+fn query_changes_cmd(
+    records: &[GraphRecord],
+    base: &str,
+    head: &str,
+    repo: Option<&str>,
+) -> Result<()> {
+    let index = query::RepositoryIndex::build(records);
+    let repo_scope = resolve_repo_scope(&index, repo);
+    match query::changes_context(records, base, head, repo_scope.as_deref()) {
         Ok(ctx) => {
             #[derive(Debug, Clone, serde::Serialize)]
             struct ChangesResponse<'a> {
