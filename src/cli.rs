@@ -4023,11 +4023,12 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             stale_only,
         } => {
             // Freshness compares an observation's anchored code version against
-            // later ones, so it needs superseded (pre-change) versions. The
-            // default `--data-dir` read collapses repeated non-temporal scans to
-            // the latest physical node per ID, which would hide the very change
-            // a verdict is about; use the history-inclusive read instead.
-            let records = load_query_records_history(graph.as_deref(), data_dir.as_deref())?;
+            // later ones, so it needs superseded (pre-change) versions — the
+            // history-inclusive read. It is also strictly read-only, so the
+            // embedded `--data-dir` store is read through a throwaway copy (opening
+            // the live engine re-persists its index files); the `--graph` path is
+            // already read-only.
+            let records = load_evidence_freshness_records(graph.as_deref(), data_dir.as_deref())?;
             query_freshness_cmd(&records, stale_only)
         }
         QuerySubcommand::Subsystem {
@@ -4451,6 +4452,53 @@ fn load_records_from_db_history(data_dir: &Path) -> Result<Vec<GraphRecord>> {
     {
         let _ = data_dir;
         anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// Loads the history-inclusive view from a store without mutating it (issue #85).
+///
+/// `eg evidence_freshness` is strictly read-only, but opening the embedded engine
+/// re-persists its on-disk index files. This copies the store to a throwaway
+/// temporary directory and reads the history-inclusive view from the copy, leaving
+/// the original byte-for-byte untouched (mirrors `load_records_from_data_dir_readonly`).
+fn load_records_from_db_history_readonly(data_dir: &Path) -> Result<Vec<GraphRecord>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let temp =
+            tempfile::tempdir().context("failed to create temporary read-only store copy")?;
+        let copy_root = temp.path().join("store");
+        copy_dir_recursive(data_dir, &copy_root).with_context(|| {
+            format!(
+                "failed to copy store {} for read-only inspection",
+                data_dir.display()
+            )
+        })?;
+        let sink = EmbeddedAletheiaSink::open_unleased(&copy_root)
+            .with_context(|| format!("failed to open embedded store {}", copy_root.display()))?;
+        sink.read_all_records_including_superseded()
+            .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// History-inclusive record load for the strictly read-only evidence-freshness
+/// command. `--graph` is already read-only; `--data-dir` reads a throwaway copy.
+fn load_evidence_freshness_records(
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+) -> Result<Vec<GraphRecord>> {
+    match (graph, data_dir) {
+        (Some(path), None) => load_records_from_jsonl(path),
+        (None, Some(dir)) => load_records_from_db_history_readonly(dir),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("provide only one of --graph or --data-dir, not both")
+        }
+        (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
     }
 }
 

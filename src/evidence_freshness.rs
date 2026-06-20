@@ -528,16 +528,18 @@ impl<'a> FreshnessIndex<'a> {
                     continue;
                 }
                 match kind {
-                    NodeKind::File => {
-                        file_matches.insert(id.as_str());
-                    }
-                    // A triple can name any code handle (`Symbol`/`Module`/`Import`),
-                    // not just a symbol; match the span for all of them.
+                    // An exact span match is a direct hit for any code handle —
+                    // including a `File` cited by its own recorded span — so a
+                    // file-level triple resolves instead of being reported absent.
                     k if is_code_handle_kind(*k)
                         && span.is_some()
                         && node_span.as_ref() == span =>
                     {
                         span_matches.insert(id.as_str());
+                    }
+                    // Otherwise a `File` is the path-only fallback (no recorded span).
+                    NodeKind::File => {
+                        file_matches.insert(id.as_str());
                     }
                     _ => {}
                 }
@@ -585,14 +587,15 @@ impl<'a> FreshnessIndex<'a> {
                 continue;
             }
             match kind {
-                NodeKind::File => {
-                    file_matches.insert(id.as_str());
-                }
-                // A triple can name any code handle (`Symbol`/`Module`/`Import`),
-                // not just a symbol; match the span for all of them before falling
-                // back to the whole file.
+                // An exact span match is a direct hit for any code handle —
+                // including a `File` cited by its own recorded span — so a
+                // file-level triple resolves instead of being reported absent.
                 k if is_code_handle_kind(*k) && span.is_some() && node_span.as_ref() == span => {
                     span_matches.insert(id.as_str());
+                }
+                // Otherwise a `File` is the path-only fallback (no recorded span).
+                NodeKind::File => {
+                    file_matches.insert(id.as_str());
                 }
                 _ => {}
             }
@@ -1158,15 +1161,14 @@ fn content_change_trigger(
 
     later.into_iter().find_map(|record| {
         (content_hash(record) != anchor_hash).then(|| {
-            let (commit, vt) = match record {
-                GraphRecord::Node {
-                    temporal: Some(t), ..
-                } => (t.git_commit.clone(), t.valid_time.clone()),
-                _ => (String::new(), String::new()),
-            };
+            // Populate the timestamp from `version_valid`, which falls back to the
+            // node-level `valid_time` for current-tree records — otherwise a
+            // non-temporal content change would emit an empty `after_valid_time`
+            // and lose the proof of when the code moved. The commit stays empty for
+            // non-temporal versions (they carry no `git_commit`).
             TriggeringHandle::ContentChange {
-                after_git_commit: commit,
-                after_valid_time: vt,
+                after_git_commit: version_commit(record).unwrap_or_default().to_owned(),
+                after_valid_time: version_valid(record).unwrap_or_default().to_owned(),
                 content_hash: content_hash(record),
             }
         })

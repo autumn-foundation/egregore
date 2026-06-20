@@ -113,8 +113,11 @@ preserves Git's committer offset) compare correctly.
 A `--data-dir` query reads the **superseded-inclusive** store view (the same
 history surface as `eg query drift`), so the pre-change code version an
 observation was anchored against is available for comparison even after later
-scans. Memory rows are collapsed to the current view: a retracted (tombstoned, or
-restored-then-current) note and notes superseded by a `superseded_by` field, a
+scans. To uphold the read-only guarantee — opening the embedded engine
+re-persists its on-disk index files — the store is copied to a throwaway
+temporary directory and the copy is read, leaving the original byte-for-byte
+untouched. Memory rows are collapsed to the current view: a retracted (tombstoned,
+or restored-then-current) note and notes superseded by a `superseded_by` field, a
 `SUPERSEDES` edge, or a `SUPERSEDES` evidence link are excluded, and re-ingested
 duplicate rows are classified once.
 

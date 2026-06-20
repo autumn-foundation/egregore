@@ -3184,3 +3184,201 @@ fn anchored_liveness_ignores_sibling_branch_tips() {
         "a symbol deleted on the anchored lineage is unresolved despite a sibling tip"
     );
 }
+
+// ── A file-level triple citing the file's own span resolves (#605) ───────────
+
+#[test]
+fn file_triple_with_recorded_span_resolves() {
+    // A file-level citation stored as a triple carries `target_span` (the evidence
+    // triple resolver requires one). When that span equals the File node's own
+    // span, it must resolve to the file (→ drifted on body change), not be reported
+    // `unresolved` for lack of a symbol match.
+    let path = "src/fs.rs";
+    let file = stable_id(&["node", "File", "repo-a", path]);
+    let records = vec![
+        file_version(&file, path, "v1", "commit_a", "2026-01-01T00:00:00Z"),
+        file_version(&file, path, "v2", "commit_b", "2026-01-02T00:00:00Z"),
+        observation(
+            &agent_memory_stable_id(&["obs", "fs"]),
+            "the file does X",
+            "0.9",
+            None, // triple, no record id
+            Some(path),
+            Some(span(1, 100)), // exactly the File node's span
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+    ];
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs = agent_memory_stable_id(&["obs", "fs"]);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(
+        entry.verdict,
+        FreshnessVerdict::Drifted,
+        "a file-level triple matching the file's own span must resolve to the file"
+    );
+}
+
+// ── Current-tree content change keeps its valid_time in the trigger (#1165) ──
+
+#[test]
+fn current_tree_content_change_preserves_valid_time() {
+    // Two repeated current-tree (non-temporal) versions of one symbol carry only a
+    // node-level `valid_time`; the later one changes content. The trigger must
+    // report that `valid_time` (the commit stays empty), not an empty string.
+    let path = "src/ct.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let mk = |body: &str, vt: &str| {
+        let mut n = GraphRecord::node(
+            sym.clone(),
+            NodeKind::Symbol,
+            Some(path.to_owned()),
+            Some(span(1, 5)),
+            Some("f".to_owned()),
+            format!("Rust fn f\nSource:\n{body}"),
+        );
+        if let GraphRecord::Node { valid_time, .. } = &mut n {
+            *valid_time = Some(vt.to_owned());
+        }
+        n
+    };
+    let mut obs = observation(
+        &agent_memory_stable_id(&["obs", "ct"]),
+        "f returns v1",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        None,
+        Some("2026-01-01T00:00:00Z"), // valid_time anchor, no commit
+    );
+    // Clear observed_at so the anchor is the supplied valid_time.
+    if let GraphRecord::Node { observed_at, .. } = &mut obs {
+        *observed_at = None;
+    }
+    let records = vec![
+        mk("body_v1", "2026-01-01T00:00:00Z"),
+        mk("body_v2", "2026-02-01T00:00:00Z"),
+        obs,
+    ];
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let obs_id = agent_memory_stable_id(&["obs", "ct"]);
+    let entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs_id)
+        .unwrap();
+    assert_eq!(entry.verdict, FreshnessVerdict::Drifted);
+    match &entry.triggering_handle {
+        Some(freshness::TriggeringHandle::ContentChange {
+            after_git_commit,
+            after_valid_time,
+            ..
+        }) => {
+            assert_eq!(after_valid_time, "2026-02-01T00:00:00Z");
+            assert!(
+                after_git_commit.is_empty(),
+                "non-temporal version has no commit"
+            );
+        }
+        other => panic!("expected content_change trigger, got {other:?}"),
+    }
+}
+
+// ── `--data-dir` evidence-freshness is strictly read-only (#4030) ────────────
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn dir_fingerprint(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let ft = entry.file_type().unwrap();
+            let path = entry.path();
+            if ft.is_dir() {
+                walk(&path, base, out);
+            } else if ft.is_file() {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn data_dir_evidence_freshness_is_read_only() {
+    // Ingest a minimal graph into an embedded store, then run evidence-freshness
+    // against `--data-dir`. The store must be byte-for-byte unchanged afterwards:
+    // the command reads a throwaway copy, never the live engine.
+    let mut graph = Graph::new();
+    let path = "src/ro.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    graph.push(symbol_version(
+        &sym,
+        path,
+        "f",
+        span(1, 5),
+        "v1",
+        "commit_a",
+        "2026-01-01T00:00:00Z",
+    ));
+    graph.push(symbol_version(
+        &sym,
+        path,
+        "f",
+        span(1, 5),
+        "v2",
+        "commit_b",
+        "2026-01-02T00:00:00Z",
+    ));
+    graph.push(observation(
+        &agent_memory_stable_id(&["obs", "ro"]),
+        "f returns v1",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("ro.jsonl");
+    fs::write(&graph_path, graph.to_jsonl().unwrap()).unwrap();
+    let data_dir = temp.path().join("store");
+
+    egregore()
+        .args(["ingest"])
+        .arg(&graph_path)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let before = dir_fingerprint(&data_dir);
+    let assert = egregore()
+        .args(["query", "evidence-freshness", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+    // Sanity: it produced a verdict report.
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["ok"], true);
+
+    let after = dir_fingerprint(&data_dir);
+    assert_eq!(
+        before, after,
+        "evidence-freshness must not modify any store file when reading --data-dir"
+    );
+}
