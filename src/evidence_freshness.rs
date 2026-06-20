@@ -534,14 +534,19 @@ impl<'a> FreshnessIndex<'a> {
             {
                 continue;
             }
-            // Only code-handle targets are freshness-relevant; this also excludes
-            // Commit/Change targets and cross-domain ones, which are not stale
-            // code handles.
-            if !self
-                .kind_by_id
-                .get(target.as_str())
-                .is_some_and(|kind| is_code_handle_kind(*kind))
-            {
+            // Only code-handle targets are freshness-relevant. When the target
+            // node is present, trust its kind (this also excludes `Commit`/`Change`
+            // and cross-domain targets). When the target is absent from the slice
+            // (tombstoned-and-pruned, or omitted), fall back to the citation
+            // relation: `MENTIONS_SYMBOL` / `TOUCHED_FILE` are unambiguous
+            // code-handle citations from the link-evidence workflow, so the note
+            // still resolves to `unresolved` instead of being silently dropped —
+            // matching how an inline link to the same absent handle is reported.
+            let target_is_handle = self.kind_by_id.get(target.as_str()).map_or_else(
+                || is_code_handle_relation(*label),
+                |kind| is_code_handle_kind(*kind),
+            );
+            if !target_is_handle {
                 continue;
             }
             let anchor_commit = temporal
@@ -752,6 +757,54 @@ fn is_non_handle_relation(relation: &str) -> bool {
         || relation == crate::ir::EdgeLabel::ChangedIn.as_str()
 }
 
+/// Evidence-link relations that unambiguously cite a **code handle** (a file or
+/// symbol). Used to synthesize an edge-backed citation when the target node is
+/// absent from the slice (tombstoned-and-pruned or omitted) and its kind can no
+/// longer be read — these labels are the ones the import/`link-evidence`
+/// workflow emits for code, so a stale edge-only note still resolves rather than
+/// being dropped. Deliberately narrow (excludes the more general `OBSERVES`,
+/// which can target non-code) so an absent non-code target is not mis-flagged.
+const fn is_code_handle_relation(label: crate::ir::EdgeLabel) -> bool {
+    matches!(
+        label,
+        crate::ir::EdgeLabel::MentionsSymbol
+            | crate::ir::EdgeLabel::TouchedFile
+            | crate::ir::EdgeLabel::TouchesFile
+    )
+}
+
+/// True when an evidence link cites a deterministic code handle that should be
+/// classified — a codegraph link that is neither a non-handle relation
+/// (`EXPLAINS_CHANGE`/`CHANGED_IN`) nor an explicit non-handle target
+/// (`Commit`/`Change`).
+fn is_classifiable_code_link(index: &FreshnessIndex<'_>, link: &EvidenceLink) -> bool {
+    if link.target_domain != "codegraph" {
+        return false;
+    }
+    if is_non_handle_relation(&link.relation) {
+        return false;
+    }
+    !link
+        .target_record_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .is_some_and(|rid| index.is_non_handle_target(rid))
+}
+
+/// Dedupe key identifying one citation by `(record_id, relation, anchor)`, used
+/// to skip a synthesized edge that an inline link already covers. `None` for a
+/// triple-only link (no record ID): a synthesized edge always carries a record
+/// ID, so a triple inline link never needs to suppress one.
+fn edge_dedupe_key(link: &EvidenceLink) -> Option<(String, String, String)> {
+    let rid = link.target_record_id.as_deref().filter(|s| !s.is_empty())?;
+    let anchor = link
+        .as_of_commit
+        .clone()
+        .or_else(|| link.target_git_commit.clone())
+        .unwrap_or_default();
+    Some((rid.to_owned(), link.relation.clone(), anchor))
+}
+
 /// Observation kinds whose evidence links are checked for freshness.
 const fn is_observation_kind(kind: NodeKind) -> bool {
     matches!(kind, NodeKind::Observation | NodeKind::Decision)
@@ -848,61 +901,38 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
             .or_else(|| observed_at.as_deref().filter(|s| !s.is_empty()))
             .or_else(|| ingested_at.as_deref().filter(|s| !s.is_empty()));
 
-        // Inline links are processed first, then edge-backed ones, so an inline
-        // citation (which can carry the recorded path/span/triple) wins over a
-        // duplicate edge to the same handle.
-        let mut seen_links: BTreeSet<(String, String, String, String)> = BTreeSet::new();
-        for link in inline_links.iter().chain(edge_links.iter()) {
-            // Only links to the deterministic code graph carry a code handle.
-            if link.target_domain != "codegraph" {
+        // Classify every inline evidence link as-is: two inline links to the same
+        // handle with distinct recorded spans (e.g. two snippets in one file) are
+        // distinct citations and each gets its own verdict — they are never
+        // collapsed. Record each inline citation's (record, relation, anchor) key
+        // so a *synthesized edge* to the same handle is treated as the same
+        // citation rather than a duplicate verdict.
+        let mut edge_covered: BTreeSet<(String, String, String)> = BTreeSet::new();
+        for link in inline_links {
+            if !is_classifiable_code_link(&index, link) {
                 continue;
             }
-            // Dedupe an inline link and an edge that cite the same handle at the
-            // same anchor so a note is not classified twice for one citation. A
-            // record-ID citation is identified by the record alone (the inline
-            // form may also carry a redundant path/span the synthesized edge does
-            // not); a triple citation is identified by its path+span.
-            let anchor_key = link
-                .as_of_commit
-                .clone()
-                .or_else(|| link.target_git_commit.clone())
-                .unwrap_or_default();
-            let dedupe_key =
-                if let Some(rid) = link.target_record_id.as_deref().filter(|s| !s.is_empty()) {
-                    (
-                        rid.to_owned(),
-                        String::new(),
-                        link.relation.clone(),
-                        anchor_key,
-                    )
-                } else {
-                    let span_repr = link
-                        .target_span
-                        .map(|s| format!("{}:{}", s.start_byte, s.end_byte))
-                        .unwrap_or_default();
-                    let path_repr = link.target_repo_relative_path.clone().unwrap_or_default();
-                    (
-                        String::new(),
-                        format!("{path_repr}#{span_repr}"),
-                        link.relation.clone(),
-                        anchor_key,
-                    )
-                };
-            if !seen_links.insert(dedupe_key) {
+            if let Some(key) = edge_dedupe_key(link) {
+                edge_covered.insert(key);
+            }
+            entries.push(classify_link(
+                &index,
+                id,
+                kind.as_str(),
+                &provenance,
+                obs_valid_time,
+                link,
+            ));
+        }
+        // Then classify edge-backed citations, skipping any an inline link (or an
+        // earlier edge) already covers. A synthesized edge always carries a record
+        // ID, so it is deduped by record alone — it has no span to distinguish.
+        for link in edge_links {
+            if !is_classifiable_code_link(&index, link) {
                 continue;
             }
-            // A codegraph link can point at a non-handle record (a `Commit`/`Change`
-            // cited by `EXPLAINS_CHANGE`/`CHANGED_IN`); those are valid links, not
-            // stale code handles, so they are not classified. Decide by relation
-            // first — that holds even when the target node is absent from the slice
-            // (so it cannot be classified as a false `unresolved`) — then by the
-            // resolved target kind for any other relation.
-            if is_non_handle_relation(&link.relation)
-                || link
-                    .target_record_id
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .is_some_and(|rid| index.is_non_handle_target(rid))
+            if let Some(key) = edge_dedupe_key(link)
+                && !edge_covered.insert(key)
             {
                 continue;
             }

@@ -3608,3 +3608,87 @@ fn edge_to_non_handle_target_is_not_synthesized() {
         "an EXPLAINS_CHANGE edge to a Commit is not a code handle and must not be classified"
     );
 }
+
+// ── Distinct inline spans to one handle each get a verdict (no over-dedupe) ───
+
+#[test]
+fn distinct_inline_spans_to_same_handle_each_classified() {
+    // One observation cites the same symbol via two inline links with the same
+    // record id/relation/anchor but DIFFERENT recorded spans (two snippets). Each
+    // is a distinct citation and must receive its own verdict — they must not be
+    // collapsed by the edge-dedupe path.
+    let path = "src/two.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let mk_link = |start, end| EvidenceLink {
+        target_record_id: Some(sym.clone()),
+        target_domain: "codegraph".to_owned(),
+        relation: "OBSERVES".to_owned(),
+        confidence: "1.0".to_owned(),
+        as_of_commit: Some("commit_a".to_owned()),
+        target_repo_relative_path: Some(path.to_owned()),
+        target_span: Some(span(start, end)),
+        target_git_commit: None,
+    };
+    let obs = agent_memory_stable_id(&["obs", "two_spans"]);
+    let mut note = GraphRecord::node(
+        obs.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "two snippets in f".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        evidence_links,
+        agent_id,
+        domain,
+        ..
+    } = &mut note
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![mk_link(1, 5), mk_link(10, 15)]);
+        *agent_id = Some("agent_1".to_owned());
+        *domain = Some("agent_memory".to_owned());
+    }
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        note,
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let count = verdicts.iter().filter(|e| e.observation_id == obs).count();
+    assert_eq!(
+        count, 2,
+        "two inline links with distinct spans are distinct citations"
+    );
+}
+
+#[test]
+fn edge_only_citation_to_absent_handle_is_unresolved() {
+    // The note cites a symbol only through a MENTIONS_SYMBOL edge, and the cited
+    // handle is absent from the slice (deleted/pruned, no node, no kind). The
+    // citation must still be classified `unresolved` — the same as an inline link
+    // to an absent handle — not silently dropped.
+    let absent_sym = stable_id(&["node", "symbol", "fn", "repo-a", "src/gone.rs", "g", "0"]);
+    let obs = agent_memory_stable_id(&["obs", "edge_absent"]);
+    let records = vec![
+        bare_observation(&obs, "g did something"),
+        citation_edge(&obs, &absent_sym, EdgeLabel::MentionsSymbol, "commit_a"),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs)
+        .expect("an edge-only citation to an absent handle must be classified");
+    assert_eq!(entry.verdict, FreshnessVerdict::Unresolved);
+}
