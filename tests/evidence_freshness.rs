@@ -3382,3 +3382,229 @@ fn data_dir_evidence_freshness_is_read_only() {
         "evidence-freshness must not modify any store file when reading --data-dir"
     );
 }
+
+// ── A superseded (not tombstoned) drift record is not a trigger ──────────────
+
+#[test]
+fn superseded_drift_record_is_not_a_trigger() {
+    // The cited symbol body is identical across commits, so only a drift record
+    // could flag it. That drift record was superseded (replaced/recomputed) rather
+    // than tombstoned, via a SUPERSEDES edge. The current-state view excludes it,
+    // so the verdict must be `current`, not `drifted`.
+    let path = "src/sd.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let mut records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "same_body",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "same_body",
+            "commit_b",
+            "2026-01-02T00:00:00Z",
+        ),
+    ];
+    let drift_id = semantic_stable_id(&["drift", "superseded"]);
+    records.extend(drift_record(
+        &drift_id,
+        &sym,
+        &sym,
+        "commit_a",
+        "commit_b",
+        "2026-01-01T00:00:00Z",
+        "2026-01-02T00:00:00Z",
+    ));
+    // A newer (recomputed) drift record SUPERSEDES the old one.
+    let new_drift_id = semantic_stable_id(&["drift", "superseded_replacement"]);
+    records.push(GraphRecord::edge(
+        EdgeLabel::Supersedes,
+        new_drift_id,
+        drift_id,
+        None,
+        "supersedes".to_owned(),
+    ));
+    let obs = agent_memory_stable_id(&["obs", "sd"]);
+    records.push(observation(
+        &obs,
+        "f at commit_a",
+        "0.9",
+        Some(&sym),
+        Some(path),
+        Some(span(1, 5)),
+        "OBSERVES",
+        Some("commit_a"),
+        None,
+    ));
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let entry = verdicts.iter().find(|e| e.observation_id == obs).unwrap();
+    assert_eq!(
+        entry.verdict,
+        FreshnessVerdict::Current,
+        "a superseded drift record must not trigger a drifted verdict"
+    );
+}
+
+// ── Edge-backed citations (graph-edge form, no inline evidence link) ──────────
+
+/// Builds an agent `Observation` with no inline evidence links — it cites code
+/// only through graph edges (`OBSERVES`, `MENTIONS_SYMBOL`, `TOUCHED_FILE`, …).
+fn bare_observation(obs_id: &str, text: &str) -> GraphRecord {
+    let mut node = GraphRecord::node(
+        obs_id.to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        format!("Observation by agent_1:sess_1: {text}"),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        agent_id,
+        session_id,
+        observed_at,
+        confidence,
+        text: txt,
+        domain,
+        ..
+    } = &mut node
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent_1".to_owned());
+        *session_id = Some("sess_1".to_owned());
+        *observed_at = Some("2026-02-01T00:00:00Z".to_owned());
+        *confidence = Some("0.9".to_owned());
+        *txt = Some(text.to_owned());
+        *domain = Some("agent_memory".to_owned());
+    }
+    node
+}
+
+/// A code-citation edge (observation → code handle) anchored at `anchor_commit`.
+fn citation_edge(
+    obs_id: &str,
+    target_id: &str,
+    label: EdgeLabel,
+    anchor_commit: &str,
+) -> GraphRecord {
+    GraphRecord::edge(
+        label,
+        obs_id.to_owned(),
+        target_id.to_owned(),
+        Some("0.9".to_owned()),
+        "edge citation".to_owned(),
+    )
+    .with_temporal(temporal(anchor_commit, "2026-01-01T00:00:00Z"))
+}
+
+#[test]
+fn edge_backed_citation_without_inline_link_is_classified() {
+    // The note cites the symbol only through an OBSERVES edge — it has no inline
+    // evidence_links. The cited symbol's content changed after the anchor commit,
+    // so the edge-only note must still be reported `drifted`, not silently dropped.
+    let path = "src/edge.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let obs = agent_memory_stable_id(&["obs", "edge_only"]);
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body_v1",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body_v2",
+            "commit_b",
+            "2026-01-02T00:00:00Z",
+        ),
+        bare_observation(&obs, "f returns body_v1"),
+        citation_edge(&obs, &sym, EdgeLabel::Observes, "commit_a"),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let entry = verdicts
+        .iter()
+        .find(|e| e.observation_id == obs)
+        .expect("an edge-only code citation must be classified, not dropped");
+    assert_eq!(entry.verdict, FreshnessVerdict::Drifted);
+    assert_eq!(
+        entry.cited_handle.target_record_id.as_deref(),
+        Some(sym.as_str())
+    );
+    assert_eq!(entry.cited_handle.relation, "OBSERVES");
+}
+
+#[test]
+fn inline_and_duplicate_edge_citation_classified_once() {
+    // The note carries an inline OBSERVES link AND a redundant OBSERVES edge to the
+    // same symbol at the same anchor. The citation must be classified exactly once.
+    let path = "src/dup.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let obs = agent_memory_stable_id(&["obs", "dup_edge"]);
+    let records = vec![
+        symbol_version(
+            &sym,
+            path,
+            "f",
+            span(1, 5),
+            "body_v1",
+            "commit_a",
+            "2026-01-01T00:00:00Z",
+        ),
+        observation(
+            &obs,
+            "f",
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            Some("commit_a"),
+            None,
+        ),
+        citation_edge(&obs, &sym, EdgeLabel::Observes, "commit_a"),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    let count = verdicts.iter().filter(|e| e.observation_id == obs).count();
+    assert_eq!(
+        count, 1,
+        "an inline link and a duplicate edge citing one handle must classify once"
+    );
+}
+
+#[test]
+fn edge_to_non_handle_target_is_not_synthesized() {
+    // An EXPLAINS_CHANGE edge from a note to a Commit record is a valid citation,
+    // not a code handle. It must not be synthesized into a freshness input (which
+    // would surface as a false `unresolved`), even with no inline links.
+    let commit_id = stable_id(&["node", "commit", "repo-a", "commit_a"]);
+    let obs = agent_memory_stable_id(&["obs", "explains"]);
+    let records = vec![
+        commit_node("commit_a", &[], "2026-01-01T00:00:00Z"),
+        bare_observation(&obs, "this change explains the refactor"),
+        citation_edge(&obs, &commit_id, EdgeLabel::ExplainsChange, "commit_a"),
+    ];
+
+    let verdicts = freshness::evidence_link_freshness(&records);
+    assert!(
+        verdicts.iter().all(|e| e.observation_id != obs),
+        "an EXPLAINS_CHANGE edge to a Commit is not a code handle and must not be classified"
+    );
+}

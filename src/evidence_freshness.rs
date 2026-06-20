@@ -44,7 +44,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use crate::ir::{GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan};
+use crate::ir::{EvidenceLink, GraphRecord, NodeKind, SemanticDriftMetadata, SourceSpan};
 
 // ── Verdict ────────────────────────────────────────────────────────────────────
 
@@ -351,9 +351,16 @@ impl<'a> FreshnessIndex<'a> {
                 } else if let (NodeKind::SemanticDrift, Some(drift)) =
                     (*kind, record_semantic_drift(record))
                 {
-                    // A retracted (tombstoned) drift record is no longer part of
-                    // current memory and must not trigger a `drifted` verdict.
-                    if !tombstone_by_deleted.contains_key(id.as_str()) {
+                    // A retracted (tombstoned) or superseded drift record is no
+                    // longer part of current memory and must not trigger a
+                    // `drifted` verdict — the same current-state filter applied to
+                    // code handles above. A replaced/recomputed measurement that
+                    // was superseded rather than tombstoned is excluded here too,
+                    // which also keeps it out of the `DRIFTS_PRIOR` edge recovery
+                    // path (it reads `drift_meta_by_id`).
+                    if !tombstone_by_deleted.contains_key(id.as_str())
+                        && !superseded_ids.contains(id.as_str())
+                    {
                         drift_meta_by_id.insert(id.as_str(), drift);
                         drifts_by_prior
                             .entry(drift.prior_record_id.as_str())
@@ -486,6 +493,76 @@ impl<'a> FreshnessIndex<'a> {
         self.kind_by_id
             .get(record_id)
             .is_some_and(|kind| !is_code_handle_kind(*kind))
+    }
+
+    /// Synthesizes evidence-link citations from graph **edges** whose source is an
+    /// agent observation and whose target is a code handle (`OBSERVES`,
+    /// `MENTIONS_SYMBOL`, `TOUCHED_FILE`, …), keyed by the source record ID.
+    ///
+    /// An `Observation`/`Decision` can cite code through the graph-edge form
+    /// instead of an inline `evidence_links` array; existing query paths honor
+    /// both, so freshness must too or a store with edge-only memory links silently
+    /// drops those notes. Only evidence-link labels are considered, and only when
+    /// the target resolves to a code-handle node kind — so a `Commit`/`Change`
+    /// target (`EXPLAINS_CHANGE`/`CHANGED_IN`) or a cross-domain target is never
+    /// mis-synthesized as a stale code handle. A tombstoned or superseded citation
+    /// edge is skipped, matching the current-state view used elsewhere.
+    fn edge_code_citations(
+        &self,
+        records: &'a [GraphRecord],
+    ) -> BTreeMap<&'a str, Vec<EvidenceLink>> {
+        let mut by_source: BTreeMap<&str, Vec<EvidenceLink>> = BTreeMap::new();
+        for record in records {
+            let GraphRecord::Edge {
+                id,
+                label,
+                source,
+                target,
+                confidence,
+                temporal,
+                ..
+            } = record
+            else {
+                continue;
+            };
+            if !label.is_evidence_link_label() {
+                continue;
+            }
+            // A retracted or replaced citation edge is not part of current memory.
+            if self.tombstone_by_deleted.contains_key(id.as_str())
+                || self.superseded_ids.contains(id.as_str())
+            {
+                continue;
+            }
+            // Only code-handle targets are freshness-relevant; this also excludes
+            // Commit/Change targets and cross-domain ones, which are not stale
+            // code handles.
+            if !self
+                .kind_by_id
+                .get(target.as_str())
+                .is_some_and(|kind| is_code_handle_kind(*kind))
+            {
+                continue;
+            }
+            let anchor_commit = temporal
+                .as_ref()
+                .map(|t| t.git_commit.clone())
+                .filter(|s| !s.is_empty());
+            by_source
+                .entry(source.as_str())
+                .or_default()
+                .push(EvidenceLink {
+                    target_record_id: Some(target.clone()),
+                    target_domain: "codegraph".to_owned(),
+                    relation: label.as_str().to_owned(),
+                    confidence: confidence.clone().unwrap_or_default(),
+                    as_of_commit: anchor_commit,
+                    target_repo_relative_path: None,
+                    target_span: None,
+                    target_git_commit: None,
+                });
+        }
+        by_source
     }
 
     /// Resolves an unanchored triple `(path, span)` to a live code node ID against
@@ -701,12 +778,17 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
     // retained older version cannot yield duplicate or non-current verdicts.
     let superseded_ids = &index.superseded_ids;
     let mut seen_observations: BTreeSet<&str> = BTreeSet::new();
+    // Edge-backed citations: an observation can cite code through a graph edge
+    // (`OBSERVES`, `MENTIONS_SYMBOL`, `TOUCHED_FILE`, …) rather than an inline
+    // evidence link. Synthesize those once and merge them with each note's inline
+    // links so edge-only memory is not silently dropped from freshness.
+    let edge_citations = index.edge_code_citations(records);
 
     for record in records {
         let GraphRecord::Node {
             id,
             kind,
-            evidence_links: Some(links),
+            evidence_links,
             agent_id,
             session_id,
             observed_at,
@@ -720,6 +802,15 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
             continue;
         };
         if !is_observation_kind(*kind) {
+            continue;
+        }
+        let inline_links = evidence_links.as_deref().unwrap_or(&[]);
+        let edge_links = edge_citations
+            .get(id.as_str())
+            .map_or(&[][..], Vec::as_slice);
+        // A note with neither inline nor edge-backed code citations has nothing to
+        // classify.
+        if inline_links.is_empty() && edge_links.is_empty() {
             continue;
         }
         // A retracted note is no longer part of current memory: a tombstoned
@@ -757,9 +848,47 @@ pub fn evidence_link_freshness(records: &[GraphRecord]) -> Vec<FreshnessVerdictE
             .or_else(|| observed_at.as_deref().filter(|s| !s.is_empty()))
             .or_else(|| ingested_at.as_deref().filter(|s| !s.is_empty()));
 
-        for link in links {
+        // Inline links are processed first, then edge-backed ones, so an inline
+        // citation (which can carry the recorded path/span/triple) wins over a
+        // duplicate edge to the same handle.
+        let mut seen_links: BTreeSet<(String, String, String, String)> = BTreeSet::new();
+        for link in inline_links.iter().chain(edge_links.iter()) {
             // Only links to the deterministic code graph carry a code handle.
             if link.target_domain != "codegraph" {
+                continue;
+            }
+            // Dedupe an inline link and an edge that cite the same handle at the
+            // same anchor so a note is not classified twice for one citation. A
+            // record-ID citation is identified by the record alone (the inline
+            // form may also carry a redundant path/span the synthesized edge does
+            // not); a triple citation is identified by its path+span.
+            let anchor_key = link
+                .as_of_commit
+                .clone()
+                .or_else(|| link.target_git_commit.clone())
+                .unwrap_or_default();
+            let dedupe_key =
+                if let Some(rid) = link.target_record_id.as_deref().filter(|s| !s.is_empty()) {
+                    (
+                        rid.to_owned(),
+                        String::new(),
+                        link.relation.clone(),
+                        anchor_key,
+                    )
+                } else {
+                    let span_repr = link
+                        .target_span
+                        .map(|s| format!("{}:{}", s.start_byte, s.end_byte))
+                        .unwrap_or_default();
+                    let path_repr = link.target_repo_relative_path.clone().unwrap_or_default();
+                    (
+                        String::new(),
+                        format!("{path_repr}#{span_repr}"),
+                        link.relation.clone(),
+                        anchor_key,
+                    )
+                };
+            if !seen_links.insert(dedupe_key) {
                 continue;
             }
             // A codegraph link can point at a non-handle record (a `Commit`/`Change`

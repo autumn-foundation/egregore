@@ -249,12 +249,19 @@ Detecting and labelling is the whole job — auto-invalidating, deleting,
 rewriting, superseding, or re-pointing stale memory is explicitly out of scope
 (supersession authoring stays with #50/#64).
 
+### Citation forms
+
+Both citation forms are scanned: inline `evidence_links` on the observation node,
+and standalone graph edges from the observation to a code handle
+(`OBSERVES`, `MENTIONS_SYMBOL`, `TOUCHED_FILE`, …). Edge-backed citations are
+synthesized into freshness inputs only when the edge target resolves to a code
+handle, so a `Commit`/`Change` citation (`EXPLAINS_CHANGE`/`CHANGED_IN`) or a
+cross-domain edge is never mis-reported as a stale handle. An inline link and a
+duplicate edge to the same handle at the same anchor are classified once, and a
+tombstoned or superseded citation edge is skipped.
+
 ### Known limitations
 
-- **Citation form.** Only inline `evidence_links` are scanned. Observations that
-  cite code solely through standalone graph edges (`MENTIONS_SYMBOL`,
-  `TOUCHED_FILE`, …) are not yet covered; synthesizing freshness inputs from those
-  edges is a tracked follow-up.
 - **Module / import content.** `Module` and `Import` nodes summarize to a name,
   not normalized source, so a content-hash change cannot be observed for them.
   Citations to a module/import are still flagged when the handle is removed
