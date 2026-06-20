@@ -6288,9 +6288,9 @@ pub struct ContextLinkedItem<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_quality: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stdout_handle: Option<&'a OutputHandle>,
+    pub stdout_handle: Option<OutputHandle>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stderr_handle: Option<&'a OutputHandle>,
+    pub stderr_handle: Option<OutputHandle>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_artifact_path: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6314,7 +6314,7 @@ pub struct ContextLinkedItem<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patch_status: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub patch_handle: Option<&'a PatchHandle>,
+    pub patch_handle: Option<PatchHandle>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patch_bytes_hash: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6330,13 +6330,33 @@ pub struct ContextLinkedItem<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub producer_session_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub body_handle: Option<&'a OutputHandle>,
+    pub body_handle: Option<OutputHandle>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence_links: Vec<&'a EvidenceLink>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verification_record: Option<Box<Self>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<&'a str>,
+}
+
+/// Returns a copy of an `OutputHandle` with the `inline` payload stripped,
+/// leaving only the bounded hash/size metadata. Used by the redacted change
+/// wrappers so captured stdout/stderr bytes never reach the changes response.
+fn output_handle_metadata_only(handle: &OutputHandle) -> OutputHandle {
+    OutputHandle {
+        inline: None,
+        hash: handle.hash.clone(),
+        bytes: handle.bytes,
+    }
+}
+
+/// Returns a copy of a `PatchHandle` with the inline patch bytes stripped,
+/// leaving only the stored-path handle.
+fn patch_handle_metadata_only(handle: &PatchHandle) -> PatchHandle {
+    PatchHandle {
+        path: handle.path.clone(),
+        inline: None,
+    }
 }
 
 /// Helper function to convert a GraphRecord to ContextObservation.
@@ -6480,8 +6500,8 @@ pub fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>
         exit_code: *exit_code,
         executed_at: executed_at.as_deref(),
         evidence_quality: evidence_quality.as_deref(),
-        stdout_handle: stdout_handle.as_deref(),
-        stderr_handle: stderr_handle.as_deref(),
+        stdout_handle: stdout_handle.as_deref().cloned(),
+        stderr_handle: stderr_handle.as_deref().cloned(),
         source_artifact_path: source_artifact_path.as_deref(),
         source_artifact_hash: source_artifact_hash.as_deref(),
         repo_relative_path: repo_relative_path.as_deref(),
@@ -6493,7 +6513,7 @@ pub fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>
         linked_turn_id: linked_turn_id.as_deref(),
         linked_patch_id: linked_patch_id.as_deref(),
         patch_status: patch_status.as_deref(),
-        patch_handle: patch_handle.as_deref(),
+        patch_handle: patch_handle.as_deref().cloned(),
         patch_bytes_hash: patch_bytes_hash.as_deref(),
         patch_bytes_size: *patch_bytes_size,
         target_files: target_files.as_deref(),
@@ -6501,7 +6521,7 @@ pub fn context_linked_item(record: &GraphRecord) -> Option<ContextLinkedItem<'_>
         base_commit: base_commit.as_deref(),
         unknown_base_reason: unknown_base_reason.as_deref(),
         producer_session_id: producer_session_id.as_deref(),
-        body_handle: body_handle.as_deref(),
+        body_handle: body_handle.as_deref().cloned(),
         evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
         verification_record: None,
         author: author.as_deref(),
@@ -6569,8 +6589,8 @@ pub fn redacted_context_linked_item(record: &GraphRecord) -> Option<ContextLinke
         exit_code: *exit_code,
         executed_at: executed_at.as_deref(),
         evidence_quality: evidence_quality.as_deref(),
-        stdout_handle: stdout_handle.as_deref(),
-        stderr_handle: stderr_handle.as_deref(),
+        stdout_handle: stdout_handle.as_deref().map(output_handle_metadata_only),
+        stderr_handle: stderr_handle.as_deref().map(output_handle_metadata_only),
         source_artifact_path: source_artifact_path.as_deref(),
         source_artifact_hash: source_artifact_hash.as_deref(),
         repo_relative_path: repo_relative_path.as_deref(),
@@ -6582,7 +6602,7 @@ pub fn redacted_context_linked_item(record: &GraphRecord) -> Option<ContextLinke
         linked_turn_id: linked_turn_id.as_deref(),
         linked_patch_id: linked_patch_id.as_deref(),
         patch_status: patch_status.as_deref(),
-        patch_handle: patch_handle.as_deref(),
+        patch_handle: patch_handle.as_deref().map(patch_handle_metadata_only),
         patch_bytes_hash: patch_bytes_hash.as_deref(),
         patch_bytes_size: *patch_bytes_size,
         target_files: target_files.as_deref(),
@@ -6590,7 +6610,7 @@ pub fn redacted_context_linked_item(record: &GraphRecord) -> Option<ContextLinke
         base_commit: base_commit.as_deref(),
         unknown_base_reason: unknown_base_reason.as_deref(),
         producer_session_id: producer_session_id.as_deref(),
-        body_handle: body_handle.as_deref(),
+        body_handle: body_handle.as_deref().map(output_handle_metadata_only),
         evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
         verification_record: None,
         author: author.as_deref(),
@@ -6915,14 +6935,21 @@ pub fn changes_context<'a>(
         }
     }
 
+    // Coverage is decided at the range level, not per commit. If any commit in
+    // the range carries CHANGED_IN edges, the history format records them, so we
+    // trust them exactly: a snapshot counts as changed only when its own
+    // `(id, commit)` pair is marked. A commit that merely re-emits snapshots
+    // without a CHANGED_IN edge (e.g. a doc/config-only commit) then contributes
+    // nothing here — only its explicit `Change` records surface via pass 2. The
+    // commit-membership fallback applies only when the range carries no
+    // CHANGED_IN edges at all (history written without them); this also keeps the
+    // fallback scoped to the queried range rather than disabled globally by a
+    // single CHANGED_IN edge elsewhere in a shared store.
+    let range_uses_changed_in = !commits_with_changed_in.is_empty();
     let is_changed_node = |r: &GraphRecord, t: &TemporalMetadata| -> bool {
-        if commits_with_changed_in.contains(t.git_commit.as_str()) {
-            // This range commit carries CHANGED_IN edges: trust them exactly, so
-            // only the snapshots marked changed at this commit qualify.
+        if range_uses_changed_in {
             changed_pairs.contains(&(r.id(), t.git_commit.as_str()))
         } else {
-            // No CHANGED_IN coverage for this commit (e.g. history written without
-            // those edges): fall back to commit membership in the range.
             range_commit_shas.contains(t.git_commit.as_str())
         }
     };

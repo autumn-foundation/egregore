@@ -3,7 +3,7 @@
 use aletheia_egregore::{
     ChangesError, EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, MetricKind, NodeKind,
     SelectionBasis, SemanticDriftMetadata, TemporalMetadata, changes_context,
-    ir::{AGENT_MEMORY_SCHEMA_VERSION, agent_memory_stable_id, stable_id},
+    ir::{AGENT_MEMORY_SCHEMA_VERSION, OutputHandle, agent_memory_stable_id, stable_id},
 };
 
 fn commit(sha: &str, parents: &[&str]) -> GraphRecord {
@@ -543,34 +543,53 @@ fn test_changed_in_excludes_unchanged_same_id_snapshot() {
     assert_eq!(ctx.changed_files[0].git_commit, "bbbbbbbb");
 }
 
-/// `CHANGED_IN` coverage is detected per range commit, not globally: a commit in
-/// the range that carries no `CHANGED_IN` edges still falls back to commit
-/// membership even though another commit in the store uses those edges.
+/// When the range uses `CHANGED_IN` edges, a commit that only re-emits a
+/// snapshot without a `CHANGED_IN` edge (e.g. a doc/config-only commit) must not
+/// have that file reported as changed — only the commits that actually carry the
+/// edge do.
 #[test]
-fn test_changed_in_scoped_per_commit_with_fallback() {
+fn test_doc_only_commit_does_not_report_reemitted_snapshot() {
     let c1 = commit("aaaaaaaa", &[]);
     let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
     let c3 = commit("cccccccc", &["bbbbbbbb"]);
     let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
     let e2 = parent_edge("bbbbbbbb", "cccccccc");
-    // bbbb carries CHANGED_IN coverage; cccc carries none.
-    let fa = file_node("src/a.rs", "bbbbbbbb");
+    // src/a.rs actually changes at bbbb (CHANGED_IN edge). At cccc it is only
+    // re-emitted (a doc-only commit) with no CHANGED_IN edge.
+    let fa_b = file_node("src/a.rs", "bbbbbbbb");
     let changed_a = changed_in_edge("src/a.rs", "bbbbbbbb");
+    let fa_c = file_node("src/a.rs", "cccccccc");
+
+    let records = vec![c1, c2, c3, e1, e2, fa_b, changed_a, fa_c];
+    let ctx = changes_context(&records, "aaaa", "cccc", None).unwrap();
+
+    assert_eq!(
+        ctx.changed_files.len(),
+        1,
+        "only the commit with a CHANGED_IN edge reports the file"
+    );
+    assert_eq!(ctx.changed_files[0].git_commit, "bbbbbbbb");
+}
+
+/// When the range carries no `CHANGED_IN` edges at all (history written without
+/// them), selection falls back to commit membership for every range commit.
+#[test]
+fn test_no_changed_in_edges_falls_back_to_commit_membership() {
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let c3 = commit("cccccccc", &["bbbbbbbb"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+    let e2 = parent_edge("bbbbbbbb", "cccccccc");
+    let fa = file_node("src/a.rs", "bbbbbbbb");
     let fb = file_node("src/b.rs", "cccccccc");
 
-    let records = vec![c1, c2, c3, e1, e2, fa, changed_a, fb];
+    let records = vec![c1, c2, c3, e1, e2, fa, fb];
     let ctx = changes_context(&records, "aaaa", "cccc", None).unwrap();
 
     let paths: std::collections::BTreeSet<&str> =
         ctx.changed_files.iter().map(|f| f.path).collect();
-    assert!(
-        paths.contains("src/a.rs"),
-        "covered commit reports its change"
-    );
-    assert!(
-        paths.contains("src/b.rs"),
-        "uncovered commit falls back to commit membership"
-    );
+    assert!(paths.contains("src/a.rs"));
+    assert!(paths.contains("src/b.rs"));
 }
 
 /// A relay (e.g. `ToolCall`) that cites a changed file via its own evidence
@@ -854,4 +873,64 @@ fn test_repo_scope_excludes_sibling_repo_with_shared_sha() {
         ctx_all.changed_files.iter().map(|f| f.path).collect();
     assert!(all_paths.contains("src/a.rs"));
     assert!(all_paths.contains("src/b.rs"));
+}
+
+/// The redacted changes response must not leak captured command output: an
+/// `OutputHandle` carrying inline stdout/stderr bytes is reduced to hash/size
+/// metadata before serialization.
+#[test]
+fn test_redacted_changes_evidence_strips_inline_output() {
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+    let f1 = file_node("src/lib.rs", "bbbbbbbb");
+    let f1_id = f1.id().to_owned();
+
+    // A CommandRun with captured stdout inline, linked to the changed file.
+    let cr_id = agent_memory_stable_id(&["verification", "cr_inline"]);
+    let mut cr = GraphRecord::node(
+        cr_id,
+        NodeKind::CommandRun,
+        None,
+        None,
+        None,
+        "cargo test".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut stdout_handle,
+        ref mut evidence_links,
+        ..
+    } = cr
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *stdout_handle = Some(Box::new(OutputHandle {
+            inline: Some("SECRET stdout bytes".to_owned()),
+            hash: "blake3hash".to_owned(),
+            bytes: 19,
+        }));
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(f1_id),
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_SYMBOL".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let records = vec![c1, c2, e1, f1, cr];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+
+    assert_eq!(ctx.verification_evidence.len(), 1);
+    let v = &ctx.verification_evidence[0];
+    let handle = v.stdout_handle.as_ref().expect("stdout handle present");
+    assert_eq!(
+        handle.inline, None,
+        "inline output must be stripped from redacted changes evidence"
+    );
+    assert_eq!(handle.hash, "blake3hash");
+    assert_eq!(handle.bytes, 19);
 }
