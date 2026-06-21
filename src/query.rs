@@ -7143,6 +7143,11 @@ pub fn changes_context<'a>(
     // deleted path, so evidence that cites the deleted code id from an earlier
     // snapshot needs a bridge into the evidence traversal (built below).
     let mut deletion_paths: BTreeSet<&str> = BTreeSet::new();
+    // Commits where a deleted path was last live (the deletion commit's parents).
+    // Evidence explaining a deletion is normally anchored to the file's prior
+    // live commit, which is out of the queried range, so the in-range anchor
+    // filter must additionally admit these commits for deletion-bridge targets.
+    let mut deletion_live_commits: BTreeSet<&str> = BTreeSet::new();
     for r in records {
         if let GraphRecord::Node {
             kind: NodeKind::Change,
@@ -7161,6 +7166,9 @@ pub fn changes_context<'a>(
                 // evidence discovery.
                 if name.as_deref().and_then(|n| n.split_whitespace().next()) == Some("D") {
                     deletion_paths.insert(path.as_str());
+                    if let Some(parents) = parent_map.get(t.git_commit.as_str()) {
+                        deletion_live_commits.extend(parents.iter().copied());
+                    }
                 }
                 if added_file_commits.insert((path.as_str(), t.git_commit.as_str())) {
                     changed_files.push(ChangesFileItem {
@@ -7278,6 +7286,24 @@ pub fn changes_context<'a>(
     let mut edges_to: BTreeMap<&str, Vec<(EdgeLabel, &str)>> = BTreeMap::new();
     let mut evidence_links_to: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
 
+    // Admits a direct evidence link for indexing/traversal. Anchored links must
+    // cite an in-range commit, except that evidence for a bridged deletion target
+    // may instead be anchored to the deleted fact's prior live commit (which is
+    // out of range by definition). Unanchored links are always admitted.
+    let direct_link_admissible = |link: &EvidenceLink| -> bool {
+        link.target_git_commit
+            .as_deref()
+            .or(link.as_of_commit.as_deref())
+            .is_none_or(|commit| {
+                range_commit_shas.contains(commit)
+                    || (link
+                        .target_record_id
+                        .as_deref()
+                        .is_some_and(|t| deletion_bridge_ids.contains(t))
+                        && deletion_live_commits.contains(commit))
+            })
+    };
+
     for r in records {
         if let GraphRecord::Edge {
             id: edge_id,
@@ -7309,7 +7335,7 @@ pub fn changes_context<'a>(
         {
             for link in links {
                 if let Some(tid) = &link.target_record_id {
-                    if !direct_evidence_link_in_range(link, &range_commit_shas) {
+                    if !direct_link_admissible(link) {
                         continue;
                     }
                     evidence_links_to
@@ -7435,7 +7461,7 @@ pub fn changes_context<'a>(
                 if !already_scanned {
                     for link in links {
                         if let Some(target_id) = &link.target_record_id {
-                            if !direct_evidence_link_in_range(link, &range_commit_shas) {
+                            if !direct_link_admissible(link) {
                                 continue;
                             }
                             if present_ids.contains(target_id.as_str()) {
@@ -7467,6 +7493,18 @@ pub fn changes_context<'a>(
                                 });
                             }
                         } else if let Some(handle) = evidence_link_triple_handle(link) {
+                            // A triple-only citation anchored to an out-of-range
+                            // commit is stale context, not an explanation of an
+                            // in-range change — mirror the seed-path pass's anchor
+                            // check so a stale citation reached here via the BFS is
+                            // not re-emitted as unresolved for the new range.
+                            let anchor = link
+                                .target_git_commit
+                                .as_deref()
+                                .or(link.as_of_commit.as_deref());
+                            if anchor.is_some_and(|commit| !range_commit_shas.contains(commit)) {
+                                continue;
+                            }
                             unresolved.push(UnresolvedRef {
                                 source_record_id: (*node_id).clone(),
                                 target_handle: handle,

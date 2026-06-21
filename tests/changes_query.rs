@@ -1622,3 +1622,142 @@ fn test_deletion_evidence_surfaced_via_prior_code_id() {
         "evidence citing the deleted file's prior code id must be surfaced for the deletion"
     );
 }
+
+/// Evidence explaining a deletion is normally anchored to the file's prior live
+/// commit (the parent of the deletion commit), which is out of the queried range.
+/// The in-range anchor filter must still admit such a citation for the bridged
+/// deletion target, otherwise the deletion is reported with no evidence.
+#[test]
+fn test_deletion_evidence_anchored_to_prior_live_commit_surfaced() {
+    fn change_node(status: &str, path: &str, commit: &str) -> GraphRecord {
+        let id = stable_id(&["node", "change", "repo_test", commit, status, path]);
+        GraphRecord::node(
+            id,
+            NodeKind::Change,
+            Some(path.to_owned()),
+            None,
+            Some(format!("{status} {path}")),
+            format!("Git change {status} to {path}"),
+        )
+        .with_temporal(TemporalMetadata {
+            git_commit: commit.to_owned(),
+            git_parent_commits: vec!["aaaaaaaa".to_owned()],
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        })
+    }
+
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+
+    let gone = file_node("src/gone.rs", "aaaaaaaa");
+    let gone_id = gone.id().to_owned();
+    let deletion = change_node("D", "src/gone.rs", "bbbbbbbb");
+
+    let obs_id = agent_memory_stable_id(&["obs", "explains_deletion_anchored"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Explains why src/gone.rs was deleted".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        // Anchored to aaaaaaaa, the prior live commit (out of the range {bbbb}).
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(gone_id),
+            target_domain: "codegraph".to_owned(),
+            relation: "EXPLAINS_CHANGE".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: Some("aaaaaaaa".to_owned()),
+        }]);
+    }
+
+    let records = vec![c1, c2, e1, gone, deletion, obs];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+
+    let obs_ids: std::collections::BTreeSet<&str> =
+        ctx.observations.iter().map(|o| o.record_id).collect();
+    assert!(
+        obs_ids.contains(obs_id.as_str()),
+        "deletion evidence anchored to the prior live commit must still be surfaced"
+    );
+}
+
+/// A triple-only citation reached during the evidence BFS (because its source
+/// node was already reached through a resolved link) must still be filtered by
+/// the same commit-anchor check as the seed-path pass, so a stale citation to an
+/// out-of-range version of a changed path is not re-emitted as unresolved.
+#[test]
+fn test_triple_only_stale_citation_filtered_in_bfs() {
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+
+    let f1 = file_node("src/lib.rs", "bbbbbbbb");
+    let f1_id = f1.id().to_owned();
+    let f1_changed = changed_in_edge("src/lib.rs", "bbbbbbbb");
+
+    let obs_id = agent_memory_stable_id(&["obs", "bfs_stale_triple"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Explains the in-range change but also carries a stale triple citation".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![
+            // Resolved, in-range link: makes the BFS reach this observation.
+            EvidenceLink {
+                target_record_id: Some(f1_id),
+                target_domain: "codegraph".to_owned(),
+                relation: "EXPLAINS_CHANGE".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            },
+            // Triple-only citation to the same path at an out-of-range commit.
+            EvidenceLink {
+                target_record_id: None,
+                target_domain: "codegraph".to_owned(),
+                relation: "MENTIONS_FILE".to_owned(),
+                confidence: "1.0".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: Some("src/lib.rs".to_owned()),
+                target_span: None,
+                target_git_commit: Some("aaaaaaaa".to_owned()),
+            },
+        ]);
+    }
+
+    let records = vec![c1, c2, e1, f1, f1_changed, obs];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+
+    assert!(
+        ctx.unresolved.iter().all(|u| u.source_record_id != obs_id),
+        "a stale out-of-range triple citation must not be emitted as unresolved from the BFS"
+    );
+}

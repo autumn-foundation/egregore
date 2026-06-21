@@ -10892,19 +10892,6 @@ fn enforce_runtime_file_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-#[allow(clippy::option_if_let_else, clippy::uninlined_format_args)]
-fn clean_windows_path(path: &Path) -> PathBuf {
-    let path_str = path.to_string_lossy();
-    if let Some(stripped) = path_str.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{}", stripped))
-    } else if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
-        PathBuf::from(stripped)
-    } else {
-        path.to_path_buf()
-    }
-}
-
 /// Sets a private Windows ACL on a runtime path, granting full control only to
 /// the current user and SYSTEM, with no inherited permissions and no broad
 /// local-group access.
@@ -10915,8 +10902,6 @@ fn clean_windows_path(path: &Path) -> PathBuf {
 #[cfg(windows)]
 fn windows_set_private_acl(path: &Path, kind: &str) -> Result<()> {
     use std::process::Command;
-
-    let clean_path = clean_windows_path(path);
 
     let script = r#"
 $ErrorActionPreference = 'Stop'
@@ -10967,9 +10952,14 @@ try {
 }
 "#;
 
+    // Pass the path through verbatim (including any `\\?\` extended-length
+    // prefix from canonicalization). Stripping the prefix could leave the .NET
+    // ACL APIs operating on a path that exceeds normal Windows limits, so
+    // `Exists` returns false and the script exits 0 without applying the private
+    // ACL — silently leaving runtime credentials with inherited permissions.
     let output = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("EGREGORE_ACL_PATH", &clean_path)
+        .env("EGREGORE_ACL_PATH", path)
         .output()
         .context("failed to execute PowerShell for Windows ACL enforcement")?;
 
@@ -10997,8 +10987,6 @@ fn windows_acl_has_broad_access(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
-
-    let clean_path = clean_windows_path(path);
 
     // Reject any Allow ACE whose SID is not the current operator or SYSTEM.
     // This catches both well-known broad groups and any other unexpected principal.
@@ -11043,9 +11031,11 @@ try {
 }
 ";
 
+    // Pass the path through verbatim so extended-length / UNC paths resolve
+    // correctly; see the note in `windows_set_private_acl`.
     let output = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("EGREGORE_ACL_PATH", &clean_path)
+        .env("EGREGORE_ACL_PATH", path)
         .output()
         .context("failed to execute PowerShell for Windows ACL inspection")?;
 
