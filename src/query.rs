@@ -6951,12 +6951,23 @@ pub fn changes_context<'a>(
     let mut commits_with_changed_in: BTreeSet<&str> = BTreeSet::new();
     for r in records {
         if let GraphRecord::Edge {
+            id: edge_id,
             label: EdgeLabel::ChangedIn,
             source,
             target,
             ..
         } = r
         {
+            // A CHANGED_IN edge retracted by an active tombstone no longer marks
+            // its fact as changed. The output BFS already skips such edges (see the
+            // edge-index build below), so trusting them here would report a fact as
+            // changed whose change marker has been revoked, and would also let a
+            // retracted edge count as range CHANGED_IN coverage.
+            if tombstoned_ids.contains(edge_id.as_str())
+                && !has_any_temporal_version.contains(edge_id.as_str())
+            {
+                continue;
+            }
             if let Some(commit) = range_target_commit.get(target.as_str()) {
                 changed_pairs.insert((source.as_str(), *commit));
                 commits_with_changed_in.insert(*commit);
@@ -7591,10 +7602,7 @@ pub fn changes_context<'a>(
                 .as_deref()
                 .and_then(|p| change_id_by_path_commit.get(&(p, commit)).copied());
             let commit_proxy = commit_id_by_sha.get(commit).copied();
-            change_proxy
-                .into_iter()
-                .chain(commit_proxy)
-                .any(&linked)
+            change_proxy.into_iter().chain(commit_proxy).any(&linked)
         });
         if explained_via_proxy {
             continue;

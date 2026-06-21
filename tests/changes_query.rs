@@ -1287,3 +1287,50 @@ fn test_changed_facts_serialize_bounded_metadata() {
     assert_eq!(symbol["name"], serde_json::json!("added"));
     assert_eq!(symbol["git_commit"], serde_json::json!("bbbbbbbb"));
 }
+
+/// A `CHANGED_IN` edge retracted by an active tombstone must not mark its fact as
+/// changed. The output BFS already skips tombstoned edges, so trusting the same
+/// edge here would report a fact as changed whose change marker has been revoked.
+/// A sibling live `CHANGED_IN` edge keeps the range on the edge-trusting path so
+/// the test isolates tombstone handling rather than the commit-membership fallback.
+#[test]
+fn test_tombstoned_changed_in_edge_excludes_fact() {
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+
+    // `src/live.rs` has a live CHANGED_IN edge; `src/dead.rs` has one retracted by
+    // a tombstone. Only `src/live.rs` should be reported.
+    let live = file_node("src/live.rs", "bbbbbbbb");
+    let live_changed = changed_in_edge("src/live.rs", "bbbbbbbb");
+
+    let dead = file_node("src/dead.rs", "bbbbbbbb");
+    let dead_changed = changed_in_edge("src/dead.rs", "bbbbbbbb");
+    let dead_changed_id = dead_changed.id().to_owned();
+    let tombstone = GraphRecord::Tombstone {
+        id: "tombstone:dead_changed".to_owned(),
+        schema_version: 4,
+        deleted_id: dead_changed_id,
+        summary: "Retracted CHANGED_IN edge for src/dead.rs".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![
+        c1,
+        c2,
+        e1,
+        live,
+        live_changed,
+        dead,
+        dead_changed,
+        tombstone,
+    ];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+
+    let paths: Vec<&str> = ctx.changed_files.iter().map(|f| f.path).collect();
+    assert_eq!(
+        paths,
+        vec!["src/live.rs"],
+        "a fact whose only CHANGED_IN edge is tombstoned must not be reported"
+    );
+}
