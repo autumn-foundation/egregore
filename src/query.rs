@@ -7310,6 +7310,7 @@ pub fn changes_context<'a>(
             label,
             source,
             target,
+            temporal,
             ..
         } = r
         {
@@ -7317,6 +7318,25 @@ pub fn changes_context<'a>(
                 && !has_any_temporal_version.contains(edge_id.as_str())
             {
                 continue;
+            }
+            // A materialized cross-domain evidence edge (e.g. EXPLAINS_CHANGE,
+            // TOUCHED_FILE) carries its commit anchor on temporal metadata. Since
+            // history reuses the same stable File/Symbol id across commits, an
+            // edge anchored outside the queried range is stale context, so skip it
+            // — mirroring `direct_link_admissible` for `EvidenceLink`s. Deletion
+            // evidence anchored to the deleted fact's prior live commit (where one
+            // endpoint is a deletion-bridge id) is still admitted. Unanchored
+            // edges and structural (non-cross-domain) edges are unaffected.
+            if is_cross_domain_label(*label) {
+                if let Some(t) = temporal {
+                    let commit = t.git_commit.as_str();
+                    let deletion_ok = (deletion_bridge_ids.contains(source.as_str())
+                        || deletion_bridge_ids.contains(target.as_str()))
+                        && deletion_live_commits.contains(commit);
+                    if !range_commit_shas.contains(commit) && !deletion_ok {
+                        continue;
+                    }
+                }
             }
             edges_from
                 .entry(source.as_str())
@@ -7640,13 +7660,23 @@ pub fn changes_context<'a>(
                 // If the citation is anchored to a specific commit, only surface
                 // it when that commit is within the queried range. A citation to
                 // an out-of-range version of the same path is stale context, not
-                // an explanation of a change in this range.
+                // an explanation of a change in this range. Exception: a deletion's
+                // explaining citation is anchored to the deleted file's prior live
+                // commit (out of range); admit it when the cited path is an
+                // in-range deletion path, mirroring the direct-link deletion bridge.
                 let anchor = link
                     .target_git_commit
                     .as_deref()
                     .or(link.as_of_commit.as_deref());
-                if anchor.is_some_and(|commit| !range_commit_shas.contains(commit)) {
-                    continue;
+                if let Some(commit) = anchor {
+                    let deletion_ok = link
+                        .target_repo_relative_path
+                        .as_deref()
+                        .is_some_and(|p| deletion_paths.contains(p))
+                        && deletion_live_commits.contains(commit);
+                    if !range_commit_shas.contains(commit) && !deletion_ok {
+                        continue;
+                    }
                 }
                 let Some(handle) = evidence_link_triple_handle(link) else {
                     continue;

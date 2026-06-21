@@ -1761,3 +1761,138 @@ fn test_triple_only_stale_citation_filtered_in_bfs() {
         "a stale out-of-range triple citation must not be emitted as unresolved from the BFS"
     );
 }
+
+/// A materialized cross-domain evidence edge carries its commit anchor on the
+/// edge's temporal metadata. An edge anchored outside the queried range is stale
+/// (history reuses the same stable id across commits), so it must not be indexed
+/// or traversed — otherwise the change is marked explained by stale evidence even
+/// though direct `EvidenceLink` anchors are already filtered.
+#[test]
+fn test_temporal_evidence_edge_out_of_range_filtered() {
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+
+    let f1 = file_node("src/lib.rs", "bbbbbbbb");
+    let f1_id = f1.id().to_owned();
+    let f1_changed = changed_in_edge("src/lib.rs", "bbbbbbbb");
+
+    let obs_id = agent_memory_stable_id(&["obs", "edge_stale_anchor"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation linked via a materialized edge anchored out of range".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+    }
+    // EXPLAINS_CHANGE edge whose temporal anchor is the base commit (out of range).
+    let explains = GraphRecord::edge(
+        EdgeLabel::ExplainsChange,
+        obs_id.clone(),
+        f1_id.clone(),
+        None,
+        "explains".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "aaaaaaaa".to_owned(),
+        git_parent_commits: Vec::new(),
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
+    });
+
+    let records = vec![c1, c2, e1, f1, f1_changed, obs, explains];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+
+    let unexplained: std::collections::BTreeSet<&str> =
+        ctx.unexplained.iter().map(|u| u.record_id).collect();
+    assert!(
+        unexplained.contains(f1_id.as_str()),
+        "a change explained only by an out-of-range-anchored edge must remain unexplained"
+    );
+    let obs_ids: std::collections::BTreeSet<&str> =
+        ctx.observations.iter().map(|o| o.record_id).collect();
+    assert!(
+        !obs_ids.contains(obs_id.as_str()),
+        "an observation reached only via an out-of-range-anchored edge must not be surfaced"
+    );
+}
+
+/// A triple-only citation explaining a deletion is anchored to the deleted file's
+/// prior live commit (out of range). The seed-path pass must admit such an anchor
+/// when the cited path is an in-range deletion path, mirroring the direct-link
+/// deletion bridge, so the deletion's unresolved evidence is still surfaced.
+#[test]
+fn test_triple_only_deletion_prior_commit_citation_surfaced() {
+    fn change_node(status: &str, path: &str, commit: &str) -> GraphRecord {
+        let id = stable_id(&["node", "change", "repo_test", commit, status, path]);
+        GraphRecord::node(
+            id,
+            NodeKind::Change,
+            Some(path.to_owned()),
+            None,
+            Some(format!("{status} {path}")),
+            format!("Git change {status} to {path}"),
+        )
+        .with_temporal(TemporalMetadata {
+            git_commit: commit.to_owned(),
+            git_parent_commits: vec!["aaaaaaaa".to_owned()],
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        })
+    }
+
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+
+    let gone = file_node("src/gone.rs", "aaaaaaaa");
+    let deletion = change_node("D", "src/gone.rs", "bbbbbbbb");
+
+    let obs_id = agent_memory_stable_id(&["obs", "triple_deletion_prior"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Triple-only citation explaining the deletion at the prior live commit".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: None,
+            target_domain: "codegraph".to_owned(),
+            relation: "EXPLAINS_CHANGE".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: Some("src/gone.rs".to_owned()),
+            target_span: None,
+            target_git_commit: Some("aaaaaaaa".to_owned()),
+        }]);
+    }
+
+    let records = vec![c1, c2, e1, gone, deletion, obs];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+
+    assert!(
+        ctx.unresolved.iter().any(|u| u.source_record_id == obs_id),
+        "a triple-only deletion citation anchored to the prior live commit must be surfaced"
+    );
+}
