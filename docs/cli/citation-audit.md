@@ -97,9 +97,18 @@ agent-authored claim is never counted as evidence for itself (AC6).
 ### Covered workflows
 
 `symbol`, `file`, `drift`, and `semantic` (code-oriented) plus the cross-domain
-lanes `context`, `subsystem`, `task`, `memory`, `failures`, `change-impact`, and
-`policy`. A workflow with nothing to return in the fixture reports zero rows
-rather than disappearing.
+lanes `context`, `subsystem`, `task`, `memory`, `failures`, `change-impact`,
+`policy`, `candidates`, `changes`, and `evidence-freshness`. A workflow with
+nothing to return in the fixture reports zero rows rather than disappearing; one
+that needs inputs the fixture lacks (e.g. `semantic` without an embedded vector
+index, or `changes` without a commit range) is reported `enabled: false` with a
+stable `disabled_reason`, never silently dropped.
+
+Ambiguous code handles in a multi-repository store are not skipped: the audit
+records an `ambiguous_code_handle` diagnostic and drives each candidate record ID
+so its rows are still measured. Scan-history graphs that carry multiple temporal
+versions under one stable record ID keep each version as a distinct row, so a
+later uncited version cannot hide behind an earlier cited one.
 
 ### Diagnostic codes (AC7)
 

@@ -21,11 +21,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
+use crate::evidence_freshness::FreshnessVerdict;
 use crate::ir::{GraphRecord, SourceSpan};
 use crate::query::{
     self, FailureHandleError, RepositoryIndex, ResolvedFailureTarget, change_impact_context,
-    failure_history_context, largest_semantic_drifts, memory_audit_context, resolve_drift_target,
-    resolve_failure_handle, subsystem_context, symbol_context, task_evidence_context,
+    changes_context, failure_history_context, largest_semantic_drifts, memory_audit_context,
+    resolve_drift_target, resolve_failure_handle, subsystem_context, symbol_context,
+    task_evidence_context,
 };
 
 /// Default gate threshold: fraction of code-answer rows that must carry a
@@ -545,7 +547,11 @@ struct WorkflowBuilder {
     trust_class: &'static str,
     enabled: bool,
     disabled_reason: Option<&'static str>,
-    rows: BTreeMap<String, RowClassification>,
+    /// Keyed by `(record_id, temporal_discriminator)` so that scan-history
+    /// graphs — where multiple temporal versions share one stable `record_id`
+    /// (symbol identity excludes commit, ADR-0004) — keep each version as a
+    /// distinct row instead of letting a cited version hide an uncited one.
+    rows: BTreeMap<(String, String), RowClassification>,
     diagnostics: BTreeSet<DiagnosticEntry>,
 }
 
@@ -579,7 +585,7 @@ impl WorkflowBuilder {
     /// Classifies a record and records its row + any diagnostic.
     fn push_record(&mut self, record: &GraphRecord) {
         let classified = classify_record(record);
-        self.push_classified(classified, None);
+        self.push_classified(classified, temporal_key(record));
     }
 
     /// Classifies a record but forces the status (used for excluded sections).
@@ -587,17 +593,20 @@ impl WorkflowBuilder {
         let mut classified = classify_record(record);
         classified.row.status = status;
         classified.diagnostic = None;
-        self.push_classified(classified, None);
+        self.push_classified(classified, temporal_key(record));
     }
 
-    fn push_classified(&mut self, classified: Classified, relation: Option<String>) {
+    fn push_classified(&mut self, classified: Classified, temporal_key: String) {
         let Classified { row, diagnostic } = classified;
         if let Some((code, target)) = diagnostic {
-            self.add_diagnostic(code, Some(row.record_id.clone()), target, relation);
+            self.add_diagnostic(code, Some(row.record_id.clone()), target, None);
         }
-        // A record may surface through several sections/anchors; keep the
-        // first (canonically lowest) classification to stay deterministic.
-        self.rows.entry(row.record_id.clone()).or_insert(row);
+        // A record may surface through several sections/anchors; keep the first
+        // (canonically lowest) classification per (record_id, temporal) to stay
+        // deterministic while still counting each temporal version once.
+        self.rows
+            .entry((row.record_id.clone(), temporal_key))
+            .or_insert(row);
     }
 
     fn add_diagnostic(
@@ -650,6 +659,54 @@ impl WorkflowBuilder {
             diagnostics,
         )
     }
+}
+
+/// Returns a temporal discriminator for a record so that distinct history
+/// versions sharing one stable `record_id` are not collapsed into one row.
+/// Current-tree records (no `temporal`) share an empty key and de-dup normally.
+fn temporal_key(record: &GraphRecord) -> String {
+    match record {
+        GraphRecord::Node {
+            temporal: Some(t), ..
+        }
+        | GraphRecord::Edge {
+            temporal: Some(t), ..
+        } => t.git_commit.clone(),
+        GraphRecord::Node {
+            valid_time: Some(v),
+            ..
+        } => v.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Classifies a `SemanticDrift` node by resolving its drift target's file/span
+/// the same way `eg query drift` / `eg query subsystem` render it, instead of
+/// crediting the drift node by its own ID. Returns the classification plus the
+/// drift node's temporal key. `None` for non-drift records.
+fn classify_drift_row(
+    records: &[GraphRecord],
+    drift_rec: &GraphRecord,
+) -> Option<(Classified, String)> {
+    let GraphRecord::Node {
+        id,
+        semantic_drift: Some(drift),
+        repo_relative_path,
+        name,
+        ..
+    } = drift_rec
+    else {
+        return None;
+    };
+    let (path, _name, span) = resolve_drift_target(
+        records,
+        id,
+        drift,
+        repo_relative_path.as_deref(),
+        name.as_deref(),
+    );
+    let classified = classify_code_handle(id, "SemanticDrift", path, span.as_ref(), true);
+    Some((classified, temporal_key(drift_rec)))
 }
 
 // ---------------------------------------------------------------------------
@@ -705,16 +762,15 @@ fn subsystem_prefixes(records: &[GraphRecord]) -> BTreeSet<String> {
         .collect()
 }
 
+/// Canonical `Task` record IDs. `task_evidence_context` / `resolve_failure_handle`
+/// seed by the stable record `id` (not `entity_id`), so emitting the record ID
+/// keeps a task that carries an `entity_id`/source handle from auditing as zero
+/// rows and silently escaping the gate.
 fn task_ids(records: &[GraphRecord]) -> BTreeSet<String> {
     records
         .iter()
         .filter_map(|r| match r {
-            GraphRecord::Node {
-                id,
-                kind,
-                entity_id,
-                ..
-            } if kind.as_str() == "Task" => Some(entity_id.clone().unwrap_or_else(|| id.clone())),
+            GraphRecord::Node { id, kind, .. } if kind.as_str() == "Task" => Some(id.clone()),
             _ => None,
         })
         .collect()
@@ -782,25 +838,9 @@ fn drive_file(records: &[GraphRecord]) -> WorkflowBuilder {
 fn drive_drift(records: &[GraphRecord]) -> WorkflowBuilder {
     let mut builder = WorkflowBuilder::new("drift", "source_fact");
     for drift_rec in largest_semantic_drifts(records, usize::MAX) {
-        let GraphRecord::Node {
-            id,
-            semantic_drift: Some(drift),
-            repo_relative_path,
-            name,
-            ..
-        } = drift_rec
-        else {
-            continue;
-        };
-        let (path, _name, span) = resolve_drift_target(
-            records,
-            id,
-            drift,
-            repo_relative_path.as_deref(),
-            name.as_deref(),
-        );
-        let classified = classify_code_handle(id, "SemanticDrift", path, span.as_ref(), true);
-        builder.push_classified(classified, None);
+        if let Some((classified, tk)) = classify_drift_row(records, drift_rec) {
+            builder.push_classified(classified, tk);
+        }
     }
     builder
 }
@@ -822,7 +862,7 @@ fn drive_semantic(config: &AuditConfig) -> WorkflowBuilder {
                     row.span.as_ref(),
                     false,
                 );
-                builder.push_classified(classified, None);
+                builder.push_classified(classified, String::new());
             }
             builder
         }
@@ -869,10 +909,16 @@ fn drive_subsystem(records: &[GraphRecord]) -> WorkflowBuilder {
             .chain(&ctx.project_state)
             .chain(&ctx.artifacts)
             .chain(&ctx.verification_evidence)
-            .chain(&ctx.semantic_drift)
         {
             builder.push_record(record);
             builder.note_redaction(record);
+        }
+        // Drift rows must be classified by their resolved target handle, exactly
+        // as `eg query subsystem` renders them — not credited by their own ID.
+        for drift_rec in &ctx.semantic_drift {
+            if let Some((classified, tk)) = classify_drift_row(records, drift_rec) {
+                builder.push_classified(classified, tk);
+            }
         }
         for unresolved in &ctx.unresolved {
             builder.add_diagnostic(
@@ -958,26 +1004,34 @@ fn drive_memory(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-/// Resolves a code/task anchor, emitting an `ambiguous_code_handle` diagnostic
-/// when the handle matches more than one repository (AC7). Returns `None` for a
-/// handle that resolves to nothing live or to a malformed/unsupported input.
-fn resolve_anchor(
+/// Resolves a code/task anchor into the target(s) the audit should drive.
+///
+/// A handle that matches more than one repository still has a valid `--repo`
+/// execution per candidate, so rather than dropping it (and leaving its rows
+/// outside the gate) the audit records an `ambiguous_code_handle` diagnostic and
+/// drives each ambiguous **candidate record ID** — each of which resolves
+/// unambiguously. Returns an empty vec for handles that resolve to nothing live
+/// or to malformed/unsupported input.
+fn resolve_anchors(
     builder: &mut WorkflowBuilder,
     records: &[GraphRecord],
     handle: &str,
     repo_index: &RepositoryIndex,
-) -> Option<ResolvedFailureTarget> {
+) -> Vec<ResolvedFailureTarget> {
     match resolve_failure_handle(records, handle, repo_index, None) {
-        Ok(target) if !target.is_empty() => Some(target),
-        Ok(_) | Err(FailureHandleError::Unsupported { .. }) => None,
-        Err(FailureHandleError::Ambiguous { handle, .. }) => {
-            builder.add_diagnostic(
-                "ambiguous_code_handle".to_owned(),
-                None,
-                Some(handle),
-                None,
-            );
-            None
+        Ok(target) if !target.is_empty() => vec![target],
+        Ok(_) | Err(FailureHandleError::Unsupported { .. }) => Vec::new(),
+        Err(FailureHandleError::Ambiguous { handle, candidates }) => {
+            builder.add_diagnostic("ambiguous_code_handle".to_owned(), None, Some(handle), None);
+            candidates
+                .iter()
+                .filter_map(|candidate| {
+                    match resolve_failure_handle(records, candidate, repo_index, None) {
+                        Ok(target) if !target.is_empty() => Some(target),
+                        _ => None,
+                    }
+                })
+                .collect()
         }
     }
 }
@@ -989,27 +1043,26 @@ fn drive_failures(records: &[GraphRecord], repo_index: &RepositoryIndex) -> Work
     handles.extend(file_paths(records).into_iter().map(str::to_owned));
     handles.extend(task_ids(records));
     for handle in handles {
-        let Some(target) = resolve_anchor(&mut builder, records, &handle, repo_index) else {
-            continue;
-        };
-        let ctx = failure_history_context(records, &target);
-        for attempt in ctx.runtime_failures.iter().chain(&ctx.agent_failures) {
-            builder.push_record(attempt.item.record);
-            builder.note_redaction(attempt.item.record);
-        }
-        for item in ctx.superseding_successes.iter().chain(&ctx.patch_artifacts) {
-            builder.push_record(item.record);
-        }
-        for record in ctx.agent_sessions.iter().chain(&ctx.agents) {
-            builder.push_record(record);
-        }
-        for diag in &ctx.diagnostics {
-            builder.add_diagnostic(
-                diag.code.clone(),
-                Some(diag.source_record_id.clone()),
-                Some(diag.target_handle.clone()),
-                Some(diag.relation.clone()),
-            );
+        for target in resolve_anchors(&mut builder, records, &handle, repo_index) {
+            let ctx = failure_history_context(records, &target);
+            for attempt in ctx.runtime_failures.iter().chain(&ctx.agent_failures) {
+                builder.push_record(attempt.item.record);
+                builder.note_redaction(attempt.item.record);
+            }
+            for item in ctx.superseding_successes.iter().chain(&ctx.patch_artifacts) {
+                builder.push_record(item.record);
+            }
+            for record in ctx.agent_sessions.iter().chain(&ctx.agents) {
+                builder.push_record(record);
+            }
+            for diag in &ctx.diagnostics {
+                builder.add_diagnostic(
+                    diag.code.clone(),
+                    Some(diag.source_record_id.clone()),
+                    Some(diag.target_handle.clone()),
+                    Some(diag.relation.clone()),
+                );
+            }
         }
     }
     builder
@@ -1021,27 +1074,26 @@ fn drive_change_impact(records: &[GraphRecord], repo_index: &RepositoryIndex) ->
     handles.extend(symbol_names(records).into_iter().map(str::to_owned));
     handles.extend(file_paths(records).into_iter().map(str::to_owned));
     for handle in handles {
-        let Some(target) = resolve_anchor(&mut builder, records, &handle, repo_index) else {
-            continue;
-        };
-        let ctx = change_impact_context(records, &target, 1, repo_index, None);
-        for lead in ctx
-            .direct_callers
-            .iter()
-            .chain(&ctx.direct_callees)
-            .chain(&ctx.referencing_files)
-            .chain(&ctx.implementation_symbols)
-            .chain(&ctx.containing_context)
-        {
-            builder.push_record(lead.record);
-        }
-        for diag in &ctx.diagnostics {
-            builder.add_diagnostic(
-                diag.code.clone(),
-                Some(diag.source_record_id.clone()),
-                Some(diag.target_handle.clone()),
-                Some(diag.relation.clone()),
-            );
+        for target in resolve_anchors(&mut builder, records, &handle, repo_index) {
+            let ctx = change_impact_context(records, &target, 1, repo_index, None);
+            for lead in ctx
+                .direct_callers
+                .iter()
+                .chain(&ctx.direct_callees)
+                .chain(&ctx.referencing_files)
+                .chain(&ctx.implementation_symbols)
+                .chain(&ctx.containing_context)
+            {
+                builder.push_record(lead.record);
+            }
+            for diag in &ctx.diagnostics {
+                builder.add_diagnostic(
+                    diag.code.clone(),
+                    Some(diag.source_record_id.clone()),
+                    Some(diag.target_handle.clone()),
+                    Some(diag.relation.clone()),
+                );
+            }
         }
     }
     builder
@@ -1056,6 +1108,130 @@ fn drive_policy(records: &[GraphRecord]) -> WorkflowBuilder {
             for record in chain {
                 builder.push_record(record);
             }
+        }
+    }
+    builder
+}
+
+/// `eg query candidates` — pending `PromoteCandidate` rows. These are
+/// user-context answers that escape the policy lane (which only sees materialized
+/// durables), so an uncited pending candidate must still be gated.
+fn drive_candidates(records: &[GraphRecord]) -> WorkflowBuilder {
+    let mut builder = WorkflowBuilder::new("candidates", "user_context");
+    for candidate in query::pending_candidates(records, None) {
+        builder.push_record(candidate);
+        builder.note_redaction(candidate);
+    }
+    builder
+}
+
+/// `eg query changes` — commit-range context. The range is derived from the
+/// earliest/latest `Commit` SHAs in the record set; without at least two
+/// distinct commits the workflow is reported disabled rather than skipped.
+fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder {
+    let mut shas: Vec<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node {
+                kind,
+                name: Some(sha),
+                ..
+            } if kind.as_str() == "Commit" => Some(sha.as_str()),
+            _ => None,
+        })
+        .collect();
+    shas.sort_unstable();
+    shas.dedup();
+    let (Some(base), Some(head)) = (shas.first(), shas.last()) else {
+        return WorkflowBuilder::disabled("changes", "source_fact", "requires_commit_range");
+    };
+    if base == head {
+        return WorkflowBuilder::disabled("changes", "source_fact", "requires_commit_range");
+    }
+
+    let Ok(ctx) = changes_context(records, base, head, None) else {
+        return WorkflowBuilder::disabled("changes", "source_fact", "commit_range_unresolved");
+    };
+
+    let mut builder = WorkflowBuilder::new("changes", "source_fact");
+    for item in &ctx.changed_files {
+        builder.push_record(item.record);
+        builder.note_redaction(item.record);
+    }
+    for item in &ctx.changed_symbols {
+        builder.push_record(item.record);
+        builder.note_redaction(item.record);
+    }
+    for item in &ctx.commits {
+        builder.push_record(item.record);
+    }
+    for item in &ctx.drift_records {
+        if let Some((classified, tk)) = classify_drift_row(records, item.record) {
+            builder.push_classified(classified, tk);
+        }
+    }
+    // Cross-domain evidence rows expose only `record_id`; resolve and classify.
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let cross_ids = ctx
+        .observations
+        .iter()
+        .map(|o| o.record_id)
+        .chain(ctx.project_state.iter().map(|p| p.record_id))
+        .chain(ctx.artifacts.iter().map(|a| a.record_id))
+        .chain(ctx.verification_evidence.iter().map(|v| v.record_id));
+    for id in cross_ids {
+        if let Some(record) = by_id.get(id) {
+            builder.push_record(record);
+            builder.note_redaction(record);
+        }
+    }
+    builder
+}
+
+/// `eg query evidence-freshness` — per-observation freshness verdicts. Each
+/// verdict row pairs an agent-authored observation with its cited code handle;
+/// both must carry their required citation, and stale/unresolved verdicts emit a
+/// diagnostic against the original handle.
+fn drive_evidence_freshness(records: &[GraphRecord]) -> WorkflowBuilder {
+    let mut builder = WorkflowBuilder::new("evidence-freshness", "agent_authored");
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    for entry in crate::evidence_freshness::evidence_link_freshness(records) {
+        if let Some(observation) = by_id.get(entry.observation_id.as_str()) {
+            builder.push_record(observation);
+            builder.note_redaction(observation);
+        }
+        match entry.cited_handle.target_record_id.as_deref() {
+            Some(target_id) => {
+                let classified = classify_code_handle(
+                    target_id,
+                    "Symbol",
+                    entry.cited_handle.repo_relative_path.as_deref(),
+                    entry.cited_handle.span.as_ref(),
+                    false,
+                );
+                builder.push_classified(classified, String::new());
+            }
+            None => builder.add_diagnostic(
+                "unresolved_evidence_link".to_owned(),
+                Some(entry.observation_id.clone()),
+                entry.cited_handle.repo_relative_path.clone(),
+                None,
+            ),
+        }
+        match entry.verdict {
+            FreshnessVerdict::Drifted => builder.add_diagnostic(
+                "stale_span".to_owned(),
+                Some(entry.observation_id.clone()),
+                entry.cited_handle.target_record_id.clone(),
+                None,
+            ),
+            FreshnessVerdict::Unresolved => builder.add_diagnostic(
+                "unresolved_evidence_link".to_owned(),
+                Some(entry.observation_id.clone()),
+                entry.cited_handle.target_record_id.clone(),
+                None,
+            ),
+            FreshnessVerdict::Current | FreshnessVerdict::Untemporal => {}
         }
     }
     builder
@@ -1081,9 +1257,12 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
     let repo_index = RepositoryIndex::build(records);
 
     let builders = vec![
+        drive_candidates(records),
         drive_change_impact(records, &repo_index),
+        drive_changes(records),
         drive_context(records),
         drive_drift(records),
+        drive_evidence_freshness(records),
         drive_failures(records, &repo_index),
         drive_file(records),
         drive_memory(records),

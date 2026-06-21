@@ -15,7 +15,7 @@ use std::{fs, path::PathBuf, time::Instant};
 
 use aletheia_egregore::{
     EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, MetricKind, NodeKind, SelectionBasis,
-    SourceSpan, UserContextScope,
+    SourceSpan, TemporalMetadata, UserContextScope,
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, Graph, PROJECT_SCHEMA_VERSION,
         PatchHandle, SEMANTIC_SCHEMA_VERSION, SemanticDriftMetadata, USER_CONTEXT_SCHEMA_VERSION,
@@ -597,6 +597,38 @@ fn seed() -> Fixture {
         user_context.active_from = Some("2026-06-01T10:05:00Z".to_owned());
     }
 
+    // A pending (undecided) PromoteCandidate so the `candidates` workflow returns
+    // a row — these escape the materialized-policy lane (issue #65 review #4).
+    let pending_cand_id = user_context_stable_id(&["candidate", "pending_65"]);
+    let mut pending_candidate = GraphRecord::node(
+        pending_cand_id,
+        NodeKind::PromoteCandidate,
+        None,
+        None,
+        None,
+        "Pending promotion candidate".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        domain,
+        confidence,
+        evidence_quality,
+        user_context,
+        ..
+    } = &mut pending_candidate
+    {
+        *schema_version = USER_CONTEXT_SCHEMA_VERSION;
+        *domain = Some("user_context".to_owned());
+        *confidence = Some("0.8".to_owned());
+        *evidence_quality = Some("summarized".to_owned());
+        user_context.proposed_rule_kind = Some("preference".to_owned());
+        user_context.proposed_rule_text = Some("Prefer explicit imports".to_owned());
+        user_context.scope = Some(UserContextScope::default());
+        user_context.contradicting_evidence = Some(vec![]);
+        user_context.supporting_evidence =
+            Some(vec![link(&promo_ids[0], "agent_memory", "PROPOSED_BY")]);
+    }
+
     // ── Assemble ────────────────────────────────────────────────────────────
     for record in [
         agent,
@@ -622,6 +654,7 @@ fn seed() -> Fixture {
         prompt,
         udecision,
         pref,
+        pending_candidate,
     ] {
         graph.push(record);
     }
@@ -723,6 +756,9 @@ fn covers_all_public_query_workflows() {
         "failures",
         "change-impact",
         "policy",
+        "candidates",
+        "changes",
+        "evidence-freshness",
     ] {
         assert!(names.contains(&expected), "workflow {expected} missing");
     }
@@ -744,6 +780,21 @@ fn covers_all_public_query_workflows() {
     assert!(
         rows_for("policy") >= 1,
         "policy lane should surface the durable preference"
+    );
+    // Review #1: a Task carrying an entity_id must still be audited (the anchor
+    // is its record ID, not the entity_id), so the task lane returns rows.
+    assert!(
+        rows_for("task") >= 1,
+        "task lane should surface the entity-id task and its evidence"
+    );
+    // Review #4: pending candidates and observation freshness are now gated.
+    assert!(
+        rows_for("candidates") >= 1,
+        "candidates lane should surface the pending PromoteCandidate"
+    );
+    assert!(
+        rows_for("evidence-freshness") >= 1,
+        "evidence-freshness lane should surface observation verdicts"
     );
 }
 
@@ -890,11 +941,20 @@ fn documentation_covers_workflow_passfail_and_alternatives() {
         "/docs/cli/citation-audit.md"
     ))
     .expect("citation-audit.md should exist");
-    assert!(doc.contains("eg audit citations --graph"), "missing shortest workflow");
+    assert!(
+        doc.contains("eg audit citations --graph"),
+        "missing shortest workflow"
+    );
     assert!(doc.contains("Shortest local workflow"));
     assert!(doc.contains("interpret pass/fail") || doc.contains("How to interpret pass/fail"));
     assert!(doc.contains("code_gate_pass") && doc.contains("non_code_handle_gate_pass"));
-    for tool in ["rg", "jq", "GitHub Code Search", "Sourcegraph", "transcript"] {
+    for tool in [
+        "rg",
+        "jq",
+        "GitHub Code Search",
+        "Sourcegraph",
+        "transcript",
+    ] {
         assert!(doc.contains(tool), "doc should compare against {tool}");
     }
 }
@@ -986,4 +1046,354 @@ fn semantic_workflow_enabled_over_embedded_store() {
         "semantic should return at least one classified code row"
     );
     assert_eq!(report["ok"], Value::Bool(true));
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for PR #250 Codex review fixes
+// ---------------------------------------------------------------------------
+
+/// Runs the audit without asserting an exit code; returns the parsed report and
+/// whether the gate passed (exit 0).
+fn audit_report(path: &std::path::Path) -> (Value, bool) {
+    let output = egregore()
+        .args(["audit", "citations", "--graph"])
+        .arg(path)
+        .output()
+        .expect("run audit");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("valid JSON report");
+    (report, output.status.success())
+}
+
+fn workflow<'a>(report: &'a Value, name: &str) -> &'a Value {
+    report["workflows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["workflow"] == name)
+        .unwrap_or_else(|| panic!("workflow {name} missing"))
+}
+
+fn temporal(commit: &str) -> TemporalMetadata {
+    TemporalMetadata {
+        git_commit: commit.to_owned(),
+        git_parent_commits: Vec::new(),
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: Some("git_commit_committer_date".to_owned()),
+    }
+}
+
+// Review #2: a subsystem's semantic_drift row is classified by its resolved
+// target handle (trust class `source_fact`), not credited generically by the
+// drift node's own ID (`other`).
+#[test]
+fn subsystem_drift_classified_by_target_handle() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("subsystem_drift.jsonl");
+    let mut graph = Graph::new();
+
+    let file_id = stable_id(&["node", "File", "src/sub/lib.rs"]);
+    graph.push(GraphRecord::syntax_node(
+        file_id.clone(),
+        NodeKind::File,
+        "src/sub/lib.rs".to_owned(),
+        span(1, 50),
+        "lib.rs".to_owned(),
+        "rust",
+        "file".to_owned(),
+    ));
+    let symbol_id = stable_id(&["node", "Symbol", "src/sub/lib.rs", "bar"]);
+    graph.push(GraphRecord::syntax_node(
+        symbol_id.clone(),
+        NodeKind::Symbol,
+        "src/sub/lib.rs".to_owned(),
+        span(10, 20),
+        "bar".to_owned(),
+        "rust",
+        "symbol bar".to_owned(),
+    ));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::Defines,
+        file_id,
+        symbol_id.clone(),
+        None,
+        "defines bar".to_owned(),
+    ));
+
+    let drift_id = semantic_stable_id(&["drift", "bar"]);
+    let mut drift = GraphRecord::node(
+        drift_id.clone(),
+        NodeKind::SemanticDrift,
+        None,
+        None,
+        None,
+        "drift on bar".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        domain,
+        semantic_drift,
+        ..
+    } = &mut drift
+    {
+        *schema_version = SEMANTIC_SCHEMA_VERSION;
+        *domain = Some("semantic".to_owned());
+        *semantic_drift = Some(Box::new(SemanticDriftMetadata {
+            embedding_model: EmbeddingModel {
+                provider: "aletheiadb_re_export".to_owned(),
+                name: "m".to_owned(),
+                version: "0.1.0".to_owned(),
+                dim: 384,
+                content_hash: "unknown".to_owned(),
+            },
+            target_record_id: symbol_id.clone(),
+            prior_record_id: symbol_id.clone(),
+            before_git_commit: "aaaa".to_owned(),
+            after_git_commit: "bbbb".to_owned(),
+            before_valid_time: "2026-06-01T00:00:00Z".to_owned(),
+            after_valid_time: "2026-06-02T00:00:00Z".to_owned(),
+            metric_kind: MetricKind::CosineDistance,
+            score: 0.8,
+            selection_threshold: 0.4,
+            selection_basis: SelectionBasis::ThresholdOnly,
+        }));
+    }
+    graph.push(drift);
+    graph.push(GraphRecord::edge(
+        EdgeLabel::DriftsFrom,
+        drift_id.clone(),
+        symbol_id,
+        None,
+        "drifts from bar".to_owned(),
+    ));
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let (report, ok) = audit_report(&path);
+    assert!(ok, "gate should pass: {report:#}");
+    let subsystem = workflow(&report, "subsystem");
+    let drift_row = subsystem["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["record_id"] == drift_id)
+        .expect("subsystem should classify the drift row");
+    assert_eq!(
+        drift_row["trust_class"], "source_fact",
+        "drift row must be classified by its target handle, not as `other`"
+    );
+    assert_eq!(
+        drift_row["primary_handle"], "src/sub/lib.rs:10-20",
+        "drift row should carry its resolved target file/span"
+    );
+}
+
+// Review #3: scan-history graphs carry multiple temporal versions sharing one
+// stable record_id; a later span-less version must be counted, not hidden by an
+// earlier cited version, so the gate fails.
+#[test]
+fn temporal_versions_each_counted() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("temporal.jsonl");
+    let mut graph = Graph::new();
+
+    // Both versions share the same identity-derived record_id (ADR-0004).
+    let symbol_id = stable_id(&["node", "Symbol", "src/lib.rs", "foo"]);
+    // Earlier version: cited (path + span).
+    graph.push(
+        GraphRecord::syntax_node(
+            symbol_id.clone(),
+            NodeKind::Symbol,
+            "src/lib.rs".to_owned(),
+            span(10, 20),
+            "foo".to_owned(),
+            "rust",
+            "foo @ aaaa".to_owned(),
+        )
+        .with_temporal(temporal("aaaaaaaa")),
+    );
+    // Later version: span-less → a real uncited code-answer row.
+    let mut later = GraphRecord::node(
+        symbol_id.clone(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("foo".to_owned()),
+        "foo @ bbbb".to_owned(),
+    );
+    later = later.with_temporal(temporal("bbbbbbbb"));
+    graph.push(later);
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let (report, ok) = audit_report(&path);
+    assert!(
+        !ok,
+        "later span-less version must fail the gate: {report:#}"
+    );
+    let symbol = workflow(&report, "symbol");
+    assert_eq!(
+        symbol["counts"]["total_rows"].as_u64().unwrap(),
+        2,
+        "both temporal versions must be counted, not collapsed by record_id"
+    );
+}
+
+// Review #4: a symbol name that is ambiguous across repositories is driven for
+// each candidate record ID (with an `ambiguous_code_handle` diagnostic), not
+// dropped — so rows behind the ambiguous handle are still measured.
+#[test]
+fn ambiguous_multi_repo_anchor_is_driven() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("ambiguous.jsonl");
+    let mut graph = Graph::new();
+
+    for repo in ["repo-a", "repo-b"] {
+        let repo_id = stable_id(&["node", "Repository", repo]);
+        graph.push(GraphRecord::node(
+            repo_id.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(repo.to_owned()),
+            format!("Repository {repo}"),
+        ));
+        let fpath = format!("src/{repo}_mod.rs");
+        let f_id = stable_id(&["node", "File", &fpath]);
+        graph.push(GraphRecord::syntax_node(
+            f_id.clone(),
+            NodeKind::File,
+            fpath.clone(),
+            span(1, 50),
+            "mod.rs".to_owned(),
+            "rust",
+            format!("file {fpath}"),
+        ));
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id,
+            f_id.clone(),
+            None,
+            "repo contains file".to_owned(),
+        ));
+        let w_id = stable_id(&["node", "Symbol", &fpath, "Widget"]);
+        graph.push(GraphRecord::syntax_node(
+            w_id.clone(),
+            NodeKind::Symbol,
+            fpath.clone(),
+            span(5, 10),
+            "Widget".to_owned(),
+            "rust",
+            "struct Widget".to_owned(),
+        ));
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Defines,
+            f_id,
+            w_id,
+            None,
+            "defines Widget".to_owned(),
+        ));
+    }
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let (report, ok) = audit_report(&path);
+    assert!(ok, "gate should pass: {report:#}");
+    // The ambiguous handle is recorded as a diagnostic, not silently dropped.
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "ambiguous_code_handle"),
+        "expected an ambiguous_code_handle diagnostic: {report:#}"
+    );
+    // Both repositories' Widget files surface as change-impact leads (containing
+    // context), proving each ambiguous candidate was driven rather than skipped.
+    assert!(
+        workflow(&report, "change-impact")["counts"]["total_rows"]
+            .as_u64()
+            .unwrap()
+            >= 2,
+        "both ambiguous candidates should be driven: {report:#}"
+    );
+}
+
+// Review #5: the `changes` workflow audits a commit range derived from the
+// record set, and reports a stable disabled reason when there is no range.
+#[test]
+fn changes_workflow_audits_commit_range() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("changes.jsonl");
+    let mut graph = Graph::new();
+
+    let commit = |sha: &str, parents: &[&str]| -> GraphRecord {
+        GraphRecord::node(
+            stable_id(&["node", "commit", sha]),
+            NodeKind::Commit,
+            None,
+            None,
+            Some(sha.to_owned()),
+            format!("Commit {sha}"),
+        )
+        .with_temporal(TemporalMetadata {
+            git_commit: sha.to_owned(),
+            git_parent_commits: parents.iter().map(|s| (*s).to_owned()).collect(),
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: Some("git_commit_committer_date".to_owned()),
+        })
+    };
+    graph.push(commit("aaaaaaaa", &[]));
+    graph.push(commit("bbbbbbbb", &["aaaaaaaa"]));
+    graph.push(GraphRecord::edge(
+        EdgeLabel::ParentOf,
+        stable_id(&["node", "commit", "aaaaaaaa"]),
+        stable_id(&["node", "commit", "bbbbbbbb"]),
+        Some("1.0".to_owned()),
+        "aaaa parent of bbbb".to_owned(),
+    ));
+    // A file changed in the head commit (cited: path + span).
+    let f_id = stable_id(&["node", "File", "src/lib.rs"]);
+    graph.push(
+        GraphRecord::syntax_node(
+            f_id.clone(),
+            NodeKind::File,
+            "src/lib.rs".to_owned(),
+            span(1, 40),
+            "lib.rs".to_owned(),
+            "rust",
+            "file".to_owned(),
+        )
+        .with_temporal(temporal("bbbbbbbb")),
+    );
+    graph.push(GraphRecord::edge(
+        EdgeLabel::ChangedIn,
+        f_id,
+        stable_id(&["node", "commit", "bbbbbbbb"]),
+        None,
+        "lib.rs changed in bbbb".to_owned(),
+    ));
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let (report, _ok) = audit_report(&path);
+    let changes = workflow(&report, "changes");
+    assert_eq!(
+        changes["enabled"],
+        Value::Bool(true),
+        "changes: {changes:#}"
+    );
+    assert!(
+        changes["counts"]["total_rows"].as_u64().unwrap() >= 1,
+        "changes should audit the commit-range rows: {changes:#}"
+    );
+}
+
+// Review #5: with no commit range, `changes` is reported disabled, not skipped.
+#[test]
+fn changes_disabled_without_commit_range() {
+    let fixture = seed();
+    let (report, _) = run_audit(&fixture);
+    let changes = workflow(&report, "changes");
+    assert_eq!(changes["enabled"], Value::Bool(false));
+    assert_eq!(changes["disabled_reason"], "requires_commit_range");
 }
