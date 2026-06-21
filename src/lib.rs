@@ -6,6 +6,8 @@
 
 /// Graph ingestion adapters.
 pub mod adapters;
+/// Citation-completeness audit over public query workflows (issue #65).
+pub mod citation_audit;
 /// Claude Code transcript JSONL importer (M4 agent-memory source, issue #52).
 pub mod claude_code;
 /// Command-line interface.

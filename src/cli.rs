@@ -437,6 +437,19 @@ enum Commands {
         #[command(subcommand)]
         subcommand: ProtectedSubcommand,
     },
+    /// Audit citation completeness across the public query workflows (issue #65).
+    ///
+    /// Drives every public query workflow over a seeded local record set and
+    /// measures, per workflow and overall, whether returned rows carry the
+    /// citation handles their trust class requires. Local-first; no network,
+    /// hosted indexing, remote crawling, or mandatory remote embeddings.
+    ///
+    /// See `docs/cli/citation-audit.md` for the full workflow.
+    Audit {
+        /// Citation-audit subcommand.
+        #[command(subcommand)]
+        subcommand: AuditSubcommand,
+    },
     /// Report local setup readiness for the scan → ingest → semantic-search workflow.
     ///
     /// Read-only by default: does not download models, create graph records, mutate
@@ -1241,6 +1254,36 @@ enum WriteKind {
     },
 }
 
+/// Subcommands for `audit`.
+#[derive(Debug, Subcommand)]
+enum AuditSubcommand {
+    /// Audit citation completeness across the public query workflows.
+    ///
+    /// Reads a seeded record set from a JSONL graph (`--graph`) or an embedded
+    /// store (`--data-dir`), drives every public query workflow over it, and
+    /// prints a deterministic per-workflow + overall citation report with a
+    /// default pass/fail gate.
+    ///
+    /// Exit codes:
+    ///   0 — gate passed (`ok: true`).
+    ///   1 — gate failed (`ok: false`); the full JSON report is still printed.
+    ///   2 — usage/load error (bad path, unparseable graph).
+    Citations {
+        /// Graph JSONL path (mutually exclusive with `--data-dir`).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` store directory (mutually exclusive with `--graph`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Minimum fraction of code-answer rows that must be cited (AC4 gate).
+        #[arg(long, default_value_t = crate::citation_audit::DEFAULT_MIN_CODE_CITATION)]
+        min_code_citation: f64,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+}
+
 /// Subcommands for `protected`.
 #[derive(Debug, Subcommand)]
 enum ProtectedSubcommand {
@@ -1476,6 +1519,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Mcp { data_dir } => crate::mcp::run_stdio(&data_dir),
         Commands::Protected { subcommand } => protected_cmd(subcommand),
+        Commands::Audit { subcommand } => audit_cmd(subcommand),
         Commands::Doctor {
             path,
             out,
@@ -4210,6 +4254,129 @@ fn load_query_records(graph: Option<&Path>, data_dir: Option<&Path>) -> Result<V
             anyhow::bail!("provide only one of --graph or --data-dir, not both")
         }
         (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+    }
+}
+
+/// Routes `eg audit` subcommands.
+fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
+    match subcommand {
+        AuditSubcommand::Citations {
+            graph,
+            data_dir,
+            min_code_citation,
+            format,
+        } => audit_citations_cmd(
+            graph.as_deref(),
+            data_dir.as_deref(),
+            min_code_citation,
+            format,
+        ),
+    }
+}
+
+/// Handles `eg audit citations` (issue #65).
+fn audit_citations_cmd(
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+    min_code_citation: f64,
+    format: OutputFormat,
+) -> Result<()> {
+    let records = match load_query_records(graph, data_dir) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+
+    let semantic = collect_semantic_input(data_dir, &records);
+    let config = crate::citation_audit::AuditConfig {
+        min_code_citation,
+        semantic,
+    };
+    let report = crate::citation_audit::run_citation_audit(&records, &config);
+
+    let output = match format {
+        OutputFormat::Json | OutputFormat::Text => serde_json::to_string_pretty(&report)
+            .context("failed to serialize citation audit report")?,
+    };
+    println!("{output}");
+    std::process::exit(i32::from(!report.ok));
+}
+
+/// Collects embedded-store semantic retrieval leads for the audit, when the
+/// `embeddings` feature is built and a `--data-dir` store is supplied.
+#[cfg(feature = "embeddings")]
+fn collect_semantic_input(
+    data_dir: Option<&Path>,
+    records: &[GraphRecord],
+) -> crate::citation_audit::SemanticInput {
+    use crate::citation_audit::{SemanticInput, SemanticRow};
+
+    let Some(dir) = data_dir else {
+        return SemanticInput::default();
+    };
+    let Ok(sink) = EmbeddedAletheiaSink::open_unleased(dir) else {
+        return SemanticInput::Disabled {
+            reason: "embedded_store_unavailable",
+        };
+    };
+    let Ok(query_vector) = embed_query_text("foo") else {
+        return SemanticInput::Disabled {
+            reason: "embedding_unavailable",
+        };
+    };
+    let fetch = records.len().max(10);
+    let Ok(mut matches) = sink.semantic_search(&query_vector, fetch) else {
+        return SemanticInput::Disabled {
+            reason: "semantic_index_unavailable",
+        };
+    };
+    matches.retain(|m| {
+        m.kind
+            .as_deref()
+            .is_some_and(|k| k == "File" || k == "Symbol")
+    });
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let rows = matches
+        .iter()
+        .map(|m| {
+            let (path, span) = by_id.get(m.record_id.as_str()).map_or((None, None), |r| {
+                if let GraphRecord::Node {
+                    repo_relative_path,
+                    span,
+                    ..
+                } = r
+                {
+                    (repo_relative_path.clone(), *span)
+                } else {
+                    (None, None)
+                }
+            });
+            SemanticRow {
+                record_id: m.record_id.clone(),
+                repo_relative_path: path,
+                span,
+            }
+        })
+        .collect();
+    SemanticInput::Enabled { rows }
+}
+
+/// Without the `embeddings` feature there is no vector index; `semantic` is
+/// reported disabled with a stable reason rather than silently dropped.
+#[cfg(not(feature = "embeddings"))]
+fn collect_semantic_input(
+    data_dir: Option<&Path>,
+    _records: &[GraphRecord],
+) -> crate::citation_audit::SemanticInput {
+    use crate::citation_audit::SemanticInput;
+    if data_dir.is_some() {
+        SemanticInput::Disabled {
+            reason: "requires_embeddings_feature",
+        }
+    } else {
+        SemanticInput::default()
     }
 }
 
@@ -7278,7 +7445,7 @@ fn query_task_cmd(records: &[GraphRecord], id_or_handle: &str) -> Result<()> {
 
 /// Maps a node kind to its trust class so an agent claim is never labelled as
 /// source truth (AC3).
-fn trust_class_for(record: &GraphRecord) -> &'static str {
+pub(crate) fn trust_class_for(record: &GraphRecord) -> &'static str {
     let Some(kind) = record.node_kind_name() else {
         return "other";
     };
