@@ -1340,6 +1340,7 @@ fn test_tombstoned_changed_in_edge_excludes_fact() {
 /// authored by a record owned by the sibling repo must not be surfaced as
 /// unresolved context for the selected repo's change.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_triple_only_citation_scoped_to_repository() {
     fn repo_node(id: &str) -> GraphRecord {
         GraphRecord::node(
@@ -1451,5 +1452,173 @@ fn test_triple_only_citation_scoped_to_repository() {
             .iter()
             .all(|u| u.source_record_id != sibling_obs_id),
         "a triple-only citation owned by a sibling repo must not be surfaced under repo scope"
+    );
+}
+
+/// When the only in-range `CHANGED_IN` marker for a commit is retracted by a
+/// tombstone, the range must still count as using `CHANGED_IN` so the legacy
+/// commit-membership fallback stays off. Otherwise the tombstoned File/Symbol
+/// snapshot would be reported as changed via the fallback anyway.
+#[test]
+fn test_tombstoned_only_changed_in_does_not_fall_back() {
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+
+    let f1 = file_node("src/only.rs", "bbbbbbbb");
+    let f1_changed = changed_in_edge("src/only.rs", "bbbbbbbb");
+    let f1_changed_id = f1_changed.id().to_owned();
+    let tombstone = GraphRecord::Tombstone {
+        id: "tombstone:only_changed".to_owned(),
+        schema_version: 4,
+        deleted_id: f1_changed_id,
+        summary: "Retracted the only CHANGED_IN edge for src/only.rs".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![c1, c2, e1, f1, f1_changed, tombstone];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+    assert!(
+        ctx.changed_files.is_empty(),
+        "a retracted sole CHANGED_IN edge must not re-enable the commit-membership fallback: {:?}",
+        ctx.changed_files.iter().map(|f| f.path).collect::<Vec<_>>()
+    );
+}
+
+/// A direct evidence link that cites a changed File/Symbol but is anchored to a
+/// commit outside the queried range is stale context, not an explanation: history
+/// reuses the same stable id across commits. Such a citation must neither be
+/// surfaced nor mark the in-range change explained.
+#[test]
+fn test_direct_evidence_out_of_range_anchor_does_not_explain() {
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+
+    let f1 = file_node("src/lib.rs", "bbbbbbbb");
+    let f1_id = f1.id().to_owned();
+    let f1_changed = changed_in_edge("src/lib.rs", "bbbbbbbb");
+
+    let obs_id = agent_memory_stable_id(&["obs", "stale_anchor"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation anchored to an out-of-range commit".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        // Anchored to the base commit aaaaaaaa, which is out of the queried range.
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(f1_id.clone()),
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_FILE".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: Some("aaaaaaaa".to_owned()),
+        }]);
+    }
+
+    let records = vec![c1, c2, e1, f1, f1_changed, obs];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+
+    let unexplained: std::collections::BTreeSet<&str> =
+        ctx.unexplained.iter().map(|u| u.record_id).collect();
+    assert!(
+        unexplained.contains(f1_id.as_str()),
+        "a change explained only by out-of-range-anchored evidence must remain unexplained"
+    );
+    let obs_ids: std::collections::BTreeSet<&str> =
+        ctx.observations.iter().map(|o| o.record_id).collect();
+    assert!(
+        !obs_ids.contains(obs_id.as_str()),
+        "an observation anchored to an out-of-range commit must not be surfaced"
+    );
+}
+
+/// A Rust-file deletion has no File/Symbol snapshot at the deleted commit and no
+/// `CHANGED_IN` edge, so evidence usually cites the deleted file's stable id from an
+/// earlier snapshot. The deletion's explaining observation must still be surfaced
+/// by bridging the prior path-backed code id into the evidence traversal.
+#[test]
+fn test_deletion_evidence_surfaced_via_prior_code_id() {
+    fn change_node(status: &str, path: &str, commit: &str) -> GraphRecord {
+        let id = stable_id(&["node", "change", "repo_test", commit, status, path]);
+        GraphRecord::node(
+            id,
+            NodeKind::Change,
+            Some(path.to_owned()),
+            None,
+            Some(format!("{status} {path}")),
+            format!("Git change {status} to {path}"),
+        )
+        .with_temporal(TemporalMetadata {
+            git_commit: commit.to_owned(),
+            git_parent_commits: Vec::new(),
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        })
+    }
+
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+
+    // Prior snapshot of the file that is deleted at bbbb (no snapshot at bbbb).
+    let gone = file_node("src/gone.rs", "aaaaaaaa");
+    let gone_id = gone.id().to_owned();
+    let deletion = change_node("D", "src/gone.rs", "bbbbbbbb");
+
+    let obs_id = agent_memory_stable_id(&["obs", "explains_deletion"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Explains why src/gone.rs was deleted".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: Some(gone_id),
+            target_domain: "codegraph".to_owned(),
+            relation: "EXPLAINS_CHANGE".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: None,
+            target_span: None,
+            target_git_commit: None,
+        }]);
+    }
+
+    let records = vec![c1, c2, e1, gone, deletion, obs];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+
+    assert!(
+        ctx.changed_files.iter().any(|f| f.path == "src/gone.rs"),
+        "the deletion must be reported as a changed file"
+    );
+    let obs_ids: std::collections::BTreeSet<&str> =
+        ctx.observations.iter().map(|o| o.record_id).collect();
+    assert!(
+        obs_ids.contains(obs_id.as_str()),
+        "evidence citing the deleted file's prior code id must be surfaced for the deletion"
     );
 }

@@ -6958,20 +6958,26 @@ pub fn changes_context<'a>(
             ..
         } = r
         {
+            let Some(commit) = range_target_commit.get(target.as_str()) else {
+                continue;
+            };
+            // Coverage is recorded from the presence of an in-range CHANGED_IN
+            // edge even when that edge is tombstoned: the history format uses
+            // CHANGED_IN, so the legacy commit-membership fallback must stay off.
+            // Recording coverage only for live edges would let a retracted edge
+            // that is a commit's sole marker re-enable the fallback and report the
+            // very snapshot whose CHANGED_IN was revoked as changed.
+            commits_with_changed_in.insert(*commit);
             // A CHANGED_IN edge retracted by an active tombstone no longer marks
-            // its fact as changed. The output BFS already skips such edges (see the
-            // edge-index build below), so trusting them here would report a fact as
-            // changed whose change marker has been revoked, and would also let a
-            // retracted edge count as range CHANGED_IN coverage.
+            // its fact as changed (the has_any_temporal_version exception keeps
+            // versioned edges live), so it is excluded from changed_pairs while
+            // still counting as coverage above.
             if tombstoned_ids.contains(edge_id.as_str())
                 && !has_any_temporal_version.contains(edge_id.as_str())
             {
                 continue;
             }
-            if let Some(commit) = range_target_commit.get(target.as_str()) {
-                changed_pairs.insert((source.as_str(), *commit));
-                commits_with_changed_in.insert(*commit);
-            }
+            changed_pairs.insert((source.as_str(), *commit));
         }
     }
 
@@ -7132,10 +7138,16 @@ pub fn changes_context<'a>(
     // explaining observation cites the de-duped `Change` would appear with its
     // evidence and still be listed as unexplained.
     let mut change_id_by_path_commit: BTreeMap<(&str, &str), &str> = BTreeMap::new();
+    // Repo-relative paths deleted in the range. `scan-history` emits no
+    // File/Symbol snapshot at a deletion commit and no CHANGED_IN edge for the
+    // deleted path, so evidence that cites the deleted code id from an earlier
+    // snapshot needs a bridge into the evidence traversal (built below).
+    let mut deletion_paths: BTreeSet<&str> = BTreeSet::new();
     for r in records {
         if let GraphRecord::Node {
             kind: NodeKind::Change,
             repo_relative_path: Some(path),
+            name,
             span,
             temporal: Some(t),
             ..
@@ -7144,6 +7156,12 @@ pub fn changes_context<'a>(
             if range_commit_shas.contains(t.git_commit.as_str()) && in_scope(r.id()) {
                 change_seed_ids.insert(r.id());
                 change_id_by_path_commit.insert((path.as_str(), t.git_commit.as_str()), r.id());
+                // The Change `name` is "<git status> <path>"; a leading "D"
+                // marks a deletion whose prior code ids must be bridged for
+                // evidence discovery.
+                if name.as_deref().and_then(|n| n.split_whitespace().next()) == Some("D") {
+                    deletion_paths.insert(path.as_str());
+                }
                 if added_file_commits.insert((path.as_str(), t.git_commit.as_str())) {
                     changed_files.push(ChangesFileItem {
                         record: r,
@@ -7210,6 +7228,30 @@ pub fn changes_context<'a>(
     // EXPLAINS_CHANGE evidence that targets the change rather than the File/Symbol.
     seed_ids.extend(change_seed_ids.iter().copied());
 
+    // Bridge prior path-backed `File`/`Symbol` ids for deleted paths into the
+    // evidence traversal. A deletion has no in-range code snapshot, but earlier
+    // snapshots (and the observations/verification that cite their stable ids)
+    // remain in the store, so without this an explained deletion would surface no
+    // evidence. These ids seed only the evidence BFS — never `seed_ids` — so they
+    // are not reported as changed facts and never appear in `unexplained`. Stale
+    // out-of-range citations to the reused id are still excluded by
+    // `direct_evidence_link_in_range`.
+    let mut deletion_bridge_ids: BTreeSet<&str> = BTreeSet::new();
+    if !deletion_paths.is_empty() {
+        for r in records {
+            if let GraphRecord::Node {
+                kind: NodeKind::File | NodeKind::Symbol,
+                repo_relative_path: Some(path),
+                ..
+            } = r
+            {
+                if deletion_paths.contains(path.as_str()) && in_scope(r.id()) {
+                    deletion_bridge_ids.insert(r.id());
+                }
+            }
+        }
+    }
+
     let mut observations = BTreeSet::new();
     let mut project_state = BTreeSet::new();
     let mut artifacts = BTreeSet::new();
@@ -7223,6 +7265,12 @@ pub fn changes_context<'a>(
 
     let mut visited = seed_ids.clone();
     let mut frontier = seed_ids.clone();
+    // Deletion bridges expand the evidence traversal without being reported facts.
+    for id in &deletion_bridge_ids {
+        if visited.insert(id) {
+            frontier.insert(id);
+        }
+    }
     let mut temporal_evidence_scanned = BTreeSet::new();
     let mut evidence_links_scanned = BTreeSet::new();
 
@@ -7261,6 +7309,9 @@ pub fn changes_context<'a>(
         {
             for link in links {
                 if let Some(tid) = &link.target_record_id {
+                    if !direct_evidence_link_in_range(link, &range_commit_shas) {
+                        continue;
+                    }
                     evidence_links_to
                         .entry(tid.as_str())
                         .or_default()
@@ -7384,6 +7435,9 @@ pub fn changes_context<'a>(
                 if !already_scanned {
                     for link in links {
                         if let Some(target_id) = &link.target_record_id {
+                            if !direct_evidence_link_in_range(link, &range_commit_shas) {
+                                continue;
+                            }
                             if present_ids.contains(target_id.as_str()) {
                                 if visited.insert(target_id.as_str()) {
                                     let was_classified = classify_and_insert_change(
@@ -7584,6 +7638,7 @@ pub fn changes_context<'a>(
             &evidence_links_to,
             &tombstoned_ids,
             &has_any_temporal_version,
+            &range_commit_shas,
         )
     };
 
@@ -7686,6 +7741,24 @@ pub fn changes_context<'a>(
     })
 }
 
+/// Returns false when a direct evidence link is anchored (`target_git_commit` or
+/// `as_of_commit`) to a commit outside the queried range. History snapshots reuse
+/// the same `File`/`Symbol` id across commits, so a citation anchored to an
+/// out-of-range version of a reused id is stale context, not an explanation of an
+/// in-range change; indexing or traversing it would let stale evidence both
+/// surface and mark the new change explained. Unanchored links are unaffected —
+/// their per-commit attribution is tracked as a separate follow-up.
+fn direct_evidence_link_in_range(link: &EvidenceLink, range_commit_shas: &BTreeSet<&str>) -> bool {
+    link.target_git_commit
+        .as_deref()
+        .or(link.as_of_commit.as_deref())
+        .is_none_or(|commit| range_commit_shas.contains(commit))
+}
+
+// Internal evidence-traversal helper: every argument is a borrowed slice of the
+// caller's traversal context (indexes plus the queried range), so threading them
+// individually is clearer than introducing a context struct used in one place.
+#[allow(clippy::too_many_arguments)]
 fn is_linked_to_evidence<'a>(
     seed_id: &'a str,
     by_id: &BTreeMap<&'a str, &'a GraphRecord>,
@@ -7694,6 +7767,7 @@ fn is_linked_to_evidence<'a>(
     evidence_links_to: &BTreeMap<&'a str, Vec<&'a str>>,
     tombstoned_ids: &BTreeSet<&'a str>,
     has_any_temporal_version: &BTreeSet<&'a str>,
+    range_commit_shas: &BTreeSet<&'a str>,
 ) -> bool {
     let mut visited = BTreeSet::new();
     let mut frontier = vec![seed_id];
@@ -7772,6 +7846,9 @@ fn is_linked_to_evidence<'a>(
             {
                 for link in links {
                     if let Some(target_id) = &link.target_record_id {
+                        if !direct_evidence_link_in_range(link, range_commit_shas) {
+                            continue;
+                        }
                         if visited.insert(target_id.as_str()) {
                             if is_evidence(target_id.as_str()) {
                                 return true;
