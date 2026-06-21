@@ -283,3 +283,78 @@ fn diagnostics_sorted_and_stable() {
     sorted.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
     assert_eq!(report.diagnostics, sorted);
 }
+
+// Review #4: a pathless `Commit` (e.g. from `eg query changes`) is documented
+// spanless, not `missing_required_handle`.
+#[test]
+fn pathless_commit_is_documented_spanless() {
+    let commit = node("codegraph:v1:commit1", NodeKind::Commit);
+    let result = classify_record(&commit);
+    assert_eq!(result.row.status, CitationStatus::AbsentHandleDocumented);
+    assert_eq!(
+        result.row.absent_handle_reason,
+        Some(AbsentHandleRule::NoSpanModuleLevel)
+    );
+}
+
+// Review #6: an empty primary handle is not a citation.
+#[test]
+fn empty_handle_is_missing_not_cited() {
+    let mut task = node("project:v1:task_e", NodeKind::Task);
+    if let GraphRecord::Node { entity_id, .. } = &mut task {
+        entity_id.replace(String::new());
+    }
+    assert_eq!(
+        classify_record(&task).row.status,
+        CitationStatus::MissingRequiredHandle
+    );
+
+    let mut pref = node("user_context:v1:pref_e", NodeKind::Preference);
+    if let GraphRecord::Node { user_context, .. } = &mut pref {
+        user_context.approval_decision_id = Some(String::new());
+    }
+    assert_eq!(
+        classify_record(&pref).row.status,
+        CitationStatus::MissingRequiredHandle
+    );
+}
+
+// Review #8: a verification row with a withheld output handle (no protected
+// prefix string) is excluded as a protected payload, matching the public audits.
+#[test]
+fn withheld_output_handle_is_excluded_protected() {
+    let mut cmd = node("verification:v1:cmd1", NodeKind::CommandEvidence);
+    if let GraphRecord::Node { stdout_handle, .. } = &mut cmd {
+        *stdout_handle = Some(Box::new(crate::ir::OutputHandle {
+            inline: None,
+            hash: "blake3:withheld".to_owned(),
+            bytes: 2048,
+        }));
+    }
+    let result = classify_record(&cmd);
+    assert_eq!(result.row.status, CitationStatus::ExcludedProtected);
+    assert_eq!(result.diagnostic.unwrap().0, "protected_payload");
+}
+
+// Review #9: an artifact lacking any source/provenance handle cannot be cited by
+// its own record ID.
+#[test]
+fn artifact_without_source_handle_is_missing() {
+    let bare = node("artifact:v1:art1", NodeKind::Artifact);
+    assert_eq!(
+        classify_record(&bare).row.status,
+        CitationStatus::MissingRequiredHandle
+    );
+    let mut with_source = node("artifact:v1:art2", NodeKind::Artifact);
+    if let GraphRecord::Node {
+        source_artifact_hash,
+        ..
+    } = &mut with_source
+    {
+        source_artifact_hash.replace("blake3:abc".to_owned());
+    }
+    assert_eq!(
+        classify_record(&with_source).row.status,
+        CitationStatus::Cited
+    );
+}

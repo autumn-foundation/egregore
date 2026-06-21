@@ -4290,9 +4290,15 @@ fn audit_citations_cmd(
     };
 
     let semantic = collect_semantic_input(data_dir, &records);
+    // The evidence-freshness lane mirrors `eg query evidence-freshness`, which
+    // reads the history-inclusive store view so superseded versions can produce
+    // drift/unresolved verdicts. A JSONL graph already carries that history; an
+    // embedded store needs the explicit history-inclusive load.
+    let freshness_records = data_dir.and_then(|dir| load_records_from_db_history(dir).ok());
     let config = crate::citation_audit::AuditConfig {
         min_code_citation,
         semantic,
+        freshness_records,
     };
     let report = crate::citation_audit::run_citation_audit(&records, &config);
 

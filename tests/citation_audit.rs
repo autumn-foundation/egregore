@@ -1397,3 +1397,52 @@ fn changes_disabled_without_commit_range() {
     assert_eq!(changes["enabled"], Value::Bool(false));
     assert_eq!(changes["disabled_reason"], "requires_commit_range");
 }
+
+// Review #1: a scan-history symbol that was later deleted still has temporal
+// rows in `eg query symbol`, so the audit must count them rather than dropping
+// every symbol whose stable ID appears in a tombstone.
+#[test]
+fn historical_tombstoned_symbol_is_counted() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("hist_tombstone.jsonl");
+    let mut graph = Graph::new();
+
+    let symbol_id = stable_id(&["node", "Symbol", "src/lib.rs", "gone"]);
+    graph.push(
+        GraphRecord::syntax_node(
+            symbol_id.clone(),
+            NodeKind::Symbol,
+            "src/lib.rs".to_owned(),
+            span(10, 20),
+            "gone".to_owned(),
+            "rust",
+            "gone @ aaaa".to_owned(),
+        )
+        .with_temporal(TemporalMetadata {
+            git_commit: "aaaaaaaa".to_owned(),
+            git_parent_commits: Vec::new(),
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: Some("git_commit_committer_date".to_owned()),
+        }),
+    );
+    // The symbol was deleted in a later commit.
+    graph.push(GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", &symbol_id]),
+        schema_version: aletheia_egregore::SCHEMA_VERSION,
+        deleted_id: symbol_id,
+        summary: "deleted gone".to_owned(),
+        producer: None,
+    });
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let (report, _ok) = audit_report(&path);
+    assert!(
+        workflow(&report, "symbol")["counts"]["total_rows"]
+            .as_u64()
+            .unwrap()
+            >= 1,
+        "historical version of a tombstoned symbol must be counted: {report:#}"
+    );
+}

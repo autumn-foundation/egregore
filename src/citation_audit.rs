@@ -90,6 +90,15 @@ pub struct AuditConfig {
     pub min_code_citation: f64,
     /// How the `semantic` workflow is supplied.
     pub semantic: SemanticInput,
+    /// Optional history-inclusive record set for the `evidence-freshness` lane.
+    ///
+    /// `eg query evidence-freshness` reads the history-inclusive store view so
+    /// superseded non-temporal versions can yield drift/unresolved verdicts. Over
+    /// `--graph` the JSONL already carries that history, so this stays `None` and
+    /// the lane uses the same records; over `--data-dir` the CLI supplies the
+    /// history-inclusive load here so the audit sees the same rows the public
+    /// command would.
+    pub freshness_records: Option<Vec<GraphRecord>>,
 }
 
 impl Default for AuditConfig {
@@ -97,6 +106,7 @@ impl Default for AuditConfig {
         Self {
             min_code_citation: DEFAULT_MIN_CODE_CITATION,
             semantic: SemanticInput::default(),
+            freshness_records: None,
         }
     }
 }
@@ -302,8 +312,48 @@ struct Classified {
     diagnostic: Option<(String, Option<String>)>,
 }
 
-/// Returns the protected-artifact handle a record references, if any (AC5/AC8).
+/// Returns a protected/withheld-payload handle a record references, if any
+/// (AC5/AC8).
+///
+/// Matches both an explicit protected-store handle (`protected:v1:…`) anywhere
+/// in the record and the withheld raw-payload handles (`stdout_handle`,
+/// `stderr_handle`, `patch_handle`, `body_handle`, …) that the public memory and
+/// failure-history audits surface as `protected_payload` diagnostics even when
+/// no protected-store handle is present.
 fn referenced_protected_handle(record: &GraphRecord) -> Option<String> {
+    if let Some(handle) = scan_protected_prefix(record) {
+        return Some(handle);
+    }
+    let GraphRecord::Node {
+        stdout_handle,
+        stderr_handle,
+        result_handle,
+        arguments_handle,
+        body_handle,
+        diff_hunk_handle,
+        patch_handle,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    if let Some(output) = stdout_handle
+        .as_ref()
+        .or(stderr_handle.as_ref())
+        .or(result_handle.as_ref())
+        .or(arguments_handle.as_ref())
+        .or(body_handle.as_ref())
+        .or(diff_hunk_handle.as_ref())
+    {
+        return Some(output.hash.clone());
+    }
+    patch_handle
+        .as_ref()
+        .map(|patch| format!("patch:{}", patch.path))
+}
+
+/// Returns an explicit `protected:v1:<hex>` handle found anywhere in the record.
+fn scan_protected_prefix(record: &GraphRecord) -> Option<String> {
     let json = serde_json::to_string(record).ok()?;
     let prefix = crate::protected::PROTECTED_HANDLE_PREFIX;
     let start = json.find(prefix)?;
@@ -343,6 +393,16 @@ fn classify_code_handle(
     span: Option<&SourceSpan>,
     drift_target: bool,
 ) -> Classified {
+    let documented = |reason: AbsentHandleRule| Classified {
+        row: RowClassification {
+            record_id: record_id.to_owned(),
+            trust_class: "source_fact",
+            status: CitationStatus::AbsentHandleDocumented,
+            primary_handle: path.map(str::to_owned),
+            absent_handle_reason: Some(reason),
+        },
+        diagnostic: None,
+    };
     match (path, span) {
         (Some(p), Some(s)) => Classified {
             row: RowClassification {
@@ -354,36 +414,10 @@ fn classify_code_handle(
             },
             diagnostic: None,
         },
-        (Some(p), None) if drift_target => Classified {
-            row: RowClassification {
-                record_id: record_id.to_owned(),
-                trust_class: "source_fact",
-                status: CitationStatus::AbsentHandleDocumented,
-                primary_handle: Some(p.to_owned()),
-                absent_handle_reason: Some(AbsentHandleRule::NoSpanDriftTargetUnresolved),
-            },
-            diagnostic: None,
-        },
-        (Some(p), None) if is_spanless_code_kind(kind) => Classified {
-            row: RowClassification {
-                record_id: record_id.to_owned(),
-                trust_class: "source_fact",
-                status: CitationStatus::AbsentHandleDocumented,
-                primary_handle: Some(p.to_owned()),
-                absent_handle_reason: Some(AbsentHandleRule::NoSpanModuleLevel),
-            },
-            diagnostic: None,
-        },
-        (path, _) if drift_target => Classified {
-            row: RowClassification {
-                record_id: record_id.to_owned(),
-                trust_class: "source_fact",
-                status: CitationStatus::AbsentHandleDocumented,
-                primary_handle: path.map(str::to_owned),
-                absent_handle_reason: Some(AbsentHandleRule::NoSpanDriftTargetUnresolved),
-            },
-            diagnostic: None,
-        },
+        // A drift target that did not resolve to a span, or a span-less code
+        // kind (Commit/Module/…), is documented-absent — with or without a path.
+        (_, None) if drift_target => documented(AbsentHandleRule::NoSpanDriftTargetUnresolved),
+        (_, None) if is_spanless_code_kind(kind) => documented(AbsentHandleRule::NoSpanModuleLevel),
         _ => Classified {
             row: RowClassification {
                 record_id: record_id.to_owned(),
@@ -436,12 +470,47 @@ fn project_handle(record: &GraphRecord) -> Option<String> {
     else {
         return None;
     };
-    entity_id
-        .clone()
-        .or_else(|| parent_task_id.clone())
-        .or_else(|| source_external_link_id.clone())
-        .or_else(|| system_native_id.clone())
-        .or_else(|| url.clone())
+    [
+        entity_id,
+        parent_task_id,
+        source_external_link_id,
+        system_native_id,
+        url,
+    ]
+    .into_iter()
+    .flatten()
+    .find(|h| !h.is_empty())
+    .cloned()
+}
+
+/// Returns the first source/provenance handle an artifact-class record carries.
+///
+/// Protected/withheld artifacts are excluded before this is reached; a surviving
+/// artifact must still name its provenance (source path/hash, patch-byte hash, or
+/// a file-edit before/after hash) rather than being credited by its own ID.
+fn artifact_handle(record: &GraphRecord) -> Option<String> {
+    let GraphRecord::Node {
+        source_artifact_path,
+        source_artifact_hash,
+        patch_bytes_hash,
+        before_hash,
+        after_hash,
+        ..
+    } = record
+    else {
+        return None;
+    };
+    [
+        source_artifact_path,
+        source_artifact_hash,
+        patch_bytes_hash,
+        before_hash,
+        after_hash,
+    ]
+    .into_iter()
+    .flatten()
+    .find(|h| !h.is_empty())
+    .cloned()
 }
 
 /// Returns the first policy-audit handle a user-context record carries.
@@ -449,19 +518,22 @@ fn user_context_handle(record: &GraphRecord) -> Option<String> {
     let GraphRecord::Node { user_context, .. } = record else {
         return None;
     };
-    if let Some(decision) = &user_context.approval_decision_id {
-        return Some(decision.clone());
-    }
-    if let Some(mat) = &user_context.materialized_record_id {
-        return Some(mat.clone());
-    }
-    if let Some(candidate) = &user_context.candidate_id {
-        return Some(candidate.clone());
-    }
-    user_context
-        .supporting_evidence
-        .as_ref()
-        .and_then(|links| links.iter().find_map(|l| l.target_record_id.clone()))
+    [
+        &user_context.approval_decision_id,
+        &user_context.materialized_record_id,
+        &user_context.candidate_id,
+    ]
+    .into_iter()
+    .flatten()
+    .find(|h| !h.is_empty())
+    .cloned()
+    .or_else(|| {
+        user_context.supporting_evidence.as_ref().and_then(|links| {
+            links
+                .iter()
+                .find_map(|l| l.target_record_id.clone().filter(|t| !t.is_empty()))
+        })
+    })
 }
 
 /// Classifies any record by its own trust class, routing code facts to the
@@ -500,8 +572,9 @@ fn classify_record(record: &GraphRecord) -> Classified {
         "agent_authored" => cited_or_missing(&id, trust, agent_external_handle(record)),
         "project_state" => cited_or_missing(&id, trust, project_handle(record)),
         "user_context" => cited_or_missing(&id, trust, user_context_handle(record)),
-        // Verification, artifact, and provenance ("other") records are
-        // inherently citable by their own stable evidence handle.
+        "artifact" => cited_or_missing(&id, trust, artifact_handle(record)),
+        // Verification and provenance ("other") records are inherently citable
+        // by their own stable evidence handle.
         _ => cited(&id, trust, id.clone()),
     }
 }
@@ -723,6 +796,13 @@ fn tombstoned_ids(records: &[GraphRecord]) -> BTreeSet<&str> {
         .collect()
 }
 
+/// A node is current-or-historical when it is not tombstoned, or it carries a
+/// temporal anchor (a scan-history version that `eg query symbol`/`file` still
+/// returns even after the symbol was later deleted).
+fn node_visible(id: &str, temporal_present: bool, tombstoned: &BTreeSet<&str>) -> bool {
+    temporal_present || !tombstoned.contains(id)
+}
+
 fn symbol_names(records: &[GraphRecord]) -> BTreeSet<&str> {
     let tombstoned = tombstoned_ids(records);
     records
@@ -732,8 +812,9 @@ fn symbol_names(records: &[GraphRecord]) -> BTreeSet<&str> {
                 id,
                 kind,
                 name: Some(name),
+                temporal,
                 ..
-            } if kind.as_str() == "Symbol" && !tombstoned.contains(id.as_str()) => {
+            } if kind.as_str() == "Symbol" && node_visible(id, temporal.is_some(), &tombstoned) => {
                 Some(name.as_str())
             }
             _ => None,
@@ -776,6 +857,46 @@ fn task_ids(records: &[GraphRecord]) -> BTreeSet<String> {
         .collect()
 }
 
+/// Source/provenance handles `eg query failures` accepts beyond code/task IDs:
+/// a failure or verification record's `source_handle`, source-artifact path/hash,
+/// or `session_id`.
+fn failure_source_handles(records: &[GraphRecord]) -> BTreeSet<String> {
+    let mut handles = BTreeSet::new();
+    for record in records {
+        let GraphRecord::Node {
+            kind,
+            source_handle,
+            source_artifact_path,
+            source_artifact_hash,
+            session_id,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if !matches!(
+            kind.as_str(),
+            "Failure" | "Verification" | "CommandRun" | "CommandEvidence" | "TestRun" | "CIStatus"
+        ) {
+            continue;
+        }
+        for handle in [
+            source_handle,
+            source_artifact_path,
+            source_artifact_hash,
+            session_id,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !handle.is_empty() {
+                handles.insert(handle.clone());
+            }
+        }
+    }
+    handles
+}
+
 fn memory_claim_ids(records: &[GraphRecord]) -> BTreeSet<String> {
     let tombstoned = tombstoned_ids(records);
     records
@@ -800,10 +921,13 @@ fn drive_symbol(records: &[GraphRecord]) -> WorkflowBuilder {
     let mut builder = WorkflowBuilder::new("symbol", "source_fact");
     let tombstoned = tombstoned_ids(records);
     for record in records {
-        let GraphRecord::Node { id, kind, .. } = record else {
+        let GraphRecord::Node {
+            id, kind, temporal, ..
+        } = record
+        else {
             continue;
         };
-        if kind.as_str() == "Symbol" && !tombstoned.contains(id.as_str()) {
+        if kind.as_str() == "Symbol" && node_visible(id, temporal.is_some(), &tombstoned) {
             builder.push_record(record);
             builder.note_redaction(record);
         }
@@ -820,6 +944,7 @@ fn drive_file(records: &[GraphRecord]) -> WorkflowBuilder {
             id,
             kind,
             repo_relative_path: Some(path),
+            temporal,
             ..
         } = record
         else {
@@ -827,7 +952,7 @@ fn drive_file(records: &[GraphRecord]) -> WorkflowBuilder {
         };
         if kind.as_str() == "Symbol"
             && paths.contains(path.as_str())
-            && !tombstoned.contains(id.as_str())
+            && node_visible(id, temporal.is_some(), &tombstoned)
         {
             builder.push_record(record);
         }
@@ -1042,6 +1167,10 @@ fn drive_failures(records: &[GraphRecord], repo_index: &RepositoryIndex) -> Work
     handles.extend(symbol_names(records).into_iter().map(str::to_owned));
     handles.extend(file_paths(records).into_iter().map(str::to_owned));
     handles.extend(task_ids(records));
+    // `eg query failures` also resolves source/provenance handles (a failure's
+    // source handle, source-artifact path/hash, or session ID), so seed those too
+    // — otherwise failures reachable only through them go unmeasured.
+    handles.extend(failure_source_handles(records));
     for handle in handles {
         for target in resolve_anchors(&mut builder, records, &handle, repo_index) {
             let ctx = failure_history_context(records, &target);
@@ -1125,24 +1254,37 @@ fn drive_candidates(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-/// `eg query changes` — commit-range context. The range is derived from the
-/// earliest/latest `Commit` SHAs in the record set; without at least two
+/// `eg query changes` — commit-range context. The range endpoints are taken in
+/// **commit topology / temporal order** (earliest-authored = base, latest = head)
+/// rather than lexicographic SHA order, so a child whose SHA sorts before its
+/// parent is not mistaken for a reversed (disabled) range. Without at least two
 /// distinct commits the workflow is reported disabled rather than skipped.
 fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder {
-    let mut shas: Vec<&str> = records
-        .iter()
-        .filter_map(|r| match r {
-            GraphRecord::Node {
-                kind,
-                name: Some(sha),
-                ..
-            } if kind.as_str() == "Commit" => Some(sha.as_str()),
-            _ => None,
-        })
-        .collect();
-    shas.sort_unstable();
-    shas.dedup();
-    let (Some(base), Some(head)) = (shas.first(), shas.last()) else {
+    // Order by (author/valid time, sha) so the endpoints follow history, not SHA
+    // string order; a `BTreeSet` keeps it deterministic and de-duplicated.
+    let mut ordered: BTreeSet<(String, &str)> = BTreeSet::new();
+    for record in records {
+        if let GraphRecord::Node {
+            kind,
+            name: Some(sha),
+            temporal,
+            ..
+        } = record
+            && kind.as_str() == "Commit"
+        {
+            let key = temporal.as_ref().map_or_else(
+                || sha.clone(),
+                |t| {
+                    t.author_time
+                        .clone()
+                        .unwrap_or_else(|| t.valid_time.clone())
+                },
+            );
+            ordered.insert((key, sha.as_str()));
+        }
+    }
+    let (Some((_, base)), Some((_, head))) = (ordered.iter().next(), ordered.iter().next_back())
+    else {
         return WorkflowBuilder::disabled("changes", "source_fact", "requires_commit_range");
     };
     if base == head {
@@ -1164,6 +1306,23 @@ fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder {
     }
     for item in &ctx.commits {
         builder.push_record(item.record);
+    }
+    // Deletion tombstones are real `eg query changes` rows; cite each by the
+    // stable ID of the code fact it deleted so the deletion result is measured.
+    for item in &ctx.tombstones {
+        builder.push_classified(
+            Classified {
+                row: RowClassification {
+                    record_id: item.record.id().to_owned(),
+                    trust_class: "source_fact",
+                    status: CitationStatus::Cited,
+                    primary_handle: Some(item.deleted_id.to_owned()),
+                    absent_handle_reason: None,
+                },
+                diagnostic: None,
+            },
+            String::new(),
+        );
     }
     for item in &ctx.drift_records {
         if let Some((classified, tk)) = classify_drift_row(records, item.record) {
@@ -1200,21 +1359,28 @@ fn drive_evidence_freshness(records: &[GraphRecord]) -> WorkflowBuilder {
             builder.push_record(observation);
             builder.note_redaction(observation);
         }
-        match entry.cited_handle.target_record_id.as_deref() {
-            Some(target_id) => {
-                let classified = classify_code_handle(
-                    target_id,
-                    "Symbol",
-                    entry.cited_handle.repo_relative_path.as_deref(),
-                    entry.cited_handle.span.as_ref(),
-                    false,
-                );
+        let path = entry.cited_handle.repo_relative_path.as_deref();
+        let span = entry.cited_handle.span.as_ref();
+        match (entry.cited_handle.target_record_id.as_deref(), path) {
+            // A record-ID citation, or a triple-only citation that resolved to a
+            // repo-relative path/span, is a real public freshness row: classify it
+            // by its code handle rather than dropping it as unresolved.
+            (Some(target_id), _) => {
+                let classified = classify_code_handle(target_id, "Symbol", path, span, false);
                 builder.push_classified(classified, String::new());
             }
-            None => builder.add_diagnostic(
+            (None, Some(resolved_path)) => {
+                let id = span.map_or_else(
+                    || resolved_path.to_owned(),
+                    |s| format!("{resolved_path}:{}-{}", s.start_line, s.end_line),
+                );
+                let classified = classify_code_handle(&id, "Symbol", path, span, false);
+                builder.push_classified(classified, String::new());
+            }
+            (None, None) => builder.add_diagnostic(
                 "unresolved_evidence_link".to_owned(),
                 Some(entry.observation_id.clone()),
-                entry.cited_handle.repo_relative_path.clone(),
+                None,
                 None,
             ),
         }
@@ -1255,6 +1421,7 @@ const NON_CODE_GATED: &[&str] = &[
 #[must_use]
 pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> CitationAuditReport {
     let repo_index = RepositoryIndex::build(records);
+    let freshness_records = config.freshness_records.as_deref().unwrap_or(records);
 
     let builders = vec![
         drive_candidates(records),
@@ -1262,7 +1429,7 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         drive_changes(records),
         drive_context(records),
         drive_drift(records),
-        drive_evidence_freshness(records),
+        drive_evidence_freshness(freshness_records),
         drive_failures(records, &repo_index),
         drive_file(records),
         drive_memory(records),
