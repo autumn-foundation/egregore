@@ -1062,3 +1062,228 @@ fn test_triple_only_citation_out_of_range_commit_is_filtered() {
         "out-of-range triple citation must be filtered"
     );
 }
+
+/// A `Symbol` snapshot carrying an explicit body, used to drive the symbol-level
+/// change gate: the `summary` stands in for the normalized source body that the
+/// real scanner emits.
+fn symbol_node_body(name: &str, path: &str, commit: &str, body: &str) -> GraphRecord {
+    let id = stable_id(&["node", "symbol", "repo_test", path, name]);
+    GraphRecord::node(
+        id,
+        NodeKind::Symbol,
+        Some(path.to_owned()),
+        None,
+        Some(name.to_owned()),
+        body.to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: commit.to_owned(),
+        git_parent_commits: Vec::new(),
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: Some("git_commit_committer_date".to_owned()),
+    })
+}
+
+/// A `CHANGED_IN` edge whose source is a `Symbol` stable ID, mirroring the
+/// per-symbol edges `scan-history` writes for every symbol in a touched file.
+fn symbol_changed_in_edge(name: &str, path: &str, commit: &str) -> GraphRecord {
+    let src = stable_id(&["node", "symbol", "repo_test", path, name]);
+    let tgt = stable_id(&["node", "commit", "repo_test", commit]);
+    GraphRecord::edge(
+        EdgeLabel::ChangedIn,
+        src,
+        tgt,
+        None,
+        format!("symbol {name} changed in {commit}"),
+    )
+}
+
+/// `scan-history` adds a `CHANGED_IN` edge for every `Symbol` snapshot in a
+/// touched file, not only the symbol whose body the commit edited. A symbol whose
+/// body is identical to its parent-commit snapshot must be excluded from
+/// `changed_symbols`, so agents are not sent to inspect unchanged code.
+#[test]
+fn test_unchanged_symbol_in_touched_file_excluded() {
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+
+    // Both symbols live in the touched file and carry a CHANGED_IN edge at bbbb,
+    // but only `edited` actually changed body between aaaa and bbbb.
+    let edited_base = symbol_node_body("edited", "src/lib.rs", "aaaaaaaa", "fn edited() { 1 }");
+    let edited_head = symbol_node_body("edited", "src/lib.rs", "bbbbbbbb", "fn edited() { 2 }");
+    let kept_base = symbol_node_body("untouched", "src/lib.rs", "aaaaaaaa", "fn untouched() {}");
+    let kept_head = symbol_node_body("untouched", "src/lib.rs", "bbbbbbbb", "fn untouched() {}");
+    let edited_changed = symbol_changed_in_edge("edited", "src/lib.rs", "bbbbbbbb");
+    let kept_changed = symbol_changed_in_edge("untouched", "src/lib.rs", "bbbbbbbb");
+
+    let records = vec![
+        c1,
+        c2,
+        e1,
+        edited_base,
+        edited_head,
+        kept_base,
+        kept_head,
+        edited_changed,
+        kept_changed,
+    ];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+
+    let names: Vec<&str> = ctx.changed_symbols.iter().map(|s| s.name).collect();
+    assert_eq!(
+        names,
+        vec!["edited"],
+        "only the symbol whose body changed should be reported"
+    );
+}
+
+/// A newly introduced symbol (no parent snapshot of the same id) is a real change
+/// and must be reported even though the gate cannot compare it to a parent.
+#[test]
+fn test_new_symbol_in_touched_file_reported() {
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+
+    let added_head = symbol_node_body("added", "src/lib.rs", "bbbbbbbb", "fn added() {}");
+    let added_changed = symbol_changed_in_edge("added", "src/lib.rs", "bbbbbbbb");
+
+    let records = vec![c1, c2, e1, added_head, added_changed];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+
+    let names: Vec<&str> = ctx.changed_symbols.iter().map(|s| s.name).collect();
+    assert_eq!(
+        names,
+        vec!["added"],
+        "a symbol with no parent snapshot is a real change"
+    );
+}
+
+/// When the only explanation targets the per-commit `Change` node, the matching
+/// `File` fact for the same `(path, commit)` must not be reported as unexplained:
+/// the output BFS already surfaces the observation via the seeded `Change`, so
+/// reporting the file as unexplained would contradict the emitted evidence.
+#[test]
+fn test_change_evidence_marks_file_explained() {
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+    let f1 = file_node("src/lib.rs", "bbbbbbbb");
+    let f1_id = f1.id().to_owned();
+    let changed = changed_in_edge("src/lib.rs", "bbbbbbbb");
+
+    let change_id = "node:change:repo_test:bbbbbbbb:M:src/lib.rs";
+    let change = GraphRecord::node(
+        change_id.to_owned(),
+        NodeKind::Change,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("M src/lib.rs".to_owned()),
+        "Git change M to src/lib.rs".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "bbbbbbbb".to_owned(),
+        git_parent_commits: Vec::new(),
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
+    });
+
+    let obs_id = agent_memory_stable_id(&["obs", "explains_change_unexplained"]);
+    let mut obs = GraphRecord::node(
+        obs_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Explains the change".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ..
+    } = obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+    }
+    let explains = GraphRecord::edge(
+        EdgeLabel::ExplainsChange,
+        obs_id.clone(),
+        change_id.to_owned(),
+        None,
+        "explains".to_owned(),
+    );
+
+    let records = vec![c1, c2, e1, f1, changed, change, obs, explains];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+
+    let unexplained: std::collections::BTreeSet<&str> =
+        ctx.unexplained.iter().map(|u| u.record_id).collect();
+    assert!(
+        !unexplained.contains(f1_id.as_str()),
+        "file explained via its Change node must not be listed as unexplained"
+    );
+
+    let obs_ids: std::collections::BTreeSet<&str> =
+        ctx.observations.iter().map(|o| o.record_id).collect();
+    assert!(
+        obs_ids.contains(obs_id.as_str()),
+        "the explaining observation must still be surfaced"
+    );
+}
+
+/// Changed-fact items must serialize bounded identity/path/commit metadata, never
+/// the raw `GraphRecord` whose `summary` embeds normalized source bodies.
+#[test]
+fn test_changed_facts_serialize_bounded_metadata() {
+    let c1 = commit("aaaaaaaa", &[]);
+    let c2 = commit("bbbbbbbb", &["aaaaaaaa"]);
+    let e1 = parent_edge("aaaaaaaa", "bbbbbbbb");
+
+    // File and symbol summaries carry a sentinel "source body" that must not leak.
+    let mut f1 = file_node("src/lib.rs", "bbbbbbbb");
+    if let GraphRecord::Node {
+        ref mut summary, ..
+    } = f1
+    {
+        *summary = "Source: SENTINEL_FILE_BODY".to_owned();
+    }
+    let f1_id = f1.id().to_owned();
+    let file_changed = changed_in_edge("src/lib.rs", "bbbbbbbb");
+
+    let sym = symbol_node_body(
+        "added",
+        "src/lib.rs",
+        "bbbbbbbb",
+        "Source: SENTINEL_SYMBOL_BODY",
+    );
+    let sym_id = sym.id().to_owned();
+    let sym_changed = symbol_changed_in_edge("added", "src/lib.rs", "bbbbbbbb");
+
+    let records = vec![c1, c2, e1, f1, file_changed, sym, sym_changed];
+    let ctx = changes_context(&records, "aaaa", "bbbb", None).unwrap();
+
+    let json = serde_json::to_string(&ctx).expect("changes context serializes");
+    assert!(
+        !json.contains("SENTINEL_FILE_BODY") && !json.contains("SENTINEL_SYMBOL_BODY"),
+        "raw source bodies must not appear in the serialized output: {json}"
+    );
+
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let file = &value["changed_files"][0];
+    assert_eq!(file["record_id"], serde_json::json!(f1_id));
+    assert_eq!(file["path"], serde_json::json!("src/lib.rs"));
+    assert_eq!(file["git_commit"], serde_json::json!("bbbbbbbb"));
+    assert!(
+        file.get("record").is_none(),
+        "the raw record must not be serialized"
+    );
+
+    let symbol = &value["changed_symbols"][0];
+    assert_eq!(symbol["record_id"], serde_json::json!(sym_id));
+    assert_eq!(symbol["name"], serde_json::json!("added"));
+    assert_eq!(symbol["git_commit"], serde_json::json!("bbbbbbbb"));
+}

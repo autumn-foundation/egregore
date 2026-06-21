@@ -16,7 +16,7 @@ use chrono::DateTime;
 
 use crate::ir::{
     EdgeLabel, EvidenceLink, GraphRecord, NodeKind, OutputHandle, PatchHandle,
-    SemanticDriftMetadata, TemporalMetadata, UserContextScope,
+    SemanticDriftMetadata, SourceSpan, TemporalMetadata, UserContextScope,
 };
 use crate::redaction::redact_value;
 /// Finds a symbol record by name at a specific Git commit.
@@ -6172,25 +6172,46 @@ pub fn memory_audit_context<'a>(
 }
 
 /// Represents a changed file in a commit range.
+///
+/// Serialization is deliberately bounded to identity/path/span/commit metadata.
+/// The backing `GraphRecord` is retained for in-process traversal only and is
+/// never emitted, because `File`/`Symbol` summaries from `scan-history` embed
+/// normalized source bodies; dumping them would leak whole file/symbol snippets
+/// into the response instead of the leads the section promises.
 #[derive(Debug, Clone, serde::Serialize, Eq, PartialEq)]
 pub struct ChangesFileItem<'a> {
-    /// The graph record for the file or change.
+    /// The graph record for the file or change (traversal only; not serialized).
+    #[serde(skip)]
     pub record: &'a GraphRecord,
+    /// Stable record ID of the changed file fact.
+    pub record_id: &'a str,
     /// The repository-relative path of the file.
     pub path: &'a str,
+    /// Source span of the file fact, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<SourceSpan>,
     /// The Git commit SHA containing this change.
     pub git_commit: &'a str,
 }
 
 /// Represents a changed symbol in a commit range.
+///
+/// Like [`ChangesFileItem`], the raw record is held for traversal but excluded
+/// from serialization to keep source bodies out of the response.
 #[derive(Debug, Clone, serde::Serialize, Eq, PartialEq)]
 pub struct ChangesSymbolItem<'a> {
-    /// The graph record for the symbol.
+    /// The graph record for the symbol (traversal only; not serialized).
+    #[serde(skip)]
     pub record: &'a GraphRecord,
+    /// Stable record ID of the changed symbol fact.
+    pub record_id: &'a str,
     /// The name of the symbol.
     pub name: &'a str,
     /// The repository-relative path of the symbol definition.
     pub path: &'a str,
+    /// Source span of the symbol definition, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<SourceSpan>,
     /// The Git commit SHA containing this change.
     pub git_commit: &'a str,
 }
@@ -6227,14 +6248,22 @@ pub struct ChangesDriftItem<'a> {
 }
 
 /// Represents a changed code fact that lacks explaining cross-domain evidence.
+///
+/// Bounded by design: identity, kind, path, and commit only. The node `summary`
+/// is deliberately omitted because `File`/`Symbol` summaries from `scan-history`
+/// embed normalized source bodies, which must not leak into the response.
 #[derive(Debug, Clone, serde::Serialize, Eq, PartialEq)]
 pub struct UnexplainedChange<'a> {
     /// The stable ID of the unexplained node.
     pub record_id: &'a str,
     /// The node kind (e.g. "Symbol", "File").
     pub kind: &'a str,
-    /// The agent-facing summary text.
-    pub summary: &'a str,
+    /// The repository-relative path of the unexplained code fact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<&'a str>,
+    /// The Git commit SHA the unexplained snapshot belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_commit: Option<&'a str>,
 }
 
 /// One item in the `observations` section of a query response.
@@ -6954,6 +6983,49 @@ pub fn changes_context<'a>(
         }
     };
 
+    // Symbol-level change gate. `scan-history` adds a `CHANGED_IN` edge for every
+    // `Symbol` snapshot in a touched file, not only the symbol whose body the
+    // commit actually edited (see `src/history.rs`). Reporting all of them would
+    // send agents to inspect unchanged code, contradicting the section contract.
+    // We index each symbol snapshot's body (its summary, which the scanner builds
+    // deterministically from source bytes with no commit-specific content) by
+    // `(stable id, commit)` and treat a snapshot as a real change only when it
+    // differs from — or has no — parent-commit snapshot of the same symbol id.
+    // The check is conservative: when the parent topology or parent snapshot is
+    // unavailable we cannot prove the body is unchanged, so we keep the row.
+    let mut symbol_snapshot_bodies: BTreeMap<(&str, &str), &str> = BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Symbol,
+            temporal: Some(t),
+            summary,
+            ..
+        } = r
+        {
+            symbol_snapshot_bodies.insert((r.id(), t.git_commit.as_str()), summary.as_str());
+        }
+    }
+    let symbol_body_changed = |id: &str, commit: &str, summary: &str| -> bool {
+        let Some(parents) = parent_map.get(commit) else {
+            return true;
+        };
+        if parents.is_empty() {
+            return true;
+        }
+        let mut saw_parent_snapshot = false;
+        for parent in parents {
+            if let Some(parent_body) = symbol_snapshot_bodies.get(&(id, *parent)) {
+                saw_parent_snapshot = true;
+                if *parent_body != summary {
+                    return true;
+                }
+            }
+        }
+        // Every parent snapshot we could find matched this body: unchanged. If we
+        // found none, we cannot prove it unchanged, so report it.
+        !saw_parent_snapshot
+    };
+
     let mut changed_files = Vec::new();
     let mut changed_symbols = Vec::new();
     let mut commits = Vec::new();
@@ -6979,12 +7051,15 @@ pub fn changes_context<'a>(
             GraphRecord::Node {
                 kind: NodeKind::File,
                 repo_relative_path: Some(path),
+                span,
                 temporal: Some(t),
                 ..
             } if is_changed_node(r, t) && in_scope(r.id()) => {
                 changed_files.push(ChangesFileItem {
                     record: r,
+                    record_id: r.id(),
                     path,
+                    span: *span,
                     git_commit: &t.git_commit,
                 });
                 added_file_commits.insert((path.as_str(), t.git_commit.as_str()));
@@ -6994,13 +7069,20 @@ pub fn changes_context<'a>(
                 kind: NodeKind::Symbol,
                 name: Some(sym_name),
                 repo_relative_path: Some(path),
+                span,
                 temporal: Some(t),
+                summary,
                 ..
-            } if is_changed_node(r, t) && in_scope(r.id()) => {
+            } if is_changed_node(r, t)
+                && in_scope(r.id())
+                && symbol_body_changed(r.id(), t.git_commit.as_str(), summary) =>
+            {
                 changed_symbols.push(ChangesSymbolItem {
                     record: r,
+                    record_id: r.id(),
                     name: sym_name,
                     path,
+                    span: *span,
                     git_commit: &t.git_commit,
                 });
             }
@@ -7032,20 +7114,31 @@ pub fn changes_context<'a>(
     // the `Change`/`Commit`, so an observation explaining a normal Rust
     // modification (which also has a File snapshot) must still be discovered.
     let mut change_seed_ids = BTreeSet::new();
+    // `(path, commit)` → `Change` record id, so the `unexplained` check can carry
+    // evidence that targets the per-commit `Change` (which the output BFS already
+    // surfaces because the change is seeded) through to the `File`/`Symbol` fact
+    // for the same `(path, commit)`. Without this a normal Rust modification whose
+    // explaining observation cites the de-duped `Change` would appear with its
+    // evidence and still be listed as unexplained.
+    let mut change_id_by_path_commit: BTreeMap<(&str, &str), &str> = BTreeMap::new();
     for r in records {
         if let GraphRecord::Node {
             kind: NodeKind::Change,
             repo_relative_path: Some(path),
+            span,
             temporal: Some(t),
             ..
         } = r
         {
             if range_commit_shas.contains(t.git_commit.as_str()) && in_scope(r.id()) {
                 change_seed_ids.insert(r.id());
+                change_id_by_path_commit.insert((path.as_str(), t.git_commit.as_str()), r.id());
                 if added_file_commits.insert((path.as_str(), t.git_commit.as_str())) {
                     changed_files.push(ChangesFileItem {
                         record: r,
+                        record_id: r.id(),
                         path,
+                        span: *span,
                         git_commit: &t.git_commit,
                     });
                     changed_paths.insert(path.as_str());
@@ -7450,27 +7543,68 @@ pub fn changes_context<'a>(
         }
     }
 
-    let mut unexplained = Vec::new();
-    for seed_id in &seed_ids {
-        if !is_linked_to_evidence(
-            seed_id,
+    // `commit sha` → `Commit` record id: the second proxy through which an
+    // explanation can reach a code fact. An `EXPLAINS_CHANGE` link may target the
+    // seeded `Commit` rather than the per-path `Change`.
+    let commit_id_by_sha: BTreeMap<&str, &str> =
+        commits.iter().map(|c| (c.commit, c.record.id())).collect();
+
+    let linked = |id: &'a str| -> bool {
+        is_linked_to_evidence(
+            id,
             &by_id,
             &edges_from,
             &edges_to,
             &evidence_links_to,
             &tombstoned_ids,
             &has_any_temporal_version,
-        ) {
-            if let Some(GraphRecord::Node { kind, summary, .. }) = by_id.get(seed_id) {
-                if matches!(kind, NodeKind::File | NodeKind::Symbol) {
-                    unexplained.push(UnexplainedChange {
-                        record_id: seed_id,
-                        kind: kind.as_str(),
-                        summary,
-                    });
-                }
-            }
+        )
+    };
+
+    let mut unexplained = Vec::new();
+    for seed_id in &seed_ids {
+        if linked(seed_id) {
+            continue;
         }
+        let Some(GraphRecord::Node {
+            kind,
+            repo_relative_path,
+            temporal,
+            ..
+        }) = by_id.get(seed_id)
+        else {
+            continue;
+        };
+        if !matches!(kind, NodeKind::File | NodeKind::Symbol) {
+            continue;
+        }
+        // The output BFS seeds the per-commit `Change` and `Commit` for this
+        // `(path, commit)`, so an observation that explains the change via either
+        // is already emitted. Mirror that here: a code fact whose `Change` or
+        // `Commit` proxy carries the evidence is explained, even when no
+        // cross-domain edge touches the `File`/`Symbol` node directly. Without
+        // this, a normal modification would appear with its explanation and still
+        // be reported unexplained.
+        let explained_via_proxy = temporal.as_ref().is_some_and(|t| {
+            let commit = t.git_commit.as_str();
+            let change_proxy = repo_relative_path
+                .as_deref()
+                .and_then(|p| change_id_by_path_commit.get(&(p, commit)).copied());
+            let commit_proxy = commit_id_by_sha.get(commit).copied();
+            change_proxy
+                .into_iter()
+                .chain(commit_proxy)
+                .any(&linked)
+        });
+        if explained_via_proxy {
+            continue;
+        }
+        unexplained.push(UnexplainedChange {
+            record_id: seed_id,
+            kind: kind.as_str(),
+            path: repo_relative_path.as_deref(),
+            git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+        });
     }
 
     changed_files.sort_by(|a, b| {
