@@ -1334,3 +1334,122 @@ fn test_tombstoned_changed_in_edge_excludes_fact() {
         "a fact whose only CHANGED_IN edge is tombstoned must not be reported"
     );
 }
+
+/// Under a `--repo` scope, a sibling repository can carry the same path and the
+/// same commit SHA. A triple-only citation (path/commit, no resolved target id)
+/// authored by a record owned by the sibling repo must not be surfaced as
+/// unresolved context for the selected repo's change.
+#[test]
+fn test_triple_only_citation_scoped_to_repository() {
+    fn repo_node(id: &str) -> GraphRecord {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(id.to_owned()),
+            format!("Repo {id}"),
+        )
+    }
+    fn scoped_commit(repo: &str, sha: &str, parents: &[&str]) -> GraphRecord {
+        GraphRecord::node(
+            format!("node:commit:{repo}:{sha}"),
+            NodeKind::Commit,
+            None,
+            None,
+            Some(sha.to_owned()),
+            format!("Commit {sha}"),
+        )
+        .with_temporal(TemporalMetadata {
+            git_commit: sha.to_owned(),
+            git_parent_commits: parents.iter().map(|s| (*s).to_owned()).collect(),
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        })
+    }
+    fn scoped_file(repo: &str, path: &str, sha: &str) -> GraphRecord {
+        GraphRecord::node(
+            format!("node:file:{repo}:{path}"),
+            NodeKind::File,
+            Some(path.to_owned()),
+            None,
+            Some(path.to_owned()),
+            format!("File {path}"),
+        )
+        .with_temporal(TemporalMetadata {
+            git_commit: sha.to_owned(),
+            git_parent_commits: Vec::new(),
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        })
+    }
+    fn contains(repo: &str, child_id: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo.to_owned(),
+            child_id.to_owned(),
+            None,
+            "contains".to_owned(),
+        )
+    }
+
+    let ra = "node:repository:A";
+    let rb = "node:repository:B";
+    // Both repos carry `src/shared.rs` and share SHAs a0aaaaaa -> a1aaaaaa.
+    let mut sibling_obs = GraphRecord::node(
+        agent_memory_stable_id(&["obs", "sibling_repo_triple"]),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation from sibling repo B".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ref mut evidence_links,
+        ..
+    } = sibling_obs
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *evidence_links = Some(vec![EvidenceLink {
+            target_record_id: None,
+            target_domain: "codegraph".to_owned(),
+            relation: "MENTIONS_FILE".to_owned(),
+            confidence: "1.0".to_owned(),
+            as_of_commit: None,
+            target_repo_relative_path: Some("src/shared.rs".to_owned()),
+            target_span: None,
+            target_git_commit: Some("a1aaaaaa".to_owned()),
+        }]);
+    }
+    let sibling_obs_id = sibling_obs.id().to_owned();
+
+    let records = vec![
+        repo_node(ra),
+        repo_node(rb),
+        scoped_commit("A", "a0aaaaaa", &[]),
+        scoped_commit("A", "a1aaaaaa", &["a0aaaaaa"]),
+        scoped_commit("B", "a0aaaaaa", &[]),
+        scoped_commit("B", "a1aaaaaa", &["a0aaaaaa"]),
+        contains(ra, "node:commit:A:a0aaaaaa"),
+        contains(ra, "node:commit:A:a1aaaaaa"),
+        contains(rb, "node:commit:B:a0aaaaaa"),
+        contains(rb, "node:commit:B:a1aaaaaa"),
+        scoped_file("A", "src/shared.rs", "a1aaaaaa"),
+        contains(ra, "node:file:A:src/shared.rs"),
+        sibling_obs,
+        contains(rb, &sibling_obs_id),
+    ];
+
+    let ctx = changes_context(&records, "a0", "a1", Some(ra)).unwrap();
+    assert!(
+        ctx.unresolved
+            .iter()
+            .all(|u| u.source_record_id != sibling_obs_id),
+        "a triple-only citation owned by a sibling repo must not be surfaced under repo scope"
+    );
+}

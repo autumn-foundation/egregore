@@ -7519,6 +7519,21 @@ pub fn changes_context<'a>(
             {
                 continue;
             }
+            // Under a repository scope, a sibling repo can carry the same path and
+            // the same commit SHA. Surface a triple-only citation only when its
+            // source node is not owned by a different repository, otherwise a
+            // sibling repo's observation would be attached as context for the
+            // selected repo's change purely by path/commit match. Records with no
+            // owning repository (cross-domain agent memory) are still surfaced.
+            let owner_ok = repo_scope.is_none_or(|scope| {
+                repo_index
+                    .as_ref()
+                    .and_then(|index| index.owner_of(id))
+                    .is_none_or(|owner| owner == scope)
+            });
+            if !owner_ok {
+                continue;
+            }
             for link in links {
                 if link.target_record_id.is_some() {
                     continue;
