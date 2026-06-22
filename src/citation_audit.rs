@@ -344,13 +344,21 @@ fn referenced_protected_handle(record: &GraphRecord) -> Option<String> {
     else {
         return None;
     };
-    if let Some(output) = stdout_handle
-        .as_ref()
-        .or(stderr_handle.as_ref())
-        .or(result_handle.as_ref())
-        .or(arguments_handle.as_ref())
-        .or(body_handle.as_ref())
-        .or(diff_hunk_handle.as_ref())
+    // A withheld output payload is protected only when it actually carries bytes;
+    // the public memory/failure diagnostics emit `protected_payload` for these
+    // handles only when `bytes > 0`, so a zero-byte stdout/stderr stays a normal
+    // returned row.
+    if let Some(output) = [
+        stdout_handle,
+        stderr_handle,
+        result_handle,
+        arguments_handle,
+        body_handle,
+        diff_hunk_handle,
+    ]
+    .into_iter()
+    .flatten()
+    .find(|h| h.bytes > 0)
     {
         return Some(output.hash.clone());
     }
@@ -485,10 +493,12 @@ fn agent_external_handle(record: &GraphRecord) -> Option<String> {
     else {
         return None;
     };
+    // Source/artifact handles must point at something other than the claim's own
+    // record ID (AC6: a claim is never its own evidence).
     if let Some(handle) = [source_handle, source_artifact_path, source_artifact_hash]
         .into_iter()
         .flatten()
-        .find(|h| !h.is_empty())
+        .find(|h| !h.is_empty() && h.as_str() != id.as_str())
     {
         return Some(handle.clone());
     }
@@ -544,6 +554,7 @@ fn project_handle(record: &GraphRecord) -> Option<String> {
 /// a file-edit before/after hash) rather than being credited by its own ID.
 fn artifact_handle(record: &GraphRecord) -> Option<String> {
     let GraphRecord::Node {
+        source_handle,
         source_artifact_path,
         source_artifact_hash,
         patch_bytes_hash,
@@ -555,6 +566,7 @@ fn artifact_handle(record: &GraphRecord) -> Option<String> {
         return None;
     };
     [
+        source_handle,
         source_artifact_path,
         source_artifact_hash,
         patch_bytes_hash,
@@ -627,8 +639,10 @@ fn classify_record(record: &GraphRecord) -> Classified {
         "project_state" => cited_or_missing(&id, trust, project_handle(record)),
         "user_context" => cited_or_missing(&id, trust, user_context_handle(record)),
         "artifact" => cited_or_missing(&id, trust, artifact_handle(record)),
-        // Verification and provenance ("other") records are inherently citable
-        // by their own stable evidence handle.
+        // Verification and provenance ("other") records are inherently citable by
+        // their own stable evidence handle — but a record with an empty id carries
+        // no usable handle and must fail the gate.
+        _ if id.is_empty() => missing(&id, trust),
         _ => cited(&id, trust, id.clone()),
     }
 }
@@ -1182,6 +1196,7 @@ fn drive_subsystem(records: &[GraphRecord]) -> WorkflowBuilder {
 
 fn drive_task(records: &[GraphRecord]) -> WorkflowBuilder {
     let mut builder = WorkflowBuilder::new("task", "project_state");
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
     for task_id in task_ids(records) {
         let ctx = task_evidence_context(records, &task_id);
         for record in ctx
@@ -1197,6 +1212,20 @@ fn drive_task(records: &[GraphRecord]) -> WorkflowBuilder {
         {
             builder.push_record(record);
             builder.note_redaction(record);
+        }
+        // `eg query task` enriches a verified AC with a field-linked
+        // `verification_record` (from `verification_link_id`) even when no edge put
+        // it in `verification_evidence`; classify those rows too.
+        for ac in &ctx.acceptance_criteria {
+            if let GraphRecord::Node {
+                verification_link_id: Some(ver_id),
+                ..
+            } = ac
+                && let Some(record) = by_id.get(ver_id.as_str())
+            {
+                builder.push_record(record);
+                builder.note_redaction(record);
+            }
         }
         for unresolved in &ctx.unresolved {
             builder.add_diagnostic(

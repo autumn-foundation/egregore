@@ -4323,8 +4323,15 @@ fn audit_citations_cmd(
     // reads the history-inclusive store view so superseded versions can produce
     // drift/unresolved verdicts. A JSONL graph already carries that history; an
     // embedded store needs the explicit history-inclusive load.
-    let freshness_records =
-        effective_data_dir.and_then(|dir| load_records_from_db_history(dir).ok());
+    // Surface a history-load failure rather than silently auditing current-only
+    // rows (the public `eg query evidence-freshness --data-dir` uses `?`).
+    let freshness_records = effective_data_dir.map(|dir| match load_records_from_db_history(dir) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    });
     let config = crate::citation_audit::AuditConfig {
         min_code_citation,
         semantic,
