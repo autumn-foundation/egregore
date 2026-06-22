@@ -1282,6 +1282,30 @@ enum AuditSubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Measure query-answer token cost against the ripgrep baseline (issue #84).
+    ///
+    /// Reads a pinned corpus manifest, scans the corpus into an in-memory graph,
+    /// and reports, per question class and in aggregate, the baseline-to-Egregore
+    /// token-savings ratio with raw counts. Local-first and offline; the grep
+    /// baseline is computed in-process (no ripgrep dependency, no network).
+    ///
+    /// Exit codes:
+    ///   0 — gate passed (`ok: true`).
+    ///   1 — gate failed (`ok: false`); the full JSON report is still printed.
+    ///   2 — usage/load error (bad manifest path, unparseable corpus, scan error).
+    TokenCost {
+        /// Path to the token-cost corpus manifest JSON.
+        #[arg(long, default_value = "corpus/token_cost_corpus.json")]
+        corpus: PathBuf,
+        /// Minimum baseline-to-Egregore savings ratio each class must meet.
+        ///
+        /// Defaults to the manifest's `min_ratio`. When supplied, overrides it.
+        #[arg(long)]
+        min_ratio: Option<f64>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 /// Subcommands for `protected`.
@@ -4271,7 +4295,121 @@ fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
             min_code_citation,
             format,
         ),
+        AuditSubcommand::TokenCost {
+            corpus,
+            min_ratio,
+            format,
+        } => audit_token_cost_cmd(&corpus, min_ratio, format),
     }
+}
+
+/// Prints a redaction-safe JSON error and exits with the usage/load code (2).
+fn token_cost_exit(code: &str, path: &str, message: &str) -> ! {
+    eprintln!(
+        "{}",
+        serde_json::json!({ "code": code, "path": path, "message": message })
+    );
+    std::process::exit(2);
+}
+
+/// Loads the corpus manifest, applies the `--min-ratio` override, and validates
+/// the pinned token-count method. Exits 2 on any load/usage error.
+fn load_token_cost_corpus(
+    corpus_path: &Path,
+    min_ratio_override: Option<f64>,
+) -> crate::token_cost::TokenCostCorpus {
+    use crate::token_cost::{TOKEN_COUNT_METHOD, TokenCostCorpus};
+
+    if let Some(min_ratio) = min_ratio_override
+        && (!min_ratio.is_finite() || min_ratio <= 0.0)
+    {
+        // A non-positive or non-finite override would silently disable the gate
+        // (ratio >= 0.0 is always true; zero is as useless as a negative value).
+        token_cost_exit(
+            "invalid_min_ratio",
+            &corpus_path.display().to_string(),
+            "--min-ratio must be a finite, positive value",
+        );
+    }
+    let path = corpus_path.display().to_string();
+    let text = std::fs::read_to_string(corpus_path)
+        .unwrap_or_else(|error| token_cost_exit("corpus_read_error", &path, &error.to_string()));
+    let mut corpus: TokenCostCorpus = serde_json::from_str(&text)
+        .unwrap_or_else(|error| token_cost_exit("corpus_parse_error", &path, &error.to_string()));
+
+    // The token-count method is pinned; reject a manifest that asks for another
+    // so the reported ratio is always produced by the documented method (AC3).
+    if corpus.token_count_method != TOKEN_COUNT_METHOD {
+        token_cost_exit(
+            "unsupported_token_count_method",
+            &path,
+            &format!("only '{TOKEN_COUNT_METHOD}' is supported"),
+        );
+    }
+    if let Some(min_ratio) = min_ratio_override {
+        corpus.min_ratio = min_ratio;
+    }
+    corpus
+}
+
+/// Scans the corpus into a deterministic graph and reads its source files for
+/// the grep baseline. Exits 2 on any scan/read error.
+fn load_token_cost_inputs(
+    corpus: &crate::token_cost::TokenCostCorpus,
+    source_dir: &Path,
+) -> (Vec<GraphRecord>, BTreeMap<String, String>) {
+    let dir = source_dir.display().to_string();
+    let graph = crate::scan_repository_at_with_override(
+        source_dir,
+        &corpus.scan_time,
+        Some(&corpus.repository_id_override),
+    )
+    .unwrap_or_else(|error| token_cost_exit("corpus_scan_error", &dir, &error.to_string()));
+    let records = graph.records().to_vec();
+
+    // Read the same source files for the grep-shaped baseline, keyed by their
+    // repo-relative path so the baseline reads exactly what the scan indexed.
+    let mut source_files: BTreeMap<String, String> = BTreeMap::new();
+    let discovered = crate::fs::discover_rust_source_files(source_dir)
+        .unwrap_or_else(|error| token_cost_exit("corpus_discover_error", &dir, &error.to_string()));
+    for source_file in discovered {
+        let content = std::fs::read_to_string(&source_file.path).unwrap_or_else(|error| {
+            token_cost_exit(
+                "corpus_read_error",
+                &source_file.path.display().to_string(),
+                &error.to_string(),
+            )
+        });
+        source_files.insert(source_file.repo_relative_path.clone(), content);
+    }
+    (records, source_files)
+}
+
+fn audit_token_cost_cmd(
+    corpus_path: &Path,
+    min_ratio_override: Option<f64>,
+    format: OutputFormat,
+) -> Result<()> {
+    let corpus = load_token_cost_corpus(corpus_path, min_ratio_override);
+
+    // Resolve the corpus source directory relative to the manifest's parent so
+    // the gate is runnable regardless of the working directory.
+    let manifest_dir = corpus_path.parent().unwrap_or_else(|| Path::new("."));
+    let source_dir = manifest_dir.join(&corpus.source_dir);
+    let corpus_display = source_dir.to_string_lossy().replace('\\', "/");
+
+    let (records, source_files) = load_token_cost_inputs(&corpus, &source_dir);
+    let report =
+        crate::token_cost::run_token_cost_report(&corpus, &source_files, &records, &corpus_display);
+
+    let output = match format {
+        OutputFormat::Json | OutputFormat::Text => serde_json::to_string_pretty(&report)
+            .unwrap_or_else(|error| {
+                token_cost_exit("serialize_error", "", &error.to_string())
+            }),
+    };
+    println!("{output}");
+    std::process::exit(i32::from(!report.ok));
 }
 
 /// Handles `eg audit citations` (issue #65).

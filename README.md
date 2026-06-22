@@ -143,7 +143,26 @@ See [docs/cli/query.md](docs/cli/query.md) for the full JSON output contract, no
 
 ## Why not just use ripgrep?
 
-Structural queries are ~10× cheaper in tokens than grepping because the graph gives you typed edges — CALLS, DEFINES, IMPORTS — with no false positives from comments or string literals. Semantic queries go further: they find code by concept, not by text match, reducing the context you need to send to an agent by 10–15× compared to grep + manual filtering.
+Structural and semantic queries return a typed, citable handle instead of every
+line a text search would make an agent ingest — no false positives from comments
+or string literals, and no bodies to read just to learn what a file defines.
+
+That saving is **measured, not asserted**. On the pinned token-cost corpus
+(`corpus/token_cost_corpus/`), counting answer tokens with one deterministic
+method on both sides, the baseline-to-Egregore ratios are:
+
+| Question | `eg` answer vs. `rg` baseline | Ratio |
+|----------|-------------------------------|-------|
+| Exact symbol lookup | `eg query symbol` vs. `rg -w <name>` | ~4.8× cheaper |
+| File-defines lookup | `eg query file` vs. reading the file | ~3.6× cheaper |
+| Semantic concept query | `eg query semantic` vs. `rg <keyword>` | ~5.2× cheaper |
+| **Aggregate** | | **~4× cheaper** |
+
+Reproduce it with `eg audit token-cost`; the gate fails if any class regresses
+below 3×. The multiplier scales with the corpus — the more comment and
+string-literal false positives a text search drags in, and the larger the file
+bodies a structural answer summarizes, the larger the saving. See
+[docs/cli/token-cost.md](docs/cli/token-cost.md).
 
 ---
 
