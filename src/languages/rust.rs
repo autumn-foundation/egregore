@@ -8,7 +8,9 @@ use crate::{
     error::{CodegraphError, Result},
     fs::SourceFile,
     ir::{EdgeLabel, Graph, GraphRecord, NodeKind, stable_id},
-    languages::common::{contains_identifier, looks_like_call, span},
+    languages::common::{
+        SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, span,
+    },
 };
 
 /// Extracts Rust syntax records from one source file.
@@ -65,13 +67,6 @@ struct ImplContext {
     display: String,
     method_owner: String,
     id: String,
-}
-
-#[derive(Debug, Clone)]
-struct SymbolBody {
-    id: String,
-    name: String,
-    text: String,
 }
 
 struct RustExtractor<'graph, 'source> {
@@ -303,22 +298,16 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         ]);
         let node_text = self.node_text(node);
         let normalized = normalize_code(node_text);
-        let mut record = GraphRecord::symbol(
+        self.graph.push(GraphRecord::syntax_symbol(
             id.clone(),
             symbol_kind,
             self.file.repo_relative_path.clone(),
             span(node),
             qualified_name.to_owned(),
+            "rust",
+            disambiguator,
             format!("Rust {symbol_kind} {qualified_name}\nSource:\n{normalized}"),
-        );
-        if let GraphRecord::Node {
-            disambiguator: node_disambiguator,
-            ..
-        } = &mut record
-        {
-            *node_disambiguator = Some(disambiguator);
-        }
-        self.graph.push(record);
+        ));
         self.add_edge(
             EdgeLabel::Defines,
             self.owner_id(),
@@ -329,11 +318,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     fn next_symbol_disambiguator(&mut self, symbol_kind: &str, qualified_name: &str) -> u64 {
-        let key = (symbol_kind.to_owned(), qualified_name.to_owned());
-        let disambiguator = self.symbol_ordinals.entry(key).or_default();
-        let current = *disambiguator;
-        *disambiguator += 1;
-        current
+        next_symbol_ordinal(&mut self.symbol_ordinals, symbol_kind, qualified_name)
     }
 
     fn next_diagnostic_disambiguator(&mut self, invocation: &str) -> u64 {
@@ -347,51 +332,11 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     fn add_edge(&mut self, label: EdgeLabel, source: String, target: String, summary: String) {
-        self.graph.push(GraphRecord::edge(
-            label,
-            source,
-            target,
-            Some("1.0".to_owned()),
-            summary,
-        ));
+        add_graph_edge(self.graph, label, source, target, summary);
     }
 
     fn emit_reference_edges(&mut self) {
-        let definitions = self.definitions.clone();
-        let bodies = self.symbol_bodies.clone();
-        for body in bodies {
-            for (name, target_id) in &definitions {
-                if body.id == *target_id
-                    || name == &body.name
-                    || !contains_identifier(&body.text, name)
-                {
-                    continue;
-                }
-
-                // A code reference between two symbols. Type it as `Calls` when
-                // it looks like an invocation, otherwise as `References` (type
-                // and value uses, trait bounds, constructors). Both are
-                // deterministic code-topology edges that downstream queries
-                // (change-impact, context) consume; emitting `References` here
-                // makes non-call code references first-class instead of hiding
-                // them in untyped `Mentions` edges.
-                if looks_like_call(&body.text, name) {
-                    self.add_edge(
-                        EdgeLabel::Calls,
-                        body.id.clone(),
-                        target_id.clone(),
-                        format!("{} calls {name}", body.name),
-                    );
-                } else {
-                    self.add_edge(
-                        EdgeLabel::References,
-                        body.id.clone(),
-                        target_id.clone(),
-                        format!("{} references {name}", body.name),
-                    );
-                }
-            }
-        }
+        emit_reference_edges(self.graph, &self.definitions, &self.symbol_bodies);
     }
 
     fn impl_target_id(&self, display: &str) -> Option<String> {

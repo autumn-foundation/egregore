@@ -8,7 +8,9 @@ use crate::{
     error::{CodegraphError, Result},
     fs::SourceFile,
     ir::{EdgeLabel, Graph, GraphRecord, NodeKind, stable_id},
-    languages::common::{contains_identifier, looks_like_call, span},
+    languages::common::{
+        SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, span,
+    },
 };
 
 /// Extracts Python syntax records from one source file.
@@ -71,13 +73,6 @@ struct Scope {
     name: String,
     kind: ScopeKind,
     id: String,
-}
-
-#[derive(Debug, Clone)]
-struct SymbolBody {
-    id: String,
-    name: String,
-    text: String,
 }
 
 struct PythonExtractor<'graph, 'source> {
@@ -272,26 +267,16 @@ impl<'graph, 'source> PythonExtractor<'graph, 'source> {
             &disambiguator.to_string(),
         ]);
         let normalized = normalize_code(self.node_text(node));
-        let mut record = GraphRecord::symbol(
+        self.graph.push(GraphRecord::syntax_symbol(
             id.clone(),
             symbol_kind,
             self.file.repo_relative_path.clone(),
             span(node),
             qualified_name.to_owned(),
+            "python",
+            disambiguator,
             format!("Python {symbol_kind} {qualified_name}\nSource:\n{normalized}"),
-        );
-        // `GraphRecord::symbol` defaults the language tag to Rust; stamp the
-        // Python tag and the source-order disambiguator in place.
-        if let GraphRecord::Node {
-            language,
-            disambiguator: node_disambiguator,
-            ..
-        } = &mut record
-        {
-            *language = Some("python".to_owned());
-            *node_disambiguator = Some(disambiguator);
-        }
-        self.graph.push(record);
+        ));
         self.add_edge(
             EdgeLabel::Defines,
             self.owner_id(),
@@ -302,56 +287,15 @@ impl<'graph, 'source> PythonExtractor<'graph, 'source> {
     }
 
     fn next_symbol_disambiguator(&mut self, symbol_kind: &str, qualified_name: &str) -> u64 {
-        let key = (symbol_kind.to_owned(), qualified_name.to_owned());
-        let disambiguator = self.symbol_ordinals.entry(key).or_default();
-        let current = *disambiguator;
-        *disambiguator += 1;
-        current
+        next_symbol_ordinal(&mut self.symbol_ordinals, symbol_kind, qualified_name)
     }
 
     fn add_edge(&mut self, label: EdgeLabel, source: String, target: String, summary: String) {
-        self.graph.push(GraphRecord::edge(
-            label,
-            source,
-            target,
-            Some("1.0".to_owned()),
-            summary,
-        ));
+        add_graph_edge(self.graph, label, source, target, summary);
     }
 
     fn emit_reference_edges(&mut self) {
-        let definitions = self.definitions.clone();
-        let bodies = self.symbol_bodies.clone();
-        for body in bodies {
-            for (name, target_id) in &definitions {
-                if body.id == *target_id
-                    || name == &body.name
-                    || !contains_identifier(&body.text, name)
-                {
-                    continue;
-                }
-
-                // Type the deterministic code-topology edge as `Calls` when the
-                // body invokes the name, otherwise `References` (value uses,
-                // base classes, type hints). Both are consumed by change-impact
-                // and context queries.
-                if looks_like_call(&body.text, name) {
-                    self.add_edge(
-                        EdgeLabel::Calls,
-                        body.id.clone(),
-                        target_id.clone(),
-                        format!("{} calls {name}", body.name),
-                    );
-                } else {
-                    self.add_edge(
-                        EdgeLabel::References,
-                        body.id.clone(),
-                        target_id.clone(),
-                        format!("{} references {name}", body.name),
-                    );
-                }
-            }
-        }
+        emit_reference_edges(self.graph, &self.definitions, &self.symbol_bodies);
     }
 
     fn superclass_names(&self, node: Node<'_>) -> Vec<String> {
@@ -361,8 +305,16 @@ impl<'graph, 'source> PythonExtractor<'graph, 'source> {
         let mut cursor = superclasses.walk();
         superclasses
             .named_children(&mut cursor)
-            .filter(|child| child.kind() == "identifier")
-            .filter_map(|child| identifier_text(child, self.source))
+            .filter_map(|child| match child.kind() {
+                "identifier" => identifier_text(child, self.source),
+                // `class Child(mod.Base):` — the base is an attribute node;
+                // extract just the attribute name so it matches the local
+                // definition entry in the definitions map.
+                "attribute" => child
+                    .child_by_field_name("attribute")
+                    .and_then(|attr| identifier_text(attr, self.source)),
+                _ => None,
+            })
             .collect()
     }
 
@@ -411,7 +363,15 @@ impl<'graph, 'source> PythonExtractor<'graph, 'source> {
     }
 
     fn is_test_function(&self, local_name: &str) -> bool {
-        local_name.starts_with("test_") || (self.in_test_class() && local_name.starts_with("test"))
+        if self.in_class_scope() {
+            // Inside a class: test only when the enclosing class is a Test*
+            // collector (pytest/unittest convention). The method name doesn't
+            // matter — all methods on a Test* class are collected.
+            self.in_test_class()
+        } else {
+            // Module or function scope: test_* prefix is the pytest convention.
+            local_name.starts_with("test_")
+        }
     }
 
     fn node_text(&self, node: Node<'_>) -> &'source str {

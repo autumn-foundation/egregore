@@ -1,8 +1,94 @@
 //! Language-neutral extraction helpers shared by the per-language extractors.
 
+use std::collections::BTreeMap;
+
 use tree_sitter::Node;
 
-use crate::ir::SourceSpan;
+use crate::ir::{EdgeLabel, Graph, GraphRecord, SourceSpan};
+
+/// A recorded symbol body used to emit cross-symbol reference edges.
+#[derive(Debug, Clone)]
+pub struct SymbolBody {
+    /// Stable record ID for the symbol node.
+    pub id: String,
+    /// Qualified name of the symbol.
+    pub name: String,
+    /// Source text of the symbol body.
+    pub text: String,
+}
+
+/// Pushes a single typed edge onto the graph.
+pub fn add_graph_edge(
+    graph: &mut Graph,
+    label: EdgeLabel,
+    source: String,
+    target: String,
+    summary: String,
+) {
+    graph.push(GraphRecord::edge(
+        label,
+        source,
+        target,
+        Some("1.0".to_owned()),
+        summary,
+    ));
+}
+
+/// Returns the next source-order ordinal for a (kind, name) pair and advances the counter.
+///
+/// Ordinals start at 0 and increase monotonically per pair so
+/// same-named symbols in the same file get distinct stable IDs.
+pub fn next_symbol_ordinal(
+    ordinals: &mut BTreeMap<(String, String), u64>,
+    symbol_kind: &str,
+    qualified_name: &str,
+) -> u64 {
+    let key = (symbol_kind.to_owned(), qualified_name.to_owned());
+    let slot = ordinals.entry(key).or_default();
+    let current = *slot;
+    *slot += 1;
+    current
+}
+
+/// Emits `Calls` / `References` edges between symbol bodies and the
+/// definitions visible in the same file.
+///
+/// The heuristic is deterministic: a body text that contains a definition name
+/// as a standalone identifier and also looks like a call site (`name(`,
+/// `::name(`, `.name(`) gets a `Calls` edge; any other identifier reference
+/// gets a `References` edge. Self-references (body ID == target ID) and
+/// name-equality guard loops (name == body name) are skipped.
+pub fn emit_reference_edges(
+    graph: &mut Graph,
+    definitions: &BTreeMap<String, String>,
+    bodies: &[SymbolBody],
+) {
+    for body in bodies {
+        for (name, target_id) in definitions {
+            if body.id == *target_id || name == &body.name || !contains_identifier(&body.text, name)
+            {
+                continue;
+            }
+            if looks_like_call(&body.text, name) {
+                add_graph_edge(
+                    graph,
+                    EdgeLabel::Calls,
+                    body.id.clone(),
+                    target_id.clone(),
+                    format!("{} calls {name}", body.name),
+                );
+            } else {
+                add_graph_edge(
+                    graph,
+                    EdgeLabel::References,
+                    body.id.clone(),
+                    target_id.clone(),
+                    format!("{} references {name}", body.name),
+                );
+            }
+        }
+    }
+}
 
 /// Builds a [`SourceSpan`] from a Tree-sitter node's byte and line positions.
 ///
