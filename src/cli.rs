@@ -4404,9 +4404,7 @@ fn audit_token_cost_cmd(
 
     let output = match format {
         OutputFormat::Json | OutputFormat::Text => serde_json::to_string_pretty(&report)
-            .unwrap_or_else(|error| {
-                token_cost_exit("serialize_error", "", &error.to_string())
-            }),
+            .unwrap_or_else(|error| token_cost_exit("serialize_error", "", &error.to_string())),
     };
     println!("{output}");
     std::process::exit(i32::from(!report.ok));

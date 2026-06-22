@@ -84,8 +84,14 @@ pub struct CorpusQuestion {
     pub eg_query: String,
     /// The record ID the correct Egregore answer must contain (AC5).
     pub expected_record_id: String,
-    /// The literal pattern the grep-shaped baseline searches for.
+    /// The literal pattern the grep-shaped baseline searches for. Used by the
+    /// single-pattern and file-read match kinds; ignored by `WordsAcrossCorpus`.
     pub baseline_pattern: String,
+    /// The keyword union a `WordsAcrossCorpus` baseline searches for — the set of
+    /// terms a human would grep when exploring the question's concept. Ignored by
+    /// the other match kinds.
+    #[serde(default)]
+    pub baseline_patterns: Vec<String>,
     /// How the baseline pattern is matched against the corpus.
     pub baseline_match_kind: BaselineMatchKind,
     /// For `Semantic` questions: maximum number of result rows to measure,
@@ -132,6 +138,14 @@ pub enum BaselineMatchKind {
     /// (`rg -n --word-regexp <pattern> <corpus>`), including comment and
     /// string-literal false positives a structural query avoids.
     WordAcrossCorpus,
+    /// Whole-word match of the union of several patterns across the corpus
+    /// (`rg -n --word-regexp '<p1>|<p2>|…' <corpus>`). Models the lines a human
+    /// exploring a concept by keyword search would have to ingest — the fair
+    /// baseline for a ranked semantic answer, which surfaces matches across the
+    /// keywords a concept spans rather than a single literal. A line that
+    /// matches several patterns is counted once, matching ripgrep's per-line
+    /// output. Reads [`CorpusQuestion::baseline_patterns`].
+    WordsAcrossCorpus,
     /// Read the named file's non-empty lines (`rg -n . <file>`): the boring
     /// substitute for "what does this file define" is reading the file.
     ReadFile,
@@ -502,7 +516,15 @@ fn build_semantic_answer(
     // Collect all Symbol nodes, sorted deterministically.
     let mut symbols: Vec<&GraphRecord> = records
         .iter()
-        .filter(|r| matches!(r, GraphRecord::Node { kind: NodeKind::Symbol, .. }))
+        .filter(|r| {
+            matches!(
+                r,
+                GraphRecord::Node {
+                    kind: NodeKind::Symbol,
+                    ..
+                }
+            )
+        })
         .collect();
     symbols.sort_by(|a, b| symbol_sort_key(a).cmp(&symbol_sort_key(b)));
 
@@ -608,6 +630,30 @@ fn build_baseline(
                 ),
             }
         }
+        BaselineMatchKind::WordsAcrossCorpus => {
+            let mut matched: Vec<&str> = Vec::new();
+            for content in source_files.values() {
+                for line in content.lines() {
+                    // A line is ingested once if it matches any keyword, mirroring
+                    // ripgrep's one-line-per-match output for an alternation.
+                    if question
+                        .baseline_patterns
+                        .iter()
+                        .any(|pattern| line_has_word(line, pattern))
+                    {
+                        matched.push(line);
+                    }
+                }
+            }
+            BuiltBaseline {
+                match_count: matched.len(),
+                text: matched.join("\n"),
+                command: format!(
+                    "rg -n --word-regexp '{}' {corpus_display}",
+                    question.baseline_patterns.join("|")
+                ),
+            }
+        }
         BaselineMatchKind::ReadFile => {
             let content = source_files.get(&question.baseline_pattern);
             let matched: Vec<&str> = content
@@ -702,8 +748,7 @@ fn measure_question(
         min_ratio,
         meets_threshold,
         pass,
-        result_limit: (question.class == QuestionClass::Semantic)
-            .then_some(question.result_limit),
+        result_limit: (question.class == QuestionClass::Semantic).then_some(question.result_limit),
     }
 }
 

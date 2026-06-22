@@ -82,12 +82,21 @@ The default corpus covers the three classes the issue requires:
 |-------|-----------------|----------------------|
 | `exact_symbol` | `eg query symbol <name>` | `rg -n --word-regexp <name> <corpus>` — every line containing the identifier, including comment and string-literal false positives. |
 | `file_defines` | `eg query file <path>` | `rg -n . <file>` — the file's lines, since reading the file is the boring substitute for "what does this file define". |
-| `semantic` | `eg query semantic <text>` | `rg -n --word-regexp <keyword> <corpus>` — the lines a concept search by keyword drags in. |
+| `semantic` | `eg query semantic <text> --limit <result_limit>` | `rg -n --word-regexp '<k1>\|<k2>\|…' <corpus>` — the lines the *union of concept keywords* a human would grep drags in. |
+
+The `semantic` comparison is held *fair on both sides*: the Egregore answer is
+measured at the same `--limit` (`result_limit` in the manifest, default 1) a
+caller would pass to `eg query semantic`, and the baseline is the union of the
+concept keywords (`baseline_patterns`) a human would search rather than a single
+literal — so both reflect "explore this concept" instead of a top-1 lookup pitted
+against a broad search. A line matching several keywords is counted once, as
+ripgrep prints it.
 
 The `semantic` answer's float `score` is embedding-derived; to keep the gate
-deterministic and offline it is reported at a fixed representative value. The
-token cost of a semantic answer is dominated by its citable handle, not the
-score, so this does not move the ratio.
+deterministic and offline it is reported at a fixed representative value (with a
+slightly lower fixed value for secondary hits). Under `word-punct-v1` any finite
+JSON float is exactly three tokens, so the choice of representative score does
+not move the ratio.
 
 ## Report shape
 
@@ -148,12 +157,16 @@ by question id).
 
 ## The pinned corpus
 
-`corpus/token_cost_corpus/` is a four-file Rust settings stack whose public
-entry point is `parse_config`. The modules mention `parse_config` and `settings`
-in doc comments and string literals on purpose, so a text search returns many
-false-positive lines that a structural `eg query` answer does not — the exact
-gap this gate measures. The manifest (`corpus/token_cost_corpus.json`) pins the
-question set, the expected record ID per question, the baseline pattern, the
+`corpus/token_cost_corpus/` is a multi-file Rust settings stack whose public
+entry point is `parse_config`. The modules mention `parse_config`, `settings`,
+`config`, `parse`, `validate`, and `typed` in doc comments and string literals on
+purpose, so a text search returns many false-positive lines that a structural
+`eg query` answer does not — the exact gap this gate measures. The corpus is
+sized so that a 10-result semantic answer is genuinely cheaper than the
+keyword-union search a human would otherwise run; a four-file fixture is too
+small to show the semantic saving, which is a scale effect. The manifest
+(`corpus/token_cost_corpus.json`) pins the question set, the expected record ID
+per question, the baseline pattern(s), the semantic `result_limit`, the
 token-count method, and the minimum ratio. It is the documented-equivalent
 representative fixture in the absence of #57's shared latency corpus.
 

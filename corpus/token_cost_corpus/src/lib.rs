@@ -9,4 +9,12 @@
 
 pub mod cache;
 pub mod config;
+pub mod defaults;
+pub mod diagnostics;
+pub mod env;
 pub mod loader;
+pub mod merge;
+pub mod policy;
+pub mod schema;
+pub mod source;
+pub mod validation;
