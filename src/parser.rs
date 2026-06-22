@@ -26,6 +26,9 @@ pub fn extract_source_file(
         Some(Language::Python) => {
             languages::python::extract_file(file, file_id, repository_id, graph)
         }
+        Some(Language::TypeScript) => {
+            languages::typescript::extract_file(file, file_id, repository_id, graph)
+        }
         None => Ok(()),
     }
 }
@@ -51,6 +54,9 @@ pub fn extract_source_text(
         }
         Some(Language::Python) => {
             languages::python::extract_file_source(file, source, file_id, repository_id, graph)
+        }
+        Some(Language::TypeScript) => {
+            languages::typescript::extract_file_source(file, source, file_id, repository_id, graph)
         }
         None => Ok(()),
     }

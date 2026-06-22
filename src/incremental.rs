@@ -35,7 +35,7 @@ pub struct IncrementalScan {
     pub tombstoned_files: Vec<String>,
 }
 
-/// Scans a repository using a JSON file cache for unchanged Rust files.
+/// Scans a repository using a JSON file cache for unchanged source files.
 ///
 /// # Errors
 ///
