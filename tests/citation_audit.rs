@@ -1440,3 +1440,19 @@ fn historical_tombstoned_symbol_is_counted() {
         "historical version of a tombstoned symbol must be counted: {report:#}"
     );
 }
+
+// Review round 5: an out-of-range --min-code-citation cannot silently disable
+// the gate; it is rejected as a usage error.
+#[test]
+fn invalid_min_code_citation_is_rejected() {
+    let fixture = seed();
+    for bad in ["-1", "2", "nan"] {
+        egregore()
+            .args(["audit", "citations", "--graph"])
+            .arg(&fixture.graph)
+            .args(["--min-code-citation", bad])
+            .assert()
+            .failure()
+            .code(2);
+    }
+}

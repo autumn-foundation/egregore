@@ -4281,7 +4281,36 @@ fn audit_citations_cmd(
     min_code_citation: f64,
     format: OutputFormat,
 ) -> Result<()> {
-    let records = match load_query_records(graph, data_dir) {
+    // The gate threshold is a fraction; reject values that would silently disable
+    // or invert the gate (e.g. a negative threshold makes 0% completeness pass).
+    if !min_code_citation.is_finite() || !(0.0..=1.0).contains(&min_code_citation) {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "code": "invalid_min_code_citation",
+                "value": min_code_citation.to_string(),
+                "message": "--min-code-citation must be a finite value in [0.0, 1.0]"
+            })
+        );
+        std::process::exit(2);
+    }
+
+    // For an embedded store, read from a throwaway read-only copy: opening the
+    // embedded engine re-persists index files, and a citation audit must never
+    // mutate the store it is only measuring. The guard keeps the copy alive for
+    // the duration of every read below.
+    // `store_copy` owns the throwaway copy path plus its tempdir guard; keeping
+    // it bound here holds the copy alive for every read below.
+    let store_copy = data_dir.map(|dir| match readonly_audit_store(dir) {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    });
+    let effective_data_dir = store_copy.as_ref().map(|(path, _guard)| path.as_path());
+
+    let records = match load_query_records(graph, effective_data_dir) {
         Ok(records) => records,
         Err(error) => {
             eprintln!("{error}");
@@ -4289,12 +4318,13 @@ fn audit_citations_cmd(
         }
     };
 
-    let semantic = collect_semantic_input(data_dir, &records);
+    let semantic = collect_semantic_input(effective_data_dir, &records);
     // The evidence-freshness lane mirrors `eg query evidence-freshness`, which
     // reads the history-inclusive store view so superseded versions can produce
     // drift/unresolved verdicts. A JSONL graph already carries that history; an
     // embedded store needs the explicit history-inclusive load.
-    let freshness_records = data_dir.and_then(|dir| load_records_from_db_history(dir).ok());
+    let freshness_records =
+        effective_data_dir.and_then(|dir| load_records_from_db_history(dir).ok());
     let config = crate::citation_audit::AuditConfig {
         min_code_citation,
         semantic,
@@ -4343,6 +4373,9 @@ fn collect_semantic_input(
             .as_deref()
             .is_some_and(|k| k == "File" || k == "Symbol")
     });
+    // Measure the DEFAULT `eg query semantic` output, which truncates the
+    // code-filtered matches to the default `--limit` (mirrors `query_semantic`).
+    matches.truncate(crate::citation_audit::DEFAULT_QUERY_LIMIT);
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
     let rows = matches
         .iter()
@@ -4440,6 +4473,33 @@ fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
 /// that opened the live store directly would modify it — violating the read-only
 /// guarantee. This copies the store to a throwaway temporary directory and reads
 /// the copy, leaving the original byte-for-byte untouched.
+/// Returns a read-only working location for embedded-store audit reads plus the
+/// tempdir guard that must outlive those reads.
+///
+/// With the embedded feature this is a throwaway copy of the store, so the audit
+/// never re-persists or otherwise mutates the original. Without the feature the
+/// path is returned unchanged (the subsequent read bails on the missing feature).
+fn readonly_audit_store(data_dir: &Path) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let temp =
+            tempfile::tempdir().context("failed to create temporary read-only store copy")?;
+        let copy_root = temp.path().join("store");
+        copy_dir_recursive(data_dir, &copy_root).with_context(|| {
+            format!(
+                "failed to copy store {} for read-only audit",
+                data_dir.display()
+            )
+        })?;
+        Ok((copy_root, Some(temp)))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        Ok((data_dir.to_path_buf(), None))
+    }
+}
+
 fn load_records_from_data_dir_readonly(data_dir: &Path) -> Result<Vec<GraphRecord>> {
     #[cfg(feature = "embedded-aletheiadb")]
     {

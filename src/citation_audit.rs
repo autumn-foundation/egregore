@@ -39,6 +39,10 @@ pub const DEFAULT_MIN_CODE_CITATION: f64 = 0.95;
 /// threshold so that an exact `0.95` fixture is not rejected by float drift.
 const GATE_EPSILON: f64 = 1e-9;
 
+/// Default `--limit` shared by `eg query drift`/`semantic`. The audit measures
+/// the default public invocation, so it caps those lanes at the same limit.
+pub const DEFAULT_QUERY_LIMIT: usize = 10;
+
 // ---------------------------------------------------------------------------
 // Public report types
 // ---------------------------------------------------------------------------
@@ -1030,7 +1034,10 @@ fn drive_file(records: &[GraphRecord]) -> WorkflowBuilder {
 
 fn drive_drift(records: &[GraphRecord]) -> WorkflowBuilder {
     let mut builder = WorkflowBuilder::new("drift", "source_fact");
-    for drift_rec in largest_semantic_drifts(records, usize::MAX) {
+    // Measure the DEFAULT `eg query drift` output, which returns the top
+    // `DEFAULT_QUERY_LIMIT` rows; later rows are not emitted by the default
+    // public invocation the gate targets.
+    for drift_rec in largest_semantic_drifts(records, DEFAULT_QUERY_LIMIT) {
         if let Some((classified, tk)) = classify_drift_row(records, drift_rec) {
             builder.push_classified(classified, tk);
         }
