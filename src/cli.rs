@@ -437,6 +437,19 @@ enum Commands {
         #[command(subcommand)]
         subcommand: ProtectedSubcommand,
     },
+    /// Audit citation completeness across the public query workflows (issue #65).
+    ///
+    /// Drives every public query workflow over a seeded local record set and
+    /// measures, per workflow and overall, whether returned rows carry the
+    /// citation handles their trust class requires. Local-first; no network,
+    /// hosted indexing, remote crawling, or mandatory remote embeddings.
+    ///
+    /// See `docs/cli/citation-audit.md` for the full workflow.
+    Audit {
+        /// Citation-audit subcommand.
+        #[command(subcommand)]
+        subcommand: AuditSubcommand,
+    },
     /// Report local setup readiness for the scan → ingest → semantic-search workflow.
     ///
     /// Read-only by default: does not download models, create graph records, mutate
@@ -1241,6 +1254,36 @@ enum WriteKind {
     },
 }
 
+/// Subcommands for `audit`.
+#[derive(Debug, Subcommand)]
+enum AuditSubcommand {
+    /// Audit citation completeness across the public query workflows.
+    ///
+    /// Reads a seeded record set from a JSONL graph (`--graph`) or an embedded
+    /// store (`--data-dir`), drives every public query workflow over it, and
+    /// prints a deterministic per-workflow + overall citation report with a
+    /// default pass/fail gate.
+    ///
+    /// Exit codes:
+    ///   0 — gate passed (`ok: true`).
+    ///   1 — gate failed (`ok: false`); the full JSON report is still printed.
+    ///   2 — usage/load error (bad path, unparseable graph).
+    Citations {
+        /// Graph JSONL path (mutually exclusive with `--data-dir`).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` store directory (mutually exclusive with `--graph`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Minimum fraction of code-answer rows that must be cited (AC4 gate).
+        #[arg(long, default_value_t = crate::citation_audit::DEFAULT_MIN_CODE_CITATION)]
+        min_code_citation: f64,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+}
+
 /// Subcommands for `protected`.
 #[derive(Debug, Subcommand)]
 enum ProtectedSubcommand {
@@ -1476,6 +1519,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Mcp { data_dir } => crate::mcp::run_stdio(&data_dir),
         Commands::Protected { subcommand } => protected_cmd(subcommand),
+        Commands::Audit { subcommand } => audit_cmd(subcommand),
         Commands::Doctor {
             path,
             out,
@@ -4213,6 +4257,182 @@ fn load_query_records(graph: Option<&Path>, data_dir: Option<&Path>) -> Result<V
     }
 }
 
+/// Routes `eg audit` subcommands.
+fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
+    match subcommand {
+        AuditSubcommand::Citations {
+            graph,
+            data_dir,
+            min_code_citation,
+            format,
+        } => audit_citations_cmd(
+            graph.as_deref(),
+            data_dir.as_deref(),
+            min_code_citation,
+            format,
+        ),
+    }
+}
+
+/// Handles `eg audit citations` (issue #65).
+fn audit_citations_cmd(
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+    min_code_citation: f64,
+    format: OutputFormat,
+) -> Result<()> {
+    // The gate threshold is a fraction; reject values that would silently disable
+    // or invert the gate (e.g. a negative threshold makes 0% completeness pass).
+    if !min_code_citation.is_finite() || !(0.0..=1.0).contains(&min_code_citation) {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "code": "invalid_min_code_citation",
+                "value": min_code_citation.to_string(),
+                "message": "--min-code-citation must be a finite value in [0.0, 1.0]"
+            })
+        );
+        std::process::exit(2);
+    }
+
+    // For an embedded store, read from a throwaway read-only copy: opening the
+    // embedded engine re-persists index files, and a citation audit must never
+    // mutate the store it is only measuring. The guard keeps the copy alive for
+    // the duration of every read below.
+    // `store_copy` owns the throwaway copy path plus its tempdir guard; keeping
+    // it bound here holds the copy alive for every read below.
+    let store_copy = data_dir.map(|dir| match readonly_audit_store(dir) {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    });
+    let effective_data_dir = store_copy.as_ref().map(|(path, _guard)| path.as_path());
+
+    let records = match load_query_records(graph, effective_data_dir) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+
+    let semantic = collect_semantic_input(effective_data_dir, &records);
+    // The evidence-freshness lane mirrors `eg query evidence-freshness`, which
+    // reads the history-inclusive store view so superseded versions can produce
+    // drift/unresolved verdicts. A JSONL graph already carries that history; an
+    // embedded store needs the explicit history-inclusive load.
+    // Surface a history-load failure rather than silently auditing current-only
+    // rows (the public `eg query evidence-freshness --data-dir` uses `?`).
+    let freshness_records = effective_data_dir.map(|dir| match load_records_from_db_history(dir) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    });
+    let config = crate::citation_audit::AuditConfig {
+        min_code_citation,
+        semantic,
+        freshness_records,
+    };
+    let report = crate::citation_audit::run_citation_audit(&records, &config);
+
+    let output = match format {
+        OutputFormat::Json | OutputFormat::Text => serde_json::to_string_pretty(&report)
+            .context("failed to serialize citation audit report")?,
+    };
+    println!("{output}");
+    // `process::exit` bypasses destructors, so the throwaway store copy's `TempDir`
+    // guard would leak a full copied store under the temp dir on every `--data-dir`
+    // run. Drop it explicitly before exiting (the borrow in `effective_data_dir` is
+    // dead after the reads above).
+    let exit_code = i32::from(!report.ok);
+    drop(store_copy);
+    std::process::exit(exit_code);
+}
+
+/// Collects embedded-store semantic retrieval leads for the audit, when the
+/// `embeddings` feature is built and a `--data-dir` store is supplied.
+#[cfg(feature = "embeddings")]
+fn collect_semantic_input(
+    data_dir: Option<&Path>,
+    records: &[GraphRecord],
+) -> crate::citation_audit::SemanticInput {
+    use crate::citation_audit::{SemanticInput, SemanticRow};
+
+    let Some(dir) = data_dir else {
+        return SemanticInput::default();
+    };
+    let Ok(sink) = EmbeddedAletheiaSink::open_unleased(dir) else {
+        return SemanticInput::Disabled {
+            reason: "embedded_store_unavailable",
+        };
+    };
+    let Ok(query_vector) = embed_query_text("foo") else {
+        return SemanticInput::Disabled {
+            reason: "embedding_unavailable",
+        };
+    };
+    let fetch = records.len().max(10);
+    let Ok(mut matches) = sink.semantic_search(&query_vector, fetch) else {
+        return SemanticInput::Disabled {
+            reason: "semantic_index_unavailable",
+        };
+    };
+    matches.retain(|m| {
+        m.kind
+            .as_deref()
+            .is_some_and(|k| k == "File" || k == "Symbol")
+    });
+    // Measure the DEFAULT `eg query semantic` output, which truncates the
+    // code-filtered matches to the default `--limit` (mirrors `query_semantic`).
+    matches.truncate(crate::citation_audit::DEFAULT_QUERY_LIMIT);
+    let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
+    let rows = matches
+        .iter()
+        .map(|m| {
+            let (path, span) = by_id.get(m.record_id.as_str()).map_or((None, None), |r| {
+                if let GraphRecord::Node {
+                    repo_relative_path,
+                    span,
+                    ..
+                } = r
+                {
+                    (repo_relative_path.clone(), *span)
+                } else {
+                    (None, None)
+                }
+            });
+            SemanticRow {
+                record_id: m.record_id.clone(),
+                kind: m.kind.clone().unwrap_or_else(|| "Symbol".to_owned()),
+                repo_relative_path: path,
+                span,
+            }
+        })
+        .collect();
+    SemanticInput::Enabled { rows }
+}
+
+/// Without the `embeddings` feature there is no vector index; `semantic` is
+/// reported disabled with a stable reason rather than silently dropped.
+#[cfg(not(feature = "embeddings"))]
+fn collect_semantic_input(
+    data_dir: Option<&Path>,
+    _records: &[GraphRecord],
+) -> crate::citation_audit::SemanticInput {
+    use crate::citation_audit::SemanticInput;
+    if data_dir.is_some() {
+        SemanticInput::Disabled {
+            reason: "requires_embeddings_feature",
+        }
+    } else {
+        SemanticInput::default()
+    }
+}
+
 fn load_records_from_jsonl(graph: &Path) -> Result<Vec<GraphRecord>> {
     let jsonl = fs::read_to_string(graph)
         .with_context(|| format!("failed to read graph JSONL from {}", graph.display()))?;
@@ -4266,6 +4486,33 @@ fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
 /// that opened the live store directly would modify it — violating the read-only
 /// guarantee. This copies the store to a throwaway temporary directory and reads
 /// the copy, leaving the original byte-for-byte untouched.
+/// Returns a read-only working location for embedded-store audit reads plus the
+/// tempdir guard that must outlive those reads.
+///
+/// With the embedded feature this is a throwaway copy of the store, so the audit
+/// never re-persists or otherwise mutates the original. Without the feature the
+/// path is returned unchanged (the subsequent read bails on the missing feature).
+fn readonly_audit_store(data_dir: &Path) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let temp =
+            tempfile::tempdir().context("failed to create temporary read-only store copy")?;
+        let copy_root = temp.path().join("store");
+        copy_dir_recursive(data_dir, &copy_root).with_context(|| {
+            format!(
+                "failed to copy store {} for read-only audit",
+                data_dir.display()
+            )
+        })?;
+        Ok((copy_root, Some(temp)))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        Ok((data_dir.to_path_buf(), None))
+    }
+}
+
 fn load_records_from_data_dir_readonly(data_dir: &Path) -> Result<Vec<GraphRecord>> {
     #[cfg(feature = "embedded-aletheiadb")]
     {
@@ -7278,7 +7525,7 @@ fn query_task_cmd(records: &[GraphRecord], id_or_handle: &str) -> Result<()> {
 
 /// Maps a node kind to its trust class so an agent claim is never labelled as
 /// source truth (AC3).
-fn trust_class_for(record: &GraphRecord) -> &'static str {
+pub(crate) fn trust_class_for(record: &GraphRecord) -> &'static str {
     let Some(kind) = record.node_kind_name() else {
         return "other";
     };

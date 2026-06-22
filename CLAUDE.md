@@ -74,6 +74,24 @@ and semantic surfaces never read. Disabled by default; enabled with `--protected
 After sources are moved or deleted, payloads remain retrievable by stable handle with BLAKE3
 hash verification. See `docs/cli/protected-artifacts.md` for the full operator workflow.
 
+Citation-completeness audit (issue #65):
+
+```powershell
+# Gate over a local JSONL graph (semantic reported disabled without embeddings)
+cargo run -- audit citations --graph graph.jsonl        # exit 0 pass, 1 gate fail, 2 load error
+
+# Gate over an embedded store (drives the semantic workflow too)
+cargo run -- audit citations --data-dir .egregore --min-code-citation 0.95
+```
+
+`eg audit citations` drives every public query workflow over a seeded local record set and
+reports, per workflow and overall, whether returned rows carry the citation handles their
+trust class requires. The default gate fails when fewer than 95% of code-answer rows carry a
+stable record ID plus a repo-relative file/span handle (or a documented absent-span reason),
+or when any non-code trust-class row lacks a source/evidence/policy handle. Output is
+deterministic and redaction-safe — record IDs, handles, hashes, markers, and counts only,
+never raw payloads. See `docs/cli/citation-audit.md`.
+
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
 
 ## Working Rules
