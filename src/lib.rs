@@ -352,6 +352,7 @@ pub(crate) fn scan_source_text_records(
         languages::Language::TypeScript => {
             crate::languages::typescript::normalize_file_code(source)
         }
+        languages::Language::Go => crate::languages::go::normalize_file_code(source),
     };
     graph.push(GraphRecord::node(
         file_id.clone(),

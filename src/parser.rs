@@ -29,6 +29,7 @@ pub fn extract_source_file(
         Some(Language::TypeScript) => {
             languages::typescript::extract_file(file, file_id, repository_id, graph)
         }
+        Some(Language::Go) => languages::go::extract_file(file, file_id, repository_id, graph),
         None => Ok(()),
     }
 }
@@ -57,6 +58,9 @@ pub fn extract_source_text(
         }
         Some(Language::TypeScript) => {
             languages::typescript::extract_file_source(file, source, file_id, repository_id, graph)
+        }
+        Some(Language::Go) => {
+            languages::go::extract_file_source(file, source, file_id, repository_id, graph)
         }
         None => Ok(()),
     }
