@@ -8,6 +8,8 @@ pub mod common;
 pub mod python;
 /// Rust source extraction.
 pub mod rust;
+/// TypeScript (and TSX) source extraction.
+pub mod typescript;
 
 /// A source language the scanner can extract a code graph from.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -16,6 +18,8 @@ pub enum Language {
     Rust,
     /// Python (`.py`).
     Python,
+    /// TypeScript (`.ts`) and TSX (`.tsx`).
+    TypeScript,
 }
 
 impl Language {
@@ -25,6 +29,7 @@ impl Language {
         match self {
             Self::Rust => "rust",
             Self::Python => "python",
+            Self::TypeScript => "typescript",
         }
     }
 
@@ -34,6 +39,7 @@ impl Language {
         match self {
             Self::Rust => "Rust",
             Self::Python => "Python",
+            Self::TypeScript => "TypeScript",
         }
     }
 
@@ -44,6 +50,10 @@ impl Language {
         match self {
             Self::Rust => ("tree_sitter_rust", env!("TREE_SITTER_RUST_VERSION")),
             Self::Python => ("tree_sitter_python", env!("TREE_SITTER_PYTHON_VERSION")),
+            Self::TypeScript => (
+                "tree_sitter_typescript",
+                env!("TREE_SITTER_TYPESCRIPT_VERSION"),
+            ),
         }
     }
 
@@ -53,6 +63,7 @@ impl Language {
         match tag {
             "rust" => Some(Self::Rust),
             "python" => Some(Self::Python),
+            "typescript" => Some(Self::TypeScript),
             _ => None,
         }
     }
@@ -72,6 +83,7 @@ pub fn detect_path(path: &Path) -> Option<Language> {
     match path.extension().and_then(OsStr::to_str) {
         Some("rs") => Some(Language::Rust),
         Some("py") => Some(Language::Python),
+        Some("ts" | "tsx") => Some(Language::TypeScript),
         _ => None,
     }
 }

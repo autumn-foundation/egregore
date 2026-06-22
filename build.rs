@@ -14,6 +14,10 @@ fn main() {
         "cargo:rustc-env=TREE_SITTER_PYTHON_VERSION={}",
         version_for_dep(&lock, "aletheia-egregore", "tree-sitter-python")
     );
+    println!(
+        "cargo:rustc-env=TREE_SITTER_TYPESCRIPT_VERSION={}",
+        version_for_dep(&lock, "aletheia-egregore", "tree-sitter-typescript")
+    );
     println!("cargo:rerun-if-changed=Cargo.lock");
 }
 

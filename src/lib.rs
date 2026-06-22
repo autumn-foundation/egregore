@@ -347,6 +347,9 @@ pub(crate) fn scan_source_text_records(
     let normalized = match language {
         languages::Language::Rust => crate::languages::rust::normalize_file_code(source),
         languages::Language::Python => crate::languages::python::normalize_file_code(source),
+        languages::Language::TypeScript => {
+            crate::languages::typescript::normalize_file_code(source)
+        }
     };
     graph.push(GraphRecord::node(
         file_id.clone(),
