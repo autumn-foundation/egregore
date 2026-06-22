@@ -1513,7 +1513,10 @@ fn dirty_probe_suppresses_global_excludes_file() {
     std::fs::write(&global_excludes, "globally_hidden.rs\n").unwrap();
     std::fs::write(
         &global_gitconfig,
-        format!("[core]\n\texcludesFile = {}\n", global_excludes.display()),
+        format!(
+            "[core]\n\texcludesFile = {}\n",
+            global_excludes.display().to_string().replace('\\', "/")
+        ),
     )
     .unwrap();
 

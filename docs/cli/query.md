@@ -81,6 +81,18 @@ See [`freshness.md`](freshness.md) for the standalone store-level report.
 
 ---
 
+## Extraction completeness (`extraction_completeness`, issue #87)
+
+`eg query symbol` and `eg query file` return an `extraction_completeness` signal (`complete` / `partial`) in their JSON output format.
+- `complete`: The queried file or symbol scope contains zero `Diagnostic` markers (unparsed macro blocks or syntax errors).
+- `partial`: The scope contains at least one active `Diagnostic` marker, indicating that code extraction may have been incomplete, and some symbols or elements within this scope might be missing from the index.
+
+For `eg query file <file>`, if the completeness is `partial`, the output also includes a `diagnostics` array enumerating the active diagnostic markers within that file (each containing `record_id`, `repo_relative_path`, and `span`).
+
+The completeness signal is advisory and states only that extraction *may* be incomplete in the scope; it does not make direct truth claims about symbol presence or absence.
+
+---
+
 ## Repository scope (`--repo`, issue #67)
 
 A shared local store can hold more than one repository, and two repositories

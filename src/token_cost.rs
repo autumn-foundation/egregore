@@ -502,7 +502,15 @@ fn build_semantic_answer(
     // Collect all Symbol nodes, sorted deterministically.
     let mut symbols: Vec<&GraphRecord> = records
         .iter()
-        .filter(|r| matches!(r, GraphRecord::Node { kind: NodeKind::Symbol, .. }))
+        .filter(|r| {
+            matches!(
+                r,
+                GraphRecord::Node {
+                    kind: NodeKind::Symbol,
+                    ..
+                }
+            )
+        })
         .collect();
     symbols.sort_by(|a, b| symbol_sort_key(a).cmp(&symbol_sort_key(b)));
 
@@ -702,8 +710,7 @@ fn measure_question(
         min_ratio,
         meets_threshold,
         pass,
-        result_limit: (question.class == QuestionClass::Semantic)
-            .then_some(question.result_limit),
+        result_limit: (question.class == QuestionClass::Semantic).then_some(question.result_limit),
     }
 }
 

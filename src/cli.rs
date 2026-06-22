@@ -2370,8 +2370,7 @@ fn egregore_store_dirs(repo_path: &Path) -> Vec<std::path::PathBuf> {
             .current_dir(repo_path)
             .args(["ls-files", "--", name.to_str().unwrap_or("")])
             .output()
-            .map(|out| !out.stdout.is_empty())
-            .unwrap_or(false);
+            .is_ok_and(|out| !out.stdout.is_empty());
         // Even when no content is tracked, an untracked directory containing `.rs`
         // files is a source directory, not a store output: its files appear in the
         // graph but are outside `git status`, so excluding it would mask deletions.
@@ -3084,6 +3083,13 @@ fn render_daemon_pressure(status: &serde_json::Value) {
 // Query output types
 // ---------------------------------------------------------------------------
 
+#[derive(Serialize, Clone, Eq, PartialEq, Debug)]
+struct DiagnosticRef<'a> {
+    record_id: &'a str,
+    repo_relative_path: &'a str,
+    span: SourceSpan,
+}
+
 #[derive(Serialize)]
 struct SymbolResult<'a> {
     record_id: &'a str,
@@ -3108,6 +3114,41 @@ struct SymbolResult<'a> {
     /// result never suppressed) when freshness was not requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     freshness: Option<&'static str>,
+    extraction_completeness: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<Vec<DiagnosticRef<'a>>>,
+}
+
+fn get_file_diagnostics<'a>(
+    records: &'a [GraphRecord],
+    file_path: &str,
+    deleted: &std::collections::BTreeSet<&str>,
+) -> (&'static str, Option<Vec<DiagnosticRef<'a>>>) {
+    let mut diagnostics = Vec::new();
+    for r in records {
+        if let GraphRecord::Node {
+            id,
+            kind: NodeKind::Diagnostic,
+            repo_relative_path: Some(path),
+            span: Some(span),
+            ..
+        } = r
+            && path == file_path
+            && !deleted.contains(id.as_str())
+        {
+            diagnostics.push(DiagnosticRef {
+                record_id: id.as_str(),
+                repo_relative_path: path.as_str(),
+                span: *span,
+            });
+        }
+    }
+    if diagnostics.is_empty() {
+        ("complete", None)
+    } else {
+        diagnostics.sort_by_key(|d| (d.span.start_line, d.record_id));
+        ("partial", Some(diagnostics))
+    }
 }
 
 #[derive(Serialize)]
@@ -4370,7 +4411,7 @@ fn load_token_cost_inputs(
     // Read the same source files for the grep-shaped baseline, keyed by their
     // repo-relative path so the baseline reads exactly what the scan indexed.
     let mut source_files: BTreeMap<String, String> = BTreeMap::new();
-    let discovered = crate::fs::discover_rust_source_files(source_dir)
+    let discovered = crate::fs::discover_source_files(source_dir)
         .unwrap_or_else(|error| token_cost_exit("corpus_discover_error", &dir, &error.to_string()));
     for source_file in discovered {
         let content = std::fs::read_to_string(&source_file.path).unwrap_or_else(|error| {
@@ -4404,9 +4445,7 @@ fn audit_token_cost_cmd(
 
     let output = match format {
         OutputFormat::Json | OutputFormat::Text => serde_json::to_string_pretty(&report)
-            .unwrap_or_else(|error| {
-                token_cost_exit("serialize_error", "", &error.to_string())
-            }),
+            .unwrap_or_else(|error| token_cost_exit("serialize_error", "", &error.to_string())),
     };
     println!("{output}");
     std::process::exit(i32::from(!report.ok));
@@ -6214,7 +6253,7 @@ fn query_symbol_all(
                 true
             }
         })
-        .filter_map(|r| symbol_result(r, name, index))
+        .filter_map(|r| symbol_result(r, name, index, records, &deleted))
         .collect();
     if let Some(repo) = selected_repo {
         results.retain(|r| r.repository_id == Some(repo));
@@ -6237,6 +6276,8 @@ fn symbol_result<'a>(
     record: &'a GraphRecord,
     name: &str,
     index: &'a query::RepositoryIndex,
+    all_records: &'a [GraphRecord],
+    deleted: &std::collections::BTreeSet<&str>,
 ) -> Option<SymbolResult<'a>> {
     let GraphRecord::Node {
         id,
@@ -6254,6 +6295,11 @@ fn symbol_result<'a>(
     if node_name.as_deref() != Some(name) {
         return None;
     }
+    let (completeness, _) = repo_relative_path
+        .as_deref()
+        .map_or(("complete", None), |path| {
+            get_file_diagnostics(all_records, path, deleted)
+        });
     let repository_id = index.owner_of(id);
     Some(SymbolResult {
         record_id: id,
@@ -6266,6 +6312,8 @@ fn symbol_result<'a>(
         repository_id,
         repository: repository_id.and_then(|repo| index.display_of(repo)),
         freshness: None,
+        extraction_completeness: completeness,
+        diagnostics: None,
     })
 }
 
@@ -6302,9 +6350,10 @@ fn query_symbol_as_of(
                     exit_ambiguous_repository(&groups);
                 }
             }
+            let deleted = current_deleted_ids(records);
             let mut symbol_results: Vec<SymbolResult<'_>> = results
                 .iter()
-                .filter_map(|r| symbol_result(r, name, index))
+                .filter_map(|r| symbol_result(r, name, index, records, &deleted))
                 .collect();
             stamp_freshness(&mut symbol_results, freshness_code);
             for result in &symbol_results {
@@ -6349,6 +6398,9 @@ struct TxSymbolRow<'a> {
     /// Human-usable repository identity handle (e.g. `owner/name`).
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<&'a str>,
+    extraction_completeness: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<Vec<DiagnosticRef<'a>>>,
 }
 
 /// Response envelope for `eg query symbol --tx-as-of`.
@@ -6378,6 +6430,8 @@ struct TxPage {
 fn tx_symbol_row<'a>(
     record: &'a GraphRecord,
     index: &'a query::RepositoryIndex,
+    all_records: &'a [GraphRecord],
+    deleted: &std::collections::BTreeSet<&str>,
 ) -> Option<TxSymbolRow<'a>> {
     let GraphRecord::Node {
         id,
@@ -6395,6 +6449,11 @@ fn tx_symbol_row<'a>(
     else {
         return None;
     };
+    let (completeness, _) = repo_relative_path
+        .as_deref()
+        .map_or(("complete", None), |path| {
+            get_file_diagnostics(all_records, path, deleted)
+        });
     // Prefer the explicit node `domain` field; otherwise fall back to the
     // kind-derived domain (a `'static str`).
     let domain_str = domain
@@ -6422,6 +6481,8 @@ fn tx_symbol_row<'a>(
         transaction_time: query::record_transaction_time(record).unwrap_or(""),
         repository_id,
         repository: repository_id.and_then(|repo| index.display_of(repo)),
+        extraction_completeness: completeness,
+        diagnostics: None,
     })
 }
 
@@ -6484,10 +6545,11 @@ fn query_symbol_tx_as_of(
             std::process::exit(1);
         }
         Ok(result) => {
+            let deleted = current_deleted_ids(records);
             let rows: Vec<TxSymbolRow<'_>> = result
                 .records
                 .iter()
-                .filter_map(|r| tx_symbol_row(r, index))
+                .filter_map(|r| tx_symbol_row(r, index, records, &deleted))
                 .collect();
             let envelope = TxSymbolEnvelope {
                 ok: true,
@@ -6689,7 +6751,8 @@ fn query_symbol_at(
             std::process::exit(2);
         }
         Some(record) => {
-            if let Some(mut result) = symbol_result(record, name, index) {
+            let deleted = current_deleted_ids(records);
+            if let Some(mut result) = symbol_result(record, name, index, records, &deleted) {
                 stamp_freshness(std::slice::from_mut(&mut result), freshness_code);
                 print_result(&result, format)?;
             }
@@ -6761,6 +6824,7 @@ fn query_file(
             && selected_repo.is_none_or(|repo| index.owner_of(id) == Some(repo))
     });
 
+    let (completeness, diags) = get_file_diagnostics(records, path, &deleted);
     let mut results: Vec<SymbolResult<'_>> = Vec::new();
     // Same-path rows excluded by the repository scope: counted and surfaced
     // through a diagnostic only — never mixed into the result set (issue #67).
@@ -6808,6 +6872,8 @@ fn query_file(
             repository_id,
             repository: repository_id.and_then(|repo| index.display_of(repo)),
             freshness: None,
+            extraction_completeness: completeness,
+            diagnostics: diags.clone(),
         });
     }
 
@@ -8603,8 +8669,9 @@ impl PrintText for SymbolResult<'_> {
         let freshness = self
             .freshness
             .map_or(String::new(), |code| format!(" (freshness: {code})"));
+        let completeness = format!(" (extraction: {})", self.extraction_completeness);
         format!(
-            "{} ({}) @ {path}:{line}{commit}{freshness}",
+            "{} ({}) @ {path}:{line}{commit}{freshness}{completeness}",
             self.name, self.kind
         )
     }

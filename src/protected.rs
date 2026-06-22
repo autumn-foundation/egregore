@@ -578,13 +578,17 @@ fn open_source_checked(path: &Path) -> io::Result<fs::File> {
         // component symlink/reparse point (best effort, small TOCTOU) so a
         // symlinked leaf is not followed and silently accepted, keeping this
         // consistent with the `symlink_metadata` rejection elsewhere.
-        if path
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink())
-        {
+        let meta = path.symlink_metadata()?;
+        if meta.file_type().is_symlink() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "path is a symlink",
+            ));
+        }
+        if !meta.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not a regular file",
             ));
         }
         fs::File::open(path)?

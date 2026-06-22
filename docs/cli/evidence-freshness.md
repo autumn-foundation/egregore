@@ -226,6 +226,7 @@ raw `text` body is never surfaced.
 | **`eg query evidence-freshness`** (this) | Whether an **agent note's cited code** has moved since the note was recorded — batch "which of my notes are now stale?" |
 | `eg query memory` (#64) | The **evidence behind a memory claim**: provenance, support, author-written contradictions/supersessions. It surfaces *existing* supersession records; it does not *compute* drift-based link staleness. |
 | `eg freshness` (#82) | Store-vs-working-tree freshness for **code facts** (does the store match the tree?). It excludes memory and per-symbol re-resolution. |
+| Extraction completeness (#87) | Whether a **symbol or file scan scope** succeeded without unparsed syntax errors or macro blocks (`complete`/`partial`). |
 | `eg query drift` (#55) | The largest **code-only** semantic drifts, ranked by score. It says nothing about which memory cited that code. |
 | `git blame` / `git log -L` | Manual, per-file archaeology of when specific lines changed — no link from a note to the code, no trust separation, no batch answer. |
 | `rg` | Fast recursive **text** search when you know where to look. |
