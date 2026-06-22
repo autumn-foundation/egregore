@@ -65,7 +65,7 @@ separate commands.
 
 | Check ID | Gate | Requirement | Pass condition |
 |---|---|---|---|
-| `repository_path` | structural | required | PATH is a directory `scan` can fully traverse — reuses `discover_rust_source_files`, so an unreadable root **or descendant** directory fails it |
+| `repository_path` | structural | required | PATH is a directory `scan` can fully traverse — reuses `discover_source_files`, so an unreadable root **or descendant** directory fails it |
 | `git_available` | structural | required | `git --version` succeeds |
 | `git_history_readable` | structural | optional → **required** with `--require-history` | `git -C <PATH> log -1` succeeds |
 | `output_path_writable` | structural | required | `--out` is a writable file target (the path itself if it exists, else its parent) |

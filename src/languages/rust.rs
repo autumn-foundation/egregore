@@ -7,7 +7,8 @@ use tree_sitter::{Node, Parser};
 use crate::{
     error::{CodegraphError, Result},
     fs::SourceFile,
-    ir::{EdgeLabel, Graph, GraphRecord, NodeKind, SourceSpan, stable_id},
+    ir::{EdgeLabel, Graph, GraphRecord, NodeKind, stable_id},
+    languages::common::{contains_identifier, looks_like_call, span},
 };
 
 /// Extracts Rust syntax records from one source file.
@@ -455,15 +456,6 @@ fn node_name(node: Node<'_>, source: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn span(node: Node<'_>) -> SourceSpan {
-    SourceSpan {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-    }
-}
-
 fn import_name(text: &str) -> String {
     text.trim()
         .trim_start_matches("use")
@@ -498,40 +490,6 @@ fn macro_invocation_name(text: &str) -> String {
         .trim_end_matches(';')
         .to_owned()
         + "!"
-}
-
-fn looks_like_call(text: &str, name: &str) -> bool {
-    let simple_name = name.rsplit("::").next().unwrap_or(name);
-    let direct = format!("{simple_name}(");
-    let associated = format!("::{simple_name}(");
-    let method = format!(".{simple_name}(");
-    text.contains(&direct) || text.contains(&associated) || text.contains(&method)
-}
-
-const fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-/// True when `name` occurs in `text` as a standalone identifier path — i.e. each
-/// occurrence is not flanked by identifier characters. Avoids substring false
-/// positives such as `Error` matching inside `ParseError`, which would otherwise
-/// promote an unrelated symbol to a first-class code reference.
-fn contains_identifier(text: &str, name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    let bytes = text.as_bytes();
-    let nlen = name.len();
-    // `match_indices` yields byte offsets at valid char boundaries, so no manual
-    // slicing can split a multi-byte UTF-8 character (Unicode identifiers would
-    // otherwise panic during a scan). A non-identifier flanking byte — including
-    // any UTF-8 continuation/lead byte — counts as a token boundary.
-    text.match_indices(name).any(|(idx, _)| {
-        let before_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
-        let end = idx + nlen;
-        let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
-        before_ok && after_ok
-    })
 }
 
 fn file_module_path(repo_relative_path: &str) -> Vec<String> {
@@ -1310,22 +1268,6 @@ pub fn normalize_file_code(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn contains_identifier_requires_token_boundaries() {
-        // Whole-identifier matches are accepted, including qualified paths.
-        assert!(contains_identifier("let x: Error = make();", "Error"));
-        assert!(contains_identifier("foo::Error::new()", "Error"));
-        assert!(contains_identifier("-> Widget {", "Widget"));
-        // Substrings of a larger identifier are rejected.
-        assert!(!contains_identifier("let e: ParseError = x;", "Error"));
-        assert!(!contains_identifier("Errorhandler::run()", "Error"));
-        assert!(!contains_identifier("my_widget", "widget"));
-        // A multi-byte Unicode identifier appearing only inside a larger
-        // identifier must be rejected without panicking on a char boundary.
-        assert!(!contains_identifier("xéx", "é"));
-        assert!(contains_identifier("call(é)", "é"));
-    }
 
     #[test]
     fn test_normalize_raw_strings() {

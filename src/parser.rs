@@ -4,10 +4,13 @@ use crate::{
     error::Result,
     fs::SourceFile,
     ir::{Graph, GraphRecord},
-    languages,
+    languages::{self, Language},
 };
 
-/// Extracts syntax-backed graph records for a source file.
+/// Extracts syntax-backed graph records for a source file, dispatching to the
+/// extractor for the file's detected language.
+///
+/// Files whose extension is not a supported source language are skipped.
 ///
 /// # Errors
 ///
@@ -18,11 +21,19 @@ pub fn extract_source_file(
     repository_id: &str,
     graph: &mut Graph,
 ) -> Result<()> {
-    languages::rust::extract_file(file, file_id, repository_id, graph)
+    match languages::detect(&file.repo_relative_path) {
+        Some(Language::Rust) => languages::rust::extract_file(file, file_id, repository_id, graph),
+        Some(Language::Python) => {
+            languages::python::extract_file(file, file_id, repository_id, graph)
+        }
+        None => Ok(()),
+    }
 }
 
 /// Extracts syntax-backed graph records from source text that may not exist in
-/// the current working tree.
+/// the current working tree, dispatching by the file's detected language.
+///
+/// Files whose extension is not a supported source language are skipped.
 ///
 /// # Errors
 ///
@@ -34,7 +45,15 @@ pub fn extract_source_text(
     repository_id: &str,
     graph: &mut Graph,
 ) -> Result<()> {
-    languages::rust::extract_file_source(file, source, file_id, repository_id, graph)
+    match languages::detect(&file.repo_relative_path) {
+        Some(Language::Rust) => {
+            languages::rust::extract_file_source(file, source, file_id, repository_id, graph)
+        }
+        Some(Language::Python) => {
+            languages::python::extract_file_source(file, source, file_id, repository_id, graph)
+        }
+        None => Ok(()),
+    }
 }
 
 /// Adds a repository containment edge for a file node.

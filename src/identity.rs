@@ -440,7 +440,7 @@ fn git_head_commit_sha(repo_root: &Path) -> Option<String> {
 /// Git is unavailable or the status probe fails, which callers treat as dirty.
 ///
 /// The probe is scoped to the same source set the scanner actually indexes
-/// (PR #186 follow-up HH1): `discover_rust_source_files` skips every `target`
+/// (PR #186 follow-up HH1): `discover_source_files` skips every `target`
 /// directory and never descends into submodules (`fs::should_descend`), so an
 /// unignored `target/` build tree or a dirty/out-of-date submodule must not count
 /// as source dirtiness here either — neither can produce a cited span.
@@ -458,13 +458,14 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
         "--untracked-files=all",
         "--ignore-submodules=all",
     ]);
-    // Scope the probe to the indexed source set: only `.rs` files can produce
-    // cited graph spans, so the freshness verdict must ignore every non-source
-    // artifact in the working tree — graph/JSONL outputs, embedded-store
-    // directories, refresh caches (including custom out-of-tree ones the caller
-    // cannot name), and build output — regardless of name or location (RR1/XX1).
-    // The positive `:(glob)**/*.rs` pathspec matches `.rs` files at any depth
-    // (root included); deletions and renames of tracked `.rs` files still surface.
+    // Scope the probe to the indexed source set: only supported source files
+    // (`.rs`, `.py`) can produce cited graph spans, so the freshness verdict must
+    // ignore every non-source artifact in the working tree — graph/JSONL outputs,
+    // embedded-store directories, refresh caches (including custom out-of-tree
+    // ones the caller cannot name), and build output — regardless of name or
+    // location (RR1/XX1). The positive `:(glob)**/*.rs` / `:(glob)**/*.py`
+    // pathspecs match source files at any depth (root included); deletions and
+    // renames of tracked source files still surface.
     //
     // `:(glob)**/.gitignore` also includes versioned ignore files: the indexed set
     // depends on them (the scanner drops gitignored untracked `.rs`), so adding or
@@ -480,6 +481,7 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
     command.args([
         "--",
         ":(glob)**/*.rs",
+        ":(glob)**/*.py",
         ":(glob)**/.gitignore",
         ":(exclude)target",
         ":(exclude,glob)**/target/**",
@@ -516,10 +518,10 @@ fn git_ls_files_v(repo_root: &Path) -> Option<String> {
 }
 
 /// Parses one `git ls-files -v` line, returning the repo-relative path of a
-/// source-set input — a `.rs` source or a versioned `.gitignore`, outside any
-/// `target/` directory — that carries an index flag hiding its state from
-/// `git status` (`skip-worktree` = `S`, `assume-unchanged` = a lowercase tag).
-/// Returns `None` for any other line.
+/// source-set input — a supported source file (`.rs`, `.py`) or a versioned
+/// `.gitignore`, outside any `target/` directory — that carries an index flag
+/// hiding its state from `git status` (`skip-worktree` = `S`, `assume-unchanged`
+/// = a lowercase tag). Returns `None` for any other line.
 ///
 /// `.gitignore` counts because the indexed set depends on it (BBB1/EEE1); files
 /// under `target/` are excluded to match the scanner's pruning (WW1).
@@ -535,14 +537,14 @@ fn hidden_source_input_path(line: &str) -> Option<&str> {
     if path.components().any(|c| c.as_os_str() == "target") {
         return None;
     }
-    let is_source_input = path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+    let is_source_input = crate::languages::is_supported_source(path)
         || path.file_name().and_then(|n| n.to_str()) == Some(".gitignore");
     is_source_input.then_some(rel)
 }
 
-/// Returns `true` when any source-set input (`.rs` or versioned `.gitignore`)
-/// that is **present in the working tree** carries an index flag hiding its state
-/// from `git status` (PR #186 follow-up LL1/EEE1).
+/// Returns `true` when any source-set input (a supported source file or versioned
+/// `.gitignore`) that is **present in the working tree** carries an index flag
+/// hiding its state from `git status` (PR #186 follow-up LL1/EEE1).
 ///
 /// The file must exist on disk to count: a clean sparse checkout marks omitted
 /// files `skip-worktree` AND leaves them absent, so the scanner never indexed

@@ -2351,7 +2351,7 @@ fn egregore_store_dirs(repo_path: &Path) -> Vec<std::path::PathBuf> {
         // Even when no content is tracked, an untracked directory containing `.rs`
         // files is a source directory, not a store output: its files appear in the
         // graph but are outside `git status`, so excluding it would mask deletions.
-        if !has_tracked && !dir_has_rust_sources(&path) {
+        if !has_tracked && !dir_has_sources(&path) {
             dirs.push(path);
         }
     }
@@ -2377,22 +2377,22 @@ fn store_exclusions_including_egregore(
     store_artifact_exclusions(repo_path, &all)
 }
 
-/// Returns `true` if `dir` or any subdirectory contains a `.rs` file.
+/// Returns `true` if `dir` or any subdirectory contains a supported source file.
 ///
 /// Used in the `.egregore*` auto-exclusion check: an untracked directory whose
-/// subtree contains `.rs` source files is a source directory, not a store output,
-/// and must not be excluded from the snapshot dirty probe.
-fn dir_has_rust_sources(dir: &Path) -> bool {
+/// subtree contains source files is a source directory, not a store output, and
+/// must not be excluded from the snapshot dirty probe.
+fn dir_has_sources(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if dir_has_rust_sources(&path) {
+            if dir_has_sources(&path) {
                 return true;
             }
-        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+        } else if crate::languages::is_supported_source(&path) {
             return true;
         }
     }
