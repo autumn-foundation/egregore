@@ -2460,3 +2460,166 @@ fn query_context_file_edit_carries_fileedit_metadata() {
         "linked_patch_id must be forwarded for FileEdit (optional but present)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue 87: extraction completeness tests
+// ---------------------------------------------------------------------------
+
+fn fixture_graph_with_diagnostics() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("graph.jsonl");
+
+    let clean_file_id = stable_id(&["node", "File", "src/clean.rs"]);
+    let clean_sym_id = stable_id(&["node", "Symbol", "src/clean.rs", "clean_fn"]);
+
+    let dirty_file_id = stable_id(&["node", "File", "src/dirty.rs"]);
+    let dirty_sym_id = stable_id(&["node", "Symbol", "src/dirty.rs", "dirty_fn"]);
+
+    let clean_file = GraphRecord::syntax_node(
+        clean_file_id.clone(),
+        NodeKind::File,
+        "src/clean.rs".to_owned(),
+        span(1, 50),
+        "clean.rs".to_owned(),
+        "rust",
+        "Source file src/clean.rs".to_owned(),
+    );
+    let clean_sym = GraphRecord::symbol(
+        clean_sym_id.clone(),
+        "fn",
+        "src/clean.rs".to_owned(),
+        span(10, 20),
+        "clean_fn".to_owned(),
+        "Rust function clean_fn".to_owned(),
+    );
+    let clean_edge = GraphRecord::edge(
+        EdgeLabel::Defines,
+        clean_file_id,
+        clean_sym_id,
+        Some("1.0".to_owned()),
+        "defines".to_owned(),
+    );
+
+    let dirty_file = GraphRecord::syntax_node(
+        dirty_file_id.clone(),
+        NodeKind::File,
+        "src/dirty.rs".to_owned(),
+        span(1, 50),
+        "dirty.rs".to_owned(),
+        "rust",
+        "Source file src/dirty.rs".to_owned(),
+    );
+    let dirty_sym = GraphRecord::symbol(
+        dirty_sym_id.clone(),
+        "fn",
+        "src/dirty.rs".to_owned(),
+        span(10, 20),
+        "dirty_fn".to_owned(),
+        "Rust function dirty_fn".to_owned(),
+    );
+    let dirty_edge = GraphRecord::edge(
+        EdgeLabel::Defines,
+        dirty_file_id,
+        dirty_sym_id,
+        Some("1.0".to_owned()),
+        "defines".to_owned(),
+    );
+
+    let diag_id = stable_id(&["node", "Diagnostic", "src/dirty.rs", "error_1"]);
+    let diag = GraphRecord::node(
+        diag_id,
+        NodeKind::Diagnostic,
+        Some("src/dirty.rs".to_owned()),
+        Some(span(15, 16)),
+        None,
+        "unparsed macro".to_owned(),
+    );
+
+    let mut graph = Graph::new();
+    graph.push(clean_file);
+    graph.push(clean_sym);
+    graph.push(clean_edge);
+    graph.push(dirty_file);
+    graph.push(dirty_sym);
+    graph.push(dirty_edge);
+    graph.push(diag);
+
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+
+    (temp, path)
+}
+
+#[test]
+fn query_file_completeness_flagging() {
+    let (_temp, graph) = fixture_graph_with_diagnostics();
+
+    // Query clean file - should be complete
+    let output = egregore()
+        .args(["query", "file", "src/clean.rs", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("first line")).expect("valid JSON");
+    assert_eq!(parsed["extraction_completeness"], "complete");
+    assert!(parsed["diagnostics"].is_null() || parsed.get("diagnostics").is_none());
+
+    // Query dirty file - should be partial and enumerate diagnostics
+    let output = egregore()
+        .args(["query", "file", "src/dirty.rs", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("first line")).expect("valid JSON");
+    assert_eq!(parsed["extraction_completeness"], "partial");
+
+    let diags = parsed["diagnostics"].as_array().expect("diagnostics array");
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0]["repo_relative_path"], "src/dirty.rs");
+    assert_eq!(diags[0]["span"]["start_line"].as_u64(), Some(15));
+}
+
+#[test]
+fn query_symbol_completeness_flagging() {
+    let (_temp, graph) = fixture_graph_with_diagnostics();
+
+    // Clean symbol - complete
+    let output = egregore()
+        .args(["query", "symbol", "clean_fn", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("first line")).expect("valid JSON");
+    assert_eq!(parsed["extraction_completeness"], "complete");
+    assert!(parsed["diagnostics"].is_null() || parsed.get("diagnostics").is_none());
+
+    // Dirty symbol - partial
+    let output = egregore()
+        .args(["query", "symbol", "dirty_fn", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("first line")).expect("valid JSON");
+    assert_eq!(parsed["extraction_completeness"], "partial");
+    // Symbol query results don't need to serialize the diagnostics themselves, just the status
+}
