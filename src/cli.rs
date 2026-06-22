@@ -4344,7 +4344,13 @@ fn audit_citations_cmd(
             .context("failed to serialize citation audit report")?,
     };
     println!("{output}");
-    std::process::exit(i32::from(!report.ok));
+    // `process::exit` bypasses destructors, so the throwaway store copy's `TempDir`
+    // guard would leak a full copied store under the temp dir on every `--data-dir`
+    // run. Drop it explicitly before exiting (the borrow in `effective_data_dir` is
+    // dead after the reads above).
+    let exit_code = i32::from(!report.ok);
+    drop(store_copy);
+    std::process::exit(exit_code);
 }
 
 /// Collects embedded-store semantic retrieval leads for the audit, when the

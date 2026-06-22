@@ -418,3 +418,103 @@ fn agent_provenance_handles_are_accepted() {
         CitationStatus::MissingRequiredHandle
     );
 }
+
+// Round-9 review: `protected_payload_diagnostics` byte-filters only stdout/stderr;
+// a zero-byte `body`/`diff_hunk`/`arguments`/`result` handle is still emitted as a
+// protected payload, so the audit must exclude it as protected rather than count it
+// as an ordinary returned row.
+#[test]
+fn zero_byte_body_handle_is_excluded_protected() {
+    let mut task = node("project:v1:task_zp", NodeKind::Task);
+    if let GraphRecord::Node { body_handle, .. } = &mut task {
+        *body_handle = Some(Box::new(crate::ir::OutputHandle {
+            inline: None,
+            hash: "blake3:zero-body".to_owned(),
+            bytes: 0,
+        }));
+    }
+    assert_eq!(
+        referenced_protected_handle(&task).as_deref(),
+        Some("blake3:zero-body")
+    );
+
+    // A zero-byte stdout stream stays an ordinary row (byte-filtered like the public
+    // diagnostics), so it is not treated as a protected payload.
+    let mut cmd = node("verification:v1:cmd_zs", NodeKind::CommandEvidence);
+    if let GraphRecord::Node { stdout_handle, .. } = &mut cmd {
+        *stdout_handle = Some(Box::new(crate::ir::OutputHandle {
+            inline: None,
+            hash: "blake3:zero-stdout".to_owned(),
+            bytes: 0,
+        }));
+    }
+    assert_eq!(referenced_protected_handle(&cmd), None);
+}
+
+// Round-9 review: `eg query subsystem <prefix>` accepts a bare file path as a
+// prefix (exact-path match is "under" the prefix), so a repo-root source fact with
+// no `/` is a real subsystem entry point and must stay in the audited prefix set.
+#[test]
+fn subsystem_prefixes_include_root_level_paths() {
+    let file = |id: &str, path: &str| {
+        GraphRecord::node(
+            id.to_owned(),
+            NodeKind::File,
+            Some(path.to_owned()),
+            None,
+            Some(path.to_owned()),
+            format!("file {path}"),
+        )
+    };
+    let records = vec![
+        file("codegraph:v1:f_root", "build.rs"),
+        file("codegraph:v1:f_nested", "src/lib.rs"),
+    ];
+    let prefixes = subsystem_prefixes(&records);
+    assert!(
+        prefixes.contains("build.rs"),
+        "root-level file kept as its own prefix: {prefixes:?}"
+    );
+    assert!(
+        prefixes.contains("src"),
+        "nested file keeps its parent-dir prefix: {prefixes:?}"
+    );
+}
+
+// Round-9 review: with two disconnected commit chains in one store, pairing
+// root/tip extrema across chains yields a `NoPath` that disables the whole lane.
+// `changes_range` must return a base/head pair proven connected by parent topology.
+#[test]
+fn changes_range_picks_a_connected_pair() {
+    let commit = |sha: &str, parents: &[&str]| -> GraphRecord {
+        GraphRecord::node(
+            format!("codegraph:v1:commit_{sha}"),
+            NodeKind::Commit,
+            None,
+            None,
+            Some(sha.to_owned()),
+            format!("commit {sha}"),
+        )
+        .with_temporal(crate::ir::TemporalMetadata {
+            git_commit: sha.to_owned(),
+            git_parent_commits: parents.iter().map(|s| (*s).to_owned()).collect(),
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: None,
+        })
+    };
+    // Chain A: a0 → a1.  Chain B: b0 → b1.  No edge connects the chains.
+    let records = vec![
+        commit("a0", &[]),
+        commit("a1", &["a0"]),
+        commit("b0", &[]),
+        commit("b1", &["b0"]),
+    ];
+    let (base, head) = changes_range(&records).expect("a connected pair exists");
+    let connected = (base == "a0" && head == "a1") || (base == "b0" && head == "b1");
+    assert!(
+        connected,
+        "expected a parent-connected in-chain pair, got ({base}, {head})"
+    );
+}

@@ -344,21 +344,26 @@ fn referenced_protected_handle(record: &GraphRecord) -> Option<String> {
     else {
         return None;
     };
-    // A withheld output payload is protected only when it actually carries bytes;
-    // the public memory/failure diagnostics emit `protected_payload` for these
-    // handles only when `bytes > 0`, so a zero-byte stdout/stderr stays a normal
-    // returned row.
-    if let Some(output) = [
-        stdout_handle,
-        stderr_handle,
-        result_handle,
-        arguments_handle,
-        body_handle,
-        diff_hunk_handle,
-    ]
-    .into_iter()
-    .flatten()
-    .find(|h| h.bytes > 0)
+    // `protected_payload_diagnostics` byte-filters only stdout/stderr (a zero-byte
+    // command stream stays a normal returned row), but emits `protected_payload`
+    // for a `body`/`diff_hunk`/`arguments`/`result` handle whenever it is present,
+    // regardless of byte count. Mirror that split so a zero-byte task/tool payload
+    // is still excluded as protected rather than audited as an ordinary row.
+    if let Some(output) = [stdout_handle, stderr_handle]
+        .into_iter()
+        .flatten()
+        .find(|h| h.bytes > 0)
+        .or_else(|| {
+            [
+                body_handle,
+                diff_hunk_handle,
+                arguments_handle,
+                result_handle,
+            ]
+            .into_iter()
+            .flatten()
+            .next()
+        })
     {
         return Some(output.hash.clone());
     }
@@ -973,9 +978,17 @@ fn source_fact_paths(records: &[GraphRecord]) -> BTreeSet<&str> {
 }
 
 fn subsystem_prefixes(records: &[GraphRecord]) -> BTreeSet<String> {
+    // `eg query subsystem <prefix>` accepts a bare file path as a prefix
+    // (`path_is_under_prefix` treats an exact path match as under the prefix), so a
+    // repo-root file like `build.rs`/`main.rs` is a real public subsystem entry
+    // point. Use the parent directory when there is one, else the path itself, so
+    // those root-level rows are audited instead of dropped.
     source_fact_paths(records)
         .into_iter()
-        .filter_map(|path| path.rsplit_once('/').map(|(dir, _)| dir.to_owned()))
+        .map(|path| match path.rsplit_once('/') {
+            Some((dir, _)) => dir.to_owned(),
+            None => path.to_owned(),
+        })
         .collect()
 }
 
@@ -1481,17 +1494,44 @@ fn changes_range(records: &[GraphRecord]) -> Option<(&str, &str)> {
             }
         }
     }
-    // base = earliest root (no in-set parent); head = latest tip (no in-set child).
-    let base = shas.iter().find(|sha| {
-        parents_of
-            .get(*sha)
-            .is_none_or(|parents| parents.iter().all(|p| !shas.contains(p)))
-    })?;
-    let head = shas.iter().rev().find(|sha| !is_parent.contains(*sha))?;
-    if base == head {
-        return None;
+    // In-set ancestors of `start` reachable via parent edges (excluding `start`).
+    let ancestors_of = |start: &str| -> BTreeSet<&str> {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut stack = vec![start];
+        while let Some(current) = stack.pop() {
+            if let Some(parents) = parents_of.get(current) {
+                for parent in parents {
+                    if shas.contains(parent) && seen.insert(*parent) {
+                        stack.push(*parent);
+                    }
+                }
+            }
+        }
+        seen
+    };
+    // `changes_context` needs `base` reachable from `head` via parent topology, so
+    // root/tip extrema from two disconnected chains pair into a `NoPath`. Walk each
+    // tip's (latest sha first) ancestry and pair it with a reachable root — a
+    // provably connected range a public `eg query changes <base> <head>` accepts.
+    for head in shas.iter().rev() {
+        if is_parent.contains(head) {
+            continue; // not a tip — some in-set commit descends from it
+        }
+        let ancestors = ancestors_of(head);
+        let base = ancestors
+            .iter()
+            .find(|a| {
+                parents_of
+                    .get(**a)
+                    .is_none_or(|parents| parents.iter().all(|p| !shas.contains(p)))
+            })
+            .or_else(|| ancestors.iter().next())
+            .copied();
+        if let Some(base) = base {
+            return Some((base, head));
+        }
     }
-    Some((base, head))
+    None
 }
 
 fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder {
