@@ -888,16 +888,10 @@ fn gate_fails_when_noncode_row_missing_handle() {
         None,
         "bare observation".to_owned(),
     );
-    if let GraphRecord::Node {
-        schema_version,
-        agent_id,
-        session_id,
-        ..
-    } = &mut obs
-    {
+    // Genuinely provenance-less: no source handle, no evidence link, and no
+    // agent/session provenance handle — the row carries nothing citable.
+    if let GraphRecord::Node { schema_version, .. } = &mut obs {
         *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
-        *agent_id = Some("agent_1".to_owned());
-        *session_id = Some("sess_1".to_owned());
     }
     graph.push(obs);
     fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");

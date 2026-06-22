@@ -376,3 +376,45 @@ fn file_source_fact_is_path_cited() {
     assert_eq!(result.row.primary_handle.as_deref(), Some("src/lib.rs"));
     assert!(result.diagnostic.is_none());
 }
+
+// Review round 4: an agent claim is citable by source-artifact provenance or by
+// its agent/session handle (matching public memory/context output), but a row
+// with no provenance at all is missing.
+#[test]
+fn agent_provenance_handles_are_accepted() {
+    // source_artifact_path provenance.
+    let mut by_artifact = node("agent_memory:v1:obs_a", NodeKind::Observation);
+    if let GraphRecord::Node {
+        source_artifact_path,
+        ..
+    } = &mut by_artifact
+    {
+        source_artifact_path.replace("trajectories/run.traj".to_owned());
+    }
+    assert_eq!(
+        classify_record(&by_artifact).row.status,
+        CitationStatus::Cited
+    );
+
+    // agent_id + session_id session-provenance handle.
+    let mut by_session = node("agent_memory:v1:obs_b", NodeKind::Observation);
+    if let GraphRecord::Node {
+        agent_id,
+        session_id,
+        ..
+    } = &mut by_session
+    {
+        *agent_id = Some("agent_1".to_owned());
+        *session_id = Some("sess_1".to_owned());
+    }
+    let result = classify_record(&by_session);
+    assert_eq!(result.row.status, CitationStatus::Cited);
+    assert_eq!(result.row.primary_handle.as_deref(), Some("agent_1:sess_1"));
+
+    // No provenance at all → missing.
+    let bare = node("agent_memory:v1:obs_c", NodeKind::Observation);
+    assert_eq!(
+        classify_record(&bare).row.status,
+        CitationStatus::MissingRequiredHandle
+    );
+}

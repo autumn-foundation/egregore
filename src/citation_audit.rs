@@ -447,30 +447,50 @@ fn classify_code_handle(
     }
 }
 
-/// Returns the first agent-authored evidence handle that points at a record
+/// Returns the first agent-authored provenance handle that points at something
 /// **other than** the claim itself (AC6: a claim is never its own evidence).
+///
+/// Accepts the same provenance the public `eg query memory`/`context` rows expose:
+/// a `source_handle`, a source-artifact path/hash, an external evidence-link
+/// target, or the `agent_id`/`session_id` session provenance handle.
 fn agent_external_handle(record: &GraphRecord) -> Option<String> {
     let GraphRecord::Node {
         id,
         source_handle,
+        source_artifact_path,
+        source_artifact_hash,
         evidence_links,
+        agent_id,
+        session_id,
         ..
     } = record
     else {
         return None;
     };
-    if let Some(handle) = source_handle.as_deref().filter(|h| !h.is_empty()) {
-        return Some(handle.to_owned());
+    if let Some(handle) = [source_handle, source_artifact_path, source_artifact_hash]
+        .into_iter()
+        .flatten()
+        .find(|h| !h.is_empty())
+    {
+        return Some(handle.clone());
     }
-    let links = evidence_links.as_ref()?;
-    links.iter().find_map(|link| {
-        let target = link.target_record_id.as_deref()?;
-        if target != id && !target.is_empty() {
-            Some(target.to_owned())
-        } else {
-            None
+    if let Some(links) = evidence_links
+        && let Some(target) = links.iter().find_map(|link| {
+            link.target_record_id
+                .as_deref()
+                .filter(|t| *t != id && !t.is_empty())
+        })
+    {
+        return Some(target.to_owned());
+    }
+    // Session provenance (`agent_id:session_id`) is a usable citation handle for
+    // imported claims that carry no artifact handle.
+    match (agent_id.as_deref(), session_id.as_deref()) {
+        (Some(agent), Some(session)) if !agent.is_empty() && !session.is_empty() => {
+            Some(format!("{agent}:{session}"))
         }
-    })
+        _ => None,
+    }
 }
 
 /// Returns the first project/source handle a project-state record carries.
@@ -839,14 +859,21 @@ fn symbol_names(records: &[GraphRecord]) -> BTreeSet<&str> {
 }
 
 fn file_paths(records: &[GraphRecord]) -> BTreeSet<&str> {
+    // `eg query file <path>` returns nothing for a tombstoned file, so the `file`
+    // workflow must not drive deleted-file paths (which would otherwise count
+    // historical symbols the public command no longer emits).
+    let tombstoned = tombstoned_ids(records);
     records
         .iter()
         .filter_map(|r| match r {
             GraphRecord::Node {
+                id,
                 kind,
                 repo_relative_path: Some(path),
                 ..
-            } if kind.as_str() == "File" => Some(path.as_str()),
+            } if kind.as_str() == "File" && !tombstoned.contains(id.as_str()) => {
+                Some(path.as_str())
+            }
             _ => None,
         })
         .collect()
@@ -909,7 +936,15 @@ fn failure_source_handles(records: &[GraphRecord]) -> BTreeSet<String> {
         };
         if !matches!(
             kind.as_str(),
-            "Failure" | "Verification" | "CommandRun" | "CommandEvidence" | "TestRun" | "CIStatus"
+            "Failure"
+                | "Verification"
+                | "CommandRun"
+                | "CommandEvidence"
+                | "TestRun"
+                | "CIStatus"
+                | "BenchmarkRun"
+                | "CoverageReport"
+                | "ProofResult"
         ) {
             continue;
         }
@@ -1125,9 +1160,11 @@ fn drive_task(records: &[GraphRecord]) -> WorkflowBuilder {
 fn drive_memory(records: &[GraphRecord]) -> WorkflowBuilder {
     let mut builder = WorkflowBuilder::new("memory", "agent_authored");
     for memory_id in memory_claim_ids(records) {
-        // Run with `verified_only` so unverified observations land in the
-        // `excluded` section, demonstrating reported-not-hidden exclusion (AC6).
-        let ctx = memory_audit_context(records, &memory_id, true);
+        // Audit the DEFAULT `eg query memory` view (no `--verified-only`): the
+        // default emits unverified supporting/contradicting claims as normal
+        // rows, so they must be classified (and gated) rather than moved to the
+        // excluded section by a `--verified-only` run the gate does not target.
+        let ctx = memory_audit_context(records, &memory_id, false);
         for record in ctx
             .memory_claim
             .iter()
@@ -1427,12 +1464,22 @@ fn drive_evidence_freshness(records: &[GraphRecord]) -> WorkflowBuilder {
         }
         let path = entry.cited_handle.repo_relative_path.as_deref();
         let span = entry.cited_handle.span.as_ref();
+        // Resolve the cited target's real kind so a file-level citation (path,
+        // no span — e.g. a `TOUCHED_FILE` link) is path-cited, not reported as a
+        // span-less `Symbol` miss. Default to `File` (path-cited) when unresolved.
+        let kind = entry
+            .cited_handle
+            .target_record_id
+            .as_deref()
+            .and_then(|t| by_id.get(t))
+            .and_then(|r| r.node_kind_name())
+            .unwrap_or("File");
         match (entry.cited_handle.target_record_id.as_deref(), path) {
             // A record-ID citation, or a triple-only citation that resolved to a
             // repo-relative path/span, is a real public freshness row: classify it
             // by its code handle rather than dropping it as unresolved.
             (Some(target_id), _) => {
-                let classified = classify_code_handle(target_id, "Symbol", path, span, false);
+                let classified = classify_code_handle(target_id, kind, path, span, false);
                 builder.push_classified(classified, String::new());
             }
             (None, Some(resolved_path)) => {
@@ -1440,7 +1487,7 @@ fn drive_evidence_freshness(records: &[GraphRecord]) -> WorkflowBuilder {
                     || resolved_path.to_owned(),
                     |s| format!("{resolved_path}:{}-{}", s.start_line, s.end_line),
                 );
-                let classified = classify_code_handle(&id, "Symbol", path, span, false);
+                let classified = classify_code_handle(&id, kind, path, span, false);
                 builder.push_classified(classified, String::new());
             }
             (None, None) => builder.add_diagnostic(
