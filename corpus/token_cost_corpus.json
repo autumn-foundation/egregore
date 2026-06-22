@@ -1,0 +1,39 @@
+{
+  "corpus_version": "1",
+  "corpus_name": "token-cost-settings-fixture",
+  "description": "A pinned four-file Rust settings stack used as the documented-equivalent representative corpus for the eg audit token-cost gate (issue #84). Functions are mentioned in comments and string literals on purpose so a text search returns many false-positive lines that a structural eg query answer does not.",
+  "source_dir": "token_cost_corpus",
+  "repository_id_override": "token-cost-fixture",
+  "scan_time": "2026-01-01T00:00:00Z",
+  "token_count_method": "word-punct-v1",
+  "min_ratio": 3.0,
+  "questions": [
+    {
+      "id": "q1-exact-symbol",
+      "class": "exact_symbol",
+      "description": "Where is the symbol parse_config defined?",
+      "eg_query": "config::parse_config",
+      "expected_record_id": "codegraph:v4:453eb6084504fa29d5df633b7332c771a49bcbdf14279a563b3b0b6d11fa5348",
+      "baseline_pattern": "parse_config",
+      "baseline_match_kind": "word_across_corpus"
+    },
+    {
+      "id": "q2-file-defines",
+      "class": "file_defines",
+      "description": "What does src/config.rs define?",
+      "eg_query": "src/config.rs",
+      "expected_record_id": "codegraph:v4:453eb6084504fa29d5df633b7332c771a49bcbdf14279a563b3b0b6d11fa5348",
+      "baseline_pattern": "src/config.rs",
+      "baseline_match_kind": "read_file"
+    },
+    {
+      "id": "q3-semantic",
+      "class": "semantic",
+      "description": "validate raw settings text into a typed configuration",
+      "eg_query": "validate raw settings text into a typed configuration",
+      "expected_record_id": "codegraph:v4:453eb6084504fa29d5df633b7332c771a49bcbdf14279a563b3b0b6d11fa5348",
+      "baseline_pattern": "settings",
+      "baseline_match_kind": "word_across_corpus"
+    }
+  ]
+}

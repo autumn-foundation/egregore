@@ -92,6 +92,23 @@ or when any non-code trust-class row lacks a source/evidence/policy handle. Outp
 deterministic and redaction-safe — record IDs, handles, hashes, markers, and counts only,
 never raw payloads. See `docs/cli/citation-audit.md`.
 
+Query-answer token-cost gate (issue #84):
+
+```powershell
+# Measure eg answer token cost vs the ripgrep baseline over a pinned corpus
+cargo run -- audit token-cost                                  # exit 0 pass, 1 gate fail, 2 load error
+cargo run -- audit token-cost --min-ratio 5                    # stricter savings floor
+```
+
+`eg audit token-cost` measures, per question class (exact-symbol, file-defines,
+semantic) and in aggregate, the baseline-to-Egregore token-savings ratio with raw counts,
+using one pinned deterministic token-count method (`word-punct-v1`) on both sides. The grep
+baseline is computed in-process (no ripgrep dependency, no network). Correctness is held
+constant: an answer counts only if it carries the expected record ID plus a repo-relative
+file/span or commit handle; an uncited answer is a miss, not a win. A class below threshold
+yields a distinct exit code and a `below_token_savings_threshold` diagnostic naming the class
+and ratio. Output is deterministic and redaction-safe. See `docs/cli/token-cost.md`.
+
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
 
 ## Working Rules

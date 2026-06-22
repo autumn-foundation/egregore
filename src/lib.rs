@@ -69,6 +69,8 @@ pub mod repair;
 pub mod schema_version;
 /// Semantic search relevance evaluation harness (issue #58).
 pub mod semantic_eval;
+/// Query-answer token-cost measurement against the ripgrep baseline (issue #84).
+pub mod token_cost;
 /// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
 pub mod traj;
 
