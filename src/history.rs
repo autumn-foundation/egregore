@@ -321,8 +321,8 @@ fn list_indexed_source_files(repo_root: &Path, sha: &str) -> Result<Vec<String>>
 /// Matches the live scanner's source set (`fs::discover_source_files`) so the history
 /// replay indexes exactly what `eg scan` would, keeping it consistent with the
 /// freshness dirty probe (which is scoped the same way):
-/// - a **case-sensitive** lowercase supported extension (`.rs`, `.py`) — the
-///   scanner matches `extension()` exactly, so an uppercase `LIB.RS` is not a
+/// - a **case-sensitive** lowercase supported extension (`.rs`, `.py`, `.ts`, `.tsx`) —
+///   the scanner matches `extension()` exactly, so an uppercase `LIB.RS` is not a
 ///   source (GGG1);
 /// - never under a `target/` build directory, which `fs::should_descend` prunes,
 ///   so committed build output is not indexed (GGG2).

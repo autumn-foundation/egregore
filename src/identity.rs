@@ -459,11 +459,12 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
         "--ignore-submodules=all",
     ]);
     // Scope the probe to the indexed source set: only supported source files
-    // (`.rs`, `.py`) can produce cited graph spans, so the freshness verdict must
-    // ignore every non-source artifact in the working tree — graph/JSONL outputs,
-    // embedded-store directories, refresh caches (including custom out-of-tree
-    // ones the caller cannot name), and build output — regardless of name or
-    // location (RR1/XX1). The positive `:(glob)**/*.rs` / `:(glob)**/*.py`
+    // (`.rs`, `.py`, `.ts`, `.tsx`) can produce cited graph spans, so the
+    // freshness verdict must ignore every non-source artifact in the working
+    // tree — graph/JSONL outputs, embedded-store directories, refresh caches
+    // (including custom out-of-tree ones the caller cannot name), and build
+    // output — regardless of name or location (RR1/XX1). The positive
+    // `:(glob)**/*.rs` / `:(glob)**/*.py` / `:(glob)**/*.ts` / `:(glob)**/*.tsx`
     // pathspecs match source files at any depth (root included); deletions and
     // renames of tracked source files still surface.
     //
@@ -476,12 +477,14 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
     // (`fs::should_descend`), so it is excluded here too (HH1/JJ1):
     // `:(exclude)target` drops the root `target/` and `:(exclude,glob)**/target/**`
     // drops nested per-crate `target/`. `exclude_rel` still drops any explicitly
-    // named store artifact a caller passes (redundant under `.rs` scoping, but
+    // named store artifact a caller passes (redundant under source scoping, but
     // harmless).
     command.args([
         "--",
         ":(glob)**/*.rs",
         ":(glob)**/*.py",
+        ":(glob)**/*.ts",
+        ":(glob)**/*.tsx",
         ":(glob)**/.gitignore",
         ":(exclude)target",
         ":(exclude,glob)**/target/**",
@@ -518,8 +521,8 @@ fn git_ls_files_v(repo_root: &Path) -> Option<String> {
 }
 
 /// Parses one `git ls-files -v` line, returning the repo-relative path of a
-/// source-set input — a supported source file (`.rs`, `.py`) or a versioned
-/// `.gitignore`, outside any `target/` directory — that carries an index flag
+/// source-set input — a supported source file (`.rs`, `.py`, `.ts`, `.tsx`) or a
+/// versioned `.gitignore`, outside any `target/` directory — that carries an index flag
 /// hiding its state from `git status` (`skip-worktree` = `S`, `assume-unchanged`
 /// = a lowercase tag). Returns `None` for any other line.
 ///

@@ -71,6 +71,7 @@ fn typescript_fixture_covers_common_symbols() {
     // Imports.
     assert_import(&records, r#"import { EventEmitter } from "events";"#);
     assert_import(&records, r#"import * as path from "path";"#);
+    assert_import(&records, r#"import type { Readable } from "stream";"#);
 
     // Classes, functions, methods, variables, qualified by module path.
     assert_symbol(&records, "class", "src.widget.Base");
@@ -301,6 +302,78 @@ fn typescript_producer_envelope_records_typescript_grammar() {
         components.get("tree_sitter_rust").is_none(),
         "TypeScript-only graph should not record the Rust grammar: {components}"
     );
+}
+
+#[test]
+fn tsx_grammar_branch_emits_function_symbol() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    fs::write(
+        repo.join("App.tsx"),
+        "export function App(): JSX.Element { return <div>hello</div>; }\n",
+    )
+    .expect("App.tsx should be written");
+
+    let jsonl = scan_repository(repo)
+        .expect("repo with .tsx file should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let records = parse_jsonl(&jsonl);
+
+    assert_symbol_in_path(&records, "function", "App.App", "App.tsx");
+}
+
+#[test]
+fn typescript_forward_referenced_base_emits_implements_edge() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    // Child is declared BEFORE Base — ensures deferred edge resolution is used.
+    fs::write(
+        repo.join("forward.ts"),
+        "export class Child extends Base {}\nexport class Base {}\n",
+    )
+    .expect("forward.ts should be written");
+
+    let jsonl = scan_repository(repo)
+        .expect("repo should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let records = parse_jsonl(&jsonl);
+
+    // File is forward.ts → module prefix "forward", so classes qualify as forward.Child / forward.Base.
+    let child_id = symbol_id(&records, "class", "forward.Child");
+    let base_id = symbol_id(&records, "class", "forward.Base");
+    let found = records.iter().any(|record| {
+        record["record_type"] == "edge"
+            && record["label"] == "IMPLEMENTS"
+            && record["source"] == child_id.as_str()
+            && record["target"] == base_id.as_str()
+    });
+    assert!(
+        found,
+        "Child should implement/extend Base even when declared before it"
+    );
+}
+
+#[test]
+fn typescript_namespace_members_qualify_with_namespace_prefix() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    fs::write(
+        repo.join("ns.ts"),
+        "export namespace Outer { export class Inner {} }\n",
+    )
+    .expect("ns.ts should be written");
+
+    let jsonl = scan_repository(repo)
+        .expect("repo should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let records = parse_jsonl(&jsonl);
+
+    // File is ns.ts → module prefix "ns", so symbols qualify as ns.Outer / ns.Outer.Inner.
+    assert_symbol_in_path(&records, "namespace", "ns.Outer", "ns.ts");
+    assert_symbol_in_path(&records, "class", "ns.Outer.Inner", "ns.ts");
 }
 
 // ---- helpers ----

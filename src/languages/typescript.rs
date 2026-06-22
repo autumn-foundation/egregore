@@ -67,6 +67,7 @@ pub fn extract_file_source(
 
     let mut extractor = TypeScriptExtractor::new(file, file_id, repository_id, graph, source);
     extractor.walk(tree.root_node());
+    extractor.emit_pending_heritage_edges();
     extractor.emit_reference_edges();
     Ok(())
 }
@@ -75,6 +76,7 @@ pub fn extract_file_source(
 enum ScopeKind {
     Class,
     Function,
+    Namespace,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +84,12 @@ struct Scope {
     name: String,
     kind: ScopeKind,
     id: String,
+}
+
+struct PendingHeritage {
+    source_id: String,
+    base_name: String,
+    summary: String,
 }
 
 struct TypeScriptExtractor<'graph, 'source> {
@@ -96,6 +104,7 @@ struct TypeScriptExtractor<'graph, 'source> {
     symbol_bodies: Vec<SymbolBody>,
     symbol_ordinals: BTreeMap<(String, String), u64>,
     is_test_file: bool,
+    pending_heritage: Vec<PendingHeritage>,
 }
 
 impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
@@ -119,6 +128,7 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
             symbol_bodies: Vec::new(),
             symbol_ordinals: BTreeMap::new(),
             is_test_file,
+            pending_heritage: Vec::new(),
         }
     }
 
@@ -136,7 +146,10 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
             "lexical_declaration" | "variable_declaration" => {
                 self.extract_variable_or_func(node);
             }
-            // export_statement wraps declarations; fall through to walk children.
+            // namespace / module declarations: push a Namespace scope so nested
+            // declarations qualify with the namespace name.
+            "internal_module" => self.extract_namespace(node),
+            // export_statement and other wrappers: fall through to walk children.
             _ => self.walk_children(node),
         }
     }
@@ -178,7 +191,7 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
     }
 
     fn extract_class(&mut self, node: Node<'_>) {
-        let Some(local_name) = node_type_name(node, self.source) else {
+        let Some(local_name) = node_name(node, self.source) else {
             self.walk_children(node);
             return;
         };
@@ -187,16 +200,14 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
         self.definitions.insert(local_name.clone(), id.clone());
         self.definitions.insert(qualified_name.clone(), id.clone());
 
-        // Emit Implements edges for extends and implements in class_heritage.
+        // Defer Implements edges: base may be declared after this class in the
+        // same file. emit_pending_heritage_edges resolves them post-walk.
         for base in self.class_base_names(node) {
-            if let Some(target) = self.definitions.get(&base).cloned() {
-                self.add_edge(
-                    EdgeLabel::Implements,
-                    id.clone(),
-                    target,
-                    format!("{qualified_name} extends/implements {base}"),
-                );
-            }
+            self.pending_heritage.push(PendingHeritage {
+                source_id: id.clone(),
+                base_name: base.clone(),
+                summary: format!("{qualified_name} extends/implements {base}"),
+            });
         }
 
         self.scope_stack.push(Scope {
@@ -209,7 +220,7 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
     }
 
     fn extract_interface(&mut self, node: Node<'_>) {
-        let Some(local_name) = node_type_name(node, self.source) else {
+        let Some(local_name) = node_name(node, self.source) else {
             self.walk_children(node);
             return;
         };
@@ -218,21 +229,18 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
         self.definitions.insert(local_name, id.clone());
         self.definitions.insert(qualified_name.clone(), id.clone());
 
-        // Interface extends: direct child extends_clause (not inside class_heritage).
+        // Defer Implements edges for interface extends (same reason as classes).
         for base in self.interface_extends_names(node) {
-            if let Some(target) = self.definitions.get(&base).cloned() {
-                self.add_edge(
-                    EdgeLabel::Implements,
-                    id.clone(),
-                    target,
-                    format!("{qualified_name} extends {base}"),
-                );
-            }
+            self.pending_heritage.push(PendingHeritage {
+                source_id: id.clone(),
+                base_name: base.clone(),
+                summary: format!("{qualified_name} extends {base}"),
+            });
         }
     }
 
     fn extract_type_alias(&mut self, node: Node<'_>) {
-        let Some(local_name) = node_type_name(node, self.source) else {
+        let Some(local_name) = node_name(node, self.source) else {
             return;
         };
         let qualified_name = self.qualify(&local_name);
@@ -287,7 +295,7 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
             self.walk_children(node);
             return;
         }
-        let Some(local_name) = node_property_name(node, self.source) else {
+        let Some(local_name) = node_name(node, self.source) else {
             self.walk_children(node);
             return;
         };
@@ -403,6 +411,42 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
         emit_reference_edges(self.graph, &self.definitions, &self.symbol_bodies);
     }
 
+    /// Resolves deferred `Implements` edges now that the full `definitions` map
+    /// is available. Handles forward references (subclass declared before base).
+    fn emit_pending_heritage_edges(&mut self) {
+        let pending = std::mem::take(&mut self.pending_heritage);
+        for entry in pending {
+            if let Some(target) = self.definitions.get(&entry.base_name).cloned() {
+                add_graph_edge(
+                    self.graph,
+                    EdgeLabel::Implements,
+                    entry.source_id,
+                    target,
+                    entry.summary,
+                );
+            }
+        }
+    }
+
+    fn extract_namespace(&mut self, node: Node<'_>) {
+        let Some(local_name) = node_name(node, self.source) else {
+            self.walk_children(node);
+            return;
+        };
+        let qualified_name = self.qualify(&local_name);
+        let id = self.add_symbol(node, "namespace", &qualified_name);
+        self.definitions.insert(local_name.clone(), id.clone());
+        self.definitions.insert(qualified_name.clone(), id.clone());
+
+        self.scope_stack.push(Scope {
+            name: local_name,
+            kind: ScopeKind::Namespace,
+            id,
+        });
+        self.walk_children(node);
+        self.scope_stack.pop();
+    }
+
     /// Returns base class / implemented interface names from class heritage.
     fn class_base_names(&self, node: Node<'_>) -> Vec<String> {
         let mut names = Vec::new();
@@ -510,21 +554,12 @@ fn clause_type_names(node: Node<'_>, source: &str) -> Vec<String> {
     names
 }
 
-/// Reads the `name` field of a node as an identifier string.
+/// Reads the `name` field of a node as a text string.
+///
+/// Works for any declaration whose grammar fills the `name` field — the tree-sitter
+/// TypeScript grammar uses `identifier`, `type_identifier`, or `property_identifier`
+/// depending on the declaration kind, but all produce plain text that is read here.
 fn node_name(node: Node<'_>, source: &str) -> Option<String> {
-    node.child_by_field_name("name")
-        .and_then(|n| identifier_text(n, source))
-}
-
-/// Reads the `name` field of a node, accepting both identifier and
-/// `type_identifier` (used by class, interface, type alias, enum declarations).
-fn node_type_name(node: Node<'_>, source: &str) -> Option<String> {
-    node.child_by_field_name("name")
-        .and_then(|n| identifier_text(n, source))
-}
-
-/// Reads the `name` field of a `method_definition`, accepting `property_identifier`.
-fn node_property_name(node: Node<'_>, source: &str) -> Option<String> {
     node.child_by_field_name("name")
         .and_then(|n| identifier_text(n, source))
 }
@@ -558,7 +593,7 @@ fn normalize_import(text: &str) -> String {
 /// Computes the dotted module path a TypeScript file contributes to qualified names.
 ///
 /// `src/widget.ts` → `["src", "widget"]`; `src/index.ts` → `["src"]` (barrel);
-/// top-level `foo.ts` → `["foo"]`.
+/// `src/models.d.ts` → `["src", "models"]`; top-level `foo.ts` → `["foo"]`.
 fn typescript_module_path(repo_relative_path: &str) -> Vec<String> {
     let mut parts = repo_relative_path
         .split(['/', '\\'])
@@ -568,12 +603,14 @@ fn typescript_module_path(repo_relative_path: &str) -> Vec<String> {
     let Some(last) = parts.pop() else {
         return Vec::new();
     };
-    for suffix in &["index.ts", "index.tsx"] {
+    // Barrel files collapse to the parent directory.
+    for suffix in &["index.ts", "index.tsx", "index.d.ts", "index.d.tsx"] {
         if last == *suffix {
             return parts;
         }
     }
-    for ext in &[".ts", ".tsx"] {
+    // Strip the longest matching extension first so `foo.d.ts` → `foo`, not `foo.d`.
+    for ext in &[".d.ts", ".d.tsx", ".ts", ".tsx"] {
         if let Some(stem) = last.strip_suffix(ext) {
             parts.push(stem.to_owned());
             return parts;
@@ -615,7 +652,13 @@ pub fn normalize_code(code: &str) -> String {
             while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '/') {
                 i += 1;
             }
-            i += 2; // consume */
+            // Only consume */ if actually present; an unterminated comment just
+            // silently drops everything to EOF.
+            if i + 1 < len {
+                i += 2;
+            } else {
+                i = len;
+            }
             pending_space = true;
             continue;
         }
@@ -702,6 +745,35 @@ mod tests {
             ]
         );
         assert_eq!(typescript_module_path("index.ts"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn module_path_strips_compound_d_ts_suffix() {
+        // .d.ts should strip the whole compound suffix, not just .ts
+        assert_eq!(
+            typescript_module_path("src/models.d.ts"),
+            vec!["src".to_owned(), "models".to_owned()]
+        );
+        assert_eq!(
+            typescript_module_path("src/types.d.tsx"),
+            vec!["src".to_owned(), "types".to_owned()]
+        );
+        // index.d.ts is a barrel
+        assert_eq!(
+            typescript_module_path("src/index.d.ts"),
+            vec!["src".to_owned()]
+        );
+    }
+
+    #[test]
+    fn normalize_handles_unterminated_block_comment() {
+        let code = "const x = 1; /* never closed";
+        let norm = normalize_code(code);
+        assert!(!norm.contains("/*"), "unterminated comment leaked: {norm}");
+        assert!(
+            norm.contains("const x=1"),
+            "code before comment mangled: {norm}"
+        );
     }
 
     #[test]
