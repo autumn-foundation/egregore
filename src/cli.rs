@@ -4321,13 +4321,14 @@ fn load_token_cost_corpus(
     use crate::token_cost::{TOKEN_COUNT_METHOD, TokenCostCorpus};
 
     if let Some(min_ratio) = min_ratio_override
-        && (!min_ratio.is_finite() || min_ratio < 0.0)
+        && (!min_ratio.is_finite() || min_ratio <= 0.0)
     {
-        // A negative or non-finite override would silently disable the gate.
+        // A non-positive or non-finite override would silently disable the gate
+        // (ratio >= 0.0 is always true; zero is as useless as a negative value).
         token_cost_exit(
             "invalid_min_ratio",
             &corpus_path.display().to_string(),
-            "--min-ratio must be a finite, non-negative value",
+            "--min-ratio must be a finite, positive value",
         );
     }
     let path = corpus_path.display().to_string();
@@ -4403,7 +4404,9 @@ fn audit_token_cost_cmd(
 
     let output = match format {
         OutputFormat::Json | OutputFormat::Text => serde_json::to_string_pretty(&report)
-            .context("failed to serialize token-cost report")?,
+            .unwrap_or_else(|error| {
+                token_cost_exit("serialize_error", "", &error.to_string())
+            }),
     };
     println!("{output}");
     std::process::exit(i32::from(!report.ok));

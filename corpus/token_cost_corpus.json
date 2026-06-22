@@ -33,7 +33,8 @@
       "eg_query": "validate raw settings text into a typed configuration",
       "expected_record_id": "codegraph:v4:453eb6084504fa29d5df633b7332c771a49bcbdf14279a563b3b0b6d11fa5348",
       "baseline_pattern": "settings",
-      "baseline_match_kind": "word_across_corpus"
+      "baseline_match_kind": "word_across_corpus",
+      "result_limit": 1
     }
   ]
 }

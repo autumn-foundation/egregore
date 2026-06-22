@@ -88,6 +88,16 @@ pub struct CorpusQuestion {
     pub baseline_pattern: String,
     /// How the baseline pattern is matched against the corpus.
     pub baseline_match_kind: BaselineMatchKind,
+    /// For `Semantic` questions: maximum number of result rows to measure,
+    /// matching the `--limit` passed to `eg query semantic`. Defaults to 1
+    /// (a focused single-symbol lookup). Structural question classes ignore
+    /// this field — they return all matching records.
+    #[serde(default = "default_result_limit")]
+    pub result_limit: usize,
+}
+
+const fn default_result_limit() -> usize {
+    1
 }
 
 /// Question class for stratified reporting.
@@ -157,7 +167,10 @@ pub fn count_tokens(text: &str) -> usize {
 }
 
 /// Returns true when `pattern` occurs in `line` as a whole word (its neighbors
-/// are not `[A-Za-z0-9_]`), mirroring ripgrep's `--word-regexp`.
+/// are not `[A-Za-z0-9_]`), mirroring ripgrep's `--word-regexp` for ASCII
+/// corpora. Both `line` and `pattern` must be ASCII for the result to agree
+/// with `rg --word-regexp`; Unicode letters are treated as non-word chars here
+/// but as word chars by ripgrep's Unicode mode.
 fn line_has_word(line: &str, pattern: &str) -> bool {
     if pattern.is_empty() {
         return false;
@@ -237,6 +250,10 @@ pub struct QuestionReport {
     pub meets_threshold: bool,
     /// Whether the question passes: correct **and** at/above threshold (AC5/AC6).
     pub pass: bool,
+    /// For `Semantic` questions: the `--limit` used when measuring the answer
+    /// (matches the manifest's `result_limit`). Absent for structural questions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_limit: Option<usize>,
 }
 
 /// Aggregate token-cost across the question set (AC4).
@@ -322,8 +339,9 @@ struct SymbolAnswerRow<'a> {
 ///
 /// The natural-language hit's float `score` is embedding-derived; to keep the
 /// gate deterministic and offline (no mandatory embeddings) it is reported at a
-/// fixed representative value. The token cost of a semantic answer is dominated
-/// by the citable handle, not the score (a one- to two-token difference).
+/// fixed representative value. Under word-punct-v1, any finite JSON float
+/// serializes to exactly 3 tokens (digit-run · punct-dot · digit-run), so the
+/// choice of representative score does not affect the measured ratio.
 #[derive(Debug, Clone, Serialize)]
 struct SemanticAnswerRow<'a> {
     record_id: &'a str,
@@ -340,8 +358,11 @@ struct SemanticAnswerRow<'a> {
     repository: Option<&'a str>,
 }
 
-/// Fixed representative semantic score (see [`SemanticAnswerRow`]).
+/// Score assigned to the primary (expected) semantic hit in the measured answer.
 const SEMANTIC_REPRESENTATIVE_SCORE: f64 = 0.5;
+
+/// Score assigned to secondary hits when `result_limit` > 1.
+const SEMANTIC_SECONDARY_SCORE: f64 = 0.4;
 
 /// A built answer: the serialized JSON-lines text plus correctness facts.
 struct BuiltAnswer {
@@ -424,8 +445,9 @@ where
     let mut serialized = Vec::with_capacity(matched.len());
     let mut has_expected = false;
     let mut expected_has_handle = false;
+    // Every element in `matched` is a Node variant (guaranteed by the filter above).
     for record in matched {
-        let GraphRecord::Node {
+        if let GraphRecord::Node {
             id,
             schema_version,
             name,
@@ -434,28 +456,27 @@ where
             temporal,
             ..
         } = record
-        else {
-            continue;
-        };
-        let path = repo_relative_path.as_deref();
-        let git_commit = temporal.as_ref().map(|t| t.git_commit.as_str());
-        let repository_id = index.owner_of(id);
-        let row = SymbolAnswerRow {
-            record_id: id,
-            schema_version: *schema_version,
-            name: name.as_deref().unwrap_or(""),
-            kind: "Symbol",
-            repo_relative_path: path,
-            span: *span,
-            git_commit,
-            repository_id,
-            repository: repository_id.and_then(|repo| index.display_of(repo)),
-        };
-        if id.as_str() == expected_record_id {
-            has_expected = true;
-            expected_has_handle = (path.is_some() && span.is_some()) || git_commit.is_some();
+        {
+            let path = repo_relative_path.as_deref();
+            let git_commit = temporal.as_ref().map(|t| t.git_commit.as_str());
+            let repository_id = index.owner_of(id);
+            let row = SymbolAnswerRow {
+                record_id: id,
+                schema_version: *schema_version,
+                name: name.as_deref().unwrap_or(""),
+                kind: "Symbol",
+                repo_relative_path: path,
+                span: *span,
+                git_commit,
+                repository_id,
+                repository: repository_id.and_then(|repo| index.display_of(repo)),
+            };
+            if id.as_str() == expected_record_id {
+                has_expected = true;
+                expected_has_handle = (path.is_some() && span.is_some()) || git_commit.is_some();
+            }
+            serialized.push(serde_json::to_string(&row).unwrap_or_default());
         }
-        serialized.push(serde_json::to_string(&row).unwrap_or_default());
     }
     BuiltAnswer {
         row_count: serialized.len(),
@@ -465,51 +486,84 @@ where
     }
 }
 
-/// Builds the `eg query semantic <text>` answer for the reviewed expected hit.
+/// Builds the `eg query semantic <text>` answer for up to `result_limit` rows.
+///
+/// The expected record is ranked first (primary score); remaining slots are
+/// filled with other Symbol nodes sorted by `(start_line, record_id)` so the
+/// measurement is deterministic without requiring live embeddings. `result_limit`
+/// should match the `--limit` a caller would pass to `eg query semantic`
+/// (the corpus manifest's `result_limit` field; default 1 for a focused lookup).
 fn build_semantic_answer(
     records: &[GraphRecord],
     index: &RepositoryIndex,
     expected_record_id: &str,
+    result_limit: usize,
 ) -> BuiltAnswer {
-    let Some(record) = records.iter().find(|r| r.id() == expected_record_id) else {
+    // Collect all Symbol nodes, sorted deterministically.
+    let mut symbols: Vec<&GraphRecord> = records
+        .iter()
+        .filter(|r| matches!(r, GraphRecord::Node { kind: NodeKind::Symbol, .. }))
+        .collect();
+    symbols.sort_by(|a, b| symbol_sort_key(a).cmp(&symbol_sort_key(b)));
+
+    // Expected record leads with primary score; remaining slots fill from the
+    // sorted corpus so the row count matches the requested result_limit.
+    let expected_idx = symbols.iter().position(|r| r.id() == expected_record_id);
+    let found_expected = expected_idx.is_some();
+    let expected_rec = expected_idx.map(|i| symbols.remove(i));
+
+    let mut ranked: Vec<(&GraphRecord, f64)> = Vec::with_capacity(result_limit);
+    if let Some(r) = expected_rec {
+        ranked.push((r, SEMANTIC_REPRESENTATIVE_SCORE));
+    }
+    let slots_left = result_limit.saturating_sub(ranked.len());
+    for r in symbols.into_iter().take(slots_left) {
+        ranked.push((r, SEMANTIC_SECONDARY_SCORE));
+    }
+
+    if ranked.is_empty() {
         return BuiltAnswer {
             text: String::new(),
             row_count: 0,
             has_expected_record_id: false,
             has_file_span_or_commit_handle: false,
         };
-    };
-    let (name, path, span, git_commit) = match record {
-        GraphRecord::Node {
+    }
+
+    let mut expected_has_handle = false;
+    let mut serialized = Vec::with_capacity(ranked.len());
+    for (record, score) in &ranked {
+        if let GraphRecord::Node {
             name,
             repo_relative_path,
             span,
             temporal,
             ..
-        } => (
-            name.as_deref(),
-            repo_relative_path.as_deref(),
-            *span,
-            temporal.as_ref().map(|t| t.git_commit.as_str()),
-        ),
-        _ => (None, None, None, None),
-    };
-    let repository_id = index.owner_of(expected_record_id);
-    let row = SemanticAnswerRow {
-        record_id: expected_record_id,
-        name,
-        repo_relative_path: path,
-        score: SEMANTIC_REPRESENTATIVE_SCORE,
-        span,
-        repository_id,
-        repository: repository_id.and_then(|repo| index.display_of(repo)),
-    };
-    let text = serde_json::to_string(&row).unwrap_or_default();
+        } = record
+        {
+            let path = repo_relative_path.as_deref();
+            let git_commit = temporal.as_ref().map(|t| t.git_commit.as_str());
+            let repository_id = index.owner_of(record.id());
+            let row = SemanticAnswerRow {
+                record_id: record.id(),
+                name: name.as_deref(),
+                repo_relative_path: path,
+                score: *score,
+                span: *span,
+                repository_id,
+                repository: repository_id.and_then(|r| index.display_of(r)),
+            };
+            if record.id() == expected_record_id {
+                expected_has_handle = (path.is_some() && span.is_some()) || git_commit.is_some();
+            }
+            serialized.push(serde_json::to_string(&row).unwrap_or_default());
+        }
+    }
     BuiltAnswer {
-        row_count: 1,
-        text,
-        has_expected_record_id: true,
-        has_file_span_or_commit_handle: (path.is_some() && span.is_some()) || git_commit.is_some(),
+        row_count: serialized.len(),
+        text: serialized.join("\n"),
+        has_expected_record_id: found_expected,
+        has_file_span_or_commit_handle: expected_has_handle,
     }
 }
 
@@ -610,9 +664,12 @@ fn measure_question(
             &question.eg_query,
             &question.expected_record_id,
         ),
-        QuestionClass::Semantic => {
-            build_semantic_answer(records, index, &question.expected_record_id)
-        }
+        QuestionClass::Semantic => build_semantic_answer(
+            records,
+            index,
+            &question.expected_record_id,
+            question.result_limit,
+        ),
     };
     let baseline = build_baseline(question, source_files, corpus_display);
 
@@ -645,6 +702,8 @@ fn measure_question(
         min_ratio,
         meets_threshold,
         pass,
+        result_limit: (question.class == QuestionClass::Semantic)
+            .then_some(question.result_limit),
     }
 }
 
