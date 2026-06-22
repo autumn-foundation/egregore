@@ -694,6 +694,10 @@ struct WorkflowBuilder {
     /// distinct row instead of letting a cited version hide an uncited one.
     rows: BTreeMap<(String, String), RowClassification>,
     diagnostics: BTreeSet<DiagnosticEntry>,
+    /// Monotonic counter that disambiguates rows with an **empty** record ID so
+    /// several malformed empty-ID public rows are each counted (they would
+    /// otherwise collapse into one `("", temporal)` map key).
+    empty_id_seq: usize,
 }
 
 /// `(code, source_record_id, target_handle, relation)` — a de-dup key for one
@@ -709,6 +713,7 @@ impl WorkflowBuilder {
             disabled_reason: None,
             rows: BTreeMap::new(),
             diagnostics: BTreeSet::new(),
+            empty_id_seq: 0,
         }
     }
 
@@ -744,10 +749,17 @@ impl WorkflowBuilder {
         }
         // A record may surface through several sections/anchors; keep the first
         // (canonically lowest) classification per (record_id, temporal) to stay
-        // deterministic while still counting each temporal version once.
-        self.rows
-            .entry((row.record_id.clone(), temporal_key))
-            .or_insert(row);
+        // deterministic while still counting each temporal version once. Rows with
+        // an empty record ID cannot be de-duplicated by identity, so give each a
+        // distinct synthetic key — several malformed empty-ID public rows must all
+        // be counted, not collapsed into one.
+        let identity = if row.record_id.is_empty() {
+            self.empty_id_seq += 1;
+            format!("\0empty:{}", self.empty_id_seq)
+        } else {
+            row.record_id.clone()
+        };
+        self.rows.entry((identity, temporal_key)).or_insert(row);
     }
 
     fn add_diagnostic(
@@ -1429,15 +1441,21 @@ fn drive_candidates(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
-/// `eg query changes` — commit-range context. The range endpoints are taken in
-/// **commit topology / temporal order** (earliest-authored = base, latest = head)
-/// rather than lexicographic SHA order, so a child whose SHA sorts before its
-/// parent is not mistaken for a reversed (disabled) range. Without at least two
-/// distinct commits the workflow is reported disabled rather than skipped.
-fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder {
-    // Order by (author/valid time, sha) so the endpoints follow history, not SHA
-    // string order; a `BTreeSet` keeps it deterministic and de-duplicated.
-    let mut ordered: BTreeSet<(String, &str)> = BTreeSet::new();
+/// `eg query changes` — commit-range context. The range endpoints are taken from
+/// the **commit parent topology** (a root with no in-set parent = base, a tip
+/// that is no in-set commit's parent = head) rather than SHA or timestamp order,
+/// so neither a child SHA sorting before its parent nor a skewed author time is
+/// mistaken for a reversed (disabled) range. Without at least two distinct
+/// commits the workflow is reported disabled rather than skipped.
+/// Derive a `(base, head)` commit pair from the in-set commit topology so the
+/// `changes` lane audits a real ancestry range rather than a timestamp guess.
+/// `base` is the earliest root with no in-set parent; `head` is the latest tip
+/// that is no in-set commit's parent. Returns `None` when fewer than two
+/// distinct commits connect.
+fn changes_range(records: &[GraphRecord]) -> Option<(&str, &str)> {
+    let mut shas: BTreeSet<&str> = BTreeSet::new();
+    let mut parents_of: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut is_parent: BTreeSet<&str> = BTreeSet::new();
     for record in records {
         if let GraphRecord::Node {
             kind,
@@ -1447,24 +1465,39 @@ fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder {
         } = record
             && kind.as_str() == "Commit"
         {
-            let key = temporal.as_ref().map_or_else(
-                || sha.clone(),
-                |t| {
-                    t.author_time
-                        .clone()
-                        .unwrap_or_else(|| t.valid_time.clone())
-                },
-            );
-            ordered.insert((key, sha.as_str()));
+            shas.insert(sha.as_str());
+            let parents: Vec<&str> = temporal
+                .as_ref()
+                .map(|t| t.git_parent_commits.iter().map(String::as_str).collect())
+                .unwrap_or_default();
+            parents_of.insert(sha.as_str(), parents);
         }
     }
-    let (Some((_, base)), Some((_, head))) = (ordered.iter().next(), ordered.iter().next_back())
-    else {
+    // A commit is some other in-set commit's parent → it has a child in the slice.
+    for parents in parents_of.values() {
+        for parent in parents {
+            if shas.contains(parent) {
+                is_parent.insert(parent);
+            }
+        }
+    }
+    // base = earliest root (no in-set parent); head = latest tip (no in-set child).
+    let base = shas.iter().find(|sha| {
+        parents_of
+            .get(*sha)
+            .is_none_or(|parents| parents.iter().all(|p| !shas.contains(p)))
+    })?;
+    let head = shas.iter().rev().find(|sha| !is_parent.contains(*sha))?;
+    if base == head {
+        return None;
+    }
+    Some((base, head))
+}
+
+fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder {
+    let Some((base, head)) = changes_range(records) else {
         return WorkflowBuilder::disabled("changes", "source_fact", "requires_commit_range");
     };
-    if base == head {
-        return WorkflowBuilder::disabled("changes", "source_fact", "requires_commit_range");
-    }
 
     let Ok(ctx) = changes_context(records, base, head, None) else {
         return WorkflowBuilder::disabled("changes", "source_fact", "commit_range_unresolved");
