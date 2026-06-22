@@ -4370,7 +4370,7 @@ fn load_token_cost_inputs(
     // Read the same source files for the grep-shaped baseline, keyed by their
     // repo-relative path so the baseline reads exactly what the scan indexed.
     let mut source_files: BTreeMap<String, String> = BTreeMap::new();
-    let discovered = crate::fs::discover_rust_source_files(source_dir)
+    let discovered = crate::fs::discover_source_files(source_dir)
         .unwrap_or_else(|error| token_cost_exit("corpus_discover_error", &dir, &error.to_string()));
     for source_file in discovered {
         let content = std::fs::read_to_string(&source_file.path).unwrap_or_else(|error| {
@@ -4404,9 +4404,7 @@ fn audit_token_cost_cmd(
 
     let output = match format {
         OutputFormat::Json | OutputFormat::Text => serde_json::to_string_pretty(&report)
-            .unwrap_or_else(|error| {
-                token_cost_exit("serialize_error", "", &error.to_string())
-            }),
+            .unwrap_or_else(|error| token_cost_exit("serialize_error", "", &error.to_string())),
     };
     println!("{output}");
     std::process::exit(i32::from(!report.ok));
