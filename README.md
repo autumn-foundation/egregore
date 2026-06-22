@@ -153,10 +153,15 @@ method on both sides, the baseline-to-Egregore ratios are:
 
 | Question | `eg` answer vs. `rg` baseline | Ratio |
 |----------|-------------------------------|-------|
-| Exact symbol lookup | `eg query symbol` vs. `rg -w <name>` | ~4.8× cheaper |
+| Exact symbol lookup | `eg query symbol` vs. `rg -w <name>` | ~14× cheaper |
 | File-defines lookup | `eg query file` vs. reading the file | ~3.6× cheaper |
-| Semantic concept query | `eg query semantic` vs. `rg <keyword>` | ~5.2× cheaper |
-| **Aggregate** | | **~4× cheaper** |
+| Semantic concept query | `eg query semantic --limit 10` vs. `rg -w 'k1\|k2\|…'` (concept keywords) | ~3.3× cheaper |
+| **Aggregate** | | **~4.1× cheaper** |
+
+Each side is measured fairly: the semantic baseline greps the *union of concept
+keywords* a human would try (not one literal), and the Egregore answer is the
+real `eg query semantic --limit 10` shape — so both reflect "explore this
+concept", not a top-1 lookup against a broad search.
 
 Reproduce it with `eg audit token-cost`; the gate fails if any class regresses
 below 3×. The multiplier scales with the corpus — the more comment and
