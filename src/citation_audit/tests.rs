@@ -358,3 +358,21 @@ fn artifact_without_source_handle_is_missing() {
         CitationStatus::Cited
     );
 }
+
+// Review #1 (P1): a `File` source fact from a real scan has a repo-relative path
+// but no span, and must be path-cited rather than `missing_required_handle`.
+#[test]
+fn file_source_fact_is_path_cited() {
+    let mut file = node("codegraph:v1:file1", NodeKind::File);
+    if let GraphRecord::Node {
+        repo_relative_path, ..
+    } = &mut file
+    {
+        repo_relative_path.replace("src/lib.rs".to_owned());
+    }
+    let result = classify_record(&file);
+    assert_eq!(result.row.status, CitationStatus::Cited);
+    assert_eq!(result.row.trust_class, "source_fact");
+    assert_eq!(result.row.primary_handle.as_deref(), Some("src/lib.rs"));
+    assert!(result.diagnostic.is_none());
+}

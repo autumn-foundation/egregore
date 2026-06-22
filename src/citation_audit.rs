@@ -77,6 +77,9 @@ impl Default for SemanticInput {
 pub struct SemanticRow {
     /// Stable code record ID of the matched node.
     pub record_id: String,
+    /// Node kind of the matched record (`File` hits are path-cited; `Symbol`
+    /// hits need a span), preserved so classification matches `eg query semantic`.
+    pub kind: String,
     /// Repo-relative path of the matched node, when present.
     pub repo_relative_path: Option<String>,
     /// Source span of the matched node, when present.
@@ -410,6 +413,19 @@ fn classify_code_handle(
                 trust_class: "source_fact",
                 status: CitationStatus::Cited,
                 primary_handle: Some(format!("{p}:{}-{}", s.start_line, s.end_line)),
+                absent_handle_reason: None,
+            },
+            diagnostic: None,
+        },
+        // A `File` source fact is cited by its repo-relative path: a scan emits
+        // `File` nodes with a path but no span, and the public context / changes /
+        // subsystem rows treat the whole-file path as the citation handle.
+        (Some(p), None) if kind == "File" => Classified {
+            row: RowClassification {
+                record_id: record_id.to_owned(),
+                trust_class: "source_fact",
+                status: CitationStatus::Cited,
+                primary_handle: Some(p.to_owned()),
                 absent_handle_reason: None,
             },
             diagnostic: None,
@@ -836,8 +852,25 @@ fn file_paths(records: &[GraphRecord]) -> BTreeSet<&str> {
         .collect()
 }
 
+/// Repo-relative paths of every code source fact (`File` and `Symbol` nodes).
+/// `eg query subsystem` accepts a prefix over both, so symbol-only slices with no
+/// `File` node must still be driven.
+fn source_fact_paths(records: &[GraphRecord]) -> BTreeSet<&str> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node {
+                kind,
+                repo_relative_path: Some(path),
+                ..
+            } if matches!(kind.as_str(), "File" | "Symbol") => Some(path.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn subsystem_prefixes(records: &[GraphRecord]) -> BTreeSet<String> {
-    file_paths(records)
+    source_fact_paths(records)
         .into_iter()
         .filter_map(|path| path.rsplit_once('/').map(|(dir, _)| dir.to_owned()))
         .collect()
@@ -982,7 +1015,7 @@ fn drive_semantic(config: &AuditConfig) -> WorkflowBuilder {
             for row in rows {
                 let classified = classify_code_handle(
                     &row.record_id,
-                    "Symbol",
+                    &row.kind,
                     row.repo_relative_path.as_deref(),
                     row.span.as_ref(),
                     false,
@@ -1001,6 +1034,7 @@ fn drive_context(records: &[GraphRecord]) -> WorkflowBuilder {
         for record in ctx
             .source_facts
             .iter()
+            .chain(&ctx.topology_edges)
             .chain(&ctx.observations)
             .chain(&ctx.project_state)
             .chain(&ctx.artifacts)
@@ -1030,6 +1064,7 @@ fn drive_subsystem(records: &[GraphRecord]) -> WorkflowBuilder {
         for record in ctx
             .source_facts
             .iter()
+            .chain(&ctx.topology_edges)
             .chain(&ctx.observations)
             .chain(&ctx.project_state)
             .chain(&ctx.artifacts)
@@ -1204,6 +1239,8 @@ fn drive_change_impact(records: &[GraphRecord], repo_index: &RepositoryIndex) ->
     handles.extend(file_paths(records).into_iter().map(str::to_owned));
     for handle in handles {
         for target in resolve_anchors(&mut builder, records, &handle, repo_index) {
+            // Audit the default change-impact invocation (depth 1). Wider
+            // `--depth N` runs are operator-driven and outside the default gate.
             let ctx = change_impact_context(records, &target, 1, repo_index, None);
             for lead in ctx
                 .direct_callers
@@ -1230,12 +1267,24 @@ fn drive_change_impact(records: &[GraphRecord], repo_index: &RepositoryIndex) ->
 
 fn drive_policy(records: &[GraphRecord]) -> WorkflowBuilder {
     let mut builder = WorkflowBuilder::new("policy", "user_context");
-    for durable in query::active_policy(records, None) {
-        builder.push_record(durable);
-        builder.note_redaction(durable);
-        if let Ok(chain) = query::audit_trail(records, durable) {
-            for record in chain {
-                builder.push_record(record);
+    // `eg query audit <durable_id>` audits any durable policy node, active or
+    // revoked, so drive the audit trail for every durable rather than only the
+    // currently-active ones returned by `active_policy`.
+    for record in records {
+        let GraphRecord::Node { kind, .. } = record else {
+            continue;
+        };
+        if !matches!(
+            kind.as_str(),
+            "Preference" | "WorkflowRule" | "NamingDecision" | "Constraint"
+        ) {
+            continue;
+        }
+        builder.push_record(record);
+        builder.note_redaction(record);
+        if let Ok(chain) = query::audit_trail(records, record) {
+            for chained in chain {
+                builder.push_record(chained);
             }
         }
     }
@@ -1343,6 +1392,23 @@ fn drive_changes(records: &[GraphRecord]) -> WorkflowBuilder {
             builder.push_record(record);
             builder.note_redaction(record);
         }
+    }
+    // `eg query changes` also serializes unexplained code changes and unresolved
+    // evidence links; classify the former (resolving each ID to its record) and
+    // surface the latter as diagnostics so neither escapes the gate.
+    for unexplained in &ctx.unexplained {
+        if let Some(record) = by_id.get(unexplained.record_id) {
+            builder.push_record(record);
+            builder.note_redaction(record);
+        }
+    }
+    for unresolved in &ctx.unresolved {
+        builder.add_diagnostic(
+            "unresolved_evidence_link".to_owned(),
+            Some(unresolved.source_record_id.clone()),
+            Some(unresolved.target_handle.clone()),
+            Some(unresolved.relation.clone()),
+        );
     }
     builder
 }

@@ -130,6 +130,24 @@ raw-artifact payloads. Only record IDs, handles, hashes, redaction markers,
 bounded labels, and counts appear. Protected payloads are referenced by
 `protected:v1:<hash>` handle only.
 
+### Scope: the default invocation of each workflow
+
+The gate measures each public query workflow at its **default invocation** — the
+current store view, no repository scope, and default depth — which is the
+behavior an operator gets by running the command with only its required
+arguments. Flag-driven variants are deliberately outside the default gate
+because they form an unbounded surface and are operator-initiated re-runs, not
+the default answer:
+
+- temporal/transaction-time views (`--at`, `--as-of`, `--tx-as-of`),
+- repository scoping (`--repo`) in a shared multi-repo store, and
+- wider neighborhoods (`eg query change-impact --depth N`, `N > 1`).
+
+The one exception is `eg query evidence-freshness`, whose *default* invocation is
+itself history-inclusive; the audit mirrors that by reading the history-inclusive
+store view for that lane over `--data-dir`. To gate a specific flagged view, run
+the underlying query directly and inspect its handles.
+
 ## When to use this versus other tools
 
 | Reach for | When you want |

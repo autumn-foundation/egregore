@@ -4361,6 +4361,7 @@ fn collect_semantic_input(
             });
             SemanticRow {
                 record_id: m.record_id.clone(),
+                kind: m.kind.clone().unwrap_or_else(|| "Symbol".to_owned()),
                 repo_relative_path: path,
                 span,
             }
