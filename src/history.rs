@@ -144,7 +144,7 @@ fn scan_repository_history_inner(
             );
         }
 
-        for path in list_rust_files(repo_root, &commit.sha)? {
+        for path in list_indexed_source_files(repo_root, &commit.sha)? {
             let change_id = change_ids_by_path.get(&path);
             let source = git_blob(repo_root, &commit.sha, &path)?;
             let source_file = SourceFile {
@@ -185,7 +185,8 @@ fn scan_repository_history_inner(
         }
     }
 
-    let mut producer = code_graph_producer();
+    let languages = crate::languages_in_graph(&graph);
+    let mut producer = code_graph_producer(&languages);
     producer.producer_kind = ProducerKind::HistoryReplay;
     // Make the producer fully deterministic too (CCC1): `code_graph_producer`
     // sets `producer_started_at` from the wall-clock `PROCESS_STARTED_AT`, which
@@ -305,27 +306,28 @@ fn parse_change_line(line: &str) -> Option<GitChange> {
     })
 }
 
-fn list_rust_files(repo_root: &Path, sha: &str) -> Result<Vec<String>> {
+fn list_indexed_source_files(repo_root: &Path, sha: &str) -> Result<Vec<String>> {
     let output = git_output(repo_root, &["ls-tree", "-r", "--name-only", sha])?;
     let mut files = output
         .lines()
         .map(str::trim)
-        .filter(|path| is_indexed_rust_source(Path::new(path)))
+        .filter(|path| is_indexed_source(Path::new(path)))
         .map(normalize_git_path)
         .collect::<Vec<_>>();
     files.sort();
     Ok(files)
 }
 
-/// Matches the live scanner's source set (`fs::discover_rust_source_files`) so
-/// history replay indexes exactly what `eg scan` would, keeping it consistent
-/// with the freshness dirty probe (which is scoped the same way):
-/// - a **case-sensitive** lowercase `.rs` extension — the scanner uses
-///   `extension() == "rs"`, so an uppercase `LIB.RS` is not a source (GGG1);
+/// Matches the live scanner's source set (`fs::discover_source_files`) so the history
+/// replay indexes exactly what `eg scan` would, keeping it consistent with the
+/// freshness dirty probe (which is scoped the same way):
+/// - a **case-sensitive** lowercase supported extension (`.rs`, `.py`) — the
+///   scanner matches `extension()` exactly, so an uppercase `LIB.RS` is not a
+///   source (GGG1);
 /// - never under a `target/` build directory, which `fs::should_descend` prunes,
 ///   so committed build output is not indexed (GGG2).
-fn is_indexed_rust_source(path: &Path) -> bool {
-    path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+fn is_indexed_source(path: &Path) -> bool {
+    crate::languages::is_supported_source(path)
         && !path.components().any(|c| c.as_os_str() == "target")
 }
 

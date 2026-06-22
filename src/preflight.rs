@@ -210,7 +210,7 @@ pub struct Observations {
     pub repo_path: PathBuf,
     /// Repository path is an existing, **readable** directory. `scan` rejects
     /// non-directories in `validate_repository` and then calls `read_dir` on the
-    /// root in `discover_rust_source_files`, so an unreadable directory fails too.
+    /// root in `discover_source_files`, so an unreadable directory fails too.
     pub repo_path_is_dir: bool,
     /// `git --version` returned exit 0.
     pub git_available: bool,
@@ -1017,12 +1017,12 @@ pub fn gather_observations(config: &DoctorConfig) -> Observations {
         .repo_path
         .canonicalize()
         .unwrap_or_else(|_| config.repo_path.clone());
-    // `scan` recursively reads the tree via `discover_rust_source_files`, so the
+    // `scan` recursively reads the tree via `discover_source_files`, so the
     // repo check must reflect full traversability — not just the readable root.
     // Reuse the exact discovery `scan` uses: an unreadable root or descendant
     // directory makes it (and therefore `scan`) fail.
-    let repo_path_is_dir = config.repo_path.is_dir()
-        && crate::fs::discover_rust_source_files(&config.repo_path).is_ok();
+    let repo_path_is_dir =
+        config.repo_path.is_dir() && crate::fs::discover_source_files(&config.repo_path).is_ok();
 
     let git_available = Command::new("git")
         .arg("--version")

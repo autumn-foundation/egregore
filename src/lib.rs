@@ -213,13 +213,14 @@ fn scan_repository_at_with_override_inner(
             .with_source_snapshot(snapshot),
     );
 
-    for source_file in fs::discover_rust_source_files(repo_root)? {
+    for source_file in fs::discover_source_files(repo_root)? {
         for record in scan_source_file_records(&source_file, &repository_id)? {
             graph.push(record.with_valid_time_inferred(transaction_time));
         }
     }
 
-    Ok(graph.stamp_producer(&code_graph_producer()))
+    let languages = languages_in_graph(&graph);
+    Ok(graph.stamp_producer(&code_graph_producer(&languages)))
 }
 
 /// Wall-clock time captured at the start of the first scan in this process.
@@ -230,21 +231,50 @@ fn scan_repository_at_with_override_inner(
 pub(crate) static PROCESS_STARTED_AT: LazyLock<String> =
     LazyLock::new(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
 
-pub(crate) fn code_graph_producer() -> Producer {
+/// The set of source languages whose records appear in `graph`, deduplicated and
+/// in a deterministic order.
+///
+/// Drives the producer envelope so a graph records exactly the Tree-sitter
+/// grammars that produced it — a Rust-only graph stays byte-identical to its
+/// historical form, and Python adds its grammar component only when present.
+pub(crate) fn languages_in_graph(graph: &Graph) -> Vec<languages::Language> {
+    let mut seen = std::collections::BTreeSet::new();
+    for record in graph.records() {
+        if let GraphRecord::Node {
+            language: Some(tag),
+            ..
+        } = record
+            && let Some(language) = languages::Language::from_tag(tag)
+        {
+            seen.insert(language.tag());
+        }
+    }
+    seen.into_iter()
+        .filter_map(languages::Language::from_tag)
+        .collect()
+}
+
+pub(crate) fn code_graph_producer(languages: &[languages::Language]) -> Producer {
+    let mut producer_components = BTreeMap::from([(
+        "tree_sitter".to_owned(),
+        env!("TREE_SITTER_VERSION").to_owned(),
+    )]);
+    // Default to Rust so a graph with no syntax-backed nodes (e.g. an empty repo)
+    // keeps the historical Rust-only producer envelope.
+    let languages = if languages.is_empty() {
+        &[languages::Language::Rust][..]
+    } else {
+        languages
+    };
+    for language in languages {
+        let (key, version) = language.tree_sitter_component();
+        producer_components.insert(key.to_owned(), version.to_owned());
+    }
     Producer {
         egregore_version: env!("CARGO_PKG_VERSION").to_owned(),
         egregore_git: None,
         producer_kind: ProducerKind::CodeGraphExtractor,
-        producer_components: BTreeMap::from([
-            (
-                "tree_sitter".to_owned(),
-                env!("TREE_SITTER_VERSION").to_owned(),
-            ),
-            (
-                "tree_sitter_rust".to_owned(),
-                env!("TREE_SITTER_RUST_VERSION").to_owned(),
-            ),
-        ]),
+        producer_components,
         producer_started_at: PROCESS_STARTED_AT.clone(),
     }
 }
@@ -313,14 +343,21 @@ pub(crate) fn scan_source_text_records(
     let mut graph = Graph::new();
     let repo_relative_path = source_file.repo_relative_path.clone();
     let file_id = stable_id(&["node", "file", repository_id, &repo_relative_path]);
-    let normalized = crate::languages::rust::normalize_file_code(source);
+    let language = languages::detect(&repo_relative_path).unwrap_or(languages::Language::Rust);
+    let normalized = match language {
+        languages::Language::Rust => crate::languages::rust::normalize_file_code(source),
+        languages::Language::Python => crate::languages::python::normalize_file_code(source),
+    };
     graph.push(GraphRecord::node(
         file_id.clone(),
         NodeKind::File,
         Some(repo_relative_path.clone()),
         None,
         Some(repo_relative_path.clone()),
-        format!("Rust source file {repo_relative_path}\nSource:\n{normalized}"),
+        format!(
+            "{} source file {repo_relative_path}\nSource:\n{normalized}",
+            language.display_name()
+        ),
     ));
     parser::add_repository_file_edge(&mut graph, repository_id, &file_id);
     parser::extract_source_text(source_file, source, &file_id, repository_id, &mut graph)?;

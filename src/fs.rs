@@ -8,6 +8,8 @@ use std::{
     process::{Command, Stdio},
 };
 
+use crate::languages;
+
 use crate::{
     error::{CodegraphError, Result},
     normalize_path,
@@ -22,13 +24,13 @@ pub struct SourceFile {
     pub repo_relative_path: String,
 }
 
-/// Discovers Rust source files under a repository root.
+/// Discovers supported source files (Rust, Python) under a repository root.
 ///
 /// # Errors
 ///
 /// Returns an error when directory traversal cannot read an entry or when a
 /// discovered source file cannot be relativized against the repository root.
-pub fn discover_rust_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
+pub fn discover_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
     // Pre-compute the set of gitignored directories so traversal can skip them
     // entirely rather than descending into them and failing on unreadable content
     // (PR #186 follow-up).  Purely filesystem-local for non-Git trees.
@@ -38,8 +40,8 @@ pub fn discover_rust_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
         HashSet::new()
     };
     let mut files = Vec::new();
-    collect_rust_source_files(repo_root, &ignored_dirs, &mut files)?;
-    // Respect .gitignore so generated/ignored Rust files are not indexed (issue
+    collect_source_files(repo_root, &ignored_dirs, &mut files)?;
+    // Respect .gitignore so generated/ignored source files are not indexed (issue
     // #82 / PR #186): a git-ignored file has no citable graph spans, and the
     // read-only freshness probe (`git status`, which omits ignored files) then
     // covers exactly the indexed set. No-op outside a Git work tree, preserving
@@ -63,7 +65,7 @@ pub fn discover_rust_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
         .collect()
 }
 
-fn collect_rust_source_files(
+fn collect_source_files(
     directory: &Path,
     ignored_dirs: &HashSet<PathBuf>,
     files: &mut Vec<PathBuf>,
@@ -88,9 +90,9 @@ fn collect_rust_source_files(
 
         if metadata.is_dir() {
             if should_descend(&path) && !ignored_dirs.contains(&path) {
-                collect_rust_source_files(&path, ignored_dirs, files)?;
+                collect_source_files(&path, ignored_dirs, files)?;
             }
-        } else if metadata.is_file() && path.extension() == Some(OsStr::new("rs")) {
+        } else if metadata.is_file() && languages::is_supported_source(&path) {
             files.push(path);
         }
     }

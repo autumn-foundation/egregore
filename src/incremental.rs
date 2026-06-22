@@ -172,7 +172,7 @@ fn scan_repository_incremental_at_inner(
         }
     }
 
-    for source_file in crate::fs::discover_rust_source_files(repo_root)? {
+    for source_file in crate::fs::discover_source_files(repo_root)? {
         let hash = file_hash(&source_file.path)?;
         seen_files.insert(source_file.repo_relative_path.clone());
         let previous_entry = previous_cache.files.get(&source_file.repo_relative_path);
@@ -232,7 +232,8 @@ fn scan_repository_incremental_at_inner(
 
     next_cache.repository_id.clone_from(&repository_id);
     next_cache.save(cache_path.as_ref())?;
-    let mut producer = code_graph_producer();
+    let languages = crate::languages_in_graph(&graph);
+    let mut producer = code_graph_producer(&languages);
     producer.producer_kind = ProducerKind::IncrementalCache;
     producer.producer_components.insert(
         "cache_format_version".to_owned(),
