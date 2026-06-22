@@ -400,6 +400,20 @@ fn classify_code_handle(
     span: Option<&SourceSpan>,
     drift_target: bool,
 ) -> Classified {
+    // The citation contract requires a stable record ID; a path/span alone is not
+    // sufficient (a malformed/imported source fact with an empty id must fail).
+    if record_id.is_empty() {
+        return Classified {
+            row: RowClassification {
+                record_id: String::new(),
+                trust_class: "source_fact",
+                status: CitationStatus::MissingRequiredHandle,
+                primary_handle: path.map(str::to_owned),
+                absent_handle_reason: None,
+            },
+            diagnostic: Some(("missing_record_id".to_owned(), path.map(str::to_owned))),
+        };
+    }
     let documented = |reason: AbsentHandleRule| Classified {
         row: RowClassification {
             record_id: record_id.to_owned(),
@@ -862,6 +876,38 @@ fn symbol_names(records: &[GraphRecord]) -> BTreeSet<&str> {
         .collect()
 }
 
+/// Every `File` path including tombstoned ones. `eg query failures <path>` and
+/// `eg query change-impact <path>` resolve through `resolve_failure_handle`,
+/// which is history-bearing and keeps temporal file records reachable after a
+/// current-state tombstone — so those lanes seed from this, not `file_paths`.
+fn all_file_paths(records: &[GraphRecord]) -> BTreeSet<&str> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node {
+                kind,
+                repo_relative_path: Some(path),
+                ..
+            } if kind.as_str() == "File" => Some(path.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Stable `AgentSession` record IDs. `eg query failures <agent-session-id>`
+/// resolves failures authored in that session (incl. via `AUTHORED_BY` edges).
+fn agent_session_ids(records: &[GraphRecord]) -> BTreeSet<String> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Node { id, kind, .. } if kind.as_str() == "AgentSession" => {
+                Some(id.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn file_paths(records: &[GraphRecord]) -> BTreeSet<&str> {
     // `eg query file <path>` returns nothing for a tombstoned file, so the `file`
     // workflow must not drive deleted-file paths (which would otherwise count
@@ -1244,8 +1290,11 @@ fn drive_failures(records: &[GraphRecord], repo_index: &RepositoryIndex) -> Work
     let mut builder = WorkflowBuilder::new("failures", "verification_evidence");
     let mut handles: BTreeSet<String> = BTreeSet::new();
     handles.extend(symbol_names(records).into_iter().map(str::to_owned));
-    handles.extend(file_paths(records).into_iter().map(str::to_owned));
+    // History-bearing: failures linked to a now-deleted file are still reachable
+    // by that path, so seed every file path (not the tombstone-filtered set).
+    handles.extend(all_file_paths(records).into_iter().map(str::to_owned));
     handles.extend(task_ids(records));
+    handles.extend(agent_session_ids(records));
     // `eg query failures` also resolves source/provenance handles (a failure's
     // source handle, source-artifact path/hash, or session ID), so seed those too
     // — otherwise failures reachable only through them go unmeasured.
@@ -1280,7 +1329,8 @@ fn drive_change_impact(records: &[GraphRecord], repo_index: &RepositoryIndex) ->
     let mut builder = WorkflowBuilder::new("change-impact", "source_fact");
     let mut handles: BTreeSet<String> = BTreeSet::new();
     handles.extend(symbol_names(records).into_iter().map(str::to_owned));
-    handles.extend(file_paths(records).into_iter().map(str::to_owned));
+    // History-bearing handle resolution (see `all_file_paths`).
+    handles.extend(all_file_paths(records).into_iter().map(str::to_owned));
     for handle in handles {
         for target in resolve_anchors(&mut builder, records, &handle, repo_index) {
             // Audit the default change-impact invocation (depth 1). Wider
@@ -1312,8 +1362,11 @@ fn drive_change_impact(records: &[GraphRecord], repo_index: &RepositoryIndex) ->
 fn drive_policy(records: &[GraphRecord]) -> WorkflowBuilder {
     let mut builder = WorkflowBuilder::new("policy", "user_context");
     // `eg query audit <durable_id>` audits any durable policy node, active or
-    // revoked, so drive the audit trail for every durable rather than only the
-    // currently-active ones returned by `active_policy`.
+    // revoked, but only when its audit trail resolves: `eg query policy` filters
+    // out durables whose `audit_trail` fails and `eg query audit` returns an
+    // error envelope (no rows) for them. So classify a durable only when its
+    // trail resolves, and count the resolved chain — never a malformed durable no
+    // default public workflow would emit.
     for record in records {
         let GraphRecord::Node { kind, .. } = record else {
             continue;
@@ -1324,9 +1377,9 @@ fn drive_policy(records: &[GraphRecord]) -> WorkflowBuilder {
         ) {
             continue;
         }
-        builder.push_record(record);
-        builder.note_redaction(record);
         if let Ok(chain) = query::audit_trail(records, record) {
+            builder.push_record(record);
+            builder.note_redaction(record);
             for chained in chain {
                 builder.push_record(chained);
             }
