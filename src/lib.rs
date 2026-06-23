@@ -6,6 +6,8 @@
 
 /// Graph ingestion adapters.
 pub mod adapters;
+/// Antigravity transcript JSONL importer.
+pub mod antigravity;
 /// Evidence bundle export, verification, and inspection (issue #68).
 pub mod bundle;
 /// Citation-completeness audit over public query workflows (issue #65).
@@ -80,6 +82,7 @@ pub mod traj;
 
 use std::{collections::BTreeMap, path::Path, sync::LazyLock};
 
+pub use antigravity::import_antigravity;
 pub use claude_code::import_claude_code;
 pub use codex::import_codex;
 pub use decide::{DecideRequest, decide_candidate};

@@ -219,6 +219,14 @@ enum Commands {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Import an Antigravity transcript JSONL into agent-memory JSONL.
+    ImportAntigravity {
+        /// Path to the Antigravity session transcript JSONL file.
+        antigravity_path: PathBuf,
+        /// Output JSONL path.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Import local project/task JSONL into project-graph JSONL.
     ImportLocalTasks {
         /// Directory containing `.jsonl` task files, or path to a single `.jsonl` file.
@@ -1493,6 +1501,10 @@ fn run_cli(cli: Cli) -> Result<()> {
             transcript_path,
             out,
         } => import_claude_code_cmd(&transcript_path, &out),
+        Commands::ImportAntigravity {
+            antigravity_path,
+            out,
+        } => import_antigravity_cmd(&antigravity_path, &out),
         Commands::ImportLocalTasks {
             tasks_path,
             out,
@@ -1988,6 +2000,27 @@ fn import_claude_code_cmd(transcript_path: &Path, out: &Path) -> Result<()> {
         "imported {} records from {}",
         graph.records().len(),
         transcript_path.display()
+    );
+    Ok(())
+}
+
+fn import_antigravity_cmd(antigravity_path: &Path, out: &Path) -> Result<()> {
+    let opts = crate::antigravity::ImportOptions::default();
+    let graph =
+        crate::antigravity::import_antigravity(antigravity_path, &opts).with_context(|| {
+            format!(
+                "failed to import Antigravity transcript from {}",
+                antigravity_path.display()
+            )
+        })?;
+    let jsonl = graph
+        .to_jsonl()
+        .context("failed to serialize agent-memory JSONL")?;
+    fs::write(out, jsonl).with_context(|| format!("failed to write JSONL to {}", out.display()))?;
+    println!(
+        "imported {} records from {}",
+        graph.records().len(),
+        antigravity_path.display()
     );
     Ok(())
 }
