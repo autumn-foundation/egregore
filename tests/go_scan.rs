@@ -227,6 +227,54 @@ fn go_forward_referenced_embedding_emits_implements_edge() {
 }
 
 #[test]
+fn go_interface_type_constraints_are_not_treated_as_embedding() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path();
+    // A plain embedded interface must still emit Implements; a generics type-set
+    // constraint (union `A | B` or approximation `~A`) is a type set, not
+    // inheritance, and must NOT emit a spurious Implements edge.
+    fs::write(
+        repo.join("constraints.go"),
+        concat!(
+            "package main\n\n",
+            "type MyType int\n\n",
+            "type Describable interface{ Describe() string }\n\n",
+            "type Reader interface {\n\tDescribable\n\tRead() string\n}\n\n",
+            "type Ordered interface {\n\tMyType | int\n}\n\n",
+            "type Approx interface {\n\t~MyType\n}\n",
+        ),
+    )
+    .expect("constraints.go should write");
+
+    let jsonl = scan_repository(repo)
+        .expect("repo should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let records = parse_jsonl(&jsonl);
+
+    // Genuine interface embedding is preserved.
+    let reader_id = symbol_id(&records, "interface", "Reader");
+    let describable_id = symbol_id(&records, "interface", "Describable");
+    assert!(
+        has_edge(&records, "IMPLEMENTS", &reader_id, &describable_id),
+        "Reader should still embed Describable"
+    );
+
+    // Type-set constraints must not be mistaken for embedding.
+    let my_type_id = symbol_id(&records, "type", "MyType");
+    let ordered_id = symbol_id(&records, "interface", "Ordered");
+    let approx_id = symbol_id(&records, "interface", "Approx");
+    assert!(
+        !has_edge(&records, "IMPLEMENTS", &ordered_id, &my_type_id),
+        "union constraint `MyType | int` must not emit an Implements edge"
+    );
+    assert!(
+        !has_edge(&records, "IMPLEMENTS", &approx_id, &my_type_id),
+        "approximation constraint `~MyType` must not emit an Implements edge"
+    );
+}
+
+#[test]
 fn go_incremental_cache_reuses_unchanged_files() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path().join("repo");

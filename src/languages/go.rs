@@ -294,11 +294,21 @@ impl<'graph, 'source> GoExtractor<'graph, 'source> {
                     if elem.kind() != "type_elem" {
                         continue;
                     }
+                    // A `type_elem` is an embedded interface only when it is a
+                    // single plain type name. A union (`A | B`) or a `~T`
+                    // approximation (`negated_type`) is a generics type-set
+                    // constraint — a type set, not inheritance — so it must not
+                    // produce an Implements edge.
                     let mut inner = elem.walk();
-                    for child in elem.named_children(&mut inner) {
-                        if let Some(name) = leaf_type_name(child, self.source) {
-                            names.push(name);
-                        }
+                    let terms = elem.named_children(&mut inner).collect::<Vec<_>>();
+                    let [term] = terms.as_slice() else {
+                        continue;
+                    };
+                    if term.kind() == "negated_type" {
+                        continue;
+                    }
+                    if let Some(name) = leaf_type_name(*term, self.source) {
+                        names.push(name);
                     }
                 }
             }
