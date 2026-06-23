@@ -697,6 +697,9 @@ enum QuerySubcommand {
         /// dropped, and an all-below result is a no-match (default 0.0).
         #[arg(long, default_value_t = 0.0)]
         min_score: f32,
+        /// Supersession resolution mode for memory/observations.
+        #[arg(long, value_enum, default_value_t = crate::temporal_status::SupersessionMode::Exclude)]
+        supersession: crate::temporal_status::SupersessionMode,
     },
     /// Recall prior agent memory by meaning (issue #91).
     ///
@@ -731,6 +734,9 @@ enum QuerySubcommand {
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
+        /// Supersession resolution mode for memory/observations.
+        #[arg(long, value_enum, default_value_t = crate::temporal_status::SupersessionMode::Exclude)]
+        supersession: crate::temporal_status::SupersessionMode,
     },
     /// Retrieve evidence-backed context for a named symbol.
     ///
@@ -758,6 +764,9 @@ enum QuerySubcommand {
         /// freshness field. See `eg query symbol --help`.
         #[arg(long)]
         repo_path: Option<PathBuf>,
+        /// Supersession resolution mode for memory/observations.
+        #[arg(long, value_enum, default_value_t = crate::temporal_status::SupersessionMode::Exclude)]
+        supersession: crate::temporal_status::SupersessionMode,
     },
     /// Retrieve evidence-backed context for a task.
     Task {
@@ -945,6 +954,9 @@ enum QuerySubcommand {
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
+        /// Supersession resolution mode for memory/observations.
+        #[arg(long, value_enum, default_value_t = crate::temporal_status::SupersessionMode::Exclude)]
+        supersession: crate::temporal_status::SupersessionMode,
     },
     /// Surface graph-derived change-impact LEADS for a symbol or file handle (issue #76).
     ///
@@ -3329,6 +3341,17 @@ struct ContextTopologyEdge<'a> {
     valid_time: Option<&'a str>,
 }
 
+/// One record excluded by a filter or temporal constraint.
+#[derive(Serialize)]
+struct ExcludedDiagnostic<'a> {
+    record_id: &'a str,
+    reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<Vec<crate::temporal_status::TemporalReference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contradicted_by: Option<Vec<crate::temporal_status::TemporalReference>>,
+}
+
 /// Full context query response envelope.
 #[derive(Serialize)]
 struct ContextResponse<'a> {
@@ -3349,6 +3372,8 @@ struct ContextResponse<'a> {
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,
     unresolved: Vec<ContextUnresolved<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    excluded: Vec<ExcludedDiagnostic<'a>>,
 }
 
 /// Full task context query response envelope.
@@ -3366,6 +3391,8 @@ struct TaskContextResponse<'a> {
     reviews: Vec<ContextLinkedItem<'a>>,
     external_links: Vec<ContextLinkedItem<'a>>,
     unresolved: Vec<ContextUnresolved<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    excluded: Vec<ExcludedDiagnostic<'a>>,
 }
 
 /// One semantic drift item in the `semantic_drift` section of a subsystem response.
@@ -3395,6 +3422,8 @@ struct SubsystemResponse<'a> {
     verification_evidence: Vec<ContextLinkedItem<'a>>,
     semantic_drift: Vec<SubsystemDrift<'a>>,
     unresolved: Vec<ContextUnresolved<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    excluded: Vec<ExcludedDiagnostic<'a>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3437,6 +3466,8 @@ struct SemanticContextMatch<'a> {
     artifacts: Vec<ContextLinkedItem<'a>>,
     verification_evidence: Vec<ContextLinkedItem<'a>>,
     unresolved: Vec<ContextUnresolved<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    excluded: Vec<ExcludedDiagnostic<'a>>,
 }
 
 /// Full `eg query semantic-context` response envelope.
@@ -3918,7 +3949,15 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo,
             limit,
             min_score,
-        } => query_semantic_context(&query, &data_dir, limit, min_score, repo.as_deref()),
+            supersession,
+        } => query_semantic_context(
+            &query,
+            &data_dir,
+            limit,
+            min_score,
+            repo.as_deref(),
+            supersession,
+        ),
         #[cfg(feature = "embeddings")]
         QuerySubcommand::SemanticMemory {
             query,
@@ -3927,6 +3966,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             limit,
             verified_only,
             format,
+            supersession,
         } => query_semantic_memory(
             &query,
             &data_dir,
@@ -3934,12 +3974,14 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo.as_deref(),
             verified_only,
             format,
+            supersession,
         ),
         QuerySubcommand::Context {
             name,
             graph,
             data_dir,
             repo_path,
+            supersession,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             // Pre-compute the context owner so the freshness hint matches the
@@ -3971,7 +4013,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 &[graph.as_deref(), data_dir.as_deref()],
                 owner_hint.as_deref(),
             );
-            query_context_cmd(&records, &name, freshness)
+            query_context_cmd(&records, &name, freshness, supersession)
         }
         QuerySubcommand::Task {
             id_or_handle,
@@ -4074,6 +4116,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             graph,
             data_dir,
             format,
+            supersession,
         } => {
             // Validate the prefix before loading records so malformed input fails
             // fast with a machine-readable diagnostic, not a store I/O error.
@@ -4090,7 +4133,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 std::process::exit(1);
             }
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            query_subsystem_cmd(&records, &prefix, format)
+            query_subsystem_cmd(&records, &prefix, format, supersession)
         }
         QuerySubcommand::ChangeImpact {
             handle,
@@ -5052,6 +5095,12 @@ struct MemoryRecallResult<'a> {
     repository_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temporal_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_by_records: Option<Vec<crate::temporal_status::TemporalReference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contradicted_by: Option<Vec<crate::temporal_status::TemporalReference>>,
 }
 
 #[cfg(feature = "embeddings")]
@@ -5213,6 +5262,26 @@ fn is_recallable_memory(
 /// observations lacking cited verification evidence are excluded too.
 #[cfg(feature = "embeddings")]
 #[allow(clippy::too_many_lines)]
+#[derive(Serialize)]
+struct ExcludedRecallDiagnostic<'a> {
+    record_id: &'a str,
+    reason: &'static str,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<Vec<crate::temporal_status::TemporalReference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contradicted_by: Option<Vec<crate::temporal_status::TemporalReference>>,
+}
+
+#[cfg(feature = "embeddings")]
+impl PrintText for ExcludedRecallDiagnostic<'_> {
+    fn as_text(&self) -> String {
+        format!("Excluded record {} due to: {}", self.record_id, self.reason)
+    }
+}
+
+#[cfg(feature = "embeddings")]
+#[allow(clippy::too_many_lines)]
 fn query_semantic_memory(
     query: &str,
     data_dir: &Path,
@@ -5220,6 +5289,7 @@ fn query_semantic_memory(
     repo: Option<&str>,
     verified_only: bool,
     format: OutputFormat,
+    supersession: crate::temporal_status::SupersessionMode,
 ) -> Result<()> {
     validate_existing_embedded_store(data_dir)?;
 
@@ -5234,6 +5304,8 @@ fn query_semantic_memory(
 
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
     let (edges_from, tombstoned) = query::verification_support_indexes(&records);
+    let resolver = crate::temporal_status::TemporalResolver::build(&records);
+    let mut excluded_recall_diagnostics = Vec::new();
 
     let query_vector = embed_query_text(query)?;
 
@@ -5312,27 +5384,101 @@ fn query_semantic_memory(
         // above guarantees it is among `owners`), so a memory citing code in
         // several repositories is never misattributed to a different one than the
         // user selected; otherwise fall back to the first owner deterministically.
-        let repository_id = selected.as_deref().or_else(|| owners.first().copied());
-        rows.push(MemoryRecallResult {
-            record_id: record.id(),
-            kind: record.node_kind_name().unwrap_or("Observation"),
-            trust_class: "agent_authored",
-            retrieval_score: m.score,
-            source_handle: source_handle_value,
-            agent_id: agent_id.as_deref(),
-            agent_kind: agent_kind.as_deref(),
-            session_id: session_id.as_deref(),
-            confidence: confidence.as_deref(),
-            observed_at: observed_at.as_deref(),
-            ingested_at: ingested_at.as_deref(),
-            review_state: if verified { "verified" } else { "unverified" },
-            redacted: redaction_policy_version.is_some(),
-            superseded_by: superseded_by.as_deref(),
-            linked_code_handles,
-            memory_text: text.as_deref().unwrap_or(summary.as_str()),
-            repository_id,
-            repository: repository_id.and_then(|id| index.display_of(id)),
-        });
+        let (status, superseded_by_refs, contradicted_by_refs) =
+            resolver.resolve_status(record.id());
+        let is_superseded = status == "superseded" || status == "cycle";
+        let is_contradicted = status == "contradicted";
+
+        if is_superseded || is_contradicted {
+            let reason = if is_superseded {
+                "superseded"
+            } else {
+                "contradicted"
+            };
+            match supersession {
+                crate::temporal_status::SupersessionMode::Exclude => {
+                    excluded_recall_diagnostics.push(ExcludedRecallDiagnostic {
+                        record_id: record.id(),
+                        reason,
+                        status: "excluded",
+                        superseded_by: if superseded_by_refs.is_empty() {
+                            None
+                        } else {
+                            Some(superseded_by_refs)
+                        },
+                        contradicted_by: if contradicted_by_refs.is_empty() {
+                            None
+                        } else {
+                            Some(contradicted_by_refs)
+                        },
+                    });
+                }
+                crate::temporal_status::SupersessionMode::IncludeButFlag => {
+                    let repository_id = selected.as_deref().or_else(|| owners.first().copied());
+                    rows.push(MemoryRecallResult {
+                        record_id: record.id(),
+                        kind: record.node_kind_name().unwrap_or("Observation"),
+                        trust_class: "agent_authored",
+                        retrieval_score: m.score,
+                        source_handle: source_handle_value,
+                        agent_id: agent_id.as_deref(),
+                        agent_kind: agent_kind.as_deref(),
+                        session_id: session_id.as_deref(),
+                        confidence: confidence.as_deref(),
+                        observed_at: observed_at.as_deref(),
+                        ingested_at: ingested_at.as_deref(),
+                        review_state: if verified { "verified" } else { "unverified" },
+                        redacted: redaction_policy_version.is_some(),
+                        superseded_by: superseded_by.as_deref(),
+                        linked_code_handles,
+                        memory_text: text.as_deref().unwrap_or(summary.as_str()),
+                        repository_id,
+                        repository: repository_id.and_then(|id| index.display_of(id)),
+                        temporal_status: Some(status.to_string()),
+                        superseded_by_records: if superseded_by_refs.is_empty() {
+                            None
+                        } else {
+                            Some(superseded_by_refs)
+                        },
+                        contradicted_by: if contradicted_by_refs.is_empty() {
+                            None
+                        } else {
+                            Some(contradicted_by_refs)
+                        },
+                    });
+                }
+            }
+        } else {
+            let repository_id = selected.as_deref().or_else(|| owners.first().copied());
+            rows.push(MemoryRecallResult {
+                record_id: record.id(),
+                kind: record.node_kind_name().unwrap_or("Observation"),
+                trust_class: "agent_authored",
+                retrieval_score: m.score,
+                source_handle: source_handle_value,
+                agent_id: agent_id.as_deref(),
+                agent_kind: agent_kind.as_deref(),
+                session_id: session_id.as_deref(),
+                confidence: confidence.as_deref(),
+                observed_at: observed_at.as_deref(),
+                ingested_at: ingested_at.as_deref(),
+                review_state: if verified { "verified" } else { "unverified" },
+                redacted: redaction_policy_version.is_some(),
+                superseded_by: superseded_by.as_deref(),
+                linked_code_handles,
+                memory_text: text.as_deref().unwrap_or(summary.as_str()),
+                repository_id,
+                repository: repository_id.and_then(|id| index.display_of(id)),
+                temporal_status: match supersession {
+                    crate::temporal_status::SupersessionMode::IncludeButFlag => {
+                        Some(status.to_string())
+                    }
+                    crate::temporal_status::SupersessionMode::Exclude => None,
+                },
+                superseded_by_records: None,
+                contradicted_by: None,
+            });
+        }
     }
 
     // Canonical ordering before truncation (AC7): equal-score ANN results can be
@@ -5355,6 +5501,10 @@ fn query_semantic_memory(
 
     for row in &rows {
         print_result(row, format)?;
+    }
+
+    for diag in &excluded_recall_diagnostics {
+        print_result(diag, format)?;
     }
     Ok(())
 }
@@ -5436,6 +5586,7 @@ fn query_semantic_context(
     limit: usize,
     min_score: f32,
     repo: Option<&str>,
+    supersession: crate::temporal_status::SupersessionMode,
 ) -> Result<()> {
     validate_existing_embedded_store(data_dir)?;
 
@@ -5507,6 +5658,7 @@ fn query_semantic_context(
     };
 
     let bundle = query::semantic_context_bundle(&records, &leads, min_score);
+    let resolver = crate::temporal_status::TemporalResolver::build(&records);
 
     if bundle.is_no_match() {
         let envelope = serde_json::json!({
@@ -5526,6 +5678,8 @@ fn query_semantic_context(
         .iter()
         .map(|m| {
             let sections = build_context_sections(&m.context);
+            let (observations, excluded) =
+                apply_supersession(sections.observations, &resolver, supersession);
             let repository_id = index.owner_of(&m.lead.record_id);
             SemanticContextMatch {
                 record_id: &m.lead.record_id,
@@ -5540,11 +5694,12 @@ fn query_semantic_context(
                 candidate_record_ids: m.candidate_record_ids.iter().map(String::as_str).collect(),
                 source_facts: sections.source_facts,
                 topology_edges: sections.topology_edges,
-                observations: sections.observations,
+                observations,
                 project_state: sections.project_state,
                 artifacts: sections.artifacts,
                 verification_evidence: sections.verification_evidence,
                 unresolved: sections.unresolved,
+                excluded,
             }
         })
         .collect();
@@ -7120,10 +7275,82 @@ fn build_context_sections<'a>(ctx: &'a query::SymbolContext<'a>) -> ContextSecti
     }
 }
 
+fn apply_supersession<'a>(
+    observations: Vec<query::ContextObservation<'a>>,
+    resolver: &crate::temporal_status::TemporalResolver<'a>,
+    mode: crate::temporal_status::SupersessionMode,
+) -> (
+    Vec<query::ContextObservation<'a>>,
+    Vec<ExcludedDiagnostic<'a>>,
+) {
+    let mut filtered = Vec::new();
+    let mut excluded = Vec::new();
+
+    for mut obs in observations {
+        let (status, superseded_by, contradicted_by) = resolver.resolve_status(obs.record_id);
+
+        let is_superseded = status == "superseded" || status == "cycle";
+        let is_contradicted = status == "contradicted";
+
+        if is_superseded || is_contradicted {
+            let reason = if is_superseded {
+                "superseded"
+            } else {
+                "contradicted"
+            };
+            match mode {
+                crate::temporal_status::SupersessionMode::Exclude => {
+                    excluded.push(ExcludedDiagnostic {
+                        record_id: obs.record_id,
+                        reason,
+                        superseded_by: if superseded_by.is_empty() {
+                            None
+                        } else {
+                            Some(superseded_by)
+                        },
+                        contradicted_by: if contradicted_by.is_empty() {
+                            None
+                        } else {
+                            Some(contradicted_by)
+                        },
+                    });
+                }
+                crate::temporal_status::SupersessionMode::IncludeButFlag => {
+                    obs.temporal_status = Some(status.to_string());
+                    obs.superseded_by = if superseded_by.is_empty() {
+                        None
+                    } else {
+                        Some(superseded_by)
+                    };
+                    obs.contradicted_by = if contradicted_by.is_empty() {
+                        None
+                    } else {
+                        Some(contradicted_by)
+                    };
+                    filtered.push(obs);
+                }
+            }
+        } else {
+            match mode {
+                crate::temporal_status::SupersessionMode::IncludeButFlag => {
+                    obs.temporal_status = Some(status.to_string());
+                    filtered.push(obs);
+                }
+                crate::temporal_status::SupersessionMode::Exclude => {
+                    filtered.push(obs);
+                }
+            }
+        }
+    }
+
+    (filtered, excluded)
+}
+
 fn query_context_cmd(
     records: &[GraphRecord],
     symbol_name: &str,
     freshness: Option<(String, &'static str)>,
+    supersession: crate::temporal_status::SupersessionMode,
 ) -> Result<()> {
     let ctx = query::symbol_context(records, symbol_name);
 
@@ -7156,17 +7383,22 @@ fn query_context_cmd(
         (owners.len() == 1 && owners.contains(&Some(owner_id.as_str()))).then_some(code)
     });
 
+    let resolver = crate::temporal_status::TemporalResolver::build(records);
+    let (observations, excluded) =
+        apply_supersession(sections.observations, &resolver, supersession);
+
     let response = ContextResponse {
         ok: true,
         symbol_name,
         freshness: freshness_code,
         source_facts: sections.source_facts,
         topology_edges: sections.topology_edges,
-        observations: sections.observations,
+        observations,
         project_state: sections.project_state,
         artifacts: sections.artifacts,
         verification_evidence: sections.verification_evidence,
         unresolved: sections.unresolved,
+        excluded,
     };
 
     let output = serde_json::to_string_pretty(&response).context("failed to serialize context")?;
@@ -7175,7 +7407,12 @@ fn query_context_cmd(
 }
 
 #[allow(clippy::too_many_lines)]
-fn query_subsystem_cmd(records: &[GraphRecord], prefix: &str, _format: OutputFormat) -> Result<()> {
+fn query_subsystem_cmd(
+    records: &[GraphRecord],
+    prefix: &str,
+    _format: OutputFormat,
+    supersession: crate::temporal_status::SupersessionMode,
+) -> Result<()> {
     let ctx = match query::subsystem_context(records, prefix) {
         Ok(ctx) => ctx,
         Err(query::SubsystemPrefixError::Malformed { prefix: p }) => {
@@ -7211,11 +7448,14 @@ fn query_subsystem_cmd(records: &[GraphRecord], prefix: &str, _format: OutputFor
         .filter_map(|r| context_source_fact(r))
         .collect();
 
-    let observations: Vec<ContextObservation<'_>> = ctx
+    let raw_observations: Vec<ContextObservation<'_>> = ctx
         .observations
         .iter()
         .filter_map(|r| context_observation(r))
         .collect();
+
+    let resolver = crate::temporal_status::TemporalResolver::build(records);
+    let (observations, excluded) = apply_supersession(raw_observations, &resolver, supersession);
 
     let project_state: Vec<ContextLinkedItem<'_>> = ctx
         .project_state
@@ -7310,6 +7550,7 @@ fn query_subsystem_cmd(records: &[GraphRecord], prefix: &str, _format: OutputFor
         verification_evidence,
         semantic_drift,
         unresolved,
+        excluded,
     };
 
     let output =
@@ -7761,6 +8002,7 @@ fn query_task_cmd(records: &[GraphRecord], id_or_handle: &str) -> Result<()> {
         reviews,
         external_links,
         unresolved,
+        excluded: Vec::new(),
     };
 
     let output =

@@ -71,6 +71,8 @@ pub mod repair;
 pub mod schema_version;
 /// Semantic search relevance evaluation harness (issue #58).
 pub mod semantic_eval;
+/// Transitive memory supersession and contradiction resolution (issue #92).
+pub mod temporal_status;
 /// Query-answer token-cost measurement against the ripgrep baseline (issue #84).
 pub mod token_cost;
 /// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
@@ -105,6 +107,7 @@ pub use schema_version::{
     RecordLineRead, RecordReadError, RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE,
     UnknownSchemaVersion, record_version, validate_record_version,
 };
+pub use temporal_status::{SupersessionMode, TemporalReference, TemporalResolver};
 pub use traj::import_traj;
 
 /// Scans a repository into deterministic graph records.
