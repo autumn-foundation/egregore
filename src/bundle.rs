@@ -442,12 +442,26 @@ pub fn export_bundle(
     // Sort unresolved links canonically
     unresolved_links.sort();
 
-    // Canonical ordering of included records by ID (and then by JSON serialization if IDs match)
-    included_records.sort_by(|a, b| {
-        let id_cmp = a.id().cmp(b.id());
+    // Wrap and hash records
+    let mut bundle_records: Vec<BundleRecord> = included_records
+        .into_iter()
+        .map(|r| {
+            let scrubbed = scrub_record(r);
+            let json = serde_json::to_string(&scrubbed).unwrap_or_default();
+            let hash = blake3::hash(json.as_bytes()).to_string();
+            BundleRecord {
+                record: scrubbed,
+                hash,
+            }
+        })
+        .collect();
+
+    // Canonical ordering of bundle records by ID (and then by JSON serialization of the scrubbed record if IDs match)
+    bundle_records.sort_by(|a, b| {
+        let id_cmp = a.record.id().cmp(b.record.id());
         if id_cmp == std::cmp::Ordering::Equal {
-            let a_json = serde_json::to_string(a).unwrap_or_default();
-            let b_json = serde_json::to_string(b).unwrap_or_default();
+            let a_json = serde_json::to_string(&a.record).unwrap_or_default();
+            let b_json = serde_json::to_string(&b.record).unwrap_or_default();
             a_json.cmp(&b_json)
         } else {
             id_cmp
@@ -472,20 +486,6 @@ pub fn export_bundle(
             break;
         }
     }
-
-    // Wrap and hash records
-    let bundle_records: Vec<BundleRecord> = included_records
-        .into_iter()
-        .map(|r| {
-            let scrubbed = scrub_record(r);
-            let serialized = serde_json::to_string(&scrubbed).unwrap();
-            let hash = blake3::hash(serialized.as_bytes()).to_hex().to_string();
-            BundleRecord {
-                record: scrubbed,
-                hash,
-            }
-        })
-        .collect();
 
     // Validate coverage threshold
     let mut total_valid = 0usize;

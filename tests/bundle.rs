@@ -500,4 +500,130 @@ fn test_bundle_cli_workflow() {
         .failure()
         .code(predicate::eq(1))
         .stderr(predicate::str::contains(r#""code":"export_failed""#));
+
+    // 7. Verify invalid selector format exits with code 2 and outputs invalid_argument
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("bundle")
+        .arg("export")
+        .arg("--root-selector")
+        .arg("invalid_format_no_colon")
+        .arg("--graph")
+        .arg(&graph_path)
+        .arg("--out")
+        .arg(&bundle_path)
+        .assert()
+        .failure()
+        .code(predicate::eq(2))
+        .stderr(predicate::str::contains(r#""code":"invalid_argument""#));
+
+    // 8. Verify missing input graph exits with code 2
+    let non_existent_graph = temp.path().join("missing.jsonl");
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("bundle")
+        .arg("export")
+        .arg("--root-selector")
+        .arg("id:obs-1")
+        .arg("--graph")
+        .arg(&non_existent_graph)
+        .arg("--out")
+        .arg(&bundle_path)
+        .assert()
+        .failure()
+        .code(predicate::eq(2))
+        .stderr(predicate::str::contains(r#""code":"load_failed""#));
+
+    // 9. Verify bundle verify on non-existent file exits with code 2
+    let non_existent_bundle = temp.path().join("missing_bundle.json");
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("bundle")
+        .arg("verify")
+        .arg(&non_existent_bundle)
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .failure()
+        .code(predicate::eq(2))
+        .stderr(predicate::str::contains(r#""code":"file_read_failed""#));
+
+    // 10. Verify bundle verify on malformed JSON exits with code 2
+    let malformed_bundle = temp.path().join("malformed_bundle.json");
+    fs::write(&malformed_bundle, "{ malformed json }").unwrap();
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("bundle")
+        .arg("verify")
+        .arg(&malformed_bundle)
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .failure()
+        .code(predicate::eq(2))
+        .stderr(predicate::str::contains(r#""code":"parse_failed""#));
+
+    // 11. Test Stripe live key detection on non-scrubbed field (summary)
+    let repo_node_with_secret = GraphRecord::node(
+        "repo-1".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("my-repo".to_owned()),
+        "Repository node containing secret key sk_live_12345abcdef012345678".to_owned(),
+    );
+    let mut obs_node_ok = GraphRecord::node(
+        "obs-1".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation node".to_owned(),
+    );
+    if let GraphRecord::Node {
+        source_handle,
+        schema_version,
+        ..
+    } = &mut obs_node_ok
+    {
+        *source_handle = Some("src/obs.txt".to_owned());
+        *schema_version = 1;
+    }
+    let records3 = vec![repo_node_with_secret, obs_node_ok];
+    let mut graph_content3 = String::new();
+    for r in records3 {
+        graph_content3.push_str(&serde_json::to_string(&r).unwrap());
+        graph_content3.push('\n');
+    }
+    let graph_path3 = temp.path().join("graph3.jsonl");
+    fs::write(&graph_path3, graph_content3).unwrap();
+
+    let bundle_path3 = temp.path().join("bundle3.json");
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("bundle")
+        .arg("export")
+        .arg("--root-selector")
+        .arg("id:repo-1")
+        .arg("--graph")
+        .arg(&graph_path3)
+        .arg("--out")
+        .arg(&bundle_path3)
+        .assert()
+        .success();
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("bundle")
+        .arg("verify")
+        .arg(&bundle_path3)
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .failure()
+        .code(predicate::eq(1))
+        .stdout(predicate::str::contains(r#""passed": false"#))
+        .stdout(predicate::str::contains(
+            "contains unredacted secret class: api_token",
+        ));
 }

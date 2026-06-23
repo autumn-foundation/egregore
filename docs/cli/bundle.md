@@ -64,7 +64,7 @@ eg bundle verify <path> [--format <json|text>]
 - **Coverage**: Audits that the selected roots and links meet the minimum citation thresholds (95% for code, 100% for non-code).
 - **Safety**: Verifies that no raw sensitive classes (e.g. secret keys or unredacted credentials) appear in the exported records or in the verifier output.
 
-If any verdict fails, the command exits with code `1`. If all pass, it exits with code `0`.
+If any verdict fails, the command exits with code `1`. If all pass, it exits with code `0`. If the verification process fails due to syntax errors (e.g. malformed JSON) or file load errors (e.g. file not found), the command exits with code `2`.
 
 ---
 

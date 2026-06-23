@@ -508,6 +508,8 @@ fn find_api_token(value: &str) -> Option<usize> {
     // Well-known API token prefixes
     const PREFIXES: &[&str] = &[
         "sk-",         // OpenAI and compatible providers
+        "sk_",         // Stripe live/test secret keys
+        "rk_",         // Stripe live/test restricted keys
         "ghp_",        // GitHub personal access token (classic)
         "ghs_",        // GitHub server-to-server token
         "github_pat_", // GitHub fine-grained PAT

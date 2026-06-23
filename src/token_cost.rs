@@ -193,7 +193,7 @@ fn line_has_word(line: &str, pattern: &str) -> bool {
     let pat = pattern.as_bytes();
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut start = 0;
-    while let Some(rel) = line[start..].find(pattern) {
+    while let Some(rel) = bytes[start..].windows(pat.len()).position(|w| w == pat) {
         let at = start + rel;
         let before_ok = at == 0 || !is_word(bytes[at - 1]);
         let after_idx = at + pat.len();
@@ -445,36 +445,6 @@ fn build_file_answer(
     )
 }
 
-fn get_file_diagnostics<'a>(
-    records: &'a [GraphRecord],
-    file_path: &str,
-) -> (&'static str, Option<Vec<DiagnosticRef<'a>>>) {
-    let mut diagnostics = Vec::new();
-    for r in records {
-        if let GraphRecord::Node {
-            id,
-            kind: NodeKind::Diagnostic,
-            repo_relative_path: Some(path),
-            span: Some(span),
-            ..
-        } = r
-            && path == file_path
-        {
-            diagnostics.push(DiagnosticRef {
-                record_id: id.as_str(),
-                repo_relative_path: path.as_str(),
-                span: *span,
-            });
-        }
-    }
-    if diagnostics.is_empty() {
-        ("complete", None)
-    } else {
-        diagnostics.sort_by_key(|d| (d.span.start_line, d.record_id));
-        ("partial", Some(diagnostics))
-    }
-}
-
 /// Serializes the symbol nodes matching `include`, sorted and shaped exactly
 /// like `eg query symbol` / `eg query file`, and computes correctness facts.
 fn build_symbol_node_answer<F>(
@@ -505,6 +475,33 @@ where
     // Mirror `query_symbol_all`: sort by (start_line, record_id).
     matched.sort_by(|a, b| symbol_sort_key(a).cmp(&symbol_sort_key(b)));
 
+    let mut diagnostics_by_path: std::collections::HashMap<&str, Vec<DiagnosticRef<'_>>> =
+        std::collections::HashMap::new();
+    if include_diagnostics {
+        for r in records {
+            if let GraphRecord::Node {
+                id,
+                kind: NodeKind::Diagnostic,
+                repo_relative_path: Some(path),
+                span: Some(span),
+                ..
+            } = r
+            {
+                diagnostics_by_path
+                    .entry(path.as_str())
+                    .or_default()
+                    .push(DiagnosticRef {
+                        record_id: id.as_str(),
+                        repo_relative_path: path.as_str(),
+                        span: *span,
+                    });
+            }
+        }
+        for diags in diagnostics_by_path.values_mut() {
+            diags.sort_by_key(|d| (d.span.start_line, d.record_id));
+        }
+    }
+
     let mut serialized = Vec::with_capacity(matched.len());
     let mut has_expected = false;
     let mut expected_has_handle = false;
@@ -522,8 +519,11 @@ where
         } = record
         {
             let path = repo_relative_path.as_deref();
-            let (completeness, diags) =
-                path.map_or(("complete", None), |p| get_file_diagnostics(records, p));
+            let (completeness, diags) = path.map_or(("complete", None), |p| {
+                diagnostics_by_path
+                    .get(p)
+                    .map_or(("complete", None), |diags| ("partial", Some(diags.clone())))
+            });
             let git_commit = temporal.as_ref().map(|t| t.git_commit.as_str());
             let repository_id = index.owner_of(id);
             let row = SymbolAnswerRow {
