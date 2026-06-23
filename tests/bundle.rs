@@ -82,3 +82,69 @@ fn test_bfs_traversal_and_selectors() {
     assert!(ids.contains(edge_file_sym.id()));
     assert!(ids.contains(edge_repo_file.id()));
 }
+
+#[test]
+fn test_record_scrubbing_and_hashing() {
+    use aletheia_egregore::ir::{GraphRecord, NodeKind, OutputHandle};
+
+    let repo_node = GraphRecord::node(
+        "repo-1".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("my-repo".to_owned()),
+        "Repository node".to_owned(),
+    );
+
+    // Let's create an observation node with sensitive text and stdout inline content
+    let mut obs_node = GraphRecord::node(
+        "obs-1".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation node".to_owned(),
+    );
+
+    if let GraphRecord::Node {
+        text,
+        stdout_handle,
+        ..
+    } = &mut obs_node
+    {
+        *text = Some("This is a sensitive transcript text".to_owned());
+        *stdout_handle = Some(Box::new(OutputHandle {
+            inline: Some("sensitive stdout output".to_owned()),
+            hash: "blake3-stdout-hash-val".to_owned(),
+            bytes: 24,
+        }));
+    }
+
+    let records = vec![repo_node, obs_node];
+
+    let bundle = export_bundle(&records, "id:obs-1", "0.1.0").expect("export should succeed");
+
+    // The exported bundle should contain obs-1, but scrubbed
+    let obs_record = bundle.records.iter().find(|br| br.record.id() == "obs-1").expect("should find obs-1");
+
+    if let GraphRecord::Node {
+        text,
+        stdout_handle,
+        ..
+    } = &obs_record.record
+    {
+        // Assert that sensitive text is removed
+        assert!(text.is_none());
+        // Assert that stdout handle inline content is removed, but hash and bytes are preserved
+        let handle = stdout_handle.as_ref().expect("stdout handle should be present");
+        assert!(handle.inline.is_none());
+        assert_eq!(handle.hash, "blake3-stdout-hash-val");
+        assert_eq!(handle.bytes, 24);
+    } else {
+        panic!("obs-1 should be a Node");
+    }
+
+    // Verify hash of the scrubbed record is correct
+    let expected_hash = blake3::hash(serde_json::to_string(&obs_record.record).unwrap().as_bytes()).to_hex().to_string();
+    assert_eq!(obs_record.hash, expected_hash);
+}

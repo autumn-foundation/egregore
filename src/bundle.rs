@@ -174,6 +174,63 @@ fn find_root_records(records: &[GraphRecord], selector: &str) -> Result<Vec<Grap
     Ok(roots)
 }
 
+/// Scrubs raw protected payloads and sensitive prose fields from a GraphRecord.
+pub fn scrub_record(mut record: GraphRecord) -> GraphRecord {
+    if let GraphRecord::Node {
+        text,
+        validation_summary,
+        arguments_summary,
+        arguments_handle,
+        result_handle,
+        stdout_handle,
+        stderr_handle,
+        patch_handle,
+        body_handle,
+        diff_hunk_handle,
+        user_context,
+        ..
+    } = &mut record
+    {
+        // 1. Scrub Node prose/text fields
+        *text = None;
+        *validation_summary = None;
+        *arguments_summary = None;
+
+        // 2. Scrub inline handle content
+        if let Some(h) = arguments_handle {
+            h.inline = None;
+        }
+        if let Some(h) = result_handle {
+            h.inline = None;
+        }
+        if let Some(h) = stdout_handle {
+            h.inline = None;
+        }
+        if let Some(h) = stderr_handle {
+            h.inline = None;
+        }
+        if let Some(h) = patch_handle {
+            h.inline = None;
+        }
+        if let Some(h) = body_handle {
+            h.inline = None;
+        }
+        if let Some(h) = diff_hunk_handle {
+            h.inline = None;
+        }
+
+        // 3. Scrub user context fields
+        user_context.proposed_rule_text = None;
+        user_context.prompt_text = None;
+        user_context.decision_rationale = None;
+        user_context.edited_rule_text = None;
+        user_context.rule_text = None;
+        user_context.action_summary = None;
+        user_context.constraint_text = None;
+    }
+    record
+}
+
 /// Exports an evidence bundle for a selected query result, task, memory record, etc.
 pub fn export_bundle(
     records: &[GraphRecord],
@@ -340,12 +397,14 @@ pub fn export_bundle(
         }
     }
 
-    // Wrap records with dummy hashes for now
+    // Wrap and hash records
     let bundle_records: Vec<BundleRecord> = included_records
         .into_iter()
         .map(|r| {
-            let hash = "dummy_hash".to_owned();
-            BundleRecord { record: r, hash }
+            let scrubbed = scrub_record(r);
+            let serialized = serde_json::to_string(&scrubbed).unwrap();
+            let hash = blake3::hash(serialized.as_bytes()).to_hex().to_string();
+            BundleRecord { record: scrubbed, hash }
         })
         .collect();
 
