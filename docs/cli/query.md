@@ -32,7 +32,9 @@ Evidence-backed audit subcommands have their own pages:
   claim** ([memory-audit.md](memory-audit.md), issue #64).
 - `eg query semantic-memory` — recall prior **agent memory by meaning** with
   provenance, trust-separated from code
-  ([semantic-memory-recall.md](semantic-memory-recall.md), issue #91).
+  ([semantic-memory-recall.md](semantic-memory-recall.md), issue #91). Supports
+  recall-time filtering of superseded and contradicted memories
+  ([recall-supersession.md](recall-supersession.md), issue #92).
 - `eg query failures` — **prior failed attempts** linked to a code or task
   handle ([failure-history.md](failure-history.md), issue #63).
 - `eg query change-impact` — **graph-derived impact leads** grouped by relation

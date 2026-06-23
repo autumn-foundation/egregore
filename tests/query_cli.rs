@@ -2623,3 +2623,195 @@ fn query_symbol_completeness_flagging() {
     assert_eq!(parsed["extraction_completeness"], "partial");
     // Symbol query results don't need to serialize the diagnostics themselves, just the status
 }
+
+// ---------------------------------------------------------------------------
+// query context — supersession and contradiction resolution
+// ---------------------------------------------------------------------------
+
+fn fixture_context_with_supersession() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("supersession_seeded.jsonl");
+
+    let sym_id = stable_id(&["node", "Symbol", "src/lib.rs", "my_function"]);
+    let sym = GraphRecord::symbol(
+        sym_id.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        SourceSpan {
+            start_byte: 0,
+            end_byte: 80,
+            start_line: 10,
+            end_line: 20,
+        },
+        "my_function".to_owned(),
+        "Rust fn my_function at src/lib.rs:10".to_owned(),
+    );
+
+    // Helper to make observation node
+    let make_obs = |id_str: &str, superseded_by: Option<&str>| -> GraphRecord {
+        let obs_id = agent_memory_stable_id(&["obs", id_str]);
+        let mut obs = GraphRecord::node(
+            obs_id,
+            NodeKind::Observation,
+            None,
+            None,
+            None,
+            format!("Observation {id_str}"),
+        );
+        if let GraphRecord::Node {
+            ref mut text,
+            ref mut agent_id,
+            ref mut session_id,
+            ref mut observed_at,
+            ref mut confidence,
+            ref mut evidence_links,
+            superseded_by: ref mut node_sub_by,
+            ref mut schema_version,
+            ..
+        } = obs
+        {
+            *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+            *text = Some(format!("Observation text {id_str}"));
+            *agent_id = Some("agent:test".to_owned());
+            *session_id = Some(format!("session:{id_str}"));
+            *observed_at = Some("2026-03-01T12:00:00Z".to_owned());
+            *confidence = Some("0.9".to_owned());
+            *node_sub_by = superseded_by.map(|s| agent_memory_stable_id(&["obs", s]));
+            *evidence_links = Some(vec![EvidenceLink {
+                target_record_id: Some(sym_id.clone()),
+                target_domain: "codegraph".to_owned(),
+                relation: "MENTIONS_SYMBOL".to_owned(),
+                confidence: "0.9".to_owned(),
+                as_of_commit: None,
+                target_repo_relative_path: None,
+                target_span: None,
+                target_git_commit: None,
+            }]);
+        }
+        obs
+    };
+
+    // A -> B -> C
+    // A: superseded by B
+    // B: superseded by C
+    // C: current (uncontested)
+    let obs_a = make_obs("A", Some("B"));
+    let obs_b = make_obs("B", Some("C"));
+    let obs_c = make_obs("C", None);
+
+    // X contradicts Y, Y contradicts X
+    let obs_x = make_obs("X", None);
+    let obs_y = make_obs("Y", None);
+
+    // Create contradicts edge between X and Y
+    let edge_contradicts = GraphRecord::edge(
+        EdgeLabel::Contradicts,
+        agent_memory_stable_id(&["obs", "X"]),
+        agent_memory_stable_id(&["obs", "Y"]),
+        None,
+        "X contradicts Y".to_owned(),
+    );
+
+    // Uncontested record U
+    let obs_u = make_obs("U", None);
+
+    let mut graph = Graph::new();
+    graph.push(sym);
+    graph.push(obs_a);
+    graph.push(obs_b);
+    graph.push(obs_c);
+    graph.push(obs_x);
+    graph.push(obs_y);
+    graph.push(edge_contradicts);
+    graph.push(obs_u);
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+
+    (temp, path)
+}
+
+#[test]
+fn test_query_context_supersession_exclude() {
+    let (_temp, graph) = fixture_context_with_supersession();
+
+    // Default mode: Exclude
+    let output = egregore()
+        .args(["query", "context", "my_function", "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    let observations = parsed["observations"].as_array().expect("array");
+    // Only U and C should remain (A, B are superseded, X, Y are contradicted)
+    assert_eq!(observations.len(), 2);
+    let record_ids: Vec<&str> = observations
+        .iter()
+        .map(|o| o["record_id"].as_str().unwrap())
+        .collect();
+    assert!(record_ids.contains(&agent_memory_stable_id(&["obs", "C"]).as_str()));
+    assert!(record_ids.contains(&agent_memory_stable_id(&["obs", "U"]).as_str()));
+
+    let excluded = parsed["excluded"].as_array().expect("array");
+    assert_eq!(excluded.len(), 4); // A, B, X, Y
+}
+
+#[test]
+fn test_query_context_supersession_include_but_flag() {
+    let (_temp, graph) = fixture_context_with_supersession();
+
+    let output = egregore()
+        .args(["query", "context", "my_function", "--graph"])
+        .arg(&graph)
+        .arg("--supersession")
+        .arg("include-but-flag")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    let observations = parsed["observations"].as_array().expect("array");
+    // All 6 observations should be included
+    assert_eq!(observations.len(), 6);
+
+    // Check statuses
+    let get_obs = |id_str: &str| {
+        let full_id = agent_memory_stable_id(&["obs", id_str]);
+        observations
+            .iter()
+            .find(|o| o["record_id"].as_str().unwrap() == full_id)
+            .unwrap()
+            .clone()
+    };
+
+    let obs_a = get_obs("A");
+    assert_eq!(obs_a["temporal_status"], "superseded");
+    let sub_by = obs_a["superseded_by"].as_array().unwrap();
+    assert_eq!(sub_by.len(), 1);
+    assert_eq!(
+        sub_by[0]["record_id"],
+        agent_memory_stable_id(&["obs", "C"]).as_str()
+    );
+
+    let obs_x = get_obs("X");
+    assert_eq!(obs_x["temporal_status"], "contradicted");
+    let contra_by = obs_x["contradicted_by"].as_array().unwrap();
+    assert_eq!(contra_by.len(), 1);
+    assert_eq!(
+        contra_by[0]["record_id"],
+        agent_memory_stable_id(&["obs", "Y"]).as_str()
+    );
+
+    let obs_u = get_obs("U");
+    assert_eq!(obs_u["temporal_status"], "current");
+}

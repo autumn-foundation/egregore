@@ -6291,6 +6291,12 @@ pub struct ContextObservation<'a> {
     pub exit_code: Option<i64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence_links: Vec<&'a EvidenceLink>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporal_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<Vec<crate::temporal_status::TemporalReference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contradicted_by: Option<Vec<crate::temporal_status::TemporalReference>>,
 }
 
 /// One item in the `project_state`, `artifacts`, or `verification_evidence` sections.
@@ -6426,6 +6432,9 @@ pub fn context_observation(record: &GraphRecord) -> Option<ContextObservation<'_
         failure_kind: failure_kind.as_deref(),
         exit_code: *exit_code,
         evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
+        temporal_status: None,
+        superseded_by: None,
+        contradicted_by: None,
     })
 }
 
@@ -6470,6 +6479,9 @@ pub fn redacted_context_observation(record: &GraphRecord) -> Option<ContextObser
         failure_kind: failure_kind.as_deref(),
         exit_code: *exit_code,
         evidence_links: evidence_links.as_deref().unwrap_or(&[]).iter().collect(),
+        temporal_status: None,
+        superseded_by: None,
+        contradicted_by: None,
     })
 }
 

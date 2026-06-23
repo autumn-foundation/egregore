@@ -8868,123 +8868,15 @@ fn context_source_fact_to_json(record: &GraphRecord) -> serde_json::Value {
 }
 
 fn context_observation_to_json(record: &GraphRecord) -> serde_json::Value {
-    let GraphRecord::Node {
-        id,
-        kind,
-        summary,
-        text,
-        agent_id,
-        session_id,
-        observed_at,
-        confidence,
-        failure_kind,
-        exit_code,
-        evidence_links,
-        ..
-    } = record
-    else {
-        return json!({ "record_id": record.id() });
-    };
-    let provenance_handle = match (agent_id.as_deref(), session_id.as_deref()) {
-        (Some(a), Some(s)) => Some(format!("{a}:{s}")),
-        (Some(a), None) => Some(a.to_owned()),
-        _ => None,
-    };
-    let links = evidence_links.as_deref().unwrap_or(&[]);
-    json!({
-        "record_id": id,
-        "kind": kind.as_str(),
-        "summary": summary,
-        "text": text,
-        "provenance_handle": provenance_handle,
-        "agent_id": agent_id,
-        "session_id": session_id,
-        "observed_at": observed_at,
-        "confidence": confidence,
-        "failure_kind": failure_kind,
-        "exit_code": exit_code,
-        "evidence_links": serde_json::to_value(links).unwrap_or_default(),
-    })
+    graph_query::context_observation(record)
+        .and_then(|obs| serde_json::to_value(&obs).ok())
+        .unwrap_or_else(|| json!({ "record_id": record.id() }))
 }
 
 fn context_linked_item_to_json(record: &GraphRecord) -> serde_json::Value {
-    let GraphRecord::Node {
-        id,
-        kind,
-        summary,
-        title,
-        name,
-        text,
-        status,
-        verification_kind,
-        exit_code,
-        executed_at,
-        evidence_quality,
-        repo_relative_path,
-        body_handle,
-        evidence_links,
-        stdout_handle,
-        stderr_handle,
-        source_artifact_path,
-        source_artifact_hash,
-        edit_kind,
-        before_hash,
-        after_hash,
-        rename_to,
-        hunk_count,
-        linked_turn_id,
-        linked_patch_id,
-        patch_status,
-        patch_handle,
-        patch_bytes_hash,
-        patch_bytes_size,
-        target_files,
-        validation_summary,
-        base_commit,
-        unknown_base_reason,
-        producer_session_id,
-        ..
-    } = record
-    else {
-        return json!({ "record_id": record.id() });
-    };
-    let links = evidence_links.as_deref().unwrap_or(&[]);
-    json!({
-        "record_id": id,
-        "kind": kind.as_str(),
-        "summary": summary,
-        "title": title,
-        "name": name,
-        "text": text,
-        "status": status,
-        "verification_kind": verification_kind,
-        "exit_code": exit_code,
-        "executed_at": executed_at,
-        "evidence_quality": evidence_quality,
-        "repo_relative_path": repo_relative_path,
-        "body_handle": body_handle.as_deref().map(|h| serde_json::to_value(h).unwrap_or_default()),
-        "stdout_handle": stdout_handle.as_deref().map(|h| serde_json::to_value(h).unwrap_or_default()),
-        "stderr_handle": stderr_handle.as_deref().map(|h| serde_json::to_value(h).unwrap_or_default()),
-        "source_artifact_path": source_artifact_path,
-        "source_artifact_hash": source_artifact_hash,
-        "edit_kind": edit_kind,
-        "before_hash": before_hash,
-        "after_hash": after_hash,
-        "rename_to": rename_to,
-        "hunk_count": hunk_count,
-        "linked_turn_id": linked_turn_id,
-        "linked_patch_id": linked_patch_id,
-        "patch_status": patch_status,
-        "patch_handle": patch_handle.as_deref().map(|h| serde_json::to_value(h).unwrap_or_default()),
-        "patch_bytes_hash": patch_bytes_hash,
-        "patch_bytes_size": patch_bytes_size,
-        "target_files": target_files,
-        "validation_summary": validation_summary,
-        "base_commit": base_commit,
-        "unknown_base_reason": unknown_base_reason,
-        "producer_session_id": producer_session_id,
-        "evidence_links": serde_json::to_value(links).unwrap_or_default(),
-    })
+    graph_query::context_linked_item(record)
+        .and_then(|item| serde_json::to_value(&item).ok())
+        .unwrap_or_else(|| json!({ "record_id": record.id() }))
 }
 
 struct ContextSections {
@@ -9094,6 +8986,75 @@ fn build_context_sections(ctx: &graph_query::SymbolContext<'_>, limit: usize) ->
     }
 }
 
+fn apply_supersession_json(
+    observations: Vec<serde_json::Value>,
+    resolver: &crate::temporal_status::TemporalResolver<'_>,
+    mode: crate::temporal_status::SupersessionMode,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut filtered = Vec::new();
+    let mut excluded = Vec::new();
+
+    for mut obs in observations {
+        if let Some(record_id) = obs.get("record_id").and_then(|v| v.as_str()) {
+            let (status, superseded_by, contradicted_by) = resolver.resolve_status(record_id);
+
+            let is_superseded = status == "superseded" || status == "cycle";
+            let is_contradicted = status == "contradicted";
+
+            if is_superseded || is_contradicted {
+                let reason = if is_superseded {
+                    "superseded"
+                } else {
+                    "contradicted"
+                };
+                match mode {
+                    crate::temporal_status::SupersessionMode::Exclude => {
+                        let mut diag = serde_json::json!({
+                            "record_id": record_id,
+                            "reason": reason,
+                        });
+                        if !superseded_by.is_empty() {
+                            diag["superseded_by"] =
+                                serde_json::to_value(&superseded_by).unwrap_or_default();
+                        }
+                        if !contradicted_by.is_empty() {
+                            diag["contradicted_by"] =
+                                serde_json::to_value(&contradicted_by).unwrap_or_default();
+                        }
+                        excluded.push(diag);
+                    }
+                    crate::temporal_status::SupersessionMode::IncludeButFlag => {
+                        obs["temporal_status"] = serde_json::Value::String(status.to_string());
+                        if !superseded_by.is_empty() {
+                            obs["superseded_by"] =
+                                serde_json::to_value(&superseded_by).unwrap_or_default();
+                        }
+                        if !contradicted_by.is_empty() {
+                            obs["contradicted_by"] =
+                                serde_json::to_value(&contradicted_by).unwrap_or_default();
+                        }
+                        filtered.push(obs);
+                    }
+                }
+            } else {
+                match mode {
+                    crate::temporal_status::SupersessionMode::IncludeButFlag => {
+                        obs["temporal_status"] = serde_json::Value::String(status.to_string());
+                        filtered.push(obs);
+                    }
+                    crate::temporal_status::SupersessionMode::Exclude => {
+                        filtered.push(obs);
+                    }
+                }
+            }
+        } else {
+            filtered.push(obs);
+        }
+    }
+
+    (filtered, excluded)
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::option_if_let_else)]
 fn handle_verb_observations_for_symbol(
@@ -9109,6 +9070,19 @@ fn handle_verb_observations_for_symbol(
         Some(n) => n.to_owned(),
         None => {
             return HttpResponse::error_with_id(request_id, ApiError::missing_field("params.name"));
+        }
+    };
+
+    let supersession = match params.get("supersession").and_then(|v| v.as_str()) {
+        Some("include-but-flag") => crate::temporal_status::SupersessionMode::IncludeButFlag,
+        Some("exclude") | None => crate::temporal_status::SupersessionMode::Exclude,
+        Some(other) => {
+            return HttpResponse::error_with_id(
+                request_id,
+                ApiError::bad_request(format!(
+                    "invalid supersession parameter: '{other}'. Expected 'exclude' or 'include-but-flag'"
+                )),
+            );
         }
     };
 
@@ -9214,6 +9188,9 @@ fn handle_verb_observations_for_symbol(
 
     let s = build_context_sections(&ctx, limit);
 
+    let resolver = crate::temporal_status::TemporalResolver::build(&records);
+    let (observations, excluded) = apply_supersession_json(s.observations, &resolver, supersession);
+
     HttpResponse::success(
         Some(request_id),
         200,
@@ -9223,11 +9200,12 @@ fn handle_verb_observations_for_symbol(
             "symbol_name": name,
             "source_facts": s.source_facts,
             "topology_edges": s.topology_edges,
-            "observations": s.observations,
+            "observations": observations,
             "project_state": s.project_state,
             "artifacts": s.artifacts,
             "verification_evidence": s.verification_evidence,
             "unresolved": s.unresolved,
+            "excluded": excluded,
         }),
     )
 }

@@ -11689,3 +11689,249 @@ fn semantic_guidance_doc_covers_daemon_backed_search() {
         "guidance must relate daemon semantic search to issue #58's relevance gate"
     );
 }
+
+#[test]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+fn daemon_observations_for_symbol_supersession() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    // 1. Ingest Symbol node
+    let cg_ingest = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ofs-ss-cg-ingest",
+            "agent_id": "ofs-ss-agent",
+            "session_id": "ofs-ss-session",
+            "idempotency_key": "ofs-ss-cg-key",
+            "domain": "codegraph",
+            "created_at": "2026-05-30T00:00:00Z",
+            "payload": {
+                "records": [{
+                    "record_type": "node",
+                    "id": "codegraph:v4:ofs-ss-symbol",
+                    "kind": "Symbol",
+                    "schema_version": SCHEMA_VERSION,
+                    "repo_relative_path": "src/lib.rs",
+                    "name": "supersession_fn",
+                    "symbol_kind": "fn",
+                    "span": {"start_byte": 0, "end_byte": 50,
+                             "start_line": 10, "end_line": 15},
+                    "summary": "fn supersession_fn in src/lib.rs"
+                }]
+            }
+        }),
+    );
+    assert!(
+        cg_ingest.starts_with("HTTP/1.1 200"),
+        "symbol ingest failed: {cg_ingest}"
+    );
+
+    // 2. Ingest Observations and edges.
+    let make_obs_payload = |id_suffix: &str, superseded_by: Option<&str>| -> serde_json::Value {
+        let mut node = serde_json::json!({
+            "record_type": "node",
+            "id": format!("agent_memory:v1:ofs-ss-obs-{}", id_suffix),
+            "kind": "Observation",
+            "schema_version": 1,
+            "agent_id": "ofs-ss-agent",
+            "agent_kind": "claude-code",
+            "session_id": format!("session-{}", id_suffix),
+            "observed_at": "2026-05-30T10:00:00Z",
+            "ingested_at": "2026-05-30T10:00:00Z",
+            "confidence": "0.9",
+            "text": format!("obs {}", id_suffix),
+            "summary": format!("Observation {}", id_suffix),
+            "evidence_links": [{
+                "target_record_id": "codegraph:v4:ofs-ss-symbol",
+                "target_domain": "codegraph",
+                "relation": "MENTIONS_SYMBOL",
+                "confidence": "0.9"
+            }]
+        });
+        if let Some(sub_by) = superseded_by {
+            node["superseded_by"] =
+                serde_json::json!(format!("agent_memory:v1:ofs-ss-obs-{}", sub_by));
+        }
+        node
+    };
+
+    let obs_a = make_obs_payload("a", Some("b"));
+    let obs_b = make_obs_payload("b", Some("c"));
+    let obs_c = make_obs_payload("c", None);
+    let obs_x = make_obs_payload("x", None);
+    let obs_y = make_obs_payload("y", None);
+    let obs_u = make_obs_payload("u", None);
+
+    let edge_contradicts = serde_json::json!({
+        "record_type": "edge",
+        "id": "agent_memory:v1:ofs-ss-edge-contradicts",
+        "label": "CONTRADICTS",
+        "source": "agent_memory:v1:ofs-ss-obs-x",
+        "target": "agent_memory:v1:ofs-ss-obs-y",
+        "schema_version": 1,
+        "confidence": "1.0",
+        "summary": "obs-x contradicts obs-y"
+    });
+
+    let am_ingest = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "ofs-ss-am-ingest",
+            "agent_id": "ofs-ss-agent",
+            "session_id": "ofs-ss-session",
+            "idempotency_key": "ofs-ss-am-key",
+            "domain": "agent_memory",
+            "created_at": "2026-05-30T00:00:00Z",
+            "payload": {
+                "records": [
+                    obs_a,
+                    obs_b,
+                    obs_c,
+                    obs_x,
+                    obs_y,
+                    edge_contradicts,
+                    obs_u
+                ]
+            }
+        }),
+    );
+    assert!(
+        am_ingest.starts_with("HTTP/1.1 200"),
+        "agent_memory ingest failed: {am_ingest}"
+    );
+
+    // Test Case 1: Exclude (default)
+    let res_exclude = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "ofs-ss-query-exclude",
+            "agent_id": "ofs-ss-agent",
+            "verb": "observations_for_symbol",
+            "params": {
+                "name": "supersession_fn",
+                "supersession": "exclude"
+            }
+        }),
+    );
+    assert!(
+        res_exclude.starts_with("HTTP/1.1 200"),
+        "exclude query failed: {res_exclude}"
+    );
+    let body_exclude = response_json(&res_exclude);
+    let result_exclude = &body_exclude["result"];
+    let observations_ex = result_exclude["observations"].as_array().expect("array");
+    assert_eq!(
+        observations_ex.len(),
+        2,
+        "Exclude mode should only return 2 observations: {observations_ex:?}"
+    );
+    let ids_ex: Vec<&str> = observations_ex
+        .iter()
+        .map(|o| o["record_id"].as_str().unwrap())
+        .collect();
+    assert!(ids_ex.contains(&"agent_memory:v1:ofs-ss-obs-c"));
+    assert!(ids_ex.contains(&"agent_memory:v1:ofs-ss-obs-u"));
+
+    let excluded_ex = result_exclude["excluded"].as_array().expect("array");
+    assert_eq!(
+        excluded_ex.len(),
+        4,
+        "Exclude mode should exclude 4 observations: {excluded_ex:?}"
+    );
+
+    // Test Case 2: Include But Flag
+    let res_flag = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "ofs-ss-query-flag",
+            "agent_id": "ofs-ss-agent",
+            "verb": "observations_for_symbol",
+            "params": {
+                "name": "supersession_fn",
+                "supersession": "include-but-flag"
+            }
+        }),
+    );
+    assert!(
+        res_flag.starts_with("HTTP/1.1 200"),
+        "include-but-flag query failed: {res_flag}"
+    );
+    let body_flag = response_json(&res_flag);
+    let result_flag = &body_flag["result"];
+    let observations_fl = result_flag["observations"].as_array().expect("array");
+    assert_eq!(
+        observations_fl.len(),
+        6,
+        "IncludeButFlag should return all 6 observations: {observations_fl:?}"
+    );
+
+    let get_obs = |id: &str| {
+        observations_fl
+            .iter()
+            .find(|o| o["record_id"].as_str().unwrap() == id)
+            .cloned()
+            .unwrap()
+    };
+
+    let obs_a_fl = get_obs("agent_memory:v1:ofs-ss-obs-a");
+    assert_eq!(obs_a_fl["temporal_status"], "superseded");
+    let sub_by = obs_a_fl["superseded_by"].as_array().unwrap();
+    assert_eq!(sub_by.len(), 1);
+    assert_eq!(sub_by[0]["record_id"], "agent_memory:v1:ofs-ss-obs-c");
+
+    let obs_x_fl = get_obs("agent_memory:v1:ofs-ss-obs-x");
+    assert_eq!(obs_x_fl["temporal_status"], "contradicted");
+    let contra_by = obs_x_fl["contradicted_by"].as_array().unwrap();
+    assert_eq!(contra_by.len(), 1);
+    assert_eq!(contra_by[0]["record_id"], "agent_memory:v1:ofs-ss-obs-y");
+
+    let obs_u_fl = get_obs("agent_memory:v1:ofs-ss-obs-u");
+    assert_eq!(obs_u_fl["temporal_status"], "current");
+
+    daemon.stop();
+}
+
+#[test]
+fn daemon_observations_for_symbol_invalid_supersession() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let res = http_json(
+        &metadata,
+        "POST",
+        "/v1/query",
+        &serde_json::json!({
+            "request_id": "ofs-invalid-ss",
+            "agent_id": "ofs-ss-agent",
+            "verb": "observations_for_symbol",
+            "params": {
+                "name": "supersession_fn",
+                "supersession": "invalid-value-typo"
+            }
+        }),
+    );
+    daemon.stop();
+
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "invalid supersession value should return 400, got {res}"
+    );
+    let body = response_json(&res);
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "invalid supersession parameter should return bad_request error code, got {body}"
+    );
+}

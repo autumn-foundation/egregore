@@ -49,7 +49,7 @@ eg query semantic-memory "what breaks when the input file is empty?" \
 
 ```text
 eg query semantic-memory <QUERY> --data-dir <DIR> [--repo <SELECTOR>] \
-    [--limit <N>] [--verified-only] [--format json|text]
+    [--limit <N>] [--verified-only] [--supersession <exclude|include-but-flag>] [--format json|text]
 ```
 
 Reads directly from an embedded AletheiaDB store (`--data-dir`). The query string
@@ -63,6 +63,7 @@ contacted.
 | `--repo <SELECTOR>` | Restrict results to one repository (issue #67). |
 | `--limit <N>` | Maximum memory hits to return (default 10). |
 | `--verified-only` | Exclude unverified observations (see below). |
+| `--supersession <mode>` | `exclude` (default) or `include-but-flag` (see [recall-supersession.md](recall-supersession.md)). |
 | `--format` | `json` (default) or `text`. |
 
 | Condition | Exit |
@@ -102,6 +103,10 @@ least one present verification-domain record through an evidence link
 non-inferential rule the [`eg query memory`](memory-audit.md) audit uses. This is
 consistent with the PR-3 / PR-4 trust rules: an unverified claim is never
 silently promoted to a fact.
+
+### `--supersession`
+
+Controls how superseded or contradicted observations are filtered or annotated. By default (`exclude`), they are excluded from the `observations` list and added to `excluded` diagnostics. With `include-but-flag`, they are returned alongside their temporal status and forward references. See [recall-supersession.md](recall-supersession.md) for full details.
 
 ### Example
 
