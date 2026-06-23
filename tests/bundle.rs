@@ -109,6 +109,7 @@ fn test_record_scrubbing_and_hashing() {
     if let GraphRecord::Node {
         text,
         stdout_handle,
+        source_handle,
         ..
     } = &mut obs_node
     {
@@ -118,6 +119,8 @@ fn test_record_scrubbing_and_hashing() {
             hash: "blake3-stdout-hash-val".to_owned(),
             bytes: 24,
         }));
+        // Provide a valid source handle so it doesn't fail citation checks yet
+        *source_handle = Some("src/observation.txt".to_owned());
     }
 
     let records = vec![repo_node, obs_node];
@@ -147,4 +150,46 @@ fn test_record_scrubbing_and_hashing() {
     // Verify hash of the scrubbed record is correct
     let expected_hash = blake3::hash(serde_json::to_string(&obs_record.record).unwrap().as_bytes()).to_hex().to_string();
     assert_eq!(obs_record.hash, expected_hash);
+}
+
+#[test]
+fn test_coverage_threshold_fails() {
+    use aletheia_egregore::ir::{GraphRecord, NodeKind};
+
+    let repo_node = GraphRecord::node(
+        "repo-1".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("my-repo".to_owned()),
+        "Repository node".to_owned(),
+    );
+
+    // 1. Code record below threshold: we have a Symbol node with NO span
+    let sym_node_no_span = GraphRecord::node(
+        "sym-no-span".to_owned(),
+        NodeKind::Symbol,
+        Some("src/main.rs".to_owned()),
+        None, // missing span!
+        Some("my_func".to_owned()),
+        "Symbol node".to_owned(),
+    );
+
+    let records = vec![repo_node.clone(), sym_node_no_span];
+    let result = export_bundle(&records, "symbol:my_func", "0.1.0");
+    assert!(result.is_err(), "should fail because code record is missing span and total records is 2, giving < 95% coverage");
+
+    // 2. Non-code record below 100% threshold: Observation node with no source_handle, evidence_links, or protected handle
+    let obs_node_uncited = GraphRecord::node(
+        "obs-1".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation node".to_owned(),
+    );
+
+    let records = vec![repo_node, obs_node_uncited];
+    let result = export_bundle(&records, "id:obs-1", "0.1.0");
+    assert!(result.is_err(), "should fail because non-code record Observation lacks any citable source or evidence link");
 }

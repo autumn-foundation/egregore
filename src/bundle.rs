@@ -408,6 +408,45 @@ pub fn export_bundle(
         })
         .collect();
 
+    // Validate coverage threshold
+    let mut total_valid = 0;
+    let mut non_code_valid = true;
+    let total_records_count = bundle_records.len();
+
+    for br in &bundle_records {
+        let classified = crate::citation_audit::classify_record_external(&br.record);
+        let trust_class = classified.trust_class;
+        
+        let is_valid = classified.status != crate::citation_audit::CitationStatus::MissingRequiredHandle;
+        if is_valid {
+            total_valid += 1;
+        }
+
+        if trust_class != "source_fact" {
+            if !is_valid {
+                non_code_valid = false;
+            }
+        }
+    }
+
+    let overall_coverage = if total_records_count > 0 {
+        total_valid as f64 / total_records_count as f64
+    } else {
+        1.0
+    };
+
+    if overall_coverage < 0.95 {
+        return Err(CodegraphError::BundleVerificationFailed {
+            message: format!("below_coverage_threshold: overall coverage is {:.2}%, required 95%", overall_coverage * 100.0),
+        });
+    }
+
+    if !non_code_valid {
+        return Err(CodegraphError::BundleVerificationFailed {
+            message: "below_coverage_threshold: non-code trust-class records must have 100% coverage".to_owned(),
+        });
+    }
+
     // Counts by domain/trust class
     let mut included_record_counts = BTreeMap::new();
     for br in &bundle_records {

@@ -309,6 +309,12 @@ pub fn citation_trust_class(record: &GraphRecord) -> &'static str {
     }
 }
 
+/// Classifies a record's citation status for external use.
+#[must_use]
+pub fn classify_record_external(record: &GraphRecord) -> RowClassification {
+    classify_record(record).row
+}
+
 // ---------------------------------------------------------------------------
 // Row classification
 // ---------------------------------------------------------------------------
