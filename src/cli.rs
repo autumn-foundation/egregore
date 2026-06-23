@@ -523,6 +523,7 @@ enum Commands {
         #[arg(long, default_value = "2")]
         poll_interval: u64,
         /// Generate embeddings for ingested records.
+        #[cfg(feature = "embeddings")]
         #[arg(long)]
         embed: bool,
     },
@@ -1661,6 +1662,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             codex_dir,
             claude_dir,
             poll_interval,
+            #[cfg(feature = "embeddings")]
             embed,
         } => watch_cmd(
             &data_dir,
@@ -1668,7 +1670,10 @@ fn run_cli(cli: Cli) -> Result<()> {
             codex_dir.as_deref(),
             claude_dir.as_deref(),
             poll_interval,
+            #[cfg(feature = "embeddings")]
             embed,
+            #[cfg(not(feature = "embeddings"))]
+            false,
         ),
     }
 }
@@ -10463,23 +10468,42 @@ fn watch_cmd(
     let default_codex = home.as_ref().map(|h| h.join(".codex/sessions"));
     let default_claude = home.as_ref().map(|h| h.join(".claude/projects"));
 
-    let resolved_antigravity = antigravity_dir.or(default_antigravity.as_deref());
-    let resolved_codex = codex_dir.or(default_codex.as_deref());
-    let resolved_claude = claude_dir.or(default_claude.as_deref());
+    // Warn only if paths were explicitly requested but do not exist
+    if let Some(p) = antigravity_dir.filter(|p| !p.exists()) {
+        eprintln!(
+            "[Watcher Warning] Specified Antigravity directory does not exist: {}",
+            p.display()
+        );
+    }
+    if let Some(p) = codex_dir.filter(|p| !p.exists()) {
+        eprintln!(
+            "[Watcher Warning] Specified Codex directory does not exist: {}",
+            p.display()
+        );
+    }
+    if let Some(p) = claude_dir.filter(|p| !p.exists()) {
+        eprintln!(
+            "[Watcher Warning] Specified Claude Code directory does not exist: {}",
+            p.display()
+        );
+    }
 
-    // We warn the user if a directory is specified but does not exist
-    for (name, path) in &[
-        ("Antigravity", resolved_antigravity),
-        ("Codex", resolved_codex),
-        ("Claude Code", resolved_claude),
-    ] {
-        if path.is_some_and(|p| !p.exists()) {
-            eprintln!(
-                "[Watcher Warning] Watched path for {} does not exist: {}",
-                name,
-                path.unwrap().display()
-            );
-        }
+    // Filter resolved paths to only watch them if they actually exist
+    let resolved_antigravity = antigravity_dir
+        .or(default_antigravity.as_deref())
+        .filter(|p| p.exists());
+    let resolved_codex = codex_dir
+        .or(default_codex.as_deref())
+        .filter(|p| p.exists());
+    let resolved_claude = claude_dir
+        .or(default_claude.as_deref())
+        .filter(|p| p.exists());
+
+    // Zero-watch validation: bail out if no valid directories remain
+    if resolved_antigravity.is_none() && resolved_codex.is_none() && resolved_claude.is_none() {
+        anyhow::bail!(
+            "No valid agent directories to watch. Ensure at least one directory exists or was explicitly specified."
+        );
     }
 
     crate::watch::watch(

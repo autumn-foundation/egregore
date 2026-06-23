@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
-use crate::ir::{Graph, agent_memory_stable_id};
+use crate::ir::agent_memory_stable_id;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentType {
@@ -30,6 +30,7 @@ impl AgentType {
 struct FileState {
     last_modified: SystemTime,
     len: u64,
+    session_id: String,
 }
 
 /// Resolves the home directory or user profile path.
@@ -44,11 +45,29 @@ pub fn get_home_dir() -> Option<PathBuf> {
 fn find_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                find_jsonl_files(&path, files);
-            } else if path.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
-                files.push(path);
+            if let Ok(file_type) = entry.file_type() {
+                if file_type.is_symlink() {
+                    continue; // Skip symlinks to prevent infinite loops and escaping watch root
+                }
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if file_type.is_dir() {
+                    // Skip massive build, VCS, and package manager directories to avoid heavy IO
+                    if name_str == ".git"
+                        || name_str == ".egregore"
+                        || name_str == "target"
+                        || name_str == "node_modules"
+                    {
+                        continue;
+                    }
+                    find_jsonl_files(&entry.path(), files);
+                } else if file_type.is_file() {
+                    // Only allocate path when it is a file and matches extension
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "jsonl") {
+                        files.push(path);
+                    }
+                }
             }
         }
     }
@@ -67,12 +86,12 @@ fn derive_stable_session_id(path: &Path, agent_type: AgentType) -> String {
 }
 
 #[cfg(feature = "embedded-aletheiadb")]
-fn ingest_graph(data_dir: &Path, graph: &Graph, embed: bool) -> Result<()> {
+fn ingest_batch(data_dir: &Path, records: &[crate::ir::GraphRecord], embed: bool) -> Result<()> {
     use crate::adapters::{EmbeddedAletheiaSink, ingest_records};
 
     #[cfg(feature = "embeddings")]
     let mut sink = if embed {
-        let (vectors, dimensions) = crate::cli::generate_embeddings(graph.records())?;
+        let (vectors, dimensions) = crate::cli::generate_embeddings(records)?;
         EmbeddedAletheiaSink::open_with_embeddings(data_dir, vectors, dimensions)
             .context("failed to open embedded store with embeddings")?
     } else {
@@ -84,7 +103,7 @@ fn ingest_graph(data_dir: &Path, graph: &Graph, embed: bool) -> Result<()> {
 
     let _ = embed; // silence unused warning if feature disabled
 
-    let report = ingest_records(graph.records(), &mut sink);
+    let report = ingest_records(records, &mut sink);
     if report.is_success() {
         sink.persist_indexes()
             .context("failed to persist indexes")?;
@@ -95,7 +114,7 @@ fn ingest_graph(data_dir: &Path, graph: &Graph, embed: bool) -> Result<()> {
 }
 
 #[cfg(not(feature = "embedded-aletheiadb"))]
-fn ingest_graph(_data_dir: &Path, _graph: &Graph, _embed: bool) -> Result<()> {
+fn ingest_batch(_data_dir: &Path, _records: &[crate::ir::GraphRecord], _embed: bool) -> Result<()> {
     anyhow::bail!("embedded-aletheiadb feature is required for ingestion");
 }
 
@@ -130,100 +149,161 @@ pub fn watch(
     }
 
     let mut file_states: HashMap<PathBuf, FileState> = HashMap::new();
+    let mut found_files: Vec<(PathBuf, AgentType)> = Vec::new();
+    let mut files_buf: Vec<PathBuf> = Vec::new();
 
     loop {
-        let mut found_files = Vec::new();
+        found_files.clear();
 
         if let Some(p) = antigravity_dir {
-            let mut files = Vec::new();
-            find_jsonl_files(p, &mut files);
-            for f in files {
-                found_files.push((f, AgentType::Antigravity));
+            files_buf.clear();
+            find_jsonl_files(p, &mut files_buf);
+            for f in &files_buf {
+                found_files.push((f.clone(), AgentType::Antigravity));
             }
         }
         if let Some(p) = codex_dir {
-            let mut files = Vec::new();
-            find_jsonl_files(p, &mut files);
-            for f in files {
-                found_files.push((f, AgentType::Codex));
+            files_buf.clear();
+            find_jsonl_files(p, &mut files_buf);
+            for f in &files_buf {
+                found_files.push((f.clone(), AgentType::Codex));
             }
         }
         if let Some(p) = claude_dir {
-            let mut files = Vec::new();
-            find_jsonl_files(p, &mut files);
-            for f in files {
-                found_files.push((f, AgentType::Claude));
+            files_buf.clear();
+            find_jsonl_files(p, &mut files_buf);
+            for f in &files_buf {
+                found_files.push((f.clone(), AgentType::Claude));
             }
         }
 
-        for (path, agent_type) in found_files {
-            if let Ok(metadata) = fs::metadata(&path) {
+        let mut current_iteration_paths = std::collections::HashSet::new();
+        let mut batch_records = Vec::new();
+        let mut pending_updates = Vec::new();
+
+        for (path, agent_type) in &found_files {
+            current_iteration_paths.insert(path.clone());
+            if let Ok(metadata) = fs::metadata(path) {
                 let mtime = metadata.modified().unwrap_or_else(|_| SystemTime::now());
                 let len = metadata.len();
 
-                let should_import = file_states
-                    .get(&path)
-                    .is_none_or(|state| state.last_modified != mtime || state.len != len);
+                let (should_import, cached_session_id) =
+                    file_states.get(path).map_or((true, None), |state| {
+                        (
+                            state.last_modified != mtime || state.len != len,
+                            Some(state.session_id.clone()),
+                        )
+                    });
 
                 if should_import {
                     println!(
                         "[Watcher] Found new or modified transcript: {}",
                         path.display()
                     );
-                    let session_id = derive_stable_session_id(&path, agent_type);
+                    let session_id = cached_session_id
+                        .unwrap_or_else(|| derive_stable_session_id(path, *agent_type));
 
                     let graph_result = match agent_type {
                         AgentType::Antigravity => {
                             let opts = crate::antigravity::ImportOptions {
-                                session_id_override: Some(session_id),
+                                session_id_override: Some(session_id.clone()),
                                 ..Default::default()
                             };
-                            crate::antigravity::import_antigravity(&path, &opts)
+                            crate::antigravity::import_antigravity(path, &opts)
                         }
                         AgentType::Claude => {
                             let opts = crate::claude_code::ImportOptions {
-                                session_id_override: Some(session_id),
+                                session_id_override: Some(session_id.clone()),
                                 ..Default::default()
                             };
-                            crate::claude_code::import_claude_code(&path, &opts)
+                            crate::claude_code::import_claude_code(path, &opts)
                         }
                         AgentType::Codex => {
                             let opts = crate::codex::ImportOptions {
-                                session_id_override: Some(session_id),
+                                session_id_override: Some(session_id.clone()),
                                 ..Default::default()
                             };
-                            crate::codex::import_codex(&path, &opts)
+                            crate::codex::import_codex(path, &opts)
                         }
                     };
 
                     match graph_result {
                         Ok(graph) => {
-                            println!(
-                                "[Watcher] Ingesting {} records from {}",
-                                graph.records().len(),
-                                path.display()
-                            );
-                            if let Err(e) = ingest_graph(data_dir, &graph, embed) {
-                                eprintln!("[Watcher] Error ingesting {}: {e:?}", path.display());
+                            // Run defense-in-depth safety gate: validate all records for unredacted secrets
+                            let mut validation_ok = true;
+                            for record in graph.records() {
+                                if let Err(err) = crate::redaction::validate_record(record) {
+                                    eprintln!(
+                                        "[Watcher Warning] Transcript record in {} failed safety validation: {err:?}",
+                                        path.display()
+                                    );
+                                    validation_ok = false;
+                                    break;
+                                }
+                            }
+
+                            if validation_ok {
+                                batch_records.extend(graph.into_records());
+                                // We will update the cache since parsing and validation succeeded.
+                                // But only after the whole batch is successfully ingested!
+                                pending_updates.push((
+                                    path.clone(),
+                                    FileState {
+                                        last_modified: mtime,
+                                        len,
+                                        session_id,
+                                    },
+                                ));
                             } else {
-                                println!("[Watcher] Ingestion successful.");
+                                // If validation fails, we STILL update the cache to prevent loop spamming,
+                                // but we do not ingest these records.
+                                file_states.insert(
+                                    path.clone(),
+                                    FileState {
+                                        last_modified: mtime,
+                                        len,
+                                        session_id,
+                                    },
+                                );
                             }
                         }
                         Err(e) => {
                             eprintln!("[Watcher] Error importing {}: {e:?}", path.display());
+                            // Mark permanent parsing errors as processed to avoid infinite loops and log spam
+                            file_states.insert(
+                                path.clone(),
+                                FileState {
+                                    last_modified: mtime,
+                                    len,
+                                    session_id,
+                                },
+                            );
                         }
                     }
-
-                    file_states.insert(
-                        path,
-                        FileState {
-                            last_modified: mtime,
-                            len,
-                        },
-                    );
                 }
             }
         }
+
+        if !batch_records.is_empty() {
+            println!(
+                "[Watcher] Ingesting batch of {} records into database...",
+                batch_records.len()
+            );
+            if let Err(e) = ingest_batch(data_dir, &batch_records, embed) {
+                eprintln!("[Watcher] Error ingesting batch: {e:?}");
+                // Transient database ingestion failure: do NOT update the file state cache,
+                // so the next iteration will retry importing and ingesting.
+            } else {
+                println!("[Watcher] Batch ingestion successful.");
+                // Apply the cache updates only after successful ingestion
+                for (path, state) in pending_updates {
+                    file_states.insert(path, state);
+                }
+            }
+        }
+
+        // Clean up deleted files from state registry to prevent memory leak
+        file_states.retain(|path, _| current_iteration_paths.contains(path));
 
         thread::sleep(poll_interval);
 
