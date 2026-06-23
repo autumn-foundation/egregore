@@ -9,7 +9,8 @@ use crate::{
     fs::SourceFile,
     ir::{EdgeLabel, Graph, GraphRecord, NodeKind, stable_id},
     languages::common::{
-        SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, span,
+        SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, node_name,
+        path_segments, span,
     },
 };
 
@@ -393,14 +394,6 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 }
 
-fn node_name(node: Node<'_>, source: &str) -> Option<String> {
-    node.child_by_field_name("name")
-        .and_then(|name| name.utf8_text(source.as_bytes()).ok())
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 fn import_name(text: &str) -> String {
     text.trim()
         .trim_start_matches("use")
@@ -438,10 +431,8 @@ fn macro_invocation_name(text: &str) -> String {
 }
 
 fn file_module_path(repo_relative_path: &str) -> Vec<String> {
-    let parts = repo_relative_path
-        .split(['/', '\\'])
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
+    let owned = path_segments(repo_relative_path);
+    let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
     if parts.first() != Some(&"src") {
         return Vec::new();
     }

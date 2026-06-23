@@ -9,7 +9,9 @@ use crate::{
     fs::SourceFile,
     ir::{EdgeLabel, Graph, GraphRecord, NodeKind, stable_id},
     languages::common::{
-        SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, span,
+        SymbolBody, add_graph_edge, collapse_whitespace, descendant_kinds, emit_reference_edges,
+        identifier_text, next_symbol_ordinal, node_name, normalize_c_like_code, path_segments,
+        span,
     },
 };
 
@@ -135,7 +137,7 @@ impl<'graph, 'source> GoExtractor<'graph, 'source> {
     /// surface a node per package), with an `Imports` edge from the file.
     fn extract_imports(&mut self, node: Node<'_>) {
         for spec in descendant_kinds(node, "import_spec") {
-            let name = normalize_whitespace(self.node_text(spec));
+            let name = collapse_whitespace(self.node_text(spec));
             if name.is_empty() {
                 continue;
             }
@@ -404,20 +406,6 @@ impl<'graph, 'source> GoExtractor<'graph, 'source> {
     }
 }
 
-/// Returns all descendant nodes of the given kind (depth-first, pre-order).
-fn descendant_kinds<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
-    let mut found = Vec::new();
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == kind {
-            found.push(child);
-        } else {
-            found.extend(descendant_kinds(child, kind));
-        }
-    }
-    found
-}
-
 /// Resolves a type expression to its leaf type identifier.
 ///
 /// Strips `*T` pointers, `pkg.T` qualification (keeps the leaf `T`), and
@@ -443,20 +431,6 @@ fn leaf_type_name(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-/// Reads the `name` field of a declaration node as text.
-fn node_name(node: Node<'_>, source: &str) -> Option<String> {
-    node.child_by_field_name("name")
-        .and_then(|n| identifier_text(n, source))
-}
-
-fn identifier_text(node: Node<'_>, source: &str) -> Option<String> {
-    node.utf8_text(source.as_bytes())
-        .ok()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 /// Returns true when the repo-relative path is a Go test file (`*_test.go`).
 #[must_use]
 pub fn is_test_file(repo_relative_path: &str) -> bool {
@@ -468,118 +442,27 @@ pub fn is_test_file(repo_relative_path: &str) -> bool {
 /// Go packages are directory-scoped, so the filename is dropped and the
 /// directory segments form the prefix: `internal/widget/widget.go` →
 /// `["internal", "widget"]`; a root-level `main.go` → `[]`.
+/// Computes the package path a Go file contributes to qualified names.
+///
+/// Go packages are directory-scoped: the filename is dropped and the directory
+/// segments form the prefix. `internal/widget/widget.go` → `["internal", "widget"]`;
+/// a root-level `main.go` → `[]`.
 fn go_module_path(repo_relative_path: &str) -> Vec<String> {
-    let mut parts = repo_relative_path
-        .split(['/', '\\'])
-        .filter(|part| !part.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
+    let mut parts = path_segments(repo_relative_path);
     // Drop the filename; the package is the containing directory.
     parts.pop();
     parts
 }
 
-/// Collapses runs of whitespace to single spaces and trims the ends.
-fn normalize_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 /// Normalizes Go source by stripping `//` and `/* */` comments and collapsing
 /// whitespace while preserving string- and rune-literal contents.
 ///
-/// Go raw strings use backticks and interpreted strings use double quotes; both
-/// (plus single-quoted rune literals) are scanned as opaque so a `//` inside a
-/// literal is never mistaken for a comment.
+/// Go raw strings use backticks; backtick-delimited content passes backslash
+/// through unchanged. Interpreted strings (`"`) and rune literals (`'`) process
+/// escape sequences normally.
 #[must_use]
 pub fn normalize_code(code: &str) -> String {
-    let mut result = String::new();
-    let mut pending_space = false;
-    let mut last_pushed: Option<char> = None;
-
-    let chars: Vec<char> = code.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-
-    while i < len {
-        let c = chars[i];
-
-        // Line comment: // … \n
-        if c == '/' && i + 1 < len && chars[i + 1] == '/' {
-            i += 2;
-            while i < len && chars[i] != '\n' {
-                i += 1;
-            }
-            pending_space = true;
-            continue;
-        }
-
-        // Block comment: /* … */
-        if c == '/' && i + 1 < len && chars[i + 1] == '*' {
-            i += 2;
-            while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            if i + 1 < len {
-                i += 2;
-            } else {
-                i = len;
-            }
-            pending_space = true;
-            continue;
-        }
-
-        // String / rune literals: ", ', and ` (raw strings).
-        if c == '"' || c == '\'' || c == '`' {
-            if pending_space {
-                pending_space = false;
-                let is_current_ident = c.is_alphanumeric() || c == '_';
-                let is_last_ident =
-                    last_pushed.is_some_and(|last| last.is_alphanumeric() || last == '_');
-                if is_current_ident && is_last_ident {
-                    result.push(' ');
-                }
-            }
-            let delim = c;
-            // Raw strings (backtick) do not process backslash escapes.
-            let raw = delim == '`';
-            result.push(c);
-            last_pushed = Some(c);
-            i += 1;
-            let mut escaped = false;
-            while i < len {
-                let sc = chars[i];
-                result.push(sc);
-                last_pushed = Some(sc);
-                i += 1;
-                if escaped {
-                    escaped = false;
-                } else if !raw && sc == '\\' {
-                    escaped = true;
-                } else if sc == delim {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        if c.is_whitespace() {
-            pending_space = true;
-        } else {
-            if pending_space {
-                pending_space = false;
-                let is_current_ident = c.is_alphanumeric() || c == '_';
-                let is_last_ident =
-                    last_pushed.is_some_and(|last| last.is_alphanumeric() || last == '_');
-                if is_current_ident && is_last_ident {
-                    result.push(' ');
-                }
-            }
-            result.push(c);
-            last_pushed = Some(c);
-        }
-        i += 1;
-    }
-    result.trim().to_owned()
+    normalize_c_like_code(code, &['`'])
 }
 
 /// Normalizes whole-file Go content for the File node summary.
