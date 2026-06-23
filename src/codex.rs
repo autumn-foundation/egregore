@@ -102,6 +102,8 @@ pub struct ImportOptions {
     pub redact: Box<dyn Fn(&str) -> String + Send + Sync>,
     /// Policy version stamped on every emitted node record, or `None` for passthrough.
     pub policy_version: Option<&'static str>,
+    /// Stable session ID override.
+    pub session_id_override: Option<String>,
 }
 
 impl Default for ImportOptions {
@@ -109,6 +111,7 @@ impl Default for ImportOptions {
         Self {
             redact: Box::new(crate::redaction::redact_value),
             policy_version: Some(crate::redaction::REDACTION_POLICY_VERSION),
+            session_id_override: None,
         }
     }
 }
@@ -122,6 +125,7 @@ impl ImportOptions {
         Self {
             redact: Box::new(|s: &str| s.to_owned()),
             policy_version: None,
+            session_id_override: None,
         }
     }
 }
@@ -595,13 +599,15 @@ pub fn import_codex(path: &Path, opts: &ImportOptions) -> Result<Graph> {
     }
 
     // Derive stable session ID from artifact hash + importer identity.
-    let session_id = agent_memory_stable_id(&[
-        "node",
-        "agent_session",
-        IMPORTER_ID,
-        IMPORTER_VERSION,
-        &source_artifact_hash,
-    ]);
+    let session_id = opts.session_id_override.clone().unwrap_or_else(|| {
+        agent_memory_stable_id(&[
+            "node",
+            "agent_session",
+            IMPORTER_ID,
+            IMPORTER_VERSION,
+            &source_artifact_hash,
+        ])
+    });
 
     let grouped = group_events(parsed);
 

@@ -504,6 +504,28 @@ enum Commands {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Watch directories for new/modified agent transcripts and auto-ingest them.
+    #[cfg(feature = "embedded-aletheiadb")]
+    Watch {
+        /// Embedded `AletheiaDB` data directory (default: `.egregore`).
+        #[arg(long, default_value = ".egregore")]
+        data_dir: PathBuf,
+        /// Directory containing Antigravity transcripts.
+        #[arg(long)]
+        antigravity_dir: Option<PathBuf>,
+        /// Directory containing Codex transcripts.
+        #[arg(long)]
+        codex_dir: Option<PathBuf>,
+        /// Directory containing Claude Code transcripts.
+        #[arg(long)]
+        claude_dir: Option<PathBuf>,
+        /// Polling interval in seconds.
+        #[arg(long, default_value = "2")]
+        poll_interval: u64,
+        /// Generate embeddings for ingested records.
+        #[arg(long)]
+        embed: bool,
+    },
 }
 
 /// Subcommands for `import`.
@@ -1630,6 +1652,22 @@ fn run_cli(cli: Cli) -> Result<()> {
             cache.as_deref(),
             format,
             #[cfg(feature = "embeddings")]
+            embed,
+        ),
+        #[cfg(feature = "embedded-aletheiadb")]
+        Commands::Watch {
+            data_dir,
+            antigravity_dir,
+            codex_dir,
+            claude_dir,
+            poll_interval,
+            embed,
+        } => watch_cmd(
+            &data_dir,
+            antigravity_dir.as_deref(),
+            codex_dir.as_deref(),
+            claude_dir.as_deref(),
+            poll_interval,
             embed,
         ),
     }
@@ -4940,7 +4978,7 @@ fn load_evidence_freshness_records(
 /// Returns a `(record_id → vector, dimension)` map ready for
 /// `EmbeddedAletheiaSink::open_with_embeddings`.
 #[cfg(feature = "embeddings")]
-fn generate_embeddings(
+pub(crate) fn generate_embeddings(
     records: &[GraphRecord],
 ) -> Result<(crate::embeddings::EmbeddingVectorMap, usize)> {
     use crate::embeddings::{
@@ -10407,6 +10445,53 @@ fn protected_capture_cmd(
         "{}",
         serde_json::to_string_pretty(&envelope).context("failed to serialise capture response")?
     );
+    Ok(())
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn watch_cmd(
+    data_dir: &Path,
+    antigravity_dir: Option<&Path>,
+    codex_dir: Option<&Path>,
+    claude_dir: Option<&Path>,
+    poll_interval: u64,
+    embed: bool,
+) -> Result<()> {
+    let home = crate::watch::get_home_dir();
+
+    let default_antigravity = home.as_ref().map(|h| h.join(".gemini/antigravity/brain"));
+    let default_codex = home.as_ref().map(|h| h.join(".codex/sessions"));
+    let default_claude = home.as_ref().map(|h| h.join(".claude/projects"));
+
+    let resolved_antigravity = antigravity_dir.or(default_antigravity.as_deref());
+    let resolved_codex = codex_dir.or(default_codex.as_deref());
+    let resolved_claude = claude_dir.or(default_claude.as_deref());
+
+    // We warn the user if a directory is specified but does not exist
+    for (name, path) in &[
+        ("Antigravity", resolved_antigravity),
+        ("Codex", resolved_codex),
+        ("Claude Code", resolved_claude),
+    ] {
+        if path.is_some_and(|p| !p.exists()) {
+            eprintln!(
+                "[Watcher Warning] Watched path for {} does not exist: {}",
+                name,
+                path.unwrap().display()
+            );
+        }
+    }
+
+    crate::watch::watch(
+        data_dir,
+        resolved_antigravity,
+        resolved_codex,
+        resolved_claude,
+        std::time::Duration::from_secs(poll_interval),
+        embed,
+        None,
+    )?;
+
     Ok(())
 }
 

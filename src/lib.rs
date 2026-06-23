@@ -79,6 +79,8 @@ pub mod temporal_status;
 pub mod token_cost;
 /// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
 pub mod traj;
+/// Transcripts watcher.
+pub mod watch;
 
 use std::{collections::BTreeMap, path::Path, sync::LazyLock};
 
@@ -112,6 +114,7 @@ pub use schema_version::{
 };
 pub use temporal_status::{SupersessionMode, TemporalReference, TemporalResolver};
 pub use traj::import_traj;
+pub use watch::watch;
 
 /// Scans a repository into deterministic graph records.
 ///

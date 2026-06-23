@@ -34,6 +34,8 @@ pub struct ImportOptions {
     pub redact: Box<dyn Fn(&str) -> String + Send + Sync>,
     /// Policy version stamped on every emitted node record.
     pub policy_version: Option<&'static str>,
+    /// Stable session ID override.
+    pub session_id_override: Option<String>,
 }
 
 impl Default for ImportOptions {
@@ -41,6 +43,7 @@ impl Default for ImportOptions {
         Self {
             redact: Box::new(crate::redaction::redact_value),
             policy_version: Some(crate::redaction::REDACTION_POLICY_VERSION),
+            session_id_override: None,
         }
     }
 }
@@ -52,6 +55,7 @@ impl ImportOptions {
         Self {
             redact: Box::new(|s: &str| s.to_owned()),
             policy_version: None,
+            session_id_override: None,
         }
     }
 }
@@ -310,7 +314,9 @@ pub fn import_antigravity(path: &Path, opts: &ImportOptions) -> Result<Graph> {
         source: e,
     })?;
     let file_hash = blake3::hash(&bytes).to_hex().to_string();
-    let session_id = agent_memory_stable_id(&["node", "agent_session", IMPORTER_ID, &file_hash]);
+    let session_id = opts.session_id_override.clone().unwrap_or_else(|| {
+        agent_memory_stable_id(&["node", "agent_session", IMPORTER_ID, &file_hash])
+    });
     let run_id = agent_memory_stable_id(&["node", "agent_run", &session_id, "run-0"]);
 
     let ctx = ImportCtx {
