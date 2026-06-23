@@ -152,4 +152,11 @@ pub enum CodegraphError {
         /// Dot-separated path to the field carrying the unversioned marker.
         field_path: String,
     },
+
+    /// A bundle verification failed.
+    #[error("bundle verification failed: {message}")]
+    BundleVerificationFailed {
+        /// Detail message.
+        message: String,
+    },
 }
