@@ -187,6 +187,10 @@ egregore query file   <path>  --data-dir .egregore
 egregore query drift          --data-dir .egregore
 egregore query semantic <text> --data-dir .egregore-semantic
 egregore import-codex session.jsonl --out agent.graph.jsonl  # Codex session/rollout import
+egregore bundle export --root-selector <selector> \
+    --graph <path> --out <path>                            # export evidence bundle
+egregore bundle inspect <path>                              # inspect bundle manifest
+egregore bundle verify <path>                               # verify bundle integrity, coverage, and safety
 # eg import github <owner>/<repo> --out github.jsonl          # planned — see docs/schema/import-github.md
 ```
 
@@ -206,6 +210,7 @@ Implemented surfaces:
 - AletheiaDB embedding re-export through the optional `embeddings` feature
 - Semantic drift records and query helpers for symbol-at-commit and largest-drift workflows
 - HNSW vector index via `embeddings` feature (enabled by default)
+- `bundle` — export, verify, and inspect redaction-safe evidence bundles (Issue #68)
 
 `embedded-aletheiadb` is enabled by default and uses the published `aletheiadb` crate with `semantic-search`, `semantic-temporal`, and `semantic-diagnostics`.
 
@@ -238,6 +243,11 @@ eg query drift --data-dir .egregore --limit 5
 
 # Flag agent notes whose cited code has drifted since recording (freshness lead, not a truth claim)
 eg query evidence-freshness --graph history.graph.jsonl --stale-only
+
+# Export and verify evidence bundles (Issue #68)
+eg bundle export --root-selector symbol:scan_repository --graph graph.jsonl --out bundle.json
+eg bundle inspect bundle.json
+eg bundle verify bundle.json --format text
 ```
 
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
@@ -265,6 +275,7 @@ Query output is newline-delimited JSON by default (`--format json`). Pass `--for
 - **Daemon HTTP wire contract (v1):** [docs/schema/daemon-api.md](docs/schema/daemon-api.md)
 - **Daemon query verb set (v1):** [docs/schema/daemon-query.md](docs/schema/daemon-query.md)
 - **Repository node identity (v2):** [docs/schema/repository-identity.md](docs/schema/repository-identity.md)
+- **Evidence bundle CLI reference:** [docs/cli/bundle.md](docs/cli/bundle.md)
 - Implementation plans: [docs/plans/](docs/plans/)
 
 ## Development
