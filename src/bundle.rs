@@ -55,6 +55,28 @@ pub struct EvidenceBundle {
     pub unresolved_links: Vec<UnresolvedLink>,
 }
 
+/// Verdict of one bundle verification check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationVerdict {
+    /// True when the check passes.
+    pub passed: bool,
+    /// Detailed diagnostic message.
+    pub detail: String,
+}
+
+/// Verification report returned by `verify_bundle`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationReport {
+    /// True if all three verdicts pass.
+    pub ok: bool,
+    /// Integrity check verdict.
+    pub integrity: VerificationVerdict,
+    /// Citation coverage check verdict.
+    pub coverage: VerificationVerdict,
+    /// Safety check verdict.
+    pub safety: VerificationVerdict,
+}
+
 /// Extracts all outgoing target IDs from a record.
 pub fn collect_references(record: &GraphRecord) -> Vec<String> {
     let mut refs = Vec::new();
@@ -470,4 +492,240 @@ pub fn export_bundle(
         records: bundle_records,
         unresolved_links,
     })
+}
+
+/// Verifies the bundle's integrity, coverage, and safety offline and read-only.
+pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
+    // 1. Integrity check
+    let mut integrity_passed = true;
+    let mut integrity_msg = "Manifest parses, record hashes match, canonical ordering is stable".to_owned();
+    
+    let manifest_included_sum: usize = bundle.manifest.included_record_counts.values().sum();
+    if manifest_included_sum != bundle.records.len() {
+        integrity_passed = false;
+        integrity_msg = format!(
+            "Integrity failure: manifest included_record_counts sum ({}) does not match records length ({})",
+            manifest_included_sum,
+            bundle.records.len()
+        );
+    } else {
+        // Check hashes match
+        for (i, br) in bundle.records.iter().enumerate() {
+            let serialized = match serde_json::to_string(&br.record) {
+                Ok(s) => s,
+                Err(e) => {
+                    integrity_passed = false;
+                    integrity_msg = format!("Integrity failure: failed to serialize record at index {}: {}", i, e);
+                    break;
+                }
+            };
+            let computed_hash = blake3::hash(serialized.as_bytes()).to_hex().to_string();
+            if computed_hash != br.hash {
+                integrity_passed = false;
+                integrity_msg = format!(
+                    "Integrity failure: record hash mismatch at index {}. Record ID: {}. Expected: {}, computed: {}",
+                    i, br.record.id(), br.hash, computed_hash
+                );
+                break;
+            }
+        }
+
+        // Check canonical ordering
+        if integrity_passed {
+            for i in 0..bundle.records.len().saturating_sub(1) {
+                let a = &bundle.records[i].record;
+                let b = &bundle.records[i+1].record;
+                let id_cmp = a.id().cmp(b.id());
+                let is_ordered = if id_cmp == std::cmp::Ordering::Equal {
+                    let a_json = serde_json::to_string(a).unwrap_or_default();
+                    let b_json = serde_json::to_string(b).unwrap_or_default();
+                    a_json <= b_json
+                } else {
+                    id_cmp == std::cmp::Ordering::Less
+                };
+                if !is_ordered {
+                    integrity_passed = false;
+                    integrity_msg = format!(
+                        "Integrity failure: canonical ordering is unstable. Record at index {} ({}) is after record at index {} ({})",
+                        i, a.id(), i+1, b.id()
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    let integrity = VerificationVerdict {
+        passed: integrity_passed,
+        detail: integrity_msg,
+    };
+
+    // 2. Coverage check
+    let mut coverage_passed = true;
+    let mut coverage_msg = "All selected roots and directly linked evidence meet the citable-handle threshold".to_owned();
+
+    let mut total_valid = 0;
+    let mut non_code_valid = true;
+    let total_records_count = bundle.records.len();
+
+    // Check that all root record IDs are included in the bundle
+    let included_ids: HashSet<&str> = bundle.records.iter().map(|br| br.record.id()).collect();
+    for root_id in &bundle.manifest.root_record_ids {
+        if !included_ids.contains(root_id.as_str()) {
+            coverage_passed = false;
+            coverage_msg = format!("Coverage failure: root record ID {} is not included in the bundle", root_id);
+            break;
+        }
+    }
+
+    if coverage_passed {
+        for br in &bundle.records {
+            let classified = crate::citation_audit::classify_record_external(&br.record);
+            let trust_class = classified.trust_class;
+            
+            let is_valid = classified.status != crate::citation_audit::CitationStatus::MissingRequiredHandle;
+            if is_valid {
+                total_valid += 1;
+            }
+
+            if trust_class != "source_fact" {
+                if !is_valid {
+                    non_code_valid = false;
+                }
+            }
+        }
+
+        let overall_coverage = if total_records_count > 0 {
+            total_valid as f64 / total_records_count as f64
+        } else {
+            1.0
+        };
+
+        if overall_coverage < 0.95 {
+            coverage_passed = false;
+            coverage_msg = format!(
+                "Coverage failure: overall citation coverage is {:.2}% (below 95% threshold)",
+                overall_coverage * 100.0
+            );
+        } else if !non_code_valid {
+            coverage_passed = false;
+            coverage_msg = "Coverage failure: non-code trust-class records must have 100% coverage".to_owned();
+        }
+    }
+
+    let coverage = VerificationVerdict {
+        passed: coverage_passed,
+        detail: coverage_msg,
+    };
+
+    // 3. Safety check
+    let mut safety_passed = true;
+    let mut safety_msg = "No raw protected payload classes or unredacted secrets found".to_owned();
+
+    for br in &bundle.records {
+        if let GraphRecord::Node {
+            text,
+            validation_summary,
+            arguments_summary,
+            arguments_handle,
+            result_handle,
+            stdout_handle,
+            stderr_handle,
+            patch_handle,
+            body_handle,
+            diff_hunk_handle,
+            user_context,
+            ..
+        } = &br.record
+        {
+            // Assert that raw prose fields are None
+            if text.is_some() {
+                safety_passed = false;
+                safety_msg = format!("Safety failure: record {} contains raw text", br.record.id());
+                break;
+            }
+            if validation_summary.is_some() {
+                safety_passed = false;
+                safety_msg = format!("Safety failure: record {} contains raw validation_summary", br.record.id());
+                break;
+            }
+            if arguments_summary.is_some() {
+                safety_passed = false;
+                safety_msg = format!("Safety failure: record {} contains raw arguments_summary", br.record.id());
+                break;
+            }
+
+            // Assert that all inline handle fields are None
+            let mut inline_payload_field = None;
+            if let Some(h) = arguments_handle && h.inline.is_some() {
+                inline_payload_field = Some("arguments_handle");
+            }
+            if let Some(h) = result_handle && h.inline.is_some() {
+                inline_payload_field = Some("result_handle");
+            }
+            if let Some(h) = stdout_handle && h.inline.is_some() {
+                inline_payload_field = Some("stdout_handle");
+            }
+            if let Some(h) = stderr_handle && h.inline.is_some() {
+                inline_payload_field = Some("stderr_handle");
+            }
+            if let Some(h) = patch_handle && h.inline.is_some() {
+                inline_payload_field = Some("patch_handle");
+            }
+            if let Some(h) = body_handle && h.inline.is_some() {
+                inline_payload_field = Some("body_handle");
+            }
+            if let Some(h) = diff_hunk_handle && h.inline.is_some() {
+                inline_payload_field = Some("diff_hunk_handle");
+            }
+
+            if let Some(field) = inline_payload_field {
+                safety_passed = false;
+                safety_msg = format!(
+                    "Safety failure: record {} carries raw inline payload in field '{}'",
+                    br.record.id(), field
+                );
+                break;
+            }
+
+            // Assert user context fields are None
+            if user_context.proposed_rule_text.is_some()
+                || user_context.prompt_text.is_some()
+                || user_context.decision_rationale.is_some()
+                || user_context.edited_rule_text.is_some()
+                || user_context.rule_text.is_some()
+                || user_context.action_summary.is_some()
+                || user_context.constraint_text.is_some()
+            {
+                safety_passed = false;
+                safety_msg = format!("Safety failure: record {} contains unscrubbed user context fields", br.record.id());
+                break;
+            }
+
+            // Check for unredacted secrets in any part of the record (e.g. metadata or display name, etc.)
+            let serialized = serde_json::to_string(&br.record).unwrap_or_default();
+            if let Some((class, _)) = crate::redaction::detect_secret(&serialized) {
+                safety_passed = false;
+                safety_msg = format!(
+                    "Safety failure: record {} contains unredacted secret class: {}",
+                    br.record.id(), class.as_str()
+                );
+                break;
+            }
+        }
+    }
+
+    let safety = VerificationVerdict {
+        passed: safety_passed,
+        detail: safety_msg,
+    };
+
+    let ok = integrity.passed && coverage.passed && safety.passed;
+
+    VerificationReport {
+        ok,
+        integrity,
+        coverage,
+        safety,
+    }
 }

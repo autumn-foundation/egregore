@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
 use aletheia_egregore::{
-    bundle::{export_bundle, EvidenceBundle},
+    bundle::{export_bundle, verify_bundle, EvidenceBundle},
     GraphRecord,
 };
 
@@ -192,4 +192,92 @@ fn test_coverage_threshold_fails() {
     let records = vec![repo_node, obs_node_uncited];
     let result = export_bundle(&records, "id:obs-1", "0.1.0");
     assert!(result.is_err(), "should fail because non-code record Observation lacks any citable source or evidence link");
+}
+
+#[test]
+fn test_bundle_verification() {
+    use aletheia_egregore::ir::{GraphRecord, NodeKind, EdgeLabel, OutputHandle};
+
+    let repo_node = GraphRecord::node(
+        "repo-1".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("my-repo".to_owned()),
+        "Repository node".to_owned(),
+    );
+
+    let mut obs_node = GraphRecord::node(
+        "obs-1".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation node".to_owned(),
+    );
+
+    if let GraphRecord::Node { source_handle, .. } = &mut obs_node {
+        *source_handle = Some("src/obs.txt".to_owned());
+    }
+
+    let edge = GraphRecord::edge(
+        EdgeLabel::Contains,
+        "repo-1".to_owned(),
+        "obs-1".to_owned(),
+        None,
+        "repo contains obs".to_owned(),
+    );
+
+    let records = vec![repo_node, obs_node, edge];
+    let mut bundle = export_bundle(&records, "id:obs-1", "0.1.0").expect("export should succeed");
+
+    // 1. Positive case: valid bundle should verify successfully
+    let report = verify_bundle(&bundle);
+    assert!(report.ok);
+    assert!(report.integrity.passed);
+    assert!(report.coverage.passed);
+    assert!(report.safety.passed);
+
+    // 2. Integrity failure: tamper with a record hash
+    let original_hash = bundle.records[0].hash.clone();
+    bundle.records[0].hash = "wrong_hash".to_owned();
+    let report = verify_bundle(&bundle);
+    assert!(!report.ok);
+    assert!(!report.integrity.passed);
+    bundle.records[0].hash = original_hash; // restore
+
+    // 3. Integrity failure: wrong ordering
+    bundle.records.swap(0, 1);
+    let report = verify_bundle(&bundle);
+    assert!(!report.ok);
+    assert!(!report.integrity.passed);
+    bundle.records.swap(0, 1); // restore
+
+    // 4. Safety failure: unredacted secret API token in text field
+    let obs_rec = bundle.records.iter_mut().find(|r| r.record.id() == "obs-1").unwrap();
+    if let GraphRecord::Node { text, .. } = &mut obs_rec.record {
+        *text = Some("unredacted API token: sk_live_12345abcdef".to_owned());
+    }
+    let report = verify_bundle(&bundle);
+    assert!(!report.ok);
+    assert!(!report.safety.passed);
+    
+    // restore
+    let obs_rec = bundle.records.iter_mut().find(|r| r.record.id() == "obs-1").unwrap();
+    if let GraphRecord::Node { text, .. } = &mut obs_rec.record {
+        *text = None;
+    }
+
+    // 5. Safety failure: inline payload present in stdout_handle
+    let obs_rec = bundle.records.iter_mut().find(|r| r.record.id() == "obs-1").unwrap();
+    if let GraphRecord::Node { stdout_handle, .. } = &mut obs_rec.record {
+        *stdout_handle = Some(Box::new(OutputHandle {
+            inline: Some("unredacted payload".to_owned()),
+            hash: "abc".to_owned(),
+            bytes: 18,
+        }));
+    }
+    let report = verify_bundle(&bundle);
+    assert!(!report.ok);
+    assert!(!report.safety.passed);
 }
