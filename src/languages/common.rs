@@ -90,6 +90,157 @@ pub fn emit_reference_edges(
     }
 }
 
+/// Reads the text of a Tree-sitter node as a trimmed, non-empty string.
+#[must_use]
+pub fn identifier_text(node: Node<'_>, source: &str) -> Option<String> {
+    node.utf8_text(source.as_bytes())
+        .ok()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Reads the `name` field of a declaration node as trimmed text.
+#[must_use]
+pub fn node_name(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("name")
+        .and_then(|n| identifier_text(n, source))
+}
+
+/// Collapses runs of whitespace to a single space and trims the ends.
+#[must_use]
+pub fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Splits a repo-relative path on `/` and `\`, discarding empty segments.
+///
+/// Used by per-language module-path helpers to canonicalize path traversal.
+#[must_use]
+pub fn path_segments(repo_relative_path: &str) -> Vec<String> {
+    repo_relative_path
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Returns all descendant nodes of the given kind (depth-first, pre-order).
+///
+/// Stops recursing into a subtree once a matching node is found at that level,
+/// so children of a matched node are not collected as additional matches.
+#[must_use]
+pub fn descendant_kinds<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
+    let mut found = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == kind {
+            found.push(child);
+        } else {
+            found.extend(descendant_kinds(child, kind));
+        }
+    }
+    found
+}
+
+/// Normalizes C-like source by stripping `//` and `/* */` comments, collapsing
+/// whitespace, and preserving string and character literal contents.
+///
+/// Delimiters listed in `raw_delims` are treated as raw-string openers —
+/// backslash escapes inside them are passed through unchanged (e.g. Go's
+/// backtick raw strings). Pass `&[]` for languages where all quoted delimiters
+/// process escapes (TypeScript), or `&['\x60']` for Go (backtick = raw).
+#[must_use]
+pub fn normalize_c_like_code(code: &str, raw_delims: &[char]) -> String {
+    let mut result = String::new();
+    let mut pending_space = false;
+    let mut last_pushed: Option<char> = None;
+
+    let chars: Vec<char> = code.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let c = chars[i];
+
+        // Line comment: // … \n
+        if c == '/' && i + 1 < len && chars[i + 1] == '/' {
+            i += 2;
+            while i < len && chars[i] != '\n' {
+                i += 1;
+            }
+            pending_space = true;
+            continue;
+        }
+
+        // Block comment: /* … */
+        if c == '/' && i + 1 < len && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2;
+            } else {
+                i = len;
+            }
+            pending_space = true;
+            continue;
+        }
+
+        // String / character literals: delim opens, matching delim closes.
+        if c == '"' || c == '\'' || c == '`' {
+            if pending_space {
+                pending_space = false;
+                let is_current_ident = c.is_alphanumeric() || c == '_';
+                let is_last_ident =
+                    last_pushed.is_some_and(|last| last.is_alphanumeric() || last == '_');
+                if is_current_ident && is_last_ident {
+                    result.push(' ');
+                }
+            }
+            let delim = c;
+            let raw = raw_delims.contains(&delim);
+            result.push(c);
+            last_pushed = Some(c);
+            i += 1;
+            let mut escaped = false;
+            while i < len {
+                let sc = chars[i];
+                result.push(sc);
+                last_pushed = Some(sc);
+                i += 1;
+                if escaped {
+                    escaped = false;
+                } else if !raw && sc == '\\' {
+                    escaped = true;
+                } else if sc == delim {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if c.is_whitespace() {
+            pending_space = true;
+        } else {
+            if pending_space {
+                pending_space = false;
+                let is_current_ident = c.is_alphanumeric() || c == '_';
+                let is_last_ident =
+                    last_pushed.is_some_and(|last| last.is_alphanumeric() || last == '_');
+                if is_current_ident && is_last_ident {
+                    result.push(' ');
+                }
+            }
+            result.push(c);
+            last_pushed = Some(c);
+        }
+        i += 1;
+    }
+    result.trim().to_owned()
+}
+
 /// Builds a [`SourceSpan`] from a Tree-sitter node's byte and line positions.
 ///
 /// Line numbers are 1-based to match editor conventions.

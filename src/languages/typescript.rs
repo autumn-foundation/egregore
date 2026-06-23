@@ -9,7 +9,8 @@ use crate::{
     fs::SourceFile,
     ir::{EdgeLabel, Graph, GraphRecord, NodeKind, stable_id},
     languages::common::{
-        SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, span,
+        SymbolBody, add_graph_edge, collapse_whitespace, emit_reference_edges, identifier_text,
+        next_symbol_ordinal, node_name, normalize_c_like_code, path_segments, span,
     },
 };
 
@@ -162,7 +163,7 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
     }
 
     fn extract_import(&mut self, node: Node<'_>) {
-        let name = normalize_import(self.node_text(node));
+        let name = collapse_whitespace(self.node_text(node));
         if name.is_empty() {
             return;
         }
@@ -557,21 +558,6 @@ fn clause_type_names(node: Node<'_>, source: &str) -> Vec<String> {
 /// Reads the `name` field of a node as a text string.
 ///
 /// Works for any declaration whose grammar fills the `name` field — the tree-sitter
-/// TypeScript grammar uses `identifier`, `type_identifier`, or `property_identifier`
-/// depending on the declaration kind, but all produce plain text that is read here.
-fn node_name(node: Node<'_>, source: &str) -> Option<String> {
-    node.child_by_field_name("name")
-        .and_then(|n| identifier_text(n, source))
-}
-
-fn identifier_text(node: Node<'_>, source: &str) -> Option<String> {
-    node.utf8_text(source.as_bytes())
-        .ok()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 /// Returns true when the repo-relative path identifies a test file by suffix.
 ///
 /// Covers Jest/Vitest/Mocha conventions: `*.test.ts`, `*.spec.ts`,
@@ -585,21 +571,12 @@ pub fn is_test_file(repo_relative_path: &str) -> bool {
         || p.ends_with(".spec.tsx")
 }
 
-/// Collapses an import statement to a single whitespace-normalized line.
-fn normalize_import(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 /// Computes the dotted module path a TypeScript file contributes to qualified names.
 ///
 /// `src/widget.ts` → `["src", "widget"]`; `src/index.ts` → `["src"]` (barrel);
 /// `src/models.d.ts` → `["src", "models"]`; top-level `foo.ts` → `["foo"]`.
 fn typescript_module_path(repo_relative_path: &str) -> Vec<String> {
-    let mut parts = repo_relative_path
-        .split(['/', '\\'])
-        .filter(|part| !part.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
+    let mut parts = path_segments(repo_relative_path);
     let Some(last) = parts.pop() else {
         return Vec::new();
     };
@@ -623,96 +600,12 @@ fn typescript_module_path(repo_relative_path: &str) -> Vec<String> {
 
 /// Normalizes TypeScript source by stripping `//` and `/* */` comments and
 /// collapsing whitespace while preserving string-literal contents.
+///
+/// All quoted delimiters (`"`, `'`, `` ` ``) process backslash escapes. To
+/// treat backtick template literals as raw (no escapes), use Go's normalizer.
 #[must_use]
 pub fn normalize_code(code: &str) -> String {
-    let mut result = String::new();
-    let mut pending_space = false;
-    let mut last_pushed: Option<char> = None;
-
-    let chars: Vec<char> = code.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-
-    while i < len {
-        let c = chars[i];
-
-        // Line comment: // … \n
-        if c == '/' && i + 1 < len && chars[i + 1] == '/' {
-            i += 2;
-            while i < len && chars[i] != '\n' {
-                i += 1;
-            }
-            pending_space = true;
-            continue;
-        }
-
-        // Block comment: /* … */
-        if c == '/' && i + 1 < len && chars[i + 1] == '*' {
-            i += 2;
-            while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            // Only consume */ if actually present; an unterminated comment just
-            // silently drops everything to EOF.
-            if i + 1 < len {
-                i += 2;
-            } else {
-                i = len;
-            }
-            pending_space = true;
-            continue;
-        }
-
-        // String literals: ", ', and ` (template literals treated as raw).
-        if c == '"' || c == '\'' || c == '`' {
-            if pending_space {
-                pending_space = false;
-                let is_current_ident = c.is_alphanumeric() || c == '_';
-                let is_last_ident =
-                    last_pushed.is_some_and(|last| last.is_alphanumeric() || last == '_');
-                if is_current_ident && is_last_ident {
-                    result.push(' ');
-                }
-            }
-            let delim = c;
-            result.push(c);
-            last_pushed = Some(c);
-            i += 1;
-            let mut escaped = false;
-            while i < len {
-                let sc = chars[i];
-                result.push(sc);
-                last_pushed = Some(sc);
-                i += 1;
-                if escaped {
-                    escaped = false;
-                } else if sc == '\\' {
-                    escaped = true;
-                } else if sc == delim {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        if c.is_whitespace() {
-            pending_space = true;
-        } else {
-            if pending_space {
-                pending_space = false;
-                let is_current_ident = c.is_alphanumeric() || c == '_';
-                let is_last_ident =
-                    last_pushed.is_some_and(|last| last.is_alphanumeric() || last == '_');
-                if is_current_ident && is_last_ident {
-                    result.push(' ');
-                }
-            }
-            result.push(c);
-            last_pushed = Some(c);
-        }
-        i += 1;
-    }
-    result.trim().to_owned()
+    normalize_c_like_code(code, &[])
 }
 
 /// Normalizes whole-file TypeScript content for the File node summary.
@@ -837,7 +730,7 @@ mod tests {
     #[test]
     fn normalize_import_collapses_multiline() {
         assert_eq!(
-            normalize_import("import {\n  Foo,\n  Bar,\n} from 'mod'"),
+            collapse_whitespace("import {\n  Foo,\n  Bar,\n} from 'mod'"),
             "import { Foo, Bar, } from 'mod'"
         );
     }

@@ -2,7 +2,7 @@
 
 Egregore is an `AletheiaDB`-backed knowledge graph substrate for agentic software engineering. It connects deterministic code facts, agent memory, project state, artifacts, and verification evidence in one temporal graph.
 
-The current implemented slice is the code graph domain: it parses Rust with Tree-sitter, emits stable JSONL graph records, replays Git history without mutating the working checkout, ingests records into an embedded AletheiaDB store, and exposes structural and semantic query helpers for agent workflows.
+The current implemented slice is the code graph domain: it parses Rust, Python, TypeScript, and Go with Tree-sitter, emits stable JSONL graph records, replays Git history without mutating the working checkout, ingests records into an embedded AletheiaDB store, and exposes structural and semantic query helpers for agent workflows.
 
 ## Getting Started
 
@@ -26,7 +26,7 @@ The release binary lands at `target/release/egregore.exe` (and `eg.exe` as a sho
 
 ### 3. Scan your codebase
 
-Point `scan` at any Rust repository. It parses every `.rs` file with Tree-sitter and emits a deterministic JSONL graph of nodes (files, modules, symbols, imports, diagnostics) and edges (DEFINES, CALLS, IMPORTS, MENTIONS, CONTAINS).
+Point `scan` at any repository. It parses every supported source file — `.rs` (Rust), `.py` (Python), `.ts`/`.tsx` (TypeScript), and `.go` (Go) — with Tree-sitter and emits a deterministic JSONL graph of nodes (files, modules, symbols, imports, diagnostics) and edges (DEFINES, CALLS, IMPORTS, MENTIONS, CONTAINS).
 
 ```powershell
 egregore scan . --out graph.jsonl
@@ -200,7 +200,7 @@ egregore bundle verify <path>                               # verify bundle inte
 
 Implemented surfaces:
 
-- `scan` — current-tree JSONL extraction (Rust via Tree-sitter)
+- `scan` — current-tree JSONL extraction (Rust, Python, TypeScript, Go via Tree-sitter)
 - `scan-history` — commit-by-commit temporal extraction
 - `inspect` — graph summary
 - `ingest` — dry-run, embedded AletheiaDB, and daemon adapters

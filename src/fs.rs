@@ -24,7 +24,7 @@ pub struct SourceFile {
     pub repo_relative_path: String,
 }
 
-/// Discovers supported source files (Rust, Python, TypeScript) under a repository root.
+/// Discovers supported source files (Rust, Python, TypeScript, Go) under a repository root.
 ///
 /// # Errors
 ///

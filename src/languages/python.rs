@@ -9,7 +9,8 @@ use crate::{
     fs::SourceFile,
     ir::{EdgeLabel, Graph, GraphRecord, NodeKind, stable_id},
     languages::common::{
-        SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, span,
+        SymbolBody, add_graph_edge, collapse_whitespace, emit_reference_edges, identifier_text,
+        next_symbol_ordinal, node_name, path_segments, span,
     },
 };
 
@@ -132,7 +133,7 @@ impl<'graph, 'source> PythonExtractor<'graph, 'source> {
     }
 
     fn extract_import(&mut self, node: Node<'_>) {
-        let name = normalize_import(self.node_text(node));
+        let name = collapse_whitespace(self.node_text(node));
         if name.is_empty() {
             return;
         }
@@ -379,35 +380,12 @@ impl<'graph, 'source> PythonExtractor<'graph, 'source> {
     }
 }
 
-fn node_name(node: Node<'_>, source: &str) -> Option<String> {
-    node.child_by_field_name("name")
-        .and_then(|name| identifier_text(name, source))
-}
-
-fn identifier_text(node: Node<'_>, source: &str) -> Option<String> {
-    node.utf8_text(source.as_bytes())
-        .ok()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-/// Collapses an import statement to a single whitespace-normalized line so its
-/// node identity is stable regardless of line wrapping.
-fn normalize_import(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 /// Computes the dotted module path a Python file contributes to qualified names.
 ///
 /// `pkg/mod.py` → `["pkg", "mod"]`, `pkg/__init__.py` → `["pkg"]` (the package),
 /// and a top-level `foo.py` → `["foo"]`.
 fn python_module_path(repo_relative_path: &str) -> Vec<String> {
-    let mut parts = repo_relative_path
-        .split(['/', '\\'])
-        .filter(|part| !part.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
+    let mut parts = path_segments(repo_relative_path);
     let Some(last) = parts.pop() else {
         return Vec::new();
     };
@@ -565,7 +543,7 @@ mod tests {
     #[test]
     fn normalize_import_collapses_wrapped_lines() {
         assert_eq!(
-            normalize_import("from a import (\n    b,\n    c,\n)"),
+            collapse_whitespace("from a import (\n    b,\n    c,\n)"),
             "from a import ( b, c, )"
         );
     }

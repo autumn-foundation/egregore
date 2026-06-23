@@ -4,6 +4,8 @@ use std::{ffi::OsStr, path::Path};
 
 /// Shared, language-neutral extraction helpers.
 pub mod common;
+/// Go source extraction.
+pub mod go;
 /// Python source extraction.
 pub mod python;
 /// Rust source extraction.
@@ -20,6 +22,8 @@ pub enum Language {
     Python,
     /// TypeScript (`.ts`) and TSX (`.tsx`).
     TypeScript,
+    /// Go (`.go`).
+    Go,
 }
 
 impl Language {
@@ -30,6 +34,7 @@ impl Language {
             Self::Rust => "rust",
             Self::Python => "python",
             Self::TypeScript => "typescript",
+            Self::Go => "go",
         }
     }
 
@@ -40,6 +45,7 @@ impl Language {
             Self::Rust => "Rust",
             Self::Python => "Python",
             Self::TypeScript => "TypeScript",
+            Self::Go => "Go",
         }
     }
 
@@ -54,6 +60,7 @@ impl Language {
                 "tree_sitter_typescript",
                 env!("TREE_SITTER_TYPESCRIPT_VERSION"),
             ),
+            Self::Go => ("tree_sitter_go", env!("TREE_SITTER_GO_VERSION")),
         }
     }
 
@@ -64,6 +71,7 @@ impl Language {
             "rust" => Some(Self::Rust),
             "python" => Some(Self::Python),
             "typescript" => Some(Self::TypeScript),
+            "go" => Some(Self::Go),
             _ => None,
         }
     }
@@ -84,6 +92,7 @@ pub fn detect_path(path: &Path) -> Option<Language> {
         Some("rs") => Some(Language::Rust),
         Some("py") => Some(Language::Python),
         Some("ts" | "tsx") => Some(Language::TypeScript),
+        Some("go") => Some(Language::Go),
         _ => None,
     }
 }
