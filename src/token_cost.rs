@@ -334,6 +334,13 @@ pub struct TokenCostReport {
 /// One Egregore answer row, serialized exactly like the `eg query symbol` /
 /// `eg query file` JSON line (AC1: the measured cost is the returned answer).
 #[derive(Debug, Clone, Serialize)]
+struct DiagnosticRef<'a> {
+    record_id: &'a str,
+    repo_relative_path: &'a str,
+    span: SourceSpan,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct SymbolAnswerRow<'a> {
     record_id: &'a str,
     schema_version: u32,
@@ -347,6 +354,9 @@ struct SymbolAnswerRow<'a> {
     repository_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<&'a str>,
+    extraction_completeness: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<Vec<DiagnosticRef<'a>>>,
 }
 
 /// One semantic answer row, serialized like the `eg query semantic` JSON line.
@@ -410,9 +420,13 @@ fn build_symbol_answer(
     name: &str,
     expected_record_id: &str,
 ) -> BuiltAnswer {
-    build_symbol_node_answer(records, index, expected_record_id, |node_name, _path| {
-        node_name == Some(name)
-    })
+    build_symbol_node_answer(
+        records,
+        index,
+        expected_record_id,
+        false,
+        |node_name, _path| node_name == Some(name),
+    )
 }
 
 /// Builds the `eg query file <path>` answer for a repo-relative path.
@@ -422,9 +436,43 @@ fn build_file_answer(
     path: &str,
     expected_record_id: &str,
 ) -> BuiltAnswer {
-    build_symbol_node_answer(records, index, expected_record_id, |_name, node_path| {
-        node_path == Some(path)
-    })
+    build_symbol_node_answer(
+        records,
+        index,
+        expected_record_id,
+        true,
+        |_name, node_path| node_path == Some(path),
+    )
+}
+
+fn get_file_diagnostics<'a>(
+    records: &'a [GraphRecord],
+    file_path: &str,
+) -> (&'static str, Option<Vec<DiagnosticRef<'a>>>) {
+    let mut diagnostics = Vec::new();
+    for r in records {
+        if let GraphRecord::Node {
+            id,
+            kind: NodeKind::Diagnostic,
+            repo_relative_path: Some(path),
+            span: Some(span),
+            ..
+        } = r
+            && path == file_path
+        {
+            diagnostics.push(DiagnosticRef {
+                record_id: id.as_str(),
+                repo_relative_path: path.as_str(),
+                span: *span,
+            });
+        }
+    }
+    if diagnostics.is_empty() {
+        ("complete", None)
+    } else {
+        diagnostics.sort_by_key(|d| (d.span.start_line, d.record_id));
+        ("partial", Some(diagnostics))
+    }
 }
 
 /// Serializes the symbol nodes matching `include`, sorted and shaped exactly
@@ -433,6 +481,7 @@ fn build_symbol_node_answer<F>(
     records: &[GraphRecord],
     index: &RepositoryIndex,
     expected_record_id: &str,
+    include_diagnostics: bool,
     include: F,
 ) -> BuiltAnswer
 where
@@ -459,6 +508,7 @@ where
     let mut serialized = Vec::with_capacity(matched.len());
     let mut has_expected = false;
     let mut expected_has_handle = false;
+    let mut is_first = true;
     // Every element in `matched` is a Node variant (guaranteed by the filter above).
     for record in matched {
         if let GraphRecord::Node {
@@ -472,6 +522,8 @@ where
         } = record
         {
             let path = repo_relative_path.as_deref();
+            let (completeness, diags) =
+                path.map_or(("complete", None), |p| get_file_diagnostics(records, p));
             let git_commit = temporal.as_ref().map(|t| t.git_commit.as_str());
             let repository_id = index.owner_of(id);
             let row = SymbolAnswerRow {
@@ -484,6 +536,13 @@ where
                 git_commit,
                 repository_id,
                 repository: repository_id.and_then(|repo| index.display_of(repo)),
+                extraction_completeness: completeness,
+                diagnostics: if include_diagnostics && is_first {
+                    is_first = false;
+                    diags
+                } else {
+                    None
+                },
             };
             if id.as_str() == expected_record_id {
                 has_expected = true;

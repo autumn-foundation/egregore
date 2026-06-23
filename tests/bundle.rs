@@ -1,8 +1,8 @@
 #![allow(missing_docs)]
 
 use aletheia_egregore::{
-    bundle::{export_bundle, verify_bundle, EvidenceBundle},
     GraphRecord,
+    bundle::{export_bundle, verify_bundle},
 };
 
 #[test]
@@ -14,7 +14,7 @@ fn test_basic_bundle_module_exists() {
 
 #[test]
 fn test_bfs_traversal_and_selectors() {
-    use aletheia_egregore::ir::{GraphRecord, NodeKind, EdgeLabel, SourceSpan};
+    use aletheia_egregore::ir::{EdgeLabel, GraphRecord, NodeKind, SourceSpan};
 
     let repo_node = GraphRecord::node(
         "repo-1".to_owned(),
@@ -66,16 +66,17 @@ fn test_bfs_traversal_and_selectors() {
     );
 
     let records = vec![
-        repo_node.clone(),
-        file_node.clone(),
-        sym_node.clone(),
+        repo_node,
+        file_node,
+        sym_node,
         edge_repo_file.clone(),
         edge_file_sym.clone(),
     ];
 
     let bundle = export_bundle(&records, "symbol:my_func", "0.1.0").expect("export should succeed");
 
-    let ids: std::collections::HashSet<&str> = bundle.records.iter().map(|br| br.record.id()).collect();
+    let ids: std::collections::HashSet<&str> =
+        bundle.records.iter().map(|br| br.record.id()).collect();
     assert!(ids.contains("sym-1"));
     assert!(ids.contains("file-1"));
     assert!(ids.contains("repo-1"));
@@ -128,7 +129,11 @@ fn test_record_scrubbing_and_hashing() {
     let bundle = export_bundle(&records, "id:obs-1", "0.1.0").expect("export should succeed");
 
     // The exported bundle should contain obs-1, but scrubbed
-    let obs_record = bundle.records.iter().find(|br| br.record.id() == "obs-1").expect("should find obs-1");
+    let obs_record = bundle
+        .records
+        .iter()
+        .find(|br| br.record.id() == "obs-1")
+        .expect("should find obs-1");
 
     if let GraphRecord::Node {
         text,
@@ -139,7 +144,9 @@ fn test_record_scrubbing_and_hashing() {
         // Assert that sensitive text is removed
         assert!(text.is_none());
         // Assert that stdout handle inline content is removed, but hash and bytes are preserved
-        let handle = stdout_handle.as_ref().expect("stdout handle should be present");
+        let handle = stdout_handle
+            .as_ref()
+            .expect("stdout handle should be present");
         assert!(handle.inline.is_none());
         assert_eq!(handle.hash, "blake3-stdout-hash-val");
         assert_eq!(handle.bytes, 24);
@@ -148,7 +155,13 @@ fn test_record_scrubbing_and_hashing() {
     }
 
     // Verify hash of the scrubbed record is correct
-    let expected_hash = blake3::hash(serde_json::to_string(&obs_record.record).unwrap().as_bytes()).to_hex().to_string();
+    let expected_hash = blake3::hash(
+        serde_json::to_string(&obs_record.record)
+            .unwrap()
+            .as_bytes(),
+    )
+    .to_hex()
+    .to_string();
     assert_eq!(obs_record.hash, expected_hash);
 }
 
@@ -177,7 +190,10 @@ fn test_coverage_threshold_fails() {
 
     let records = vec![repo_node.clone(), sym_node_no_span];
     let result = export_bundle(&records, "symbol:my_func", "0.1.0");
-    assert!(result.is_err(), "should fail because code record is missing span and total records is 2, giving < 95% coverage");
+    assert!(
+        result.is_err(),
+        "should fail because code record is missing span and total records is 2, giving < 95% coverage"
+    );
 
     // 2. Non-code record below 100% threshold: Observation node with no source_handle, evidence_links, or protected handle
     let obs_node_uncited = GraphRecord::node(
@@ -191,12 +207,15 @@ fn test_coverage_threshold_fails() {
 
     let records = vec![repo_node, obs_node_uncited];
     let result = export_bundle(&records, "id:obs-1", "0.1.0");
-    assert!(result.is_err(), "should fail because non-code record Observation lacks any citable source or evidence link");
+    assert!(
+        result.is_err(),
+        "should fail because non-code record Observation lacks any citable source or evidence link"
+    );
 }
 
 #[test]
 fn test_bundle_verification() {
-    use aletheia_egregore::ir::{GraphRecord, NodeKind, EdgeLabel, OutputHandle};
+    use aletheia_egregore::ir::{EdgeLabel, GraphRecord, NodeKind, OutputHandle};
 
     let repo_node = GraphRecord::node(
         "repo-1".to_owned(),
@@ -254,22 +273,34 @@ fn test_bundle_verification() {
     bundle.records.swap(0, 1); // restore
 
     // 4. Safety failure: unredacted secret API token in text field
-    let obs_rec = bundle.records.iter_mut().find(|r| r.record.id() == "obs-1").unwrap();
+    let obs_rec = bundle
+        .records
+        .iter_mut()
+        .find(|r| r.record.id() == "obs-1")
+        .unwrap();
     if let GraphRecord::Node { text, .. } = &mut obs_rec.record {
         *text = Some("unredacted API token: sk_live_12345abcdef".to_owned());
     }
     let report = verify_bundle(&bundle);
     assert!(!report.ok);
     assert!(!report.safety.passed);
-    
+
     // restore
-    let obs_rec = bundle.records.iter_mut().find(|r| r.record.id() == "obs-1").unwrap();
+    let obs_rec = bundle
+        .records
+        .iter_mut()
+        .find(|r| r.record.id() == "obs-1")
+        .unwrap();
     if let GraphRecord::Node { text, .. } = &mut obs_rec.record {
         *text = None;
     }
 
     // 5. Safety failure: inline payload present in stdout_handle
-    let obs_rec = bundle.records.iter_mut().find(|r| r.record.id() == "obs-1").unwrap();
+    let obs_rec = bundle
+        .records
+        .iter_mut()
+        .find(|r| r.record.id() == "obs-1")
+        .unwrap();
     if let GraphRecord::Node { stdout_handle, .. } = &mut obs_rec.record {
         *stdout_handle = Some(Box::new(OutputHandle {
             inline: Some("unredacted payload".to_owned()),
@@ -280,4 +311,193 @@ fn test_bundle_verification() {
     let report = verify_bundle(&bundle);
     assert!(!report.ok);
     assert!(!report.safety.passed);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_bundle_cli_workflow() {
+    use aletheia_egregore::ir::{GraphRecord, NodeKind};
+    use assert_cmd::Command;
+    use predicates::prelude::*;
+    use std::fs;
+
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let graph_path = temp.path().join("graph.jsonl");
+    let bundle_path = temp.path().join("bundle.json");
+
+    // Seed a valid graph
+    let repo_node = GraphRecord::node(
+        "repo-1".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("my-repo".to_owned()),
+        "Repository node".to_owned(),
+    );
+
+    let mut obs_node = GraphRecord::node(
+        "obs-1".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation node".to_owned(),
+    );
+
+    if let GraphRecord::Node {
+        source_handle,
+        text,
+        schema_version,
+        ..
+    } = &mut obs_node
+    {
+        *source_handle = Some("src/obs.txt".to_owned());
+        *text = Some("This contains sensitive text".to_owned());
+        *schema_version = 1;
+    }
+
+    let records = vec![repo_node, obs_node];
+    let mut graph_content = String::new();
+    for r in records {
+        graph_content.push_str(&serde_json::to_string(&r).unwrap());
+        graph_content.push('\n');
+    }
+    fs::write(&graph_path, graph_content).unwrap();
+
+    // 1. Export the bundle
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("bundle")
+        .arg("export")
+        .arg("--root-selector")
+        .arg("id:obs-1")
+        .arg("--graph")
+        .arg(&graph_path)
+        .arg("--out")
+        .arg(&bundle_path)
+        .assert()
+        .success();
+
+    // Verify bundle file content is redacted
+    let bundle_content = fs::read_to_string(&bundle_path).expect("bundle file should exist");
+    assert!(bundle_content.contains(r#""root_selector": "id:obs-1""#));
+    assert!(
+        !bundle_content.contains("This contains sensitive text"),
+        "prose should be redacted"
+    );
+
+    // 2. Inspect the bundle
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("bundle")
+        .arg("inspect")
+        .arg(&bundle_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Root Selector: id:obs-1"))
+        .stdout(predicate::str::contains("Repository Identity: repo-1"))
+        .stdout(predicate::str::contains("agent_authored: 1"));
+
+    // 3. Verify the bundle (text format)
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("bundle")
+        .arg("verify")
+        .arg(&bundle_path)
+        .arg("--format")
+        .arg("text")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Verification Verdict: PASS"))
+        .stdout(predicate::str::contains("- Integrity: PASS"))
+        .stdout(predicate::str::contains("- Coverage: PASS"))
+        .stdout(predicate::str::contains("- Safety: PASS"));
+
+    // 4. Verify the bundle (json format)
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("bundle")
+        .arg("verify")
+        .arg(&bundle_path)
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""ok": true"#));
+
+    // 5. Tamper with the bundle and run verify
+    let mut bundle: serde_json::Value = serde_json::from_str(&bundle_content).unwrap();
+    if let Some(first_rec) = bundle
+        .get_mut("records")
+        .and_then(|r| r.as_array_mut())
+        .and_then(|a| a.get_mut(0))
+    {
+        first_rec["hash"] = serde_json::Value::String("tampered_hash_value".to_owned());
+    }
+    let tampered_content = serde_json::to_string_pretty(&bundle).unwrap();
+    fs::write(&bundle_path, tampered_content).unwrap();
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("bundle")
+        .arg("verify")
+        .arg(&bundle_path)
+        .assert()
+        .failure()
+        .code(predicate::eq(1))
+        .stdout(predicate::str::contains(r#""ok": false"#));
+
+    // Test short alias `eg` binary for verify
+    Command::cargo_bin("eg")
+        .expect("binary should run")
+        .arg("bundle")
+        .arg("verify")
+        .arg(&bundle_path)
+        .assert()
+        .failure()
+        .code(predicate::eq(1));
+
+    // 6. Test export failure due to coverage
+    let mut uncited_obs = GraphRecord::node(
+        "obs-uncited".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Uncited Observation".to_owned(),
+    );
+    if let GraphRecord::Node {
+        text,
+        schema_version,
+        ..
+    } = &mut uncited_obs
+    {
+        *text = Some("Uncited text".to_owned());
+        *schema_version = 1;
+    }
+
+    let records2 = vec![uncited_obs];
+    let mut graph_content2 = String::new();
+    for r in records2 {
+        graph_content2.push_str(&serde_json::to_string(&r).unwrap());
+        graph_content2.push('\n');
+    }
+    let graph_path2 = temp.path().join("graph2.jsonl");
+    fs::write(&graph_path2, graph_content2).unwrap();
+
+    let bundle_path2 = temp.path().join("bundle2.json");
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("bundle")
+        .arg("export")
+        .arg("--root-selector")
+        .arg("id:obs-uncited")
+        .arg("--graph")
+        .arg(&graph_path2)
+        .arg("--out")
+        .arg(&bundle_path2)
+        .assert()
+        .failure()
+        .code(predicate::eq(1))
+        .stderr(predicate::str::contains(r#""code":"export_failed""#));
 }

@@ -437,6 +437,12 @@ enum Commands {
         #[command(subcommand)]
         subcommand: ProtectedSubcommand,
     },
+    /// Manage, export, verify, and inspect redaction-safe evidence bundles (issue #68).
+    Bundle {
+        /// Bundle subcommand.
+        #[command(subcommand)]
+        subcommand: BundleSubcommand,
+    },
     /// Audit citation completeness across the public query workflows (issue #65).
     ///
     /// Drives every public query workflow over a seeded local record set and
@@ -1308,6 +1314,39 @@ enum AuditSubcommand {
     },
 }
 
+/// Subcommands for `bundle`.
+#[derive(Debug, Subcommand)]
+enum BundleSubcommand {
+    /// Export an evidence bundle for a selected selector.
+    Export {
+        /// The starting selector (e.g. `symbol:my_func`, `file:src/lib.rs`, `id:<record_id>`).
+        #[arg(long)]
+        root_selector: String,
+        /// Path to the graph JSONL file (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long, conflicts_with = "graph")]
+        data_dir: Option<PathBuf>,
+        /// Output path for the generated bundle JSON file.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Verify an exported evidence bundle's integrity, coverage, and safety.
+    Verify {
+        /// Path to the bundle JSON file to verify.
+        path: PathBuf,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Inspect and print the manifest of an evidence bundle.
+    Inspect {
+        /// Path to the bundle JSON file to inspect.
+        path: PathBuf,
+    },
+}
+
 /// Subcommands for `protected`.
 #[derive(Debug, Subcommand)]
 enum ProtectedSubcommand {
@@ -1543,6 +1582,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Mcp { data_dir } => crate::mcp::run_stdio(&data_dir),
         Commands::Protected { subcommand } => protected_cmd(subcommand),
+        Commands::Bundle { subcommand } => bundle_cmd(subcommand),
         Commands::Audit { subcommand } => audit_cmd(subcommand),
         Commands::Doctor {
             path,
@@ -6831,6 +6871,7 @@ fn query_file(
     let mut excluded_rows: usize = 0;
     let mut excluded_repos: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
 
+    let mut is_first = true;
     for r in records {
         let GraphRecord::Node {
             id,
@@ -6873,7 +6914,12 @@ fn query_file(
             repository: repository_id.and_then(|repo| index.display_of(repo)),
             freshness: None,
             extraction_completeness: completeness,
-            diagnostics: diags.clone(),
+            diagnostics: if is_first {
+                is_first = false;
+                diags.clone()
+            } else {
+                None
+            },
         });
     }
 
@@ -9642,6 +9688,138 @@ fn protected_get_cmd(handle: &str, store: &Path, operator: &str, out: Option<&Pa
                 err_code,
                 format!("failed to write bytes to {dest_label}: {e}"),
             ),
+        }
+    }
+}
+
+/// Dispatches `eg bundle <subcommand>` (issue #68).
+#[allow(clippy::too_many_lines)]
+fn bundle_cmd(subcommand: BundleSubcommand) -> Result<()> {
+    match subcommand {
+        BundleSubcommand::Export {
+            root_selector,
+            graph,
+            data_dir,
+            out,
+        } => {
+            // For an embedded store, read from a throwaway read-only copy
+            let store_copy = data_dir
+                .as_ref()
+                .map(|dir| match readonly_audit_store(dir) {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        std::process::exit(2);
+                    }
+                });
+            let effective_data_dir = store_copy.as_ref().map(|(path, _guard)| path.as_path());
+
+            let records = match load_query_records(graph.as_deref(), effective_data_dir) {
+                Ok(records) => records,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(2);
+                }
+            };
+
+            let version = env!("CARGO_PKG_VERSION");
+            let bundle = match crate::bundle::export_bundle(&records, &root_selector, version) {
+                Ok(b) => b,
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "ok": false,
+                            "error": {
+                                "code": "export_failed",
+                                "message": error.to_string()
+                            }
+                        })
+                    );
+                    std::process::exit(1);
+                }
+            };
+
+            let json = serde_json::to_string_pretty(&bundle)
+                .map_err(|e| anyhow::anyhow!("failed to serialize bundle: {e}"))?;
+            fs::write(&out, json)
+                .map_err(|e| anyhow::anyhow!("failed to write bundle to {}: {e}", out.display()))?;
+            Ok(())
+        }
+        BundleSubcommand::Verify { path, format } => {
+            let content = fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("failed to read bundle file: {e}"))?;
+            let bundle: crate::bundle::EvidenceBundle = serde_json::from_str(&content)
+                .map_err(|e| anyhow::anyhow!("failed to parse bundle JSON: {e}"))?;
+
+            let report = crate::bundle::verify_bundle(&bundle);
+
+            let output = match format {
+                OutputFormat::Json => serde_json::to_string_pretty(&report)
+                    .map_err(|e| anyhow::anyhow!("failed to serialize report: {e}"))?,
+                OutputFormat::Text => {
+                    format!(
+                        "Verification Verdict: {}\n\n- Integrity: {} ({})\n- Coverage: {} ({})\n- Safety: {} ({})\n",
+                        if report.ok { "PASS" } else { "FAIL" },
+                        if report.integrity.passed {
+                            "PASS"
+                        } else {
+                            "FAIL"
+                        },
+                        report.integrity.detail,
+                        if report.coverage.passed {
+                            "PASS"
+                        } else {
+                            "FAIL"
+                        },
+                        report.coverage.detail,
+                        if report.safety.passed { "PASS" } else { "FAIL" },
+                        report.safety.detail,
+                    )
+                }
+            };
+            println!("{output}");
+
+            if !report.ok {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        BundleSubcommand::Inspect { path } => {
+            let content = fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("failed to read bundle file: {e}"))?;
+            let bundle: crate::bundle::EvidenceBundle = serde_json::from_str(&content)
+                .map_err(|e| anyhow::anyhow!("failed to parse bundle JSON: {e}"))?;
+
+            let m = &bundle.manifest;
+            println!("Evidence Bundle Manifest:");
+            println!("  Root Selector: {}", m.root_selector);
+            println!("  Source Query: {}", m.source_query);
+            println!("  Repository Identity: {}", m.repository_identity);
+            println!("  Egregore Version: {}", m.egregore_version);
+            if let Some(s) = &m.snapshot {
+                match s {
+                    SnapshotHead::Commit { sha } => println!("  Snapshot HEAD Commit: {sha}"),
+                    SnapshotHead::NoGit => println!("  Snapshot HEAD: no git"),
+                    SnapshotHead::UnbornHead => println!("  Snapshot HEAD: unborn"),
+                }
+            }
+            println!("  Omitted Records: {}", m.omitted_record_counts);
+            println!("  Included Records by Trust Class:");
+            for (tc, count) in &m.included_record_counts {
+                println!("    {tc}: {count}");
+            }
+            println!("  Root Record IDs Selected: {:?}", m.root_record_ids);
+            if !bundle.unresolved_links.is_empty() {
+                println!("  Diagnostics (Unresolved Links):");
+                for link in &bundle.unresolved_links {
+                    let src_id = &link.source_id;
+                    let tgt_handle = &link.target_handle;
+                    let rel = &link.relation;
+                    println!("    - Link from {src_id} to missing {tgt_handle} via {rel}");
+                }
+            }
+            Ok(())
         }
     }
 }

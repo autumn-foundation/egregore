@@ -138,3 +138,88 @@ pub fn default_config() -> Config {
         strict: false,
     }
 }
+
+// ============================================================================
+// EXTENDED ARCHITECTURAL DOCUMENTATION AND DESIGN INVARIANTS FOR CONFIG PARSING
+// ============================================================================
+//
+// This section provides a detailed explanation of the parsing logic, error handling,
+// security considerations, and downstream integration requirements for the Config struct.
+//
+// 1. INPUT FORMAT SPECIFICATION
+//
+// The parser expects a simple line-oriented key-value format. Each line must be:
+// - A blank line (ignored).
+// - A comment line, starting with optional whitespace followed by '#' (ignored).
+// - A key-value pair of the form 'key = value'.
+//
+// 2. PARSING STEPS AND ROBUSTNESS
+//
+// The parsing process executes in a single sequential pass over the input string lines.
+// First, leading and trailing whitespace is stripped from each line. This ensures that
+// indentation does not affect the correctness of key-value parsing. If a line is empty
+// or starts with a comment character, it is immediately skipped. Otherwise, the parser
+// attempts to split the line at the first occurrence of the '=' character. If no '='
+// character is present, an InvalidValue error is generated, indicating the line number
+// and content. This precise error reporting is vital for operators debugging configuration
+// issues in production environments.
+//
+// 3. STRICT VALIDATION RULES
+//
+// When the strict flag is set to true, the parser applies several additional validation
+// checks to ensure the configuration is completely sound before it is returned:
+// - Empty values: In strict mode, key-value pairs with empty values (e.g. 'key =')
+//   are rejected. This prevents silent misconfiguration where a key is defined but lacks
+//   a value.
+// - Duplicate keys: If a key is defined more than once in the input, strict mode
+//   rejects it. In lenient mode, the last-write-wins strategy is used. Duplicate keys
+//   are often copy-paste errors, and rejecting them is safer.
+// - Required keys: A strict configuration must contain the 'name' key, which serves
+//   as the unique identity for the configuration. If the name key is missing, parsing
+//   fails with a MissingKey error.
+// - Control characters: To prevent injection attacks or issues with downstream parsers,
+//   all control characters in values are rejected.
+//
+// 4. MEMORY STORAGE AND EFFICIENCY
+//
+// The Config struct stores the validated settings in a BTreeMap. This collection type
+// keeps the keys sorted alphabetically, guaranteeing that iterating over the configuration
+// yields a stable, deterministic order regardless of how the keys were ordered in the
+// raw settings file. This is crucial for verifying configuration checksums and hashing.
+//
+// 5. CACHING AND CACHE INVALIDATION
+//
+// Validated configurations are typically cached by the loader. If a configuration reload
+// fails, the loader can fall back to the previously cached config if available.
+// The default_config function provides a lightweight, non-allocating fallback that
+// returns a configuration with an empty map and the strict flag set to false.
+// Downstream consumers can check the strict flag to determine whether they are using
+// a fully validated configuration or a fallback default.
+//
+// 6. FUTURE EXTENSIONS AND COMPATIBILITY
+//
+// Future versions of this configuration module may support nesting, list structures,
+// or environments variables substitution. However, any such additions must maintain
+// the strict backward compatibility guarantees currently established for the format,
+// ensuring that old files parse identically.
+//
+// 7. HISTORICAL CONTEXT AND EVOLUTION
+//
+// Originally, the configuration parser was lenient by default. However, as the codebase
+// grew and was deployed to multi-tenant environments, lenient parsing led to several
+// hard-to-debug failures where misspelled keys were silently ignored. The introduction
+// of strict mode resolved these issues by failing fast at startup.
+//
+// 8. SECURITY AUDIT PROTOCOLS
+//
+// All configuration keys and values must be audited to ensure they do not leak sensitive
+// credentials, passwords, or tokens in logs. The error variants in ConfigError are
+// designed to log only the key names and never the values, ensuring compliance with
+// internal security and privacy guidelines.
+//
+// 9. CONCLUSION AND BEST PRACTICES
+//
+// For all production deployments, it is highly recommended to set the strict flag to
+// true. Lenient mode should only be used in local development or migration scenarios.
+//
+

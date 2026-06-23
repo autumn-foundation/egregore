@@ -1,5 +1,5 @@
 use crate::error::{CodegraphError, Result};
-use crate::ir::{GraphRecord, SnapshotHead, NodeKind};
+use crate::ir::{GraphRecord, NodeKind, SnapshotHead};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -78,6 +78,7 @@ pub struct VerificationReport {
 }
 
 /// Extracts all outgoing target IDs from a record.
+#[must_use]
 pub fn collect_references(record: &GraphRecord) -> Vec<String> {
     let mut refs = Vec::new();
     match record {
@@ -146,7 +147,7 @@ pub fn collect_references(record: &GraphRecord) -> Vec<String> {
 fn find_root_records(records: &[GraphRecord], selector: &str) -> Result<Vec<GraphRecord>> {
     let Some((prefix, value)) = selector.split_once(':') else {
         return Err(CodegraphError::InvalidArgument {
-            message: format!("invalid selector format: '{}', expected prefix:value", selector),
+            message: format!("invalid selector format: '{selector}', expected prefix:value"),
         });
     };
 
@@ -155,21 +156,37 @@ fn find_root_records(records: &[GraphRecord], selector: &str) -> Result<Vec<Grap
         .filter(|rec| match prefix {
             "id" => rec.id() == value,
             "symbol" => {
-                if let GraphRecord::Node { kind: NodeKind::Symbol, name: Some(n), .. } = rec {
+                if let GraphRecord::Node {
+                    kind: NodeKind::Symbol,
+                    name: Some(n),
+                    ..
+                } = rec
+                {
                     n == value
                 } else {
                     false
                 }
             }
             "file" => {
-                if let GraphRecord::Node { kind: NodeKind::File, repo_relative_path: Some(p), .. } = rec {
+                if let GraphRecord::Node {
+                    kind: NodeKind::File,
+                    repo_relative_path: Some(p),
+                    ..
+                } = rec
+                {
                     p == value
                 } else {
                     false
                 }
             }
             "task" => {
-                if let GraphRecord::Node { kind, entity_id, id, .. } = rec {
+                if let GraphRecord::Node {
+                    kind,
+                    entity_id,
+                    id,
+                    ..
+                } = rec
+                {
                     kind.as_str() == "Task" && (entity_id.as_deref() == Some(value) || id == value)
                 } else {
                     false
@@ -177,7 +194,10 @@ fn find_root_records(records: &[GraphRecord], selector: &str) -> Result<Vec<Grap
             }
             "memory" => {
                 if let GraphRecord::Node { kind, id, .. } = rec {
-                    matches!(kind.as_str(), "Observation" | "Decision" | "Failure" | "Lesson") && id == value
+                    matches!(
+                        kind.as_str(),
+                        "Observation" | "Decision" | "Failure" | "Lesson"
+                    ) && id == value
                 } else {
                     false
                 }
@@ -189,14 +209,15 @@ fn find_root_records(records: &[GraphRecord], selector: &str) -> Result<Vec<Grap
 
     if roots.is_empty() {
         return Err(CodegraphError::InvalidArgument {
-            message: format!("no records matched selector: '{}'", selector),
+            message: format!("no records matched selector: '{selector}'"),
         });
     }
 
     Ok(roots)
 }
 
-/// Scrubs raw protected payloads and sensitive prose fields from a GraphRecord.
+/// Scrubs raw protected payloads and sensitive prose fields from a `GraphRecord`.
+#[must_use]
 pub fn scrub_record(mut record: GraphRecord) -> GraphRecord {
     if let GraphRecord::Node {
         text,
@@ -254,6 +275,12 @@ pub fn scrub_record(mut record: GraphRecord) -> GraphRecord {
 }
 
 /// Exports an evidence bundle for a selected query result, task, memory record, etc.
+///
+/// # Errors
+///
+/// Returns an error if the root records cannot be resolved, if citation threshold requirements are not met,
+/// or if serialization fails.
+#[allow(clippy::too_many_lines, clippy::missing_panics_doc)]
 pub fn export_bundle(
     records: &[GraphRecord],
     root_selector: &str,
@@ -278,12 +305,25 @@ pub fn export_bundle(
     for rec in records {
         let id = rec.id();
         match rec {
-            GraphRecord::Edge { source, target, label, .. } => {
+            GraphRecord::Edge {
+                source,
+                target,
+                label,
+                ..
+            } => {
                 let label_str = label.as_str().to_owned();
-                adj.entry(id.to_owned()).or_default().push((source.clone(), label_str.clone()));
-                adj.entry(id.to_owned()).or_default().push((target.clone(), label_str.clone()));
-                adj.entry(source.clone()).or_default().push((id.to_owned(), label_str.clone()));
-                adj.entry(target.clone()).or_default().push((id.to_owned(), label_str.clone()));
+                adj.entry(id.to_owned())
+                    .or_default()
+                    .push((source.clone(), label_str.clone()));
+                adj.entry(id.to_owned())
+                    .or_default()
+                    .push((target.clone(), label_str.clone()));
+                adj.entry(source.clone())
+                    .or_default()
+                    .push((id.to_owned(), label_str.clone()));
+                adj.entry(target.clone())
+                    .or_default()
+                    .push((id.to_owned(), label_str.clone()));
             }
             GraphRecord::Node {
                 superseded_by,
@@ -299,8 +339,12 @@ pub fn export_bundle(
                 ..
             } => {
                 let mut add_ref = |target_id: &str, relation: &str| {
-                    adj.entry(id.to_owned()).or_default().push((target_id.to_owned(), relation.to_owned()));
-                    adj.entry(target_id.to_owned()).or_default().push((id.to_owned(), relation.to_owned()));
+                    adj.entry(id.to_owned())
+                        .or_default()
+                        .push((target_id.to_owned(), relation.to_owned()));
+                    adj.entry(target_id.to_owned())
+                        .or_default()
+                        .push((id.to_owned(), relation.to_owned()));
                 };
 
                 if let Some(target) = superseded_by {
@@ -342,8 +386,12 @@ pub fn export_bundle(
                 }
             }
             GraphRecord::Tombstone { deleted_id, .. } => {
-                adj.entry(id.to_owned()).or_default().push((deleted_id.clone(), "deleted_id".to_owned()));
-                adj.entry(deleted_id.clone()).or_default().push((id.to_owned(), "deleted_id".to_owned()));
+                adj.entry(id.to_owned())
+                    .or_default()
+                    .push((deleted_id.clone(), "deleted_id".to_owned()));
+                adj.entry(deleted_id.clone())
+                    .or_default()
+                    .push((id.to_owned(), "deleted_id".to_owned()));
             }
         }
     }
@@ -410,8 +458,14 @@ pub fn export_bundle(
     let mut repo_id = "unknown".to_owned();
     let mut snapshot = None;
     for rec in records {
-        if let GraphRecord::Node { kind: NodeKind::Repository, id, source_snapshot, .. } = rec {
-            repo_id = id.clone();
+        if let GraphRecord::Node {
+            kind: NodeKind::Repository,
+            id,
+            source_snapshot,
+            ..
+        } = rec
+        {
+            repo_id.clone_from(id);
             if let Some(s) = source_snapshot {
                 snapshot = Some(s.head.clone());
             }
@@ -426,31 +480,34 @@ pub fn export_bundle(
             let scrubbed = scrub_record(r);
             let serialized = serde_json::to_string(&scrubbed).unwrap();
             let hash = blake3::hash(serialized.as_bytes()).to_hex().to_string();
-            BundleRecord { record: scrubbed, hash }
+            BundleRecord {
+                record: scrubbed,
+                hash,
+            }
         })
         .collect();
 
     // Validate coverage threshold
-    let mut total_valid = 0;
+    let mut total_valid = 0usize;
     let mut non_code_valid = true;
     let total_records_count = bundle_records.len();
 
     for br in &bundle_records {
         let classified = crate::citation_audit::classify_record_external(&br.record);
         let trust_class = classified.trust_class;
-        
-        let is_valid = classified.status != crate::citation_audit::CitationStatus::MissingRequiredHandle;
+
+        let is_valid =
+            classified.status != crate::citation_audit::CitationStatus::MissingRequiredHandle;
         if is_valid {
             total_valid += 1;
         }
 
-        if trust_class != "source_fact" {
-            if !is_valid {
-                non_code_valid = false;
-            }
+        if trust_class != "source_fact" && !is_valid {
+            non_code_valid = false;
         }
     }
 
+    #[allow(clippy::cast_precision_loss)]
     let overall_coverage = if total_records_count > 0 {
         total_valid as f64 / total_records_count as f64
     } else {
@@ -458,14 +515,19 @@ pub fn export_bundle(
     };
 
     if overall_coverage < 0.95 {
+        let coverage_pct = overall_coverage * 100.0;
         return Err(CodegraphError::BundleVerificationFailed {
-            message: format!("below_coverage_threshold: overall coverage is {:.2}%, required 95%", overall_coverage * 100.0),
+            message: format!(
+                "below_coverage_threshold: overall coverage is {coverage_pct:.2}%, required 95%"
+            ),
         });
     }
 
     if !non_code_valid {
         return Err(CodegraphError::BundleVerificationFailed {
-            message: "below_coverage_threshold: non-code trust-class records must have 100% coverage".to_owned(),
+            message:
+                "below_coverage_threshold: non-code trust-class records must have 100% coverage"
+                    .to_string(),
         });
     }
 
@@ -495,18 +557,20 @@ pub fn export_bundle(
 }
 
 /// Verifies the bundle's integrity, coverage, and safety offline and read-only.
+#[must_use]
+#[allow(clippy::too_many_lines, clippy::if_not_else)]
 pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
     // 1. Integrity check
     let mut integrity_passed = true;
-    let mut integrity_msg = "Manifest parses, record hashes match, canonical ordering is stable".to_owned();
-    
+    let mut integrity_msg =
+        "Manifest parses, record hashes match, canonical ordering is stable".to_owned();
+
     let manifest_included_sum: usize = bundle.manifest.included_record_counts.values().sum();
     if manifest_included_sum != bundle.records.len() {
         integrity_passed = false;
+        let records_len = bundle.records.len();
         integrity_msg = format!(
-            "Integrity failure: manifest included_record_counts sum ({}) does not match records length ({})",
-            manifest_included_sum,
-            bundle.records.len()
+            "Integrity failure: manifest included_record_counts sum ({manifest_included_sum}) does not match records length ({records_len})"
         );
     } else {
         // Check hashes match
@@ -515,16 +579,18 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
                 Ok(s) => s,
                 Err(e) => {
                     integrity_passed = false;
-                    integrity_msg = format!("Integrity failure: failed to serialize record at index {}: {}", i, e);
+                    integrity_msg =
+                        format!("Integrity failure: failed to serialize record at index {i}: {e}");
                     break;
                 }
             };
             let computed_hash = blake3::hash(serialized.as_bytes()).to_hex().to_string();
             if computed_hash != br.hash {
                 integrity_passed = false;
+                let record_id = br.record.id();
+                let expected_hash = &br.hash;
                 integrity_msg = format!(
-                    "Integrity failure: record hash mismatch at index {}. Record ID: {}. Expected: {}, computed: {}",
-                    i, br.record.id(), br.hash, computed_hash
+                    "Integrity failure: record hash mismatch at index {i}. Record ID: {record_id}. Expected: {expected_hash}, computed: {computed_hash}"
                 );
                 break;
             }
@@ -534,7 +600,7 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
         if integrity_passed {
             for i in 0..bundle.records.len().saturating_sub(1) {
                 let a = &bundle.records[i].record;
-                let b = &bundle.records[i+1].record;
+                let b = &bundle.records[i + 1].record;
                 let id_cmp = a.id().cmp(b.id());
                 let is_ordered = if id_cmp == std::cmp::Ordering::Equal {
                     let a_json = serde_json::to_string(a).unwrap_or_default();
@@ -545,9 +611,11 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
                 };
                 if !is_ordered {
                     integrity_passed = false;
+                    let a_id = a.id();
+                    let b_id = b.id();
+                    let next_i = i + 1;
                     integrity_msg = format!(
-                        "Integrity failure: canonical ordering is unstable. Record at index {} ({}) is after record at index {} ({})",
-                        i, a.id(), i+1, b.id()
+                        "Integrity failure: canonical ordering is unstable. Record at index {i} ({a_id}) is after record at index {next_i} ({b_id})"
                     );
                     break;
                 }
@@ -562,9 +630,11 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
 
     // 2. Coverage check
     let mut coverage_passed = true;
-    let mut coverage_msg = "All selected roots and directly linked evidence meet the citable-handle threshold".to_owned();
+    let mut coverage_msg =
+        "All selected roots and directly linked evidence meet the citable-handle threshold"
+            .to_owned();
 
-    let mut total_valid = 0;
+    let mut total_valid = 0usize;
     let mut non_code_valid = true;
     let total_records_count = bundle.records.len();
 
@@ -573,7 +643,8 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
     for root_id in &bundle.manifest.root_record_ids {
         if !included_ids.contains(root_id.as_str()) {
             coverage_passed = false;
-            coverage_msg = format!("Coverage failure: root record ID {} is not included in the bundle", root_id);
+            coverage_msg =
+                format!("Coverage failure: root record ID {root_id} is not included in the bundle");
             break;
         }
     }
@@ -582,19 +653,19 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
         for br in &bundle.records {
             let classified = crate::citation_audit::classify_record_external(&br.record);
             let trust_class = classified.trust_class;
-            
-            let is_valid = classified.status != crate::citation_audit::CitationStatus::MissingRequiredHandle;
+
+            let is_valid =
+                classified.status != crate::citation_audit::CitationStatus::MissingRequiredHandle;
             if is_valid {
                 total_valid += 1;
             }
 
-            if trust_class != "source_fact" {
-                if !is_valid {
-                    non_code_valid = false;
-                }
+            if trust_class != "source_fact" && !is_valid {
+                non_code_valid = false;
             }
         }
 
+        #[allow(clippy::cast_precision_loss)]
         let overall_coverage = if total_records_count > 0 {
             total_valid as f64 / total_records_count as f64
         } else {
@@ -602,14 +673,15 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
         };
 
         if overall_coverage < 0.95 {
+            let coverage_pct = overall_coverage * 100.0;
             coverage_passed = false;
             coverage_msg = format!(
-                "Coverage failure: overall citation coverage is {:.2}% (below 95% threshold)",
-                overall_coverage * 100.0
+                "Coverage failure: overall citation coverage is {coverage_pct:.2}% (below 95% threshold)"
             );
         } else if !non_code_valid {
             coverage_passed = false;
-            coverage_msg = "Coverage failure: non-code trust-class records must have 100% coverage".to_owned();
+            coverage_msg = "Coverage failure: non-code trust-class records must have 100% coverage"
+                .to_string();
         }
     }
 
@@ -638,52 +710,64 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
             ..
         } = &br.record
         {
+            let record_id = br.record.id();
+
             // Assert that raw prose fields are None
             if text.is_some() {
                 safety_passed = false;
-                safety_msg = format!("Safety failure: record {} contains raw text", br.record.id());
+                safety_msg = format!("Safety failure: record {record_id} contains raw text");
                 break;
             }
             if validation_summary.is_some() {
                 safety_passed = false;
-                safety_msg = format!("Safety failure: record {} contains raw validation_summary", br.record.id());
+                safety_msg =
+                    format!("Safety failure: record {record_id} contains raw validation_summary");
                 break;
             }
             if arguments_summary.is_some() {
                 safety_passed = false;
-                safety_msg = format!("Safety failure: record {} contains raw arguments_summary", br.record.id());
+                safety_msg =
+                    format!("Safety failure: record {record_id} contains raw arguments_summary");
                 break;
             }
 
             // Assert that all inline handle fields are None
-            let mut inline_payload_field = None;
-            if let Some(h) = arguments_handle && h.inline.is_some() {
-                inline_payload_field = Some("arguments_handle");
-            }
-            if let Some(h) = result_handle && h.inline.is_some() {
-                inline_payload_field = Some("result_handle");
-            }
-            if let Some(h) = stdout_handle && h.inline.is_some() {
-                inline_payload_field = Some("stdout_handle");
-            }
-            if let Some(h) = stderr_handle && h.inline.is_some() {
-                inline_payload_field = Some("stderr_handle");
-            }
-            if let Some(h) = patch_handle && h.inline.is_some() {
-                inline_payload_field = Some("patch_handle");
-            }
-            if let Some(h) = body_handle && h.inline.is_some() {
-                inline_payload_field = Some("body_handle");
-            }
-            if let Some(h) = diff_hunk_handle && h.inline.is_some() {
-                inline_payload_field = Some("diff_hunk_handle");
-            }
+            let inline_payload_field = if let Some(h) = arguments_handle
+                && h.inline.is_some()
+            {
+                Some("arguments_handle")
+            } else if let Some(h) = result_handle
+                && h.inline.is_some()
+            {
+                Some("result_handle")
+            } else if let Some(h) = stdout_handle
+                && h.inline.is_some()
+            {
+                Some("stdout_handle")
+            } else if let Some(h) = stderr_handle
+                && h.inline.is_some()
+            {
+                Some("stderr_handle")
+            } else if let Some(h) = patch_handle
+                && h.inline.is_some()
+            {
+                Some("patch_handle")
+            } else if let Some(h) = body_handle
+                && h.inline.is_some()
+            {
+                Some("body_handle")
+            } else if let Some(h) = diff_hunk_handle
+                && h.inline.is_some()
+            {
+                Some("diff_hunk_handle")
+            } else {
+                None
+            };
 
             if let Some(field) = inline_payload_field {
                 safety_passed = false;
                 safety_msg = format!(
-                    "Safety failure: record {} carries raw inline payload in field '{}'",
-                    br.record.id(), field
+                    "Safety failure: record {record_id} carries raw inline payload in field '{field}'"
                 );
                 break;
             }
@@ -698,7 +782,9 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
                 || user_context.constraint_text.is_some()
             {
                 safety_passed = false;
-                safety_msg = format!("Safety failure: record {} contains unscrubbed user context fields", br.record.id());
+                safety_msg = format!(
+                    "Safety failure: record {record_id} contains unscrubbed user context fields"
+                );
                 break;
             }
 
@@ -706,9 +792,9 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
             let serialized = serde_json::to_string(&br.record).unwrap_or_default();
             if let Some((class, _)) = crate::redaction::detect_secret(&serialized) {
                 safety_passed = false;
+                let class_str = class.as_str();
                 safety_msg = format!(
-                    "Safety failure: record {} contains unredacted secret class: {}",
-                    br.record.id(), class.as_str()
+                    "Safety failure: record {record_id} contains unredacted secret class: {class_str}"
                 );
                 break;
             }
