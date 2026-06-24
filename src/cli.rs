@@ -570,7 +570,7 @@ enum ImportSource {
 
 /// Output format for query results.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, clap::ValueEnum)]
-enum OutputFormat {
+pub(crate) enum OutputFormat {
     /// Newline-delimited JSON objects (default, machine-readable).
     #[default]
     Json,
@@ -1351,6 +1351,27 @@ enum AuditSubcommand {
         /// Defaults to the manifest's `min_ratio`. When supplied, overrides it.
         #[arg(long)]
         min_ratio: Option<f64>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Measure code-graph extraction accuracy against a ground-truth labeled corpus (issue #93).
+    Accuracy {
+        /// Path to the Rust test corpus directory.
+        #[arg(long, default_value = "corpus/accuracy")]
+        corpus_dir: PathBuf,
+        /// Path to the expected labels JSON file.
+        #[arg(long, default_value = "corpus/accuracy_labels.json")]
+        labels: PathBuf,
+        /// Line tolerance for span matching.
+        #[arg(long, default_value_t = 0)]
+        span_line_tolerance: usize,
+        /// Target precision threshold (default: overrides from labels JSON).
+        #[arg(long)]
+        min_precision: Option<f64>,
+        /// Target recall threshold (default: overrides from labels JSON).
+        #[arg(long)]
+        min_recall: Option<f64>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -4500,6 +4521,21 @@ fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
             min_ratio,
             format,
         } => audit_token_cost_cmd(&corpus, min_ratio, format),
+        AuditSubcommand::Accuracy {
+            corpus_dir,
+            labels,
+            span_line_tolerance,
+            min_precision,
+            min_recall,
+            format,
+        } => crate::accuracy::eval_accuracy_cmd(
+            &corpus_dir,
+            &labels,
+            span_line_tolerance,
+            min_precision,
+            min_recall,
+            format,
+        ),
     }
 }
 

@@ -614,5 +614,8 @@ fn find_env_secret(value: &str) -> Option<usize> {
 fn env_key_start(value: &str, eq_pos: usize) -> usize {
     value[..eq_pos]
         .rfind(|c: char| !c.is_ascii_uppercase() && !c.is_ascii_digit() && c != '_')
-        .map_or(0, |p| p + 1)
+        .map_or(0, |p| {
+            let ch = value[p..].chars().next().unwrap_or(' ');
+            p + ch.len_utf8()
+        })
 }

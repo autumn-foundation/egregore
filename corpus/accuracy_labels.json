@@ -1,0 +1,157 @@
+{
+  "thresholds": {
+    "nodes": {
+      "Symbol": { "precision": 0.98, "recall": 0.95 },
+      "Import": { "precision": 0.98, "recall": 0.95 },
+      "Module": { "precision": 0.98, "recall": 0.95 },
+      "Diagnostic": { "precision": 0.98, "recall": 0.95 }
+    },
+    "edges": {
+      "DEFINES": { "precision": 0.98, "recall": 0.95 },
+      "CALLS": { "precision": 0.98, "recall": 0.95 },
+      "IMPORTS": { "precision": 0.98, "recall": 0.95 },
+      "CONTAINS": { "precision": 0.98, "recall": 0.95 },
+      "IMPLEMENTS": { "precision": 0.98, "recall": 0.95 }
+    }
+  },
+  "nodes": [
+    {
+      "id": "repo-node",
+      "kind": "Repository",
+      "name": "accuracy-corpus"
+    },
+    {
+      "id": "file-lib",
+      "kind": "File",
+      "repo_relative_path": "src/lib.rs",
+      "name": "src/lib.rs"
+    },
+    {
+      "id": "mod-nested",
+      "kind": "Module",
+      "repo_relative_path": "src/lib.rs",
+      "name": "nested_mod",
+      "span": { "start_byte": 455, "end_byte": 509, "start_line": 30, "end_line": 32 }
+    },
+    {
+      "id": "sym-free-func",
+      "kind": "Symbol",
+      "repo_relative_path": "src/lib.rs",
+      "name": "free_function",
+      "symbol_kind": "function",
+      "span": { "start_byte": 58, "end_byte": 107, "start_line": 3, "end_line": 5 }
+    },
+    {
+      "id": "sym-mystruct",
+      "kind": "Symbol",
+      "repo_relative_path": "src/lib.rs",
+      "name": "MyStruct",
+      "symbol_kind": "struct",
+      "span": { "start_byte": 109, "end_byte": 153, "start_line": 7, "end_line": 9 }
+    },
+    {
+      "id": "sym-impl-mystruct",
+      "kind": "Symbol",
+      "repo_relative_path": "src/lib.rs",
+      "name": "impl<T> MyStruct<T>",
+      "symbol_kind": "impl",
+      "span": { "start_byte": 155, "end_byte": 304, "start_line": 11, "end_line": 18 }
+    },
+    {
+      "id": "sym-impl-mystruct-new",
+      "kind": "Symbol",
+      "repo_relative_path": "src/lib.rs",
+      "name": "impl<T> MyStruct<T>::new",
+      "symbol_kind": "method",
+      "span": { "start_byte": 181, "end_byte": 240, "start_line": 12, "end_line": 14 }
+    },
+    {
+      "id": "sym-impl-mystruct-get-value",
+      "kind": "Symbol",
+      "repo_relative_path": "src/lib.rs",
+      "name": "impl<T> MyStruct<T>::get_value",
+      "symbol_kind": "method",
+      "span": { "start_byte": 245, "end_byte": 302, "start_line": 15, "end_line": 17 }
+    },
+    {
+      "id": "sym-mytrait",
+      "kind": "Symbol",
+      "repo_relative_path": "src/lib.rs",
+      "name": "MyTrait",
+      "symbol_kind": "trait",
+      "span": { "start_byte": 306, "end_byte": 355, "start_line": 20, "end_line": 22 }
+    },
+    {
+      "id": "sym-impl-mytrait",
+      "kind": "Symbol",
+      "repo_relative_path": "src/lib.rs",
+      "name": "impl MyTrait for MyStruct<i32>",
+      "symbol_kind": "impl",
+      "span": { "start_byte": 357, "end_byte": 453, "start_line": 24, "end_line": 28 }
+    },
+    {
+      "id": "sym-impl-mytrait-method",
+      "kind": "Symbol",
+      "repo_relative_path": "src/lib.rs",
+      "name": "MyTrait for MyStruct<i32>::trait_method",
+      "symbol_kind": "method",
+      "span": { "start_byte": 394, "end_byte": 451, "start_line": 25, "end_line": 27 }
+    },
+    {
+      "id": "sym-nested-func",
+      "kind": "Symbol",
+      "repo_relative_path": "src/lib.rs",
+      "name": "nested_mod::nested_function",
+      "symbol_kind": "function",
+      "span": { "start_byte": 480, "end_byte": 507, "start_line": 31, "end_line": 31 }
+    },
+    {
+      "id": "import-aliased",
+      "kind": "Import",
+      "repo_relative_path": "src/lib.rs",
+      "name": "pub use nested_mod::nested_function as aliased_func",
+      "span": { "start_byte": 511, "end_byte": 563, "start_line": 34, "end_line": 34 }
+    },
+    {
+      "id": "import-hashmap",
+      "kind": "Import",
+      "repo_relative_path": "src/lib.rs",
+      "name": "std::collections::HashMap",
+      "span": { "start_byte": 565, "end_byte": 595, "start_line": 36, "end_line": 36 }
+    },
+    {
+      "id": "diag-macro",
+      "kind": "Diagnostic",
+      "repo_relative_path": "src/lib.rs",
+      "name": "my_macro!",
+      "span": { "start_byte": 675, "end_byte": 700, "start_line": 43, "end_line": 43 }
+    },
+    {
+      "id": "sym-decoy-str",
+      "kind": "Symbol",
+      "repo_relative_path": "src/lib.rs",
+      "name": "DECOY_STR",
+      "symbol_kind": "const",
+      "span": { "start_byte": 703, "end_byte": 752, "start_line": 45, "end_line": 45 }
+    }
+  ],
+  "edges": [
+    { "label": "CONTAINS", "source": "repo-node", "target": "file-lib" },
+    { "label": "DEFINES", "source": "file-lib", "target": "sym-free-func" },
+    { "label": "DEFINES", "source": "file-lib", "target": "sym-mystruct" },
+    { "label": "DEFINES", "source": "file-lib", "target": "sym-impl-mystruct" },
+    { "label": "DEFINES", "source": "sym-impl-mystruct", "target": "sym-impl-mystruct-new" },
+    { "label": "DEFINES", "source": "sym-impl-mystruct", "target": "sym-impl-mystruct-get-value" },
+    { "label": "IMPLEMENTS", "source": "sym-impl-mystruct", "target": "sym-impl-mystruct" },
+    { "label": "DEFINES", "source": "file-lib", "target": "sym-mytrait" },
+    { "label": "DEFINES", "source": "file-lib", "target": "sym-impl-mytrait" },
+    { "label": "DEFINES", "source": "sym-impl-mytrait", "target": "sym-impl-mytrait-method" },
+    { "label": "IMPLEMENTS", "source": "sym-impl-mytrait", "target": "sym-mytrait" },
+    { "label": "CONTAINS", "source": "file-lib", "target": "mod-nested" },
+    { "label": "DEFINES", "source": "mod-nested", "target": "sym-nested-func" },
+    { "label": "IMPORTS", "source": "file-lib", "target": "import-aliased" },
+    { "label": "IMPORTS", "source": "file-lib", "target": "import-hashmap" },
+    { "label": "DEFINES", "source": "file-lib", "target": "sym-decoy-str" },
+    { "label": "CALLS", "source": "sym-impl-mytrait-method", "target": "sym-free-func" }
+  ]
+}
