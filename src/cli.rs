@@ -1331,6 +1331,39 @@ enum AuditSubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Audit agent-memory composition health to flag reviewability risk (issue #94).
+    ///
+    /// Reads a seeded record set from a JSONL graph (`--graph`) or an embedded
+    /// store (`--data-dir`), aggregates observation records, and prints a
+    /// report with a default pass/fail gate.
+    ///
+    /// Exit codes:
+    ///   0 — gate passed (`ok: true`).
+    ///   1 — gate failed (`ok: false`); the report is still printed.
+    ///   2 — usage/load error (bad path, unparseable graph).
+    MemoryHealth {
+        /// Graph JSONL path (mutually exclusive with `--data-dir`).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` store directory (mutually exclusive with `--graph`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Minimum fraction of observation records that must have provenance coverage.
+        #[arg(long, default_value_t = 1.0)]
+        min_provenance_coverage: f64,
+        /// Maximum fraction of observation records that can have dangling evidence.
+        #[arg(long, default_value_t = 0.0)]
+        max_dangling_evidence: f64,
+        /// Optional maximum fraction of observation records that can be unverified.
+        #[arg(long)]
+        max_unverified: Option<f64>,
+        /// Optional maximum fraction of active observation records that can be contaminated.
+        #[arg(long)]
+        max_current_guidance_contamination: Option<f64>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Measure query-answer token cost against the ripgrep baseline (issue #84).
     ///
     /// Reads a pinned corpus manifest, scans the corpus into an in-memory graph,
@@ -4516,6 +4549,23 @@ fn audit_cmd(subcommand: AuditSubcommand) -> Result<()> {
             min_code_citation,
             format,
         ),
+        AuditSubcommand::MemoryHealth {
+            graph,
+            data_dir,
+            min_provenance_coverage,
+            max_dangling_evidence,
+            max_unverified,
+            max_current_guidance_contamination,
+            format,
+        } => audit_memory_health_cmd(
+            graph.as_deref(),
+            data_dir.as_deref(),
+            min_provenance_coverage,
+            max_dangling_evidence,
+            max_unverified,
+            max_current_guidance_contamination,
+            format,
+        ),
         AuditSubcommand::TokenCost {
             corpus,
             min_ratio,
@@ -4720,6 +4770,90 @@ fn audit_citations_cmd(
     // guard would leak a full copied store under the temp dir on every `--data-dir`
     // run. Drop it explicitly before exiting (the borrow in `effective_data_dir` is
     // dead after the reads above).
+    let exit_code = i32::from(!report.ok);
+    drop(store_copy);
+    std::process::exit(exit_code);
+}
+
+/// Handles `eg audit memory-health` (issue #94).
+fn audit_memory_health_cmd(
+    graph: Option<&Path>,
+    data_dir: Option<&Path>,
+    min_provenance_coverage: f64,
+    max_dangling_evidence: f64,
+    max_unverified: Option<f64>,
+    max_current_guidance_contamination: Option<f64>,
+    format: OutputFormat,
+) -> Result<()> {
+    // Validate inputs
+    for (name, val) in [
+        ("min-provenance-coverage", min_provenance_coverage),
+        ("max-dangling-evidence", max_dangling_evidence),
+    ] {
+        if !val.is_finite() || !(0.0..=1.0).contains(&val) {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "code": format!("invalid_{}", name.replace('-', "_")),
+                    "value": val.to_string(),
+                    "message": format!("--{} must be a finite value in [0.0, 1.0]", name)
+                })
+            );
+            std::process::exit(2);
+        }
+    }
+    for (name, val_opt) in [
+        ("max-unverified", max_unverified),
+        (
+            "max-current-guidance-contamination",
+            max_current_guidance_contamination,
+        ),
+    ] {
+        if val_opt.is_some_and(|val| !val.is_finite() || !(0.0..=1.0).contains(&val)) {
+            let val = val_opt.unwrap();
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "code": format!("invalid_{}", name.replace('-', "_")),
+                    "value": val.to_string(),
+                    "message": format!("--{} must be a finite value in [0.0, 1.0]", name)
+                })
+            );
+            std::process::exit(2);
+        }
+    }
+
+    let store_copy = data_dir.map(|dir| match readonly_audit_store(dir) {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    });
+    let effective_data_dir = store_copy.as_ref().map(|(path, _guard)| path.as_path());
+
+    let records = match load_query_records_history(graph, effective_data_dir) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+
+    let config = crate::memory_health::MemoryHealthConfig {
+        min_provenance_coverage,
+        max_dangling_evidence,
+        max_unverified,
+        max_current_guidance_contamination,
+    };
+    let report = crate::memory_health::run_memory_health_audit(&records, &config);
+
+    let output = match format {
+        OutputFormat::Json | OutputFormat::Text => serde_json::to_string_pretty(&report)
+            .context("failed to serialize memory health report")?,
+    };
+    println!("{output}");
+
     let exit_code = i32::from(!report.ok);
     drop(store_copy);
     std::process::exit(exit_code);
