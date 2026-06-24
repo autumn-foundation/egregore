@@ -3,13 +3,14 @@
 use aletheia_egregore::{
     EdgeLabel, EmbeddingModel, EvidenceLink, GraphRecord, MetricKind, NodeKind, SelectionBasis,
     SemanticDriftMetadata, TemporalMetadata,
+    citation_audit::AbsentHandleRule,
     ir::{
         AGENT_MEMORY_SCHEMA_VERSION, VERIFICATION_SCHEMA_VERSION, agent_memory_stable_id,
         verification_stable_id,
     },
     query::{
-        largest_semantic_drifts, path_is_under_prefix, subsystem_context, symbol_at_commit,
-        symbol_context,
+        ModuleNodeKind, OrientationError, is_entry_point, largest_semantic_drifts, orientation_map,
+        path_is_under_prefix, subsystem_context, symbol_at_commit, symbol_context,
     },
 };
 
@@ -4894,4 +4895,455 @@ fn semantic_context_bundle_preserves_lead_order_and_is_deterministic() {
     for _ in 0..5 {
         assert_eq!(project(), first, "bundle output must be deterministic");
     }
+}
+
+#[test]
+fn test_is_entry_point_matches_roots_and_binaries() {
+    assert!(is_entry_point("src/lib.rs"));
+    assert!(is_entry_point("src/main.rs"));
+    assert!(is_entry_point("src/bin/foo.rs"));
+    assert!(is_entry_point("src/bin/bar/main.rs"));
+    assert!(is_entry_point("crates/subcrate/src/lib.rs"));
+    assert!(is_entry_point("crates/subcrate/src/main.rs"));
+    assert!(is_entry_point("crates/subcrate/src/bin/nested.rs"));
+
+    assert!(!is_entry_point("src/adapters/aletheiadb.rs"));
+    assert!(!is_entry_point("Cargo.toml"));
+    assert!(!is_entry_point("README.md"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_orientation_map_happy_path() {
+    let repo_id = "repo:test-repo";
+    let repo_node = GraphRecord::node(
+        repo_id.to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("test-repo".to_owned()),
+        "Test repository".to_owned(),
+    );
+
+    // Entry points
+    let lib_file = GraphRecord::node(
+        "file:lib".to_owned(),
+        NodeKind::File,
+        Some("src/lib.rs".to_owned()),
+        None,
+        Some("src/lib.rs".to_owned()),
+        "file src/lib.rs".to_owned(),
+    );
+    let bin_file = GraphRecord::node(
+        "file:bin".to_owned(),
+        NodeKind::File,
+        Some("src/bin/tool.rs".to_owned()),
+        None,
+        Some("src/bin/tool.rs".to_owned()),
+        "file src/bin/tool.rs".to_owned(),
+    );
+    // Regular file
+    let helper_file = GraphRecord::node(
+        "file:helper".to_owned(),
+        NodeKind::File,
+        Some("src/helper.rs".to_owned()),
+        None,
+        Some("src/helper.rs".to_owned()),
+        "file src/helper.rs".to_owned(),
+    );
+
+    // Symbols
+    let lib_fn = GraphRecord::symbol(
+        "symbol:lib_fn".to_owned(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        aletheia_egregore::SourceSpan {
+            start_byte: 0,
+            end_byte: 10,
+            start_line: 1,
+            end_line: 2,
+        },
+        "lib_fn".to_owned(),
+        "fn lib_fn".to_owned(),
+    );
+    let bin_fn = GraphRecord::symbol(
+        "symbol:bin_fn".to_owned(),
+        "fn",
+        "src/bin/tool.rs".to_owned(),
+        aletheia_egregore::SourceSpan {
+            start_byte: 0,
+            end_byte: 10,
+            start_line: 1,
+            end_line: 2,
+        },
+        "bin_fn".to_owned(),
+        "fn bin_fn".to_owned(),
+    );
+    let helper_fn = GraphRecord::symbol(
+        "symbol:helper_fn".to_owned(),
+        "fn",
+        "src/helper.rs".to_owned(),
+        aletheia_egregore::SourceSpan {
+            start_byte: 0,
+            end_byte: 10,
+            start_line: 5,
+            end_line: 6,
+        },
+        "helper_fn".to_owned(),
+        "fn helper_fn".to_owned(),
+    );
+
+    // Contained in repository edges
+    let e_repo_lib = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "file:lib".to_owned(),
+        None,
+        "repo contains lib".to_owned(),
+    );
+    let e_repo_bin = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "file:bin".to_owned(),
+        None,
+        "repo contains bin".to_owned(),
+    );
+    let e_repo_helper = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "file:helper".to_owned(),
+        None,
+        "repo contains helper".to_owned(),
+    );
+
+    // Defined/Contained in file edges
+    let e_lib_fn = GraphRecord::edge(
+        EdgeLabel::Defines,
+        "file:lib".to_owned(),
+        "symbol:lib_fn".to_owned(),
+        None,
+        "lib defines lib_fn".to_owned(),
+    );
+    let e_bin_fn = GraphRecord::edge(
+        EdgeLabel::Defines,
+        "file:bin".to_owned(),
+        "symbol:bin_fn".to_owned(),
+        None,
+        "bin defines bin_fn".to_owned(),
+    );
+    let e_helper_fn = GraphRecord::edge(
+        EdgeLabel::Defines,
+        "file:helper".to_owned(),
+        "symbol:helper_fn".to_owned(),
+        None,
+        "helper defines helper_fn".to_owned(),
+    );
+
+    // Reference edges (calls/references to symbol:helper_fn to give it high in-degree)
+    let e_call1 = GraphRecord::edge(
+        EdgeLabel::Calls,
+        "symbol:lib_fn".to_owned(),
+        "symbol:helper_fn".to_owned(),
+        None,
+        "lib_fn calls helper_fn".to_owned(),
+    );
+    let e_call2 = GraphRecord::edge(
+        EdgeLabel::Calls,
+        "symbol:bin_fn".to_owned(),
+        "symbol:helper_fn".to_owned(),
+        None,
+        "bin_fn calls helper_fn".to_owned(),
+    );
+
+    // Inbound to lib_fn (gives it degree 1)
+    let e_call3 = GraphRecord::edge(
+        EdgeLabel::Calls,
+        "symbol:bin_fn".to_owned(),
+        "symbol:lib_fn".to_owned(),
+        None,
+        "bin_fn calls lib_fn".to_owned(),
+    );
+
+    let records = vec![
+        repo_node,
+        lib_file,
+        bin_file,
+        helper_file,
+        lib_fn,
+        bin_fn,
+        helper_fn,
+        e_repo_lib,
+        e_repo_bin,
+        e_repo_helper,
+        e_lib_fn,
+        e_bin_fn,
+        e_helper_fn,
+        e_call1,
+        e_call2,
+        e_call3,
+    ];
+
+    let map = orientation_map(&records, None, 10).expect("should build orientation map");
+
+    // 1. Entry points
+    assert_eq!(map.entry_points.len(), 2);
+    assert_eq!(map.entry_points[0].repo_relative_path, "src/bin/tool.rs");
+    assert_eq!(map.entry_points[1].repo_relative_path, "src/lib.rs");
+
+    // 2. Module tree structure
+    assert_eq!(map.module_tree.len(), 1);
+    let src_node = &map.module_tree[0];
+    assert_eq!(src_node.name, "src");
+    assert_eq!(src_node.path, "src");
+    assert_eq!(src_node.kind, ModuleNodeKind::Directory);
+    assert_eq!(src_node.symbol_count, 3); // transitive sum
+    assert_eq!(
+        src_node.absent_handle_reason,
+        Some(AbsentHandleRule::NoSpanModuleLevel)
+    );
+
+    assert_eq!(src_node.children.len(), 3);
+    // BTreeMap keeps keys alphabetically sorted: bin, helper.rs, lib.rs
+    assert_eq!(src_node.children[0].name, "bin");
+    assert_eq!(src_node.children[0].kind, ModuleNodeKind::Directory);
+    assert_eq!(src_node.children[0].symbol_count, 1);
+
+    assert_eq!(src_node.children[1].name, "helper.rs");
+    assert_eq!(src_node.children[1].kind, ModuleNodeKind::File);
+    assert_eq!(src_node.children[1].symbol_count, 1);
+
+    assert_eq!(src_node.children[2].name, "lib.rs");
+    assert_eq!(src_node.children[2].kind, ModuleNodeKind::File);
+    assert_eq!(src_node.children[2].symbol_count, 1);
+
+    // 3. Top-referenced symbols
+    assert_eq!(map.top_referenced_symbols.len(), 3);
+    // helper_fn should be first (degree 3: Contains helper_fn + Defines helper_fn + Calls + Calls = wait, Contains/Defines/Calls are in edges)
+    // Wait, let's trace inbound edges to helper_fn: Contains (no, Contains points to helper_file), Defines (from helper_file to helper_fn) = 1, Calls (e_call1) = 2, Calls (e_call2) = 3. So inbound degree is 3!
+    assert_eq!(map.top_referenced_symbols[0].name, "helper_fn");
+    assert_eq!(map.top_referenced_symbols[0].inbound_degree, 3);
+
+    // lib_fn has Defines (1) + Calls (e_call3) (1) = 2
+    assert_eq!(map.top_referenced_symbols[1].name, "lib_fn");
+    assert_eq!(map.top_referenced_symbols[1].inbound_degree, 2);
+
+    // bin_fn has Defines (1) = 1
+    assert_eq!(map.top_referenced_symbols[2].name, "bin_fn");
+    assert_eq!(map.top_referenced_symbols[2].inbound_degree, 1);
+}
+
+#[test]
+fn test_orientation_map_errors() {
+    let helper_file = GraphRecord::node(
+        "file:helper".to_owned(),
+        NodeKind::File,
+        Some("src/helper.rs".to_owned()),
+        None,
+        Some("src/helper.rs".to_owned()),
+        "file src/helper.rs".to_owned(),
+    );
+
+    // 1. Empty graph
+    let res_empty = orientation_map(&[], None, 10);
+    assert_eq!(res_empty, Err(OrientationError::EmptyGraph));
+
+    // 2. No entry points
+    let res_no_ep = orientation_map(&[helper_file], None, 10);
+    assert_eq!(res_no_ep, Err(OrientationError::NoEntryPoints));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_orientation_map_repo_scoping_tombstones_and_normalization() {
+    let repo_a = "repo:repo_a";
+    let repo_b = "repo:repo_b";
+
+    // Nodes for repo A
+    let node_repo_a = GraphRecord::node(
+        repo_a.to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo_a".to_owned()),
+        "Repo A".to_owned(),
+    );
+    // File with Windows backslashes
+    let file_a = GraphRecord::node(
+        "file:a".to_owned(),
+        NodeKind::File,
+        Some("src\\lib.rs".to_owned()),
+        None,
+        Some("src\\lib.rs".to_owned()),
+        "file src\\lib.rs".to_owned(),
+    );
+    let sym_a = GraphRecord::symbol(
+        "symbol:a".to_owned(),
+        "fn",
+        "src\\lib.rs".to_owned(),
+        span(1, 5),
+        "func_a".to_owned(),
+        "fn func_a".to_owned(),
+    );
+
+    // Nodes for repo B (another language - Go main.go entry point)
+    let node_repo_b = GraphRecord::node(
+        repo_b.to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo_b".to_owned()),
+        "Repo B".to_owned(),
+    );
+    let file_b = GraphRecord::node(
+        "file:b".to_owned(),
+        NodeKind::File,
+        Some("main.go".to_owned()),
+        None,
+        Some("main.go".to_owned()),
+        "file main.go".to_owned(),
+    );
+    let sym_b = GraphRecord::symbol(
+        "symbol:b".to_owned(),
+        "fn",
+        "main.go".to_owned(),
+        span(1, 10),
+        "main".to_owned(),
+        "fn main".to_owned(),
+    );
+
+    // Edge records (ownership links via Contains)
+    let e_contains_a = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_a.to_owned(),
+        "file:a".to_owned(),
+        None,
+        "repo contains file_a".to_owned(),
+    );
+    let e_defines_a = GraphRecord::edge(
+        EdgeLabel::Defines,
+        "file:a".to_owned(),
+        "symbol:a".to_owned(),
+        None,
+        "file defines sym_a".to_owned(),
+    );
+
+    let e_contains_b = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_b.to_owned(),
+        "file:b".to_owned(),
+        None,
+        "repo contains file_b".to_owned(),
+    );
+    let e_defines_b = GraphRecord::edge(
+        EdgeLabel::Defines,
+        "file:b".to_owned(),
+        "symbol:b".to_owned(),
+        None,
+        "file defines sym_b".to_owned(),
+    );
+
+    // Scoped reference edge: referencing sym_a from another symbol inside repo_a
+    let sym_referrer_a = GraphRecord::symbol(
+        "symbol:referrer_a".to_owned(),
+        "fn",
+        "src\\lib.rs".to_owned(),
+        span(10, 15),
+        "referrer_a".to_owned(),
+        "fn referrer_a".to_owned(),
+    );
+    let e_defines_ref_a = GraphRecord::edge(
+        EdgeLabel::Defines,
+        "file:a".to_owned(),
+        "symbol:referrer_a".to_owned(),
+        None,
+        "file defines referrer_a".to_owned(),
+    );
+    let e_call_a = GraphRecord::edge(
+        EdgeLabel::Calls,
+        "symbol:referrer_a".to_owned(),
+        "symbol:a".to_owned(),
+        None,
+        "referrer_a calls func_a".to_owned(),
+    );
+
+    // Cross-repo reference: sym_b referencing sym_a (should not count for repo A's internal inbound degree if we scope to repo A)
+    let e_cross_call = GraphRecord::edge(
+        EdgeLabel::Calls,
+        "symbol:b".to_owned(),
+        "symbol:a".to_owned(),
+        None,
+        "cross repo call".to_owned(),
+    );
+
+    // Tombstoned elements:
+    let dead_file = GraphRecord::node(
+        "file:dead".to_owned(),
+        NodeKind::File,
+        Some("src/main.rs".to_owned()),
+        None,
+        Some("src/main.rs".to_owned()),
+        "deleted main".to_owned(),
+    );
+    let tombstone = GraphRecord::Tombstone {
+        id: "tombstone:file:dead".to_owned(),
+        schema_version: 0,
+        deleted_id: "file:dead".to_owned(),
+        summary: "deleted file:dead".to_owned(),
+        producer: None,
+    };
+
+    let records = vec![
+        node_repo_a,
+        file_a,
+        sym_a,
+        sym_referrer_a,
+        node_repo_b,
+        file_b,
+        sym_b,
+        e_contains_a,
+        e_defines_a,
+        e_contains_b,
+        e_defines_b,
+        e_defines_ref_a,
+        e_call_a,
+        e_cross_call,
+        dead_file,
+        tombstone,
+    ];
+
+    // Query for Repo A:
+    let map_a = orientation_map(&records, Some(repo_a), 10).expect("should query repo A");
+    // 1. Path normalization check: backslash replaced with forward slash
+    assert_eq!(map_a.module_tree[0].name, "src");
+    assert_eq!(map_a.module_tree[0].children[0].name, "lib.rs");
+    assert_eq!(map_a.module_tree[0].children[0].path, "src/lib.rs"); // normalized!
+
+    // 2. Tombstone check: dead_file is not in entry points
+    assert!(
+        !map_a
+            .entry_points
+            .iter()
+            .any(|ep| ep.record_id == "file:dead")
+    );
+
+    // 3. Inbound degree and repository scoping check:
+    // symbol:a has inbound edges:
+    // - Defines from file:a (repo A)
+    // - Calls from symbol:referrer_a (repo A)
+    // - Calls from symbol:b (repo B)
+    // When scoped to repo A, Calls from symbol:b is excluded because symbol:b is owned by repo B.
+    // So inbound degree of symbol:a should be 2 (Defines from file_a + Calls from referrer_a).
+    // If edge ownership check was broken/on edge ID, it would be 0.
+    let sym_a_info = map_a
+        .top_referenced_symbols
+        .iter()
+        .find(|s| s.record_id == "symbol:a")
+        .unwrap();
+    assert_eq!(sym_a_info.inbound_degree, 2);
+
+    // Query for Repo B:
+    let map_b = orientation_map(&records, Some(repo_b), 10).expect("should query repo B");
+    // Verify non-rust Go main.go entry point is correctly classified
+    assert_eq!(map_b.entry_points.len(), 1);
+    assert_eq!(map_b.entry_points[0].repo_relative_path, "main.go");
 }
