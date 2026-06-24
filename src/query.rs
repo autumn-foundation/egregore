@@ -5506,21 +5506,6 @@ pub(crate) type TombstonedSet<'a> = BTreeSet<&'a str>;
 pub(crate) fn verification_support_indexes(
     records: &[GraphRecord],
 ) -> (OutgoingEdgeIndex<'_>, TombstonedSet<'_>) {
-    let mut edges_from: BTreeMap<&str, Vec<(&EdgeLabel, &str)>> = BTreeMap::new();
-    for r in records {
-        if let GraphRecord::Edge {
-            label,
-            source,
-            target,
-            ..
-        } = r
-        {
-            edges_from
-                .entry(source.as_str())
-                .or_default()
-                .push((label, target.as_str()));
-        }
-    }
     let tombstoned: BTreeSet<&str> = records
         .iter()
         .filter_map(|r| match r {
@@ -5528,6 +5513,25 @@ pub(crate) fn verification_support_indexes(
             _ => None,
         })
         .collect();
+
+    let mut edges_from: BTreeMap<&str, Vec<(&EdgeLabel, &str)>> = BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Edge {
+            id,
+            label,
+            source,
+            target,
+            ..
+        } = r
+        {
+            if !tombstoned.contains(id.as_str()) {
+                edges_from
+                    .entry(source.as_str())
+                    .or_default()
+                    .push((label, target.as_str()));
+            }
+        }
+    }
     (edges_from, tombstoned)
 }
 

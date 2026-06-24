@@ -56,6 +56,8 @@ pub mod local_project;
 /// MCP server exposing read-only evidence-query tools (issue #53).
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod mcp;
+/// Agent-memory health report to flag reviewability risk (issue #94).
+pub mod memory_health;
 /// Agent-memory recall evaluation harness (issue #91).
 pub mod memory_recall_eval;
 /// Parser orchestration.
