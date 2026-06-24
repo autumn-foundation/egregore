@@ -179,7 +179,7 @@ pub enum CitationStatus {
 
 /// Documented reason a code row legitimately carries no span (AC4 "or
 /// documented absent-span reason").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AbsentHandleRule {
     /// A module/repository/commit/change/import node is span-less by design.
