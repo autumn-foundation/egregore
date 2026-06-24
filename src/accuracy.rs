@@ -171,6 +171,24 @@ const fn span_matches(actual: &SourceSpan, expected: &SpanSpec, tolerance: usize
     start_diff <= tolerance && end_diff <= tolerance
 }
 
+fn path_equals_normalized(a: &str, b: &str) -> bool {
+    let mut a_chars = a.chars();
+    let mut b_chars = b.chars();
+    loop {
+        match (a_chars.next(), b_chars.next()) {
+            (Some(ac), Some(bc)) => {
+                let ac_norm = if ac == '\\' { '/' } else { ac };
+                let bc_norm = if bc == '\\' { '/' } else { bc };
+                if ac_norm != bc_norm {
+                    return false;
+                }
+            }
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
 fn accuracy_exit(code: &str, path: &str, message: &str) -> ! {
     eprintln!(
         "{}",
@@ -246,13 +264,14 @@ pub(crate) fn eval_accuracy_cmd(
     }
 
     // 4. Greedy 1-to-1 matching of expected nodes to actual nodes
-    let mut matched_expected = HashSet::new(); // indices in labels.nodes
-    let mut matched_actual = HashSet::new(); // IDs of actual nodes
-    let mut actual_id_to_expected_idx = HashMap::new(); // actual node id -> index in labels.nodes
+    let n_expected = labels.nodes.len();
+    let mut matched_expected = HashSet::with_capacity(n_expected); // indices in labels.nodes
+    let mut matched_actual = HashSet::with_capacity(n_expected); // IDs of actual nodes
+    let mut actual_id_to_expected_idx = HashMap::with_capacity(n_expected); // actual node id -> index in labels.nodes
 
     for (expected_idx, exp) in labels.nodes.iter().enumerate() {
         for &(act_id, act_kind, act_path, act_span, act_name, act_symbol_kind) in &actual_nodes {
-            if matched_actual.contains(act_id) {
+            if matched_actual.contains(act_id.as_str()) {
                 continue;
             }
 
@@ -262,12 +281,8 @@ pub(crate) fn eval_accuracy_cmd(
             }
 
             // B. Repo-relative path must match (normalize slashes)
-            let path_matches = match (act_path, &exp.repo_relative_path) {
-                (Some(ap), Some(ep)) => {
-                    let ap_norm = ap.replace('\\', "/");
-                    let ep_norm = ep.replace('\\', "/");
-                    ap_norm == ep_norm
-                }
+            let path_matches = match (act_path.as_deref(), exp.repo_relative_path.as_deref()) {
+                (Some(ap), Some(ep)) => path_equals_normalized(ap, ep),
                 (None, None) => true,
                 _ => false,
             };
@@ -276,47 +291,34 @@ pub(crate) fn eval_accuracy_cmd(
             }
 
             // C. Name must match
-            let name_matches = match (act_name, &exp.name) {
-                (Some(an), Some(en)) => an == en,
-                (None, None) => true,
-                _ => false,
-            };
-            if !name_matches {
+            if act_name.as_deref() != exp.name.as_deref() {
                 continue;
             }
 
             // D. Symbol kind must match if expected has it
-            if let Some(exp_sk) = &exp.symbol_kind {
-                match act_symbol_kind {
-                    Some(ask) => {
-                        if ask != exp_sk {
-                            continue;
-                        }
-                    }
-                    None => {
-                        continue;
-                    }
-                }
+            if exp
+                .symbol_kind
+                .as_ref()
+                .is_some_and(|exp_sk| act_symbol_kind.as_deref() != Some(exp_sk.as_str()))
+            {
+                continue;
             }
 
             // E. Span must match if expected has it
             if let Some(exp_span) = &exp.span {
-                match act_span {
-                    Some(aspan) => {
-                        if !span_matches(aspan, exp_span, span_line_tolerance) {
-                            continue;
-                        }
-                    }
-                    None => {
+                if let Some(aspan) = act_span {
+                    if !span_matches(aspan, exp_span, span_line_tolerance) {
                         continue;
                     }
+                } else {
+                    continue;
                 }
             }
 
             // Match found!
             matched_expected.insert(expected_idx);
-            matched_actual.insert(act_id.clone());
-            actual_id_to_expected_idx.insert(act_id.clone(), expected_idx);
+            matched_actual.insert(act_id.as_str());
+            actual_id_to_expected_idx.insert(act_id.as_str(), expected_idx);
             break;
         }
     }
@@ -324,10 +326,10 @@ pub(crate) fn eval_accuracy_cmd(
     // 5. Node evaluation metrics
     let mut all_node_kinds = BTreeSet::new();
     for exp in &labels.nodes {
-        all_node_kinds.insert(exp.kind.clone());
+        all_node_kinds.insert(exp.kind.as_str());
     }
     for &(_, act_kind, _, _, _, _) in &actual_nodes {
-        all_node_kinds.insert(act_kind.as_str().to_string());
+        all_node_kinds.insert(act_kind.as_str());
     }
 
     let mut node_metrics = BTreeMap::new();
@@ -363,7 +365,7 @@ pub(crate) fn eval_accuracy_cmd(
 
         // Check actual
         for &(act_id, act_kind, act_path, act_span, act_name, act_symbol_kind) in &actual_nodes {
-            if act_kind.as_str() == kind && !matched_actual.contains(act_id) {
+            if act_kind.as_str() == kind && !matched_actual.contains(act_id.as_str()) {
                 false_positives_list.push(NodeInfo {
                     id: Some(act_id.clone()),
                     kind: act_kind.as_str().to_string(),
@@ -395,7 +397,7 @@ pub(crate) fn eval_accuracy_cmd(
         };
 
         node_metrics.insert(
-            kind.clone(),
+            kind.to_string(),
             MetricReport {
                 true_positives: tp,
                 false_positives: fp,
@@ -413,16 +415,25 @@ pub(crate) fn eval_accuracy_cmd(
             .iter()
             .map(|item| serde_json::to_value(item).unwrap())
             .collect();
-        node_failures.insert(kind, (false_positives_json, false_negatives_json));
+        node_failures.insert(
+            kind.to_string(),
+            (false_positives_json, false_negatives_json),
+        );
     }
 
+    // Pre-build ID-to-name lookup index
+    let actual_node_names: HashMap<&str, &Option<String>> = actual_nodes
+        .iter()
+        .map(|&(id, _, _, _, name, _)| (id.as_str(), name))
+        .collect();
+
     // 6. Match expected edges
-    let mut matched_expected_edges = HashSet::new(); // indices in labels.edges
-    let mut matched_actual_edges = HashSet::new(); // IDs of actual edges
+    let mut matched_expected_edges = HashSet::with_capacity(labels.edges.len()); // indices in labels.edges
+    let mut matched_actual_edges = HashSet::with_capacity(actual_edges.len()); // IDs of actual edges
 
     for &(act_id, act_label, act_source, act_target) in &actual_edges {
-        let source_idx = actual_id_to_expected_idx.get(act_source);
-        let target_idx = actual_id_to_expected_idx.get(act_target);
+        let source_idx = actual_id_to_expected_idx.get(act_source.as_str());
+        let target_idx = actual_id_to_expected_idx.get(act_target.as_str());
 
         if let (Some(&s_idx), Some(&t_idx)) = (source_idx, target_idx) {
             let exp_source_id = &labels.nodes[s_idx].id;
@@ -438,7 +449,7 @@ pub(crate) fn eval_accuracy_cmd(
                     && exp_edge.target == *exp_target_id
                 {
                     matched_expected_edges.insert(exp_edge_idx);
-                    matched_actual_edges.insert(act_id.clone());
+                    matched_actual_edges.insert(act_id.as_str());
                     found_match = true;
                     break;
                 }
@@ -452,10 +463,10 @@ pub(crate) fn eval_accuracy_cmd(
     // 7. Edge evaluation metrics
     let mut all_edge_labels = BTreeSet::new();
     for exp in &labels.edges {
-        all_edge_labels.insert(exp.label.clone());
+        all_edge_labels.insert(exp.label.as_str());
     }
     for &(_, act_label, _, _) in &actual_edges {
-        all_edge_labels.insert(act_label.as_str().to_string());
+        all_edge_labels.insert(act_label.as_str());
     }
 
     let mut edge_metrics = BTreeMap::new();
@@ -484,18 +495,16 @@ pub(crate) fn eval_accuracy_cmd(
 
         // Actual edges
         for &(act_id, act_label, act_source, act_target) in &actual_edges {
-            if act_label.as_str() == label && !matched_actual_edges.contains(act_id) {
-                let source_display = actual_nodes
-                    .iter()
-                    .find(|t| t.0 == act_source)
-                    .and_then(|t| t.4.as_ref())
+            if act_label.as_str() == label && !matched_actual_edges.contains(act_id.as_str()) {
+                let source_display = actual_node_names
+                    .get(act_source.as_str())
+                    .and_then(|name| name.as_ref())
                     .cloned()
                     .unwrap_or_else(|| act_source.clone());
 
-                let target_display = actual_nodes
-                    .iter()
-                    .find(|t| t.0 == act_target)
-                    .and_then(|t| t.4.as_ref())
+                let target_display = actual_node_names
+                    .get(act_target.as_str())
+                    .and_then(|name| name.as_ref())
                     .cloned()
                     .unwrap_or_else(|| act_target.clone());
 
@@ -528,7 +537,7 @@ pub(crate) fn eval_accuracy_cmd(
         };
 
         edge_metrics.insert(
-            label.clone(),
+            label.to_string(),
             MetricReport {
                 true_positives: tp,
                 false_positives: fp,
@@ -546,7 +555,10 @@ pub(crate) fn eval_accuracy_cmd(
             .iter()
             .map(|item| serde_json::to_value(item).unwrap())
             .collect();
-        edge_failures.insert(label, (false_positives_json, false_negatives_json));
+        edge_failures.insert(
+            label.to_string(),
+            (false_positives_json, false_negatives_json),
+        );
     }
 
     // 8. Apply precision/recall thresholds and generate diagnostics
