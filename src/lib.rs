@@ -4,6 +4,8 @@
 //! IR. Agent memory, project state, artifacts, and richer domain graphs are
 //! layered on top of the same `AletheiaDB` substrate.
 
+/// Extraction accuracy measurement against a ground-truth labeled corpus (issue #93).
+pub mod accuracy;
 /// Graph ingestion adapters.
 pub mod adapters;
 /// Antigravity transcript JSONL importer.

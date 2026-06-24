@@ -31,6 +31,11 @@ pub struct TemporalResolver<'a> {
     records_by_id: HashMap<&'a str, &'a GraphRecord>,
 }
 
+struct DfsFrame<'b, 'a> {
+    node: &'a str,
+    successors: Option<std::collections::hash_set::Iter<'b, &'a str>>,
+}
+
 impl<'a> TemporalResolver<'a> {
     /// Build the resolver from a slice of graph records.
     #[must_use]
@@ -51,11 +56,11 @@ impl<'a> TemporalResolver<'a> {
             match r {
                 GraphRecord::Node {
                     id,
-                    superseded_by: Some(sub_by),
+                    superseded_by: sub_by_opt,
                     evidence_links,
                     ..
                 } => {
-                    if !sub_by.is_empty() {
+                    if let Some(sub_by) = sub_by_opt.as_ref().filter(|s| !s.is_empty()) {
                         superseded_by
                             .entry(id.as_str())
                             .or_default()
@@ -84,32 +89,6 @@ impl<'a> TemporalResolver<'a> {
                         }
                     }
                 }
-                GraphRecord::Node {
-                    id,
-                    evidence_links: Some(links),
-                    ..
-                } => {
-                    for link in links {
-                        if let Some(target_id) = &link.target_record_id {
-                            if link.relation == "SUPERSEDES" {
-                                // id SUPERSEDES target_id => target_id is superseded by id
-                                superseded_by
-                                    .entry(target_id.as_str())
-                                    .or_default()
-                                    .insert(id.as_str());
-                            } else if link.relation == "CONTRADICTS" {
-                                contradicts
-                                    .entry(id.as_str())
-                                    .or_default()
-                                    .insert(target_id.as_str());
-                                contradicts
-                                    .entry(target_id.as_str())
-                                    .or_default()
-                                    .insert(id.as_str());
-                            }
-                        }
-                    }
-                }
                 GraphRecord::Edge {
                     label,
                     source,
@@ -133,7 +112,7 @@ impl<'a> TemporalResolver<'a> {
                             .insert(source.as_str());
                     }
                 }
-                _ => {}
+                GraphRecord::Tombstone { .. } => {}
             }
         }
 
@@ -181,33 +160,60 @@ impl<'a> TemporalResolver<'a> {
         }
 
         let mut heads = HashSet::new();
-        // DFS stack stores (current_node, path_from_start)
-        let mut stack = vec![(start_id, vec![start_id])];
+        let mut path = Vec::new();
+        let mut path_set = HashSet::new();
 
-        while let Some((curr, path)) = stack.pop() {
-            if let Some(next_set) = self.superseded_by.get(curr) {
-                let mut is_leaf = true;
-                for next in next_set {
-                    if path.contains(next) {
-                        // Cycle detected!
-                        let mut cycle = HashSet::new();
-                        let pos = path.iter().position(|x| x == next).unwrap_or(0);
-                        for item in &path[pos..] {
-                            cycle.insert(*item);
-                        }
-                        cycle.insert(*next);
-                        return Err(cycle);
+        path.push(start_id);
+        path_set.insert(start_id);
+
+        let mut stack = vec![DfsFrame {
+            node: start_id,
+            successors: self
+                .superseded_by
+                .get(start_id)
+                .map(std::collections::HashSet::iter),
+        }];
+
+        while let Some(frame) = stack.last_mut() {
+            let next_opt = frame
+                .successors
+                .as_mut()
+                .and_then(std::iter::Iterator::next);
+            if let Some(&next) = next_opt {
+                if path_set.contains(next) {
+                    let mut cycle = HashSet::new();
+                    let pos = path.iter().position(|x| *x == next).unwrap_or(0);
+                    for item in &path[pos..] {
+                        cycle.insert(*item);
                     }
-                    is_leaf = false;
-                    let mut next_path = path.clone();
-                    next_path.push(*next);
-                    stack.push((*next, next_path));
+                    cycle.insert(next);
+                    return Err(cycle);
                 }
-                if is_leaf {
-                    heads.insert(curr);
-                }
+
+                path.push(next);
+                path_set.insert(next);
+
+                let next_successors = self
+                    .superseded_by
+                    .get(next)
+                    .map(std::collections::HashSet::iter);
+                stack.push(DfsFrame {
+                    node: next,
+                    successors: next_successors,
+                });
             } else {
-                heads.insert(curr);
+                let is_leaf = self
+                    .superseded_by
+                    .get(frame.node)
+                    .is_none_or(std::collections::HashSet::is_empty);
+                if is_leaf {
+                    heads.insert(frame.node);
+                }
+
+                if let Some(popped) = stack.pop() {
+                    path.pop();
+                    path_set.remove(popped.node);
+                }
             }
         }
 

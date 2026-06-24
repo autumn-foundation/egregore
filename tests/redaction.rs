@@ -935,3 +935,14 @@ fn detect_database_url_at_in_prose_not_flagged() {
         "@ in prose outside the URL authority must not be flagged as database credential"
     );
 }
+
+// Fix: env key parsing with leading multi-byte Unicode characters must not panic and must succeed.
+#[test]
+fn redact_value_env_key_with_unicode_prefix_does_not_panic() {
+    let value = "🌳API_KEY=abcdefghijklmnop";
+    let result = redact_value(value);
+    assert!(
+        result.contains("<REDACTED:"),
+        "must redact API_KEY even when preceded by multi-byte Unicode; got: {result}"
+    );
+}
