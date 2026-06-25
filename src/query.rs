@@ -10679,3 +10679,307 @@ pub fn orientation_map(
         top_referenced_symbols: ranked_symbols,
     })
 }
+
+/// A temporal event in a symbol's lifecycle.
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+pub struct LifelineEvent {
+    /// The event kind: "introduced", "modified", "removed", or "reintroduced".
+    pub event_type: String,
+    /// The stable record ID associated with this event (symbol node ID, or tombstone ID).
+    pub record_id: String,
+    /// The Git commit SHA.
+    pub commit: String,
+    /// The repository-relative path (absent for removal events).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_relative_path: Option<String>,
+    /// The syntax source span (absent for removal events).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<SourceSpan>,
+    /// The documented reason the span is absent (e.g. "tombstone" for removal events).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub absent_span_reason: Option<String>,
+    /// The SemanticDrift record ID if this is a modifying event with drift.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drift_record_id: Option<String>,
+    /// The semantic drift score if this is a modifying event with drift.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drift_score: Option<f64>,
+}
+
+/// Errors returned by the symbol lifeline query.
+#[derive(thiserror::Error, Debug, Clone, Eq, PartialEq)]
+pub enum LifelineError {
+    /// The query symbol handle/name was not found in the graph.
+    #[error("symbol not found in the graph: {query}")]
+    UnknownSymbol {
+        /// The query string.
+        query: String,
+    },
+    /// The query name matched multiple symbols.
+    #[error("ambiguous symbol name '{query}' matches multiple symbols")]
+    AmbiguousSymbol {
+        /// The query string.
+        query: String,
+        /// The unique record IDs matching the query.
+        candidates: Vec<String>,
+    },
+}
+
+/// Traces a single symbol's lifecycle across Git history.
+///
+/// # Errors
+///
+/// Returns `LifelineError::UnknownSymbol` if the query matches 0 symbols,
+/// or `LifelineError::AmbiguousSymbol` if it matches multiple symbols.
+pub fn symbol_lifeline(
+    records: &[GraphRecord],
+    query: &str,
+    repo_id: Option<&str>,
+) -> Result<Vec<LifelineEvent>, LifelineError> {
+    let tombstoned_ids: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Tombstone { deleted_id, .. } = r {
+                Some(deleted_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let index = RepositoryIndex::build(records);
+
+    let is_owned =
+        |id: &str| -> bool { repo_id.is_none_or(|r_id| index.owner_of(id) == Some(r_id)) };
+
+    // Gather all matching Symbol nodes
+    let mut matching_symbol_ids = BTreeSet::new();
+    for r in records {
+        if let GraphRecord::Node {
+            id,
+            kind: NodeKind::Symbol,
+            name,
+            ..
+        } = r
+        {
+            if tombstoned_ids.contains(id.as_str()) {
+                continue;
+            }
+            if !is_owned(id.as_str()) {
+                continue;
+            }
+            if id == query || name.as_deref() == Some(query) {
+                matching_symbol_ids.insert(id.clone());
+            }
+        }
+    }
+
+    if matching_symbol_ids.is_empty() {
+        return Err(LifelineError::UnknownSymbol {
+            query: query.to_owned(),
+        });
+    }
+    if matching_symbol_ids.len() > 1 {
+        let mut candidates: Vec<String> = matching_symbol_ids.into_iter().collect();
+        candidates.sort();
+        return Err(LifelineError::AmbiguousSymbol {
+            query: query.to_owned(),
+            candidates,
+        });
+    }
+
+    let target_symbol_id =
+        matching_symbol_ids
+            .into_iter()
+            .next()
+            .ok_or_else(|| LifelineError::UnknownSymbol {
+                query: query.to_owned(),
+            })?;
+
+    // Find the repository of the target symbol
+    let target_repo_id = index.owner_of(&target_symbol_id);
+
+    // Build the CommitOrder for repository commits
+    let commit_order = CommitOrder::build(records);
+
+    // Filter commits belonging to target_repo_id (if found)
+    let mut repo_commits = Vec::new();
+    let mut parent_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Commit,
+            name: Some(sha),
+            temporal: Some(t),
+            ..
+        } = r
+        {
+            let in_repo = target_repo_id.is_none_or(|r_id| index.owner_of(r.id()) == Some(r_id));
+            if in_repo {
+                repo_commits.push((sha.clone(), r));
+                parent_map.insert(sha.clone(), t.git_parent_commits.clone());
+            }
+        }
+    }
+
+    // Sort repository commits by topological rank
+    repo_commits.sort_by(|a, b| {
+        let rank_a = commit_order.rank(&a.0);
+        let rank_b = commit_order.rank(&b.0);
+        rank_a.cmp(&rank_b).then_with(|| a.0.cmp(&b.0))
+    });
+
+    // Gather symbol snapshots
+    let mut symbol_snapshots: BTreeMap<String, &GraphRecord> = BTreeMap::new();
+    let mut symbol_snapshot_bodies: BTreeMap<String, String> = BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Node {
+            id,
+            kind: NodeKind::Symbol,
+            temporal: Some(t),
+            summary,
+            ..
+        } = r
+        {
+            if id == &target_symbol_id {
+                symbol_snapshots.insert(t.git_commit.clone(), r);
+                symbol_snapshot_bodies.insert(t.git_commit.clone(), summary.clone());
+            }
+        }
+    }
+
+    // Map drift records
+    let mut drift_map: BTreeMap<String, &GraphRecord> = BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::SemanticDrift,
+            semantic_drift: Some(drift),
+            ..
+        } = r
+        {
+            if drift.target_record_id == target_symbol_id {
+                drift_map.insert(drift.after_git_commit.clone(), r);
+            }
+        }
+    }
+
+    // Helper: did the symbol body change in a commit?
+    let symbol_body_changed = |commit: &str, summary: &str| -> bool {
+        let Some(parents) = parent_map.get(commit) else {
+            return true;
+        };
+        if parents.is_empty() {
+            return true;
+        }
+        let mut saw_parent_snapshot = false;
+        for parent in parents {
+            if let Some(parent_body) = symbol_snapshot_bodies.get(parent) {
+                saw_parent_snapshot = true;
+                if parent_body != summary {
+                    return true;
+                }
+            }
+        }
+        !saw_parent_snapshot
+    };
+
+    let mut events = Vec::new();
+    let mut is_live = false;
+    let mut has_ever_been_introduced = false;
+
+    for (commit_sha, _) in &repo_commits {
+        let snapshot = symbol_snapshots.get(commit_sha);
+        if let Some(node) = snapshot {
+            let GraphRecord::Node {
+                repo_relative_path,
+                span,
+                summary,
+                ..
+            } = node
+            else {
+                continue;
+            };
+
+            if is_live {
+                // If it is already live, check if modified
+                let changed = symbol_body_changed(commit_sha, summary);
+                let drift_node = drift_map.get(commit_sha);
+                if changed || drift_node.is_some() {
+                    let drift_record_id = drift_node.map(|r| r.id().to_owned());
+                    let drift_score = drift_node.and_then(|r| {
+                        if let GraphRecord::Node {
+                            semantic_drift: Some(d),
+                            ..
+                        } = r
+                        {
+                            Some(d.score)
+                        } else {
+                            None
+                        }
+                    });
+                    events.push(LifelineEvent {
+                        event_type: "modified".to_owned(),
+                        record_id: target_symbol_id.clone(),
+                        commit: commit_sha.clone(),
+                        repo_relative_path: repo_relative_path.clone(),
+                        span: *span,
+                        absent_span_reason: None,
+                        drift_record_id,
+                        drift_score,
+                    });
+                }
+            } else {
+                let event_type = if has_ever_been_introduced {
+                    "reintroduced".to_owned()
+                } else {
+                    has_ever_been_introduced = true;
+                    "introduced".to_owned()
+                };
+                events.push(LifelineEvent {
+                    event_type,
+                    record_id: target_symbol_id.clone(),
+                    commit: commit_sha.clone(),
+                    repo_relative_path: repo_relative_path.clone(),
+                    span: *span,
+                    absent_span_reason: None,
+                    drift_record_id: None,
+                    drift_score: None,
+                });
+                is_live = true;
+            }
+        } else {
+            // Symbol is absent at this commit
+            if is_live {
+                // If it was live but is now absent, it's a removal event!
+                let tombstone_record_id = records
+                    .iter()
+                    .find_map(|r| {
+                        if let GraphRecord::Tombstone { id, deleted_id, .. } = r {
+                            if deleted_id == &target_symbol_id {
+                                return Some(id.clone());
+                            }
+                        }
+                        None
+                    })
+                    .unwrap_or_else(|| {
+                        // Generate a deterministic stable tombstone ID if not present in records
+                        // Matches aletheiadb's stable_id generation rules
+                        crate::ir::stable_id(&["tombstone", &target_symbol_id])
+                    });
+
+                events.push(LifelineEvent {
+                    event_type: "removed".to_owned(),
+                    record_id: tombstone_record_id,
+                    commit: commit_sha.clone(),
+                    repo_relative_path: None,
+                    span: None,
+                    absent_span_reason: Some("tombstone".to_owned()),
+                    drift_record_id: None,
+                    drift_score: None,
+                });
+                is_live = false;
+            }
+        }
+    }
+
+    Ok(events)
+}

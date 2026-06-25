@@ -114,7 +114,13 @@ pub fn run_memory_health_audit(
     let mut edges_from: BTreeMap<&str, Vec<(&EdgeLabel, &str)>> = BTreeMap::new();
     for r in records {
         match r {
-            GraphRecord::Edge { id, label, source, target, .. } if !tombstoned.contains(id.as_str()) => {
+            GraphRecord::Edge {
+                id,
+                label,
+                source,
+                target,
+                ..
+            } if !tombstoned.contains(id.as_str()) => {
                 edges_from
                     .entry(source.as_str())
                     .or_default()
