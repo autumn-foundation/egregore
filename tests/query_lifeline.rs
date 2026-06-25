@@ -370,7 +370,11 @@ fn fixture_graph() -> (tempfile::TempDir, PathBuf) {
         None,
         "Test observation to be ignored".to_owned(),
     );
-    if let GraphRecord::Node { ref mut schema_version, .. } = obs_node {
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ..
+    } = obs_node
+    {
         *schema_version = 1;
     }
     let mut task_node = GraphRecord::node(
@@ -381,7 +385,11 @@ fn fixture_graph() -> (tempfile::TempDir, PathBuf) {
         None,
         "Test task to be ignored".to_owned(),
     );
-    if let GraphRecord::Node { ref mut schema_version, .. } = task_node {
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ..
+    } = task_node
+    {
         *schema_version = 1;
     }
 

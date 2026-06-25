@@ -10830,28 +10830,48 @@ pub fn symbol_lifeline(
     // Build the CommitOrder for repository commits
     let commit_order = CommitOrder::build(records);
 
-    // Filter commits belonging to target_repo_id (if found)
+    // Filter commits, symbol snapshots, and drift records in a single consolidated loop
     let mut repo_commits = Vec::new();
-    let mut parent_map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut parent_map: BTreeMap<&str, &[String]> = BTreeMap::new();
+    let mut symbol_snapshots: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
+    let mut symbol_snapshot_bodies: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut drift_map: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
+
     for r in records {
-        if let GraphRecord::Node {
-            kind: NodeKind::Commit,
-            name: Some(sha),
-            temporal: Some(t),
-            ..
-        } = r
-        {
-            let in_repo = target_repo_id.map_or_else(
-                || index.owner_of(r.id()).is_none(),
-                |r_id| index.owner_of(r.id()) == Some(r_id),
-            );
-            if in_repo {
-                repo_commits.push((sha.as_str(), r));
-                parent_map.insert(
-                    sha.as_str(),
-                    t.git_parent_commits.iter().map(String::as_str).collect(),
+        match r {
+            GraphRecord::Node {
+                kind: NodeKind::Commit,
+                name: Some(sha),
+                temporal: Some(t),
+                ..
+            } => {
+                let in_repo = target_repo_id.map_or_else(
+                    || index.owner_of(r.id()).is_none(),
+                    |r_id| index.owner_of(r.id()) == Some(r_id),
                 );
+                if in_repo {
+                    repo_commits.push((sha.as_str(), r));
+                    parent_map.insert(sha.as_str(), &t.git_parent_commits);
+                }
             }
+            GraphRecord::Node {
+                kind: NodeKind::Symbol,
+                id,
+                temporal: Some(t),
+                summary,
+                ..
+            } if id == target_symbol_id => {
+                symbol_snapshots.insert(t.git_commit.as_str(), r);
+                symbol_snapshot_bodies.insert(t.git_commit.as_str(), summary.as_str());
+            }
+            GraphRecord::Node {
+                kind: NodeKind::SemanticDrift,
+                semantic_drift: Some(drift),
+                ..
+            } if drift.target_record_id == target_symbol_id => {
+                drift_map.insert(drift.after_git_commit.as_str(), r);
+            }
+            _ => {}
         }
     }
 
@@ -10862,40 +10882,6 @@ pub fn symbol_lifeline(
         rank_a.cmp(&rank_b).then_with(|| a.0.cmp(b.0))
     });
 
-    // Map commits to the symbol snapshot node at that commit (borrowed references)
-    let mut symbol_snapshots: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
-    let mut symbol_snapshot_bodies: BTreeMap<&str, &str> = BTreeMap::new();
-    for r in records {
-        if let GraphRecord::Node {
-            kind: NodeKind::Symbol,
-            id,
-            temporal: Some(t),
-            summary,
-            ..
-        } = r
-        {
-            if id == target_symbol_id {
-                symbol_snapshots.insert(t.git_commit.as_str(), r);
-                symbol_snapshot_bodies.insert(t.git_commit.as_str(), summary.as_str());
-            }
-        }
-    }
-
-    // Map drift records (borrowed references)
-    let mut drift_map: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
-    for r in records {
-        if let GraphRecord::Node {
-            kind: NodeKind::SemanticDrift,
-            semantic_drift: Some(drift),
-            ..
-        } = r
-        {
-            if drift.target_record_id == target_symbol_id {
-                drift_map.insert(drift.after_git_commit.as_str(), r);
-            }
-        }
-    }
-
     // Helper: did the symbol body change in a commit?
     let symbol_body_changed = |commit: &str, summary: &str| -> bool {
         let Some(parents) = parent_map.get(commit) else {
@@ -10905,8 +10891,8 @@ pub fn symbol_lifeline(
             return true;
         }
         let mut saw_parent_snapshot = false;
-        for parent in parents {
-            if let Some(parent_body) = symbol_snapshot_bodies.get(parent) {
+        for parent in *parents {
+            if let Some(parent_body) = symbol_snapshot_bodies.get(parent.as_str()) {
                 saw_parent_snapshot = true;
                 if *parent_body != summary {
                     return true;
@@ -10936,7 +10922,7 @@ pub fn symbol_lifeline(
             let parents = parent_map.get(commit_sha);
             let was_live_at_any_parent = parents.is_some_and(|ps| {
                 ps.iter()
-                    .any(|p| commit_live.get(p).copied().unwrap_or(false))
+                    .any(|p| commit_live.get(p.as_str()).copied().unwrap_or(false))
             });
 
             if was_live_at_any_parent {
@@ -11012,7 +10998,7 @@ pub fn symbol_lifeline(
             let parents = parent_map.get(commit_sha);
             let was_live_at_any_parent = parents.is_some_and(|ps| {
                 ps.iter()
-                    .any(|p| commit_live.get(p).copied().unwrap_or(false))
+                    .any(|p| commit_live.get(p.as_str()).copied().unwrap_or(false))
             });
 
             if was_live_at_any_parent {

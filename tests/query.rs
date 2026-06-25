@@ -5600,7 +5600,11 @@ fn test_symbol_lifeline_happy_path() {
         None,
         "Test observation to be ignored".to_owned(),
     );
-    if let GraphRecord::Node { ref mut schema_version, .. } = obs_node {
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ..
+    } = obs_node
+    {
         *schema_version = 1;
     }
     let mut task_node = GraphRecord::node(
@@ -5611,7 +5615,11 @@ fn test_symbol_lifeline_happy_path() {
         None,
         "Test task to be ignored".to_owned(),
     );
-    if let GraphRecord::Node { ref mut schema_version, .. } = task_node {
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ..
+    } = task_node
+    {
         *schema_version = 1;
     }
 
