@@ -362,6 +362,29 @@ fn fixture_graph() -> (tempfile::TempDir, PathBuf) {
         String::new(),
     );
 
+    let mut obs_node = GraphRecord::node(
+        "obs:test_ignored".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Test observation to be ignored".to_owned(),
+    );
+    if let GraphRecord::Node { ref mut schema_version, .. } = obs_node {
+        *schema_version = 1;
+    }
+    let mut task_node = GraphRecord::node(
+        "task:test_ignored".to_owned(),
+        NodeKind::Task,
+        None,
+        None,
+        None,
+        "Test task to be ignored".to_owned(),
+    );
+    if let GraphRecord::Node { ref mut schema_version, .. } = task_node {
+        *schema_version = 1;
+    }
+
     let records = vec![
         repo_node,
         c1,
@@ -396,6 +419,8 @@ fn fixture_graph() -> (tempfile::TempDir, PathBuf) {
         e_repo_sib,
         sib_symbol_s1,
         e_sib_c1_s1,
+        obs_node,
+        task_node,
     ];
 
     let content = records

@@ -8266,7 +8266,14 @@ fn query_lifeline_cmd(
                             (Some(path), Some(span)) => {
                                 format!(" @ {path}:{}-{}", span.start_line, span.end_line)
                             }
-                            _ => ev
+                            (Some(path), None) => {
+                                let reason = ev
+                                    .absent_span_reason
+                                    .as_ref()
+                                    .map_or_else(String::new, |r| format!(" [{r}]"));
+                                format!(" @ {path}{reason}")
+                            }
+                            (None, _) => ev
                                 .absent_span_reason
                                 .as_ref()
                                 .map_or_else(String::new, |reason| format!(" [{reason}]")),
