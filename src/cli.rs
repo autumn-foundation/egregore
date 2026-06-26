@@ -3551,6 +3551,9 @@ struct WhoResult<'a> {
     /// Repository-relative path to the file containing the symbol.
     #[serde(skip_serializing_if = "Option::is_none")]
     repo_relative_path: Option<&'a str>,
+    /// Optional store-freshness code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness: Option<&'a str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4152,7 +4155,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             as_of,
             tx_as_of,
             repo,
-            repo_path: _,
+            repo_path,
             format,
         } => {
             if tx_as_of.is_some() {
@@ -4169,6 +4172,13 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             let selected = selected.as_deref();
+
+            let freshness_code = query_freshness_code_with_hint(
+                &records,
+                repo_path.as_deref(),
+                &[graph.as_deref(), data_dir.as_deref()],
+                selected,
+            );
 
             match query::who_last_changed(
                 &records,
@@ -4217,6 +4227,15 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                         None
                     };
 
+                    let repository_id = index.owner_of(symbol_node.id());
+                    let freshness = freshness_code.as_ref().and_then(|(repo_id, code)| {
+                        if repository_id == Some(repo_id.as_str()) {
+                            Some(*code)
+                        } else {
+                            None
+                        }
+                    });
+
                     let result = WhoResult {
                         symbol_name: &name,
                         commit_sha,
@@ -4224,6 +4243,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                         author_email,
                         valid_time,
                         repo_relative_path,
+                        freshness,
                     };
                     print_result(&result, format)?;
                     Ok(())
@@ -9723,9 +9743,12 @@ impl PrintText for WhoResult<'_> {
             (None, None) => "unknown".to_owned(),
         };
         let path = self.repo_relative_path.unwrap_or("(unknown)");
+        let freshness = self
+            .freshness
+            .map_or(String::new(), |code| format!(" (freshness: {code})"));
         format!(
-            "{} last changed by {} in commit {} @ {} ({})",
-            self.symbol_name, author, self.commit_sha, self.valid_time, path
+            "{} last changed by {} in commit {} @ {} ({}){}",
+            self.symbol_name, author, self.commit_sha, self.valid_time, path, freshness
         )
     }
 }

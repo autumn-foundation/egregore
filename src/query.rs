@@ -2729,7 +2729,7 @@ pub fn who_last_changed<'records>(
     repo: Option<&str>,
 ) -> Result<Option<(&'records GraphRecord, &'records GraphRecord)>, String> {
     // 1. Build indices in a single O(N) pre-pass to prevent multiple scans
-    let mut commit_nodes = HashMap::new();
+    let mut commit_nodes: HashMap<&str, Vec<&GraphRecord>> = HashMap::new();
     let mut commit_parents = HashMap::new();
     let mut tombstoned_ids = HashSet::new();
     let mut matching_commits = Vec::new();
@@ -2745,7 +2745,7 @@ pub fn who_last_changed<'records>(
                 ..
             } => {
                 let sha = t.git_commit.as_str();
-                commit_nodes.insert(sha, record);
+                commit_nodes.entry(sha).or_default().push(record);
                 commit_parents.insert(sha, t.git_parent_commits.as_slice());
                 if let Some(prefix) = at_commit {
                     if sha.starts_with(prefix) {
@@ -2764,12 +2764,18 @@ pub fn who_last_changed<'records>(
     let symbol_nodes = if let Some(commit) = at_commit {
         if let Some(repo_id) = repo {
             matching_commits.retain(|sha| {
-                commit_nodes.get(sha).is_some_and(|c_node| {
-                    let owner = index.owner_of(c_node.id());
-                    owner == Some(repo_id) || owner.is_none()
+                commit_nodes.get(sha).is_some_and(|c_nodes| {
+                    c_nodes.iter().any(|c_node| {
+                        let owner = index.owner_of(c_node.id());
+                        owner == Some(repo_id) || owner.is_none()
+                    })
                 })
             });
         }
+
+        // Deduplicate matching_commits to ensure unique SHAs
+        matching_commits.sort_unstable();
+        matching_commits.dedup();
 
         // Resolve prefix and enforce uniqueness
         if matching_commits.is_empty() {
@@ -2821,6 +2827,8 @@ pub fn who_last_changed<'records>(
         return Ok(None);
     };
 
+    let target_repo_id = index.owner_of(symbol_node.id());
+
     // 3. Define candidate commits, scoping them to the active lineage (prevent branch bleeding)
     let candidate_commit_shas = if at_commit.is_some() {
         let start_sha = matching_commits[0];
@@ -2849,14 +2857,26 @@ pub fn who_last_changed<'records>(
                 .map_err(|e| format!("invalid --as-of timestamp '{as_of}': {e}"))?;
             let mut filtered = HashSet::new();
             for sha in visited {
-                if let Some(GraphRecord::Node {
-                    temporal: Some(t), ..
-                }) = commit_nodes.get(sha)
-                {
-                    if let Ok(vt) = DateTime::parse_from_rfc3339(&t.valid_time) {
-                        if vt <= as_of_dt {
-                            filtered.insert(sha);
+                if let Some(c_nodes) = commit_nodes.get(sha) {
+                    let has_valid_node = c_nodes.iter().any(|c_node| {
+                        if let Some(repo_id) = target_repo_id {
+                            let owner = index.owner_of(c_node.id());
+                            if owner != Some(repo_id) && owner.is_some() {
+                                return false;
+                            }
                         }
+                        if let GraphRecord::Node {
+                            temporal: Some(t), ..
+                        } = c_node
+                        {
+                            if let Ok(vt) = DateTime::parse_from_rfc3339(&t.valid_time) {
+                                return vt <= as_of_dt;
+                            }
+                        }
+                        false
+                    });
+                    if has_valid_node {
+                        filtered.insert(sha);
                     }
                 }
             }
@@ -2867,7 +2887,6 @@ pub fn who_last_changed<'records>(
     } else {
         // Lineage traversal for HEAD/as-of queries starting from recorded HEAD commit
         let mut head_sha = None;
-        let target_repo_id = index.owner_of(symbol_node.id());
         if let Some(repo_id) = target_repo_id {
             for record in records {
                 if let GraphRecord::Node {
@@ -2911,14 +2930,26 @@ pub fn who_last_changed<'records>(
                     .map_err(|e| format!("invalid --as-of timestamp '{as_of}': {e}"))?;
                 let mut filtered = HashSet::new();
                 for sha in visited {
-                    if let Some(GraphRecord::Node {
-                        temporal: Some(t), ..
-                    }) = commit_nodes.get(sha)
-                    {
-                        if let Ok(vt) = DateTime::parse_from_rfc3339(&t.valid_time) {
-                            if vt <= as_of_dt {
-                                filtered.insert(sha);
+                    if let Some(c_nodes) = commit_nodes.get(sha) {
+                        let has_valid_node = c_nodes.iter().any(|c_node| {
+                            if let Some(repo_id) = target_repo_id {
+                                let owner = index.owner_of(c_node.id());
+                                if owner != Some(repo_id) && owner.is_some() {
+                                    return false;
+                                }
                             }
+                            if let GraphRecord::Node {
+                                temporal: Some(t), ..
+                            } = c_node
+                            {
+                                if let Ok(vt) = DateTime::parse_from_rfc3339(&t.valid_time) {
+                                    return vt <= as_of_dt;
+                                }
+                            }
+                            false
+                        });
+                        if has_valid_node {
+                            filtered.insert(sha);
                         }
                     }
                 }
@@ -2932,14 +2963,16 @@ pub fn who_last_changed<'records>(
             if let Some(as_of) = as_of_time {
                 let as_of_dt = DateTime::parse_from_rfc3339(as_of)
                     .map_err(|e| format!("invalid --as-of timestamp '{as_of}': {e}"))?;
-                for (sha, record) in &commit_nodes {
-                    if let GraphRecord::Node {
-                        temporal: Some(t), ..
-                    } = record
-                    {
-                        if let Ok(vt) = DateTime::parse_from_rfc3339(&t.valid_time) {
-                            if vt <= as_of_dt {
-                                candidates.insert(*sha);
+                for (sha, c_nodes) in &commit_nodes {
+                    for record in c_nodes {
+                        if let GraphRecord::Node {
+                            temporal: Some(t), ..
+                        } = record
+                        {
+                            if let Ok(vt) = DateTime::parse_from_rfc3339(&t.valid_time) {
+                                if vt <= as_of_dt {
+                                    candidates.insert(*sha);
+                                }
                             }
                         }
                     }
@@ -2949,9 +2982,11 @@ pub fn who_last_changed<'records>(
             }
             if let Some(repo_id) = target_repo_id {
                 candidates.retain(|sha| {
-                    commit_nodes.get(sha).is_some_and(|c_node| {
-                        let owner = index.owner_of(c_node.id());
-                        owner == Some(repo_id) || owner.is_none()
+                    commit_nodes.get(sha).is_some_and(|c_nodes| {
+                        c_nodes.iter().any(|c_node| {
+                            let owner = index.owner_of(c_node.id());
+                            owner == Some(repo_id) || owner.is_none()
+                        })
                     })
                 });
             }
@@ -2983,7 +3018,21 @@ pub fn who_last_changed<'records>(
         }
 
         // O(1) commit lookup
-        let Some(commit_node) = commit_nodes.get(sha).copied() else {
+        let commit_node = commit_nodes.get(sha).and_then(|c_nodes| {
+            target_repo_id.map_or_else(
+                || c_nodes.first().copied(),
+                |repo_id| {
+                    c_nodes
+                        .iter()
+                        .find(|c_node| {
+                            let owner = index.owner_of(c_node.id());
+                            owner == Some(repo_id) || owner.is_none()
+                        })
+                        .copied()
+                },
+            )
+        });
+        let Some(commit_node) = commit_node else {
             continue;
         };
 

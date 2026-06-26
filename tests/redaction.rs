@@ -963,8 +963,8 @@ fn redact_value_email_address() {
 #[test]
 fn detect_email_address_with_valid_extensions() {
     for email in &["alice@example.rs", "bob@example.md", "dev@project.sh"] {
-        let (class, _) = detect_secret(email)
-            .unwrap_or_else(|| panic!("email {email} must be detected"));
+        let (class, _) =
+            detect_secret(email).unwrap_or_else(|| panic!("email {email} must be detected"));
         assert_eq!(class, SecretClass::Email);
     }
 }
