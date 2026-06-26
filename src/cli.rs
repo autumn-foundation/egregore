@@ -2250,6 +2250,62 @@ fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<
 }
 
 fn scan_history(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<()> {
+    // AC5: Verify git is available in PATH.
+    let git_available = std::process::Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !git_available {
+        let diag = serde_json::json!({
+            "code": "git_unavailable",
+            "message": "git command not found in PATH"
+        });
+        eprintln!("{}", serde_json::to_string(&diag).unwrap_or_default());
+        std::process::exit(2);
+    }
+
+    // AC5: Verify the path is a git repository.
+    let is_git_repo = std::process::Command::new("git")
+        .args(["-c", "core.excludesFile="])
+        .arg("-C")
+        .arg(repo_path)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["rev-parse", "--git-dir"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !is_git_repo {
+        let diag = serde_json::json!({
+            "code": "not_a_git_repository",
+            "message": format!("path is not a git repository: {}", repo_path.display())
+        });
+        eprintln!("{}", serde_json::to_string(&diag).unwrap_or_default());
+        std::process::exit(2);
+    }
+
+    // AC5: Verify the git history is readable (has at least one commit).
+    let git_history_readable = std::process::Command::new("git")
+        .args(["-c", "core.excludesFile="])
+        .arg("-C")
+        .arg(repo_path)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["log", "-1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !git_history_readable {
+        let diag = serde_json::json!({
+            "code": "git_history_unreadable",
+            "message": "git history is not readable (e.g. repository has no commits)"
+        });
+        eprintln!("{}", serde_json::to_string(&diag).unwrap_or_default());
+        std::process::exit(2);
+    }
+
     // History replay reads only committed Git objects, so the stamped snapshot is
     // always `dirty=false` (committed HEAD state); a pre-existing in-tree output or
     // companion store cannot affect it, and no dirty-probe exclusions are needed
