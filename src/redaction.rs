@@ -50,6 +50,8 @@ pub enum SecretClass {
     SessionCookie,
     /// `.env`-style `KEY=VALUE` whose key matches the secret-name allowlist.
     EnvSecret,
+    /// Email addresses (PII).
+    Email,
 }
 
 impl SecretClass {
@@ -64,6 +66,7 @@ impl SecretClass {
             Self::WebhookSecret => "webhook_secret",
             Self::SessionCookie => "session_cookie",
             Self::EnvSecret => "env_secret",
+            Self::Email => "email",
         }
     }
 }
@@ -87,6 +90,7 @@ pub fn detect_secret(value: &str) -> Option<(SecretClass, usize)> {
         .or_else(|| find_webhook_secret(value).map(|p| (SecretClass::WebhookSecret, p)))
         .or_else(|| find_session_cookie(value).map(|p| (SecretClass::SessionCookie, p)))
         .or_else(|| find_api_token(value).map(|p| (SecretClass::ApiToken, p)))
+        .or_else(|| find_email(value).map(|p| (SecretClass::Email, p)))
         .or_else(|| find_env_secret(value).map(|p| (SecretClass::EnvSecret, p)))
 }
 
@@ -618,4 +622,51 @@ fn env_key_start(value: &str, eq_pos: usize) -> usize {
             let ch = value[p..].chars().next().unwrap_or(' ');
             p + ch.len_utf8()
         })
+}
+
+fn find_email(value: &str) -> Option<usize> {
+    const BLOCKED_EXTENSIONS: &[&str] = &[
+        "rs", "py", "js", "go", "ts", "cpp", "java", "rb", "json", "yaml", "yml", "toml", "md",
+        "txt", "html", "css", "sh", "bat", "lock", "class",
+    ];
+
+    for (idx, c) in value.char_indices() {
+        if c == '@' {
+            let before = &value[..idx];
+            let username_len = before
+                .chars()
+                .rev()
+                .take_while(|&ch| {
+                    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '%' | '+' | '-')
+                })
+                .count();
+            if username_len == 0 {
+                continue;
+            }
+
+            // Parse domain walking forward
+            let after = &value[idx + 1..];
+            let mut domain_len = 0;
+            for ch in after.chars() {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '.' {
+                    domain_len += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let domain_str = &after[..domain_len];
+            let labels: Vec<&str> = domain_str.split('.').collect();
+
+            if labels.len() >= 2 && labels.iter().all(|l| !l.is_empty()) {
+                let last_label = labels.last().unwrap();
+                if last_label.len() >= 2 && last_label.chars().all(|c| c.is_ascii_alphabetic()) {
+                    let tld_lower = last_label.to_lowercase();
+                    if !BLOCKED_EXTENSIONS.contains(&tld_lower.as_str()) {
+                        return Some(idx - username_len);
+                    }
+                }
+            }
+        }
+    }
+    None
 }

@@ -10,13 +10,13 @@
 )]
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use chrono::DateTime;
 
 use crate::ir::{
     EdgeLabel, EvidenceLink, GraphRecord, NodeKind, OutputHandle, PatchHandle,
-    SemanticDriftMetadata, SourceSpan, TemporalMetadata, UserContextScope,
+    SemanticDriftMetadata, SnapshotHead, SourceSpan, TemporalMetadata, UserContextScope,
 };
 use crate::redaction::redact_value;
 /// Finds a symbol record by name at a specific Git commit.
@@ -2713,6 +2713,297 @@ pub fn symbol_as_of_valid_time_by_repo<'records>(
     Ok(results)
 }
 
+/// Finds the Commit node that last changed the symbol's file at or before the queried commit/time.
+///
+/// Returns `Ok(Some((symbol_node, commit_node)))` if found.
+///
+/// # Errors
+///
+/// Returns an error string when a temporal selector is malformed or the requested commit is not found.
+pub fn who_last_changed<'records>(
+    records: &'records [GraphRecord],
+    symbol_name: &str,
+    at_commit: Option<&str>,
+    as_of_time: Option<&str>,
+    index: &RepositoryIndex,
+    repo: Option<&str>,
+) -> Result<Option<(&'records GraphRecord, &'records GraphRecord)>, String> {
+    // 1. Build indices in a single O(N) pre-pass to prevent multiple scans
+    let mut commit_nodes = HashMap::new();
+    let mut commit_parents = HashMap::new();
+    let mut tombstoned_ids = HashSet::new();
+    let mut matching_commits = Vec::new();
+
+    for record in records {
+        match record {
+            GraphRecord::Tombstone { deleted_id, .. } => {
+                tombstoned_ids.insert(deleted_id.as_str());
+            }
+            GraphRecord::Node {
+                kind: NodeKind::Commit,
+                temporal: Some(t),
+                ..
+            } => {
+                let sha = t.git_commit.as_str();
+                commit_nodes.insert(sha, record);
+                commit_parents.insert(sha, t.git_parent_commits.as_slice());
+                if let Some(prefix) = at_commit {
+                    if sha.starts_with(prefix) {
+                        matching_commits.push(sha);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Build a CommitOrder helper for topological rankings
+    let commit_order = CommitOrder::build(records);
+
+    // 2. Resolve the symbol node
+    let symbol_nodes = if let Some(commit) = at_commit {
+        // Resolve prefix and enforce uniqueness
+        if matching_commits.is_empty() {
+            return Err(format!("commit prefix '{commit}' not found"));
+        } else if matching_commits.len() > 1 {
+            return Err(format!(
+                "commit prefix '{commit}' is ambiguous, matched: {:?}",
+                matching_commits
+            ));
+        }
+
+        let mut matches = symbols_at_commit(records, symbol_name, commit);
+        if let Some(repo_id) = repo {
+            matches.retain(|r| index.owner_of(r.id()) == Some(repo_id));
+        }
+        matches
+    } else {
+        let as_of = as_of_time.unwrap_or("9999-12-31T23:59:59Z");
+        let mut matches =
+            symbol_as_of_valid_time_by_repo(records, symbol_name, as_of, index, repo)?;
+
+        // Suppress tombstoned symbol nodes for active HEAD / current-state queries
+        if as_of_time.is_none() {
+            matches.retain(|r| !tombstoned_ids.contains(r.id()));
+        }
+        matches
+    };
+
+    if symbol_nodes.len() > 1 {
+        let repos: Vec<&str> = symbol_nodes
+            .iter()
+            .filter_map(|r| index.owner_of(r.id()))
+            .collect();
+        return Err(format!(
+            "symbol '{symbol_name}' is defined in multiple repositories ({repos:?}). Please specify --repo to resolve ambiguity."
+        ));
+    }
+    let symbol_node = symbol_nodes.into_iter().next();
+
+    let Some(symbol_node) = symbol_node else {
+        return Ok(None);
+    };
+
+    let GraphRecord::Node {
+        repo_relative_path: Some(file_path),
+        ..
+    } = symbol_node
+    else {
+        return Ok(None);
+    };
+
+    // 3. Define candidate commits, scoping them to the active lineage (prevent branch bleeding)
+    let candidate_commit_shas = if at_commit.is_some() {
+        let start_sha = matching_commits[0];
+
+        // Traverse ancestry from target commit
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(start_sha);
+
+        while let Some(sha) = queue.pop_front() {
+            if visited.insert(sha) {
+                if let Some(parents) = commit_parents.get(sha) {
+                    for parent in *parents {
+                        let p_str = parent.as_str();
+                        if !visited.contains(p_str) {
+                            queue.push_back(p_str);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply valid-time limit to target ancestry if --as-of is co-specified
+        if let Some(as_of) = as_of_time {
+            let as_of_dt = DateTime::parse_from_rfc3339(as_of)
+                .map_err(|e| format!("invalid --as-of timestamp '{as_of}': {e}"))?;
+            let mut filtered = HashSet::new();
+            for sha in visited {
+                if let Some(GraphRecord::Node {
+                    temporal: Some(t), ..
+                }) = commit_nodes.get(sha)
+                {
+                    if let Ok(vt) = DateTime::parse_from_rfc3339(&t.valid_time) {
+                        if vt <= as_of_dt {
+                            filtered.insert(sha);
+                        }
+                    }
+                }
+            }
+            filtered
+        } else {
+            visited
+        }
+    } else {
+        // Lineage traversal for HEAD/as-of queries starting from recorded HEAD commit
+        let mut head_sha = None;
+        let target_repo_id = index.owner_of(symbol_node.id());
+        if let Some(repo_id) = target_repo_id {
+            for record in records {
+                if let GraphRecord::Node {
+                    kind: NodeKind::Repository,
+                    id,
+                    source_snapshot: Some(snapshot),
+                    ..
+                } = record
+                {
+                    if id == repo_id {
+                        if let SnapshotHead::Commit { sha } = &snapshot.head {
+                            head_sha = Some(sha.as_str());
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(start_sha) = head_sha {
+            // Traverse ancestry starting from repository HEAD commit
+            let mut visited = HashSet::new();
+            let mut queue = VecDeque::new();
+            queue.push_back(start_sha);
+
+            while let Some(sha) = queue.pop_front() {
+                if visited.insert(sha) {
+                    if let Some(parents) = commit_parents.get(sha) {
+                        for parent in *parents {
+                            let p_str = parent.as_str();
+                            if !visited.contains(p_str) {
+                                queue.push_back(p_str);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(as_of) = as_of_time {
+                let as_of_dt = DateTime::parse_from_rfc3339(as_of)
+                    .map_err(|e| format!("invalid --as-of timestamp '{as_of}': {e}"))?;
+                let mut filtered = HashSet::new();
+                for sha in visited {
+                    if let Some(GraphRecord::Node {
+                        temporal: Some(t), ..
+                    }) = commit_nodes.get(sha)
+                    {
+                        if let Ok(vt) = DateTime::parse_from_rfc3339(&t.valid_time) {
+                            if vt <= as_of_dt {
+                                filtered.insert(sha);
+                            }
+                        }
+                    }
+                }
+                filtered
+            } else {
+                visited
+            }
+        } else {
+            // Fallback to all commits if no git metadata is present (legacy fixtures)
+            let mut candidates = HashSet::new();
+            if let Some(as_of) = as_of_time {
+                let as_of_dt = DateTime::parse_from_rfc3339(as_of)
+                    .map_err(|e| format!("invalid --as-of timestamp '{as_of}': {e}"))?;
+                for (sha, record) in &commit_nodes {
+                    if let GraphRecord::Node {
+                        temporal: Some(t), ..
+                    } = record
+                    {
+                        if let Ok(vt) = DateTime::parse_from_rfc3339(&t.valid_time) {
+                            if vt <= as_of_dt {
+                                candidates.insert(*sha);
+                            }
+                        }
+                    }
+                }
+            } else {
+                candidates.extend(commit_nodes.keys().copied());
+            }
+            if let Some(repo_id) = target_repo_id {
+                candidates.retain(|sha| {
+                    commit_nodes.get(sha).is_some_and(|c_node| {
+                        let owner = index.owner_of(c_node.id());
+                        owner == Some(repo_id) || owner.is_none()
+                    })
+                });
+            }
+            candidates
+        }
+    };
+
+    // 4. Find the latest commit that changed the file, ordering topologically
+    let mut latest_commit: Option<(&GraphRecord, usize, DateTime<chrono::FixedOffset>)> = None;
+
+    for record in records {
+        let GraphRecord::Node {
+            kind: NodeKind::Change,
+            repo_relative_path: Some(change_path),
+            temporal: Some(t),
+            ..
+        } = record
+        else {
+            continue;
+        };
+
+        if change_path != file_path {
+            continue;
+        }
+
+        let sha = t.git_commit.as_str();
+        if !candidate_commit_shas.contains(sha) {
+            continue;
+        }
+
+        // O(1) commit lookup
+        let Some(commit_node) = commit_nodes.get(sha).copied() else {
+            continue;
+        };
+
+        let Ok(vt) = DateTime::parse_from_rfc3339(&t.valid_time) else {
+            continue;
+        };
+
+        let current_rank = commit_order.rank(sha);
+
+        let is_better = if let Some((prev_commit, prev_rank, prev_vt)) = latest_commit {
+            // Rank topological descendant first, fall back to timestamp for parallel branches,
+            // and use lexicographical ID comparison as the final tie-breaker.
+            current_rank > prev_rank
+                || (current_rank == prev_rank && vt > prev_vt)
+                || (current_rank == prev_rank
+                    && vt == prev_vt
+                    && commit_node.id() < prev_commit.id())
+        } else {
+            true
+        };
+
+        if is_better {
+            latest_commit = Some((commit_node, current_rank, vt));
+        }
+    }
+
+    Ok(latest_commit.map(|(commit, _, _)| (symbol_node, commit)))
+}
+
 // ── Transaction-time queries (Issue #66) ───────────────────────────────────────
 
 /// A machine-readable diagnostic emitted by a transaction-time query.
@@ -2897,9 +3188,7 @@ impl<'a> CommitOrder<'a> {
         let mut parents: BTreeMap<&'a str, Vec<&'a str>> = BTreeMap::new();
         for record in records {
             if let GraphRecord::Node {
-                kind: NodeKind::Commit,
-                temporal: Some(t),
-                ..
+                temporal: Some(t), ..
             } = record
             {
                 let entry = parents.entry(t.git_commit.as_str()).or_default();

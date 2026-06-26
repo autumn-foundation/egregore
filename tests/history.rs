@@ -360,6 +360,8 @@ fn assert_commit_node(records: &[Value], sha: &str, valid_time: &str) {
                 && record["temporal"]["git_commit"] == sha
                 && record["temporal"]["valid_time"] == valid_time
                 && record["temporal"]["author_time"] == valid_time
+                && record["author_name"] == "Codegraph Test"
+                && record["author_email"] == "codegraph@example.invalid"
         }),
         "missing commit node for {sha}; candidates: {candidates:?}"
     );

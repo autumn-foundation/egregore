@@ -1446,6 +1446,8 @@ impl EmbeddedAletheiaSink {
             confidence,
             source_handle,
             redaction_policy_version,
+            author_name,
+            author_email,
             valid_time,
             valid_time_source,
             entity_id,
@@ -1528,6 +1530,8 @@ impl EmbeddedAletheiaSink {
             .insert("egregore_seq", seq_str.as_str());
         builder = insert_optional(builder, "repo_relative_path", repo_relative_path.as_deref());
         builder = insert_optional(builder, "name", name.as_deref());
+        builder = insert_optional(builder, "author_name", author_name.as_deref());
+        builder = insert_optional(builder, "author_email", author_email.as_deref());
         builder = insert_optional(builder, "language", language.as_deref());
         builder = insert_optional(builder, "symbol_kind", symbol_kind.as_deref());
         if let Some(disambiguator) = disambiguator {
@@ -2235,6 +2239,16 @@ impl EmbeddedAletheiaSink {
                 record_id,
                 "redaction_policy_version",
                 node.get_property("redaction_policy_version"),
+            )?,
+            author_name: optional_str_property(
+                record_id,
+                "author_name",
+                node.get_property("author_name"),
+            )?,
+            author_email: optional_str_property(
+                record_id,
+                "author_email",
+                node.get_property("author_email"),
             )?,
             repository_identity: optional_str_property(
                 record_id,

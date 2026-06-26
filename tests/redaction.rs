@@ -930,10 +930,9 @@ fn detect_session_cookie_jwt_second_occurrence_after_short() {
 fn detect_database_url_at_in_prose_not_flagged() {
     // "user:pass@example.com" is an email address in prose, not inside the URL authority.
     let value = "database postgres://localhost/db contact user:pass@example.com for support";
-    assert!(
-        detect_secret(value).is_none(),
-        "@ in prose outside the URL authority must not be flagged as database credential"
-    );
+    // Since email is now a secret class, this is detected as Email. We check it is not DatabaseUrl.
+    let (class, _) = detect_secret(value).expect("must detect email secret");
+    assert_eq!(class, SecretClass::Email);
 }
 
 // Fix: env key parsing with leading multi-byte Unicode characters must not panic and must succeed.
@@ -945,4 +944,18 @@ fn redact_value_env_key_with_unicode_prefix_does_not_panic() {
         result.contains("<REDACTED:"),
         "must redact API_KEY even when preceded by multi-byte Unicode; got: {result}"
     );
+}
+
+#[test]
+fn detect_email_address_pii() {
+    let value = "Please contact me at admin@example.com for info.";
+    let (class, _) = detect_secret(value).expect("email must be detected");
+    assert_eq!(class, SecretClass::Email);
+}
+
+#[test]
+fn redact_value_email_address() {
+    let value = "admin@example.com";
+    let redacted = redact_value(value);
+    assert!(redacted.starts_with("<REDACTED:email:"));
 }

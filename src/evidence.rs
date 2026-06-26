@@ -372,6 +372,8 @@ fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
         temporal: None,
         semantic_drift: None,
         evidence_links: None,
+        author_name: None,
+        author_email: None,
         repository_identity: None,
         source_snapshot: None,
         text: None,
@@ -454,6 +456,7 @@ fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
 }
 
 /// Builds an `AgentSession` node for the given session.
+#[allow(clippy::too_many_lines)]
 fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> GraphRecord {
     let id = agent_memory_stable_id(&[
         "node",
@@ -476,6 +479,8 @@ fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> Grap
         temporal: None,
         semantic_drift: None,
         evidence_links: None,
+        author_name: None,
+        author_email: None,
         repository_identity: None,
         source_snapshot: None,
         text: None,
@@ -784,6 +789,8 @@ pub fn build_observation_records(
         temporal: None,
         semantic_drift: None,
         evidence_links: Some(sorted_links),
+        author_name: None,
+        author_email: None,
         repository_identity: None,
         source_snapshot: None,
         text: Some(redacted_text.clone()),
@@ -1010,6 +1017,8 @@ pub fn build_command_evidence_records(
         temporal: None,
         semantic_drift: None,
         evidence_links: None,
+        author_name: None,
+        author_email: None,
         repository_identity: None,
         source_snapshot: None,
         text: None,
@@ -1240,6 +1249,8 @@ pub fn build_artifact_records(
         temporal: None,
         semantic_drift: None,
         evidence_links: None,
+        author_name: None,
+        author_email: None,
         repository_identity: None,
         source_snapshot: None,
         text: None,
@@ -1443,6 +1454,8 @@ pub fn build_verification_records(
         temporal: None,
         semantic_drift: None,
         evidence_links: None,
+        author_name: None,
+        author_email: None,
         repository_identity: None,
         source_snapshot: None,
         text: None,

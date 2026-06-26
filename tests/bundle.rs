@@ -563,14 +563,14 @@ fn test_bundle_cli_workflow() {
         .code(predicate::eq(2))
         .stderr(predicate::str::contains(r#""code":"parse_failed""#));
 
-    // 11. Test Stripe live key detection on non-scrubbed field (summary)
+    // 11. Test Stripe live key detection on non-scrubbed field (name)
     let repo_node_with_secret = GraphRecord::node(
         "repo-1".to_owned(),
         NodeKind::Repository,
         None,
         None,
-        Some("my-repo".to_owned()),
-        "Repository node containing secret key sk_live_12345abcdef012345678".to_owned(),
+        Some("Repository node containing secret key sk_live_12345abcdef012345678".to_owned()),
+        "Repository node".to_owned(),
     );
     let mut obs_node_ok = GraphRecord::node(
         "obs-1".to_owned(),
@@ -626,4 +626,130 @@ fn test_bundle_cli_workflow() {
         .stdout(predicate::str::contains(
             "contains unredacted secret class: api_token",
         ));
+}
+
+#[test]
+fn test_author_email_scrubbing_on_export() {
+    use aletheia_egregore::ir::{GraphRecord, NodeKind};
+
+    let repo_node = GraphRecord::node(
+        "repo-1".to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("my-repo".to_owned()),
+        "Repository node".to_owned(),
+    );
+
+    let mut commit_node = GraphRecord::node(
+        "commit-1".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("commit_sha_123".to_owned()),
+        "Commit node".to_owned(),
+    );
+
+    if let GraphRecord::Node {
+        author_name,
+        author_email,
+        ..
+    } = &mut commit_node
+    {
+        *author_name = Some("Alice".to_owned());
+        *author_email = Some("alice@example.com".to_owned());
+    }
+
+    let records = vec![repo_node, commit_node];
+
+    let bundle = export_bundle(&records, "id:commit-1", "0.1.0").expect("export should succeed");
+
+    let scrubbed_commit = bundle
+        .records
+        .iter()
+        .find(|br| br.record.id() == "commit-1")
+        .expect("should find commit-1");
+
+    if let GraphRecord::Node {
+        author_name,
+        author_email,
+        ..
+    } = &scrubbed_commit.record
+    {
+        assert_eq!(author_name.as_deref(), Some("Alice"));
+        let email = author_email
+            .as_ref()
+            .expect("author email should be present");
+        assert!(email.starts_with("<REDACTED:email:"));
+        assert!(!email.contains("alice@example.com"));
+    } else {
+        panic!("not a node record");
+    }
+
+    // Verify the bundle passes safety checks
+    let report = verify_bundle(&bundle);
+    assert!(
+        report.safety.passed,
+        "safety check should pass: {}",
+        report.safety.detail
+    );
+}
+
+#[test]
+fn test_verify_bundle_fails_on_unredacted_email() {
+    use aletheia_egregore::bundle::{BundleManifest, BundleRecord, EvidenceBundle};
+    use aletheia_egregore::ir::{GraphRecord, NodeKind};
+
+    let mut commit_node = GraphRecord::node(
+        "commit-1".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("commit_sha_123".to_owned()),
+        "Commit node".to_owned(),
+    );
+
+    if let GraphRecord::Node {
+        author_name,
+        author_email,
+        ..
+    } = &mut commit_node
+    {
+        *author_name = Some("Alice".to_owned());
+        *author_email = Some("alice@example.com".to_owned());
+    }
+
+    // Directly put the unredacted node into a bundle record
+    let json = serde_json::to_string(&commit_node).unwrap();
+    let hash = blake3::hash(json.as_bytes()).to_string();
+    let br = BundleRecord {
+        record: commit_node,
+        hash,
+    };
+
+    let manifest = BundleManifest {
+        root_selector: "id:commit-1".to_owned(),
+        source_query: "id".to_owned(),
+        snapshot: None,
+        repository_identity: "repo-1".to_owned(),
+        egregore_version: "0.1.0".to_owned(),
+        included_record_counts: std::collections::BTreeMap::new(),
+        omitted_record_counts: 0,
+        root_record_ids: vec!["commit-1".to_owned()],
+    };
+
+    let bundle = EvidenceBundle {
+        manifest,
+        records: vec![br],
+        unresolved_links: vec![],
+    };
+
+    let report = verify_bundle(&bundle);
+    assert!(!report.safety.passed);
+    assert!(
+        report
+            .safety
+            .detail
+            .contains("unredacted secret class: email")
+    );
 }

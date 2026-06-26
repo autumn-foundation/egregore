@@ -681,6 +681,12 @@ pub enum GraphRecord {
         /// Redaction policy version when any field passed through redaction.
         #[serde(skip_serializing_if = "Option::is_none")]
         redaction_policy_version: Option<String>,
+        /// Display name of the Git author (present on Commit nodes).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        author_name: Option<String>,
+        /// Email address of the Git author (present on Commit nodes).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        author_email: Option<String>,
         /// RFC 3339 valid time for current-tree (non-history) scan records.
         /// For history-backed records use `temporal.valid_time` instead.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -991,6 +997,8 @@ impl GraphRecord {
             confidence: None,
             source_handle: None,
             redaction_policy_version: None,
+            author_name: None,
+            author_email: None,
             valid_time: None,
             valid_time_source: None,
             entity_id: None,
@@ -1096,6 +1104,8 @@ impl GraphRecord {
             confidence: None,
             source_handle: None,
             redaction_policy_version: None,
+            author_name: None,
+            author_email: None,
             valid_time: None,
             valid_time_source: None,
             entity_id: None,
@@ -1200,6 +1210,8 @@ impl GraphRecord {
             confidence: None,
             source_handle: None,
             redaction_policy_version: None,
+            author_name: None,
+            author_email: None,
             valid_time: None,
             valid_time_source: None,
             entity_id: None,
@@ -1310,6 +1322,8 @@ impl GraphRecord {
             confidence: None,
             source_handle: None,
             redaction_policy_version: None,
+            author_name: None,
+            author_email: None,
             valid_time: None,
             valid_time_source: None,
             entity_id: None,
@@ -1434,6 +1448,21 @@ impl GraphRecord {
                 *temporal = Some(temporal_metadata);
             }
             Self::Tombstone { .. } => {}
+        }
+        self
+    }
+
+    /// Attaches author name and email to a node record.
+    #[must_use]
+    pub fn with_author(mut self, name: Option<String>, email: Option<String>) -> Self {
+        if let Self::Node {
+            author_name,
+            author_email,
+            ..
+        } = &mut self
+        {
+            *author_name = name;
+            *author_email = email;
         }
         self
     }

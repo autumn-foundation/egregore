@@ -1528,6 +1528,8 @@ fn make_node(
         temporal: None,
         semantic_drift: None,
         evidence_links: None,
+        author_name: None,
+        author_email: None,
         text: extra.text,
         superseded_by: None,
         agent_id: Some(IMPORTER_ID.to_owned()),

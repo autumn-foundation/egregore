@@ -203,6 +203,8 @@ struct GitCommit {
     parents: Vec<String>,
     committed_at: String,
     authored_at: String,
+    author_name: String,
+    author_email: String,
     subject: String,
 }
 
@@ -218,7 +220,7 @@ impl GitCommit {
         }
     }
 
-    fn short_sha(&self) -> String {
+    fn short_sha(&self) -> &str {
         short_sha(&self.sha)
     }
 }
@@ -244,13 +246,15 @@ fn list_commits(repo_root: &Path) -> Result<Vec<GitCommit>> {
 fn commit_metadata(repo_root: &Path, sha: &str) -> Result<GitCommit> {
     let output = git_output(
         repo_root,
-        &["show", "-s", "--format=%H%n%P%n%cI%n%aI%n%s", sha],
+        &["show", "-s", "--format=%H%n%P%n%cI%n%aI%n%an%n%ae%n%s", sha],
     )?;
     let mut lines = output.lines();
     let full_sha = required_line(&mut lines, "commit sha")?;
     let parents = required_line(&mut lines, "commit parents")?;
     let committed_at = required_line(&mut lines, "commit time")?;
     let authored_at = required_line(&mut lines, "author time")?;
+    let author_name = required_line(&mut lines, "author name")?;
+    let author_email = required_line(&mut lines, "author email")?;
     let subject = lines.collect::<Vec<_>>().join("\n");
 
     Ok(GitCommit {
@@ -262,6 +266,8 @@ fn commit_metadata(repo_root: &Path, sha: &str) -> Result<GitCommit> {
             .collect(),
         committed_at: normalize_timestamp(committed_at),
         authored_at: normalize_timestamp(authored_at),
+        author_name: author_name.to_owned(),
+        author_email: author_email.to_owned(),
         subject,
     })
 }
@@ -351,6 +357,10 @@ fn commit_record(repository_id: &str, commit: &GitCommit) -> GraphRecord {
         ),
     )
     .with_temporal(commit.temporal())
+    .with_author(
+        Some(commit.author_name.clone()),
+        Some(commit.author_email.clone()),
+    )
 }
 
 fn change_record(repository_id: &str, commit: &GitCommit, change: &GitChange) -> GraphRecord {
@@ -429,7 +439,7 @@ fn required_line<'a>(
     field_name: &str,
 ) -> Result<&'a str> {
     lines.next().ok_or_else(|| CodegraphError::GitCommand {
-        command: "git show -s --format=%H%n%P%n%cI%n%aI%n%s".to_owned(),
+        command: "git show -s --format=%H%n%P%n%cI%n%aI%n%an%n%ae%n%s".to_owned(),
         message: format!("missing {field_name}"),
     })
 }
@@ -441,6 +451,6 @@ fn normalize_git_path(path: &str) -> String {
         .join("/")
 }
 
-fn short_sha(sha: &str) -> String {
-    sha.chars().take(12).collect()
+fn short_sha(sha: &str) -> &str {
+    if sha.len() >= 12 { &sha[..12] } else { sha }
 }
