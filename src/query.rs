@@ -2940,7 +2940,7 @@ pub fn who_last_changed<'records>(
     };
 
     let GraphRecord::Node {
-        repo_relative_path: Some(file_path),
+        repo_relative_path: Some(_),
         ..
     } = symbol_node
     else {
@@ -3142,10 +3142,6 @@ pub fn who_last_changed<'records>(
             continue;
         };
 
-        if change_path != file_path {
-            continue;
-        }
-
         let sha = t.git_commit.as_str();
         if !candidate_commit_shas.contains(sha) {
             continue;
@@ -3180,12 +3176,17 @@ pub fn who_last_changed<'records>(
         };
 
         let GraphRecord::Node {
+            repo_relative_path: Some(sym_path_at_sha),
             summary: sym_summary,
             ..
         } = sym_node_at_sha
         else {
             continue;
         };
+
+        if change_path != sym_path_at_sha {
+            continue;
+        }
 
         let parents = commit_parents.get(sha).copied().unwrap_or(&[]);
         let has_unchanged_parent = parents.iter().any(|parent_sha| {
