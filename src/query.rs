@@ -2762,6 +2762,15 @@ pub fn who_last_changed<'records>(
 
     // 2. Resolve the symbol node
     let symbol_nodes = if let Some(commit) = at_commit {
+        if let Some(repo_id) = repo {
+            matching_commits.retain(|sha| {
+                commit_nodes.get(sha).is_some_and(|c_node| {
+                    let owner = index.owner_of(c_node.id());
+                    owner == Some(repo_id) || owner.is_none()
+                })
+            });
+        }
+
         // Resolve prefix and enforce uniqueness
         if matching_commits.is_empty() {
             return Err(format!("commit prefix '{commit}' not found"));

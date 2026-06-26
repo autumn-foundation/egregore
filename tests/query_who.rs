@@ -427,6 +427,45 @@ fn test_query_who_ambiguous_symbol() {
     );
 }
 
+#[test]
+fn test_query_who_ambiguous_at_prefix_resolved_by_repo() {
+    let (_temp, graph_path) = fixture_graph_for_ambiguity();
+
+    // 1. Querying with --at commit without --repo should fail as commit prefix is ambiguous
+    egregore()
+        .args(["query", "who", "scan_repository", "--graph"])
+        .arg(&graph_path)
+        .arg("--at")
+        .arg("commit")
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains(
+            "commit prefix 'commit' is ambiguous",
+        ));
+
+    // 2. Querying with --at commit and --repo repo1 should succeed and resolve to commit1_sha
+    let output = egregore()
+        .args(["query", "who", "scan_repository", "--graph"])
+        .arg(&graph_path)
+        .arg("--at")
+        .arg("commit")
+        .arg("--repo")
+        .arg("repo1")
+        .arg("--format")
+        .arg("text")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).expect("utf8");
+    assert!(text.contains(
+        "scan_repository last changed by Alice <alice@example.com> in commit commit1_sha"
+    ));
+}
+
 #[allow(clippy::too_many_lines)]
 fn fixture_graph_for_ambiguity() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("temp dir");

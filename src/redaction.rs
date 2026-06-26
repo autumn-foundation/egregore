@@ -626,8 +626,8 @@ fn env_key_start(value: &str, eq_pos: usize) -> usize {
 
 fn find_email(value: &str) -> Option<usize> {
     const BLOCKED_EXTENSIONS: &[&str] = &[
-        "rs", "py", "js", "go", "ts", "cpp", "java", "rb", "json", "yaml", "yml", "toml", "md",
-        "txt", "html", "css", "sh", "bat", "lock", "class",
+        "py", "js", "go", "ts", "cpp", "rb", "json", "yaml", "yml", "toml", "txt", "html", "css",
+        "bat", "lock", "class",
     ];
 
     for (idx, c) in value.char_indices() {
