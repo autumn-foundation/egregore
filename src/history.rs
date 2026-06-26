@@ -223,7 +223,7 @@ impl GitCommit {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct GitChange {
     status: String,
     path: String,
@@ -289,7 +289,7 @@ fn list_changes(repo_root: &Path, commit: &GitCommit) -> Result<Vec<GitChange>> 
     Ok(output
         .lines()
         .filter_map(parse_change_line)
-        .filter(|change| seen.insert((change.status.clone(), change.path.clone())))
+        .filter(|change| seen.insert(change.clone()))
         .collect::<Vec<_>>())
 }
 
@@ -393,6 +393,7 @@ fn git_output(repo_root: &Path, args: &[&str]) -> Result<String> {
         .arg("-C")
         .arg(repo_root)
         .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
         .output()
         .map_err(|source| CodegraphError::GitCommand {
@@ -434,12 +435,8 @@ fn required_line<'a>(
 }
 
 fn normalize_git_path(path: &str) -> String {
-    PathBuf::from(path)
-        .components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(part) => part.to_str(),
-            _ => None,
-        })
+    path.split('/')
+        .filter(|part| !part.is_empty() && *part != "." && *part != "..")
         .collect::<Vec<_>>()
         .join("/")
 }
