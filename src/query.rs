@@ -2733,6 +2733,7 @@ pub fn who_last_changed<'records>(
     let mut commit_parents = HashMap::new();
     let mut tombstoned_ids = HashSet::new();
     let mut matching_commits = Vec::new();
+    let mut symbol_by_commit_and_name: HashMap<(&str, &str), Vec<&GraphRecord>> = HashMap::new();
 
     for record in records {
         match record {
@@ -2752,6 +2753,17 @@ pub fn who_last_changed<'records>(
                         matching_commits.push(sha);
                     }
                 }
+            }
+            GraphRecord::Node {
+                kind: NodeKind::Symbol,
+                name: Some(name),
+                temporal: Some(t),
+                ..
+            } => {
+                symbol_by_commit_and_name
+                    .entry((t.git_commit.as_str(), name.as_str()))
+                    .or_default()
+                    .push(record);
             }
             _ => {}
         }
@@ -3102,6 +3114,20 @@ pub fn who_last_changed<'records>(
         }
     };
 
+    // Helper to find the symbol node at a specific commit SHA that matches target repo
+    let get_symbol_node = |commit_sha: &str| -> Option<&GraphRecord> {
+        symbol_by_commit_and_name
+            .get(&(commit_sha, symbol_name))
+            .and_then(|syms| {
+                syms.iter()
+                    .find(|sym| {
+                        let owner = index.owner_of(sym.id());
+                        owner.is_none() || owner == target_repo_id
+                    })
+                    .copied()
+            })
+    };
+
     // 4. Find the latest commit that changed the file, ordering topologically
     let mut latest_commit: Option<(&GraphRecord, usize, DateTime<chrono::FixedOffset>)> = None;
 
@@ -3147,6 +3173,39 @@ pub fn who_last_changed<'records>(
         let Ok(vt) = DateTime::parse_from_rfc3339(&t.valid_time) else {
             continue;
         };
+
+        // Check if the symbol actually changed in this commit
+        let Some(sym_node_at_sha) = get_symbol_node(sha) else {
+            continue;
+        };
+
+        let GraphRecord::Node {
+            summary: sym_summary,
+            ..
+        } = sym_node_at_sha
+        else {
+            continue;
+        };
+
+        let parents = commit_parents.get(sha).copied().unwrap_or(&[]);
+        let has_unchanged_parent = parents.iter().any(|parent_sha| {
+            let parent_sha_str = parent_sha.as_str();
+            if !candidate_commit_shas.contains(parent_sha_str) {
+                return false;
+            }
+            if let Some(GraphRecord::Node {
+                summary: parent_summary,
+                ..
+            }) = get_symbol_node(parent_sha_str)
+            {
+                return parent_summary == sym_summary;
+            }
+            false
+        });
+
+        if has_unchanged_parent {
+            continue;
+        }
 
         let current_rank = commit_order.rank(sha);
 
