@@ -1047,6 +1047,24 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Trace a single symbol's lifecycle across Git history.
+    Lifeline {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Symbol stable ID or exact symbol name.
+        #[arg(index = 1)]
+        symbol: String,
+        /// Restrict symbol/file resolution to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -4307,6 +4325,18 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_orient_cmd(&records, selected.as_deref(), limit, format)
+        }
+        QuerySubcommand::Lifeline {
+            graph,
+            data_dir,
+            symbol,
+            repo,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_lifeline_cmd(&records, &symbol, selected.as_deref(), format)
         }
     }
 }
@@ -8209,6 +8239,98 @@ fn query_orient_cmd(
                 }
             }
             std::process::exit(4);
+        }
+    }
+}
+
+fn query_lifeline_cmd(
+    records: &[GraphRecord],
+    symbol: &str,
+    repo_id: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    match query::symbol_lifeline(records, symbol, repo_id) {
+        Ok(events) => {
+            match format {
+                OutputFormat::Json => {
+                    let envelope = serde_json::json!({
+                        "ok": true,
+                        "result": events,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                }
+                OutputFormat::Text => {
+                    println!("Advisory temporal facts: where and when this symbol changed");
+                    for ev in &events {
+                        let citation = match (&ev.repo_relative_path, &ev.span) {
+                            (Some(path), Some(span)) => {
+                                format!(" @ {path}:{}-{}", span.start_line, span.end_line)
+                            }
+                            (Some(path), None) => {
+                                let reason = ev
+                                    .absent_span_reason
+                                    .as_ref()
+                                    .map_or_else(String::new, |r| format!(" [{r}]"));
+                                format!(" @ {path}{reason}")
+                            }
+                            (None, _) => ev
+                                .absent_span_reason
+                                .as_ref()
+                                .map_or_else(String::new, |reason| format!(" [{reason}]")),
+                        };
+                        let drift = match (ev.drift_score, &ev.drift_record_id) {
+                            (Some(score), Some(id)) => format!(" drift={score:.4} ({id})"),
+                            _ => " drift=absent".to_string(),
+                        };
+                        println!(
+                            "[{}] commit={} record_id={}{}{}",
+                            ev.event_type, ev.commit, ev.record_id, citation, drift
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        Err(query::LifelineError::UnknownSymbol { query }) => {
+            let code = "unknown_symbol";
+            let msg = format!("symbol not found in the graph: {query}");
+            match format {
+                OutputFormat::Json => {
+                    let envelope = serde_json::json!({
+                        "ok": false,
+                        "error": {
+                            "code": code,
+                            "message": msg
+                        }
+                    });
+                    println!("{}", serde_json::to_string(&envelope)?);
+                }
+                OutputFormat::Text => {
+                    eprintln!("Error: {msg}");
+                }
+            }
+            std::process::exit(5);
+        }
+        Err(query::LifelineError::AmbiguousSymbol { query, candidates }) => {
+            let code = "ambiguous_symbol";
+            let msg = format!("ambiguous symbol name '{query}' matches multiple symbols");
+            match format {
+                OutputFormat::Json => {
+                    let envelope = serde_json::json!({
+                        "ok": false,
+                        "error": {
+                            "code": code,
+                            "message": msg,
+                            "candidates": candidates
+                        }
+                    });
+                    println!("{}", serde_json::to_string(&envelope)?);
+                }
+                OutputFormat::Text => {
+                    eprintln!("Error: {msg}. Candidates: {}", candidates.join(", "));
+                }
+            }
+            std::process::exit(6);
         }
     }
 }

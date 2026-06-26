@@ -9,8 +9,9 @@ use aletheia_egregore::{
         verification_stable_id,
     },
     query::{
-        ModuleNodeKind, OrientationError, is_entry_point, largest_semantic_drifts, orientation_map,
-        path_is_under_prefix, subsystem_context, symbol_at_commit, symbol_context,
+        LifelineError, LifelineEventKind, ModuleNodeKind, OrientationError, is_entry_point,
+        largest_semantic_drifts, orientation_map, path_is_under_prefix, subsystem_context,
+        symbol_at_commit, symbol_context, symbol_lifeline,
     },
 };
 
@@ -71,6 +72,7 @@ fn drift(id: &str, name: &str, before: &str, after: &str, score: f64) -> GraphRe
         format!("Semantic drift for {name}"),
     )
     .with_temporal(temporal(after, "2026-01-02T00:00:00Z"))
+    .with_domain("semantic", 1)
     .with_semantic_drift(SemanticDriftMetadata {
         embedding_model: EmbeddingModel {
             provider: "test".to_owned(),
@@ -5346,4 +5348,697 @@ fn test_orientation_map_repo_scoping_tombstones_and_normalization() {
     // Verify non-rust Go main.go entry point is correctly classified
     assert_eq!(map_b.entry_points.len(), 1);
     assert_eq!(map_b.entry_points[0].repo_relative_path, "main.go");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_symbol_lifeline_happy_path() {
+    let repo_id = "repo:test";
+    let symbol_id = "symbol:answer";
+
+    let repo_node = GraphRecord::node(
+        repo_id.to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("test-repo".to_owned()),
+        "Test repository".to_owned(),
+    );
+
+    let c1 = GraphRecord::node(
+        "commit:1".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("c1".to_owned()),
+        "commit 1".to_owned(),
+    )
+    .with_temporal(temporal("c1", "2026-01-01T00:00:00Z"));
+    let c2 = GraphRecord::node(
+        "commit:2".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("c2".to_owned()),
+        "commit 2".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c2", &["c1"], "2026-01-02T00:00:00Z"));
+    let c3 = GraphRecord::node(
+        "commit:3".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("c3".to_owned()),
+        "commit 3".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c3", &["c2"], "2026-01-03T00:00:00Z"));
+    let c4 = GraphRecord::node(
+        "commit:4".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("c4".to_owned()),
+        "commit 4".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c4", &["c3"], "2026-01-04T00:00:00Z"));
+    let c5 = GraphRecord::node(
+        "commit:5".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("c5".to_owned()),
+        "commit 5".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c5", &["c4"], "2026-01-05T00:00:00Z"));
+    let c6 = GraphRecord::node(
+        "commit:6".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("c6".to_owned()),
+        "commit 6".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c6", &["c5"], "2026-01-06T00:00:00Z"));
+    let c7 = GraphRecord::node(
+        "commit:7".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("c7".to_owned()),
+        "commit 7".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c7", &["c6"], "2026-01-07T00:00:00Z"));
+
+    let e_repo_c1 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "commit:1".to_owned(),
+        None,
+        "repo contains c1".to_owned(),
+    );
+    let e_repo_c2 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "commit:2".to_owned(),
+        None,
+        "repo contains c2".to_owned(),
+    );
+    let e_repo_c3 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "commit:3".to_owned(),
+        None,
+        "repo contains c3".to_owned(),
+    );
+    let e_repo_c4 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "commit:4".to_owned(),
+        None,
+        "repo contains c4".to_owned(),
+    );
+    let e_repo_c5 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "commit:5".to_owned(),
+        None,
+        "repo contains c5".to_owned(),
+    );
+    let e_repo_c6 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "commit:6".to_owned(),
+        None,
+        "repo contains c6".to_owned(),
+    );
+    let e_repo_c7 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "commit:7".to_owned(),
+        None,
+        "repo contains c7".to_owned(),
+    );
+
+    // C1: introduced
+    let s1 = GraphRecord::node(
+        symbol_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        Some(span(1, 4)),
+        Some("answer".to_owned()),
+        "answer body 1".to_owned(),
+    )
+    .with_temporal(temporal("c1", "2026-01-01T00:00:00Z"));
+    let e_c1_s1 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        "commit:1".to_owned(),
+        symbol_id.to_owned(),
+        None,
+        String::new(),
+    );
+
+    // C2: modified (body summary changed)
+    let s2 = GraphRecord::node(
+        symbol_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        Some(span(1, 4)),
+        Some("answer".to_owned()),
+        "answer body 2".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c2", &["c1"], "2026-01-02T00:00:00Z"));
+    let e_c2_s2 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        "commit:2".to_owned(),
+        symbol_id.to_owned(),
+        None,
+        String::new(),
+    );
+
+    // C3: modified (body summary same as s2, but has SemanticDrift record)
+    let s3 = GraphRecord::node(
+        symbol_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        Some(span(1, 4)),
+        Some("answer".to_owned()),
+        "answer body 2".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c3", &["c2"], "2026-01-03T00:00:00Z"));
+    let e_c3_s3 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        "commit:3".to_owned(),
+        symbol_id.to_owned(),
+        None,
+        String::new(),
+    );
+    let drift_node = drift("drift:c3", "answer", "c2", "c3", 0.75);
+
+    // C4: unchanged (body summary matches s3/s2, no drift)
+    let s4 = GraphRecord::node(
+        symbol_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        Some(span(1, 4)),
+        Some("answer".to_owned()),
+        "answer body 2".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c4", &["c3"], "2026-01-04T00:00:00Z"));
+    let e_c4_s4 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        "commit:4".to_owned(),
+        symbol_id.to_owned(),
+        None,
+        String::new(),
+    );
+
+    // C5: removed (symbol absent at C5, so no Symbol node at C5, but parent C4 had it)
+    // C6: still absent
+
+    // C7: reintroduced
+    let s7 = GraphRecord::node(
+        symbol_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        Some(span(5, 8)),
+        Some("answer".to_owned()),
+        "answer body 3".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c7", &["c6"], "2026-01-07T00:00:00Z"));
+    let e_c7_s7 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        "commit:7".to_owned(),
+        symbol_id.to_owned(),
+        None,
+        String::new(),
+    );
+
+    // Add unrelated same-name symbol in different module/file to verify zero bleed
+    let unrelated_id = "symbol:other_answer";
+    let unrelated_c2 = GraphRecord::node(
+        unrelated_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/other.rs".to_owned()),
+        Some(span(1, 2)),
+        Some("answer".to_owned()),
+        "other body".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c2", &["c1"], "2026-01-02T00:00:00Z"));
+    let e_c2_unrelated = GraphRecord::edge(
+        EdgeLabel::Contains,
+        "commit:2".to_owned(),
+        unrelated_id.to_owned(),
+        None,
+        String::new(),
+    );
+
+    let mut obs_node = GraphRecord::node(
+        "obs:test_ignored".to_owned(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Test observation to be ignored".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ..
+    } = obs_node
+    {
+        *schema_version = 1;
+    }
+    let mut task_node = GraphRecord::node(
+        "task:test_ignored".to_owned(),
+        NodeKind::Task,
+        None,
+        None,
+        None,
+        "Test task to be ignored".to_owned(),
+    );
+    if let GraphRecord::Node {
+        ref mut schema_version,
+        ..
+    } = task_node
+    {
+        *schema_version = 1;
+    }
+
+    let records = vec![
+        repo_node,
+        c1,
+        c2,
+        c3,
+        c4,
+        c5,
+        c6,
+        c7,
+        e_repo_c1,
+        e_repo_c2,
+        e_repo_c3,
+        e_repo_c4,
+        e_repo_c5,
+        e_repo_c6,
+        e_repo_c7,
+        s1,
+        e_c1_s1,
+        s2,
+        e_c2_s2,
+        s3,
+        e_c3_s3,
+        drift_node,
+        s4,
+        e_c4_s4,
+        s7,
+        e_c7_s7,
+        unrelated_c2,
+        e_c2_unrelated,
+        obs_node,
+        task_node,
+    ];
+
+    let events =
+        symbol_lifeline(&records, symbol_id, None).expect("should query lifeline successfully");
+
+    // Expected events:
+    // 1. Introduced at c1
+    // 2. Modified at c2
+    // 3. Modified at c3 (due to drift)
+    // 4. Removed at c5
+    // 5. Reintroduced at c7
+    assert_eq!(events.len(), 5);
+
+    assert_eq!(events[0].event_type, LifelineEventKind::Introduced);
+    assert_eq!(events[0].commit, "c1");
+    assert_eq!(events[0].repo_relative_path, Some("src/lib.rs".to_string()));
+
+    assert_eq!(events[1].event_type, LifelineEventKind::Modified);
+    assert_eq!(events[1].commit, "c2");
+
+    assert_eq!(events[2].event_type, LifelineEventKind::Modified);
+    assert_eq!(events[2].commit, "c3");
+    assert_eq!(events[2].drift_record_id, Some("drift:c3".to_string()));
+    assert_eq!(events[2].drift_score, Some(0.75));
+
+    assert_eq!(events[3].event_type, LifelineEventKind::Removed);
+    assert_eq!(events[3].commit, "c5");
+    assert_eq!(events[3].repo_relative_path, None);
+    assert_eq!(events[3].span, None);
+    assert_eq!(events[3].absent_span_reason, Some("tombstone".to_string()));
+
+    assert_eq!(events[4].event_type, LifelineEventKind::Reintroduced);
+    assert_eq!(events[4].commit, "c7");
+    assert_eq!(events[4].repo_relative_path, Some("src/lib.rs".to_string()));
+}
+
+#[test]
+fn test_symbol_lifeline_unknown_and_ambiguous() {
+    let repo_id = "repo:test";
+    let repo_node = GraphRecord::node(
+        repo_id.to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("test-repo".to_owned()),
+        "Test repository".to_owned(),
+    );
+
+    let c1 = GraphRecord::node(
+        "commit:1".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("c1".to_owned()),
+        "commit 1".to_owned(),
+    )
+    .with_temporal(temporal("c1", "2026-01-01T00:00:00Z"));
+    let e_repo_c1 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "commit:1".to_owned(),
+        None,
+        "repo contains c1".to_owned(),
+    );
+
+    let s_a = GraphRecord::node(
+        "symbol:a".to_owned(),
+        NodeKind::Symbol,
+        Some("src/a.rs".to_owned()),
+        Some(span(1, 4)),
+        Some("helper".to_owned()),
+        "body".to_owned(),
+    )
+    .with_temporal(temporal("c1", "2026-01-01T00:00:00Z"));
+    let edge_c1_symbol_a = GraphRecord::edge(
+        EdgeLabel::Contains,
+        "commit:1".to_owned(),
+        "symbol:a".to_owned(),
+        None,
+        String::new(),
+    );
+
+    let s_b = GraphRecord::node(
+        "symbol:b".to_owned(),
+        NodeKind::Symbol,
+        Some("src/b.rs".to_owned()),
+        Some(span(1, 4)),
+        Some("helper".to_owned()),
+        "body".to_owned(),
+    )
+    .with_temporal(temporal("c1", "2026-01-01T00:00:00Z"));
+    let edge_c1_symbol_b = GraphRecord::edge(
+        EdgeLabel::Contains,
+        "commit:1".to_owned(),
+        "symbol:b".to_owned(),
+        None,
+        String::new(),
+    );
+
+    let records = vec![
+        repo_node,
+        c1,
+        e_repo_c1,
+        s_a,
+        edge_c1_symbol_a,
+        s_b,
+        edge_c1_symbol_b,
+    ];
+
+    // Unknown symbol
+    let err_unknown = symbol_lifeline(&records, "nonexistent", None).unwrap_err();
+    assert_eq!(
+        err_unknown,
+        LifelineError::UnknownSymbol {
+            query: "nonexistent".to_string()
+        }
+    );
+
+    // Ambiguous symbol
+    let err_ambig = symbol_lifeline(&records, "helper", None).unwrap_err();
+    match err_ambig {
+        LifelineError::AmbiguousSymbol {
+            query,
+            mut candidates,
+        } => {
+            assert_eq!(query, "helper");
+            candidates.sort();
+            assert_eq!(
+                candidates,
+                vec!["symbol:a".to_string(), "symbol:b".to_string()]
+            );
+        }
+        LifelineError::UnknownSymbol { query } => {
+            panic!("expected AmbiguousSymbol error, got UnknownSymbol for {query}");
+        }
+    }
+}
+
+fn temporal_with_parents(commit: &str, parents: &[&str], valid_time: &str) -> TemporalMetadata {
+    TemporalMetadata {
+        git_commit: commit.to_owned(),
+        git_parent_commits: parents.iter().map(|&s| s.to_owned()).collect(),
+        valid_time: valid_time.to_owned(),
+        author_time: None,
+        observed_at: valid_time.to_owned(),
+        valid_time_source: None,
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_symbol_lifeline_non_linear_branching() {
+    let repo_id = "repo:test";
+    let symbol_id = "symbol:branchy";
+
+    let repo_node = GraphRecord::node(
+        repo_id.to_owned(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("test-repo".to_owned()),
+        "Test repository".to_owned(),
+    );
+
+    // Commit graph:
+    //   c1 (Introduced) -> c2 (Unchanged) -> c3 (Removed) -> c4 (Reintroduced) -> c6 (Merge c4 & c5)
+    //   c1 -> c5 (Divergent branch, Unchanged) -----------------------------------> c6
+    let c1 = GraphRecord::node(
+        "commit:1".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("c1".to_owned()),
+        "commit 1".to_owned(),
+    )
+    .with_temporal(temporal("c1", "2026-01-01T00:00:00Z"));
+
+    let c5 = GraphRecord::node(
+        "commit:5".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("c5".to_owned()),
+        "commit 5".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c5", &["c1"], "2026-01-02T00:00:00Z"));
+
+    let c2 = GraphRecord::node(
+        "commit:2".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("c2".to_owned()),
+        "commit 2".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c2", &["c1"], "2026-01-03T00:00:00Z"));
+
+    let c3 = GraphRecord::node(
+        "commit:3".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("c3".to_owned()),
+        "commit 3".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c3", &["c2"], "2026-01-04T00:00:00Z"));
+
+    let c4 = GraphRecord::node(
+        "commit:4".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("c4".to_owned()),
+        "commit 4".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c4", &["c3"], "2026-01-05T00:00:00Z"));
+
+    let c6 = GraphRecord::node(
+        "commit:6".to_owned(),
+        NodeKind::Commit,
+        None,
+        None,
+        Some("c6".to_owned()),
+        "commit 6".to_owned(),
+    )
+    .with_temporal(temporal_with_parents(
+        "c6",
+        &["c4", "c5"],
+        "2026-01-06T00:00:00Z",
+    ));
+
+    let e_repo_c1 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "commit:1".to_owned(),
+        None,
+        String::new(),
+    );
+    let e_repo_c2 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "commit:2".to_owned(),
+        None,
+        String::new(),
+    );
+    let e_repo_c3 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "commit:3".to_owned(),
+        None,
+        String::new(),
+    );
+    let e_repo_c4 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "commit:4".to_owned(),
+        None,
+        String::new(),
+    );
+    let e_repo_c5 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "commit:5".to_owned(),
+        None,
+        String::new(),
+    );
+    let e_repo_c6 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        repo_id.to_owned(),
+        "commit:6".to_owned(),
+        None,
+        String::new(),
+    );
+
+    // Symbol snapshots:
+    // present at c1, c5, c2, c4, c6. absent at c3.
+    let s1 = GraphRecord::node(
+        symbol_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        Some(span(1, 4)),
+        Some("branchy".to_owned()),
+        "body 1".to_owned(),
+    )
+    .with_temporal(temporal("c1", "2026-01-01T00:00:00Z"));
+    let e_c1_s1 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        "commit:1".to_owned(),
+        symbol_id.to_owned(),
+        None,
+        String::new(),
+    );
+
+    let s5 = GraphRecord::node(
+        symbol_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        Some(span(1, 4)),
+        Some("branchy".to_owned()),
+        "body 1".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c5", &["c1"], "2026-01-02T00:00:00Z"));
+    let e_c5_s5 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        "commit:5".to_owned(),
+        symbol_id.to_owned(),
+        None,
+        String::new(),
+    );
+
+    let s2 = GraphRecord::node(
+        symbol_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        Some(span(1, 4)),
+        Some("branchy".to_owned()),
+        "body 1".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c2", &["c1"], "2026-01-03T00:00:00Z"));
+    let e_c2_s2 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        "commit:2".to_owned(),
+        symbol_id.to_owned(),
+        None,
+        String::new(),
+    );
+
+    // c3 has no contains edge to symbol:branchy -> absent/removed
+
+    let s4 = GraphRecord::node(
+        symbol_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        Some(span(1, 4)),
+        Some("branchy".to_owned()),
+        "body 1".to_owned(),
+    )
+    .with_temporal(temporal_with_parents("c4", &["c3"], "2026-01-05T00:00:00Z"));
+    let e_c4_s4 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        "commit:4".to_owned(),
+        symbol_id.to_owned(),
+        None,
+        String::new(),
+    );
+
+    let s6 = GraphRecord::node(
+        symbol_id.to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        Some(span(1, 4)),
+        Some("branchy".to_owned()),
+        "body 1".to_owned(),
+    )
+    .with_temporal(temporal_with_parents(
+        "c6",
+        &["c4", "c5"],
+        "2026-01-06T00:00:00Z",
+    ));
+    let e_c6_s6 = GraphRecord::edge(
+        EdgeLabel::Contains,
+        "commit:6".to_owned(),
+        symbol_id.to_owned(),
+        None,
+        String::new(),
+    );
+
+    let records = vec![
+        repo_node, c1, c2, c3, c4, c5, c6, e_repo_c1, e_repo_c2, e_repo_c3, e_repo_c4, e_repo_c5,
+        e_repo_c6, s1, e_c1_s1, s5, e_c5_s5, s2, e_c2_s2, s4, e_c4_s4, s6, e_c6_s6,
+    ];
+
+    let events = symbol_lifeline(&records, symbol_id, None).expect("should trace lifeline");
+
+    // We expect:
+    // 1. Introduced at c1
+    // 2. Removed at c3
+    // 3. Reintroduced at c4
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].event_type, LifelineEventKind::Introduced);
+    assert_eq!(events[0].commit, "c1");
+
+    assert_eq!(events[1].event_type, LifelineEventKind::Removed);
+    assert_eq!(events[1].commit, "c3");
+
+    assert_eq!(events[2].event_type, LifelineEventKind::Reintroduced);
+    assert_eq!(events[2].commit, "c4");
 }
