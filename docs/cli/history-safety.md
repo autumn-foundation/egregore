@@ -1,6 +1,6 @@
 # Git History and Scan Safety Guarantees
 
-Egregore guarantees that scanning operations (`eg scan` and `eg scan-history`) are strictly read-only and safe to run on active, dirty working trees. They will never mutate the repository's Git state or modify files in the working directory.
+Egregore guarantees that scanning operations (`eg scan` and `eg scan-history`) are strictly read-only and safe to run on active, dirty working trees. They will never mutate the repository's Git state or modify any files in the working directory, with the sole exception of writing the requested `--out` file.
 
 ## Guarantees
 
@@ -18,5 +18,6 @@ Both commands are fully offline and run with no network access.
 
 ## Out of Scope
 
+- **Output File Writes**: The command will write the final serialized JSONL graph to the path supplied in the `--out` flag, creating or overwriting that file. If the path specified by `--out` lives inside the repository directory, it will modify that file in the working tree. For a completely mutation-free run, specify an `--out` file path located outside the repository root.
 - **Ingestion and Query paths**: Commands like `eg ingest` and `eg query` are out of scope for these git repo guarantees. They write metadata, indexes, and nodes to an explicitly supplied `--data-dir` external to the tracked Git state.
 - **Incremental Cache**: `eg refresh` reads working-tree edits as input and caches results under `--data-dir`, but does not mutate the git repository itself.
