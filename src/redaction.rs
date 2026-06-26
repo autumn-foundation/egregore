@@ -626,8 +626,8 @@ fn env_key_start(value: &str, eq_pos: usize) -> usize {
 
 fn find_email(value: &str) -> Option<usize> {
     const BLOCKED_EXTENSIONS: &[&str] = &[
-        "py", "js", "go", "ts", "cpp", "rb", "json", "yaml", "yml", "toml", "txt", "html", "css",
-        "bat", "lock", "class",
+        "js", "go", "ts", "cpp", "rb", "json", "yaml", "yml", "toml", "txt", "html", "css", "bat",
+        "lock", "class",
     ];
 
     for (idx, c) in value.char_indices() {
@@ -644,6 +644,15 @@ fn find_email(value: &str) -> Option<usize> {
                 continue;
             }
 
+            // Context-aware check: reject if username is preceded by a path separator
+            let start_idx = idx - username_len;
+            if start_idx > 0 {
+                let prev_char = value[..start_idx].chars().next_back();
+                if prev_char == Some('/') || prev_char == Some('\\') {
+                    continue;
+                }
+            }
+
             // Parse domain walking forward
             let after = &value[idx + 1..];
             let mut domain_len = 0;
@@ -654,6 +663,13 @@ fn find_email(value: &str) -> Option<usize> {
                     break;
                 }
             }
+
+            // Context-aware check: reject if domain is followed by a path separator
+            let next_char = after[domain_len..].chars().next();
+            if next_char == Some('/') || next_char == Some('\\') {
+                continue;
+            }
+
             let domain_str = &after[..domain_len];
             let labels: Vec<&str> = domain_str.split('.').collect();
 
@@ -662,7 +678,7 @@ fn find_email(value: &str) -> Option<usize> {
                 if last_label.len() >= 2 && last_label.chars().all(|c| c.is_ascii_alphabetic()) {
                     let tld_lower = last_label.to_lowercase();
                     if !BLOCKED_EXTENSIONS.contains(&tld_lower.as_str()) {
-                        return Some(idx - username_len);
+                        return Some(start_idx);
                     }
                 }
             }

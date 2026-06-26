@@ -2797,6 +2797,114 @@ pub fn who_last_changed<'records>(
         let mut matches =
             symbol_as_of_valid_time_by_repo(records, symbol_name, as_of, index, repo)?;
 
+        // Filter matches to only include live symbols in their repository lineage at as_of
+        matches.retain(|r| {
+            let Some(repo_id) = index.owner_of(r.id()) else {
+                return true; // legacy/unattributed repository, keep it
+            };
+
+            // Find HEAD commit of repo_id
+            let mut head_sha = None;
+            for record in records {
+                if let GraphRecord::Node {
+                    kind: NodeKind::Repository,
+                    id,
+                    source_snapshot: Some(snapshot),
+                    ..
+                } = record
+                {
+                    if id == repo_id {
+                        if let SnapshotHead::Commit { sha } = &snapshot.head {
+                            head_sha = Some(sha.as_str());
+                        }
+                        break;
+                    }
+                }
+            }
+
+            let Some(start_sha) = head_sha else {
+                return true; // no git context/head commit, keep it
+            };
+
+            // Traverse ancestry from start_sha
+            let mut visited = HashSet::new();
+            let mut queue = VecDeque::new();
+            queue.push_back(start_sha);
+
+            while let Some(sha) = queue.pop_front() {
+                if visited.insert(sha) {
+                    if let Some(parents) = commit_parents.get(sha) {
+                        for parent in *parents {
+                            let p_str = parent.as_str();
+                            if !visited.contains(p_str) {
+                                queue.push_back(p_str);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Filter by as_of_time
+            let filtered_lineage = if let Some(as_of_t) = as_of_time {
+                let Ok(as_of_dt) = DateTime::parse_from_rfc3339(as_of_t) else {
+                    return false; // invalid timestamp format
+                };
+                let mut filtered = HashSet::new();
+                for sha in visited {
+                    if let Some(c_nodes) = commit_nodes.get(sha) {
+                        let has_valid_node = c_nodes.iter().any(|c_node| {
+                            let owner = index.owner_of(c_node.id());
+                            if owner.is_some_and(|o| o != repo_id) {
+                                return false;
+                            }
+                            if let GraphRecord::Node {
+                                temporal: Some(t), ..
+                            } = c_node
+                            {
+                                if let Ok(vt) = DateTime::parse_from_rfc3339(&t.valid_time) {
+                                    return vt <= as_of_dt;
+                                }
+                            }
+                            false
+                        });
+                        if has_valid_node {
+                            filtered.insert(sha);
+                        }
+                    }
+                }
+                filtered
+            } else {
+                visited
+            };
+
+            // Find lineage_head (latest commit in the lineage)
+            let lineage_head = filtered_lineage
+                .iter()
+                .max_by_key(|&&sha| commit_order.rank(sha))
+                .copied();
+
+            let Some(head_commit_sha) = lineage_head else {
+                return false; // no commits in lineage at this time
+            };
+
+            // Check if there is a Symbol node for symbol_name at head_commit_sha owned by repo_id
+            records.iter().any(|rec| {
+                if let GraphRecord::Node {
+                    kind: NodeKind::Symbol,
+                    name,
+                    temporal: Some(t),
+                    ..
+                } = rec
+                {
+                    if name.as_deref() == Some(symbol_name) && t.git_commit == head_commit_sha {
+                        let owner = index.owner_of(rec.id());
+                        return owner.is_none_or(|o| o == repo_id);
+                    }
+                }
+                false
+            })
+        });
+
         // Suppress tombstoned symbol nodes for active HEAD / current-state queries
         if as_of_time.is_none() {
             matches.retain(|r| !tombstoned_ids.contains(r.id()));

@@ -962,9 +962,32 @@ fn redact_value_email_address() {
 
 #[test]
 fn detect_email_address_with_valid_extensions() {
-    for email in &["alice@example.rs", "bob@example.md", "dev@project.sh"] {
+    for email in &[
+        "alice@example.rs",
+        "bob@example.md",
+        "dev@project.sh",
+        "alice@example.py",
+    ] {
         let (class, _) =
             detect_secret(email).unwrap_or_else(|| panic!("email {email} must be detected"));
         assert_eq!(class, SecretClass::Email);
+    }
+}
+
+#[test]
+fn detect_email_address_context_aware_path_checks() {
+    let paths = &[
+        "foo/bar@latest/module.py",
+        "some_dep@1.0.0/src/file.js",
+        "/src/foo@bar.py",
+        "C:\\src\\foo@bar.py",
+        "foo@bar.py/baz",
+        "foo@bar.py\\baz",
+    ];
+    for path in paths {
+        assert!(
+            detect_secret(path).is_none() || detect_secret(path).unwrap().0 != SecretClass::Email,
+            "path {path} must NOT be detected as email"
+        );
     }
 }

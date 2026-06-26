@@ -1139,3 +1139,243 @@ fn fixture_graph_for_duplicate_commits() -> (tempfile::TempDir, PathBuf) {
 
     (temp, path)
 }
+
+#[test]
+fn test_query_who_deleted_symbol_not_found() {
+    let (_temp, graph_path) = fixture_graph_for_deleted_symbol();
+
+    // 1. Querying at HEAD (current HEAD is commit2_sha where the symbol is deleted) should fail (exit 2)
+    egregore()
+        .args(["query", "who", "scan_repository", "--graph"])
+        .arg(&graph_path)
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "error: no match found for symbol `scan_repository`",
+        ));
+
+    // 2. Querying --as-of 2026-01-01 (before deletion) should succeed and return Alice
+    let output = egregore()
+        .args(["query", "who", "scan_repository", "--graph"])
+        .arg(&graph_path)
+        .arg("--as-of")
+        .arg("2026-01-01T12:00:00Z")
+        .arg("--format")
+        .arg("text")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).expect("utf8");
+    assert!(text.contains(
+        "scan_repository last changed by Alice <alice@example.com> in commit commit1_sha"
+    ));
+}
+
+#[allow(clippy::too_many_lines)]
+fn fixture_graph_for_deleted_symbol() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("graph.jsonl");
+
+    let repo_id = stable_id(&["node", "Repository", "my_repo"]);
+
+    // Commit 2 is HEAD
+    let repo_node = GraphRecord::node(
+        repo_id.clone(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("my_repo".to_owned()),
+        "Repository my_repo".to_owned(),
+    )
+    .with_source_snapshot(aletheia_egregore::SourceSnapshotPayload {
+        head: aletheia_egregore::SnapshotHead::Commit {
+            sha: "commit2_sha".to_owned(),
+        },
+        dirty: false,
+        repository_id: repo_id.clone(),
+        scanned_at: "2026-01-02T12:00:00Z".to_owned(),
+    });
+
+    let file_id = stable_id(&["node", "File", "src/lib.rs"]);
+    let file_node = GraphRecord::syntax_node(
+        file_id.clone(),
+        NodeKind::File,
+        "src/lib.rs".to_owned(),
+        span(1, 50),
+        "lib.rs".to_owned(),
+        "rust",
+        "Source file src/lib.rs".to_owned(),
+    );
+
+    // Symbol node is only defined at Commit 1
+    let sym_id_a = stable_id(&[
+        "node",
+        "Symbol",
+        "src/lib.rs",
+        "scan_repository",
+        "commit1_sha",
+    ]);
+    let sym_node_a = GraphRecord::symbol(
+        sym_id_a.clone(),
+        "fn",
+        "src/lib.rs".to_owned(),
+        span(10, 20),
+        "scan_repository".to_owned(),
+        "Rust function scan_repository at commit 1".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "commit1_sha".to_owned(),
+        git_parent_commits: vec![],
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
+    });
+
+    let defines_edge_a = GraphRecord::edge(
+        aletheia_egregore::EdgeLabel::Defines,
+        file_id,
+        sym_id_a,
+        Some("1.0".to_owned()),
+        "file defines symbol".to_owned(),
+    );
+
+    let contains_edge = GraphRecord::edge(
+        aletheia_egregore::EdgeLabel::Contains,
+        repo_id.clone(),
+        file_node.id().to_owned(),
+        None,
+        "contains file".to_owned(),
+    );
+
+    // Commit 1: Alice at 2026-01-01
+    let commit1_id = stable_id(&["node", "Commit", "my_repo", "commit1_sha"]);
+    let commit1 = GraphRecord::node(
+        commit1_id,
+        NodeKind::Commit,
+        None,
+        None,
+        Some("commit1_sha".to_owned()),
+        "Commit 1".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "commit1_sha".to_owned(),
+        git_parent_commits: vec![],
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
+    })
+    .with_author(
+        Some("Alice".to_owned()),
+        Some("alice@example.com".to_owned()),
+    );
+
+    // Change 1: in commit 1, modifying src/lib.rs
+    let change1_id = stable_id(&[
+        "node",
+        "Change",
+        "my_repo",
+        "commit1_sha",
+        "M",
+        "src/lib.rs",
+    ]);
+    let change1 = GraphRecord::node(
+        change1_id,
+        NodeKind::Change,
+        Some("src/lib.rs".to_owned()),
+        None,
+        None,
+        "change 1".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "commit1_sha".to_owned(),
+        git_parent_commits: vec![],
+        valid_time: "2026-01-01T00:00:00Z".to_owned(),
+        author_time: Some("2026-01-01T00:00:00Z".to_owned()),
+        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+        valid_time_source: None,
+    });
+
+    // Commit 2: Bob at 2026-01-02 (deletes the symbol, but modifies file)
+    let commit2_id = stable_id(&["node", "Commit", "my_repo", "commit2_sha"]);
+    let commit2 = GraphRecord::node(
+        commit2_id,
+        NodeKind::Commit,
+        None,
+        None,
+        Some("commit2_sha".to_owned()),
+        "Commit 2".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "commit2_sha".to_owned(),
+        git_parent_commits: vec!["commit1_sha".to_owned()],
+        valid_time: "2026-01-02T00:00:00Z".to_owned(),
+        author_time: Some("2026-01-02T00:00:00Z".to_owned()),
+        observed_at: "2026-01-02T00:00:00Z".to_owned(),
+        valid_time_source: None,
+    })
+    .with_author(Some("Bob".to_owned()), Some("bob@example.com".to_owned()));
+
+    // Change 2: in commit 2, modifying src/lib.rs
+    let change2_id = stable_id(&[
+        "node",
+        "Change",
+        "my_repo",
+        "commit2_sha",
+        "M",
+        "src/lib.rs",
+    ]);
+    let change2 = GraphRecord::node(
+        change2_id,
+        NodeKind::Change,
+        Some("src/lib.rs".to_owned()),
+        None,
+        None,
+        "change 2".to_owned(),
+    )
+    .with_temporal(TemporalMetadata {
+        git_commit: "commit2_sha".to_owned(),
+        git_parent_commits: vec!["commit1_sha".to_owned()],
+        valid_time: "2026-01-02T00:00:00Z".to_owned(),
+        author_time: Some("2026-01-02T00:00:00Z".to_owned()),
+        observed_at: "2026-01-02T00:00:00Z".to_owned(),
+        valid_time_source: None,
+    });
+
+    let contains_commit1 = GraphRecord::edge(
+        aletheia_egregore::EdgeLabel::Contains,
+        repo_id.clone(),
+        commit1.id().to_owned(),
+        None,
+        "contains commit 1".to_owned(),
+    );
+    let contains_commit2 = GraphRecord::edge(
+        aletheia_egregore::EdgeLabel::Contains,
+        repo_id,
+        commit2.id().to_owned(),
+        None,
+        "contains commit 2".to_owned(),
+    );
+
+    let mut graph = Graph::new();
+    graph.push(repo_node);
+    graph.push(file_node);
+    graph.push(sym_node_a);
+    graph.push(defines_edge_a);
+    graph.push(contains_edge);
+    graph.push(contains_commit1);
+    graph.push(contains_commit2);
+    graph.push(commit1);
+    graph.push(change1);
+    graph.push(commit2);
+    graph.push(change2);
+
+    let jsonl = graph.to_jsonl().expect("serialize graph");
+    fs::write(&path, jsonl).expect("write fixture");
+
+    (temp, path)
+}
