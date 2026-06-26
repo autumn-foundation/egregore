@@ -2258,7 +2258,11 @@ fn scan_history(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) ->
         .status()
         .is_ok_and(|s| s.success());
     if !git_available {
-        eprintln!(r#"{{"code":"git_unavailable","message":"git command not found in PATH"}}"#);
+        let diag = serde_json::json!({
+            "code": "git_unavailable",
+            "message": "git command not found in PATH"
+        });
+        eprintln!("{}", serde_json::to_string(&diag).unwrap_or_default());
         std::process::exit(2);
     }
 
@@ -2274,10 +2278,11 @@ fn scan_history(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) ->
         .status()
         .is_ok_and(|s| s.success());
     if !is_git_repo {
-        eprintln!(
-            r#"{{"code":"not_a_git_repository","message":"path is not a git repository: {}"}}"#,
-            repo_path.display()
-        );
+        let diag = serde_json::json!({
+            "code": "not_a_git_repository",
+            "message": format!("path is not a git repository: {}", repo_path.display())
+        });
+        eprintln!("{}", serde_json::to_string(&diag).unwrap_or_default());
         std::process::exit(2);
     }
 
@@ -2293,9 +2298,11 @@ fn scan_history(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) ->
         .status()
         .is_ok_and(|s| s.success());
     if !git_history_readable {
-        eprintln!(
-            r#"{{"code":"git_history_unreadable","message":"git history is not readable (e.g. repository has no commits)"}}"#
-        );
+        let diag = serde_json::json!({
+            "code": "git_history_unreadable",
+            "message": "git history is not readable (e.g. repository has no commits)"
+        });
+        eprintln!("{}", serde_json::to_string(&diag).unwrap_or_default());
         std::process::exit(2);
     }
 
