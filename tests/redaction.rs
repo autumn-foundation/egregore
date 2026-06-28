@@ -1001,3 +1001,15 @@ fn detect_email_address_with_punycode_tld() {
     let redacted = redact_value(email);
     assert!(redacted.starts_with("<REDACTED:email:"));
 }
+
+#[test]
+fn detect_email_address_with_trailing_punctuation() {
+    for email in &[
+        "Please contact alice@example.com.",
+        "Please contact alice@example.com...",
+        "Please contact alice@example.com-",
+    ] {
+        let (class, _) = detect_secret(email).expect("email with trailing punctuation must be detected");
+        assert_eq!(class, SecretClass::Email);
+    }
+}

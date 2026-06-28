@@ -670,7 +670,10 @@ fn find_email(value: &str) -> Option<usize> {
                 continue;
             }
 
-            let domain_str = &after[..domain_len];
+            let mut domain_str = &after[..domain_len];
+            while domain_str.ends_with('.') || domain_str.ends_with('-') {
+                domain_str = &domain_str[..domain_str.len() - 1];
+            }
             let labels: Vec<&str> = domain_str.split('.').collect();
 
             if labels.len() >= 2 && labels.iter().all(|l| !l.is_empty()) {
