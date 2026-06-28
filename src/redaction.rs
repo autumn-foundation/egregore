@@ -675,7 +675,15 @@ fn find_email(value: &str) -> Option<usize> {
 
             if labels.len() >= 2 && labels.iter().all(|l| !l.is_empty()) {
                 let last_label = labels.last().unwrap();
-                if last_label.len() >= 2 && last_label.chars().all(|c| c.is_ascii_alphabetic()) {
+                let is_punycode = last_label.to_lowercase().starts_with("xn--")
+                    && last_label.len() >= 6
+                    && last_label[4..]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-');
+                let is_alphabetic =
+                    last_label.len() >= 2 && last_label.chars().all(|c| c.is_ascii_alphabetic());
+
+                if is_alphabetic || is_punycode {
                     let tld_lower = last_label.to_lowercase();
                     if !BLOCKED_EXTENSIONS.contains(&tld_lower.as_str()) {
                         return Some(start_idx);

@@ -991,3 +991,13 @@ fn detect_email_address_context_aware_path_checks() {
         );
     }
 }
+
+#[test]
+fn detect_email_address_with_punycode_tld() {
+    let email = "alice@example.xn--p1ai";
+    let (class, _) = detect_secret(email).expect("punycode email must be detected");
+    assert_eq!(class, SecretClass::Email);
+
+    let redacted = redact_value(email);
+    assert!(redacted.starts_with("<REDACTED:email:"));
+}
