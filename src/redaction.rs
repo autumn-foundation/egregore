@@ -669,6 +669,12 @@ fn find_email(value: &str) -> Option<usize> {
             if next_char == Some('/') || next_char == Some('\\') {
                 continue;
             }
+            if next_char == Some(':') {
+                let after_colon = after[domain_len + 1..].chars().next();
+                if after_colon.is_some_and(|ch| !ch.is_whitespace()) {
+                    continue;
+                }
+            }
 
             let mut domain_str = &after[..domain_len];
             while domain_str.ends_with('.') || domain_str.ends_with('-') {

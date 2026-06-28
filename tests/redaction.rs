@@ -1013,3 +1013,17 @@ fn detect_email_address_with_trailing_punctuation() {
         assert_eq!(class, SecretClass::Email);
     }
 }
+
+#[test]
+fn detect_none_ssh_remotes() {
+    for remote in &[
+        "git@github.com:org/repo",
+        "git@gitlab.com:user/project.git",
+        "user@host:8080",
+    ] {
+        assert!(
+            detect_secret(remote).is_none() || detect_secret(remote).unwrap().0 != SecretClass::Email,
+            "SSH remote {remote} must NOT be detected as email"
+        );
+    }
+}

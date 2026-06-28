@@ -2780,7 +2780,7 @@ pub fn who_last_changed<'records>(
                 commit_nodes.get(sha).is_some_and(|c_nodes| {
                     c_nodes.iter().any(|c_node| {
                         let owner = index.owner_of(c_node.id());
-                        owner == Some(repo_id) || owner.is_none()
+                        owner == Some(repo_id)
                     })
                 })
             });
@@ -3118,7 +3118,7 @@ pub fn who_last_changed<'records>(
                     commit_nodes.get(sha).is_some_and(|c_nodes| {
                         c_nodes.iter().any(|c_node| {
                             let owner = index.owner_of(c_node.id());
-                            owner == Some(repo_id) || owner.is_none()
+                            owner == Some(repo_id)
                         })
                     })
                 });
@@ -3337,7 +3337,7 @@ pub fn who_last_changed<'records>(
                         .iter()
                         .find(|c_node| {
                             let owner = index.owner_of(c_node.id());
-                            owner == Some(repo_id) || owner.is_none()
+                            owner == Some(repo_id)
                         })
                         .copied()
                 },
