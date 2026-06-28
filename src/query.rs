@@ -2720,6 +2720,7 @@ pub fn symbol_as_of_valid_time_by_repo<'records>(
 /// # Errors
 ///
 /// Returns an error string when a temporal selector is malformed or the requested commit is not found.
+#[allow(clippy::option_if_let_else)]
 pub fn who_last_changed<'records>(
     records: &'records [GraphRecord],
     symbol_name: &str,
@@ -2939,12 +2940,24 @@ pub fn who_last_changed<'records>(
         return Ok(None);
     };
 
-    let GraphRecord::Node {
-        repo_relative_path: Some(_),
-        ..
-    } = symbol_node
-    else {
-        return Ok(None);
+    let (target_symbol_kind, target_disambiguator, target_file_path, start_sha) = {
+        if let GraphRecord::Node {
+            symbol_kind,
+            disambiguator,
+            repo_relative_path: Some(path),
+            temporal: Some(t),
+            ..
+        } = symbol_node
+        {
+            (
+                symbol_kind.as_deref(),
+                *disambiguator,
+                path.as_str(),
+                t.git_commit.as_str(),
+            )
+        } else {
+            return Ok(None);
+        }
     };
 
     let target_repo_id = index.owner_of(symbol_node.id());
@@ -3114,15 +3127,183 @@ pub fn who_last_changed<'records>(
         }
     };
 
-    // Helper to find the symbol node at a specific commit SHA that matches target repo
+    let get_matching_symbols = |commit_sha: &str| -> Vec<&GraphRecord> {
+        symbol_by_commit_and_name
+            .get(&(commit_sha, symbol_name))
+            .map(|syms| {
+                syms.iter()
+                    .filter(|sym| {
+                        let owner = index.owner_of(sym.id());
+                        if owner.is_some() && owner != target_repo_id {
+                            return false;
+                        }
+                        if let GraphRecord::Node {
+                            symbol_kind,
+                            disambiguator,
+                            ..
+                        } = sym
+                        {
+                            if symbol_kind.as_deref() != target_symbol_kind {
+                                return false;
+                            }
+                            if *disambiguator != target_disambiguator {
+                                return false;
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let mut symbol_path_by_commit: HashMap<&str, &str> = HashMap::new();
+    symbol_path_by_commit.insert(start_sha, target_file_path);
+
+    let mut path_queue = VecDeque::new();
+    path_queue.push_back(start_sha);
+
+    let mut path_visited = HashSet::new();
+
+    while let Some(sha) = path_queue.pop_front() {
+        if !path_visited.insert(sha) {
+            continue;
+        }
+
+        let Some(&current_path) = symbol_path_by_commit.get(sha) else {
+            continue;
+        };
+
+        if let Some(parents) = commit_parents.get(sha) {
+            for parent in *parents {
+                let parent_sha = parent.as_str();
+                if !candidate_commit_shas.contains(parent_sha) {
+                    continue;
+                }
+                if symbol_path_by_commit.contains_key(parent_sha) {
+                    path_queue.push_back(parent_sha);
+                    continue;
+                }
+
+                let parent_syms = get_matching_symbols(parent_sha);
+
+                let parent_path = if let Some(p_sym) = parent_syms.iter().find(|s| {
+                    if let GraphRecord::Node {
+                        repo_relative_path: Some(path),
+                        ..
+                    } = s
+                    {
+                        path.as_str() == current_path
+                    } else {
+                        false
+                    }
+                }) {
+                    if let GraphRecord::Node {
+                        repo_relative_path: Some(path),
+                        ..
+                    } = p_sym
+                    {
+                        Some(path.as_str())
+                    } else {
+                        None
+                    }
+                } else if parent_syms.len() == 1 {
+                    if let GraphRecord::Node {
+                        repo_relative_path: Some(path),
+                        ..
+                    } = parent_syms[0]
+                    {
+                        Some(path.as_str())
+                    } else {
+                        None
+                    }
+                } else if !parent_syms.is_empty() {
+                    let mut found_path = None;
+                    for p_sym in &parent_syms {
+                        if let GraphRecord::Node {
+                            repo_relative_path: Some(p_path),
+                            ..
+                        } = p_sym
+                        {
+                            let has_change = records.iter().any(|rec| {
+                                if let GraphRecord::Node {
+                                    kind: NodeKind::Change,
+                                    repo_relative_path: Some(change_path),
+                                    temporal: Some(t_change),
+                                    ..
+                                } = rec
+                                {
+                                    t_change.git_commit == sha && change_path == p_path
+                                } else {
+                                    false
+                                }
+                            });
+                            if has_change {
+                                found_path = Some(p_path.as_str());
+                                break;
+                            }
+                        }
+                    }
+                    found_path.or_else(|| {
+                        if let GraphRecord::Node {
+                            repo_relative_path: Some(p_path),
+                            ..
+                        } = parent_syms[0]
+                        {
+                            Some(p_path.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
+
+                if let Some(path) = parent_path {
+                    symbol_path_by_commit.insert(parent_sha, path);
+                    path_queue.push_back(parent_sha);
+                }
+            }
+        }
+    }
+
+    // Helper to find the symbol node at a specific commit SHA that matches target repo, kind, disambiguator, and tracked path
     let get_symbol_node = |commit_sha: &str| -> Option<&GraphRecord> {
+        let tracked_path = symbol_path_by_commit.get(commit_sha).copied();
         symbol_by_commit_and_name
             .get(&(commit_sha, symbol_name))
             .and_then(|syms| {
                 syms.iter()
                     .find(|sym| {
                         let owner = index.owner_of(sym.id());
-                        owner.is_none() || owner == target_repo_id
+                        if owner.is_some() && owner != target_repo_id {
+                            return false;
+                        }
+                        if let GraphRecord::Node {
+                            symbol_kind,
+                            disambiguator,
+                            repo_relative_path,
+                            ..
+                        } = sym
+                        {
+                            if symbol_kind.as_deref() != target_symbol_kind {
+                                return false;
+                            }
+                            if *disambiguator != target_disambiguator {
+                                return false;
+                            }
+                            if tracked_path.is_some()
+                                && repo_relative_path.as_deref() != tracked_path
+                            {
+                                return false;
+                            }
+                            true
+                        } else {
+                            false
+                        }
                     })
                     .copied()
             })
