@@ -97,7 +97,7 @@ fn git_tracked_files(repo_root: &Path) -> Option<Vec<PathBuf>> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8(output.stdout).ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
     Some(
         text.split('\0')
             .filter(|line| !line.is_empty())
@@ -127,7 +127,7 @@ fn git_count_skipped_files(repo_root: &Path) -> Option<(usize, usize, usize, usi
         if !output.status.success() {
             return None;
         }
-        let text = String::from_utf8(output.stdout).ok()?;
+        let text = String::from_utf8_lossy(&output.stdout);
         for line in text.split('\0') {
             if line.is_empty() {
                 continue;
@@ -247,9 +247,7 @@ fn git_ignored_dir_prefixes(repo_root: &Path) -> HashSet<PathBuf> {
     if !output.status.success() {
         return HashSet::new();
     }
-    let Ok(text) = String::from_utf8(output.stdout) else {
-        return HashSet::new();
-    };
+    let text = String::from_utf8_lossy(&output.stdout);
     text.split('\0')
         .filter(|line| !line.is_empty())
         .map(|l| {
@@ -353,7 +351,7 @@ fn git_check_ignored(repo_root: &Path, rels: &[String]) -> Option<HashSet<String
     if code != Some(0) && code != Some(1) {
         return None;
     }
-    let text = String::from_utf8(output.stdout).ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
     Some(
         text.split('\0')
             .filter(|line| !line.is_empty())

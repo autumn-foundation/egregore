@@ -498,7 +498,7 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8(output.stdout).ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
     
     // Check if there are any dirty changes: modifications to tracked files,
     // or new untracked .gitignore files. Untracked source files are ignored.
