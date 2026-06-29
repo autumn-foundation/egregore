@@ -231,6 +231,10 @@ pub fn scrub_record(mut record: GraphRecord) -> GraphRecord {
         body_handle,
         diff_hunk_handle,
         user_context,
+        author_email,
+        author_name,
+        title,
+        summary,
         ..
     } = &mut record
     {
@@ -270,7 +274,30 @@ pub fn scrub_record(mut record: GraphRecord) -> GraphRecord {
         user_context.rule_text = None;
         user_context.action_summary = None;
         user_context.constraint_text = None;
+
+        // 4. Redact author email
+        if let Some(email) = author_email {
+            let hash = blake3::hash(email.as_bytes());
+            let hex = hash.to_hex();
+            let prefix = &hex.as_str()[..12];
+            *author_email = Some(format!("<REDACTED:email:{prefix}>"));
+        }
+
+        // 5. Redact other preserved text/metadata fields
+        if let Some(t) = title {
+            *t = crate::redaction::redact_value(t);
+        }
+        if let Some(name) = author_name {
+            *name = crate::redaction::redact_value(name);
+        }
+        *summary = crate::redaction::redact_value(summary);
     }
+
+    // Also scrub Edge summaries
+    if let GraphRecord::Edge { summary, .. } = &mut record {
+        *summary = crate::redaction::redact_value(summary);
+    }
+
     record
 }
 
@@ -695,6 +722,19 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
     let mut safety_msg = "No raw protected payload classes or unredacted secrets found".to_owned();
 
     for br in &bundle.records {
+        let record_id = br.record.id();
+
+        // Check for unredacted secrets in any part of the record (Node, Edge, Tombstone, etc.)
+        let serialized = serde_json::to_string(&br.record).unwrap_or_default();
+        if let Some((class, _)) = crate::redaction::detect_secret(&serialized) {
+            safety_passed = false;
+            let class_str = class.as_str();
+            safety_msg = format!(
+                "Safety failure: record {record_id} contains unredacted secret class: {class_str}"
+            );
+            break;
+        }
+
         if let GraphRecord::Node {
             text,
             validation_summary,
@@ -710,8 +750,6 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
             ..
         } = &br.record
         {
-            let record_id = br.record.id();
-
             // Assert that raw prose fields are None
             if text.is_some() {
                 safety_passed = false;
@@ -784,17 +822,6 @@ pub fn verify_bundle(bundle: &EvidenceBundle) -> VerificationReport {
                 safety_passed = false;
                 safety_msg = format!(
                     "Safety failure: record {record_id} contains unscrubbed user context fields"
-                );
-                break;
-            }
-
-            // Check for unredacted secrets in any part of the record (e.g. metadata or display name, etc.)
-            let serialized = serde_json::to_string(&br.record).unwrap_or_default();
-            if let Some((class, _)) = crate::redaction::detect_secret(&serialized) {
-                safety_passed = false;
-                let class_str = class.as_str();
-                safety_msg = format!(
-                    "Safety failure: record {record_id} contains unredacted secret class: {class_str}"
                 );
                 break;
             }

@@ -50,6 +50,8 @@ pub enum SecretClass {
     SessionCookie,
     /// `.env`-style `KEY=VALUE` whose key matches the secret-name allowlist.
     EnvSecret,
+    /// Email addresses (PII).
+    Email,
 }
 
 impl SecretClass {
@@ -64,6 +66,7 @@ impl SecretClass {
             Self::WebhookSecret => "webhook_secret",
             Self::SessionCookie => "session_cookie",
             Self::EnvSecret => "env_secret",
+            Self::Email => "email",
         }
     }
 }
@@ -87,6 +90,7 @@ pub fn detect_secret(value: &str) -> Option<(SecretClass, usize)> {
         .or_else(|| find_webhook_secret(value).map(|p| (SecretClass::WebhookSecret, p)))
         .or_else(|| find_session_cookie(value).map(|p| (SecretClass::SessionCookie, p)))
         .or_else(|| find_api_token(value).map(|p| (SecretClass::ApiToken, p)))
+        .or_else(|| find_email(value).map(|p| (SecretClass::Email, p)))
         .or_else(|| find_env_secret(value).map(|p| (SecretClass::EnvSecret, p)))
 }
 
@@ -618,4 +622,84 @@ fn env_key_start(value: &str, eq_pos: usize) -> usize {
             let ch = value[p..].chars().next().unwrap_or(' ');
             p + ch.len_utf8()
         })
+}
+
+fn find_email(value: &str) -> Option<usize> {
+    const BLOCKED_EXTENSIONS: &[&str] = &[
+        "js", "go", "ts", "cpp", "rb", "json", "yaml", "yml", "toml", "txt", "html", "css", "bat",
+        "lock", "class",
+    ];
+
+    for (idx, c) in value.char_indices() {
+        if c == '@' {
+            let before = &value[..idx];
+            let username_len = before
+                .chars()
+                .rev()
+                .take_while(|&ch| {
+                    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '%' | '+' | '-')
+                })
+                .count();
+            if username_len == 0 {
+                continue;
+            }
+
+            // Context-aware check: reject if username is preceded by a path separator
+            let start_idx = idx - username_len;
+            if start_idx > 0 {
+                let prev_char = value[..start_idx].chars().next_back();
+                if prev_char == Some('/') || prev_char == Some('\\') {
+                    continue;
+                }
+            }
+
+            // Parse domain walking forward
+            let after = &value[idx + 1..];
+            let mut domain_len = 0;
+            for ch in after.chars() {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '.' {
+                    domain_len += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+
+            // Context-aware check: reject if domain is followed by a path separator
+            let next_char = after[domain_len..].chars().next();
+            if next_char == Some('/') || next_char == Some('\\') {
+                continue;
+            }
+            if next_char == Some(':') {
+                let after_colon = after[domain_len + 1..].chars().next();
+                if after_colon.is_some_and(|ch| !ch.is_whitespace()) {
+                    continue;
+                }
+            }
+
+            let mut domain_str = &after[..domain_len];
+            while domain_str.ends_with('.') || domain_str.ends_with('-') {
+                domain_str = &domain_str[..domain_str.len() - 1];
+            }
+            let labels: Vec<&str> = domain_str.split('.').collect();
+
+            if labels.len() >= 2 && labels.iter().all(|l| !l.is_empty()) {
+                let last_label = labels.last().unwrap();
+                let is_punycode = last_label.to_lowercase().starts_with("xn--")
+                    && last_label.len() >= 6
+                    && last_label[4..]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-');
+                let is_alphabetic =
+                    last_label.len() >= 2 && last_label.chars().all(|c| c.is_ascii_alphabetic());
+
+                if is_alphabetic || is_punycode {
+                    let tld_lower = last_label.to_lowercase();
+                    if !BLOCKED_EXTENSIONS.contains(&tld_lower.as_str()) {
+                        return Some(start_idx);
+                    }
+                }
+            }
+        }
+    }
+    None
 }

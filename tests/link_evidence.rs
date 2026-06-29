@@ -129,6 +129,8 @@ fn make_agent_memory_node(
         confidence: None,
         source_handle: Some("fixture:deadbeef".to_string()),
         redaction_policy_version: None,
+        author_name: None,
+        author_email: None,
         valid_time: None,
         valid_time_source: None,
         entity_id: None,

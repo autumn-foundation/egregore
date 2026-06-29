@@ -625,6 +625,42 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Find who last changed a symbol.
+    Who {
+        /// Symbol name to look up.
+        name: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir / --daemon).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Route the query through the running daemon (requires --data-dir, conflicts with --graph).
+        #[cfg(feature = "embedded-aletheiadb")]
+        #[arg(long, requires = "data_dir", conflicts_with = "graph")]
+        daemon: bool,
+        /// Restrict to the record at this commit SHA or unique prefix.
+        /// Shorthand for --as-of keyed by a Git SHA. Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Return the symbol state at the most recent commit at or before this
+        /// RFC 3339 instant (valid-time axis). Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Transaction-time selector (reserved, not yet implemented).
+        /// Returns a `not_implemented` error envelope rather than silently ignoring the flag.
+        #[arg(long)]
+        tx_as_of: Option<String>,
+        /// Restrict results to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Working-tree path to compute store freshness against.
+        #[arg(long)]
+        repo_path: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// List symbols defined in a file via DEFINES edges.
     File {
         /// Repository-relative file path.
@@ -3497,6 +3533,29 @@ impl<'a> SemanticResult<'a> {
     }
 }
 
+/// The query outcome containing info on who last changed a given symbol.
+#[derive(Serialize)]
+struct WhoResult<'a> {
+    /// Name of the queried symbol.
+    symbol_name: &'a str,
+    /// Git SHA of the commit that last changed the symbol's file.
+    commit_sha: &'a str,
+    /// Optional Git author display name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author_name: Option<&'a str>,
+    /// Optional Git author email address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author_email: Option<&'a str>,
+    /// Valid time when the commit was recorded.
+    valid_time: &'a str,
+    /// Repository-relative path to the file containing the symbol.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    /// Optional store-freshness code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness: Option<&'a str>,
+}
+
 // ---------------------------------------------------------------------------
 // Context query output types (issue #38)
 // ---------------------------------------------------------------------------
@@ -4085,6 +4144,119 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     )
                 },
             )
+        }
+        QuerySubcommand::Who {
+            name,
+            graph,
+            data_dir,
+            #[cfg(feature = "embedded-aletheiadb")]
+            daemon,
+            at,
+            as_of,
+            tx_as_of,
+            repo,
+            repo_path,
+            format,
+        } => {
+            if tx_as_of.is_some() {
+                eprintln!("error: --tx-as-of is not supported for query who");
+                std::process::exit(1);
+            }
+            #[cfg(feature = "embedded-aletheiadb")]
+            if daemon {
+                eprintln!("error: --daemon is not supported for query who");
+                std::process::exit(1);
+            }
+
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            let selected = selected.as_deref();
+
+            let freshness_code = query_freshness_code_with_hint(
+                &records,
+                repo_path.as_deref(),
+                &[graph.as_deref(), data_dir.as_deref()],
+                selected,
+            );
+
+            match query::who_last_changed(
+                &records,
+                &name,
+                at.as_deref(),
+                as_of.as_deref(),
+                &index,
+                selected,
+            ) {
+                Ok(Some((symbol_node, commit_node))) => {
+                    let (author_name, author_email) = if let GraphRecord::Node {
+                        author_name,
+                        author_email,
+                        ..
+                    } = commit_node
+                    {
+                        (author_name.as_deref(), author_email.as_deref())
+                    } else {
+                        (None, None)
+                    };
+
+                    let commit_sha = if let GraphRecord::Node {
+                        temporal: Some(t), ..
+                    } = commit_node
+                    {
+                        t.git_commit.as_str()
+                    } else {
+                        ""
+                    };
+
+                    let valid_time = if let GraphRecord::Node {
+                        temporal: Some(t), ..
+                    } = commit_node
+                    {
+                        t.valid_time.as_str()
+                    } else {
+                        ""
+                    };
+
+                    let repo_relative_path = if let GraphRecord::Node {
+                        repo_relative_path, ..
+                    } = symbol_node
+                    {
+                        repo_relative_path.as_deref()
+                    } else {
+                        None
+                    };
+
+                    let repository_id = index.owner_of(symbol_node.id());
+                    let freshness = freshness_code.as_ref().and_then(|(repo_id, code)| {
+                        if repository_id == Some(repo_id.as_str()) {
+                            Some(*code)
+                        } else {
+                            None
+                        }
+                    });
+
+                    let result = WhoResult {
+                        symbol_name: &name,
+                        commit_sha,
+                        author_name,
+                        author_email,
+                        valid_time,
+                        repo_relative_path,
+                        freshness,
+                    };
+                    print_result(&result, format)?;
+                    Ok(())
+                }
+                Ok(None) => {
+                    eprintln!("error: no match found for symbol `{name}`");
+                    std::process::exit(2);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         QuerySubcommand::File {
             path,
@@ -9559,6 +9731,25 @@ impl PrintText for SemanticResult<'_> {
         let path = self.repo_relative_path.unwrap_or("(unknown)");
         let line = self.span.map_or(0, |s| s.start_line);
         format!("{name} score={:.4} @ {path}:{line}", self.score)
+    }
+}
+
+impl PrintText for WhoResult<'_> {
+    fn as_text(&self) -> String {
+        let author = match (self.author_name, self.author_email) {
+            (Some(name), Some(email)) => format!("{name} <{email}>"),
+            (Some(name), None) => name.to_owned(),
+            (None, Some(email)) => format!("<{email}>"),
+            (None, None) => "unknown".to_owned(),
+        };
+        let path = self.repo_relative_path.unwrap_or("(unknown)");
+        let freshness = self
+            .freshness
+            .map_or(String::new(), |code| format!(" (freshness: {code})"));
+        format!(
+            "{} last changed by {} in commit {} @ {} ({}){}",
+            self.symbol_name, author, self.commit_sha, self.valid_time, path, freshness
+        )
     }
 }
 
