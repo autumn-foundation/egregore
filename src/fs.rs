@@ -36,7 +36,14 @@ pub fn discover_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
     if crate::identity::is_repo_root(repo_root) {
         if let Some(tracked) = git_tracked_files(repo_root) {
             for path in tracked {
-                if path.is_file() && languages::is_supported_source(&path) {
+                if !path.is_file() || !languages::is_supported_source(&path) {
+                    continue;
+                }
+                let Ok(rel) = repo_relative_path(repo_root, &path) else {
+                    continue;
+                };
+                let has_target_or_git = rel.split('/').any(|part| part == "target" || part == ".git");
+                if !has_target_or_git {
                     files.push(path);
                 }
             }
@@ -123,6 +130,10 @@ fn git_count_skipped_files(repo_root: &Path) -> Option<(usize, usize, usize, usi
         let text = String::from_utf8(output.stdout).ok()?;
         for line in text.split('\0') {
             if line.is_empty() {
+                continue;
+            }
+            let has_target_or_git = line.split('/').any(|part| part == "target" || part == ".git");
+            if has_target_or_git {
                 continue;
             }
             if let Some(ext) = Path::new(line).extension().and_then(OsStr::to_str) {
