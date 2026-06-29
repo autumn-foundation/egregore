@@ -31,29 +31,36 @@ pub struct SourceFile {
 /// Returns an error when directory traversal cannot read an entry or when a
 /// discovered source file cannot be relativized against the repository root.
 pub fn discover_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
-    // Pre-compute the set of gitignored directories so traversal can skip them
-    // entirely rather than descending into them and failing on unreadable content
-    // (PR #186 follow-up).  Purely filesystem-local for non-Git trees.
-    let ignored_dirs = if crate::identity::is_repo_root(repo_root) {
-        git_ignored_dir_prefixes(repo_root)
-    } else {
-        HashSet::new()
-    };
     let mut files = Vec::new();
-    collect_source_files(repo_root, &ignored_dirs, &mut files)?;
-    // Respect .gitignore so generated/ignored source files are not indexed (issue
-    // #82 / PR #186): a git-ignored file has no citable graph spans, and the
-    // read-only freshness probe (`git status`, which omits ignored files) then
-    // covers exactly the indexed set. No-op outside a Git work tree, preserving
-    // the filesystem-local behavior for non-Git trees and determinism for fixtures.
-    filter_git_ignored(repo_root, &mut files);
-    files.sort_by(|left, right| {
-        let left = normalize_path(left);
-        let right = normalize_path(right);
-        left.cmp(&right)
-    });
 
-    files
+    if crate::identity::is_repo_root(repo_root) {
+        if let Some(tracked) = git_tracked_files(repo_root) {
+            for path in tracked {
+                if path.is_file() && languages::is_supported_source(&path) {
+                    files.push(path);
+                }
+            }
+
+            // Report skipped files
+            let (skipped_rust_count, skipped_python_count, skipped_typescript_count, skipped_go_count) =
+                git_count_skipped_files(repo_root).unwrap_or((0, 0, 0, 0));
+
+            eprintln!(
+                "Skipped {skipped_rust_count} .rs, {skipped_python_count} .py, {skipped_typescript_count} .ts/.tsx, {skipped_go_count} .go files by ignore rules"
+            );
+        } else {
+            // Git command failed, fallback
+            let ignored_dirs = git_ignored_dir_prefixes(repo_root);
+            collect_source_files(repo_root, &ignored_dirs, &mut files)?;
+            filter_git_ignored(repo_root, &mut files);
+        }
+    } else {
+        // Fallback to pure filesystem walk for non-Git trees
+        let ignored_dirs = HashSet::new();
+        collect_source_files(repo_root, &ignored_dirs, &mut files)?;
+    }
+
+    let mut source_files: Vec<SourceFile> = files
         .into_iter()
         .map(|path| {
             let repo_relative_path = repo_relative_path(repo_root, &path)?;
@@ -62,7 +69,81 @@ pub fn discover_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
                 repo_relative_path,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    source_files.sort_by(|left, right| left.repo_relative_path.cmp(&right.repo_relative_path));
+    Ok(source_files)
+}
+
+fn git_tracked_files(repo_root: &Path) -> Option<Vec<PathBuf>> {
+    let output = Command::new("git")
+        .args(["-c", "core.excludesFile="])
+        .args(["-c", "core.quotePath=false"])
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-files", "-z"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(
+        text.split('\0')
+            .filter(|line| !line.is_empty())
+            .map(|line| repo_root.join(line))
+            .collect(),
+    )
+}
+
+fn git_count_skipped_files(repo_root: &Path) -> Option<(usize, usize, usize, usize)> {
+    let mut skipped_rust = 0;
+    let mut skipped_python = 0;
+    let mut skipped_typescript = 0;
+    let mut skipped_go = 0;
+
+    let mut process_output = |args: &[&str]| -> Option<()> {
+        let output = Command::new("git")
+            .args(["-c", "core.excludesFile="])
+            .args(["-c", "core.quotePath=false"])
+            .arg("-C")
+            .arg(repo_root)
+            .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        for line in text.split('\0') {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(ext) = Path::new(line).extension().and_then(OsStr::to_str) {
+                if ext.eq_ignore_ascii_case("rs") {
+                    skipped_rust += 1;
+                } else if ext.eq_ignore_ascii_case("py") {
+                    skipped_python += 1;
+                } else if ext.eq_ignore_ascii_case("ts") || ext.eq_ignore_ascii_case("tsx") {
+                    skipped_typescript += 1;
+                } else if ext.eq_ignore_ascii_case("go") {
+                    skipped_go += 1;
+                }
+            }
+        }
+        Some(())
+    };
+
+    process_output(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+    process_output(&["ls-files", "--others", "--ignored", "--exclude-standard", "-z"])?;
+
+    Some((skipped_rust, skipped_python, skipped_typescript, skipped_go))
 }
 
 fn collect_source_files(
@@ -81,18 +162,18 @@ fn collect_source_files(
             source,
         })?;
         let path = entry.path();
-        let metadata = entry
-            .metadata()
+        let file_type = entry
+            .file_type()
             .map_err(|source| CodegraphError::InspectPath {
                 path: path.clone(),
                 source,
             })?;
 
-        if metadata.is_dir() {
+        if file_type.is_dir() {
             if should_descend(&path) && !ignored_dirs.contains(&path) {
                 collect_source_files(&path, ignored_dirs, files)?;
             }
-        } else if metadata.is_file() && languages::is_supported_source(&path) {
+        } else if file_type.is_file() && languages::is_supported_source(&path) {
             files.push(path);
         }
     }
@@ -120,7 +201,7 @@ fn should_descend(path: &Path) -> bool {
     !path.join(".git").exists()
 }
 
-/// Runs `git ls-files --others --ignored --directory --exclude-standard` to
+/// Runs `git ls-files --others --ignored --directory --exclude-standard -z` to
 /// obtain the set of gitignored top-level directories.  Returns their absolute
 /// paths so callers can skip them during traversal without descending into
 /// potentially unreadable or very large subtrees.
@@ -134,6 +215,7 @@ fn git_ignored_dir_prefixes(repo_root: &Path) -> HashSet<PathBuf> {
         // different developer environments and must only honour repository-controlled
         // ignore rules (.gitignore, .git/info/exclude), not operator-specific globals.
         .args(["-c", "core.excludesFile="])
+        .args(["-c", "core.quotePath=false"])
         .arg("-C")
         .arg(repo_root)
         .args([
@@ -142,19 +224,31 @@ fn git_ignored_dir_prefixes(repo_root: &Path) -> HashSet<PathBuf> {
             "--ignored",
             "--directory",
             "--exclude-standard",
+            "-z",
         ])
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
     else {
         return HashSet::new();
     };
-    if !output.status.success() && output.status.code() != Some(1) {
+    if !output.status.success() {
         return HashSet::new();
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|l| repo_root.join(l.trim_end_matches('/')))
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return HashSet::new();
+    };
+    text.split('\0')
+        .filter(|line| !line.is_empty())
+        .map(|l| {
+            let clean_rel = l.trim_end_matches('/');
+            let mut path = repo_root.to_path_buf();
+            for part in clean_rel.split('/') {
+                path.push(part);
+            }
+            path
+        })
         .collect()
 }
 
@@ -187,10 +281,8 @@ fn filter_git_ignored(repo_root: &Path, files: &mut Vec<PathBuf>) {
     let rels: Vec<String> = files
         .iter()
         .map(|file| {
-            file.strip_prefix(repo_root)
-                .unwrap_or(file)
-                .to_string_lossy()
-                .into_owned()
+            let rel = file.strip_prefix(repo_root).unwrap_or(file);
+            normalize_path(rel)
         })
         .collect();
     let Some(ignored) = git_check_ignored(repo_root, &rels) else {
@@ -199,13 +291,12 @@ fn filter_git_ignored(repo_root: &Path, files: &mut Vec<PathBuf>) {
     if ignored.is_empty() {
         return;
     }
-    let mut kept = Vec::with_capacity(files.len());
-    for (file, rel) in files.iter().zip(rels.iter()) {
-        if !ignored.contains(rel) {
-            kept.push(file.clone());
-        }
-    }
-    *files = kept;
+    let mut idx = 0;
+    files.retain(|_| {
+        let keep = !ignored.contains(&rels[idx]);
+        idx += 1;
+        keep
+    });
 }
 
 /// Runs `git check-ignore -z --stdin` for `rels` under `repo_root`, returning the
@@ -220,6 +311,7 @@ fn git_check_ignored(repo_root: &Path, rels: &[String]) -> Option<HashSet<String
         // scan is reproducible across developer environments; only honour
         // repository-controlled rules (.gitignore, .git/info/exclude) (AA1).
         .args(["-c", "core.excludesFile="])
+        .args(["-c", "core.quotePath=false"])
         .arg("-C")
         .arg(repo_root)
         .args(["check-ignore", "-z", "--stdin"])
@@ -246,8 +338,8 @@ fn git_check_ignored(repo_root: &Path, rels: &[String]) -> Option<HashSet<String
     let _ = writer.join();
     let output = output?;
 
-    // 128 → not a Git repository / Git error: skip filtering entirely.
-    if output.status.code() == Some(128) {
+    let code = output.status.code();
+    if code != Some(0) && code != Some(1) {
         return None;
     }
     let text = String::from_utf8(output.stdout).ok()?;

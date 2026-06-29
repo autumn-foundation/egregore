@@ -155,10 +155,13 @@ fn git_is_repo_root(repo_root: &Path) -> bool {
     let Some(top_level) = git_top_level(repo_root) else {
         return false;
     };
-    let canonical_root =
-        std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    let canonical_top = std::fs::canonicalize(&top_level).unwrap_or(top_level);
-    canonical_root == canonical_top
+    if let (Ok(r1), Ok(r2)) = (std::fs::canonicalize(repo_root), std::fs::canonicalize(&top_level)) {
+        r1 == r2
+    } else {
+        let s1 = repo_root.to_string_lossy().replace('\\', "/").to_lowercase();
+        let s2 = top_level.to_string_lossy().replace('\\', "/").to_lowercase();
+        s1.trim_end_matches('/') == s2.trim_end_matches('/')
+    }
 }
 
 /// Outcome of the remote-URL probe: distinguishes "no remotes configured" from
@@ -274,9 +277,9 @@ pub(crate) fn is_local_remote_url(url: &str) -> bool {
         let host = extract_host_from_authority(after_scheme);
         return is_loopback_host(host);
     }
-    // No scheme: scp form ([user@]host:path) if ':' appears before any '/'.
+    // No scheme: scp form ([user@]host:path) if ':' appears before any '/' or '\'.
     // colon_pos > 1 rejects Windows drive letters like C:/repos (single-char prefix).
-    if let Some(colon_pos) = url.find(':').filter(|&p| p > 1 && !url[..p].contains('/')) {
+    if let Some(colon_pos) = url.find(':').filter(|&p| p > 1 && !url[..p].contains('/') && !url[..p].contains('\\')) {
         // scp form: [user@]host:path — portable unless the host is loopback.
         let host_field = &url[..colon_pos];
         let host = host_field.split('@').next_back().unwrap_or(host_field);
@@ -410,6 +413,7 @@ fn read_only_git(repo_root: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .args(["-c", "core.excludesFile="])
+        .args(["-c", "core.quotePath=false"])
         .arg("-C")
         .arg(repo_root)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -446,10 +450,8 @@ fn git_head_commit_sha(repo_root: &Path) -> Option<String> {
 /// as source dirtiness here either — neither can produce a cited span.
 fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
     let mut command = read_only_git(repo_root);
-    // `--untracked-files=all` overrides any `status.showUntrackedFiles=no` user
-    // config that would suppress `??` rows for untracked files. The scanner
-    // indexes untracked `.rs` files, so silently hiding them here would make a
-    // freshly added untracked source read as `fresh` (PR #186 follow-up).
+    // `--untracked-files=all` ensures we see untracked files so we can detect
+    // untracked .gitignore files (which affect ignore rules).
     // `--ignore-submodules=all` drops submodule state, which `git status` reports
     // by default but the scanner never indexes (HH1).
     command.args([
@@ -497,13 +499,34 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
         return None;
     }
     let text = String::from_utf8(output.stdout).ok()?;
+    
+    // Check if there are any dirty changes: modifications to tracked files,
+    // or new untracked .gitignore files. Untracked source files are ignored.
+    let mut has_dirty_changes = false;
+    for line in text.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let status = &line[..2];
+        let path = &line[3..];
+        if status == "??" {
+            if path == ".gitignore" || path.ends_with("/.gitignore") {
+                has_dirty_changes = true;
+                break;
+            }
+        } else {
+            has_dirty_changes = true;
+            break;
+        }
+    }
+
     // `git status` cannot see edits to tracked files marked `assume-unchanged`
     // or `skip-worktree` (e.g. after a sparse-checkout change). The scanner reads
     // those files when present, so a graph built from a full checkout would read
     // `fresh` after sparse checkout removes a cited `.rs` file. Treat any such
     // index-hidden source input as dirtiness so the verdict stays conservative
     // (PR #186 follow-up LL1).
-    Some(!text.trim().is_empty() || git_index_hidden_source_inputs(repo_root))
+    Some(has_dirty_changes || git_index_hidden_source_inputs(repo_root))
 }
 
 /// Runs `git ls-files -v` (strictly read-only) and returns its stdout, or `None`
@@ -561,9 +584,22 @@ fn git_index_hidden_source_inputs(repo_root: &Path) -> bool {
     let Some(text) = git_ls_files_v(repo_root) else {
         return false;
     };
+    let mut dir_exists_cache = std::collections::HashMap::new();
     text.lines()
         .filter_map(hidden_source_input_path)
-        .any(|rel| repo_root.join(rel).is_file())
+        .any(|rel| {
+            let path = Path::new(rel);
+            if let Some(parent) = path.parent() {
+                let parent_abs = repo_root.join(parent);
+                let exists = *dir_exists_cache
+                    .entry(parent_abs.clone())
+                    .or_insert_with(|| parent_abs.exists());
+                if !exists {
+                    return false;
+                }
+            }
+            repo_root.join(rel).is_file()
+        })
 }
 
 /// Returns the repo-relative paths of source-set inputs (`.rs` / versioned

@@ -935,17 +935,14 @@ fn refresh_excludes_in_tree_data_dir_from_dirty_probe() {
 // Codex follow-up round 3 (commit 67dcda5)
 // ---------------------------------------------------------------------------
 
-/// Finding 5: `status.showUntrackedFiles=no` must not suppress the dirty probe.
-/// An untracked source file must still be detected (PR #186 follow-up).
+/// Finding 5: `status.showUntrackedFiles` config must not affect the probe since untracked files are ignored.
+/// An untracked source file must be ignored by the dirty probe (issue #99).
 #[test]
-fn dirty_probe_detects_untracked_files_despite_config() {
+fn dirty_probe_ignores_untracked_files() {
     let fx = Fixture::committed();
     fx.scan();
 
-    // Simulate `status.showUntrackedFiles=no` in the repo config.
-    git(fx.repo(), ["config", "status.showUntrackedFiles", "no"]);
-
-    // Add an untracked .rs file — without --untracked-files=all this would be hidden.
+    // Add an untracked .rs file
     std::fs::write(fx.repo().join("src").join("new.rs"), "pub fn new_fn() {}\n").unwrap();
 
     let out = eg()
@@ -958,8 +955,8 @@ fn dirty_probe_detects_untracked_files_despite_config() {
         .success();
     let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(
-        report["freshness"], "stale_dirty",
-        "untracked files must be detected even when showUntrackedFiles=no: {report}"
+        report["freshness"], "fresh",
+        "untracked files must be ignored: {report}"
     );
 }
 
@@ -1178,21 +1175,20 @@ fn scan_does_not_exclude_egregore_directory_with_tracked_content() {
     );
 }
 
-/// Y1: an untracked `.egregore`-prefixed directory that contains `.rs` source
-/// files must not be auto-excluded from the dirty probe — its files appear in
-/// the graph and must be covered by the freshness signal.
+/// Y1: a tracked `.egregore`-prefixed directory that contains `.rs` source
+/// files must not be auto-excluded from the scan or the dirty probe.
 #[test]
-fn scan_does_not_exclude_untracked_egregore_dir_with_rust_sources() {
+fn scan_does_not_exclude_tracked_egregore_dir_with_rust_sources() {
     let fx = Fixture::committed();
-    // Create an untracked `.egregore_plugin/` directory containing Rust source.
-    // It has no tracked content (git ls-files is empty) but it has `.rs` files,
-    // so it must not be excluded from the dirty probe.
+    // Create a tracked `.egregore_plugin/` directory containing Rust source.
     let plugin_dir = fx.repo().join(".egregore_plugin");
     std::fs::create_dir_all(&plugin_dir).unwrap();
-    std::fs::write(plugin_dir.join("lib.rs"), "// plugin\n").unwrap();
+    let file_path = plugin_dir.join("lib.rs");
+    std::fs::write(&file_path, "// plugin\n").unwrap();
+    git(fx.repo(), ["add", ".egregore_plugin/lib.rs"]);
 
-    // Modify the `.rs` file (not committed, not gitignored) — tree is dirty.
-    std::fs::write(plugin_dir.join("lib.rs"), "// modified\n").unwrap();
+    // Modify the `.rs` file (staged addition) — tree is dirty.
+    std::fs::write(&file_path, "// modified\n").unwrap();
 
     let out_graph = fx.work.path().join("graph.jsonl");
     eg().args(["scan"])
@@ -1203,6 +1199,11 @@ fn scan_does_not_exclude_untracked_egregore_dir_with_rust_sources() {
         .success();
 
     let jsonl = std::fs::read_to_string(&out_graph).unwrap();
+    assert!(
+        jsonl.contains(".egregore_plugin/lib.rs"),
+        "tracked .egregore-prefixed directory with .rs files must be scanned: {jsonl}"
+    );
+
     let repo_node = jsonl
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
@@ -1211,7 +1212,7 @@ fn scan_does_not_exclude_untracked_egregore_dir_with_rust_sources() {
     assert_eq!(
         repo_node["source_snapshot"]["dirty"],
         Value::Bool(true),
-        "untracked .egregore-prefixed directory with .rs files must not be excluded: {repo_node}"
+        "tracked .egregore-prefixed directory with .rs files must not be excluded: {repo_node}"
     );
 }
 
@@ -1488,22 +1489,11 @@ fn scan_history_excludes_in_tree_output_from_dirty_probe() {
     );
 }
 
-/// DD1: the dirty probe (`git status`) must run with `-c core.excludesFile=`
-/// matching the scanner's own gitignore checks.  Without the override,
-/// `git status` honours the user's global excludes file and silently hides
-/// untracked files that the scanner (which also runs with `-c core.excludesFile=`)
-/// has already indexed.  The mismatch causes `dirty=false` to be stamped even
-/// though indexed untracked files are present, and a later edit to those files
-/// produces a false `fresh` verdict.
-///
-/// This test sets `GIT_CONFIG_GLOBAL` to a temporary gitconfig that installs a
-/// global excludes file matching `globally_hidden.rs`, then verifies that:
-/// 1. The scanner still indexes the file (its `git check-ignore` suppresses the
-///    global config).
-/// 2. The dirty probe also suppresses the global config and stamps `dirty=true`
-///    for the untracked file.
+/// DD1: Under the new design (issue #99), all untracked files are ignored, regardless of global config.
+/// This test verifies that a globally-ignored untracked file is NOT indexed by the scanner,
+/// and does NOT make the repository dirty.
 #[test]
-fn dirty_probe_suppresses_global_excludes_file() {
+fn dirty_probe_ignores_globally_hidden_untracked_file() {
     let fx = Fixture::committed();
 
     let global_dir = tempfile::tempdir().unwrap();
@@ -1538,8 +1528,8 @@ fn dirty_probe_suppresses_global_excludes_file() {
 
     let jsonl = std::fs::read_to_string(&out_graph).unwrap();
     assert!(
-        jsonl.contains("globally_hidden"),
-        "globally-ignored untracked file must be indexed by the scanner: {jsonl}"
+        !jsonl.contains("globally_hidden"),
+        "globally-ignored untracked file must NOT be indexed by the scanner: {jsonl}"
     );
 
     let repo_node = jsonl
@@ -1549,8 +1539,8 @@ fn dirty_probe_suppresses_global_excludes_file() {
         .expect("Repository node in graph");
     assert_eq!(
         repo_node["source_snapshot"]["dirty"],
-        Value::Bool(true),
-        "globally-ignored untracked file must be visible to the dirty probe: {repo_node}"
+        Value::Bool(false),
+        "globally-ignored untracked file must NOT make the repository dirty: {repo_node}"
     );
 }
 
