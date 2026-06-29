@@ -1009,7 +1009,8 @@ fn detect_email_address_with_trailing_punctuation() {
         "Please contact alice@example.com...",
         "Please contact alice@example.com-",
     ] {
-        let (class, _) = detect_secret(email).expect("email with trailing punctuation must be detected");
+        let (class, _) =
+            detect_secret(email).expect("email with trailing punctuation must be detected");
         assert_eq!(class, SecretClass::Email);
     }
 }
@@ -1022,7 +1023,8 @@ fn detect_none_ssh_remotes() {
         "user@host:8080",
     ] {
         assert!(
-            detect_secret(remote).is_none() || detect_secret(remote).unwrap().0 != SecretClass::Email,
+            detect_secret(remote).is_none()
+                || detect_secret(remote).unwrap().0 != SecretClass::Email,
             "SSH remote {remote} must NOT be detected as email"
         );
     }
