@@ -2900,18 +2900,48 @@ pub fn who_last_changed<'records>(
                 return false; // no commits in lineage at this time
             };
 
+            let r_kind = match r {
+                GraphRecord::Node {
+                    symbol_kind: Some(k),
+                    ..
+                } => k.as_str(),
+                _ => "fn",
+            };
+            let r_disambiguator = match r {
+                GraphRecord::Node {
+                    disambiguator: Some(d),
+                    ..
+                } => *d,
+                _ => 0,
+            };
+            let r_path = match r {
+                GraphRecord::Node {
+                    repo_relative_path,
+                    ..
+                } => repo_relative_path.as_deref(),
+                _ => None,
+            };
+
             // Check if there is a Symbol node for symbol_name at head_commit_sha owned by repo_id
+            // that matches candidate r's path, kind, and disambiguator.
             records.iter().any(|rec| {
                 if let GraphRecord::Node {
                     kind: NodeKind::Symbol,
                     name,
                     temporal: Some(t),
+                    symbol_kind: Some(rec_kind),
+                    disambiguator: Some(rec_disambiguator),
+                    repo_relative_path: rec_path,
                     ..
                 } = rec
                 {
                     if name.as_deref() == Some(symbol_name) && t.git_commit == head_commit_sha {
                         let owner = index.owner_of(rec.id());
-                        return owner.is_none_or(|o| o == repo_id);
+                        if owner.is_none_or(|o| o == repo_id) {
+                            return rec_path.as_deref() == r_path
+                                && rec_kind == r_kind
+                                && *rec_disambiguator == r_disambiguator;
+                        }
                     }
                 }
                 false
