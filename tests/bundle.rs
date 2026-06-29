@@ -753,3 +753,50 @@ fn test_verify_bundle_fails_on_unredacted_email() {
             .contains("unredacted secret class: email")
     );
 }
+
+#[test]
+fn test_verify_bundle_fails_on_unredacted_email_in_edge_summary() {
+    use aletheia_egregore::bundle::{BundleManifest, BundleRecord, EvidenceBundle};
+    use aletheia_egregore::ir::GraphRecord;
+
+    let edge_node = GraphRecord::edge(
+        aletheia_egregore::ir::EdgeLabel::Contains,
+        "repo-1".to_owned(),
+        "file-1".to_owned(),
+        None,
+        "Edge summary containing secret email: alice@example.com".to_owned(),
+    );
+
+    let json = serde_json::to_string(&edge_node).unwrap();
+    let hash = blake3::hash(json.as_bytes()).to_string();
+    let br = BundleRecord {
+        record: edge_node,
+        hash,
+    };
+
+    let manifest = BundleManifest {
+        root_selector: "id:repo-1".to_owned(),
+        source_query: "id".to_owned(),
+        snapshot: None,
+        repository_identity: "repo-1".to_owned(),
+        egregore_version: "0.1.0".to_owned(),
+        included_record_counts: std::collections::BTreeMap::new(),
+        omitted_record_counts: 0,
+        root_record_ids: vec!["repo-1".to_owned()],
+    };
+
+    let bundle = EvidenceBundle {
+        manifest,
+        records: vec![br],
+        unresolved_links: vec![],
+    };
+
+    let report = verify_bundle(&bundle);
+    assert!(!report.safety.passed);
+    assert!(
+        report
+            .safety
+            .detail
+            .contains("unredacted secret class: email")
+    );
+}

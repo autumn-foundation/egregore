@@ -2852,6 +2852,161 @@ pub fn resolve_head_symbols<'records>(
     matched
 }
 
+/// Resolves the symbol nodes representing the state of their respective repositories as of a specific valid time.
+///
+/// Strictly filters candidate symbol commits by repository HEAD lineage before picking the newest.
+/// Fallbacks to maximum-timestamp matching if Repository metadata or Git context is missing.
+///
+/// # Errors
+///
+/// Returns an error if the `--as-of` timestamp is not a valid RFC3339 string.
+#[allow(clippy::implicit_hasher)]
+pub fn resolve_as_of_symbols<'records>(
+    records: &'records [GraphRecord],
+    symbol_name: &str,
+    as_of: &str,
+    index: &RepositoryIndex,
+    repo: Option<&str>,
+    commit_parents: &HashMap<&str, &'records [String]>,
+    commit_nodes: &HashMap<&str, Vec<&'records GraphRecord>>,
+) -> Result<Vec<&'records GraphRecord>, String> {
+    let as_of_dt = DateTime::parse_from_rfc3339(as_of)
+        .map_err(|e| format!("invalid --as-of timestamp '{as_of}': {e}"))?;
+
+    // Find HEAD commit of each repository
+    let mut repo_heads = HashMap::new();
+    for record in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Repository,
+            id,
+            source_snapshot: Some(snapshot),
+            ..
+        } = record
+        {
+            if let SnapshotHead::Commit { sha } = &snapshot.head {
+                repo_heads.insert(id.as_str(), sha.as_str());
+            }
+        }
+    }
+
+    // For each repository owner, compute its filtered lineage (ancestors of HEAD as of as_of_dt)
+    let mut repo_lineages = HashMap::new();
+    for (&repo_id, &head_sha) in &repo_heads {
+        if let Some(repo_filter) = repo {
+            if repo_id != repo_filter {
+                continue;
+            }
+        }
+
+        // Traverse ancestry from head_sha
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(head_sha);
+
+        while let Some(sha) = queue.pop_front() {
+            if visited.insert(sha) {
+                if let Some(&parents) = commit_parents.get(sha) {
+                    for parent in parents {
+                        let p_str = parent.as_str();
+                        if !visited.contains(p_str) {
+                            queue.push_back(p_str);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Filter visited commits by valid_time <= as_of_dt
+        let mut filtered = HashSet::new();
+        for sha in visited {
+            if let Some(c_nodes) = commit_nodes.get(sha) {
+                let has_valid_node = c_nodes.iter().any(|c_node| {
+                    let owner = index.owner_of(c_node.id());
+                    if owner.is_some_and(|o| o != repo_id) {
+                        return false;
+                    }
+                    if let GraphRecord::Node {
+                        temporal: Some(t), ..
+                    } = c_node
+                    {
+                        if let Ok(vt) = DateTime::parse_from_rfc3339(&t.valid_time) {
+                            return vt <= as_of_dt;
+                        }
+                    }
+                    false
+                });
+                if has_valid_node {
+                    filtered.insert(sha);
+                }
+            }
+        }
+        repo_lineages.insert(repo_id, filtered);
+    }
+
+    // Now, find all candidate symbols that are on the computed lineages and <= as_of_dt
+    let mut best: BTreeMap<Option<&str>, (&GraphRecord, DateTime<chrono::FixedOffset>)> =
+        BTreeMap::new();
+
+    for record in records {
+        let GraphRecord::Node {
+            kind: NodeKind::Symbol,
+            name,
+            temporal,
+            valid_time,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if name.as_deref() != Some(symbol_name) {
+            continue;
+        }
+        let owner = index.owner_of(record.id());
+        if let Some(repo_id) = repo {
+            if owner != Some(repo_id) {
+                continue;
+            }
+        }
+
+        // Must be on the lineage of its owner repository
+        if let Some(owner_id) = owner {
+            if let Some(lineage) = repo_lineages.get(owner_id) {
+                let Some(t) = temporal else {
+                    continue;
+                };
+                if !lineage.contains(t.git_commit.as_str()) {
+                    continue;
+                }
+            }
+        }
+
+        let vt_str = temporal
+            .as_ref()
+            .map(|t| t.valid_time.as_str())
+            .or(valid_time.as_deref());
+        let Some(vt_str) = vt_str else {
+            continue;
+        };
+        let Ok(vt) = DateTime::parse_from_rfc3339(vt_str) else {
+            continue;
+        };
+        if vt > as_of_dt {
+            continue;
+        }
+
+        let is_better = best.get(&owner).is_none_or(|(prev_r, prev_vt)| {
+            vt > *prev_vt || (vt == *prev_vt && record.id() < prev_r.id())
+        });
+        if is_better {
+            best.insert(owner, (record, vt));
+        }
+    }
+
+    let mut results: Vec<&GraphRecord> = best.into_values().map(|(r, _)| r).collect();
+    results.sort_by(|left, right| left.id().cmp(right.id()));
+    Ok(results)
+}
+
 /// Finds the Commit node that last changed the symbol's file at or before the queried commit/time.
 ///
 /// Returns `Ok(Some((symbol_node, commit_node)))` if found.
@@ -2946,7 +3101,15 @@ pub fn who_last_changed<'records>(
         matches
     } else {
         let mut matches = if let Some(as_of) = as_of_time {
-            symbol_as_of_valid_time_by_repo(records, symbol_name, as_of, index, repo)?
+            resolve_as_of_symbols(
+                records,
+                symbol_name,
+                as_of,
+                index,
+                repo,
+                &commit_parents,
+                &commit_nodes,
+            )?
         } else {
             resolve_head_symbols(records, symbol_name, index, repo)
         };
@@ -2955,6 +3118,14 @@ pub fn who_last_changed<'records>(
         matches.retain(|r| {
             let Some(repo_id) = index.owner_of(r.id()) else {
                 return true; // legacy/unattributed repository, keep it
+            };
+            let r_commit = if let GraphRecord::Node {
+                temporal: Some(t), ..
+            } = r
+            {
+                t.git_commit.as_str()
+            } else {
+                return true;
             };
 
             // Find HEAD commit of repo_id
@@ -3030,6 +3201,10 @@ pub fn who_last_changed<'records>(
             } else {
                 visited
             };
+
+            if !filtered_lineage.contains(r_commit) {
+                return false;
+            }
 
             // Find lineage_head (latest commit in the lineage)
             let lineage_head = filtered_lineage
