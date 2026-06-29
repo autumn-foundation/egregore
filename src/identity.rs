@@ -498,19 +498,19 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let stdout_bytes = output.stdout;
     
     // Check if there are any dirty changes: modifications to tracked files,
     // or new untracked .gitignore files. Untracked source files are ignored.
     let mut has_dirty_changes = false;
-    for line in text.lines() {
+    for line in stdout_bytes.split(|&b| b == b'\n') {
         if line.len() < 4 {
             continue;
         }
         let status = &line[..2];
-        let path = &line[3..];
-        if status == "??" {
-            if path == ".gitignore" || path.ends_with("/.gitignore") {
+        let path_bytes = &line[3..];
+        if status == b"??" {
+            if path_bytes == b".gitignore" || path_bytes.ends_with(b"/.gitignore") || path_bytes.ends_with(b"\\.gitignore") {
                 has_dirty_changes = true;
                 break;
             }

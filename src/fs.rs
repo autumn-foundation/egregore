@@ -82,6 +82,18 @@ pub fn discover_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
     Ok(source_files)
 }
 
+fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
 fn git_tracked_files(repo_root: &Path) -> Option<Vec<PathBuf>> {
     let output = Command::new("git")
         .args(["-c", "core.excludesFile="])
@@ -97,14 +109,14 @@ fn git_tracked_files(repo_root: &Path) -> Option<Vec<PathBuf>> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
     let mut seen = HashSet::new();
     let mut paths = Vec::new();
-    for line in text.split('\0') {
-        if line.is_empty() {
+    for chunk in output.stdout.split(|&b| b == 0) {
+        if chunk.is_empty() {
             continue;
         }
-        let path = repo_root.join(line);
+        let rel_path = bytes_to_path(chunk);
+        let path = repo_root.join(rel_path);
         if seen.insert(path.clone()) {
             paths.push(path);
         }
@@ -133,16 +145,22 @@ fn git_count_skipped_files(repo_root: &Path) -> Option<(usize, usize, usize, usi
         if !output.status.success() {
             return None;
         }
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.split('\0') {
-            if line.is_empty() {
+        for chunk in output.stdout.split(|&b| b == 0) {
+            if chunk.is_empty() {
                 continue;
             }
-            let has_target_or_git = line.split('/').any(|part| part == "target" || part == ".git");
+            let rel_path = bytes_to_path(chunk);
+            let has_target_or_git = rel_path.components().any(|c| {
+                if let std::path::Component::Normal(part) = c {
+                    part == "target" || part == ".git"
+                } else {
+                    false
+                }
+            });
             if has_target_or_git {
                 continue;
             }
-            if let Some(ext) = Path::new(line).extension().and_then(OsStr::to_str) {
+            if let Some(ext) = rel_path.extension().and_then(|e| e.to_str()) {
                 if ext.eq_ignore_ascii_case("rs") {
                     skipped_rust += 1;
                 } else if ext.eq_ignore_ascii_case("py") {
@@ -253,18 +271,21 @@ fn git_ignored_dir_prefixes(repo_root: &Path) -> HashSet<PathBuf> {
     if !output.status.success() {
         return HashSet::new();
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.split('\0')
-        .filter(|line| !line.is_empty())
-        .map(|l| {
-            let clean_rel = l.trim_end_matches('/');
-            let mut path = repo_root.to_path_buf();
-            for part in clean_rel.split('/') {
+    let mut dirs = HashSet::new();
+    for chunk in output.stdout.split(|&b| b == 0) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let rel_path = bytes_to_path(chunk);
+        let mut path = repo_root.to_path_buf();
+        for component in rel_path.components() {
+            if let std::path::Component::Normal(part) = component {
                 path.push(part);
             }
-            path
-        })
-        .collect()
+        }
+        dirs.insert(path);
+    }
+    dirs
 }
 
 fn repo_relative_path(repo_root: &Path, path: &Path) -> Result<String> {
@@ -293,11 +314,11 @@ fn filter_git_ignored(repo_root: &Path, files: &mut Vec<PathBuf>) {
     if !crate::identity::is_repo_root(repo_root) {
         return;
     }
-    let rels: Vec<String> = files
+    let rels: Vec<PathBuf> = files
         .iter()
         .map(|file| {
             let rel = file.strip_prefix(repo_root).unwrap_or(file);
-            normalize_path(rel)
+            rel.components().collect()
         })
         .collect();
     let Some(ignored) = git_check_ignored(repo_root, &rels) else {
@@ -320,7 +341,7 @@ fn filter_git_ignored(repo_root: &Path, files: &mut Vec<PathBuf>) {
 /// Returns `None` when Git is unavailable or `repo_root` is not a Git work tree
 /// (exit code 128), in which case no filtering is applied. Exit code 1 ("nothing
 /// ignored") is a normal, non-error result. The probe is strictly read-only.
-fn git_check_ignored(repo_root: &Path, rels: &[String]) -> Option<HashSet<String>> {
+fn git_check_ignored(repo_root: &Path, rels: &[PathBuf]) -> Option<HashSet<PathBuf>> {
     let mut child = Command::new("git")
         // Suppress user/system-level global gitignore (core.excludesFile) so the
         // scan is reproducible across developer environments; only honour
@@ -340,11 +361,19 @@ fn git_check_ignored(repo_root: &Path, rels: &[String]) -> Option<HashSet<String
     // Write the NUL-separated paths from a dedicated thread so a large stdin
     // cannot deadlock against a filling stdout pipe.
     let mut stdin = child.stdin.take()?;
-    let payload: Vec<u8> = rels.iter().fold(Vec::new(), |mut buf, rel| {
-        buf.extend_from_slice(rel.as_bytes());
-        buf.push(0);
-        buf
-    });
+    let mut payload = Vec::new();
+    for rel in rels {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            payload.extend_from_slice(rel.as_os_str().as_bytes());
+        }
+        #[cfg(not(unix))]
+        {
+            payload.extend_from_slice(rel.to_string_lossy().as_bytes());
+        }
+        payload.push(0);
+    }
     let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(&payload);
     });
@@ -357,11 +386,13 @@ fn git_check_ignored(repo_root: &Path, rels: &[String]) -> Option<HashSet<String
     if code != Some(0) && code != Some(1) {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    Some(
-        text.split('\0')
-            .filter(|line| !line.is_empty())
-            .map(str::to_owned)
-            .collect(),
-    )
+    let mut ignored = HashSet::new();
+    for chunk in output.stdout.split(|&b| b == 0) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let path = bytes_to_path(chunk);
+        ignored.insert(path.components().collect());
+    }
+    Some(ignored)
 }
