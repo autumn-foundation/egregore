@@ -98,12 +98,18 @@ fn git_tracked_files(repo_root: &Path) -> Option<Vec<PathBuf>> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    Some(
-        text.split('\0')
-            .filter(|line| !line.is_empty())
-            .map(|line| repo_root.join(line))
-            .collect(),
-    )
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for line in text.split('\0') {
+        if line.is_empty() {
+            continue;
+        }
+        let path = repo_root.join(line);
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+    Some(paths)
 }
 
 fn git_count_skipped_files(repo_root: &Path) -> Option<(usize, usize, usize, usize)> {
