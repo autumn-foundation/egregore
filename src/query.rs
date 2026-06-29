@@ -2713,6 +2713,145 @@ pub fn symbol_as_of_valid_time_by_repo<'records>(
     Ok(results)
 }
 
+/// Resolves the symbol nodes representing the current HEAD state of their respective repositories.
+/// Fallbacks to maximum-timestamp matching if Repository metadata or Git context is missing.
+#[must_use]
+pub fn resolve_head_symbols<'records>(
+    records: &'records [GraphRecord],
+    symbol_name: &str,
+    index: &RepositoryIndex,
+    repo: Option<&str>,
+) -> Vec<&'records GraphRecord> {
+    let mut repo_heads = HashMap::new();
+    for record in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Repository,
+            id,
+            source_snapshot: Some(snapshot),
+            ..
+        } = record
+        {
+            if let SnapshotHead::Commit { sha } = &snapshot.head {
+                repo_heads.insert(id.as_str(), sha.as_str());
+            }
+        }
+    }
+
+    let mut best: BTreeMap<Option<&str>, &GraphRecord> = BTreeMap::new();
+    let mut repos_with_match = HashSet::new();
+
+    for record in records {
+        let GraphRecord::Node {
+            kind: NodeKind::Symbol,
+            name,
+            temporal: Some(t),
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if name.as_deref() != Some(symbol_name) {
+            continue;
+        }
+        let owner = index.owner_of(record.id());
+        if let Some(repo_id) = repo {
+            if owner != Some(repo_id) {
+                continue;
+            }
+        }
+        if let Some(owner_id) = owner {
+            if let Some(&head_sha) = repo_heads.get(owner_id) {
+                if t.git_commit == head_sha {
+                    let is_better = best
+                        .get(&owner)
+                        .is_none_or(|prev_r| record.id() < prev_r.id());
+                    if is_better {
+                        best.insert(owner, record);
+                        repos_with_match.insert(owner_id);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut matched: Vec<&GraphRecord> = best.into_values().collect();
+
+    let mut fallback_repos = Vec::new();
+    if let Some(repo_id) = repo {
+        if !repos_with_match.contains(repo_id) {
+            fallback_repos.push(Some(repo_id));
+        }
+    } else {
+        for record in records {
+            if let GraphRecord::Node {
+                kind: NodeKind::Symbol,
+                name,
+                ..
+            } = record
+            {
+                if name.as_deref() == Some(symbol_name) {
+                    let owner = index.owner_of(record.id());
+                    if let Some(o) = owner {
+                        if !repos_with_match.contains(o) {
+                            fallback_repos.push(Some(o));
+                        }
+                    } else if repos_with_match.is_empty() {
+                        fallback_repos.push(None);
+                    }
+                }
+            }
+        }
+    }
+
+    fallback_repos.sort();
+    fallback_repos.dedup();
+
+    for r_opt in fallback_repos {
+        let mut best: Option<(&GraphRecord, DateTime<chrono::FixedOffset>)> = None;
+        for record in records {
+            let GraphRecord::Node {
+                kind: NodeKind::Symbol,
+                name,
+                temporal,
+                valid_time,
+                ..
+            } = record
+            else {
+                continue;
+            };
+            if name.as_deref() != Some(symbol_name) {
+                continue;
+            }
+            let owner = index.owner_of(record.id());
+            if owner != r_opt {
+                continue;
+            }
+            let vt_str = temporal
+                .as_ref()
+                .map(|t| t.valid_time.as_str())
+                .or(valid_time.as_deref());
+            let Some(vt_str) = vt_str else {
+                continue;
+            };
+            let Ok(vt) = DateTime::parse_from_rfc3339(vt_str) else {
+                continue;
+            };
+            let is_better = best.as_ref().is_none_or(|(prev_r, prev_vt)| {
+                vt > *prev_vt || (vt == *prev_vt && record.id() < prev_r.id())
+            });
+            if is_better {
+                best = Some((record, vt));
+            }
+        }
+        if let Some((r, _)) = best {
+            matched.push(r);
+        }
+    }
+
+    matched.sort_by(|left, right| left.id().cmp(right.id()));
+    matched
+}
+
 /// Finds the Commit node that last changed the symbol's file at or before the queried commit/time.
 ///
 /// Returns `Ok(Some((symbol_node, commit_node)))` if found.
@@ -2806,9 +2945,11 @@ pub fn who_last_changed<'records>(
         }
         matches
     } else {
-        let as_of = as_of_time.unwrap_or("9999-12-31T23:59:59Z");
-        let mut matches =
-            symbol_as_of_valid_time_by_repo(records, symbol_name, as_of, index, repo)?;
+        let mut matches = if let Some(as_of) = as_of_time {
+            symbol_as_of_valid_time_by_repo(records, symbol_name, as_of, index, repo)?
+        } else {
+            resolve_head_symbols(records, symbol_name, index, repo)
+        };
 
         // Filter matches to only include live symbols in their repository lineage at as_of
         matches.retain(|r| {
@@ -2935,8 +3076,7 @@ pub fn who_last_changed<'records>(
                 } = rec
                 {
                     if name.as_deref() == Some(symbol_name) && t.git_commit == head_commit_sha {
-                        let owner = index.owner_of(rec.id());
-                        if owner.is_none_or(|o| o == repo_id) {
+                        if index.owner_of(rec.id()) == Some(repo_id) {
                             return rec_path.as_deref() == r_path
                                 && rec_kind == r_kind
                                 && *rec_disambiguator == r_disambiguator;
@@ -3106,7 +3246,7 @@ pub fn who_last_changed<'records>(
                 syms.iter()
                     .filter(|sym| {
                         let owner = index.owner_of(sym.id());
-                        if owner.is_some() && owner != target_repo_id {
+                        if owner != target_repo_id {
                             return false;
                         }
                         if let GraphRecord::Node {
@@ -3251,7 +3391,7 @@ pub fn who_last_changed<'records>(
                 syms.iter()
                     .find(|sym| {
                         let owner = index.owner_of(sym.id());
-                        if owner.is_some() && owner != target_repo_id {
+                        if owner != target_repo_id {
                             return false;
                         }
                         if let GraphRecord::Node {
