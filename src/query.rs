@@ -350,6 +350,26 @@ impl RepositoryIndex {
                 owner.insert(id.clone(), repo_id);
             }
         }
+        // Remap owners to their highest-version counterpart to preserve all schema-version owners.
+        let mut suffix_to_versions: HashMap<&str, Vec<(u32, &str)>> = HashMap::new();
+        for repo_id in repos.keys() {
+            if let Some((version, suffix)) = parse_codegraph_id(repo_id) {
+                suffix_to_versions.entry(suffix).or_default().push((version, repo_id.as_str()));
+            }
+        }
+        let mut repo_translation: HashMap<String, String> = HashMap::new();
+        for versions in suffix_to_versions.values() {
+            if let Some((_, highest_repo_id)) = versions.iter().max_by_key(|(v, _)| v) {
+                for (_, repo_id) in versions {
+                    repo_translation.insert((*repo_id).to_owned(), (*highest_repo_id).to_owned());
+                }
+            }
+        }
+        for val in owner.values_mut() {
+            if let Some(highest_id) = repo_translation.get(val) {
+                *val = highest_id.clone();
+            }
+        }
 
         Self { owner, repos }
     }

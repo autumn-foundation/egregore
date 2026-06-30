@@ -142,6 +142,25 @@ fn test_repository_version_resolution_deduplication() {
     }))
     .unwrap();
 
+    let file_v4: GraphRecord = serde_json::from_value(json!({
+        "record_type": "node",
+        "id": "codegraph:v4:file-v4-hash",
+        "kind": "File",
+        "schema_version": 4,
+        "repo_relative_path": "src/lib.rs",
+        "summary": "file in v4"
+    })).unwrap();
+
+    let edge_v4: GraphRecord = serde_json::from_value(json!({
+        "record_type": "edge",
+        "id": "codegraph:v4:edge-v4-hash",
+        "schema_version": 4,
+        "label": "CONTAINS",
+        "source": "codegraph:v4:my-repo-hash",
+        "target": "codegraph:v4:file-v4-hash",
+        "summary": "v4 edge contains"
+    })).unwrap();
+
     let repo_v5: GraphRecord = serde_json::from_value(json!({
         "record_type": "node",
         "id": "codegraph:v5:my-repo-hash",
@@ -156,8 +175,32 @@ fn test_repository_version_resolution_deduplication() {
     }))
     .unwrap();
 
-    let records = vec![repo_v4, repo_v5];
+    let file_v5: GraphRecord = serde_json::from_value(json!({
+        "record_type": "node",
+        "id": "codegraph:v5:file-v5-hash",
+        "kind": "File",
+        "schema_version": 5,
+        "repo_relative_path": "src/main.rs",
+        "summary": "file in v5"
+    })).unwrap();
+
+    let edge_v5: GraphRecord = serde_json::from_value(json!({
+        "record_type": "edge",
+        "id": "codegraph:v5:edge-v5-hash",
+        "schema_version": 5,
+        "label": "CONTAINS",
+        "source": "codegraph:v5:my-repo-hash",
+        "target": "codegraph:v5:file-v5-hash",
+        "summary": "v5 edge contains"
+    })).unwrap();
+
+    let records = vec![repo_v4, file_v4, edge_v4, repo_v5, file_v5, edge_v5];
     let index = RepositoryIndex::build(&records);
+    
     let resolved = index.resolve_selector("my-repo").unwrap();
     assert_eq!(resolved, "codegraph:v5:my-repo-hash");
+
+    // Ownership remapping verification: both files should be mapped to the highest version ID (v5)
+    assert_eq!(index.owner_of("codegraph:v4:file-v4-hash"), Some("codegraph:v5:my-repo-hash"));
+    assert_eq!(index.owner_of("codegraph:v5:file-v5-hash"), Some("codegraph:v5:my-repo-hash"));
 }

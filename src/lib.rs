@@ -404,9 +404,7 @@ fn validate_repository(repo_root: &Path) -> Result<()> {
 }
 
 pub(crate) fn normalize_path(path: &Path) -> String {
-    let path_str = path.to_string_lossy().replace('\\', "/");
-    Path::new(&path_str)
-        .components()
+    path.components()
         .filter_map(|component| match component {
             std::path::Component::Normal(part) => Some(part.to_string_lossy()),
             _ => None,
