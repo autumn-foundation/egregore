@@ -93,6 +93,22 @@ For `eg query file <file>`, if the completeness is `partial`, the output also in
 
 The completeness signal is advisory and states only that extraction *may* be incomplete in the scope; it does not make direct truth claims about symbol presence or absence.
 
+
+---
+
+## Cross-Producer Determinism & Portable Spans
+
+Egregore guarantees cross-platform and cross-producer byte-for-byte stable scans for identical Git commits:
+
+1. **Path Normalization**: All `repo_relative_path` and path-based fields are normalized to use forward slashes (`/`) as separators, ensuring that scans run on Windows do not leak backslashes (`\`) compared to scans on POSIX systems.
+2. **Line-Ending Normalization (Portable Spans)**: Source files are normalized to use LF (`\n`) line endings before syntax parsing and span generation. As a result, all `SourceSpan` byte offsets (`start_byte`, `end_byte`) are completely portable and stable regardless of whether the local checkout has LF or CRLF (`\r\n`) line endings (e.g. from Git's `core.autocrlf` setting).
+3. **Identity Stability**: Node and edge stable record IDs are computed on normalized inputs and match perfectly across platforms.
+
+### Distinctions from other axes
+
+- **VS. Freshness/Staleness (issue #82)**: Line-ending normalization ensures that identical content produces identical facts. Working-tree staleness (dirty files or HEAD changes) is an orthogonal axis tracked by the `freshness` signals.
+- **VS. Extraction Accuracy (issue #93)**: Portable spans guarantee structural identity and portability of spans across platforms; they do not impact the linguistic precision or syntax coverage of the language-specific extractors.
+
 ---
 
 ## Repository scope (`--repo`, issue #67)

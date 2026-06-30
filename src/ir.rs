@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 /// Current schema version for code-graph records.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Schema version for agent-memory records (`Agent`, `AgentSession`, `Observation`, etc.).
 /// Documented in `docs/schema/agent-memory.md`.
@@ -2238,6 +2238,22 @@ pub(crate) fn versioned_stable_id(version: u32, parts: &[&str]) -> String {
         hasher.update(b"\0");
     }
     format!("codegraph:v{version}:{}", hasher.finalize().to_hex())
+}
+
+/// Parses the schema version and hash suffix from a versioned codegraph ID.
+///
+/// Expected format: `codegraph:v<version>:<suffix>`.
+#[must_use]
+pub fn parse_codegraph_id(id: &str) -> Option<(u32, &str)> {
+    if !id.starts_with("codegraph:v") {
+        return None;
+    }
+    let rest = &id["codegraph:v".len()..];
+    let colon_idx = rest.find(':')?;
+    let version_str = &rest[..colon_idx];
+    let version = version_str.parse::<u32>().ok()?;
+    let suffix = &rest[colon_idx + 1..];
+    Some((version, suffix))
 }
 
 /// Builds a stable verification-domain record ID.

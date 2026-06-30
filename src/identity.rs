@@ -13,7 +13,9 @@ use std::{
     process::{Command, Stdio},
 };
 
-use crate::ir::{IdentitySource, RepositoryIdentityPayload, SnapshotHead, stable_id};
+use crate::ir::{
+    IdentitySource, RepositoryIdentityPayload, SnapshotHead, stable_id, versioned_stable_id,
+};
 
 /// Computed repository identity, including its stable ID and full payload.
 #[derive(Debug, Clone)]
@@ -155,11 +157,20 @@ fn git_is_repo_root(repo_root: &Path) -> bool {
     let Some(top_level) = git_top_level(repo_root) else {
         return false;
     };
-    if let (Ok(r1), Ok(r2)) = (std::fs::canonicalize(repo_root), std::fs::canonicalize(&top_level)) {
+    if let (Ok(r1), Ok(r2)) = (
+        std::fs::canonicalize(repo_root),
+        std::fs::canonicalize(&top_level),
+    ) {
         r1 == r2
     } else {
-        let s1 = repo_root.to_string_lossy().replace('\\', "/").to_lowercase();
-        let s2 = top_level.to_string_lossy().replace('\\', "/").to_lowercase();
+        let s1 = repo_root
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_lowercase();
+        let s2 = top_level
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_lowercase();
         s1.trim_end_matches('/') == s2.trim_end_matches('/')
     }
 }
@@ -279,7 +290,10 @@ pub(crate) fn is_local_remote_url(url: &str) -> bool {
     }
     // No scheme: scp form ([user@]host:path) if ':' appears before any '/' or '\'.
     // colon_pos > 1 rejects Windows drive letters like C:/repos (single-char prefix).
-    if let Some(colon_pos) = url.find(':').filter(|&p| p > 1 && !url[..p].contains('/') && !url[..p].contains('\\')) {
+    if let Some(colon_pos) = url
+        .find(':')
+        .filter(|&p| p > 1 && !url[..p].contains('/') && !url[..p].contains('\\'))
+    {
         // scp form: [user@]host:path — portable unless the host is loopback.
         let host_field = &url[..colon_pos];
         let host = host_field.split('@').next_back().unwrap_or(host_field);
@@ -499,7 +513,7 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
         return None;
     }
     let stdout_bytes = output.stdout;
-    
+
     // Check if there are any dirty changes: modifications to tracked files,
     // or new untracked .gitignore files. Untracked source files are ignored.
     let mut has_dirty_changes = false;
@@ -510,7 +524,10 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
         let status = &line[..2];
         let path_bytes = &line[3..];
         if status == b"??" {
-            if path_bytes == b".gitignore" || path_bytes.ends_with(b"/.gitignore") || path_bytes.ends_with(b"\\.gitignore") {
+            if path_bytes == b".gitignore"
+                || path_bytes.ends_with(b"/.gitignore")
+                || path_bytes.ends_with(b"\\.gitignore")
+            {
                 has_dirty_changes = true;
                 break;
             }
@@ -734,21 +751,53 @@ pub(crate) fn repository_id_matches_payload(
     submitted_id: &str,
     payload: &RepositoryIdentityPayload,
 ) -> bool {
-    match payload.identity_source {
-        IdentitySource::Remote => payload.remote_url.as_deref().is_some_and(|url| {
-            stable_id(&["repository", "remote", &normalize_remote_url(url)]) == submitted_id
-        }),
-        IdentitySource::LocalRootCommit => payload.root_commit_sha.as_deref().is_some_and(|sha| {
-            stable_id(&["repository", "local-root-commit", sha]) == submitted_id
-        }),
-        IdentitySource::LocalPath => payload
-            .canonical_path
-            .as_deref()
-            .is_some_and(|path| stable_id(&["repository", "local-path", path]) == submitted_id),
-        IdentitySource::OperatorOverride => {
-            stable_id(&["repository", "operator-override", &payload.basename]) == submitted_id
+    let version = if let Some((v, _)) = crate::ir::parse_codegraph_id(submitted_id) {
+        v
+    } else {
+        crate::ir::SCHEMA_VERSION
+    };
+
+    let parts: Vec<String> = match payload.identity_source {
+        IdentitySource::Remote => {
+            let Some(url) = &payload.remote_url else {
+                return false;
+            };
+            vec![
+                "repository".to_owned(),
+                "remote".to_owned(),
+                normalize_remote_url(url),
+            ]
         }
-    }
+        IdentitySource::LocalRootCommit => {
+            let Some(sha) = &payload.root_commit_sha else {
+                return false;
+            };
+            vec![
+                "repository".to_owned(),
+                "local-root-commit".to_owned(),
+                sha.clone(),
+            ]
+        }
+        IdentitySource::LocalPath => {
+            let Some(path) = &payload.canonical_path else {
+                return false;
+            };
+            vec![
+                "repository".to_owned(),
+                "local-path".to_owned(),
+                path.clone(),
+            ]
+        }
+        IdentitySource::OperatorOverride => {
+            vec![
+                "repository".to_owned(),
+                "operator-override".to_owned(),
+                payload.basename.clone(),
+            ]
+        }
+    };
+    let parts_refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+    versioned_stable_id(version, &parts_refs) == submitted_id
 }
 
 #[cfg(test)]
@@ -1014,5 +1063,12 @@ mod tests {
             "codegraph:v3:wrong-hash",
             &payload
         ));
+
+        // Test prior version-awareness (v4 ID matches v4 payload check)
+        let v4_id = crate::ir::versioned_stable_id(
+            4,
+            &["repository", "remote", "https://github.com/owner/repo"],
+        );
+        assert!(super::repository_id_matches_payload(&v4_id, &payload));
     }
 }
