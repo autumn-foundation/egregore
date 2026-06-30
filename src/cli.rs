@@ -51,6 +51,12 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Scan a repository and write graph JSONL.
+    ///
+    /// When run in a Git repository root, scopes the scan strictly to Git-tracked files
+    /// (committed and staged), honoring .gitignore rules and skipping ignored/untracked files.
+    /// A count of skipped source files by language (.rs, .py, .ts/.tsx, .go) is printed to stderr.
+    /// If the target is not a Git repository root, falls back to a filesystem walk that
+    /// skips .git and target directories.
     Scan {
         /// Repository path to scan.
         repo_path: PathBuf,

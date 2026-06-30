@@ -34,6 +34,22 @@ egregore inspect graph.jsonl
 # records: 4386   nodes: 1353   edges: 3033   tombstones: 0   diagnostics: 599
 ```
 
+#### Scoping and Ignore Rules
+
+When run in a Git repository root, `eg scan` automatically scopes the scan to **Git-tracked files only** (both committed and staged changes in the Git index). It honors `.gitignore` rules (including nested gitignores and negation `!`) by ignoring any untracked or ignored files.
+
+If there are unsupported, untracked, or ignored files, the scan reports the count of skipped files for each supported language to `stderr`:
+```
+Skipped 3 .rs, 1 .py, 1 .ts/.tsx, 1 .go files by ignore rules
+```
+
+To list the skipped files in your repository, you can use Git:
+- **Ignored files:** `git ls-files --others --ignored --exclude-standard`
+- **Untracked files:** `git ls-files --others --exclude-standard`
+
+If the target path is not a Git repository root, `eg scan` falls back to a filesystem walk that walks all files under the directory but hardcodes skipping `.git` and `target` directories.
+
+
 ### 4. Ingest into AletheiaDB (structural index)
 
 ```powershell

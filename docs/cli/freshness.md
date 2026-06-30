@@ -54,10 +54,11 @@ any uncommitted change in the working tree, with two refinements:
   probe, so the documented in-tree workflow (`eg scan . --out graph.jsonl`) is
   not reported `stale_dirty` merely because the store it just wrote is itself an
   untracked file.
-- **Git-ignored files are excluded — and so are they from the graph.** The
-  scanner skips git-ignored Rust files (they are never indexed, so they carry no
-  citable spans), which keeps the indexed set aligned with what `git status`
-  reports.
+- **Git-ignored and untracked files are excluded — and so are they from the graph.** The
+  scanner scopes the scan to Git-tracked files only, skipping any untracked or
+  git-ignored files for all supported languages (Rust, Python, TypeScript, Go).
+  This keeps the indexed set aligned with what `git status` reports.
+
 
 ---
 

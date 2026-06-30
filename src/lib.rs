@@ -404,7 +404,7 @@ fn validate_repository(repo_root: &Path) -> Result<()> {
 pub(crate) fn normalize_path(path: &Path) -> String {
     path.components()
         .filter_map(|component| match component {
-            std::path::Component::Normal(part) => part.to_str(),
+            std::path::Component::Normal(part) => Some(part.to_string_lossy()),
             _ => None,
         })
         .collect::<Vec<_>>()
