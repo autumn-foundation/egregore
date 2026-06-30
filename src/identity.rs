@@ -155,11 +155,20 @@ fn git_is_repo_root(repo_root: &Path) -> bool {
     let Some(top_level) = git_top_level(repo_root) else {
         return false;
     };
-    if let (Ok(r1), Ok(r2)) = (std::fs::canonicalize(repo_root), std::fs::canonicalize(&top_level)) {
+    if let (Ok(r1), Ok(r2)) = (
+        std::fs::canonicalize(repo_root),
+        std::fs::canonicalize(&top_level),
+    ) {
         r1 == r2
     } else {
-        let s1 = repo_root.to_string_lossy().replace('\\', "/").to_lowercase();
-        let s2 = top_level.to_string_lossy().replace('\\', "/").to_lowercase();
+        let s1 = repo_root
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_lowercase();
+        let s2 = top_level
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_lowercase();
         s1.trim_end_matches('/') == s2.trim_end_matches('/')
     }
 }
@@ -279,7 +288,10 @@ pub(crate) fn is_local_remote_url(url: &str) -> bool {
     }
     // No scheme: scp form ([user@]host:path) if ':' appears before any '/' or '\'.
     // colon_pos > 1 rejects Windows drive letters like C:/repos (single-char prefix).
-    if let Some(colon_pos) = url.find(':').filter(|&p| p > 1 && !url[..p].contains('/') && !url[..p].contains('\\')) {
+    if let Some(colon_pos) = url
+        .find(':')
+        .filter(|&p| p > 1 && !url[..p].contains('/') && !url[..p].contains('\\'))
+    {
         // scp form: [user@]host:path — portable unless the host is loopback.
         let host_field = &url[..colon_pos];
         let host = host_field.split('@').next_back().unwrap_or(host_field);
@@ -499,7 +511,7 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
         return None;
     }
     let stdout_bytes = output.stdout;
-    
+
     // Check if there are any dirty changes: modifications to tracked files,
     // or new untracked .gitignore files. Untracked source files are ignored.
     let mut has_dirty_changes = false;
@@ -510,7 +522,10 @@ fn git_tree_dirty(repo_root: &Path, exclude_rel: &[String]) -> Option<bool> {
         let status = &line[..2];
         let path_bytes = &line[3..];
         if status == b"??" {
-            if path_bytes == b".gitignore" || path_bytes.ends_with(b"/.gitignore") || path_bytes.ends_with(b"\\.gitignore") {
+            if path_bytes == b".gitignore"
+                || path_bytes.ends_with(b"/.gitignore")
+                || path_bytes.ends_with(b"\\.gitignore")
+            {
                 has_dirty_changes = true;
                 break;
             }

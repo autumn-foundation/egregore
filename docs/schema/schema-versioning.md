@@ -22,7 +22,7 @@ Readers interpret `schema_version` as scoped to:
 Examples:
 
 ```text
-(codegraph, Symbol, 4)
+(codegraph, Symbol, 5)
 (project, Task, 1)
 (agent_memory, ToolCall, 1)
 (semantic, SemanticDrift, 1)
@@ -134,9 +134,9 @@ Rules:
 Example inspect lines:
 
 ```text
-schema_version codegraph Symbol v4: 12
-schema_version codegraph Symbol v3: 2
-unknown_schema_version codegraph Symbol v5: 1
+schema_version codegraph Symbol v5: 12
+schema_version codegraph Symbol v4: 2
+unknown_schema_version codegraph Symbol v6: 1
 ```
 
 ## 6 - Migration Manifests

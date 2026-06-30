@@ -388,12 +388,35 @@ impl RepositoryIndex {
         if let Some((id, _)) = self.repos.get_key_value(selector) {
             return Ok(id.as_str());
         }
-        let candidates: Vec<&str> = self
+        let mut candidates: Vec<&str> = self
             .repos
             .iter()
             .filter(|(_, entry)| entry.selectors.contains(selector))
             .map(|(id, _)| id.as_str())
             .collect();
+
+        // Deduplicate candidates that represent the same repository under different schema versions.
+        if candidates.len() > 1 {
+            let mut groups: std::collections::HashMap<&str, (u32, &str)> =
+                std::collections::HashMap::new();
+            let mut has_unparseable = false;
+            for candidate in &candidates {
+                if let Some((version, suffix)) = parse_codegraph_id(candidate) {
+                    let entry = groups.entry(suffix).or_insert((0, ""));
+                    if version > entry.0 {
+                        *entry = (version, candidate);
+                    }
+                } else {
+                    has_unparseable = true;
+                    break;
+                }
+            }
+            if !has_unparseable {
+                candidates = groups.values().map(|(_, id)| *id).collect();
+                candidates.sort_unstable();
+            }
+        }
+
         match candidates.as_slice() {
             [] => Err(RepositorySelectorError::Unknown {
                 selector: selector.to_owned(),
@@ -405,6 +428,18 @@ impl RepositoryIndex {
             }),
         }
     }
+}
+
+fn parse_codegraph_id(id: &str) -> Option<(u32, &str)> {
+    if !id.starts_with("codegraph:v") {
+        return None;
+    }
+    let rest = &id["codegraph:v".len()..];
+    let colon_idx = rest.find(':')?;
+    let version_str = &rest[..colon_idx];
+    let version = version_str.parse::<u32>().ok()?;
+    let suffix = &rest[colon_idx + 1..];
+    Some((version, suffix))
 }
 
 fn matches_symbol_at_commit(record: &GraphRecord, symbol_name: &str, commit: &str) -> bool {

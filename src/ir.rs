@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 /// Current schema version for code-graph records.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Schema version for agent-memory records (`Agent`, `AgentSession`, `Observation`, etc.).
 /// Documented in `docs/schema/agent-memory.md`.

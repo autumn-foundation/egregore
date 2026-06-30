@@ -123,3 +123,41 @@ fn additive_unknown_field_parses_and_inspects_without_warning() {
         .stdout(predicate::str::contains("unknown_schema_version").not())
         .stderr(predicate::str::is_empty());
 }
+
+#[test]
+fn test_repository_version_resolution_deduplication() {
+    use aletheia_egregore::RepositoryIndex;
+
+    let repo_v4: GraphRecord = serde_json::from_value(json!({
+        "record_type": "node",
+        "id": "codegraph:v4:my-repo-hash",
+        "kind": "Repository",
+        "schema_version": 4,
+        "name": "my-repo",
+        "repository_identity": {
+            "identity_source": "operator_override",
+            "basename": "my-repo"
+        },
+        "summary": "v4 repo metadata"
+    }))
+    .unwrap();
+
+    let repo_v5: GraphRecord = serde_json::from_value(json!({
+        "record_type": "node",
+        "id": "codegraph:v5:my-repo-hash",
+        "kind": "Repository",
+        "schema_version": 5,
+        "name": "my-repo",
+        "repository_identity": {
+            "identity_source": "operator_override",
+            "basename": "my-repo"
+        },
+        "summary": "v5 repo metadata"
+    }))
+    .unwrap();
+
+    let records = vec![repo_v4, repo_v5];
+    let index = RepositoryIndex::build(&records);
+    let resolved = index.resolve_selector("my-repo").unwrap();
+    assert_eq!(resolved, "codegraph:v5:my-repo-hash");
+}

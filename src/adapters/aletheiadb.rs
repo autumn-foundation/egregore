@@ -4386,12 +4386,12 @@ mod tests {
         let data_dir = temp.path().join("future-kind-store");
         let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
 
-        let record_id = "codegraph:v5:future-kind-repo";
+        let record_id = "codegraph:v6:future-kind-repo";
         let properties = ::aletheiadb::PropertyMapBuilder::new()
             .insert("codegraph_id", record_id)
             .insert("record_type", "node")
             .insert("kind", "NewFutureKind")
-            .insert("schema_version", 5i64)
+            .insert("schema_version", 6i64)
             .insert("domain", "codegraph")
             .build();
 
@@ -4407,7 +4407,7 @@ mod tests {
         let unknown = &report.unknown_schema_versions[0];
         assert_eq!(unknown.version.domain, "codegraph");
         assert_eq!(unknown.version.kind, "NewFutureKind");
-        assert_eq!(unknown.version.version, 5);
+        assert_eq!(unknown.version.version, 6);
     }
 
     #[test]

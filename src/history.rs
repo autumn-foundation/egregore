@@ -445,7 +445,8 @@ fn required_line<'a>(
 }
 
 fn normalize_git_path(path: &str) -> String {
-    path.split('/')
+    path.replace('\\', "/")
+        .split('/')
         .filter(|part| !part.is_empty() && *part != "." && *part != "..")
         .collect::<Vec<_>>()
         .join("/")

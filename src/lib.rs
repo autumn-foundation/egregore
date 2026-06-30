@@ -357,6 +357,8 @@ pub(crate) fn scan_source_text_records(
     source: &str,
     repository_id: &str,
 ) -> Result<Vec<GraphRecord>> {
+    let source_lf = source.replace("\r\n", "\n");
+    let source = &source_lf;
     let mut graph = Graph::new();
     let repo_relative_path = source_file.repo_relative_path.clone();
     let file_id = stable_id(&["node", "file", repository_id, &repo_relative_path]);
@@ -402,7 +404,9 @@ fn validate_repository(repo_root: &Path) -> Result<()> {
 }
 
 pub(crate) fn normalize_path(path: &Path) -> String {
-    path.components()
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    Path::new(&path_str)
+        .components()
         .filter_map(|component| match component {
             std::path::Component::Normal(part) => Some(part.to_string_lossy()),
             _ => None,

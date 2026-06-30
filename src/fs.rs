@@ -36,24 +36,28 @@ pub fn discover_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
     if crate::identity::is_repo_root(repo_root) {
         if let Some(tracked) = git_tracked_files(repo_root) {
             for path in tracked {
-                let is_file = std::fs::symlink_metadata(&path)
-                    .map(|m| m.is_file())
-                    .unwrap_or(false);
+                let is_file = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
                 if !is_file || !languages::is_supported_source(&path) {
                     continue;
                 }
                 let Ok(rel) = repo_relative_path(repo_root, &path) else {
                     continue;
                 };
-                let has_target_or_git = rel.split('/').any(|part| part == "target" || part == ".git");
+                let has_target_or_git = rel
+                    .split('/')
+                    .any(|part| part == "target" || part == ".git");
                 if !has_target_or_git {
                     files.push(path);
                 }
             }
 
             // Report skipped files
-            let (skipped_rust_count, skipped_python_count, skipped_typescript_count, skipped_go_count) =
-                git_count_skipped_files(repo_root).unwrap_or((0, 0, 0, 0));
+            let (
+                skipped_rust_count,
+                skipped_python_count,
+                skipped_typescript_count,
+                skipped_go_count,
+            ) = git_count_skipped_files(repo_root).unwrap_or((0, 0, 0, 0));
 
             eprintln!(
                 "Skipped {skipped_rust_count} .rs, {skipped_python_count} .py, {skipped_typescript_count} .ts/.tsx, {skipped_go_count} .go files by ignore rules"
@@ -179,7 +183,13 @@ fn git_count_skipped_files(repo_root: &Path) -> Option<(usize, usize, usize, usi
     };
 
     process_output(&["ls-files", "--others", "--exclude-standard", "-z"])?;
-    process_output(&["ls-files", "--others", "--ignored", "--exclude-standard", "-z"])?;
+    process_output(&[
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+    ])?;
 
     Some((skipped_rust, skipped_python, skipped_typescript, skipped_go))
 }
