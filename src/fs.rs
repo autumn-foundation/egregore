@@ -36,7 +36,10 @@ pub fn discover_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
     if crate::identity::is_repo_root(repo_root) {
         if let Some(tracked) = git_tracked_files(repo_root) {
             for path in tracked {
-                if !path.is_file() || !languages::is_supported_source(&path) {
+                let is_file = std::fs::symlink_metadata(&path)
+                    .map(|m| m.is_file())
+                    .unwrap_or(false);
+                if !is_file || !languages::is_supported_source(&path) {
                     continue;
                 }
                 let Ok(rel) = repo_relative_path(repo_root, &path) else {
