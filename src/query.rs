@@ -17,6 +17,7 @@ use chrono::DateTime;
 use crate::ir::{
     EdgeLabel, EvidenceLink, GraphRecord, NodeKind, OutputHandle, PatchHandle,
     SemanticDriftMetadata, SnapshotHead, SourceSpan, TemporalMetadata, UserContextScope,
+    parse_codegraph_id,
 };
 use crate::redaction::redact_value;
 /// Finds a symbol record by name at a specific Git commit.
@@ -428,18 +429,6 @@ impl RepositoryIndex {
             }),
         }
     }
-}
-
-fn parse_codegraph_id(id: &str) -> Option<(u32, &str)> {
-    if !id.starts_with("codegraph:v") {
-        return None;
-    }
-    let rest = &id["codegraph:v".len()..];
-    let colon_idx = rest.find(':')?;
-    let version_str = &rest[..colon_idx];
-    let version = version_str.parse::<u32>().ok()?;
-    let suffix = &rest[colon_idx + 1..];
-    Some((version, suffix))
 }
 
 fn matches_symbol_at_commit(record: &GraphRecord, symbol_name: &str, commit: &str) -> bool {

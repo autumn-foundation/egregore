@@ -2240,6 +2240,22 @@ pub(crate) fn versioned_stable_id(version: u32, parts: &[&str]) -> String {
     format!("codegraph:v{version}:{}", hasher.finalize().to_hex())
 }
 
+/// Parses the schema version and hash suffix from a versioned codegraph ID.
+///
+/// Expected format: `codegraph:v<version>:<suffix>`.
+#[must_use]
+pub fn parse_codegraph_id(id: &str) -> Option<(u32, &str)> {
+    if !id.starts_with("codegraph:v") {
+        return None;
+    }
+    let rest = &id["codegraph:v".len()..];
+    let colon_idx = rest.find(':')?;
+    let version_str = &rest[..colon_idx];
+    let version = version_str.parse::<u32>().ok()?;
+    let suffix = &rest[colon_idx + 1..];
+    Some((version, suffix))
+}
+
 /// Builds a stable verification-domain record ID.
 ///
 /// Uses the `verification:v1:` prefix so verification IDs cannot collide with
