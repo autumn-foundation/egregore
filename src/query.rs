@@ -204,6 +204,8 @@ pub struct RepositoryIndex {
     owner: BTreeMap<String, String>,
     /// Repository record ID → identity handles.
     repos: BTreeMap<String, RepositoryEntry>,
+    /// Repository record ID → highest-version repository record ID.
+    highest_version: BTreeMap<String, String>,
 }
 
 impl RepositoryIndex {
@@ -354,7 +356,10 @@ impl RepositoryIndex {
         let mut suffix_to_versions: HashMap<&str, Vec<(u32, &str)>> = HashMap::new();
         for repo_id in repos.keys() {
             if let Some((version, suffix)) = parse_codegraph_id(repo_id) {
-                suffix_to_versions.entry(suffix).or_default().push((version, repo_id.as_str()));
+                suffix_to_versions
+                    .entry(suffix)
+                    .or_default()
+                    .push((version, repo_id.as_str()));
             }
         }
         let mut repo_translation: HashMap<String, String> = HashMap::new();
@@ -371,7 +376,13 @@ impl RepositoryIndex {
             }
         }
 
-        Self { owner, repos }
+        let highest_version: BTreeMap<String, String> = repo_translation.into_iter().collect();
+
+        Self {
+            owner,
+            repos,
+            highest_version,
+        }
     }
 
     /// Returns the owning repository record ID for a node record ID.
@@ -406,48 +417,58 @@ impl RepositoryIndex {
     /// when more than one repository matches. Ambiguity is never resolved by
     /// picking a repository implicitly.
     pub fn resolve_selector(&self, selector: &str) -> Result<&str, RepositorySelectorError> {
-        if let Some((id, _)) = self.repos.get_key_value(selector) {
-            return Ok(id.as_str());
-        }
-        let mut candidates: Vec<&str> = self
-            .repos
-            .iter()
-            .filter(|(_, entry)| entry.selectors.contains(selector))
-            .map(|(id, _)| id.as_str())
-            .collect();
+        let resolved = if let Some((id, _)) = self.repos.get_key_value(selector) {
+            id.as_str()
+        } else {
+            let mut candidates: Vec<&str> = self
+                .repos
+                .iter()
+                .filter(|(_, entry)| entry.selectors.contains(selector))
+                .map(|(id, _)| id.as_str())
+                .collect();
 
-        // Deduplicate candidates that represent the same repository under different schema versions.
-        if candidates.len() > 1 {
-            let mut groups: std::collections::HashMap<&str, (u32, &str)> =
-                std::collections::HashMap::new();
-            let mut has_unparseable = false;
-            for candidate in &candidates {
-                if let Some((version, suffix)) = parse_codegraph_id(candidate) {
-                    let entry = groups.entry(suffix).or_insert((0, ""));
-                    if version > entry.0 {
-                        *entry = (version, candidate);
+            // Deduplicate candidates that represent the same repository under different schema versions.
+            if candidates.len() > 1 {
+                let mut groups: std::collections::HashMap<&str, (u32, &str)> =
+                    std::collections::HashMap::new();
+                let mut has_unparseable = false;
+                for candidate in &candidates {
+                    if let Some((version, suffix)) = parse_codegraph_id(candidate) {
+                        let entry = groups.entry(suffix).or_insert((0, ""));
+                        if version > entry.0 {
+                            *entry = (version, candidate);
+                        }
+                    } else {
+                        has_unparseable = true;
+                        break;
                     }
-                } else {
-                    has_unparseable = true;
-                    break;
+                }
+                if !has_unparseable {
+                    candidates = groups.values().map(|(_, id)| *id).collect();
+                    candidates.sort_unstable();
                 }
             }
-            if !has_unparseable {
-                candidates = groups.values().map(|(_, id)| *id).collect();
-                candidates.sort_unstable();
-            }
-        }
 
-        match candidates.as_slice() {
-            [] => Err(RepositorySelectorError::Unknown {
-                selector: selector.to_owned(),
-            }),
-            [single] => Ok(single),
-            _ => Err(RepositorySelectorError::Ambiguous {
-                selector: selector.to_owned(),
-                candidates: candidates.into_iter().map(str::to_owned).collect(),
-            }),
-        }
+            match candidates.as_slice() {
+                [] => {
+                    return Err(RepositorySelectorError::Unknown {
+                        selector: selector.to_owned(),
+                    });
+                }
+                [single] => *single,
+                _ => {
+                    return Err(RepositorySelectorError::Ambiguous {
+                        selector: selector.to_owned(),
+                        candidates: candidates.into_iter().map(str::to_owned).collect(),
+                    });
+                }
+            }
+        };
+
+        Ok(self
+            .highest_version
+            .get(resolved)
+            .map_or(resolved, String::as_str))
     }
 }
 
