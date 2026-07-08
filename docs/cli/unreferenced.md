@@ -80,12 +80,20 @@ individually).
 ## Extraction-completeness caveat (issue #87)
 
 A candidate whose file scope contains extractor `Diagnostic` markers
-(unparsed macro invocations, unresolved call targets) — matched by file
-path, exactly like the `eg query file` diagnostics rule, so `--repo`
-scoping never drops a caveat — carries an
+(unparsed macro invocations, unresolved call targets) carries an
 `extraction_caveat`: a macro-hidden reference may exist in that scope, so
 the candidate's confidence is lower. The caveat is **advisory** — it cites
 the marker records and never rewrites or hides the code fact.
+
+Markers are matched to candidates by file path. Under `--repo` in a
+multi-repo store, each marker is attributed to its producing repository by
+recomputing the extractor's stable-ID schemes, so a marker from another
+repository that happens to share the same repo-relative path never caveats
+the scoped repository's candidates — and the scoped repository always keeps
+its own. A marker with an unrecognized ID scheme falls back to the
+path-owner rule (kept when its path is recorded by the scoped repository):
+conservative, because dropping a real marker would hide lower extraction
+confidence.
 
 ## Output shape
 

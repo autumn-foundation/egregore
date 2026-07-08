@@ -18,7 +18,7 @@ use chrono::DateTime;
 use crate::ir::{
     CallResolution, EdgeLabel, EvidenceLink, GraphRecord, NodeKind, OutputHandle, PatchHandle,
     SemanticDriftMetadata, SnapshotHead, SourceSpan, TemporalMetadata, UserContextScope,
-    parse_codegraph_id,
+    parse_codegraph_id, stable_id,
 };
 use crate::redaction::redact_value;
 /// Finds a symbol record by name at a specific Git commit.
@@ -17601,7 +17601,9 @@ pub fn ownership_map<'a>(
         files,
         diagnostics,
     })
+}
 
+// ---------------------------------------------------------------------------
 // unreferenced-symbol prune candidates (issue #113)
 // ---------------------------------------------------------------------------
 
@@ -17807,20 +17809,19 @@ pub fn unreferenced_symbols<'a>(
     // Candidate population: live, in-scope Symbol nodes, keep-last dedupe by
     // stable ID so history graphs resolve to their newest version.
     let mut symbols: BTreeMap<&str, &'a GraphRecord> = BTreeMap::new();
-    // Active extractor Diagnostic markers per file scope. Code-domain only:
-    // trajectory/importer records reuse `NodeKind::Diagnostic` with a `domain`
-    // marker and must not lower confidence in code extraction. Markers are
-    // matched by path, never by repository ownership: extractor Diagnostics
-    // are not attached to the containment topology, so an ownership filter
-    // would silently drop every caveat from a repo-scoped run. This mirrors
-    // the issue #87 `eg query file` diagnostics rule.
-    let mut file_diagnostics: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    // Active extractor Diagnostic markers, collected raw here and attributed
+    // to repositories below. Code-domain only: trajectory/importer records
+    // reuse `NodeKind::Diagnostic` with a `domain` marker and must not lower
+    // confidence in code extraction.
+    let mut diagnostic_rows: Vec<(&str, &str, Option<&str>, Option<&TemporalMetadata>)> =
+        Vec::new();
     for record in records {
         let GraphRecord::Node {
             id,
             kind,
             repo_relative_path,
             symbol_kind,
+            name,
             domain,
             temporal,
             ..
@@ -17844,17 +17845,94 @@ pub fn unreferenced_symbols<'a>(
                 symbols.insert(id.as_str(), record);
             }
             NodeKind::Diagnostic if domain.is_none() => {
-                if !unowned_record_is_current(temporal.as_ref()) {
-                    continue;
-                }
                 if let Some(path) = repo_relative_path.as_deref() {
-                    file_diagnostics
-                        .entry(path)
-                        .or_default()
-                        .insert(id.as_str());
+                    diagnostic_rows.push((id.as_str(), path, name.as_deref(), temporal.as_ref()));
                 }
             }
             _ => {}
+        }
+    }
+
+    // ── Diagnostic attribution, scoping, and currency ───────────────────────
+    // Extractor Diagnostic markers are not attached to the containment
+    // topology, so `owner_of` cannot attribute them (an ownership pre-filter
+    // would silently drop every caveat from a repo-scoped run). Their stable
+    // IDs embed the producing repository's record ID, so attribution is
+    // recomputed from the two extractor ID schemes (unsupported macro
+    // invocation; unresolved call target). A marker with an unrecognized
+    // scheme falls back to the path-owner rule used by the file-at-point
+    // lanes — kept when its path is recorded by the selected repository —
+    // because the caveat is advisory and dropping a real marker would hide
+    // lower extraction confidence.
+    let mut file_diagnostics: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    if !diagnostic_rows.is_empty() {
+        let repository_ids = index.repository_ids();
+        // Macro-scheme disambiguators are per-(path, invocation) ordinals, so
+        // the instance count bounds the recomputation search.
+        let mut name_counts: BTreeMap<(&str, &str), u64> = BTreeMap::new();
+        for (_, path, name, _) in &diagnostic_rows {
+            if let Some(name) = name {
+                *name_counts.entry((*path, *name)).or_default() += 1;
+            }
+        }
+        // Live File/Symbol owners per path: the fallback attribution rule.
+        let mut path_owners: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for record in records {
+            if let GraphRecord::Node {
+                id,
+                kind: NodeKind::File | NodeKind::Symbol,
+                repo_relative_path: Some(path),
+                ..
+            } = record
+                && !tombstoned.contains(id.as_str())
+                && let Some(owner) = index.owner_of(id)
+            {
+                path_owners.entry(path.as_str()).or_default().insert(owner);
+            }
+        }
+        // Repository record IDs can differ in schema version across records;
+        // compare by canonical suffix so a version bump never splits a repo.
+        let same_repo = |a: &str, b: &str| -> bool {
+            a == b
+                || matches!(
+                    (parse_codegraph_id(a), parse_codegraph_id(b)),
+                    (Some((_, sa)), Some((_, sb))) if sa == sb
+                )
+        };
+        for (id, path, name, temporal) in &diagnostic_rows {
+            let attributed = name.and_then(|name| {
+                let ordinal_bound = name_counts.get(&(*path, name)).copied().unwrap_or(0);
+                repository_ids.iter().copied().find(|repo| {
+                    stable_id(&["node", "diagnostic", repo, path, "unresolved-call", name]) == *id
+                        || (0..ordinal_bound).any(|ordinal| {
+                            let ordinal = ordinal.to_string();
+                            stable_id(&["node", "diagnostic", repo, path, name, &ordinal]) == *id
+                        })
+                })
+            });
+            let in_scope = match (repo_scope, attributed) {
+                (None, _) => true,
+                (Some(scope), Some(repo)) => same_repo(repo, scope),
+                (Some(scope), None) => path_owners
+                    .get(path)
+                    .is_some_and(|owners| owners.iter().any(|owner| same_repo(owner, scope))),
+            };
+            if !in_scope {
+                continue;
+            }
+            let current = attributed.map_or_else(
+                || unowned_record_is_current(*temporal),
+                |repo| {
+                    temporal.is_none_or(|t| {
+                        repo_heads
+                            .get(repo)
+                            .is_none_or(|head_sha| t.git_commit == *head_sha)
+                    })
+                },
+            );
+            if current {
+                file_diagnostics.entry(path).or_default().insert(id);
+            }
         }
     }
 

@@ -768,3 +768,135 @@ fn repo_scoped_run_keeps_extraction_caveats_for_diagnostic_marked_files() {
         "Diagnostic-marked files must stay tallied under --repo"
     );
 }
+
+// ---------------------------------------------------------------------------
+// --repo scoping must not import another repository's Diagnostic caveats
+// ---------------------------------------------------------------------------
+
+/// Both repositories record `src/lib.rs`; only `repo-dirty`'s copy contains an
+/// extraction Diagnostic. A run scoped to the clean repository must not
+/// caveat its candidates off the other repository's marker, and a run scoped
+/// to the dirty repository must keep its own caveat.
+#[test]
+fn repo_scope_excludes_other_repositories_diagnostic_caveats_on_shared_paths() {
+    let temp_clean = tempfile::tempdir().expect("temp dir clean");
+    fs::create_dir_all(temp_clean.path().join("src")).expect("src dir");
+    fs::write(
+        temp_clean.path().join("src/lib.rs"),
+        "fn clean_orphan() {}\n",
+    )
+    .expect("clean lib.rs");
+    let temp_dirty = tempfile::tempdir().expect("temp dir dirty");
+    fs::create_dir_all(temp_dirty.path().join("src")).expect("src dir");
+    fs::write(
+        temp_dirty.path().join("src/lib.rs"),
+        "fn dirty_orphan() {}\n\ntotally_unknown_macro!(marker);\n",
+    )
+    .expect("dirty lib.rs");
+
+    let jsonl_clean =
+        scan_repository_at_with_override(temp_clean.path(), FIXED_TIME, Some("repo-clean"))
+            .expect("scan clean")
+            .to_jsonl()
+            .expect("serialize clean");
+    let jsonl_dirty =
+        scan_repository_at_with_override(temp_dirty.path(), FIXED_TIME, Some("repo-dirty"))
+            .expect("scan dirty")
+            .to_jsonl()
+            .expect("serialize dirty");
+    let graph = temp_clean.path().join("merged.graph.jsonl");
+    fs::write(&graph, format!("{jsonl_clean}{jsonl_dirty}")).expect("write merged graph");
+
+    let scoped = |selector: &str| -> Value {
+        let output = egregore()
+            .args(["query", "unreferenced", "--repo", selector, "--graph"])
+            .arg(&graph)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_str(std::str::from_utf8(&output).expect("utf8").trim())
+            .expect("stdout must be valid JSON")
+    };
+
+    let clean = scoped("repo-clean");
+    assert!(
+        candidate(&clean, "clean_orphan")["extraction_caveat"].is_null(),
+        "the clean repository must not inherit the other repository's marker \
+         through the shared repo-relative path"
+    );
+    assert_eq!(
+        clean["counts"]["files_with_diagnostic_markers"], 0,
+        "out-of-scope Diagnostic-marked files must not be tallied"
+    );
+
+    let dirty = scoped("repo-dirty");
+    assert_eq!(
+        dirty["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .find(|c| c["name"] == "dirty_orphan")
+            .expect("dirty_orphan candidate")["extraction_caveat"]["code"],
+        "diagnostics_in_file_scope",
+        "the owning repository keeps its own extraction caveat"
+    );
+    assert_eq!(dirty["counts"]["files_with_diagnostic_markers"], 1);
+}
+
+// ---------------------------------------------------------------------------
+// --data-dir reads must leave the live embedded store byte-for-byte untouched
+// ---------------------------------------------------------------------------
+
+/// Recursive path -> content map for byte-exact store comparisons.
+#[cfg(feature = "embedded-aletheiadb")]
+fn dir_contents(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut contents = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("dir should read") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let bytes = fs::read(&path).expect("file should read");
+                contents.insert(path.display().to_string(), bytes);
+            }
+        }
+    }
+    contents
+}
+
+/// Opening the embedded engine in place re-persists index files, so the
+/// `--data-dir` path must read through a throwaway copy (same contract as the
+/// other strictly read-only lanes).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn unreferenced_query_is_read_only_for_embedded_store() {
+    let (temp, graph) = fixture_graph();
+    let data_dir = temp.path().join("store");
+
+    egregore()
+        .arg("ingest")
+        .arg(&graph)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let bytes_before = dir_contents(&data_dir);
+
+    egregore()
+        .args(["query", "unreferenced", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    assert_eq!(
+        dir_contents(&data_dir),
+        bytes_before,
+        "querying must leave the live embedded store byte-for-byte untouched"
+    );
+}
