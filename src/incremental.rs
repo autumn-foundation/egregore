@@ -15,12 +15,16 @@ use crate::{
     error::{CodegraphError, Result},
     identity,
     ir::{Graph, GraphRecord, ProducerKind, SCHEMA_VERSION, stable_id, versioned_stable_id},
+    languages::cross_file::{FileFacts, cross_file_call_records},
     repository_record_from_identity, scan_source_file_records,
     schema_version::validate_record_version,
 };
 
 /// Incremental cache schema for extractor output stored on disk.
-const CACHE_SCHEMA_VERSION: u32 = 4;
+///
+/// v5 adds per-file cross-file resolution facts and the previously emitted
+/// cross-file record IDs (issue #152).
+const CACHE_SCHEMA_VERSION: u32 = 5;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -178,19 +182,21 @@ fn scan_repository_incremental_at_inner(
         let previous_entry = previous_cache.files.get(&source_file.repo_relative_path);
         let cached = previous_entry.filter(|_| can_reuse_cache_records);
 
-        let records = if let Some(cached) = cached.filter(|entry| entry.hash == hash) {
+        let (records, facts) = if let Some(cached) = cached.filter(|entry| entry.hash == hash) {
             reused_files.push(source_file.repo_relative_path.clone());
             // Restamp reused records so valid_time reflects this scan's transaction time,
             // not the prior scan's time when they were first extracted.
-            cached
+            let records = cached
                 .records
                 .iter()
                 .cloned()
                 .map(|r| r.with_valid_time_inferred(transaction_time))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (records, cached.facts.clone())
         } else {
             rebuilt_files.push(source_file.repo_relative_path.clone());
-            let records = scan_source_file_records(&source_file, &repository_id)?
+            let (records, facts) = scan_source_file_records(&source_file, &repository_id)?;
+            let records = records
                 .into_iter()
                 .map(|r| r.with_valid_time_inferred(transaction_time))
                 .collect::<Vec<_>>();
@@ -204,7 +210,7 @@ fn scan_repository_incremental_at_inner(
                     graph.push(tombstone);
                 }
             }
-            records
+            (records, facts)
         };
 
         for record in &records {
@@ -212,9 +218,48 @@ fn scan_repository_incremental_at_inner(
         }
         next_cache.files.insert(
             source_file.repo_relative_path.clone(),
-            CachedFile { hash, records },
+            CachedFile {
+                hash,
+                records,
+                facts,
+            },
         );
     }
+
+    // Repo-wide cross-file call resolution (issue #152): recompute the pass
+    // from every file's cached or freshly extracted facts, and tombstone any
+    // cross-file record from the previous scan that no longer exists so
+    // persisted stores can retire it.
+    let facts_by_file: BTreeMap<String, FileFacts> = next_cache
+        .files
+        .iter()
+        .filter(|(_, cached_file)| !cached_file.facts.is_empty())
+        .map(|(path, cached_file)| (path.clone(), cached_file.facts.clone()))
+        .collect();
+    let cross_file_records = cross_file_call_records(&repository_id, &facts_by_file);
+    let cross_file_ids: BTreeSet<String> = cross_file_records
+        .iter()
+        .map(|record| record.id().to_owned())
+        .collect();
+    let reusable_previous_ids = if can_reuse_cache_records {
+        previous_cache.cross_file_record_ids.clone()
+    } else {
+        Vec::new()
+    };
+    for stale_id in reusable_previous_ids
+        .iter()
+        .filter(|previous_id| !cross_file_ids.contains(*previous_id))
+    {
+        graph.push(invalidated_record_tombstone(
+            "cross-file",
+            stale_id,
+            transaction_time,
+        ));
+    }
+    for record in cross_file_records {
+        graph.push(record.with_valid_time_inferred(transaction_time));
+    }
+    next_cache.cross_file_record_ids = cross_file_ids.into_iter().collect();
 
     let mut tombstoned_files = Vec::new();
     for (removed, cached_file) in &previous_cache.files {
@@ -253,6 +298,10 @@ struct CacheFile {
     #[serde(default)]
     repository_id: String,
     files: BTreeMap<String, CachedFile>,
+    /// Cross-file resolution records emitted by the previous scan (issue #152),
+    /// kept so a later scan can tombstone the ones that disappear.
+    #[serde(default)]
+    cross_file_record_ids: Vec<String>,
 }
 
 impl Default for CacheFile {
@@ -261,6 +310,7 @@ impl Default for CacheFile {
             schema_version: CACHE_SCHEMA_VERSION,
             repository_id: String::new(),
             files: BTreeMap::new(),
+            cross_file_record_ids: Vec::new(),
         }
     }
 }
@@ -312,6 +362,9 @@ impl CacheFile {
 struct CachedFile {
     hash: String,
     records: Vec<GraphRecord>,
+    /// Cross-file resolution facts for the file (issue #152).
+    #[serde(default, skip_serializing_if = "FileFacts::is_empty")]
+    facts: FileFacts,
 }
 
 fn file_hash(path: &Path) -> Result<String> {

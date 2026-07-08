@@ -106,8 +106,8 @@ Initial edge labels:
 | `CONTAINS` | Repository/Directory/File/Module -> child | Hierarchical ownership |
 | `DEFINES` | File/Module -> Symbol | Definition lives here |
 | `IMPORTS` | File/Module -> Import | Import declaration appears here |
-| `REFERENCES` | Symbol/Import -> Symbol | Best-effort syntactic reference |
-| `CALLS` | Symbol -> Symbol | Best-effort function or method call |
+| `REFERENCES` | Symbol/Import -> Symbol | Best-effort syntactic reference (same-file) |
+| `CALLS` | Symbol -> Symbol/Diagnostic | Function or method call; resolved repo-wide across files for Rust and labeled with a `resolution` status (see below) |
 | `IMPLEMENTS` | Symbol -> Symbol | Impl/trait relationship where syntactically resolvable |
 | `MENTIONS` | Symbol -> Symbol | Weaker unresolved textual/syntactic mention |
 | `CHANGED_IN` | File/Symbol -> Commit/Change | Entity changed in a commit |
@@ -115,6 +115,37 @@ Initial edge labels:
 | `DRIFTS_FROM` | SemanticDrift -> File/Symbol | Semantic-domain edge; see [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md). |
 | `DRIFTS_PRIOR` | SemanticDrift -> File/Symbol | Semantic-domain prior edge; see [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md). |
 | `MEASURED_BY` | SemanticDrift -> EmbeddingModel | Reserved semantic-domain model edge; see [`docs/schema/semantic-drift.md`](../schema/semantic-drift.md). |
+
+### Cross-File Call Resolution Boundary (issue #152)
+
+Rust `CALLS` edges are produced by two deterministic passes:
+
+1. The per-file pass links call sites to definitions in the same file.
+2. A repo-wide resolution pass links call sites to definitions in **other files of the
+   same scanned repository**, using only facts the scan already extracts (Tree-sitter
+   call expressions, module paths, qualified names, impl owners). Call sites come from
+   the AST, so names appearing only in comments, string literals, macro token trees, or
+   as substrings of longer identifiers never produce edges.
+
+Every edge emitted by the repo-wide pass carries a `resolution` field:
+
+| `resolution` | Meaning |
+|--------------|---------|
+| `resolved` | The call's name (plus any path/receiver narrowing) matched exactly one in-repo definition. |
+| `ambiguous` | The name matched two or more in-repo definitions; an edge is emitted to every candidate. |
+| `unresolved` | No in-repo definition matched; the edge targets a `Diagnostic` node naming the callee — the call is labeled, not dropped, and never bound to an invented symbol. |
+
+The resolution scope is a documented contract, not folklore:
+
+- **In scope:** in-repo cross-file resolution of direct calls, path-qualified calls
+  (`crate::`/`self::`/`super::` stripped, `Self::` rewritten to the impl owner), and
+  method calls (`self.method()` prefers the surrounding impl's methods).
+- **Out of scope:** cross-crate resolution into external dependency source, trait
+  dynamic dispatch, macro-expanded call sites, generic monomorphization, and
+  cross-language resolution. Method calls with no in-repo candidate and
+  constructor-style calls (leading-uppercase final segment, e.g. `Some(..)`) are
+  external or value constructions by construction and are not recorded as unresolved
+  diagnostics, keeping the graph bounded.
 
 Every emitted node must include:
 

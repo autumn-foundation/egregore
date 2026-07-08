@@ -4,13 +4,16 @@ use crate::{
     error::Result,
     fs::SourceFile,
     ir::{Graph, GraphRecord},
-    languages::{self, Language},
+    languages::{self, Language, cross_file::FileFacts},
 };
 
 /// Extracts syntax-backed graph records for a source file, dispatching to the
 /// extractor for the file's detected language.
 ///
 /// Files whose extension is not a supported source language are skipped.
+///
+/// Returns the file's cross-file resolution facts (issue #152); empty for
+/// languages without a cross-file resolution pass.
 ///
 /// # Errors
 ///
@@ -20,17 +23,20 @@ pub fn extract_source_file(
     file_id: &str,
     repository_id: &str,
     graph: &mut Graph,
-) -> Result<()> {
+) -> Result<FileFacts> {
     match languages::detect(&file.repo_relative_path) {
         Some(Language::Rust) => languages::rust::extract_file(file, file_id, repository_id, graph),
         Some(Language::Python) => {
             languages::python::extract_file(file, file_id, repository_id, graph)
+                .map(|()| FileFacts::default())
         }
         Some(Language::TypeScript) => {
             languages::typescript::extract_file(file, file_id, repository_id, graph)
+                .map(|()| FileFacts::default())
         }
-        Some(Language::Go) => languages::go::extract_file(file, file_id, repository_id, graph),
-        None => Ok(()),
+        Some(Language::Go) => languages::go::extract_file(file, file_id, repository_id, graph)
+            .map(|()| FileFacts::default()),
+        None => Ok(FileFacts::default()),
     }
 }
 
@@ -38,6 +44,9 @@ pub fn extract_source_file(
 /// the current working tree, dispatching by the file's detected language.
 ///
 /// Files whose extension is not a supported source language are skipped.
+///
+/// Returns the file's cross-file resolution facts (issue #152); empty for
+/// languages without a cross-file resolution pass.
 ///
 /// # Errors
 ///
@@ -48,21 +57,24 @@ pub fn extract_source_text(
     file_id: &str,
     repository_id: &str,
     graph: &mut Graph,
-) -> Result<()> {
+) -> Result<FileFacts> {
     match languages::detect(&file.repo_relative_path) {
         Some(Language::Rust) => {
             languages::rust::extract_file_source(file, source, file_id, repository_id, graph)
         }
         Some(Language::Python) => {
             languages::python::extract_file_source(file, source, file_id, repository_id, graph)
+                .map(|()| FileFacts::default())
         }
         Some(Language::TypeScript) => {
             languages::typescript::extract_file_source(file, source, file_id, repository_id, graph)
+                .map(|()| FileFacts::default())
         }
         Some(Language::Go) => {
             languages::go::extract_file_source(file, source, file_id, repository_id, graph)
+                .map(|()| FileFacts::default())
         }
-        None => Ok(()),
+        None => Ok(FileFacts::default()),
     }
 }
 

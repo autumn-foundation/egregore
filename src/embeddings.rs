@@ -399,6 +399,7 @@ fn semantic_edge(
         source,
         target,
         confidence,
+        resolution: None,
         temporal: None,
         summary,
         producer: None,

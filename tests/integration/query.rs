@@ -483,6 +483,7 @@ fn symbol_context_edge_linked_node_backing_evidence_is_classified() {
         target: sym_id.to_owned(),
         schema_version: 0,
         confidence: None,
+        resolution: None,
         temporal: None,
         summary: "obs mentions edge_backed_fn".to_owned(),
         producer: None,

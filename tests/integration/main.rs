@@ -13,6 +13,7 @@ mod citation_audit;
 mod claude_code;
 mod cli;
 mod codex;
+mod cross_file_calls;
 mod daemon;
 mod deterministic_scan;
 mod doctor;

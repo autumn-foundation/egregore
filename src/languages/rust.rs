@@ -8,13 +8,19 @@ use crate::{
     error::{CodegraphError, Result},
     fs::SourceFile,
     ir::{EdgeLabel, Graph, GraphRecord, NodeKind, stable_id},
-    languages::common::{
-        SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, node_name,
-        path_segments, span,
+    languages::{
+        common::{
+            SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, node_name,
+            path_segments, span,
+        },
+        cross_file::{CallKind, CallSiteFact, DefinitionFact, FileFacts},
     },
 };
 
 /// Extracts Rust syntax records from one source file.
+///
+/// Returns the file's cross-file resolution facts (issue #152) for the
+/// repo-wide `CALLS` resolution pass.
 ///
 /// # Errors
 ///
@@ -25,7 +31,7 @@ pub fn extract_file(
     file_id: &str,
     repository_id: &str,
     graph: &mut Graph,
-) -> Result<()> {
+) -> Result<FileFacts> {
     let source =
         std::fs::read_to_string(&file.path).map_err(|source| CodegraphError::ReadFile {
             path: file.path.clone(),
@@ -35,6 +41,9 @@ pub fn extract_file(
 }
 
 /// Extracts Rust syntax records from supplied source text.
+///
+/// Returns the file's cross-file resolution facts (issue #152) for the
+/// repo-wide `CALLS` resolution pass.
 ///
 /// # Errors
 ///
@@ -46,7 +55,7 @@ pub fn extract_file_source(
     file_id: &str,
     repository_id: &str,
     graph: &mut Graph,
-) -> Result<()> {
+) -> Result<FileFacts> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -60,7 +69,7 @@ pub fn extract_file_source(
     let mut extractor = RustExtractor::new(file, file_id, repository_id, graph, source);
     extractor.walk(tree.root_node());
     extractor.emit_reference_edges();
-    Ok(())
+    Ok(extractor.facts)
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +92,7 @@ struct RustExtractor<'graph, 'source> {
     symbol_bodies: Vec<SymbolBody>,
     symbol_ordinals: BTreeMap<(String, String), u64>,
     diagnostic_ordinals: BTreeMap<String, u64>,
+    facts: FileFacts,
 }
 
 impl<'graph, 'source> RustExtractor<'graph, 'source> {
@@ -106,6 +116,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             symbol_bodies: Vec::new(),
             symbol_ordinals: BTreeMap::new(),
             diagnostic_ordinals: BTreeMap::new(),
+            facts: FileFacts::default(),
         }
     }
 
@@ -230,14 +241,149 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         );
 
         let id = self.add_symbol(node, symbol_kind, &qualified_name);
-        self.definitions.insert(local_name, id.clone());
+        self.definitions.insert(local_name.clone(), id.clone());
         self.definitions.insert(qualified_name.clone(), id.clone());
+        self.facts.definitions.push(DefinitionFact {
+            id: id.clone(),
+            qualified_name: qualified_name.clone(),
+            simple_name: local_name.clone(),
+            match_segments: self.definition_match_segments(&local_name),
+            symbol_kind: symbol_kind.to_owned(),
+            repo_relative_path: self.file.repo_relative_path.clone(),
+        });
+        self.collect_call_sites(node, &id, &qualified_name);
         self.symbol_bodies.push(SymbolBody {
             id,
             name: qualified_name,
             text: node_text.to_owned(),
         });
         self.walk_children(node);
+    }
+
+    /// Match segments for a callable definition: the module path, plus the
+    /// normalized impl owner for methods, plus the simple name.
+    fn definition_match_segments(&self, local_name: &str) -> Vec<String> {
+        let mut segments = self.module_names.clone();
+        if let Some(impl_context) = &self.impl_context
+            && let Some(owner) = normalize_impl_owner(&impl_context.method_owner)
+        {
+            segments.push(owner);
+        }
+        segments.push(local_name.to_owned());
+        segments
+    }
+
+    /// Collects syntactic call sites inside a recorded symbol body (issue #152).
+    ///
+    /// Recursion stops at nested definition scopes (`fn`, `impl`, `trait`,
+    /// `mod`) — those register their own symbols and collect their own calls —
+    /// and never enters macro token trees, comments, or string literals
+    /// (Tree-sitter parses none of them as `call_expression`).
+    fn collect_call_sites(&mut self, node: Node<'_>, caller_id: &str, caller_name: &str) {
+        let mut cursor = node.walk();
+        let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        for child in children {
+            match child.kind() {
+                "function_item" | "impl_item" | "trait_item" | "mod_item" | "macro_definition"
+                | "macro_invocation" => {}
+                "call_expression" => {
+                    if let Some(fact) = self.call_site_fact(child, caller_id, caller_name) {
+                        self.facts.call_sites.push(fact);
+                    }
+                    self.collect_call_sites(child, caller_id, caller_name);
+                }
+                _ => self.collect_call_sites(child, caller_id, caller_name),
+            }
+        }
+    }
+
+    /// Classifies one `call_expression` into a [`CallSiteFact`], or `None`
+    /// when the callee is not a resolvable name form (closure calls, chained
+    /// call results, qualified `<T as Trait>::` paths, tuple-index fields).
+    fn call_site_fact(
+        &self,
+        node: Node<'_>,
+        caller_id: &str,
+        caller_name: &str,
+    ) -> Option<CallSiteFact> {
+        let mut function = node.child_by_field_name("function")?;
+        if function.kind() == "generic_function" {
+            function = function.child_by_field_name("function")?;
+        }
+        let (display, segments, call_kind, receiver_owner) = match function.kind() {
+            "identifier" => {
+                let name = self.node_text(function).trim().to_owned();
+                (name.clone(), vec![name], CallKind::Direct, None)
+            }
+            "scoped_identifier" => {
+                let display = self.node_text(function).trim().to_owned();
+                let segments = self.normalize_call_path(&display)?;
+                (display, segments, CallKind::Path, None)
+            }
+            "field_expression" => {
+                let field = function.child_by_field_name("field")?;
+                if field.kind() != "field_identifier" {
+                    return None;
+                }
+                let name = self.node_text(field).trim().to_owned();
+                let receiver_is_self = function
+                    .child_by_field_name("value")
+                    .is_some_and(|value| value.kind() == "self");
+                let owner = receiver_is_self
+                    .then(|| {
+                        self.impl_context.as_ref().and_then(|impl_context| {
+                            normalize_impl_owner(&impl_context.method_owner)
+                        })
+                    })
+                    .flatten();
+                let call_kind = if owner.is_some() {
+                    CallKind::SelfMethod
+                } else {
+                    CallKind::Method
+                };
+                (name.clone(), vec![name], call_kind, owner)
+            }
+            _ => return None,
+        };
+        if segments.is_empty() || segments.iter().any(|segment| !is_simple_ident(segment)) {
+            return None;
+        }
+        Some(CallSiteFact {
+            caller_id: caller_id.to_owned(),
+            caller_name: caller_name.to_owned(),
+            callee_display: display,
+            callee_segments: segments,
+            call_kind,
+            receiver_owner,
+            span: span(node),
+        })
+    }
+
+    /// Normalizes a `::`-separated call path for matching: strips leading
+    /// `crate`/`self`/`super` segments and rewrites a leading `Self` to the
+    /// surrounding impl owner when known.
+    fn normalize_call_path(&self, display: &str) -> Option<Vec<String>> {
+        let mut segments: Vec<String> = display
+            .split("::")
+            .map(|segment| segment.trim().to_owned())
+            .collect();
+        while segments
+            .first()
+            .is_some_and(|first| matches!(first.as_str(), "crate" | "self" | "super"))
+        {
+            segments.remove(0);
+        }
+        if segments.first().is_some_and(|first| first == "Self") {
+            segments.remove(0);
+            if let Some(owner) = self
+                .impl_context
+                .as_ref()
+                .and_then(|impl_context| normalize_impl_owner(&impl_context.method_owner))
+            {
+                segments.insert(0, owner);
+            }
+        }
+        (!segments.is_empty()).then_some(segments)
     }
 
     fn extract_impl(&mut self, node: Node<'_>) {
@@ -418,6 +564,54 @@ fn method_owner(display: &str) -> String {
         .unwrap_or(display)
         .trim()
         .to_owned()
+}
+
+/// Normalizes an impl owner display to the implementing type's simple name
+/// for cross-file call matching (issue #152).
+///
+/// `Runner for Widget` → `Widget`; `impl<T> MyStruct<T>` → `MyStruct`;
+/// `crate::foo::Bar` → `Bar`. Returns `None` for owner forms that do not
+/// reduce to a simple identifier (references, trait objects, tuples).
+fn normalize_impl_owner(owner: &str) -> Option<String> {
+    let owner = owner.rsplit(" for ").next()?.trim();
+    // A leftover `impl` / `impl<T>` prefix survives `method_owner` when the
+    // impl has generic parameters; strip it before reading the type.
+    let owner = strip_impl_prefix(owner).trim();
+    let owner = owner.split('<').next()?.trim();
+    let owner = owner.rsplit("::").next()?.trim();
+    (is_simple_ident(owner)).then(|| owner.to_owned())
+}
+
+/// Strips a leading `impl` keyword and its generic parameter list, if any.
+fn strip_impl_prefix(owner: &str) -> &str {
+    let Some(rest) = owner.strip_prefix("impl") else {
+        return owner;
+    };
+    let rest = rest.trim_start();
+    let Some(generics) = rest.strip_prefix('<') else {
+        return rest;
+    };
+    let mut depth = 1usize;
+    let mut end = generics.len();
+    for (idx, c) in generics.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = idx + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    generics.get(end..).unwrap_or("")
+}
+
+/// True when `text` is a plain identifier (letters, digits, underscores).
+fn is_simple_ident(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 fn macro_invocation_name(text: &str) -> String {

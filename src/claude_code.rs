@@ -1642,6 +1642,7 @@ fn make_edge(
         source,
         target,
         confidence: None,
+        resolution: None,
         temporal: None,
         summary: summary.to_owned(),
         producer: None,

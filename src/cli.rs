@@ -10447,6 +10447,7 @@ fn decide_cmd(
                                 source: id.clone(),
                                 target: c_id.clone(),
                                 confidence: None,
+                                resolution: None,
                                 temporal: None,
                                 summary: "PromotionDecision decided on PromoteCandidate".to_owned(),
                                 producer: None,
@@ -10489,6 +10490,7 @@ fn decide_cmd(
                                         source: mat_id.clone(),
                                         target: id.clone(),
                                         confidence: None,
+                                        resolution: None,
                                         temporal: None,
                                         summary:
                                             "PromotionDecision revoked durable user-context record"
@@ -10509,6 +10511,7 @@ fn decide_cmd(
                                         source: id.clone(),
                                         target: mat_id.clone(),
                                         confidence: None,
+                                        resolution: None,
                                         temporal: None,
                                         summary: "PromotionDecision materialized durable user-context record".to_owned(),
                                         producer: None,
@@ -10528,6 +10531,7 @@ fn decide_cmd(
                             source: id.clone(),
                             target: c_id.clone(),
                             confidence: None,
+                            resolution: None,
                             temporal: None,
                             summary: "PromotionPrompt prompted for PromoteCandidate".to_owned(),
                             producer: None,

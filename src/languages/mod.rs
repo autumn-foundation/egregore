@@ -4,6 +4,8 @@ use std::{ffi::OsStr, path::Path};
 
 /// Shared, language-neutral extraction helpers.
 pub mod common;
+/// Deterministic repo-wide cross-file call resolution (issue #152).
+pub mod cross_file;
 /// Go source extraction.
 pub mod go;
 /// Python source extraction.

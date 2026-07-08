@@ -151,6 +151,7 @@ fn build_fixture_records() -> Vec<GraphRecord> {
         source: "obs_contradicted".to_owned(),
         target: "obs_verified".to_owned(),
         confidence: None,
+        resolution: None,
         temporal: None,
         summary: "Contradiction edge".to_owned(),
         producer: None,
