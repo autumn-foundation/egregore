@@ -77,8 +77,17 @@ declared entry (manifest key):
   (`"1.0.228"`, `"1"`). Absent when the declaration carries no `version` key
   (pure `path`/`git`/`workspace = true` dependencies) — never fabricated.
 - **`resolved_version`** / **`resolution`** — the manifest resolves against
-  the nearest `Cargo.lock`, walking up from the manifest's directory to the
-  repository root (the standard workspace layout keeps one root lockfile).
+  the `Cargo.lock` Cargo would actually use: its own directory's lockfile, or
+  an ancestor directory's lockfile **only when that ancestor's `Cargo.toml`
+  declares a `[workspace]` whose `members` globs include the crate and whose
+  `exclude` globs do not** (the standard workspace layout keeps one root
+  lockfile). An independent nested crate outside the members globs, or an
+  excluded member, gets `no_lockfile` — never a fabricated `locked` from an
+  unrelated ancestor. Plain package manifests and stray lockfiles without a
+  manifest are walked past, mirroring Cargo's workspace discovery; an
+  unreadable ancestor manifest stops the walk without accepting anything.
+  (`package.workspace` explicit-pointer keys are not interpreted in this
+  slice.)
   A parseable declared requirement gates **every** path with Cargo semantics
   (`"1"` means `^1`), including a sole locked version that a stale or shared
   lockfile can leave unsatisfying: exactly one satisfying version is

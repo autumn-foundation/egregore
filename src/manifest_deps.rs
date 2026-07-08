@@ -453,7 +453,7 @@ fn unparseable_manifest_diagnostic(repository_id: &str, manifest_path: &str) -> 
 /// Returns an error when manifest discovery cannot read the filesystem.
 pub fn scan_dependency_records(repo_root: &Path, repository_id: &str) -> Result<Vec<GraphRecord>> {
     let mut records = Vec::new();
-    let mut lockfile_cache: BTreeMap<String, LockfileStatus> = BTreeMap::new();
+    let mut lockfile_cache = LockfileWalkCache::default();
     for manifest in discover_cargo_manifests(repo_root)? {
         let Ok(manifest_text) = std::fs::read_to_string(&manifest.path) else {
             // An unreadable manifest is reported like an unparseable one:
@@ -517,50 +517,211 @@ pub fn scan_dependency_records(repo_root: &Path, repository_id: &str) -> Result<
     Ok(records)
 }
 
-/// Finds and parses the nearest `Cargo.lock`, walking from the manifest's
-/// directory up to the repository root. Per-directory outcomes are cached so
-/// workspace members sharing a root lockfile parse it once.
+/// What one ancestor directory's `Cargo.toml` says about workspace roots
+/// (PR #314 review: the lockfile walk respects workspace boundaries).
+#[derive(Debug, Clone)]
+enum WorkspaceFacts {
+    /// No `Cargo.toml` beside the candidate lockfile: a stray lockfile that
+    /// Cargo would never attribute; the walk skips past it.
+    NoManifest,
+    /// The manifest exists but cannot be read or parsed: membership cannot be
+    /// verified, so the walk stops without accepting the lockfile.
+    Unverifiable,
+    /// A plain package manifest (no `[workspace]` table): its lockfile covers
+    /// only itself; Cargo's workspace discovery walks past it.
+    PackageOnly,
+    /// A workspace root: `members` / `exclude` globs decide coverage.
+    Workspace {
+        members: Vec<String>,
+        exclude: Vec<String>,
+    },
+}
+
+/// Per-directory caches for the lockfile walk: what lockfile the directory
+/// holds and what its manifest says about workspace membership.
+#[derive(Debug, Default)]
+struct LockfileWalkCache {
+    lockfiles: BTreeMap<String, LockfileStatus>,
+    workspaces: BTreeMap<String, WorkspaceFacts>,
+}
+
+/// Finds and parses the `Cargo.lock` Cargo would actually use for a manifest,
+/// walking from the manifest's directory up to the repository root.
+/// Per-directory outcomes are cached so workspace members sharing a root
+/// lockfile parse it once.
 ///
-/// The nearest `Cargo.lock` that *exists* is authoritative: when it fails to
-/// read or parse, the walk stops with [`LockfileStatus::Invalid`] instead of
-/// consulting an ancestor lockfile whose versions would be unrelated
-/// fabrications (PR #314 review).
+/// Boundary rules (PR #314 review):
+///
+/// - The manifest's **own** directory's lockfile is always its own.
+/// - An **ancestor** directory's lockfile is accepted only when that
+///   directory's `Cargo.toml` declares a `[workspace]` whose `members` globs
+///   include the manifest's directory and whose `exclude` globs do not — an
+///   independent nested crate or an excluded member never resolves from an
+///   unrelated ancestor lockfile (`no_lockfile` instead).
+/// - A plain package manifest (no `[workspace]`) or a stray lockfile with no
+///   manifest beside it is walked past, mirroring Cargo's workspace
+///   discovery; an unreadable/unparseable ancestor manifest stops the walk
+///   without accepting anything (membership cannot be verified).
+/// - A candidate lockfile that exists but cannot be read or parsed stops the
+///   walk with [`LockfileStatus::Invalid`] — never a fallback to a higher
+///   ancestor.
 fn nearest_lockfile(
     repo_root: &Path,
     manifest_repo_relative_path: &str,
-    cache: &mut BTreeMap<String, LockfileStatus>,
+    cache: &mut LockfileWalkCache,
 ) -> LockfileStatus {
     let mut segments: Vec<&str> = manifest_repo_relative_path.split('/').collect();
     // Drop the `Cargo.toml` file name, keeping the containing directory.
     segments.pop();
+    let manifest_dir: Vec<&str> = segments.clone();
     loop {
-        let dir_key = segments.join("/");
-        let status = cache.get(&dir_key).cloned().unwrap_or_else(|| {
-            let mut candidate = repo_root.to_path_buf();
-            for segment in &segments {
-                candidate.push(segment);
-            }
-            candidate.push("Cargo.lock");
-            let status = match std::fs::read_to_string(&candidate) {
-                Ok(text) => LockfileIndex::parse(&text)
-                    .map_or(LockfileStatus::Invalid, LockfileStatus::Found),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    LockfileStatus::Absent
-                }
-                // The file exists (or its state is unknowable) but cannot be
-                // read: it must not be skipped in favor of an ancestor.
-                Err(_) => LockfileStatus::Invalid,
-            };
-            cache.insert(dir_key, status.clone());
-            status
-        });
+        let status = lockfile_in_dir(repo_root, &segments, cache);
+        let is_own_dir = segments.len() == manifest_dir.len();
         if !matches!(status, LockfileStatus::Absent) {
-            return status;
+            if is_own_dir {
+                // A package's own directory's lockfile is its own.
+                return status;
+            }
+            match workspace_facts_in_dir(repo_root, &segments, cache) {
+                WorkspaceFacts::Workspace { members, exclude } => {
+                    let rel = manifest_dir[segments.len()..].join("/");
+                    let is_member = members.iter().any(|glob| member_glob_match(glob, &rel))
+                        && !exclude.iter().any(|glob| member_glob_match(glob, &rel));
+                    if is_member {
+                        return status;
+                    }
+                    // Cargo stops at the first workspace root: a non-member or
+                    // excluded crate is standalone and never resolves from
+                    // this (or any higher) ancestor lockfile.
+                    return LockfileStatus::Absent;
+                }
+                // Membership cannot be verified: never fabricate a resolution.
+                WorkspaceFacts::Unverifiable => return LockfileStatus::Absent,
+                // Not a workspace root: Cargo's discovery walks past it.
+                WorkspaceFacts::NoManifest | WorkspaceFacts::PackageOnly => {}
+            }
         }
         if segments.pop().is_none() {
             return LockfileStatus::Absent;
         }
     }
+}
+
+/// Reads (and caches) the lockfile state of one directory.
+fn lockfile_in_dir(
+    repo_root: &Path,
+    segments: &[&str],
+    cache: &mut LockfileWalkCache,
+) -> LockfileStatus {
+    let dir_key = segments.join("/");
+    if let Some(cached) = cache.lockfiles.get(&dir_key) {
+        return cached.clone();
+    }
+    let mut candidate = repo_root.to_path_buf();
+    for segment in segments {
+        candidate.push(segment);
+    }
+    candidate.push("Cargo.lock");
+    let status = match std::fs::read_to_string(&candidate) {
+        Ok(text) => {
+            LockfileIndex::parse(&text).map_or(LockfileStatus::Invalid, LockfileStatus::Found)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => LockfileStatus::Absent,
+        // The file exists (or its state is unknowable) but cannot be
+        // read: it must not be skipped in favor of an ancestor.
+        Err(_) => LockfileStatus::Invalid,
+    };
+    cache.lockfiles.insert(dir_key, status.clone());
+    status
+}
+
+/// Reads (and caches) what one directory's `Cargo.toml` says about workspace
+/// roots.
+fn workspace_facts_in_dir(
+    repo_root: &Path,
+    segments: &[&str],
+    cache: &mut LockfileWalkCache,
+) -> WorkspaceFacts {
+    let dir_key = segments.join("/");
+    if let Some(cached) = cache.workspaces.get(&dir_key) {
+        return cached.clone();
+    }
+    let mut candidate = repo_root.to_path_buf();
+    for segment in segments {
+        candidate.push(segment);
+    }
+    candidate.push("Cargo.toml");
+    let facts = match std::fs::read_to_string(&candidate) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => WorkspaceFacts::NoManifest,
+        Err(_) => WorkspaceFacts::Unverifiable,
+        Ok(text) => match text.parse::<toml_edit::DocumentMut>() {
+            Err(_) => WorkspaceFacts::Unverifiable,
+            Ok(doc) => match doc
+                .get("workspace")
+                .and_then(toml_edit::Item::as_table_like)
+            {
+                None => WorkspaceFacts::PackageOnly,
+                Some(workspace) => WorkspaceFacts::Workspace {
+                    members: string_array(workspace.get("members")),
+                    exclude: string_array(workspace.get("exclude")),
+                },
+            },
+        },
+    };
+    cache.workspaces.insert(dir_key, facts.clone());
+    facts
+}
+
+/// Extracts a TOML string array (`members` / `exclude`) as owned strings with
+/// trailing slashes trimmed; non-arrays and non-strings yield nothing.
+fn string_array(item: Option<&toml_edit::Item>) -> Vec<String> {
+    item.and_then(toml_edit::Item::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(|value| value.trim_end_matches('/').to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Minimal deterministic glob match for Cargo workspace `members` / `exclude`
+/// entries over a `/`-separated relative directory path: `*` matches any
+/// sequence within one path segment, `?` one non-separator character, and a
+/// `**` segment spans zero or more whole segments. No external glob crate.
+fn member_glob_match(pattern: &str, path: &str) -> bool {
+    fn segments_match(pattern: &[&str], path: &[&str]) -> bool {
+        match pattern.split_first() {
+            None => path.is_empty(),
+            Some((&"**", rest)) => (0..=path.len()).any(|skip| segments_match(rest, &path[skip..])),
+            Some((first, rest)) => match path.split_first() {
+                Some((segment, path_rest)) => {
+                    segment_match(first, segment) && segments_match(rest, path_rest)
+                }
+                None => false,
+            },
+        }
+    }
+    fn segment_match(pattern: &str, segment: &str) -> bool {
+        let (p, s): (Vec<char>, Vec<char>) = (pattern.chars().collect(), segment.chars().collect());
+        fn inner(p: &[char], s: &[char]) -> bool {
+            match p.split_first() {
+                None => s.is_empty(),
+                Some(('*', rest)) => (0..=s.len()).any(|skip| inner(rest, &s[skip..])),
+                Some(('?', rest)) => s
+                    .split_first()
+                    .is_some_and(|(_, s_rest)| inner(rest, s_rest)),
+                Some((ch, rest)) => s
+                    .split_first()
+                    .is_some_and(|(sc, s_rest)| sc == ch && inner(rest, s_rest)),
+            }
+        }
+        inner(&p, &s)
+    }
+    let pattern_segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    segments_match(&pattern_segments, &path_segments)
 }
 
 #[cfg(test)]
@@ -842,6 +1003,22 @@ version = "2.0.0"
             LockResolution::AmbiguousInLockfile
         );
         assert_eq!(index.resolve("absent", None), LockResolution::NotInLockfile);
+    }
+
+    #[test]
+    fn member_globs_match_cargo_workspace_semantics() {
+        // Literal members, single-segment `*`, `?`, and spanning `**`.
+        assert!(member_glob_match("crates/member", "crates/member"));
+        assert!(member_glob_match("crates/*", "crates/member"));
+        assert!(!member_glob_match("crates/*", "crates/member/nested"));
+        assert!(member_glob_match("crates/**", "crates/member/nested"));
+        assert!(member_glob_match("crates/**", "crates"));
+        assert!(member_glob_match("crates/mem?er", "crates/member"));
+        assert!(!member_glob_match("crates/*", "vendor/independent"));
+        assert!(member_glob_match("**/nested", "a/b/nested"));
+        // Trailing-slash normalization happens in `string_array`; the matcher
+        // itself ignores empty segments.
+        assert!(member_glob_match("crates//member", "crates/member"));
     }
 
     #[test]

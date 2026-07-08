@@ -1158,3 +1158,95 @@ fn clean_repo_carries_no_skipped_manifest_diagnostics() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// PR #314 review: the lockfile walk respects workspace/package boundaries
+// ---------------------------------------------------------------------------
+
+/// Workspace root (`members = ["crates/*"]`, `exclude = ["crates/excluded"]`)
+/// with a root lockfile, plus a genuine member, an excluded member, and an
+/// independent nested crate outside the members globs. Only the genuine
+/// member may resolve from the root lockfile; Cargo would give the others
+/// their own (missing) lockfile, so fabricating `locked` from the unrelated
+/// ancestor is forbidden.
+fn workspace_boundary_graph() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    for dir in [
+        "crates/member/src",
+        "crates/excluded/src",
+        "vendor/independent/src",
+    ] {
+        fs::create_dir_all(repo.join(dir)).expect("dirs");
+    }
+    fs::write(
+        repo.join("Cargo.toml"),
+        r#"[workspace]
+members = ["crates/*"]
+exclude = ["crates/excluded"]
+"#,
+    )
+    .expect("workspace manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    for (dir, pkg) in [
+        ("crates/member", "member"),
+        ("crates/excluded", "excluded"),
+        ("vendor/independent", "independent"),
+    ] {
+        fs::write(
+            repo.join(dir).join("Cargo.toml"),
+            format!("[package]\nname = \"{pkg}\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n"),
+        )
+        .expect("member manifest");
+        fs::write(repo.join(dir).join("src/lib.rs"), "pub fn f() {}\n").expect("lib.rs");
+    }
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("boundary-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+    (temp, graph)
+}
+
+#[test]
+fn ancestor_lockfile_only_resolves_genuine_workspace_members() {
+    let (_temp, graph) = workspace_boundary_graph();
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    assert_eq!(declarations.len(), 3, "all three crates declare serde");
+
+    let by_pkg = |pkg: &str| {
+        declarations
+            .iter()
+            .find(|d| d["declaring_package"] == pkg)
+            .unwrap_or_else(|| panic!("row for {pkg}"))
+    };
+
+    // Genuine glob-matched member: covered by the root workspace lockfile.
+    let member = by_pkg("member");
+    assert_eq!(member["resolution"], "locked");
+    assert_eq!(member["resolved_version"], "1.0.228");
+
+    // Excluded member: Cargo treats it as standalone — its own (missing)
+    // lockfile, never the ancestor's.
+    let excluded = by_pkg("excluded");
+    assert_eq!(
+        excluded["resolution"], "no_lockfile",
+        "an excluded crate must not resolve from the workspace lockfile"
+    );
+    assert!(excluded["resolved_version"].is_null());
+
+    // Independent nested crate outside the members globs: same.
+    let independent = by_pkg("independent");
+    assert_eq!(
+        independent["resolution"], "no_lockfile",
+        "an independent nested crate must not resolve from an unrelated ancestor lockfile"
+    );
+    assert!(independent["resolved_version"].is_null());
+}
