@@ -1469,6 +1469,51 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Aggregate Git authorship into per-file ownership shares, a primary
+    /// owner, and a bus-factor signal (issue #245).
+    ///
+    /// Over a history store produced by `scan-history`, returns one row per
+    /// indexed source file present at the resolved anchor commit: the ranked
+    /// author list (distinct in-scope commits + ownership share per author),
+    /// the max-share primary owner (ties break to the lexicographically
+    /// smallest `(author_email, author_name)` identity), and the bus factor —
+    /// the minimum number of top authors whose cumulative share reaches
+    /// `--threshold` percent (default 50). Rows are empirical
+    /// history-derived leads, never declared ownership, review authority, or
+    /// proven expertise. Reads Git-object-derived records only; the working
+    /// tree is never touched. Documented in `docs/cli/ownership.md`.
+    Ownership {
+        /// Optional repo-relative file path to report one file only.
+        path: Option<String>,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Report ownership as-of this commit SHA or unique prefix
+        /// (valid-time axis). Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Report ownership at the most recent commit at or before this
+        /// RFC 3339 instant (valid-time axis). Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Restrict aggregation to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Cumulative ownership-share threshold percent for the bus factor
+        /// (1..=100).
+        #[arg(long, default_value_t = query::OWNERSHIP_DEFAULT_THRESHOLD_PERCENT)]
+        threshold: u32,
+        /// Maximum number of file rows (1..=1000; the answer states whether
+        /// it was truncated).
+        #[arg(long, default_value_t = query::OWNERSHIP_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -5291,6 +5336,30 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_lifeline_cmd(&records, &symbol, selected.as_deref(), format)
+        }
+        QuerySubcommand::Ownership {
+            path,
+            graph,
+            data_dir,
+            at,
+            as_of,
+            repo,
+            threshold,
+            limit,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            let options = query::OwnershipOptions {
+                path: path.as_deref(),
+                at_commit: at.as_deref(),
+                as_of: as_of.as_deref(),
+                repo_scope: selected.as_deref(),
+                threshold_percent: threshold,
+                limit,
+            };
+            query_ownership_cmd(&records, &options, format)
         }
     }
 }
@@ -10192,6 +10261,111 @@ fn query_orient_cmd(
             }
             std::process::exit(4);
         }
+    }
+}
+
+/// `eg query ownership` (issue #245): per-file authorship aggregates with a
+/// primary owner and bus-factor signal.
+///
+/// Exit codes follow the `eg query deltas` convention: `0` on success
+/// (including an explicit empty surface), `2` when nothing matches (unknown
+/// path, missing commit, no commits at the queried time, empty history), and
+/// `1` for the remaining stable diagnostics (ambiguous prefix, malformed
+/// timestamp, invalid threshold or limit).
+fn query_ownership_cmd(
+    records: &[GraphRecord],
+    options: &query::OwnershipOptions<'_>,
+    format: OutputFormat,
+) -> Result<()> {
+    match query::ownership_map(records, options) {
+        Ok(map) => {
+            match format {
+                OutputFormat::Json => {
+                    #[derive(Debug, Clone, serde::Serialize)]
+                    struct OwnershipResponse<'a> {
+                        ok: bool,
+                        #[serde(flatten)]
+                        map: query::OwnershipMap<'a>,
+                    }
+                    let response = OwnershipResponse { ok: true, map };
+                    let output = serde_json::to_string(&response)
+                        .context("failed to serialize ownership map")?;
+                    println!("{output}");
+                }
+                OutputFormat::Text => print_ownership_text(&map),
+            }
+            Ok(())
+        }
+        Err(err) => {
+            #[derive(Debug, Clone, serde::Serialize)]
+            struct OwnershipErrorResponse {
+                ok: bool,
+                error: query::OwnershipError,
+            }
+            let response = OwnershipErrorResponse {
+                ok: false,
+                error: err.clone(),
+            };
+            let output =
+                serde_json::to_string(&response).context("failed to serialize ownership error")?;
+            println!("{output}");
+            let exit_code = match err {
+                query::OwnershipError::EmptyHistory
+                | query::OwnershipError::MissingCommit { .. }
+                | query::OwnershipError::NoCommitsAtTime { .. }
+                | query::OwnershipError::UnknownPath { .. } => 2,
+                _ => 1,
+            };
+            std::process::exit(exit_code);
+        }
+    }
+}
+
+/// Human-readable one-file-per-block form of an ownership map.
+fn print_ownership_text(map: &query::OwnershipMap<'_>) {
+    let anchors = map
+        .anchors
+        .iter()
+        .map(|a| a.commit_sha)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let truncated = if map.truncated { " (truncated)" } else { "" };
+    println!(
+        "ownership: {} of {} files, threshold {}%, anchors [{}]{}",
+        map.returned_file_count, map.total_file_count, map.threshold_percent, anchors, truncated
+    );
+    println!("note: {}", map.disclaimer);
+    for row in &map.files {
+        println!(
+            "{} bus_factor={} total_commits={} primary={} share={:.4} ({})",
+            row.repo_relative_path,
+            row.bus_factor,
+            row.total_commits,
+            ownership_author_identity(&row.primary_owner),
+            row.primary_owner.share,
+            row.record_id
+        );
+        for author in &row.authors {
+            println!(
+                "  author {} commits={} share={:.4}",
+                ownership_author_identity(author),
+                author.commits,
+                author.share
+            );
+        }
+    }
+    for diagnostic in &map.diagnostics {
+        println!("diagnostic: {} {}", diagnostic.code, diagnostic.detail);
+    }
+}
+
+/// Bounded display identity for an ownership author row.
+fn ownership_author_identity(author: &query::OwnershipAuthor<'_>) -> String {
+    match (author.author_name, author.author_email) {
+        (Some(name), Some(email)) => format!("{name} <{email}>"),
+        (Some(name), None) => name.to_owned(),
+        (None, Some(email)) => format!("<{email}>"),
+        (None, None) => "(unrecorded author)".to_owned(),
     }
 }
 
