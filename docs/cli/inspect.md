@@ -124,7 +124,10 @@ Count semantics after a retraction (`eg forget`, issue #231): daemon-free
 retracted record's physical versions (inspect never shows content). Daemon
 inspection (`--daemon`) counts the daemon's transaction-time-current serving
 view (`GET /v1/records`), which excludes actively retracted records while
-still counting their tombstones and retraction events.
+still counting their tombstones and retraction events. That serving view is
+also version-collapsed — one (latest) version per stable ID — so daemon
+counts exclude superseded prior versions and stale tombstones that the
+physical inventory still counts.
 
 ## Errors
 

@@ -77,7 +77,13 @@ record-serving surfaces suppress it too: `GET /v1/records/{id}` and the
 `eg inspect --daemon`, and the MCP tools) never serializes the retracted
 record, so knowing the handle is not enough to fetch the content back. The
 retraction event and the tombstone themselves stay fetchable — they are the
-audit trail.
+audit trail. The bulk endpoint serves a version-collapsed current view: one
+(latest) version per stable ID, so a superseded prior version is never
+serialized either. If a forgotten handle is later revived by a re-ingest,
+only the restored version is served — the pre-retraction version and the
+now-stale tombstone (which downstream `deleted_id` filters would use to
+re-suppress the revived record) stay unserved, while the retraction event
+remains visible.
 
 One deliberate nuance: daemon-free `eg inspect --data-dir` reports a physical
 inventory, so its *counts* still include a retracted record's physical

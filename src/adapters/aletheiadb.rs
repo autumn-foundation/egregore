@@ -886,26 +886,146 @@ impl EmbeddedAletheiaSink {
         Ok(report)
     }
 
-    /// Reads the transaction-time-current serving view of the store: every
-    /// physical record from [`Self::inspect_all_records`] minus records
-    /// suppressed by an active tombstone (issue #231 retraction). Tombstones
-    /// themselves and stale-tombstoned (revived) records stay, so the fact
-    /// that a retraction happened remains visible and countable while the
-    /// retracted content is never serialized to callers. This is the bulk
-    /// analog of [`Self::read_back_current_until`] and must back any surface
-    /// that hands raw records to clients (e.g. the daemon's `GET /v1/records`).
+    /// Reads the transaction-time-current serving view of the store with the
+    /// same record selection as [`Self::read_all_records`]: the latest
+    /// physical version per stable non-temporal ID (superseded prior versions
+    /// are never serialized), every current per-commit temporal candidate,
+    /// every physical project-node version, active tombstones, and the latest
+    /// physical version of each edge. Records suppressed by an active
+    /// tombstone (issue #231 retraction) are dropped; stale tombstones —
+    /// whose target was revived by a later re-ingest — are dropped too, so
+    /// neither the pre-retraction physical version nor a tombstone that
+    /// downstream `deleted_id` filters would use to re-suppress the revived
+    /// record ever reaches a caller. Unlike `read_all_records`, unknown
+    /// `(domain, kind, schema_version)` physical records are tolerated: they
+    /// are tallied per physical occurrence (they cannot be version-collapsed
+    /// because they never deserialize), never serialized and never an error.
+    /// This is the bulk analog of [`Self::read_back_current_until`] and must
+    /// back any surface that hands raw records to clients (e.g. the daemon's
+    /// `GET /v1/records`).
     ///
     /// # Errors
     ///
-    /// Returns an error if a physical record or tombstone cannot be read.
+    /// Returns an error if a physical record, tombstone, or edge cannot be
+    /// read.
     pub fn inspect_current_records(&self) -> AdapterResult<InspectStoreReport> {
-        let mut report = self.inspect_all_records()?;
-        let retracted = self.active_deleted_ids()?;
-        if !retracted.is_empty() {
-            report.records.retain(|record| {
-                matches!(record, GraphRecord::Tombstone { .. }) || !retracted.contains(record.id())
-            });
+        let active_tombstoned = self.active_deleted_ids()?;
+        // Physical IDs of the current per-commit temporal candidates:
+        // `read_all_records` serves every per-commit candidate (even for
+        // tombstoned records, so `--at <commit>` views can resolve past
+        // state); non-candidate temporal observations are superseded within
+        // their commit and stay unserved.
+        let mut current_temporal: BTreeSet<::aletheiadb::NodeId> = BTreeSet::new();
+        for commits in self.node_lookup.by_commit.values() {
+            current_temporal.extend(commits.values().map(|candidate| candidate.storage_id));
         }
+
+        let mut report = InspectStoreReport::default();
+
+        for node_id in self.db.get_all_node_ids() {
+            let node = self
+                .db
+                .get_node(node_id)
+                .map_err(|error| read_back_error("inspect_current_records", error.to_string()))?;
+            let Some(record_id) = optional_str_property(
+                "inspect_current_records",
+                "codegraph_id",
+                node.get_property("codegraph_id"),
+            )?
+            else {
+                continue;
+            };
+            let record_type = optional_str_property(
+                "inspect_current_records",
+                "record_type",
+                node.get_property("record_type"),
+            )?;
+            let version = Self::node_record_version_from_properties(
+                &node,
+                &record_id,
+                record_type.as_deref(),
+            )?;
+            if !crate::schema_version::is_known_record_version(&version) {
+                report
+                    .unknown_schema_versions
+                    .push(crate::schema_version::UnknownSchemaVersion::new(version));
+                continue;
+            }
+            if record_type.as_deref() == Some("tombstone") {
+                // Serve only the indexed (latest) physical version of an
+                // active tombstone. A stale tombstone's target has been
+                // revived by a later write; re-serving it would let
+                // order-based `deleted_id` consumers re-suppress the revived
+                // record (mirrors `read_all_records`).
+                if self.tombstone_ids.get(&record_id) != Some(&node_id)
+                    || self.stored_tombstone_is_stale(&record_id)?
+                {
+                    continue;
+                }
+                report
+                    .records
+                    .push(self.read_tombstone_record_internal(&record_id, node_id)?);
+                continue;
+            }
+            let is_current = if record_id.starts_with("project:v1:") {
+                // Project records are mutable append-with-same-entity-id;
+                // every physical version is part of the current view unless
+                // the record is actively tombstoned (mirrors
+                // `read_all_records`).
+                record_type.as_deref() == Some("node")
+                    && !active_tombstoned.contains(record_id.as_str())
+            } else if current_temporal.contains(&node_id) {
+                true
+            } else {
+                !active_tombstoned.contains(record_id.as_str())
+                    && self.node_lookup.non_temporal.get(record_id.as_str()) == Some(&node_id)
+            };
+            if is_current {
+                report
+                    .records
+                    .push(self.read_node_record_internal(&record_id, node_id)?);
+            }
+        }
+
+        // Edges: tally every unknown-version physical edge, then serve the
+        // latest physical version of each stable edge ID (skipping actively
+        // tombstoned IDs), mirroring `read_all_records`' edge collapse.
+        for node_id in self.db.get_all_node_ids() {
+            for edge_id in self.db.get_outgoing_edges(node_id) {
+                let edge = self.db.get_edge(edge_id).map_err(|error| {
+                    read_back_error("inspect_current_records", error.to_string())
+                })?;
+                let Some(codegraph_id) = optional_str_property(
+                    "inspect_current_records",
+                    "codegraph_id",
+                    edge.get_property("codegraph_id"),
+                )?
+                else {
+                    continue;
+                };
+                let version = Self::edge_record_version_from_properties(&edge, &codegraph_id)?;
+                if !crate::schema_version::is_known_record_version(&version) {
+                    report
+                        .unknown_schema_versions
+                        .push(crate::schema_version::UnknownSchemaVersion::new(version));
+                }
+            }
+        }
+        for (codegraph_id, edge_id) in self.latest_edge_versions(&active_tombstoned)? {
+            let edge = self
+                .db
+                .get_edge(edge_id)
+                .map_err(|error| read_back_error("inspect_current_records", error.to_string()))?;
+            let version = Self::edge_record_version_from_properties(&edge, &codegraph_id)?;
+            if !crate::schema_version::is_known_record_version(&version) {
+                // Already tallied in the physical sweep above.
+                continue;
+            }
+            report
+                .records
+                .push(self.read_edge_record_internal(&codegraph_id, edge_id)?);
+        }
+
         Ok(report)
     }
 
@@ -5078,5 +5198,148 @@ mod tests {
             res.is_err(),
             "Expected inspect_all_records to fail on corrupt record of known version, got {res:?}"
         );
+    }
+
+    /// Issue #231 (round 6): the current serving view must collapse physical
+    /// versions to the latest write per stable ID. A re-ingested record
+    /// leaves its superseded prior version in the store; the physical
+    /// inventory (`inspect_all_records`) keeps reporting both, but the
+    /// current view must serialize exactly one — the latest.
+    #[test]
+    fn inspect_current_records_collapses_superseded_versions() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("superseded-current-view-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "superseded"]);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&current_symbol_record(&symbol_id, "original version", 10))
+            .expect("original symbol should write");
+        sink.write_record(&current_symbol_record(&symbol_id, "updated version", 42))
+            .expect("updated symbol should write");
+
+        // Physical inventory keeps every version (embedded `eg inspect --data-dir`).
+        let all = sink
+            .inspect_all_records()
+            .expect("inspect_all_records should succeed");
+        assert_eq!(
+            all.records
+                .iter()
+                .filter(|record| record.id() == symbol_id)
+                .count(),
+            2,
+            "physical inventory must keep both versions: {all:?}"
+        );
+
+        // The current serving view collapses to the latest write.
+        let current = sink
+            .inspect_current_records()
+            .expect("inspect_current_records should succeed");
+        let versions: Vec<_> = current
+            .records
+            .iter()
+            .filter(|record| record.id() == symbol_id)
+            .collect();
+        assert_eq!(
+            versions.len(),
+            1,
+            "current view must serialize exactly one version per stable ID: {current:?}"
+        );
+        assert!(
+            matches!(
+                versions[0],
+                GraphRecord::Node { span: Some(span), .. } if span.end_byte == 42
+            ),
+            "current view must serialize the latest version, got {:?}",
+            versions[0]
+        );
+    }
+
+    /// Issue #231 (round 6): after a tombstoned record is revived by a later
+    /// re-ingest, the tombstone is stale and no longer suppresses the stable
+    /// ID. The current serving view must then emit only the restored version
+    /// — never the pre-retraction physical version — and must drop the stale
+    /// tombstone (mirroring `read_all_records`, so downstream `deleted_id`
+    /// filters cannot re-suppress the revived record).
+    #[test]
+    fn inspect_current_records_never_serializes_pre_retraction_version_after_revive() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("revive-current-view-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "revived"]);
+        let tombstone_id = stable_id(&["tombstone", &symbol_id, "revive-current-view"]);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&current_symbol_record(&symbol_id, "retracted version", 10))
+            .expect("original symbol should write");
+        sink.write_record(&GraphRecord::Tombstone {
+            id: tombstone_id.clone(),
+            schema_version: crate::ir::SCHEMA_VERSION,
+            deleted_id: symbol_id.clone(),
+            summary: "retracted".to_owned(),
+            producer: None,
+        })
+        .expect("tombstone should write");
+        sink.write_record(&current_symbol_record(&symbol_id, "restored version", 42))
+            .expect("restored symbol should write");
+
+        let current = sink
+            .inspect_current_records()
+            .expect("inspect_current_records should succeed");
+        let versions: Vec<_> = current
+            .records
+            .iter()
+            .filter(|record| record.id() == symbol_id)
+            .collect();
+        assert_eq!(
+            versions.len(),
+            1,
+            "revived record must appear exactly once on the current view: {current:?}"
+        );
+        assert!(
+            matches!(
+                versions[0],
+                GraphRecord::Node { span: Some(span), .. } if span.end_byte == 42
+            ),
+            "current view must serialize the restored version, never the \
+             pre-retraction one, got {:?}",
+            versions[0]
+        );
+        assert!(
+            !current
+                .records
+                .iter()
+                .any(|record| record.id() == tombstone_id),
+            "stale tombstone must not be re-served on the current view: {current:?}"
+        );
+    }
+
+    /// The current serving view keeps the physical inventory's tolerance for
+    /// unknown `(domain, kind, schema_version)` tuples: they are tallied,
+    /// never deserialized and never an error.
+    #[test]
+    fn inspect_current_records_tolerates_future_node_kind() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("future-kind-current-view-store");
+        let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+        let record_id = "codegraph:v6:future-kind-repo";
+        let properties = ::aletheiadb::PropertyMapBuilder::new()
+            .insert("codegraph_id", record_id)
+            .insert("record_type", "node")
+            .insert("kind", "NewFutureKind")
+            .insert("schema_version", 6i64)
+            .insert("domain", "codegraph")
+            .build();
+
+        sink.db
+            .create_node("Repository", properties)
+            .expect("should create raw node");
+
+        let report = sink
+            .inspect_current_records()
+            .expect("inspect_current_records should succeed");
+        assert_eq!(report.records.len(), 0);
+        assert_eq!(report.unknown_schema_versions.len(), 1);
+        let unknown = &report.unknown_schema_versions[0];
+        assert_eq!(unknown.version.domain, "codegraph");
+        assert_eq!(unknown.version.kind, "NewFutureKind");
+        assert_eq!(unknown.version.version, 6);
     }
 }
