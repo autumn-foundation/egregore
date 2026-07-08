@@ -2143,6 +2143,11 @@ pub enum NodeKind {
     // ── M3 Codex importer node kinds (docs/schema/agent-memory.md) ────────────
     /// Token and cost accounting record for an agent turn (M3 Codex import).
     CostUsage,
+    // ── Retraction node kind (issue #231) ─────────────────────────────────────
+    /// Auditable operator retraction event for a persisted record. Records who
+    /// retracted the target, when (transaction time), the reason, and the prior
+    /// record handle, so logical retraction never leaves a silent hole.
+    Retraction,
 }
 
 impl NodeKind {
@@ -2200,6 +2205,7 @@ impl NodeKind {
             Self::NamingDecision => "NamingDecision",
             Self::Constraint => "Constraint",
             Self::CostUsage => "CostUsage",
+            Self::Retraction => "Retraction",
         }
     }
 }

@@ -24,6 +24,7 @@ mod embeddings;
 mod evidence_freshness;
 mod evidence_write;
 mod failure_history;
+mod forget;
 mod freshness;
 mod git_scope_scan;
 mod go_scan;

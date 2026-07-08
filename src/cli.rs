@@ -451,6 +451,43 @@ enum Commands {
         #[arg(long, default_value = "operator")]
         prompted_to: String,
     },
+    /// Retract one persisted record from every current read surface (issue #231).
+    ///
+    /// Logical, auditable retraction for agent-authored or sensitive records:
+    /// writes a citable retraction event (who retracted, when on the
+    /// transaction-time axis, why, and the prior record handle) plus a
+    /// tombstone, so structural, semantic, context, task, memory, audit,
+    /// failures, changes, and MCP reads all stop returning the record's
+    /// content. The bytes are not destroyed: a transaction-time view predating
+    /// the retraction still reflects that the record existed then.
+    ///
+    /// Deterministic code-graph facts (File / Symbol / Import / CALLS edges /
+    /// Commit / Change) are refused with a machine-readable error; they are
+    /// reproducible from source and are corrected with `eg refresh` or a
+    /// re-scan. Re-running on an already-retracted handle is a no-op success
+    /// returning the original retraction event.
+    ///
+    /// Success prints a JSON envelope on stdout and exits 0. Failures print a
+    /// machine-readable JSON envelope on stderr and exit 1 (refused or
+    /// malformed) or 2 (handle not found). See `docs/cli/forget.md`.
+    #[cfg(feature = "embedded-aletheiadb")]
+    Forget {
+        /// Stable record ID of the record to retract.
+        handle: String,
+        /// Embedded `AletheiaDB` data directory.
+        #[arg(long, default_value = ".egregore")]
+        data_dir: PathBuf,
+        /// Retraction reason recorded on the auditable retraction event.
+        #[arg(long)]
+        reason: String,
+        /// Operator handle recorded as the retraction actor.
+        #[arg(long, default_value = "operator")]
+        retracted_by: String,
+        /// Fixed RFC 3339 transaction time for deterministic output (useful for
+        /// tests). Defaults to the current wall-clock instant.
+        #[arg(long)]
+        transaction_time: Option<String>,
+    },
     /// Offline repair workflow for Egregore stores.
     ///
     /// Use `repair preflight` first to inspect ownership, then `repair run --confirm`
@@ -2231,6 +2268,14 @@ fn run_cli(cli: Cli) -> Result<()> {
             prompt_surface,
             prompted_to,
         ),
+        #[cfg(feature = "embedded-aletheiadb")]
+        Commands::Forget {
+            handle,
+            data_dir,
+            reason,
+            retracted_by,
+            transaction_time,
+        } => forget_cmd(&handle, &data_dir, reason, retracted_by, transaction_time),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Repair { action } => repair_cmd(action),
         #[cfg(feature = "embedded-aletheiadb")]
@@ -13123,6 +13168,72 @@ fn query_audit_cmd(records: &[GraphRecord], durable_id: &str, format: OutputForm
             anyhow::bail!("audit trail failed: {e}")
         }
     }
+}
+
+/// Implements `eg forget` (issue #231): logical, auditable retraction of one
+/// persisted record from every transaction-time-current read surface.
+///
+/// Reads the current store view, resolves the retraction through the pure
+/// [`crate::forget`] logic, persists the generated retraction-event node and
+/// tombstone through the adapter, and prints a machine-readable JSON envelope.
+/// Failures print a JSON envelope to stderr and exit 1 (refused or malformed)
+/// or 2 (handle not found).
+#[cfg(feature = "embedded-aletheiadb")]
+fn forget_cmd(
+    handle: &str,
+    data_dir: &Path,
+    reason: String,
+    retracted_by: String,
+    transaction_time: Option<String>,
+) -> Result<()> {
+    validate_existing_embedded_store(data_dir)?;
+    let mut sink = EmbeddedAletheiaSink::open(data_dir)
+        .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+    let records = sink
+        .read_all_records()
+        .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))?;
+
+    let req = crate::forget::ForgetRequest {
+        handle: handle.to_owned(),
+        reason,
+        retracted_by,
+        transaction_time,
+    };
+    let outcome = match crate::forget::retract_from_records(&records, &req) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!("{}", error.to_json());
+            std::process::exit(error.exit_code());
+        }
+    };
+
+    let (action, event) = match outcome {
+        crate::forget::ForgetOutcome::Retracted {
+            event,
+            records: generated,
+        } => {
+            let report = ingest_records(&generated, &mut sink);
+            if !report.is_success() {
+                for failure in &report.failures {
+                    eprintln!("{}: {}", failure.record_id, failure.message);
+                }
+                anyhow::bail!("failed to write retraction records to store");
+            }
+            sink.persist_indexes().with_context(|| {
+                format!("failed to persist embedded store {}", data_dir.display())
+            })?;
+            ("retracted", event)
+        }
+        crate::forget::ForgetOutcome::AlreadyRetracted { event } => ("already_retracted", event),
+    };
+
+    let envelope = serde_json::json!({
+        "ok": true,
+        "action": action,
+        "retraction": event,
+    });
+    println!("{}", serde_json::to_string(&envelope)?);
+    Ok(())
 }
 
 #[allow(

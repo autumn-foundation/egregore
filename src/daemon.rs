@@ -7217,7 +7217,11 @@ fn handle_get_all_records(state: &ServerState) -> HttpResponse {
         return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
     };
     let snapshot_timestamp = chrono::Utc::now().to_rfc3339();
-    let report = match sink.inspect_all_records() {
+    // Current-view read (issue #231): actively retracted records must not be
+    // serialized to any caller of this bulk endpoint (DaemonClient, `eg
+    // inspect --daemon`, MCP tools). Their tombstones and retraction events
+    // stay in the response, so the retraction itself remains auditable.
+    let report = match sink.inspect_current_records() {
         Ok(r) => r,
         Err(e) => return HttpResponse::error(adapter_read_error_to_api(e)),
     };
@@ -7332,7 +7336,10 @@ fn handle_get_record(record_id: &str, state: &ServerState) -> HttpResponse {
     let Ok(sink) = state.sink.read() else {
         return HttpResponse::error(ApiError::internal("embedded sink lock poisoned"));
     };
-    match sink.read_back(record_id) {
+    // Current-view lookup (issue #231): records suppressed by an active
+    // tombstone — e.g. retracted by `eg forget` — must not be fetchable by
+    // handle through the direct-lookup endpoint.
+    match sink.read_back_current_until(record_id, None) {
         Ok(record) => HttpResponse::success(None, 200, json!({ "record": record })),
         Err(error) => HttpResponse::error(adapter_read_error_to_api(error)),
     }
@@ -7878,7 +7885,9 @@ fn handle_verb_get_records(
                 Ok(sink) => sink,
                 Err(error) => return HttpResponse::error_with_id(request_id, error),
             };
-            sink.read_back_until(record_id, deadline)
+            // Current-view lookup (issue #231): actively tombstoned
+            // (retracted) records are suppressed, matching read_all_records.
+            sink.read_back_current_until(record_id, deadline)
         };
         match result {
             Ok(Some(record)) => {
@@ -11375,6 +11384,376 @@ mod tests {
         assert_eq!(
             query_response.body["error"]["code"],
             UNKNOWN_SCHEMA_VERSION_CODE
+        );
+        Ok(())
+    }
+
+    /// Issue #231: after `eg forget` writes a retraction event plus an active
+    /// tombstone, the daemon's direct-lookup read surfaces (`GET
+    /// /v1/records/{id}` and the `get_records` query verb) must suppress the
+    /// retracted record instead of serving its content to anyone who knows
+    /// the handle. The retraction event and the tombstone themselves stay
+    /// fetchable — they are part of the current view and the audit trail.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn direct_record_reads_suppress_actively_retracted_records() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let obs_id = agent_memory_stable_id(&["node", "observation", "sess-forget", "0"]);
+        let mut record = GraphRecord::node(
+            obs_id.clone(),
+            NodeKind::Observation,
+            None,
+            None,
+            Some("observation".to_owned()),
+            "agent observation".to_owned(),
+        );
+        if let GraphRecord::Node {
+            ref mut schema_version,
+            ref mut text,
+            ref mut agent_id,
+            ref mut session_id,
+            ref mut observed_at,
+            ..
+        } = record
+        {
+            *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+            *text = Some("the parser silently skips empty input".to_owned());
+            *agent_id = Some("agent-1".to_owned());
+            *session_id = Some("sess-forget".to_owned());
+            *observed_at = Some("2026-06-01T00:00:00Z".to_owned());
+        }
+        let mut raw_sink =
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?;
+        let report = ingest_records(std::slice::from_ref(&record), &mut raw_sink);
+        assert!(report.is_success(), "{report:?}");
+
+        // Retract the observation exactly as `eg forget` does: resolve over
+        // the current view, then persist the event node and the tombstone.
+        let current = raw_sink
+            .read_all_records()
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let request = crate::forget::ForgetRequest {
+            handle: obs_id.clone(),
+            reason: "leaked customer detail".to_owned(),
+            retracted_by: "op-1".to_owned(),
+            transaction_time: Some("2026-07-01T00:00:00Z".to_owned()),
+        };
+        let crate::forget::ForgetOutcome::Retracted {
+            event,
+            records: generated,
+        } = crate::forget::retract_from_records(&current, &request)
+            .map_err(|error| anyhow!(format!("{error:?}")))?
+        else {
+            anyhow::bail!("expected Retracted outcome");
+        };
+        let report = ingest_records(&generated, &mut raw_sink);
+        assert!(report.is_success(), "{report:?}");
+
+        let sink = Arc::new(RwLock::new(raw_sink));
+        let (write_tx, _write_rx) = mpsc::sync_channel(1);
+        let idempotency = Arc::new(Mutex::new(IdempotencyStore {
+            path: temp.path().join("idempotency.json"),
+            entries: BTreeMap::new(),
+        }));
+        let state = ServerState {
+            token: "test-token".to_owned(),
+            store_identity: store_identity_text(temp.path()),
+            sink,
+            write_tx,
+            jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            agents: Arc::new(Mutex::new(BTreeMap::new())),
+            idempotency,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            pressure: Arc::new(PressureTracker::new(1)),
+        };
+
+        // Direct lookup must not serve the retracted record's content.
+        let response = handle_get_record(&obs_id, &state);
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.body["result"]["record"],
+            serde_json::Value::Null,
+            "retracted record must not be fetchable by handle: {}",
+            response.body
+        );
+
+        // The audit trail stays fetchable: the retraction event and the
+        // tombstone are part of the transaction-time-current view.
+        let response = handle_get_record(&event.retraction_id, &state);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["result"]["record"]["id"], event.retraction_id);
+        let response = handle_get_record(&event.tombstone_id, &state);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["result"]["record"]["id"], event.tombstone_id);
+
+        // The `get_records` query verb reads the same suppression.
+        let query_request = HttpRequest {
+            method: "POST".to_owned(),
+            path: "/v1/query".to_owned(),
+            headers: HashMap::new(),
+            body: serde_json::to_vec(&json!({
+                "request_id": "retracted-get-records",
+                "agent_id": "test-agent",
+                "domain": "agent_memory",
+                "verb": "get_records",
+                "params": { "record_ids": [obs_id] }
+            }))?,
+        };
+        let response = handle_query(&query_request, &state);
+        assert_eq!(response.status, 200);
+        let rows = response.body["result"]["records"]
+            .as_array()
+            .context("records array")?;
+        assert!(
+            rows.is_empty(),
+            "retracted record must not leak through get_records: {}",
+            response.body
+        );
+        Ok(())
+    }
+
+    /// Issue #231: `GET /v1/records` is the daemon's bulk read surface (it
+    /// backs `DaemonClient::get_all_records`, `eg inspect --daemon`, and the
+    /// MCP tools). After `eg forget`, the retracted record's content must not
+    /// be serialized to callers — only the tombstone and the retraction event
+    /// remain visible, so the fact of the retraction stays auditable while
+    /// the retracted text is gone from every transaction-time-current lane.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn get_all_records_suppresses_actively_retracted_record_content() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let obs_id = agent_memory_stable_id(&["node", "observation", "sess-forget-all", "0"]);
+        let mut record = GraphRecord::node(
+            obs_id.clone(),
+            NodeKind::Observation,
+            None,
+            None,
+            Some("observation".to_owned()),
+            "agent observation".to_owned(),
+        );
+        if let GraphRecord::Node {
+            ref mut schema_version,
+            ref mut text,
+            ref mut agent_id,
+            ref mut session_id,
+            ref mut observed_at,
+            ..
+        } = record
+        {
+            *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+            *text = Some("leaked-customer-name-acme-corp".to_owned());
+            *agent_id = Some("agent-1".to_owned());
+            *session_id = Some("sess-forget-all".to_owned());
+            *observed_at = Some("2026-06-01T00:00:00Z".to_owned());
+        }
+        let mut raw_sink =
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?;
+        let report = ingest_records(std::slice::from_ref(&record), &mut raw_sink);
+        assert!(report.is_success(), "{report:?}");
+
+        // Retract the observation exactly as `eg forget` does: resolve over
+        // the current view, then persist the event node and the tombstone.
+        let current = raw_sink
+            .read_all_records()
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let request = crate::forget::ForgetRequest {
+            handle: obs_id.clone(),
+            reason: "leaked customer detail".to_owned(),
+            retracted_by: "op-1".to_owned(),
+            transaction_time: Some("2026-07-01T00:00:00Z".to_owned()),
+        };
+        let crate::forget::ForgetOutcome::Retracted {
+            event,
+            records: generated,
+        } = crate::forget::retract_from_records(&current, &request)
+            .map_err(|error| anyhow!(format!("{error:?}")))?
+        else {
+            anyhow::bail!("expected Retracted outcome");
+        };
+        let report = ingest_records(&generated, &mut raw_sink);
+        assert!(report.is_success(), "{report:?}");
+
+        let sink = Arc::new(RwLock::new(raw_sink));
+        let (write_tx, _write_rx) = mpsc::sync_channel(1);
+        let idempotency = Arc::new(Mutex::new(IdempotencyStore {
+            path: temp.path().join("idempotency.json"),
+            entries: BTreeMap::new(),
+        }));
+        let state = ServerState {
+            token: "test-token".to_owned(),
+            store_identity: store_identity_text(temp.path()),
+            sink,
+            write_tx,
+            jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            agents: Arc::new(Mutex::new(BTreeMap::new())),
+            idempotency,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            pressure: Arc::new(PressureTracker::new(1)),
+        };
+
+        let response = handle_get_all_records(&state);
+        assert_eq!(response.status, 200);
+        let records = response.body["result"]["records"]
+            .as_array()
+            .context("records array")?;
+        let returned_ids: Vec<&str> = records
+            .iter()
+            .filter_map(|row| row["id"].as_str())
+            .collect();
+        assert!(
+            !returned_ids.contains(&obs_id.as_str()),
+            "retracted record must not appear in GET /v1/records: {}",
+            response.body
+        );
+        let serialized = response.body.to_string();
+        assert!(
+            !serialized.contains("leaked-customer-name-acme-corp"),
+            "retracted record text must not be serialized to /v1/records callers: {serialized}"
+        );
+
+        // The audit trail stays served: the retraction event node and the
+        // tombstone are part of the transaction-time-current view.
+        assert!(
+            returned_ids.contains(&event.retraction_id.as_str()),
+            "retraction event must stay visible in GET /v1/records: {}",
+            response.body
+        );
+        assert!(
+            returned_ids.contains(&event.tombstone_id.as_str()),
+            "retraction tombstone must stay visible in GET /v1/records: {}",
+            response.body
+        );
+        Ok(())
+    }
+
+    /// Issue #231 (round 6): when a forgotten record is later revived by a
+    /// re-ingest of the same stable ID, its retraction tombstone goes stale
+    /// and no longer suppresses that ID. The bulk `GET /v1/records` surface
+    /// must then serialize only the current (restored) version — never the
+    /// pre-retraction physical version that still sits in the store — and
+    /// must not re-serve the stale tombstone (order-based consumers would
+    /// use it to re-suppress the revived record). The retraction event node
+    /// stays visible, so the retraction remains auditable.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn get_all_records_after_revive_never_serializes_pre_retraction_content() -> Result<()> {
+        let temp = tempfile::tempdir().context("temp dir should be created")?;
+        let obs_id = agent_memory_stable_id(&["node", "observation", "sess-forget-revive", "0"]);
+        let make_observation = |text: &str, observed_at: &str| {
+            let mut record = GraphRecord::node(
+                obs_id.clone(),
+                NodeKind::Observation,
+                None,
+                None,
+                Some("observation".to_owned()),
+                "agent observation".to_owned(),
+            );
+            if let GraphRecord::Node {
+                ref mut schema_version,
+                text: ref mut record_text,
+                ref mut agent_id,
+                ref mut session_id,
+                observed_at: ref mut record_observed_at,
+                ..
+            } = record
+            {
+                *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+                *record_text = Some(text.to_owned());
+                *agent_id = Some("agent-1".to_owned());
+                *session_id = Some("sess-forget-revive".to_owned());
+                *record_observed_at = Some(observed_at.to_owned());
+            }
+            record
+        };
+        let mut raw_sink =
+            EmbeddedAletheiaSink::open(temp.path()).map_err(|error| anyhow!(error.to_string()))?;
+        let original = make_observation("pre-retraction-secret-zeta", "2026-06-01T00:00:00Z");
+        let report = ingest_records(std::slice::from_ref(&original), &mut raw_sink);
+        assert!(report.is_success(), "{report:?}");
+
+        // Retract the observation exactly as `eg forget` does: resolve over
+        // the current view, then persist the event node and the tombstone.
+        let current = raw_sink
+            .read_all_records()
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let request = crate::forget::ForgetRequest {
+            handle: obs_id.clone(),
+            reason: "leaked customer detail".to_owned(),
+            retracted_by: "op-1".to_owned(),
+            transaction_time: Some("2026-07-01T00:00:00Z".to_owned()),
+        };
+        let crate::forget::ForgetOutcome::Retracted {
+            event,
+            records: generated,
+        } = crate::forget::retract_from_records(&current, &request)
+            .map_err(|error| anyhow!(format!("{error:?}")))?
+        else {
+            anyhow::bail!("expected Retracted outcome");
+        };
+        let report = ingest_records(&generated, &mut raw_sink);
+        assert!(report.is_success(), "{report:?}");
+
+        // Revive the stable ID with an updated version: the retraction
+        // tombstone is now stale and no longer suppresses the handle.
+        let restored = make_observation("post-revive-replacement-text", "2026-07-02T00:00:00Z");
+        let report = ingest_records(std::slice::from_ref(&restored), &mut raw_sink);
+        assert!(report.is_success(), "{report:?}");
+
+        let sink = Arc::new(RwLock::new(raw_sink));
+        let (write_tx, _write_rx) = mpsc::sync_channel(1);
+        let idempotency = Arc::new(Mutex::new(IdempotencyStore {
+            path: temp.path().join("idempotency.json"),
+            entries: BTreeMap::new(),
+        }));
+        let state = ServerState {
+            token: "test-token".to_owned(),
+            store_identity: store_identity_text(temp.path()),
+            sink,
+            write_tx,
+            jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            agents: Arc::new(Mutex::new(BTreeMap::new())),
+            idempotency,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            pressure: Arc::new(PressureTracker::new(1)),
+        };
+
+        let response = handle_get_all_records(&state);
+        assert_eq!(response.status, 200);
+        let records = response.body["result"]["records"]
+            .as_array()
+            .context("records array")?;
+        let returned_ids: Vec<&str> = records
+            .iter()
+            .filter_map(|row| row["id"].as_str())
+            .collect();
+        assert_eq!(
+            returned_ids
+                .iter()
+                .filter(|id| **id == obs_id.as_str())
+                .count(),
+            1,
+            "revived record must appear exactly once in GET /v1/records: {}",
+            response.body
+        );
+        let serialized = response.body.to_string();
+        assert!(
+            !serialized.contains("pre-retraction-secret-zeta"),
+            "pre-retraction content must never be serialized after a revive: {serialized}"
+        );
+        assert!(
+            serialized.contains("post-revive-replacement-text"),
+            "restored record content must be served: {serialized}"
+        );
+        assert!(
+            returned_ids.contains(&event.retraction_id.as_str()),
+            "retraction event must stay visible in GET /v1/records: {}",
+            response.body
+        );
+        assert!(
+            !returned_ids.contains(&event.tombstone_id.as_str()),
+            "stale retraction tombstone must not be re-served (consumers would \
+             re-suppress the revived record): {}",
+            response.body
         );
         Ok(())
     }
