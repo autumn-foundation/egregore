@@ -68,6 +68,20 @@ egregore ingest graph.jsonl --adapter embedded --data-dir .egregore
 
 This writes the graph into a local AletheiaDB store. The store is self-contained in `.egregore/` and does not require a running server.
 
+To confirm what landed — totals plus per-domain, per-kind, and per-schema-version
+counts grouped by trust class — inspect the store directly, with no daemon
+(issue #125, the daemon-free analog of `eg inspect --daemon`):
+
+```powershell
+egregore inspect --data-dir .egregore
+# {"records":4386,"nodes":1353,"edges":3033,...,"source":{"data_dir":".egregore","mode":"embedded"}}
+egregore inspect --data-dir .egregore --format text
+```
+
+The read is strictly read-only and the JSON line is byte-identical across runs
+on an unchanged store. See [docs/cli/inspect.md](docs/cli/inspect.md) for the
+documented JSON contract.
+
 ### 5. Verify setup before semantic work (`eg doctor`)
 
 Before the semantic embedding step, run the setup preflight to confirm this machine
@@ -209,6 +223,7 @@ bodies a structural answer summarizes, the larger the saving. See
 egregore scan . --out graph.jsonl                          # current-tree extraction
 egregore scan-history . --out history.graph.jsonl          # commit-by-commit temporal extraction
 egregore inspect graph.jsonl                               # graph summary
+egregore inspect --data-dir .egregore                      # embedded-store summary, no daemon
 egregore ingest graph.jsonl --adapter dry-run              # validate without writing
 egregore ingest graph.jsonl --adapter embedded \
     --data-dir .egregore                                   # structural store
@@ -234,7 +249,7 @@ Implemented surfaces:
 
 - `scan` — current-tree JSONL extraction (Rust, Python, TypeScript, Go via Tree-sitter)
 - `scan-history` — commit-by-commit temporal extraction
-- `inspect` — graph summary
+- `inspect` — graph summary over a JSONL file, an embedded store (`--data-dir`, no daemon), or a running daemon
 - `ingest` — dry-run, embedded AletheiaDB, and daemon adapters
 - `import-codex` — Codex session/rollout JSONL → agent-memory graph records (M3)
 - `query symbol / file / drift / semantic` — structural and semantic agent queries

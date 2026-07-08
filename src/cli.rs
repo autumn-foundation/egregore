@@ -127,7 +127,16 @@ enum Commands {
         #[arg(long)]
         embed: bool,
     },
-    /// Inspect a graph JSONL file or a running daemon.
+    /// Inspect a graph JSONL file, an embedded store, or a running daemon.
+    ///
+    /// `--data-dir` alone reads an embedded `AletheiaDB` store directly — no
+    /// daemon, no network, no embeddings — and reports totals plus
+    /// per-domain/per-kind/per-schema-version counts grouped by trust class
+    /// (issue #125). The read is strictly read-only and the output is
+    /// byte-identical across runs on an unchanged store. Unknown
+    /// `(domain, kind, schema_version)` tuples are counted and labeled
+    /// distinctly, never folded into known versions. See `docs/cli/inspect.md`
+    /// for the documented JSON contract.
     Inspect {
         /// Graph JSONL path to inspect.
         graph: Option<PathBuf>,
@@ -139,8 +148,11 @@ enum Commands {
         #[arg(long, conflicts_with = "graph")]
         data_dir: Option<PathBuf>,
         /// Output format.
-        #[arg(long, default_value = "text")]
-        format: OutputFormat,
+        ///
+        /// Defaults to `text` for graph JSONL and daemon inspection, and to
+        /// newline-delimited `json` for embedded `--data-dir` inspection.
+        #[arg(long)]
+        format: Option<OutputFormat>,
     },
     /// Report whether a store still matches the current working tree (issue #82).
     ///
@@ -3104,12 +3116,11 @@ fn inspect(
     graph: Option<&Path>,
     daemon: bool,
     data_dir: Option<&Path>,
-    format: OutputFormat,
+    format: Option<OutputFormat>,
 ) -> Result<()> {
-    #[cfg(not(feature = "embedded-aletheiadb"))]
-    let _ = data_dir;
     #[cfg(feature = "embedded-aletheiadb")]
     if daemon {
+        let format = format.unwrap_or(OutputFormat::Text);
         let default_path = PathBuf::from(".egregore");
         let data_dir = data_dir.unwrap_or(&default_path);
         let client = DaemonClient::from_data_dir(data_dir).with_context(|| {
@@ -3151,7 +3162,16 @@ fn inspect(
         anyhow::bail!("daemon inspection requires 'embedded-aletheiadb' feature");
     }
 
-    let graph = graph.ok_or_else(|| anyhow::anyhow!("graph file path or --daemon is required"))?;
+    // Daemon-free embedded-store inspection (issue #125): `--data-dir` without
+    // `--daemon` reads the store through the same embedded read path the query
+    // surface uses, defaulting to newline-delimited JSON.
+    if let Some(data_dir) = data_dir {
+        return inspect_embedded_store(data_dir, format.unwrap_or(OutputFormat::Json));
+    }
+
+    let format = format.unwrap_or(OutputFormat::Text);
+    let graph = graph
+        .ok_or_else(|| anyhow::anyhow!("graph file path, --data-dir, or --daemon is required"))?;
     let jsonl = fs::read_to_string(graph)
         .with_context(|| format!("failed to read graph JSONL from {}", graph.display()))?;
     let counts = InspectCounts::from_jsonl(&jsonl)?;
@@ -3230,6 +3250,67 @@ fn validate_cmd(graph: &Path, format: OutputFormat) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Inspects an embedded `--data-dir` store directly, without a daemon (issue #125).
+///
+/// Reads through the same read-only embedded path the audit surfaces use (the
+/// store is copied to a throwaway temporary directory first, so the original is
+/// never re-persisted or otherwise mutated), then reports the same totals and
+/// per-domain/per-kind/per-schema-version trust-class counts as `eg inspect`
+/// over a graph JSONL file. Unknown `(domain, kind, schema_version)` tuples are
+/// counted under `unknown_schema_versions`, never folded into known versions.
+///
+/// JSON output is a single deterministic line (newline-delimited JSON) that is
+/// byte-identical across runs on an unchanged store; it carries no timestamp
+/// and no raw record payloads — counts, domains, kinds, schema versions, and
+/// repository handles only. The shape is documented in `docs/cli/inspect.md`.
+#[cfg(feature = "embedded-aletheiadb")]
+fn inspect_embedded_store(data_dir: &Path, format: OutputFormat) -> Result<()> {
+    let (store_root, _readonly_guard) = readonly_audit_store(data_dir)?;
+    let sink = EmbeddedAletheiaSink::open_unleased(&store_root)
+        .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+    let report = sink.inspect_all_records().map_err(|error| {
+        anyhow::anyhow!(
+            "failed to inspect embedded store {}: {error}",
+            data_dir.display()
+        )
+    })?;
+
+    // A directory can hold engine index/runtime files while containing zero
+    // Egregore records (empty ingest, or a non-Egregore AletheiaDB dir). That
+    // is a wrong-store diagnostic naming the path, never successful zero
+    // counts (issue #125).
+    if report.records.is_empty() && report.unknown_schema_versions.is_empty() {
+        anyhow::bail!(
+            "error: embedded store at {} contains no Egregore records - \
+             run `eg ingest --adapter embedded --data-dir <path>` first",
+            data_dir.display()
+        );
+    }
+
+    let mut counts = InspectCounts::from_records(&report.records, &report.unknown_schema_versions);
+    // Canonical ordering: repository summaries sort by stable record ID so the
+    // output is deterministic regardless of physical store iteration order.
+    counts.repositories.sort_by(|a, b| a.id.cmp(&b.id));
+
+    match format {
+        OutputFormat::Json => {
+            let json_val = counts.to_json_embedded(&data_dir.display().to_string());
+            println!("{}", serde_json::to_string(&json_val)?);
+        }
+        OutputFormat::Text => print_counts_text(&counts),
+    }
+    Ok(())
+}
+
+/// Feature-off stub: `--data-dir` inspection needs the embedded adapter.
+#[cfg(not(feature = "embedded-aletheiadb"))]
+fn inspect_embedded_store(data_dir: &Path, _format: OutputFormat) -> Result<()> {
+    anyhow::bail!(
+        "inspecting {} requires the 'embedded-aletheiadb' feature",
+        data_dir.display()
+    )
 }
 
 fn ingest(
@@ -11237,6 +11318,25 @@ impl InspectCounts {
     }
 
     fn to_json(&self, snapshot_timestamp: &str) -> serde_json::Value {
+        let mut json_val = self.counts_json();
+        json_val["snapshot_timestamp"] = serde_json::Value::from(snapshot_timestamp);
+        json_val
+    }
+
+    /// Deterministic embedded-store envelope (issue #125): the shared count
+    /// fields plus a `source` descriptor, and deliberately no timestamp so the
+    /// output is byte-identical across runs on an unchanged store.
+    #[cfg(feature = "embedded-aletheiadb")]
+    fn to_json_embedded(&self, data_dir: &str) -> serde_json::Value {
+        let mut json_val = self.counts_json();
+        json_val["source"] = serde_json::json!({
+            "mode": "embedded",
+            "data_dir": data_dir,
+        });
+        json_val
+    }
+
+    fn counts_json(&self) -> serde_json::Value {
         let mut schema_versions_obj = serde_json::Map::new();
         for (version, count) in &self.schema_versions {
             let key = format!("{}:{}:{}", version.domain, version.kind, version.version);
@@ -11262,7 +11362,6 @@ impl InspectCounts {
         }
 
         serde_json::json!({
-            "snapshot_timestamp": snapshot_timestamp,
             "records": self.records,
             "nodes": self.nodes,
             "edges": self.edges,
