@@ -34,7 +34,11 @@ use crate::{
 /// records still contain phantom comment/string-sourced reference edges
 /// (issue #134); same-file resolution labels are recomputed per scan and are
 /// never cached.
-const CACHE_SCHEMA_VERSION: u32 = 7;
+///
+/// v8: cached per-file records include `DebtMarker` debt-comment marker
+/// nodes with their `note` field and `CONTAINS` edges (issue #218); older
+/// caches rebuild so reused records are never missing the markers.
+const CACHE_SCHEMA_VERSION: u32 = 8;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

@@ -1518,6 +1518,7 @@ impl EmbeddedAletheiaSink {
             signature,
             doc,
             call_context,
+            note,
             temporal,
             semantic_drift,
             evidence_links,
@@ -1628,6 +1629,7 @@ impl EmbeddedAletheiaSink {
         builder = insert_optional(builder, "signature", signature.as_deref());
         builder = insert_optional(builder, "doc", doc.as_deref());
         builder = insert_optional(builder, "call_context", call_context.as_deref());
+        builder = insert_optional(builder, "note", note.as_deref());
         builder = insert_temporal(builder, temporal.as_ref());
         builder = insert_semantic_drift(builder, semantic_drift.as_deref());
         builder = insert_optional(builder, "node_valid_time", valid_time.as_deref());
@@ -2297,6 +2299,7 @@ impl EmbeddedAletheiaSink {
                 "call_context",
                 node.get_property("call_context"),
             )?,
+            note: optional_str_property(record_id, "note", node.get_property("note"))?,
             temporal: temporal_from_properties(record_id, |key| node.get_property(key))?,
             semantic_drift: semantic_drift_from_properties(record_id, |key| {
                 node.get_property(key)
@@ -3272,6 +3275,7 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "Import" => Ok(NodeKind::Import),
         "Diagnostic" => Ok(NodeKind::Diagnostic),
         "PanicRiskSite" => Ok(NodeKind::PanicRiskSite),
+        "DebtMarker" => Ok(NodeKind::DebtMarker),
         "Commit" => Ok(NodeKind::Commit),
         "Change" => Ok(NodeKind::Change),
         "SemanticDrift" => Ok(NodeKind::SemanticDrift),
@@ -3493,6 +3497,7 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::Import
         | NodeKind::Diagnostic
         | NodeKind::PanicRiskSite
+        | NodeKind::DebtMarker
         | NodeKind::Commit
         | NodeKind::Change
         | NodeKind::SemanticDrift

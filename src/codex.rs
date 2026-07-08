@@ -1529,6 +1529,7 @@ fn make_node(
         signature: None,
         doc: None,
         call_context: None,
+        note: None,
         temporal: None,
         semantic_drift: None,
         evidence_links: None,

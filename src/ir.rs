@@ -722,6 +722,13 @@ pub enum GraphRecord {
         /// identity input.
         #[serde(skip_serializing_if = "Option::is_none")]
         call_context: Option<String>,
+        // ── Debt-comment marker fields (issue #218) ───────────────────────────
+        /// Trimmed single-line note text following the marker token on
+        /// `DebtMarker` nodes, after passing through redaction policy v1.
+        /// Absent on all other node kinds. Additive per
+        /// `docs/schema/schema-versioning.md §2`; never an identity input.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
         /// Git and bitemporal provenance for history-backed records.
         #[serde(skip_serializing_if = "Option::is_none")]
         temporal: Option<TemporalMetadata>,
@@ -1080,6 +1087,7 @@ impl GraphRecord {
             signature: None,
             doc: None,
             call_context: None,
+            note: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1191,6 +1199,7 @@ impl GraphRecord {
             signature: None,
             doc: None,
             call_context: None,
+            note: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1301,6 +1310,7 @@ impl GraphRecord {
             signature: None,
             doc: None,
             call_context: None,
+            note: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1417,6 +1427,7 @@ impl GraphRecord {
             signature: None,
             doc: None,
             call_context: None,
+            note: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1628,6 +1639,27 @@ impl GraphRecord {
             *doc = symbol_doc;
         }
         self
+    }
+
+    /// Stamps the trimmed single-line note text on a `DebtMarker` node record
+    /// (issue #218). The value is additive metadata per
+    /// `docs/schema/schema-versioning.md §2` and MUST NOT contribute to
+    /// stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub fn with_note(mut self, marker_note: &str) -> Self {
+        if let Self::Node { note, .. } = &mut self {
+            *note = Some(marker_note.to_owned());
+        }
+        self
+    }
+
+    /// Returns the debt-marker note text when present.
+    #[must_use]
+    pub fn note(&self) -> Option<&str> {
+        match self {
+            Self::Node { note, .. } => note.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
     }
 
     /// Attaches semantic drift metadata to a node record.
@@ -2018,6 +2050,11 @@ pub enum NodeKind {
     /// (issue #223). The `name` field carries the closed category (`unwrap`
     /// or `expect`) and `call_context` carries the production-vs-test class.
     PanicRiskSite,
+    /// Deterministic human-authored debt-comment marker (issue #218): a
+    /// `TODO` / `FIXME` / `HACK` / `XXX` token inside a Tree-sitter comment
+    /// node. The `name` field carries the closed lowercase category and
+    /// `note` carries the trimmed single-line note text.
+    DebtMarker,
     /// Git commit observed during history replay.
     Commit,
     /// File-level change observed in a commit.
@@ -2120,6 +2157,7 @@ impl NodeKind {
             Self::Import => "Import",
             Self::Diagnostic => "Diagnostic",
             Self::PanicRiskSite => "PanicRiskSite",
+            Self::DebtMarker => "DebtMarker",
             Self::Commit => "Commit",
             Self::Change => "Change",
             Self::SemanticDrift => "SemanticDrift",
