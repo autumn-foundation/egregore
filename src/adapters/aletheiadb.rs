@@ -1175,39 +1175,72 @@ impl EmbeddedAletheiaSink {
             else {
                 continue;
             };
-            // Tombstone is stale if the node record was re-ingested after it (higher NodeId).
-            let node_stale = self
-                .node_lookup
-                .non_temporal
-                .get(deleted_id.as_str())
-                .is_some_and(|&live_node_id| live_node_id > tombstone_node_id);
-            // Tombstone is stale if an edge with the same codegraph_id was written AFTER the
-            // tombstone (higher egregore_seq). Using seq rather than a simple count correctly
-            // handles updates: an edge that was re-written before being tombstoned has a higher
-            // write count but a lower seq than the tombstone, so the tombstone is not stale.
-            //
-            // Four cases based on whether seq metadata is present:
-            //   (edge_seq, tombstone_seq): comparison
-            //   (Some(e), Some(t)):        e > t   — compare directly
-            //   (Some(e), None):           true    — edge written after upgrade ⇒ newer than tombstone
-            //   (None, Some(_)):           false   — edge written before upgrade ⇒ older than tombstone
-            //   (None, None):              legacy  — fall back to count-based duplicate detection
-            let tombstone_seq = self.tombstone_node_seqs.get(&tombstone_node_id).copied();
-            let edge_seq = self.edge_seqs.get(deleted_id.as_str()).copied();
-            let edge_stale = match (edge_seq, tombstone_seq) {
-                (Some(es), Some(ts)) => es > ts,
-                (Some(_), None) => true,
-                (None, Some(_)) => false,
-                (None, None) => self
-                    .legacy_edge_counts
-                    .get(deleted_id.as_str())
-                    .is_some_and(|&count| count > 1),
-            };
-            if !node_stale && !edge_stale {
+            if !self.tombstone_node_is_stale(tombstone_node_id, &deleted_id) {
                 deleted.insert(deleted_id);
             }
         }
         Ok(deleted)
+    }
+
+    /// Returns true when the physical tombstone at `tombstone_node_id` no
+    /// longer suppresses `deleted_id` because a newer write of that record
+    /// supersedes it.
+    fn tombstone_node_is_stale(
+        &self,
+        tombstone_node_id: ::aletheiadb::NodeId,
+        deleted_id: &str,
+    ) -> bool {
+        // Tombstone is stale if the node record was re-ingested after it (higher NodeId).
+        let node_stale = self
+            .node_lookup
+            .non_temporal
+            .get(deleted_id)
+            .is_some_and(|&live_node_id| live_node_id > tombstone_node_id);
+        // Tombstone is stale if an edge with the same codegraph_id was written AFTER the
+        // tombstone (higher egregore_seq). Using seq rather than a simple count correctly
+        // handles updates: an edge that was re-written before being tombstoned has a higher
+        // write count but a lower seq than the tombstone, so the tombstone is not stale.
+        //
+        // Four cases based on whether seq metadata is present:
+        //   (edge_seq, tombstone_seq): comparison
+        //   (Some(e), Some(t)):        e > t   — compare directly
+        //   (Some(e), None):           true    — edge written after upgrade ⇒ newer than tombstone
+        //   (None, Some(_)):           false   — edge written before upgrade ⇒ older than tombstone
+        //   (None, None):              legacy  — fall back to count-based duplicate detection
+        let tombstone_seq = self.tombstone_node_seqs.get(&tombstone_node_id).copied();
+        let edge_seq = self.edge_seqs.get(deleted_id).copied();
+        let edge_stale = match (edge_seq, tombstone_seq) {
+            (Some(es), Some(ts)) => es > ts,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => self
+                .legacy_edge_counts
+                .get(deleted_id)
+                .is_some_and(|&count| count > 1),
+        };
+        node_stale || edge_stale
+    }
+
+    /// Returns true when the tombstone record stored under
+    /// `tombstone_record_id` is stale: a newer write of its deleted ID
+    /// supersedes it, so it no longer suppresses anything.
+    fn stored_tombstone_is_stale(&self, tombstone_record_id: &str) -> AdapterResult<bool> {
+        let Some(&tombstone_node_id) = self.tombstone_ids.get(tombstone_record_id) else {
+            return Ok(false);
+        };
+        let node = self
+            .db
+            .get_node(tombstone_node_id)
+            .map_err(|e| read_back_error(tombstone_record_id, e.to_string()))?;
+        let Some(deleted_id) = optional_str_property(
+            tombstone_record_id,
+            "deleted_id",
+            node.get_property("deleted_id"),
+        )?
+        else {
+            return Ok(false);
+        };
+        Ok(self.tombstone_node_is_stale(tombstone_node_id, &deleted_id))
     }
 
     /// Returns true if the store contains any records whose ID does not start with `codegraph:`.
@@ -1490,7 +1523,20 @@ impl EmbeddedAletheiaSink {
                 }
             }
             Some("tombstone") => {
-                self.tombstone_ids.insert(record_id, node_id);
+                // A record ID can have several physical tombstone versions
+                // (e.g. a retraction tombstone re-issued after its target was
+                // revived by a re-ingest). Keep the latest write — highest
+                // NodeId, mirroring the non-temporal node index — regardless
+                // of storage iteration order, so staleness comparisons see
+                // the newest deletion marker after a reopen.
+                self.tombstone_ids
+                    .entry(record_id)
+                    .and_modify(|current| {
+                        if node_id > *current {
+                            *current = node_id;
+                        }
+                    })
+                    .or_insert(node_id);
             }
             Some(_) | None => {}
         }
@@ -1952,7 +1998,14 @@ impl EmbeddedAletheiaSink {
     }
 
     fn write_tombstone(&mut self, record: &GraphRecord) -> AdapterResult<()> {
-        if self.expected_record_state(record)? == ExpectedRecordState::Matched {
+        // A byte-identical tombstone is only a no-op while the stored copy is
+        // still active. Once a newer write of the deleted ID supersedes it
+        // (a revived record), re-issuing the same tombstone must land as a
+        // fresh write so the deletion becomes the latest write again — this
+        // is what the `eg forget` repair path relies on (issue #231).
+        if self.expected_record_state(record)? == ExpectedRecordState::Matched
+            && !self.stored_tombstone_is_stale(record.id())?
+        {
             return Ok(());
         }
         let GraphRecord::Tombstone {
@@ -4516,6 +4569,122 @@ mod tests {
         assert!(
             !stale_tombstone_emitted,
             "stale tombstone must not appear in read_all_records output"
+        );
+    }
+
+    /// A re-issued tombstone must keep suppressing its target across store
+    /// reopens. Reopen leaves two physical tombstone nodes with the same
+    /// record ID; `rebuild_lookup_indexes` must index the latest one
+    /// regardless of storage iteration order, or the staleness comparison
+    /// resurrects the target nondeterministically. Each scope mirrors one CLI
+    /// process (open, write, persist, drop).
+    #[test]
+    fn reissued_tombstone_still_suppresses_target_after_reopen() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("reopen-re-retraction-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "reopened"]);
+        let tombstone = GraphRecord::Tombstone {
+            id: stable_id(&["tombstone", &symbol_id, "reopened"]),
+            schema_version: crate::ir::SCHEMA_VERSION,
+            deleted_id: symbol_id.clone(),
+            summary: "deleted".to_owned(),
+            producer: None,
+        };
+        {
+            let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("open 1");
+            // A second node keeps the store off the single-node NodeId(0)
+            // path so ID generation continues monotonically across reopens.
+            let other_id = stable_id(&["node", "symbol", "src/lib.rs", "reopened-other"]);
+            sink.write_record(&current_symbol_record(&other_id, "other", 5))
+                .expect("write other");
+            sink.write_record(&current_symbol_record(&symbol_id, "original", 10))
+                .expect("write original");
+            sink.persist_indexes().expect("persist 1");
+        }
+        {
+            let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("open 2");
+            sink.write_record(&tombstone).expect("write tombstone");
+            sink.persist_indexes().expect("persist 2");
+        }
+        {
+            let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("open 3");
+            sink.write_record(&current_symbol_record(&symbol_id, "revived", 20))
+                .expect("write revived");
+            sink.persist_indexes().expect("persist 3");
+        }
+        {
+            let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("open 4");
+            sink.write_record(&tombstone)
+                .expect("re-issue the byte-identical tombstone");
+            sink.persist_indexes().expect("persist 4");
+        }
+        {
+            let sink = EmbeddedAletheiaSink::open(&data_dir).expect("open 5");
+            let records = sink.read_all_records().expect("read");
+            let node_live = records
+                .iter()
+                .any(|r| matches!(r, GraphRecord::Node { id, .. } if id == &symbol_id));
+            assert!(
+                !node_live,
+                "the revived record must stay suppressed after reopen"
+            );
+            let tombstone_active = records.iter().any(
+                |r| matches!(r, GraphRecord::Tombstone { deleted_id, .. } if deleted_id == &symbol_id),
+            );
+            assert!(
+                tombstone_active,
+                "the re-issued tombstone must be emitted as active after reopen"
+            );
+        }
+    }
+
+    #[test]
+    fn write_tombstone_reissues_stale_tombstone_after_reingest() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("re-retraction-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "re_retracted"]);
+        let tombstone_id = stable_id(&["tombstone", &symbol_id, "v1"]);
+        let tombstone = GraphRecord::Tombstone {
+            id: tombstone_id,
+            schema_version: crate::ir::SCHEMA_VERSION,
+            deleted_id: symbol_id.clone(),
+            summary: "deleted".to_owned(),
+            producer: None,
+        };
+
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        // 1. Write original node, then tombstone it.
+        sink.write_record(&current_symbol_record(&symbol_id, "original", 10))
+            .expect("original symbol should write");
+        sink.write_record(&tombstone)
+            .expect("tombstone should write");
+        // 2. Re-ingest the record: the newer write supersedes the tombstone,
+        //    so the record is live again and the stored tombstone is stale.
+        sink.write_record(&current_symbol_record(&symbol_id, "revived", 20))
+            .expect("revived symbol should write");
+        // 3. Re-issue the byte-identical tombstone (the `eg forget` repair
+        //    path). The identical-content Matched no-op must not apply to a
+        //    stale tombstone: the write has to land as a fresh, active
+        //    deletion marker.
+        sink.write_record(&tombstone)
+            .expect("re-issued tombstone should write");
+
+        let records = sink
+            .read_all_records()
+            .expect("read_all_records should succeed");
+        let node_live = records
+            .iter()
+            .any(|r| matches!(r, GraphRecord::Node { id, .. } if id == &symbol_id));
+        assert!(
+            !node_live,
+            "a re-issued tombstone must suppress the revived record again"
+        );
+        let tombstone_active = records.iter().any(
+            |r| matches!(r, GraphRecord::Tombstone { deleted_id, .. } if deleted_id == &symbol_id),
+        );
+        assert!(
+            tombstone_active,
+            "the re-issued tombstone must be emitted as active"
         );
     }
 

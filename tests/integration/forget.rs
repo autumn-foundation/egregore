@@ -342,6 +342,57 @@ mod embedded {
         assert_eq!(first_stdout, second_stdout, "byte-identical across runs");
     }
 
+    /// A record revived by a later re-ingest must be suppressed again by
+    /// re-running `eg forget`: the repair tombstone has to land as a fresh
+    /// write instead of no-oping against the stale tombstone left over from
+    /// the first retraction (which would leave the target live while the
+    /// envelope claims `retracted`).
+    #[test]
+    fn forget_rerun_suppresses_record_revived_by_reingest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = seed_store(temp.path());
+        let (code, _, stderr) = forget(&store, &obs_id());
+        assert_eq!(code, 0, "first retraction succeeds: {stderr}");
+
+        // Revive the retracted record: re-ingest an updated version of the
+        // same stable ID. The newer write supersedes the retraction
+        // tombstone, so the record is live again on current read surfaces.
+        let revived = observation(
+            &obs_id(),
+            "revised parser claim after retraction",
+            vec![link(&symbol_id(), "codegraph", "MENTIONS_SYMBOL")],
+        );
+        let graph = temp.path().join("revive.jsonl");
+        let line = serde_json::to_string(&revived).expect("serializable");
+        fs::write(&graph, format!("{line}\n")).expect("revive JSONL written");
+        egregore()
+            .args(["ingest"])
+            .arg(&graph)
+            .args(["--adapter", "embedded", "--data-dir"])
+            .arg(&store)
+            .assert()
+            .success();
+        let (code, stdout, _) = run(&store, &["query", "memory", &obs_id()]);
+        assert_eq!(code, 0, "the re-ingested record is live again: {stdout}");
+
+        // Re-running forget must actually suppress the revived record.
+        let (code, stdout, stderr) = forget(&store, &obs_id());
+        assert_eq!(code, 0, "repair retraction succeeds: {stderr}");
+        let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON");
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["action"], "retracted");
+
+        let (code, stdout, _) = run(&store, &["query", "memory", &obs_id()]);
+        assert_eq!(
+            code, 2,
+            "the revived record must be retracted again, not left live: {stdout}"
+        );
+        assert!(
+            stdout.contains("stale_handle"),
+            "stale verdict expected: {stdout}"
+        );
+    }
+
     /// AC4: deterministic code-graph facts are refused with a machine-readable
     /// error naming the correction path, and the store stays untouched.
     #[test]
