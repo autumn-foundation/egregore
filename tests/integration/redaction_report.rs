@@ -648,6 +648,168 @@ fn import_codex_cli_rejects_report_path_dotdot_alias_of_out() {
     );
 }
 
+/// A pre-existing dangling symlink `report.json -> records.jsonl` names the
+/// same eventual file as `--out`: `canonicalize()` fails on it (the target
+/// does not exist yet), so the guard must resolve the link component itself
+/// rather than comparing the unresolved spelling.
+#[cfg(unix)]
+#[test]
+fn import_traj_cli_rejects_dangling_symlink_report_aliasing_out() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let traj_path = write_secret_traj(temp.path());
+    std::os::unix::fs::symlink("records.jsonl", temp.path().join("report.json"))
+        .expect("dangling report symlink");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .current_dir(temp.path())
+        .arg("import-traj")
+        .arg(&traj_path)
+        .arg("--out")
+        .arg("records.jsonl")
+        .arg("--redaction-report")
+        .arg("report.json")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--redaction-report"));
+
+    assert!(
+        !temp.path().join("records.jsonl").exists(),
+        "neither artifact may be written when the report path is a dangling \
+         symlink to --out"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn import_codex_cli_rejects_dangling_symlink_report_aliasing_out() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let codex_path = write_secret_codex(temp.path());
+    std::os::unix::fs::symlink("records.jsonl", temp.path().join("report.json"))
+        .expect("dangling report symlink");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .current_dir(temp.path())
+        .arg("import-codex")
+        .arg(&codex_path)
+        .arg("--out")
+        .arg("records.jsonl")
+        .arg("--redaction-report")
+        .arg("report.json")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--redaction-report"));
+
+    assert!(
+        !temp.path().join("records.jsonl").exists(),
+        "neither artifact may be written when the report path is a dangling \
+         symlink to --out"
+    );
+}
+
+/// The mirror case: `--out` spelled through a dangling symlink that points at
+/// the report path collides just the same (the records write would land on
+/// the report's file, then the report write would replace it).
+#[cfg(unix)]
+#[test]
+fn import_traj_cli_rejects_dangling_symlink_out_aliasing_report() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let traj_path = write_secret_traj(temp.path());
+    std::os::unix::fs::symlink("report.json", temp.path().join("records.jsonl"))
+        .expect("dangling out symlink");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .current_dir(temp.path())
+        .arg("import-traj")
+        .arg(&traj_path)
+        .arg("--out")
+        .arg("records.jsonl")
+        .arg("--redaction-report")
+        .arg("report.json")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--redaction-report"));
+
+    assert!(
+        !temp.path().join("report.json").exists(),
+        "neither artifact may be written when --out is a dangling symlink to \
+         the report path"
+    );
+}
+
+/// A dangling report symlink pointing at an *unrelated* name is not a
+/// collision: the import must succeed and write both artifacts, with the
+/// report landing through the symlink at its target.
+#[cfg(unix)]
+#[test]
+fn import_traj_cli_accepts_dangling_symlink_report_to_unrelated_target() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let traj_path = write_secret_traj(temp.path());
+    std::os::unix::fs::symlink("other.json", temp.path().join("report.json"))
+        .expect("dangling report symlink");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .current_dir(temp.path())
+        .arg("import-traj")
+        .arg(&traj_path)
+        .arg("--out")
+        .arg("records.jsonl")
+        .arg("--redaction-report")
+        .arg("report.json")
+        .assert()
+        .success();
+
+    let records = fs::read_to_string(temp.path().join("records.jsonl"))
+        .expect("records JSONL must be written when the report symlink is unrelated");
+    assert!(
+        records
+            .lines()
+            .next()
+            .is_some_and(|line| { serde_json::from_str::<serde_json::Value>(line).is_ok() }),
+        "records output must be graph JSONL, not the report"
+    );
+    let body = fs::read_to_string(temp.path().join("other.json"))
+        .expect("report must be written through the symlink to its target");
+    let report: serde_json::Value = serde_json::from_str(body.trim()).expect("report is JSON");
+    assert_eq!(report["redaction"], "enabled");
+}
+
+/// A symlink cycle can never be resolved to a real file; the guard must
+/// terminate deterministically and refuse (the safe side) rather than loop
+/// or guess that the paths are distinct.
+#[cfg(unix)]
+#[test]
+fn import_traj_cli_rejects_symlink_cycle_report_path() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let traj_path = write_secret_traj(temp.path());
+    std::os::unix::fs::symlink("loop.json", temp.path().join("report.json"))
+        .expect("cycle symlink a");
+    std::os::unix::fs::symlink("report.json", temp.path().join("loop.json"))
+        .expect("cycle symlink b");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .current_dir(temp.path())
+        .arg("import-traj")
+        .arg(&traj_path)
+        .arg("--out")
+        .arg("records.jsonl")
+        .arg("--redaction-report")
+        .arg("report.json")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--redaction-report"));
+
+    assert!(
+        !temp.path().join("records.jsonl").exists(),
+        "no artifact may be written when the report path is an unresolvable \
+         symlink cycle"
+    );
+}
+
 #[test]
 fn import_traj_cli_accepts_distinct_paths_with_dotdot_components() {
     let temp = tempfile::tempdir().expect("temp dir");

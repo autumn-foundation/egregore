@@ -2470,15 +2470,21 @@ fn import_antigravity_cmd(antigravity_path: &Path, out: &Path) -> Result<()> {
 ///
 /// The report is written after the records, so a matching path would silently
 /// replace the graph JSONL with the report while the command still exits 0.
-/// Paths are compared after absolutization, lexical `.`/`..` collapsing, and
-/// canonicalization of the deepest existing ancestor, so aliases such as
-/// `tmp/../records.jsonl` vs `records.jsonl` (and symlinked parent
-/// directories) conflict even though the output files themselves do not exist
-/// yet; `-` (stdout) never conflicts.
+/// Paths are compared after absolutization, lexical `.`/`..` collapsing,
+/// canonicalization of the deepest existing ancestor, and explicit resolution
+/// of dangling-symlink components on the non-existing remainder, so aliases
+/// such as `tmp/../records.jsonl` vs `records.jsonl`, symlinked parent
+/// directories, and a pre-existing dangling symlink pointing at the other
+/// output all conflict even though the output files themselves do not exist
+/// yet; `-` (stdout) never conflicts. A path whose symlink chain cannot be
+/// resolved within [`SYMLINK_RESOLUTION_LIMIT`] hops (a cycle or an absurdly
+/// deep chain) is treated as conflicting — the guard refuses rather than
+/// guessing the paths are distinct.
 ///
 /// # Errors
 ///
-/// Returns an error naming both flags when the paths resolve to the same file.
+/// Returns an error naming both flags when the paths resolve to the same file
+/// or when a symlink chain on either path cannot be resolved.
 fn ensure_report_path_distinct(out: &Path, redaction_report: Option<&Path>) -> Result<()> {
     let Some(report_path) = redaction_report else {
         return Ok(());
@@ -2486,8 +2492,15 @@ fn ensure_report_path_distinct(out: &Path, redaction_report: Option<&Path>) -> R
     if report_path == Path::new("-") {
         return Ok(());
     }
-    let conflict =
-        resolve_output_path_for_collision(out) == resolve_output_path_for_collision(report_path);
+    let conflict = match (
+        resolve_output_path_for_collision(out),
+        resolve_output_path_for_collision(report_path),
+    ) {
+        (Some(resolved_out), Some(resolved_report)) => resolved_out == resolved_report,
+        // An unresolvable symlink chain means the write target is unknowable;
+        // refuse deterministically instead of risking a clobber.
+        _ => true,
+    };
     if conflict {
         anyhow::bail!(
             "--redaction-report path {} matches --out; the report would overwrite the \
@@ -2498,34 +2511,81 @@ fn ensure_report_path_distinct(out: &Path, redaction_report: Option<&Path>) -> R
     Ok(())
 }
 
+/// Upper bound on symlink hops followed while resolving an output path for
+/// the collision check, mirroring the kernel's `ELOOP` limit of 40. Hitting
+/// the bound (a symlink cycle, or a chain deeper than any legitimate layout)
+/// yields `None`, which [`ensure_report_path_distinct`] treats as a conflict.
+const SYMLINK_RESOLUTION_LIMIT: u32 = 40;
+
 /// Resolves an output path for the `--out`/`--redaction-report` collision
 /// check without requiring the target file to exist.
 ///
 /// Absolutizes against the cwd, lexically collapses `.`/`..` components, then
-/// canonicalizes the deepest existing ancestor and re-joins the remainder, so
-/// differing spellings of the same file (cwd-relative vs `..`-aliased vs
-/// through a symlinked parent directory) compare equal. Falls back to the
-/// lexically normalized form when no ancestor exists.
-fn resolve_output_path_for_collision(path: &Path) -> PathBuf {
+/// canonicalizes the deepest existing ancestor and re-joins the remainder.
+/// `canonicalize()` fails on a *dangling* symlink (its target does not exist
+/// yet), so remainder components are checked with [`fs::symlink_metadata`]
+/// and any symlink among them is followed explicitly via [`fs::read_link`]
+/// (relative targets resolve against the link's parent, then lexically
+/// normalize) before resolution restarts. Differing spellings of the same
+/// file — cwd-relative vs `..`-aliased, through a symlinked parent, or via a
+/// pre-existing dangling symlink — therefore compare equal.
+///
+/// Returns `None` when a symlink chain exceeds [`SYMLINK_RESOLUTION_LIMIT`]
+/// hops or a discovered link cannot be read; callers must treat `None` as
+/// "possibly the same file" (the safe side). Falls back to the lexically
+/// normalized form when no ancestor exists.
+fn resolve_output_path_for_collision(path: &Path) -> Option<PathBuf> {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let normalized = lexically_normalize(&abs);
-    let mut existing = normalized.as_path();
-    let mut remainder: Vec<std::ffi::OsString> = Vec::new();
-    loop {
-        if let Ok(canonical) = existing.canonicalize() {
-            let mut resolved = canonical;
-            for part in remainder.iter().rev() {
-                resolved.push(part);
+    let mut current = lexically_normalize(&abs);
+    let mut hops: u32 = 0;
+    'resolve: loop {
+        // Canonicalize the deepest existing ancestor; components that do not
+        // canonicalize (missing, or dangling symlinks) form the remainder,
+        // deepest-first.
+        let mut existing = current.as_path();
+        let mut remainder: Vec<std::ffi::OsString> = Vec::new();
+        let base = loop {
+            if let Ok(canonical) = existing.canonicalize() {
+                break canonical;
             }
-            return resolved;
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                remainder.push(name.to_os_string());
-                existing = parent;
+            match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    remainder.push(name.to_os_string());
+                    existing = parent;
+                }
+                _ => break existing.to_path_buf(),
             }
-            _ => return normalized,
+        };
+        // Re-join the remainder one component at a time, following the first
+        // symlink encountered and restarting resolution from the retargeted
+        // path (which may itself expose further links or existing ancestors).
+        let mut resolved = base;
+        while let Some(name) = remainder.pop() {
+            resolved.push(&name);
+            let is_symlink = fs::symlink_metadata(&resolved)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false);
+            if !is_symlink {
+                continue;
+            }
+            if hops >= SYMLINK_RESOLUTION_LIMIT {
+                return None;
+            }
+            hops += 1;
+            let target = fs::read_link(&resolved).ok()?;
+            resolved.pop();
+            let mut retargeted = if target.is_absolute() {
+                lexically_normalize(&target)
+            } else {
+                lexically_normalize(&resolved.join(target))
+            };
+            while let Some(rest) = remainder.pop() {
+                retargeted.push(rest);
+            }
+            current = retargeted;
+            continue 'resolve;
         }
+        return Some(resolved);
     }
 }
 
