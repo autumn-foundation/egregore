@@ -3383,6 +3383,212 @@ fn data_dir_evidence_freshness_is_read_only() {
     );
 }
 
+// ── Issue #205: `--data-dir` honors tombstone write order like `--graph` ─────
+
+/// A current-tree (non-temporal) symbol, the shape the incremental cache and
+/// `scan` produce; issue #205 is specific to non-temporal stable IDs.
+#[cfg(feature = "embedded-aletheiadb")]
+fn current_tree_symbol(sym_id: &str, path: &str, name: &str, body: &str) -> GraphRecord {
+    GraphRecord::node(
+        sym_id.to_owned(),
+        NodeKind::Symbol,
+        Some(path.to_owned()),
+        Some(span(1, 5)),
+        Some(name.to_owned()),
+        format!("Rust fn {name}\nSource:\n{body}"),
+    )
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn tombstone_of(deleted_id: &str, marker: &str) -> GraphRecord {
+    GraphRecord::Tombstone {
+        id: stable_id(&["tombstone", deleted_id, marker]),
+        schema_version: aletheia_egregore::SCHEMA_VERSION,
+        deleted_id: deleted_id.to_owned(),
+        summary: "deleted".to_owned(),
+        producer: None,
+    }
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn ingest_into(
+    data_dir: &std::path::Path,
+    scratch: &std::path::Path,
+    name: &str,
+    records: &[GraphRecord],
+) {
+    let mut graph = Graph::new();
+    for record in records {
+        graph.push(record.clone());
+    }
+    let path = scratch.join(name);
+    fs::write(&path, graph.to_jsonl().unwrap()).unwrap();
+    egregore()
+        .args(["ingest"])
+        .arg(&path)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(data_dir)
+        .assert()
+        .success();
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+fn freshness_from_data_dir(data_dir: &std::path::Path) -> serde_json::Value {
+    let assert = egregore()
+        .args(["query", "evidence-freshness", "--data-dir"])
+        .arg(data_dir)
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    serde_json::from_str(stdout.trim()).expect("valid JSON")
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn data_dir_tombstoned_then_not_restored_records_match_graph_semantics() {
+    // Issue #205: the embedded history read used to emit active tombstones in
+    // its current-state prefix while the deleted non-temporal node versions
+    // were re-emitted in a write-order suffix *after* them. Freshness infers
+    // restoration from slice order, so a genuine deletion looked restored: a
+    // retracted observation was still classified and a deleted current-tree
+    // handle reported live. The `--graph` append-only path is the contract.
+    let path = "src/t205.rs";
+    let kept_sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "kept", "0"]);
+    let gone_sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "gone", "0"]);
+    let obs_retracted = agent_memory_stable_id(&["obs", "retracted-205"]);
+    let obs_deleted_handle = agent_memory_stable_id(&["obs", "deleted-handle-205"]);
+
+    // First write batch: two current-tree symbols, one observation citing each.
+    let first = vec![
+        current_tree_symbol(&kept_sym, path, "kept", "kept_body"),
+        current_tree_symbol(&gone_sym, path, "gone", "gone_body"),
+        observation(
+            &obs_retracted,
+            RAW_OBS_TEXT_SENTINEL,
+            "0.9",
+            Some(&kept_sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            None,
+            None,
+        ),
+        observation(
+            &obs_deleted_handle,
+            "gone does Y",
+            "0.9",
+            Some(&gone_sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            None,
+            None,
+        ),
+    ];
+    // Second write batch: retract the first observation, delete the second's
+    // cited handle. Neither stable ID is ever re-emitted afterwards.
+    let second = vec![
+        tombstone_of(&obs_retracted, "retract"),
+        tombstone_of(&gone_sym, "delete"),
+    ];
+
+    let assert_tombstone_semantics = |v: &serde_json::Value, source: &str| {
+        let verdicts = v["verdicts"].as_array().unwrap();
+        assert!(
+            !verdicts
+                .iter()
+                .any(|e| e["observation_id"] == obs_retracted.as_str()),
+            "{source}: a retracted (tombstoned, never restored) observation must be \
+             omitted, got {verdicts:?}"
+        );
+        let entry = verdict_for(v, &obs_deleted_handle);
+        assert_eq!(
+            entry["verdict"], "unresolved",
+            "{source}: a citation to a deleted (tombstoned, never restored) handle \
+             must be unresolved"
+        );
+        assert_eq!(entry["triggering_handle"]["kind"], "handle_removed");
+    };
+
+    // Contract: the append-only `--graph` path over the same write order.
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("combined.jsonl");
+    let mut combined = Graph::new();
+    for record in first.iter().chain(second.iter()) {
+        combined.push(record.clone());
+    }
+    fs::write(&graph_path, combined.to_jsonl().unwrap()).unwrap();
+    let (code, stdout, stderr) = run(&graph_path, &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_tombstone_semantics(&v, "--graph");
+
+    // Same write order through the embedded store must behave identically.
+    let data_dir = temp.path().join("store");
+    ingest_into(&data_dir, temp.path(), "first.jsonl", &first);
+    ingest_into(&data_dir, temp.path(), "second.jsonl", &second);
+    let v = freshness_from_data_dir(&data_dir);
+    assert_tombstone_semantics(&v, "--data-dir");
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn data_dir_tombstoned_then_restored_observation_stays_live() {
+    // Issue #205 acceptance: fixing the deletion case must not break
+    // restoration — a stable ID re-ingested AFTER its tombstone is live again
+    // and its observation is classified.
+    let path = "src/t205r.rs";
+    let sym = stable_id(&["node", "symbol", "fn", "repo-a", path, "f", "0"]);
+    let obs = agent_memory_stable_id(&["obs", "restored-205"]);
+
+    let obs_record = |text: &str| {
+        observation(
+            &obs,
+            text,
+            "0.9",
+            Some(&sym),
+            Some(path),
+            Some(span(1, 5)),
+            "OBSERVES",
+            None,
+            None,
+        )
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("store");
+    ingest_into(
+        &data_dir,
+        temp.path(),
+        "first.jsonl",
+        &[
+            current_tree_symbol(&sym, path, "f", "body"),
+            obs_record("f does X"),
+        ],
+    );
+    ingest_into(
+        &data_dir,
+        temp.path(),
+        "second.jsonl",
+        &[tombstone_of(&obs, "retract")],
+    );
+    // Restoration: the same stable observation ID is re-ingested after the
+    // tombstone (revised text so the write is not an idempotent no-op).
+    ingest_into(
+        &data_dir,
+        temp.path(),
+        "third.jsonl",
+        &[obs_record("f does X (re-verified)")],
+    );
+
+    let v = freshness_from_data_dir(&data_dir);
+    let entry = verdict_for(&v, &obs);
+    assert!(
+        entry["verdict"].is_string(),
+        "a tombstoned-then-restored observation must be classified again"
+    );
+}
+
 // ── A superseded (not tombstoned) drift record is not a trigger ──────────────
 
 #[test]

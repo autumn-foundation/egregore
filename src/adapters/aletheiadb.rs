@@ -611,7 +611,11 @@ impl EmbeddedAletheiaSink {
 
     /// Like [`Self::read_all_records`], but also emits *superseded* non-temporal
     /// physical nodes — older versions of a stable ID that a later re-ingest
-    /// replaced in the current-state index.
+    /// replaced in the current-state index. Non-temporal node versions and
+    /// active tombstones are emitted in write (`egregore_seq`) order relative to
+    /// each other, so slice order mirrors the append-only JSONL write order that
+    /// order-based consumers (the tx resolver's tie-break, evidence freshness's
+    /// tombstone-restoration inference) rely on (issues #66, #205).
     ///
     /// Each write creates a new physical node and only repoints the current-state
     /// index, so prior non-temporal versions remain in the database. Current-state
@@ -629,31 +633,42 @@ impl EmbeddedAletheiaSink {
     /// Returns an error if a physical record cannot be read.
     pub fn read_all_records_including_superseded(&self) -> AdapterResult<Vec<GraphRecord>> {
         // Start from the current-state read, then drop its current non-temporal
-        // node versions: every non-temporal physical version (current,
-        // superseded, and active-tombstoned) is re-emitted below in write order.
+        // node versions and its (active) tombstones: every non-temporal physical
+        // version (current, superseded, and active-tombstoned) and every active
+        // tombstone is re-emitted below in write order.
         //
-        // Ordering matters. The transaction-time resolver breaks equal-
-        // transaction-time ties between two versions of one stable ID by input
-        // order (later wins). `read_all_records` emits the current version first
-        // and a naive append would place older superseded versions after it, so
-        // a `--tx-as-of` at/after a shared timestamp (e.g. a batch ingest reusing
-        // one stamp) would resolve to the stale row. Re-emitting all versions
-        // sorted by `egregore_seq` (the store's monotonic write sequence) puts
-        // the latest write last, so the resolver's tie-break picks it.
-        let mut records: Vec<GraphRecord> = self
-            .read_all_records()?
-            .into_iter()
-            .filter(|record| {
-                // Keep project nodes (emitted in full), temporal nodes, tombstones
-                // and edges; drop only current non-temporal node versions, which
-                // are re-emitted in write order below.
-                !matches!(
-                    record,
-                    GraphRecord::Node { temporal: None, id, .. }
-                        if !id.starts_with("project:v1:")
-                )
-            })
-            .collect();
+        // Ordering matters twice over. First, the transaction-time resolver
+        // breaks equal-transaction-time ties between two versions of one stable
+        // ID by input order (later wins). `read_all_records` emits the current
+        // version first and a naive append would place older superseded versions
+        // after it, so a `--tx-as-of` at/after a shared timestamp (e.g. a batch
+        // ingest reusing one stamp) would resolve to the stale row. Re-emitting
+        // all versions sorted by `egregore_seq` (the store's monotonic write
+        // sequence) puts the latest write last, so the resolver's tie-break
+        // picks it. Second (issue #205), order-based consumers such as evidence
+        // freshness decide whether a tombstone is active by whether any version
+        // of its deleted ID appears *after* it, mirroring the append-only JSONL
+        // contract. Leaving tombstones in the current-state prefix would place
+        // them before the write-ordered node suffix, making every genuine
+        // deletion of a non-temporal record look like a restoration; tombstones
+        // therefore join the same `egregore_seq`-ordered stream. Stale
+        // tombstones (deleted ID re-emitted later) stay dropped, exactly as in
+        // `read_all_records`, so the CLI `deleted_id` filter never re-suppresses
+        // a restored record.
+        let mut tombstones: Vec<GraphRecord> = Vec::new();
+        let mut records: Vec<GraphRecord> = Vec::new();
+        for record in self.read_all_records()? {
+            match &record {
+                GraphRecord::Tombstone { .. } => tombstones.push(record),
+                // Keep project nodes (emitted in full), temporal nodes and
+                // edges; drop current non-temporal node versions, which are
+                // re-emitted in write order below.
+                GraphRecord::Node {
+                    temporal: None, id, ..
+                } if !id.starts_with("project:v1:") => {}
+                _ => records.push(record),
+            }
+        }
 
         // Temporal commit candidates already emitted by read_all_records (one per
         // commit). Their non-latest observations and every non-temporal physical
@@ -709,6 +724,23 @@ impl EmbeddedAletheiaSink {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
             versioned.push((seq, self.read_node_record(&record_id, node_id)?));
+        }
+        // Active tombstones re-enter at their own write sequence. An active
+        // tombstone is by definition the latest write for its deleted ID, so it
+        // sorts after every re-emitted physical version of that ID and the
+        // order-based restoration inference stays sound (issue #205). Legacy
+        // tombstones predating the sequence system sort at 0 alongside legacy
+        // nodes; the stable sort keeps them after equal-seq node versions
+        // because they are appended below, matching the store's own
+        // active/stale determination.
+        for tombstone in tombstones {
+            let seq = self
+                .tombstone_ids
+                .get(tombstone.id())
+                .and_then(|node_id| self.tombstone_node_seqs.get(node_id))
+                .copied()
+                .unwrap_or(0);
+            versioned.push((seq, tombstone));
         }
         // Stable sort by ascending write sequence: the latest write of any stable
         // ID lands last, so the resolver's later-input-wins tie-break prefers it.
@@ -3823,6 +3855,61 @@ mod tests {
         assert!(
             node_present(&history),
             "history-inclusive read must surface the pre-delete node for prior tx views"
+        );
+    }
+
+    #[test]
+    fn history_inclusive_read_orders_active_tombstone_after_deleted_node_versions() {
+        // Issue #205: consumers of the history-inclusive read (evidence
+        // freshness) infer whether a tombstone is active or superseded from
+        // slice order, mirroring the append-only JSONL contract where slice
+        // order is write order. The read must therefore emit an active
+        // tombstone AFTER every re-emitted physical version of its deleted
+        // stable ID — emitting the tombstone in the current-state prefix while
+        // the deleted node versions sort into the `egregore_seq` suffix makes
+        // a genuine deletion look like a restoration.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("tombstone-order-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+        let tombstone_id = stable_id(&["tombstone", &symbol_id]);
+
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        // Two writes of the same stable ID, then a delete: write order is
+        // v1 → v2 → tombstone.
+        sink.write_record(&current_symbol_record(&symbol_id, "v1", 20))
+            .expect("v1 should write");
+        sink.write_record(&current_symbol_record(&symbol_id, "v2", 42))
+            .expect("v2 should write");
+        sink.write_record(&GraphRecord::Tombstone {
+            id: tombstone_id,
+            schema_version: crate::ir::SCHEMA_VERSION,
+            deleted_id: symbol_id.clone(),
+            summary: "deleted".to_owned(),
+            producer: None,
+        })
+        .expect("tombstone should write");
+
+        let history = sink
+            .read_all_records_including_superseded()
+            .expect("history read");
+        let last_node_idx = history
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r, GraphRecord::Node { id, .. } if id == &symbol_id))
+            .map(|(idx, _)| idx)
+            .max()
+            .expect("deleted node versions must still be emitted for tx views");
+        let tombstone_idx = history
+            .iter()
+            .position(
+                |r| matches!(r, GraphRecord::Tombstone { deleted_id, .. } if deleted_id == &symbol_id),
+            )
+            .expect("active tombstone must be emitted");
+        assert!(
+            tombstone_idx > last_node_idx,
+            "active tombstone (idx {tombstone_idx}) must be emitted after every physical \
+             version of its deleted ID (last at idx {last_node_idx}) so slice order matches \
+             write order"
         );
     }
 
