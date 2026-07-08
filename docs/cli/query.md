@@ -34,7 +34,7 @@ eg query unreferenced     --graph <PATH>   [--repo <SELECTOR>]
 
 eg query at       <PATH>:<LINE> --graph <PATH> [--at <COMMIT>] [--repo <SELECTOR>]
 
-eg query manifest-deps    --graph <PATH>   [--name <CRATE>] [--format json|text]
+eg query manifest-deps    --graph <PATH>   [--name <CRATE>] [--repo <SELECTOR>] [--format json|text]
 ```
 
 Evidence-backed audit subcommands have their own pages:

@@ -357,8 +357,9 @@ requirement as written, the resolved version from the nearest `Cargo.lock` (mark
 `no_lockfile` / `not_in_lockfile` / `ambiguous_in_lockfile` / `lockfile_unreadable` — never a
 guessed version, and never a fallback past an invalid nearest lockfile), the
 declaring package, and the repo-relative manifest handle. `--name <crate>` answers the direct
-"do we depend on X?" lookup. Manifests are parsed with a real TOML parser; `cargo metadata` is
-never invoked and the scan stays read-only. An empty surface or a name miss is a machine-
+"do we depend on X?" lookup; rows carry their owning repository label and `--repo <selector>`
+scopes a shared multi-repo store. Manifests are parsed with a real TOML parser; `cargo metadata`
+is never invoked and the scan stays read-only. An empty surface or a name miss is a machine-
 readable success (exit 0 with a stable diagnostic). Output (JSON or `--format text`) is
 deterministic and byte-identical across runs. Rows are declaration facts, never usage or build
 proof. See `docs/cli/manifest-deps.md`.

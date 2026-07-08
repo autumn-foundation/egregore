@@ -27,7 +27,7 @@ use std::{
 use crate::{
     error::Result,
     fs::discover_cargo_manifests,
-    ir::{DependencyDeclarationPayload, GraphRecord, NodeKind, stable_id},
+    ir::{DependencyDeclarationPayload, EdgeLabel, GraphRecord, NodeKind, stable_id},
 };
 
 /// Dependency table a declaration was written in.
@@ -401,12 +401,53 @@ pub fn scan_dependency_records(repo_root: &Path, repository_id: &str) -> Result<
         };
         let lockfile =
             nearest_lockfile(repo_root, &manifest.repo_relative_path, &mut lockfile_cache);
-        records.extend(manifest_dependency_records(
+        let manifest_records = manifest_dependency_records(
             repository_id,
             &manifest.repo_relative_path,
             &manifest_text,
             &lockfile,
-        ));
+        );
+        // Repository attribution topology (PR #314 review): a manifest that
+        // declares dependencies gets a `File` node plus the exact
+        // `Repository —CONTAINS→ File —CONTAINS→ DependencyDeclaration` chain
+        // `RepositoryIndex` walks for ownership, so a shared multi-repo store
+        // can scope and label every dependency fact.
+        let dependency_ids: Vec<String> = manifest_records
+            .iter()
+            .filter(|record| record.node_kind_name() == Some("DependencyDeclaration"))
+            .map(|record| record.id().to_owned())
+            .collect();
+        if dependency_ids.is_empty() {
+            records.extend(manifest_records);
+        } else {
+            let file_id = stable_id(&["node", "file", repository_id, &manifest.repo_relative_path]);
+            // Handle-only summary: the manifest body is never embedded.
+            records.push(GraphRecord::node(
+                file_id.clone(),
+                NodeKind::File,
+                Some(manifest.repo_relative_path.clone()),
+                None,
+                Some(manifest.repo_relative_path.clone()),
+                format!("Cargo manifest {}", manifest.repo_relative_path),
+            ));
+            records.push(GraphRecord::edge(
+                EdgeLabel::Contains,
+                repository_id.to_owned(),
+                file_id.clone(),
+                Some("1.0".to_owned()),
+                "Repository contains manifest file".to_owned(),
+            ));
+            records.extend(manifest_records);
+            for dependency_id in dependency_ids {
+                records.push(GraphRecord::edge(
+                    EdgeLabel::Contains,
+                    file_id.clone(),
+                    dependency_id,
+                    Some("1.0".to_owned()),
+                    "Manifest file contains dependency declaration".to_owned(),
+                ));
+            }
+        }
     }
     Ok(records)
 }

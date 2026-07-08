@@ -57,6 +57,9 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
             // `File CONTAINS DebtMarker` attributes debt-comment markers
             // (issue #218) to their owning file.
             NodeKind::DebtMarker,
+            // Manifest File —CONTAINS→ DependencyDeclaration attaches Cargo
+            // dependency facts to their repository topology (issue #180).
+            NodeKind::DependencyDeclaration,
             NodeKind::File,
             NodeKind::Module,
             // `File CONTAINS PanicRiskSite`: unwrap/expect panic-risk call
@@ -476,6 +479,18 @@ mod tests {
         let report = validate_records(&records);
         assert!(report.is_clean(), "got {:?}", report.diagnostics);
         assert_eq!((report.nodes, report.edges, report.tombstones), (2, 1, 0));
+    }
+
+    #[test]
+    fn contains_edge_to_dependency_declaration_is_allowed() {
+        // Issue #180 topology: File(Cargo.toml) —CONTAINS→ DependencyDeclaration.
+        let records = vec![
+            node("n:manifest", NodeKind::File),
+            node("n:dep", NodeKind::DependencyDeclaration),
+            edge("e:contains", EdgeLabel::Contains, "n:manifest", "n:dep"),
+        ];
+        let report = validate_records(&records);
+        assert!(report.is_clean(), "got {:?}", report.diagnostics);
     }
 
     #[test]

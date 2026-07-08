@@ -19,13 +19,17 @@ manifests itself (the per-answer token cost issue #84 targets).
 ## Synopsis
 
 ```text
-eg query manifest-deps --graph <PATH>    [--name <CRATE>] [--format json|text]
-eg query manifest-deps --data-dir <DIR>  [--name <CRATE>] [--format json|text]
+eg query manifest-deps --graph <PATH>    [--name <CRATE>] [--repo <SELECTOR>] [--format json|text]
+eg query manifest-deps --data-dir <DIR>  [--name <CRATE>] [--repo <SELECTOR>] [--format json|text]
 ```
 
 Reads from either a JSONL file (`--graph`) or an embedded AletheiaDB store
 (`--data-dir`). `--name <CRATE>` answers the direct lookup, returning only
-declarations of that exact crate name.
+declarations of that exact crate name. In a shared multi-repo store every row
+carries its owning repository's display label (`repository`), and
+`--repo <SELECTOR>` restricts the surface to one repository; an unknown or
+ambiguous selector is rejected with a machine-readable stderr diagnostic
+(exit 1), never resolved implicitly.
 
 | Condition | Exit | Output |
 |-----------|------|--------|
@@ -70,6 +74,12 @@ and `[build-dependencies]` becomes one `DependencyDeclaration` node per
 - **`declaring_package`** — `[package].name` of the owning manifest.
 - **manifest handle** — the node's `repo_relative_path` is the owning
   `Cargo.toml`, and every row carries a stable `codegraph:v<N>:` record ID.
+- **repository attribution** — each declaring manifest gets a `File` node
+  joined by the standard containment chain
+  (`Repository —CONTAINS→ File —CONTAINS→ DependencyDeclaration`), the exact
+  topology `RepositoryIndex` walks, so dependency facts are scoped and labeled
+  per repository in a shared multi-repo store. The manifest `File` summary is
+  handle-only — the manifest body is never embedded.
 
 A manifest that fails TOML parsing yields one `Diagnostic` node citing the
 manifest handle; the scan never fails and never invents facts. A virtual
@@ -100,9 +110,9 @@ lockfile.
 
 ## Output
 
-Deterministic and byte-identical across runs. Stable ordering: manifest path,
-then declaring package, then dependency kind (`normal` < `dev` < `build`),
-then crate name. Redaction-safe: names, version strings, markers, handles,
+Deterministic and byte-identical across runs. Stable ordering: repository
+label, then manifest path, then declaring package, then dependency kind
+(`normal` < `dev` < `build`), then crate name. Redaction-safe: names, version strings, markers, handles,
 and counts only — raw manifest body text is never emitted.
 
 ### `--format json` (default, the agent contract)
@@ -116,6 +126,7 @@ and counts only — raw manifest body text is never emitted.
   "declarations": [
     {
       "record_id": "codegraph:v5:…",
+      "repository": "acme/widget",
       "name": "serde",
       "dependency_kind": "normal",
       "declared_requirement": "1.0.228",
@@ -130,7 +141,9 @@ and counts only — raw manifest body text is never emitted.
 }
 ```
 
-`name` echoes the `--name` filter when one was given. `declared_requirement`
+`name` echoes the `--name` filter when one was given; `repo_scope` echoes the
+resolved `--repo` selector. `repository` is omitted when a record cannot be
+attributed (e.g. a legacy graph without a `Repository` node). `declared_requirement`
 and `resolved_version` are omitted when absent — readers must treat a missing
 key as "not declared / not resolved", never as an empty string.
 

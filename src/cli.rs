@@ -1405,6 +1405,9 @@ enum QuerySubcommand {
         /// Return only declarations of this exact crate name.
         #[arg(long)]
         name: Option<String>,
+        /// Restrict the surface to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
         /// Output format.
         #[arg(long, default_value = "json")]
         format: OutputFormat,
@@ -6049,10 +6052,19 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             graph,
             data_dir,
             name,
+            repo,
             format,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            query_manifest_deps_cmd(&records, name.as_deref(), format)
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_manifest_deps_cmd(
+                &records,
+                &index,
+                selected.as_deref(),
+                name.as_deref(),
+                format,
+            )
         }
         QuerySubcommand::PublicApiDeltas {
             base,
@@ -11254,6 +11266,10 @@ const MANIFEST_DEPS_DISCLAIMER: &str = "Declared-dependency facts parsed from Ca
 #[derive(serde::Serialize)]
 struct ManifestDepsDeclarationJson<'a> {
     record_id: &'a str,
+    /// Owning repository display label; absent when the record cannot be
+    /// attributed (e.g. a legacy graph without a `Repository` node).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
     name: &'a str,
     dependency_kind: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11281,6 +11297,8 @@ struct ManifestDepsResponse<'a> {
     query: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_scope: Option<&'a str>,
     count: usize,
     disclaimer: &'a str,
     declarations: Vec<ManifestDepsDeclarationJson<'a>>,
@@ -11298,15 +11316,13 @@ const fn dependency_kind_rank(kind: &str) -> u8 {
     }
 }
 
-/// `eg query manifest-deps` (issue #180): list declared Cargo dependencies with their
-/// lockfile resolution, or answer a direct `--name` lookup. Deterministic,
-/// byte-identical output; an empty surface or a miss is a machine-readable
-/// success, never an error.
-fn query_manifest_deps_cmd(
-    records: &[GraphRecord],
-    name_filter: Option<&str>,
-    format: OutputFormat,
-) -> Result<()> {
+/// Collects, attributes, scopes, and canonically orders the declaration rows
+/// for `eg query manifest-deps`.
+fn collect_manifest_deps_rows<'a>(
+    records: &'a [GraphRecord],
+    index: &'a query::RepositoryIndex,
+    repo_scope: Option<&str>,
+) -> Vec<ManifestDepsDeclarationJson<'a>> {
     let mut rows: Vec<ManifestDepsDeclarationJson<'_>> = records
         .iter()
         .filter_map(|record| {
@@ -11322,8 +11338,17 @@ fn query_manifest_deps_cmd(
             else {
                 return None;
             };
+            // Repository attribution via the CONTAINS topology (PR #314
+            // review); scoping drops rows owned by other repositories.
+            let owner = index.owner_of(id);
+            if let Some(scope) = repo_scope
+                && owner != Some(scope)
+            {
+                return None;
+            }
             Some(ManifestDepsDeclarationJson {
                 record_id: id,
+                repository: owner.and_then(|repo_id| index.display_of(repo_id)),
                 name,
                 dependency_kind: &payload.dependency_kind,
                 declared_requirement: payload.declared_requirement.as_deref(),
@@ -11336,8 +11361,10 @@ fn query_manifest_deps_cmd(
         })
         .collect();
     rows.sort_by(|left, right| {
-        left.manifest_path
-            .cmp(right.manifest_path)
+        left.repository
+            .unwrap_or("")
+            .cmp(right.repository.unwrap_or(""))
+            .then_with(|| left.manifest_path.cmp(right.manifest_path))
             .then_with(|| left.declaring_package.cmp(right.declaring_package))
             .then_with(|| {
                 dependency_kind_rank(left.dependency_kind)
@@ -11346,6 +11373,21 @@ fn query_manifest_deps_cmd(
             .then_with(|| left.name.cmp(right.name))
             .then_with(|| left.record_id.cmp(right.record_id))
     });
+    rows
+}
+
+/// `eg query manifest-deps` (issue #180): list declared Cargo dependencies
+/// with their lockfile resolution and repository attribution, or answer a
+/// direct `--name` lookup. Deterministic, byte-identical output; an empty
+/// surface or a miss is a machine-readable success, never an error.
+fn query_manifest_deps_cmd(
+    records: &[GraphRecord],
+    index: &query::RepositoryIndex,
+    repo_scope: Option<&str>,
+    name_filter: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let mut rows = collect_manifest_deps_rows(records, index, repo_scope);
     let surface_is_empty = rows.is_empty();
     if let Some(filter) = name_filter {
         rows.retain(|row| row.name == filter);
@@ -11370,6 +11412,7 @@ fn query_manifest_deps_cmd(
                 ok: true,
                 query: "manifest-deps",
                 name: name_filter,
+                repo_scope: repo_scope.and_then(|repo_id| index.display_of(repo_id)),
                 count: rows.len(),
                 disclaimer: MANIFEST_DEPS_DISCLAIMER,
                 declarations: rows,
@@ -11384,8 +11427,12 @@ fn query_manifest_deps_cmd(
             for row in &rows {
                 let requirement = row.declared_requirement.unwrap_or("(none)");
                 let resolved = row.resolved_version.unwrap_or(row.resolution);
+                let repository = row
+                    .repository
+                    .map(|label| format!(" repo={label}"))
+                    .unwrap_or_default();
                 println!(
-                    "{package} {kind} {name} requirement={requirement} resolved={resolved} manifest={manifest} ({record_id})",
+                    "{package} {kind} {name} requirement={requirement} resolved={resolved} manifest={manifest}{repository} ({record_id})",
                     package = row.declaring_package,
                     kind = row.dependency_kind,
                     name = row.name,

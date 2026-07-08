@@ -705,3 +705,162 @@ fn query_deps_round_trips_through_the_embedded_store() {
         "embedded store answer must match the JSONL answer"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR #314 review: dependency facts must be attributable to their repository
+// ---------------------------------------------------------------------------
+
+/// Scans two distinct repositories that both declare `serde` (at different
+/// locked versions) and merges the scans into one multi-repo graph.
+/// Returns `(tempdir, merged graph path)`.
+fn two_repo_graph() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    for (dir, req, locked) in [("repo-a", "1.0.228", "1.0.228"), ("repo-b", "1", "1.0.100")] {
+        let root = temp.path().join(dir);
+        fs::create_dir_all(root.join("src")).expect("src dir");
+        fs::write(
+            root.join("Cargo.toml"),
+            format!("[package]\nname = \"{dir}-pkg\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"{req}\"\n"),
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("Cargo.lock"),
+            format!("version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"{locked}\"\n"),
+        )
+        .expect("lockfile");
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").expect("lib.rs");
+    }
+    let mut merged = String::new();
+    for dir in ["repo-a", "repo-b"] {
+        merged.push_str(
+            &scan_repository_at_with_override(temp.path().join(dir), FIXED_TIME, Some(dir))
+                .expect("fixture should scan")
+                .to_jsonl()
+                .expect("graph should serialize"),
+        );
+    }
+    let graph = temp.path().join("merged.jsonl");
+    fs::write(&graph, merged).expect("write merged graph");
+    (temp, graph)
+}
+
+#[test]
+fn multi_repo_rows_carry_distinct_repository_labels() {
+    let (_temp, graph) = two_repo_graph();
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    assert_eq!(declarations.len(), 2, "both repos declare serde");
+    let mut labels: Vec<&str> = declarations
+        .iter()
+        .map(|d| {
+            d["repository"]
+                .as_str()
+                .expect("every row must carry its owning repository label")
+        })
+        .collect();
+    labels.sort_unstable();
+    assert_eq!(
+        labels,
+        vec!["repo-a", "repo-b"],
+        "rows from unrelated repos must be distinguishable"
+    );
+    // The two rows are not otherwise mergeable: resolved versions differ.
+    let by_repo = |label: &str| {
+        declarations
+            .iter()
+            .find(|d| d["repository"] == label)
+            .unwrap_or_else(|| panic!("row for {label}"))
+    };
+    assert_eq!(by_repo("repo-a")["resolved_version"], "1.0.228");
+    assert_eq!(by_repo("repo-b")["resolved_version"], "1.0.100");
+}
+
+#[test]
+fn repo_selector_scopes_manifest_deps_to_one_repository() {
+    let (_temp, graph) = two_repo_graph();
+    let parsed = run_query_deps(&graph, &["--name", "serde", "--repo", "repo-a"]);
+
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    assert_eq!(declarations.len(), 1, "scoped to exactly one repository");
+    assert_eq!(declarations[0]["repository"], "repo-a");
+    assert_eq!(declarations[0]["resolved_version"], "1.0.228");
+}
+
+#[test]
+fn unknown_repo_selector_is_rejected_machine_readably() {
+    let (_temp, graph) = two_repo_graph();
+    let output = egregore()
+        .args(["query", "manifest-deps", "--graph"])
+        .arg(&graph)
+        .args(["--repo", "does-not-exist"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let diag: Value = String::from_utf8_lossy(&output)
+        .lines()
+        .find_map(|l| serde_json::from_str(l.trim()).ok())
+        .expect("stderr should carry a machine-readable diagnostic");
+    assert_eq!(diag["code"], "unknown_repository_selector");
+}
+
+/// The topology that makes attribution possible must itself be valid: the
+/// manifest `File` node and its `CONTAINS` chain pass `eg validate`.
+#[test]
+fn dependency_topology_passes_referential_validation() {
+    let (_temp, graph) = two_repo_graph();
+    egregore().arg("validate").arg(&graph).assert().success();
+}
+
+/// Repository —CONTAINS→ File(Cargo.toml) —CONTAINS→ `DependencyDeclaration`:
+/// the exact chain `RepositoryIndex` walks for ownership.
+#[test]
+fn dependency_facts_are_edge_attached_to_the_manifest_file() {
+    let (_temp, graph) = fixture_graph();
+    let records: Vec<Value> = fs::read_to_string(&graph)
+        .expect("graph readable")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("record JSON"))
+        .collect();
+
+    let dep = records
+        .iter()
+        .find(|r| {
+            r["kind"] == "DependencyDeclaration"
+                && r["name"] == "serde"
+                && r["repo_relative_path"] == "crates/pkg-a/Cargo.toml"
+        })
+        .expect("serde dependency node");
+    let manifest_file = records
+        .iter()
+        .find(|r| r["kind"] == "File" && r["repo_relative_path"] == "crates/pkg-a/Cargo.toml")
+        .expect("the owning Cargo.toml gets a File node");
+    // File —CONTAINS→ DependencyDeclaration
+    assert!(
+        records.iter().any(|r| r["record_type"] == "edge"
+            && r["label"] == "CONTAINS"
+            && r["source"] == manifest_file["id"]
+            && r["target"] == dep["id"]),
+        "manifest file must contain the dependency fact"
+    );
+    // Repository —CONTAINS→ File
+    let repo = records
+        .iter()
+        .find(|r| r["kind"] == "Repository")
+        .expect("repository node");
+    assert!(
+        records.iter().any(|r| r["record_type"] == "edge"
+            && r["label"] == "CONTAINS"
+            && r["source"] == repo["id"]
+            && r["target"] == manifest_file["id"]),
+        "repository must contain the manifest file"
+    );
+    // The manifest File node never embeds raw manifest body text.
+    let summary = manifest_file["summary"].as_str().expect("summary");
+    assert!(
+        !summary.contains("[dependencies]") && !summary.contains("1.0.228"),
+        "manifest File summary must not embed manifest body text, got {summary:?}"
+    );
+}
