@@ -1381,6 +1381,76 @@ enum QuerySubcommand {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Rank the files that historically changed in the same commits as a target file (issue #153).
+    ///
+    /// Over a temporal store produced by `scan-history`, counts the distinct
+    /// commits in which each other file changed together with the target
+    /// file and ranks partners by a documented normalized coupling strength
+    /// (`jaccard_v1`: shared commits over the union of both files' change
+    /// sets), with a directional confidence (shared commits over the
+    /// target's changes) on every row. A minimum-support threshold
+    /// (`--min-support`, default 2, max 100) suppresses noise pairs; the
+    /// threshold used is echoed in the answer. `--limit` (default 20, max
+    /// 500) caps output and the answer states whether it was truncated.
+    ///
+    /// Temporal scope: full history by default; `--base`+`--head` bound it
+    /// to the `(base, head]` commit range (issue #118 semantics), `--at` to
+    /// the ancestor closure of one commit, `--as-of` to commits recorded at
+    /// or before an RFC 3339 instant.
+    ///
+    /// Rows are historical co-change LEADS — files observed changing in the
+    /// same commits — never proof of dependency, breakage, or behavior
+    /// change, and absence of coupling is not proof of independence. Because
+    /// partners must resolve to `File` nodes, untracked, ignored, and
+    /// non-source paths never appear. Reads only the supplied store; never
+    /// touches Git state or the working tree.
+    ///
+    /// Exit codes:
+    ///   0 — ranked partners returned (including an explicit empty set).
+    ///   1 — malformed path/selector/threshold, ambiguous handle, identical
+    ///       endpoints, or reversed range (machine-readable JSON).
+    ///   2 — unknown file (no `File` node), missing commit, empty history,
+    ///       or no commit at/before the --as-of instant.
+    ///
+    /// Documented in `docs/cli/coupling.md`.
+    Coupling {
+        /// Repo-relative path of the target file (e.g. `src/lib.rs`).
+        path: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict commit and file resolution to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Range base commit SHA or unique prefix (older, exclusive
+        /// endpoint). Requires --head.
+        #[arg(long, requires = "head", conflicts_with_all = ["at", "as_of"])]
+        base: Option<String>,
+        /// Range head commit SHA or unique prefix (newer, inclusive
+        /// endpoint). Requires --base.
+        #[arg(long, requires = "base", conflicts_with_all = ["at", "as_of"])]
+        head: Option<String>,
+        /// Bound the in-scope commits to the ancestor closure of this commit
+        /// SHA or unique prefix. Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Bound the in-scope commits to those recorded at or before this
+        /// RFC 3339 instant. Mutually exclusive with --at.
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Minimum shared-commit count for a partner row (1..=100).
+        #[arg(long, default_value_t = query::CO_CHANGE_DEFAULT_MIN_SUPPORT)]
+        min_support: usize,
+        /// Maximum partner rows returned (1..=500); truncation is reported.
+        #[arg(long, default_value_t = query::CO_CHANGE_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Trace a single symbol's lifecycle across Git history.
     Lifeline {
         /// Graph JSONL path (mutually exclusive with --data-dir).
@@ -5166,6 +5236,32 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_deltas_cmd(&records, &base, &head, repo.as_deref())
+        }
+        QuerySubcommand::Coupling {
+            path,
+            graph,
+            data_dir,
+            repo,
+            base,
+            head,
+            at,
+            as_of,
+            min_support,
+            limit,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            let options = query::CoChangeCouplingOptions {
+                base: base.as_deref(),
+                head: head.as_deref(),
+                at: at.as_deref(),
+                as_of: as_of.as_deref(),
+                min_support,
+                limit,
+            };
+            query_coupling_cmd(&records, &path, selected.as_deref(), &options, format)
         }
         QuerySubcommand::PublicApiDeltas {
             base,
@@ -11321,6 +11417,119 @@ fn query_deltas_cmd(
             std::process::exit(exit_code);
         }
     }
+}
+
+/// `eg query coupling` (issue #153): ranked historical co-change partners
+/// for one target file over a `scan-history` temporal store.
+///
+/// Exit codes follow the history-query convention: `0` on success (including
+/// an explicit empty partner set), `2` when the target or a commit handle
+/// resolves to nothing (`unknown_file`, `missing_commit`, `empty_history`,
+/// `no_commit_at_or_before`), and `1` for malformed or ambiguous input
+/// (paths, selectors, thresholds, identical endpoints, reversed ranges).
+fn query_coupling_cmd(
+    records: &[GraphRecord],
+    path: &str,
+    repo_scope: Option<&str>,
+    options: &query::CoChangeCouplingOptions<'_>,
+    format: OutputFormat,
+) -> Result<()> {
+    match query::co_change_coupling(records, path, repo_scope, options) {
+        Ok(report) => {
+            match format {
+                OutputFormat::Json => {
+                    #[derive(Debug, Clone, serde::Serialize)]
+                    struct CouplingResponse<'a> {
+                        ok: bool,
+                        #[serde(flatten)]
+                        report: query::CoChangeCoupling<'a>,
+                    }
+                    let response = CouplingResponse { ok: true, report };
+                    let output = serde_json::to_string(&response)
+                        .context("failed to serialize co-change coupling")?;
+                    println!("{output}");
+                }
+                OutputFormat::Text => print!("{}", render_coupling_text(&report)),
+            }
+            Ok(())
+        }
+        Err(err) => {
+            #[derive(Debug, Clone, serde::Serialize)]
+            struct CouplingErrorResponse {
+                ok: bool,
+                error: query::CoChangeCouplingError,
+            }
+            let response = CouplingErrorResponse {
+                ok: false,
+                error: err.clone(),
+            };
+            let output = serde_json::to_string(&response)
+                .context("failed to serialize co-change coupling error")?;
+            println!("{output}");
+            let exit_code = match err {
+                query::CoChangeCouplingError::UnknownFile { .. }
+                | query::CoChangeCouplingError::MissingCommit { .. }
+                | query::CoChangeCouplingError::EmptyHistory
+                | query::CoChangeCouplingError::NoCommitAtOrBefore { .. } => 2,
+                _ => 1,
+            };
+            std::process::exit(exit_code);
+        }
+    }
+}
+
+/// Deterministic human-readable rendering of a co-change coupling report.
+fn render_coupling_text(report: &query::CoChangeCoupling<'_>) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let scope_detail = match report.scope.selector {
+        "commit_range" => format!(
+            " range {}..{}",
+            report.scope.base.unwrap_or("?"),
+            report.scope.head.unwrap_or("?")
+        ),
+        "at_commit" => format!(" at {}", report.scope.at.unwrap_or("?")),
+        "as_of" => format!(" as of {}", report.scope.as_of.unwrap_or("?")),
+        _ => String::new(),
+    };
+    let _ = writeln!(
+        out,
+        "co-change coupling for {} — {} in-scope change(s) across {} commit(s) [{}{}]",
+        report.target.repo_relative_path,
+        report.target.change_count,
+        report.scope.commit_count,
+        report.scope.selector,
+        scope_detail,
+    );
+    let _ = writeln!(
+        out,
+        "min support {}; metric {}; showing {} of {} partner(s){}",
+        report.min_support,
+        report.coupling_metric,
+        report.partners.len(),
+        report.total_partners,
+        if report.truncated { " (truncated)" } else { "" },
+    );
+    for partner in &report.partners {
+        let short_sha =
+            &partner.last_co_change_commit[..partner.last_co_change_commit.len().min(12)];
+        let _ = writeln!(
+            out,
+            "  {}  co_changes={}  partner_changes={}  coupling={:.4}  confidence={:.4}  last={}",
+            partner.repo_relative_path,
+            partner.co_change_count,
+            partner.partner_change_count,
+            partner.coupling,
+            partner.confidence,
+            short_sha,
+        );
+    }
+    for diagnostic in &report.diagnostics {
+        let _ = writeln!(out, "  [{}] {}", diagnostic.code, diagnostic.detail);
+    }
+    let _ = writeln!(out, "note: {}", report.disclaimer);
+    out
 }
 
 /// `eg query public-api-deltas` (issue #157): classified public-API surface

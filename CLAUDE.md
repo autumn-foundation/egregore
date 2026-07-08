@@ -69,6 +69,13 @@ cargo run -- query file src/lib.rs --graph history.graph.jsonl --as-of 2026-01-0
 cargo run -- query file src/nope.rs --graph history.graph.jsonl --at <commit_sha>            # exit 2 (unknown_path)
 cargo run -- query file src/lib.rs --graph history.graph.jsonl --tx-as-of <instant>          # exit 1 (not_implemented)
 
+# Ranked historical co-change partners for a file (issue #153)
+cargo run -- query coupling src/lib.rs --graph history.graph.jsonl            # exit 0 (even when empty)
+cargo run -- query coupling src/lib.rs --graph history.graph.jsonl --min-support 5 --limit 10
+cargo run -- query coupling src/lib.rs --graph history.graph.jsonl --base <sha> --head <sha>
+cargo run -- query coupling src/lib.rs --graph history.graph.jsonl --at <sha>   # history as of one commit
+cargo run -- query coupling src/nope.rs --graph history.graph.jsonl            # exit 2 (unknown_file)
+
 # Externally-reachable public API surface (issue #213)
 cargo run -- query public-api --graph graph.jsonl                 # exit 0 (even when surface is empty)
 cargo run -- query public-api --graph graph.jsonl --repo acme/widget  # scope one repo; bad selector exits 1
@@ -129,6 +136,19 @@ explicit `empty_symbol_set` success (exit 0); an unknown path or a path absent a
 is a machine-readable error (exit 2); `--tx-as-of` on `query file` is reserved and returns
 `not_implemented` (exit 1). Code-facts only, read-only, and byte-identical across runs.
 See the `eg query file` section of `docs/cli/query.md`.
+
+`eg query coupling <path>` ranks the files that historically changed in the same commits as
+a target file over a `scan-history` store, using the distinct-commit co-change count and a
+documented normalized strength (`jaccard_v1`: shared commits over the union of both files'
+change sets) plus a directional confidence (shared commits over the target's changes), so
+high-churn files cannot dominate purely by volume. A minimum-support threshold
+(`--min-support`, default 2, max 100) suppresses noise pairs and is echoed in the answer;
+`--limit` (default 20, max 500) caps rows with an explicit truncation signal. Temporal scope
+follows the existing selector contract: full history, `--base`+`--head` range, `--at`, or
+`--as-of`. Both target and partners must resolve to `File` nodes, so untracked, ignored, and
+non-source paths never appear. Rows are historical co-change leads — never proof of
+dependency, and absence of coupling is not proof of independence. Output is deterministic
+and byte-identical across runs. See `docs/cli/coupling.md`.
 
 `eg query public-api` enumerates the Rust library crate's externally-reachable public API
 surface from recorded per-symbol visibility (issue #124) and module containment — never a

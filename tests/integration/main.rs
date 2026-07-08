@@ -14,6 +14,7 @@ mod changes_query;
 mod citation_audit;
 mod claude_code;
 mod cli;
+mod co_change_coupling;
 mod codex;
 mod cross_file_calls;
 mod daemon;
