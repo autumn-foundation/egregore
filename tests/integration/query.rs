@@ -5670,24 +5670,29 @@ fn test_symbol_lifeline_happy_path() {
 
     assert_eq!(events[0].event_type, LifelineEventKind::Introduced);
     assert_eq!(events[0].commit, "c1");
+    assert_eq!(events[0].valid_time, "2026-01-01T00:00:00Z");
     assert_eq!(events[0].repo_relative_path, Some("src/lib.rs".to_string()));
 
     assert_eq!(events[1].event_type, LifelineEventKind::Modified);
     assert_eq!(events[1].commit, "c2");
+    assert_eq!(events[1].valid_time, "2026-01-02T00:00:00Z");
 
     assert_eq!(events[2].event_type, LifelineEventKind::Modified);
     assert_eq!(events[2].commit, "c3");
+    assert_eq!(events[2].valid_time, "2026-01-03T00:00:00Z");
     assert_eq!(events[2].drift_record_id, Some("drift:c3".to_string()));
     assert_eq!(events[2].drift_score, Some(0.75));
 
     assert_eq!(events[3].event_type, LifelineEventKind::Removed);
     assert_eq!(events[3].commit, "c5");
+    assert_eq!(events[3].valid_time, "2026-01-05T00:00:00Z");
     assert_eq!(events[3].repo_relative_path, None);
     assert_eq!(events[3].span, None);
     assert_eq!(events[3].absent_span_reason, Some("tombstone".to_string()));
 
     assert_eq!(events[4].event_type, LifelineEventKind::Reintroduced);
     assert_eq!(events[4].commit, "c7");
+    assert_eq!(events[4].valid_time, "2026-01-07T00:00:00Z");
     assert_eq!(events[4].repo_relative_path, Some("src/lib.rs".to_string()));
 }
 

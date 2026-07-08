@@ -457,30 +457,48 @@ fn test_cli_lifeline_happy_path_json() {
         .clone();
 
     let stdout = String::from_utf8(output).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(parsed["ok"], true);
-
-    let result = parsed["result"].as_array().unwrap();
+    // Issue #215: output is newline-delimited JSON — one standalone event
+    // object per line, no wrapping envelope.
+    let result: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line must be a standalone JSON event"))
+        .collect();
     assert_eq!(result.len(), 5);
 
     assert_eq!(result[0]["event_type"], "introduced");
     assert_eq!(result[0]["commit"], "c1");
+    assert_eq!(result[0]["valid_time"], "2026-01-01T00:00:00Z");
+    assert_eq!(result[0]["record_id"], "symbol:answer");
+    assert_eq!(result[0]["repo_relative_path"], "src/lib.rs");
+    assert_eq!(result[0]["span"]["start_line"], 1);
+    assert_eq!(result[0]["span"]["end_line"], 4);
 
     assert_eq!(result[1]["event_type"], "modified");
     assert_eq!(result[1]["commit"], "c2");
+    assert_eq!(result[1]["valid_time"], "2026-01-02T00:00:00Z");
 
     assert_eq!(result[2]["event_type"], "modified");
     assert_eq!(result[2]["commit"], "c3");
+    assert_eq!(result[2]["valid_time"], "2026-01-03T00:00:00Z");
     assert_eq!(result[2]["drift_record_id"], "drift:c3");
     assert_eq!(result[2]["drift_score"], 0.75);
 
     assert_eq!(result[3]["event_type"], "removed");
     assert_eq!(result[3]["commit"], "c5");
+    assert_eq!(result[3]["valid_time"], "2026-01-05T00:00:00Z");
     assert!(result[3]["repo_relative_path"].is_null());
     assert_eq!(result[3]["absent_span_reason"], "tombstone");
 
     assert_eq!(result[4]["event_type"], "reintroduced");
     assert_eq!(result[4]["commit"], "c7");
+    assert_eq!(result[4]["valid_time"], "2026-01-07T00:00:00Z");
+
+    // Every event row is citable: a record ID plus either a repo-relative
+    // path or a documented absent-span reason.
+    for event in &result {
+        assert!(event["record_id"].is_string());
+        assert!(event["repo_relative_path"].is_string() || event["absent_span_reason"].is_string());
+    }
 }
 
 #[test]
@@ -500,21 +518,22 @@ fn test_cli_lifeline_happy_path_text() {
 
     let stdout = String::from_utf8(output).unwrap();
     assert!(stdout.contains("Advisory temporal facts: where and when this symbol changed"));
-    assert!(
-        stdout.contains(
-            "[introduced] commit=c1 record_id=symbol:answer @ src/lib.rs:1-4 drift=absent"
-        )
-    );
-    assert!(
-        stdout
-            .contains("[modified] commit=c2 record_id=symbol:answer @ src/lib.rs:1-4 drift=absent")
-    );
     assert!(stdout.contains(
-        "[modified] commit=c3 record_id=symbol:answer @ src/lib.rs:1-4 drift=0.7500 (drift:c3)"
+        "[introduced] commit=c1 valid_time=2026-01-01T00:00:00Z record_id=symbol:answer \
+         @ src/lib.rs:1-4 drift=absent"
     ));
-    assert!(stdout.contains("[removed] commit=c5 record_id="));
     assert!(stdout.contains(
-        "[reintroduced] commit=c7 record_id=symbol:answer @ src/lib.rs:5-8 drift=absent"
+        "[modified] commit=c2 valid_time=2026-01-02T00:00:00Z record_id=symbol:answer \
+         @ src/lib.rs:1-4 drift=absent"
+    ));
+    assert!(stdout.contains(
+        "[modified] commit=c3 valid_time=2026-01-03T00:00:00Z record_id=symbol:answer \
+         @ src/lib.rs:1-4 drift=0.7500 (drift:c3)"
+    ));
+    assert!(stdout.contains("[removed] commit=c5 valid_time=2026-01-05T00:00:00Z record_id="));
+    assert!(stdout.contains(
+        "[reintroduced] commit=c7 valid_time=2026-01-07T00:00:00Z record_id=symbol:answer \
+         @ src/lib.rs:5-8 drift=absent"
     ));
 }
 
@@ -522,13 +541,14 @@ fn test_cli_lifeline_happy_path_text() {
 fn test_cli_lifeline_errors() {
     let (_temp, graph) = fixture_graph();
 
-    // Unknown symbol (exit code 5)
+    // Unknown symbol exits with the established no-result exit code
+    // (2, consistent with `eg query symbol`), never a panic (issue #215).
     let output_unknown = egregore()
         .args(["query", "lifeline", "--graph"])
         .arg(&graph)
         .arg("nonexistent")
         .assert()
-        .code(5)
+        .code(2)
         .get_output()
         .stdout
         .clone();
@@ -574,13 +594,77 @@ fn test_cli_lifeline_repo_scoping() {
         .clone();
 
     let stdout = String::from_utf8(output).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(parsed["ok"], true);
-
-    let result = parsed["result"].as_array().unwrap();
+    let result: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line must be a standalone JSON event"))
+        .collect();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0]["record_id"], "symbol:sibling_answer");
     assert_eq!(result[0]["commit"], "sib1");
+}
+
+#[test]
+fn test_cli_lifeline_single_commit_symbol_returns_single_introduced_event() {
+    let (_temp, graph) = fixture_graph();
+
+    // A symbol present in only one commit returns a single `introduced`
+    // event, not an error (issue #215).
+    let output = egregore()
+        .args(["query", "lifeline", "--graph"])
+        .arg(&graph)
+        .arg("symbol:sibling_answer")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    let result: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line must be a standalone JSON event"))
+        .collect();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0]["event_type"], "introduced");
+    assert_eq!(result[0]["commit"], "sib1");
+    assert_eq!(result[0]["valid_time"], "2026-01-01T00:00:00Z");
+    assert_eq!(result[0]["record_id"], "symbol:sibling_answer");
+    assert_eq!(result[0]["repo_relative_path"], "src/lib.rs");
+}
+
+#[test]
+fn test_cli_lifeline_symbol_without_history_exits_no_result() {
+    // A symbol that matches but carries zero commit-linked history records
+    // yields the no-result exit code with a stable diagnostic, never an
+    // empty success (issues #96, #215).
+    let temp = tempfile::tempdir().unwrap();
+    let graph_path = temp.path().join("graph.jsonl");
+
+    let symbol = GraphRecord::node(
+        "symbol:lonely".to_owned(),
+        NodeKind::Symbol,
+        Some("src/lib.rs".to_owned()),
+        Some(span(1, 2)),
+        Some("lonely".to_owned()),
+        "lonely body".to_owned(),
+    );
+    let content = serde_json::to_string(&symbol).unwrap() + "\n";
+    fs::write(&graph_path, content).unwrap();
+
+    let output = egregore()
+        .args(["query", "lifeline", "--graph"])
+        .arg(&graph_path)
+        .arg("lonely")
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["ok"], false);
+    assert_eq!(parsed["error"]["code"], "no_history");
 }
 
 #[test]

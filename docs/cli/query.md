@@ -27,6 +27,7 @@ eg query transitive-callers <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-d
 eg query deps     <HANDLE> --graph <PATH>   [--repo <SELECTOR>] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query deltas   <BASE> <HEAD> --graph <PATH> [--repo <SELECTOR>]
 eg query coupling <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--base <COMMIT> --head <COMMIT> | --at <COMMIT> | --as-of <RFC3339>] [--min-support N] [--limit N] [--format json|text]
+eg query lifeline <SYMBOL> --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
 eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
 eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--include-private] [--format json|text]
 eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--threshold <PERCENT>] [--limit N] [--format json|text]
@@ -68,6 +69,10 @@ Evidence-backed audit subcommands have their own pages:
   commits** as a target file, ranked by a documented normalized coupling
   strength with a minimum-support threshold; historical co-change leads,
   never dependency proof ([coupling.md](coupling.md), issue #153).
+- `eg query lifeline` — **one symbol's full evolution timeline** across commit
+  history: introduced, each modifying commit with its drift record, removal
+  and reintroduction, as newline-delimited JSON events
+  ([lifeline.md](lifeline.md), issues #96, #215).
 - `eg query public-api` — the crate's **externally-reachable public API
   surface** from recorded visibility and module containment, re-exports
   included, trapped `pub` items excluded

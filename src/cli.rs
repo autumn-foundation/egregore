@@ -1732,6 +1732,22 @@ enum QuerySubcommand {
         format: OutputFormat,
     },
     /// Trace a single symbol's lifecycle across Git history.
+    ///
+    /// Resolves one symbol (stable record ID or exact name) against a
+    /// `scan-history` graph or embedded store and returns its chronologically
+    /// ordered lifecycle events: `introduced`, each `modified` commit with
+    /// its semantic-drift record where one exists, `removed` if the symbol
+    /// was tombstoned, and `reintroduced` if it came back. Every event
+    /// carries the commit SHA, its valid time, a stable record ID, and a
+    /// repo-relative file/span handle (or a documented absent-span reason).
+    /// Output is newline-delimited JSON by default — one event object per
+    /// line — and byte-identical across runs; `--format text` prints a
+    /// human-readable timeline. Events are advisory temporal facts, never a
+    /// risk or behavior claim. An unknown symbol or a symbol with no
+    /// commit-linked history exits 2; an ambiguous name reports all
+    /// candidate record IDs and exits 6.
+    ///
+    /// Documented in `docs/cli/lifeline.md`.
     Lifeline {
         /// Graph JSONL path (mutually exclusive with --data-dir).
         #[arg(long)]
@@ -12419,15 +12435,55 @@ fn query_lifeline_cmd(
     repo_id: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
+    /// Prints a stable machine-readable lifeline diagnostic and exits.
+    fn fail(
+        code: &str,
+        msg: &str,
+        candidates: Option<&[String]>,
+        format: OutputFormat,
+        exit_code: i32,
+    ) -> ! {
+        match format {
+            OutputFormat::Json => {
+                let mut error = serde_json::json!({
+                    "code": code,
+                    "message": msg
+                });
+                if let Some(candidates) = candidates {
+                    error["candidates"] = serde_json::json!(candidates);
+                }
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": error
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string(&envelope).expect("diagnostic envelope must serialize")
+                );
+            }
+            OutputFormat::Text => match candidates {
+                Some(candidates) => {
+                    eprintln!("Error: {msg}. Candidates: {}", candidates.join(", "));
+                }
+                None => eprintln!("Error: {msg}"),
+            },
+        }
+        std::process::exit(exit_code);
+    }
+
     match query::symbol_lifeline(records, symbol, repo_id) {
         Ok(events) => {
+            if events.is_empty() {
+                let msg = format!("symbol matched but has no commit-linked history: {symbol}");
+                fail("no_history", &msg, None, format, 2);
+            }
             match format {
                 OutputFormat::Json => {
-                    let envelope = serde_json::json!({
-                        "ok": true,
-                        "result": events,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                    // Newline-delimited JSON: one standalone event object per
+                    // line, chronologically ordered (issue #215).
+                    for ev in &events {
+                        println!("{}", serde_json::to_string(ev)?);
+                    }
                 }
                 OutputFormat::Text => {
                     println!("Advisory temporal facts: where and when this symbol changed");
@@ -12453,8 +12509,8 @@ fn query_lifeline_cmd(
                             _ => " drift=absent".to_string(),
                         };
                         println!(
-                            "[{}] commit={} record_id={}{}{}",
-                            ev.event_type, ev.commit, ev.record_id, citation, drift
+                            "[{}] commit={} valid_time={} record_id={}{}{}",
+                            ev.event_type, ev.commit, ev.valid_time, ev.record_id, citation, drift
                         );
                     }
                 }
@@ -12462,45 +12518,12 @@ fn query_lifeline_cmd(
             Ok(())
         }
         Err(query::LifelineError::UnknownSymbol { query }) => {
-            let code = "unknown_symbol";
             let msg = format!("symbol not found in the graph: {query}");
-            match format {
-                OutputFormat::Json => {
-                    let envelope = serde_json::json!({
-                        "ok": false,
-                        "error": {
-                            "code": code,
-                            "message": msg
-                        }
-                    });
-                    println!("{}", serde_json::to_string(&envelope)?);
-                }
-                OutputFormat::Text => {
-                    eprintln!("Error: {msg}");
-                }
-            }
-            std::process::exit(5);
+            fail("unknown_symbol", &msg, None, format, 2);
         }
         Err(query::LifelineError::AmbiguousSymbol { query, candidates }) => {
-            let code = "ambiguous_symbol";
             let msg = format!("ambiguous symbol name '{query}' matches multiple symbols");
-            match format {
-                OutputFormat::Json => {
-                    let envelope = serde_json::json!({
-                        "ok": false,
-                        "error": {
-                            "code": code,
-                            "message": msg,
-                            "candidates": candidates
-                        }
-                    });
-                    println!("{}", serde_json::to_string(&envelope)?);
-                }
-                OutputFormat::Text => {
-                    eprintln!("Error: {msg}. Candidates: {}", candidates.join(", "));
-                }
-            }
-            std::process::exit(6);
+            fail("ambiguous_symbol", &msg, Some(&candidates), format, 6);
         }
     }
 }
