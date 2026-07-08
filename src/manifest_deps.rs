@@ -654,22 +654,28 @@ fn workspace_facts_in_dir(
     let facts = match std::fs::read_to_string(&candidate) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => WorkspaceFacts::NoManifest,
         Err(_) => WorkspaceFacts::Unverifiable,
-        Ok(text) => match text.parse::<toml_edit::DocumentMut>() {
-            Err(_) => WorkspaceFacts::Unverifiable,
-            Ok(doc) => match doc
-                .get("workspace")
-                .and_then(toml_edit::Item::as_table_like)
-            {
-                None => WorkspaceFacts::PackageOnly,
-                Some(workspace) => WorkspaceFacts::Workspace {
-                    members: string_array(workspace.get("members")),
-                    exclude: string_array(workspace.get("exclude")),
-                },
-            },
-        },
+        Ok(text) => parse_workspace_facts(&text),
     };
     cache.workspaces.insert(dir_key, facts.clone());
     facts
+}
+
+/// Classifies one manifest body as a workspace root, a plain package, or
+/// unverifiable.
+fn parse_workspace_facts(text: &str) -> WorkspaceFacts {
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return WorkspaceFacts::Unverifiable;
+    };
+    let Some(workspace) = doc
+        .get("workspace")
+        .and_then(toml_edit::Item::as_table_like)
+    else {
+        return WorkspaceFacts::PackageOnly;
+    };
+    WorkspaceFacts::Workspace {
+        members: string_array(workspace.get("members")),
+        exclude: string_array(workspace.get("exclude")),
+    }
 }
 
 /// Extracts a TOML string array (`members` / `exclude`) as owned strings with
@@ -704,7 +710,6 @@ fn member_glob_match(pattern: &str, path: &str) -> bool {
         }
     }
     fn segment_match(pattern: &str, segment: &str) -> bool {
-        let (p, s): (Vec<char>, Vec<char>) = (pattern.chars().collect(), segment.chars().collect());
         fn inner(p: &[char], s: &[char]) -> bool {
             match p.split_first() {
                 None => s.is_empty(),
@@ -717,6 +722,7 @@ fn member_glob_match(pattern: &str, path: &str) -> bool {
                     .is_some_and(|(sc, s_rest)| sc == ch && inner(rest, s_rest)),
             }
         }
+        let (p, s): (Vec<char>, Vec<char>) = (pattern.chars().collect(), segment.chars().collect());
         inner(&p, &s)
     }
     let pattern_segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();

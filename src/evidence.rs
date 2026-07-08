@@ -357,6 +357,7 @@ fn evidence_producer() -> Producer {
 /// Agent nodes carry a stable ID based on `agent_id` and `agent_kind`; the same
 /// agent registered with different kinds produces distinct records, preventing
 /// mismatched-payload conflicts in the embedded sink.
+#[allow(clippy::too_many_lines)]
 fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
     let id = agent_memory_stable_id(&["node", "agent", agent_id, agent_kind]);
     GraphRecord::Node {
