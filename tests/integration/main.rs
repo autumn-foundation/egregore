@@ -59,6 +59,7 @@ mod query_symbols;
 mod query_who;
 mod range_deltas;
 mod redaction;
+mod redaction_report;
 mod refresh;
 mod repair;
 mod repo_scope;

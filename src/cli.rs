@@ -243,6 +243,10 @@ enum Commands {
         /// Output JSONL path.
         #[arg(long)]
         out: PathBuf,
+        /// Emit a secret-free JSON redaction summary to this path (`-` for
+        /// stdout). Emitted even when zero redactions occur (issue #266).
+        #[arg(long)]
+        redaction_report: Option<PathBuf>,
     },
     /// Import a Codex session or rollout JSONL into agent-memory JSONL.
     ImportCodex {
@@ -251,6 +255,10 @@ enum Commands {
         /// Output JSONL path.
         #[arg(long)]
         out: PathBuf,
+        /// Emit a secret-free JSON redaction summary to this path (`-` for
+        /// stdout). Emitted even when zero redactions occur (issue #266).
+        #[arg(long)]
+        redaction_report: Option<PathBuf>,
     },
     /// Import a Claude Code transcript JSONL into agent-memory JSONL.
     ///
@@ -1894,8 +1902,16 @@ fn run_cli(cli: Cli) -> Result<()> {
             #[cfg(feature = "embeddings")]
             embed,
         ),
-        Commands::ImportTraj { traj_path, out } => import_traj_cmd(&traj_path, &out),
-        Commands::ImportCodex { codex_path, out } => import_codex_cmd(&codex_path, &out),
+        Commands::ImportTraj {
+            traj_path,
+            out,
+            redaction_report,
+        } => import_traj_cmd(&traj_path, &out, redaction_report.as_deref()),
+        Commands::ImportCodex {
+            codex_path,
+            out,
+            redaction_report,
+        } => import_codex_cmd(&codex_path, &out, redaction_report.as_deref()),
         Commands::ImportClaudeCode {
             transcript_path,
             out,
@@ -2386,7 +2402,7 @@ fn import_github_cmd(
     }
 }
 
-fn import_codex_cmd(codex_path: &Path, out: &Path) -> Result<()> {
+fn import_codex_cmd(codex_path: &Path, out: &Path, redaction_report: Option<&Path>) -> Result<()> {
     let opts = crate::codex::ImportOptions::default();
     let graph = crate::codex::import_codex(codex_path, &opts)
         .with_context(|| format!("failed to import Codex JSONL from {}", codex_path.display()))?;
@@ -2394,12 +2410,17 @@ fn import_codex_cmd(codex_path: &Path, out: &Path) -> Result<()> {
         .to_jsonl()
         .context("failed to serialize agent-memory JSONL")?;
     fs::write(out, jsonl).with_context(|| format!("failed to write JSONL to {}", out.display()))?;
-    println!(
+    let status = format!(
         "imported {} records from {}",
         graph.records().len(),
         codex_path.display()
     );
-    Ok(())
+    emit_import_status_and_report(
+        &status,
+        graph.records(),
+        opts.policy_version,
+        redaction_report,
+    )
 }
 
 fn import_claude_code_cmd(transcript_path: &Path, out: &Path) -> Result<()> {
@@ -2444,7 +2465,43 @@ fn import_antigravity_cmd(antigravity_path: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn import_traj_cmd(traj_path: &Path, out: &Path) -> Result<()> {
+/// Emits the import status line and, when requested, the issue #266 redaction
+/// report.
+///
+/// The report is a single deterministic JSON line built from the emitted
+/// records' stored markers — record IDs, field paths, class names, hash
+/// prefixes, and counts only, never raw payloads. `-` writes the report to
+/// stdout (the status line moves to stderr so stdout is exactly the report);
+/// any other path writes a file and keeps the status line on stdout.
+fn emit_import_status_and_report(
+    status: &str,
+    records: &[crate::ir::GraphRecord],
+    policy_version: Option<&str>,
+    redaction_report: Option<&Path>,
+) -> Result<()> {
+    let Some(report_path) = redaction_report else {
+        println!("{status}");
+        return Ok(());
+    };
+    let report = crate::redaction_report::build_redaction_report(records, policy_version);
+    let json = serde_json::to_string(&report).context("failed to serialize redaction report")?;
+    if report_path == Path::new("-") {
+        println!("{json}");
+        eprintln!("{status}");
+    } else {
+        fs::write(report_path, format!("{json}\n")).with_context(|| {
+            format!(
+                "failed to write redaction report to {}",
+                report_path.display()
+            )
+        })?;
+        println!("{status}");
+        println!("redaction report written to {}", report_path.display());
+    }
+    Ok(())
+}
+
+fn import_traj_cmd(traj_path: &Path, out: &Path, redaction_report: Option<&Path>) -> Result<()> {
     let opts = ImportOptions::default();
     let graph = traj::import_traj(traj_path, &opts)
         .with_context(|| format!("failed to import .traj from {}", traj_path.display()))?;
@@ -2452,12 +2509,17 @@ fn import_traj_cmd(traj_path: &Path, out: &Path) -> Result<()> {
         .to_jsonl()
         .context("failed to serialize agent-memory JSONL")?;
     fs::write(out, jsonl).with_context(|| format!("failed to write JSONL to {}", out.display()))?;
-    println!(
+    let status = format!(
         "imported {} records from {}",
         graph.records().len(),
         traj_path.display()
     );
-    Ok(())
+    emit_import_status_and_report(
+        &status,
+        graph.records(),
+        opts.policy_version,
+        redaction_report,
+    )
 }
 
 fn link_evidence_cmd(code_graph_path: &Path, evidence_path: &Path, out: &Path) -> Result<()> {

@@ -46,6 +46,59 @@ command arguments, stdout/stderr excerpts, and assistant prose.
 cargo run -- import-codex session.jsonl --out records.jsonl
 ```
 
+### At-import redaction report (issue #266)
+
+`import-traj` and `import-codex` accept `--redaction-report <path>` (`-` for
+stdout) to emit a verifiable, secret-free JSON summary of exactly what the
+import redacted, alongside the normal record output:
+
+```powershell
+cargo run -- import-traj trajectory.traj --out records.jsonl --redaction-report report.json
+cargo run -- import-codex session.jsonl --out records.jsonl --redaction-report -
+```
+
+The report is built from the `<REDACTED:secret_class:hash_prefix>` markers
+stored on the emitted records, so every entry provably ties to a persisted
+marker. Each entry carries the owning record ID, the redacted field path
+(e.g. `stdout_handle.inline`), the `secret_class`, and the marker's BLAKE3
+`hash_prefix` — never the raw secret value. The envelope carries the source
+artifact path and hash, per-class counts, and a total count:
+
+```json
+{
+  "schema_version": 1,
+  "redaction": "enabled",
+  "policy_version": "v1",
+  "source_artifact_path": "trajectory.traj",
+  "source_artifact_hash": "<blake3-hex>",
+  "total": 2,
+  "counts_by_class": {"cloud_credential": 1, "env_secret": 1},
+  "entries": [
+    {"record_id": "agent:v1:...", "field_path": "text", "secret_class": "env_secret", "hash_prefix": "abc123def456"}
+  ]
+}
+```
+
+Guarantees:
+
+- The report is emitted even when zero redactions occur (`total: 0`), so a
+  silent clean pass is distinguishable from redaction being disabled.
+- A field that was absent is never reported as redacted; a field that carries
+  a marker is always reported.
+- Re-running the same import produces a byte-identical report (canonical
+  entry ordering, sorted class counts).
+- A passthrough (no-redaction) import marks the report
+  `"redaction": "disabled"` with `"policy_version": null` and no entries, so
+  an empty report cannot be mistaken for a clean redacted pass. The CLI
+  importers always apply the v1 policy; passthrough reports arise only on
+  programmatic (dry-run/test) paths.
+- When the report goes to stdout (`-`), the human status line moves to stderr
+  so stdout is exactly the JSON report.
+
+The report covers the two local transcript importers' at-import write
+boundary only — it is not a resting-store leak audit, retraction tool, or
+export bundle.
+
 ### Programmatic write path
 
 Any code that constructs non-code-graph records and calls `ingest_records` or
