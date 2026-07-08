@@ -2470,13 +2470,14 @@ fn import_antigravity_cmd(antigravity_path: &Path, out: &Path) -> Result<()> {
 ///
 /// The report is written after the records, so a matching path would silently
 /// replace the graph JSONL with the report while the command still exits 0.
-/// Paths are compared after absolutization, lexical `.`/`..` collapsing,
-/// canonicalization of the deepest existing ancestor, and explicit resolution
-/// of dangling-symlink components on the non-existing remainder, so aliases
-/// such as `tmp/../records.jsonl` vs `records.jsonl`, symlinked parent
-/// directories, and a pre-existing dangling symlink pointing at the other
-/// output all conflict even though the output files themselves do not exist
-/// yet; `-` (stdout) never conflicts. A path whose symlink chain cannot be
+/// Paths are compared after resolving their components in filesystem order —
+/// symlinks followed as encountered, `.`/`..` applied where the OS applies
+/// them, never collapsed lexically up front — so aliases such as
+/// `tmp/../records.jsonl` vs `records.jsonl`, `..` after a symlinked
+/// directory (`link/../records.jsonl` with `link -> target/child`), symlinked
+/// parent directories, and a pre-existing dangling symlink pointing at the
+/// other output all conflict even though the output files themselves do not
+/// exist yet; `-` (stdout) never conflicts. A path whose symlink chain cannot be
 /// resolved within [`SYMLINK_RESOLUTION_LIMIT`] hops (a cycle or an absurdly
 /// deep chain) is treated as conflicting — the guard refuses rather than
 /// guessing the paths are distinct. When both resolved targets already exist,
@@ -2544,96 +2545,97 @@ const SYMLINK_RESOLUTION_LIMIT: u32 = 40;
 /// Resolves an output path for the `--out`/`--redaction-report` collision
 /// check without requiring the target file to exist.
 ///
-/// Absolutizes against the cwd, lexically collapses `.`/`..` components, then
-/// canonicalizes the deepest existing ancestor and re-joins the remainder.
-/// `canonicalize()` fails on a *dangling* symlink (its target does not exist
-/// yet), so remainder components are checked with [`fs::symlink_metadata`]
-/// and any symlink among them is followed explicitly via [`fs::read_link`]
-/// (relative targets resolve against the link's parent, then lexically
-/// normalize) before resolution restarts. Differing spellings of the same
-/// file — cwd-relative vs `..`-aliased, through a symlinked parent, or via a
-/// pre-existing dangling symlink — therefore compare equal.
+/// Components are resolved in *filesystem order* — the order the OS applies
+/// when the write finally happens — never by collapsing `.`/`..` lexically up
+/// front. Starting from the canonicalized cwd (relative paths) or the
+/// root/prefix (absolute paths), each raw component is applied left to right:
+/// `.` is skipped; `..` pops the last resolved component (safe because the
+/// resolved prefix is already fully symlink-free; at the root it stays at the
+/// root); a normal component is appended and, when [`fs::symlink_metadata`]
+/// reports a symlink, its [`fs::read_link`] target is resolved through this
+/// same walk (relative targets against the link's parent). With
+/// `link -> target/child`, `link/../records.jsonl` therefore resolves to
+/// `target/records.jsonl` — where the OS actually writes — not the lexical
+/// `./records.jsonl`. Components that do not exist yet never test as symlinks
+/// and are appended as-is, so the guard works before either output exists;
+/// dangling symlinks still resolve to their eventual targets.
 ///
 /// Returns `None` when a symlink chain exceeds [`SYMLINK_RESOLUTION_LIMIT`]
-/// hops or a discovered link cannot be read; callers must treat `None` as
-/// "possibly the same file" (the safe side). Falls back to the lexically
-/// normalized form when no ancestor exists.
+/// hops, a discovered link cannot be read, or the cwd cannot be
+/// canonicalized; callers must treat `None` as "possibly the same file" (the
+/// safe side).
 fn resolve_output_path_for_collision(path: &Path) -> Option<PathBuf> {
-    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut current = lexically_normalize(&abs);
+    let mut resolved = if path.is_absolute() {
+        // The walk's prefix/root components establish the base themselves.
+        PathBuf::new()
+    } else {
+        std::env::current_dir().ok()?.canonicalize().ok()?
+    };
     let mut hops: u32 = 0;
-    'resolve: loop {
-        // Canonicalize the deepest existing ancestor; components that do not
-        // canonicalize (missing, or dangling symlinks) form the remainder,
-        // deepest-first.
-        let mut existing = current.as_path();
-        let mut remainder: Vec<std::ffi::OsString> = Vec::new();
-        let base = loop {
-            if let Ok(canonical) = existing.canonicalize() {
-                break canonical;
-            }
-            match (existing.parent(), existing.file_name()) {
-                (Some(parent), Some(name)) => {
-                    remainder.push(name.to_os_string());
-                    existing = parent;
-                }
-                _ => break existing.to_path_buf(),
-            }
-        };
-        // Re-join the remainder one component at a time, following the first
-        // symlink encountered and restarting resolution from the retargeted
-        // path (which may itself expose further links or existing ancestors).
-        let mut resolved = base;
-        while let Some(name) = remainder.pop() {
-            resolved.push(&name);
-            let is_symlink = fs::symlink_metadata(&resolved)
-                .map(|meta| meta.file_type().is_symlink())
-                .unwrap_or(false);
-            if !is_symlink {
-                continue;
-            }
-            if hops >= SYMLINK_RESOLUTION_LIMIT {
-                return None;
-            }
-            hops += 1;
-            let target = fs::read_link(&resolved).ok()?;
-            resolved.pop();
-            let mut retargeted = if target.is_absolute() {
-                lexically_normalize(&target)
-            } else {
-                lexically_normalize(&resolved.join(target))
-            };
-            while let Some(rest) = remainder.pop() {
-                retargeted.push(rest);
-            }
-            current = retargeted;
-            continue 'resolve;
-        }
-        return Some(resolved);
-    }
+    resolve_components_in_filesystem_order(&mut resolved, path, &mut hops)?;
+    Some(resolved)
 }
 
-/// Lexically collapses `.` and `..` components of an already-absolute path.
+/// Applies `path`'s raw components onto `resolved` in filesystem order,
+/// following symlinks as they are encountered (recursing for link targets,
+/// bounded by [`SYMLINK_RESOLUTION_LIMIT`] total hops via `hops`).
 ///
-/// No filesystem access, so paths that do not exist yet still normalize
-/// deterministically; `..` at the root stays at the root.
-fn lexically_normalize(path: &Path) -> PathBuf {
+/// `resolved` must be fully symlink-free on entry — either empty (an absolute
+/// `path` supplies its own prefix/root) or a canonicalized directory — so
+/// popping a component for `..` is exactly what the OS would do.
+///
+/// Returns `None` on an unresolvable chain (hop limit or unreadable link);
+/// the caller treats that as a possible collision.
+fn resolve_components_in_filesystem_order(
+    resolved: &mut PathBuf,
+    path: &Path,
+    hops: &mut u32,
+) -> Option<()> {
     use std::path::Component;
-    let mut out = PathBuf::new();
     for component in path.components() {
         match component {
+            Component::Prefix(prefix) => {
+                *resolved = PathBuf::from(prefix.as_os_str());
+            }
+            // Pushing a rooted component drops everything after any prefix,
+            // matching the OS restart-at-root behavior for absolute targets.
+            Component::RootDir => resolved.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                // Pop a named component; `..` above the root (or prefix) is
-                // the root itself, so it drops.
-                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
-                    out.pop();
+                // `resolved` is symlink-free, so popping the last component
+                // is the filesystem-order meaning of `..`; at the root there
+                // is nothing to pop and `..` stays at the root.
+                if matches!(
+                    resolved.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    resolved.pop();
                 }
             }
-            other => out.push(other.as_os_str()),
+            Component::Normal(name) => {
+                resolved.push(name);
+                // Nonexistent components never test as symlinks and stay
+                // appended as-is — outputs need not exist yet.
+                let is_symlink = fs::symlink_metadata(&resolved)
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false);
+                if !is_symlink {
+                    continue;
+                }
+                if *hops >= SYMLINK_RESOLUTION_LIMIT {
+                    return None;
+                }
+                *hops += 1;
+                let target = fs::read_link(&resolved).ok()?;
+                // Resolve the target through this same walk: relative targets
+                // continue from the link's parent; absolute targets reset at
+                // their root/prefix via the components above.
+                resolved.pop();
+                resolve_components_in_filesystem_order(resolved, &target, hops)?;
+            }
         }
     }
-    out
+    Some(())
 }
 
 /// Emits the import status line and, when requested, the issue #266 redaction

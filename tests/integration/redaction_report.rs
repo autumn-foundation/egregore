@@ -810,6 +810,116 @@ fn import_traj_cli_rejects_symlink_cycle_report_path() {
     );
 }
 
+/// A `..` component *after* a symlinked directory must be resolved in
+/// filesystem order: with `link -> target/child`, the OS resolves `link`
+/// first, so `link/../records.jsonl` names `target/records.jsonl` — not the
+/// lexically collapsed `./records.jsonl`. Collapsing `..` before following
+/// the link would let this alias of the report path slip past the guard.
+#[cfg(unix)]
+#[test]
+fn import_traj_cli_rejects_dotdot_through_symlink_out_aliasing_report() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let traj_path = write_secret_traj(temp.path());
+    fs::create_dir_all(temp.path().join("target/child")).expect("target dirs");
+    std::os::unix::fs::symlink("target/child", temp.path().join("link")).expect("dir symlink");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .current_dir(temp.path())
+        .arg("import-traj")
+        .arg(&traj_path)
+        .arg("--out")
+        .arg("link/../records.jsonl")
+        .arg("--redaction-report")
+        .arg("target/records.jsonl")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--redaction-report"));
+
+    assert!(
+        !temp.path().join("target/records.jsonl").exists(),
+        "neither artifact may be written when --out reaches the report path \
+         through a `..`-after-symlink spelling"
+    );
+    assert!(
+        !temp.path().join("records.jsonl").exists(),
+        "no artifact may appear at the lexically-collapsed spelling either"
+    );
+}
+
+/// The mirror case: the report path spelled `link/../records.jsonl` resolves
+/// in filesystem order to `target/records.jsonl` — the same file as `--out`.
+#[cfg(unix)]
+#[test]
+fn import_traj_cli_rejects_dotdot_through_symlink_report_aliasing_out() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let traj_path = write_secret_traj(temp.path());
+    fs::create_dir_all(temp.path().join("target/child")).expect("target dirs");
+    std::os::unix::fs::symlink("target/child", temp.path().join("link")).expect("dir symlink");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .current_dir(temp.path())
+        .arg("import-traj")
+        .arg(&traj_path)
+        .arg("--out")
+        .arg("target/records.jsonl")
+        .arg("--redaction-report")
+        .arg("link/../records.jsonl")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--redaction-report"));
+
+    assert!(
+        !temp.path().join("target/records.jsonl").exists(),
+        "neither artifact may be written when the report path reaches --out \
+         through a `..`-after-symlink spelling"
+    );
+}
+
+/// A `..`-after-symlink spelling that resolves to a genuinely *distinct* file
+/// must still pass, and both artifacts must land at their filesystem-order
+/// locations: `link/../records.jsonl` writes `target/records.jsonl`, never
+/// the lexically collapsed `./records.jsonl`.
+#[cfg(unix)]
+#[test]
+fn import_traj_cli_accepts_dotdot_through_symlink_to_distinct_file() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let traj_path = write_secret_traj(temp.path());
+    fs::create_dir_all(temp.path().join("target/child")).expect("target dirs");
+    std::os::unix::fs::symlink("target/child", temp.path().join("link")).expect("dir symlink");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .current_dir(temp.path())
+        .arg("import-traj")
+        .arg(&traj_path)
+        .arg("--out")
+        .arg("link/../records.jsonl")
+        .arg("--redaction-report")
+        .arg("report.json")
+        .assert()
+        .success();
+
+    let records = fs::read_to_string(temp.path().join("target/records.jsonl"))
+        .expect("records JSONL must land at the filesystem-order location");
+    assert!(
+        records
+            .lines()
+            .next()
+            .is_some_and(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()),
+        "records output must be graph JSONL, not the report"
+    );
+    assert!(
+        !temp.path().join("records.jsonl").exists(),
+        "nothing may be written at the lexically-collapsed spelling"
+    );
+    let body =
+        fs::read_to_string(temp.path().join("report.json")).expect("report file must be written");
+    let report: serde_json::Value = serde_json::from_str(body.trim()).expect("report is JSON");
+    assert_eq!(report["redaction"], "enabled");
+}
+
 /// Two pre-existing hard links to one inode have *different* resolved path
 /// strings, so a string comparison alone passes them as distinct — yet the
 /// records write updates the shared inode and the report write through the
