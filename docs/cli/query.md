@@ -758,7 +758,8 @@ eg query at <PATH>:<LINE> --data-dir <DIR> [--at <COMMIT>] [--repo <SELECTOR>]
   excluded, and a history graph is anchored to its stamped HEAD snapshot
   (issue #82): a path deleted or renamed at HEAD is a `no_match`, never a
   stale pre-deletion symbol. Legacy stores without a stamped snapshot fall
-  back to each stable ID's newest version. With `--at`, only records observed
+  back to each stable ID's newest recorded version (by valid time,
+  independent of record emission order). With `--at`, only records observed
   at that commit participate, so the same line can resolve to different
   symbols (or to none) at different commits.
 - **Repository boundary stays explicit.** An unscoped location whose path

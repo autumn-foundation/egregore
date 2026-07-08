@@ -636,3 +636,93 @@ fn query_at_default_view_over_history_graph_resolves_head_spans() {
     let parsed = run_at_err(&graph, "src/keep.rs:1", 2);
     assert_eq!(parsed["error"]["code"], "no_enclosing_symbol");
 }
+
+// ---------------------------------------------------------------------------
+// Legacy fallback (no stamped source snapshot): newest version per ID must be
+// chosen by valid time, not by record emission order — an embedded store
+// emits temporal snapshots in commit-SHA lexical order (PR #306 review
+// follow-up, round 2)
+// ---------------------------------------------------------------------------
+
+/// Legacy history store (no `Repository` source-snapshot stamp) where the
+/// NEWER commit's SHA (`aaa…`) sorts lexically before the OLDER commit's
+/// (`zzz…`), and records are emitted in commit-SHA order exactly as
+/// `EmbeddedAletheiaSink::read_all_records()` does. Symbol `shifty` sits at
+/// lines 1–5 in the old commit and lines 10–20 in the new one.
+fn sha_ordered_legacy_fixture() -> (tempfile::TempDir, PathBuf) {
+    const OLD_COMMIT: &str = "zzzz00000000"; // T1, span 1–5
+    const NEW_COMMIT: &str = "aaaa00000000"; // T2, span 10–20 — sorts FIRST
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = "src/lib.rs";
+    let file_id = stable_id(&["node", "file", "repo_legacy", path]);
+    let sym_id = stable_id(&["node", "symbol", "repo_legacy", path, "shifty"]);
+
+    // Serialize lines by hand in commit-SHA lexical order — the NEWER commit
+    // first — because `Graph::to_jsonl` sorts lines and would not preserve
+    // the embedded store's emission order that this regression reproduces.
+    // An order-dependent keep-last dedupe would wrongly keep the OLDER
+    // version here.
+    let mut lines: Vec<String> = Vec::new();
+    for (commit_sha, valid_time, span) in [
+        (NEW_COMMIT, T2, line_span(10, 20)),
+        (OLD_COMMIT, T1, line_span(1, 5)),
+    ] {
+        let records = [
+            GraphRecord::node(
+                stable_id(&["node", "commit", "repo_legacy", commit_sha]),
+                NodeKind::Commit,
+                None,
+                None,
+                Some(commit_sha.to_owned()),
+                format!("Commit {commit_sha}"),
+            )
+            .with_temporal(temporal(commit_sha, valid_time)),
+            GraphRecord::node(
+                file_id.clone(),
+                NodeKind::File,
+                Some(path.to_owned()),
+                None,
+                Some(path.to_owned()),
+                format!("Rust source file {path}"),
+            )
+            .with_temporal(temporal(commit_sha, valid_time)),
+            GraphRecord::node(
+                sym_id.clone(),
+                NodeKind::Symbol,
+                Some(path.to_owned()),
+                Some(span),
+                Some("shifty".to_owned()),
+                "Symbol shifty".to_owned(),
+            )
+            .with_temporal(temporal(commit_sha, valid_time)),
+        ];
+        for record in records {
+            lines.push(serde_json::to_string(&record).expect("record serializes"));
+        }
+    }
+
+    let graph_path = temp.path().join("legacy.jsonl");
+    fs::write(&graph_path, format!("{}\n", lines.join("\n"))).expect("write graph");
+    (temp, graph_path)
+}
+
+#[test]
+fn query_at_legacy_fallback_prefers_newest_valid_time_over_emission_order() {
+    let (_temp, graph) = sha_ordered_legacy_fixture();
+
+    // Line 12 is inside the symbol only in the NEWEST version (T2): the
+    // default view must resolve it even though that record is emitted first.
+    let parsed = run_at_ok(&graph, "src/lib.rs:12");
+    assert_eq!(parsed["symbol"]["name"], "shifty");
+    assert_eq!(
+        parsed["symbol"]["span"]["start_line"], 10,
+        "the newest (T2) span must win, got {parsed:?}"
+    );
+    assert_eq!(parsed["symbol"]["git_commit"], "aaaa00000000");
+
+    // Line 2 was inside the symbol only in the SUPERSEDED (T1) version: the
+    // default view must not resurrect it.
+    let parsed = run_at_err(&graph, "src/lib.rs:2", 2);
+    assert_eq!(parsed["error"]["code"], "no_enclosing_symbol");
+}

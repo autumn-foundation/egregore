@@ -18727,6 +18727,24 @@ pub struct LocationContext<'a> {
     pub repo_groups: BTreeSet<Option<&'a str>>,
 }
 
+/// Recency ordering for two versions of one stable record ID in the
+/// current-state view. A non-temporal (current-scan) record outranks every
+/// history-backed snapshot; history-backed snapshots order by parsed valid
+/// time (unparseable valid times sort oldest), with the commit SHA as a
+/// deterministic tiebreak for equal-time commits (e.g. rebases).
+fn version_recency_key(record: &GraphRecord) -> (u8, Option<DateTime<chrono::FixedOffset>>, &str) {
+    let GraphRecord::Node { temporal, .. } = record else {
+        return (0, None, "");
+    };
+    temporal.as_ref().map_or((1, None, ""), |t| {
+        (
+            0,
+            DateTime::parse_from_rfc3339(&t.valid_time).ok(),
+            t.git_commit.as_str(),
+        )
+    })
+}
+
 /// Resolves the smallest enclosing `Symbol` for a `path:line` location.
 ///
 /// View selection mirrors the other single-answer query verbs:
@@ -18823,7 +18841,17 @@ pub fn location_context<'a>(
                 continue;
             }
         }
-        nodes.insert(id.as_str(), record);
+        // Newest-version-per-ID must not depend on record emission order:
+        // the embedded store emits temporal snapshots in commit-SHA lexical
+        // order (`read_all_records`), not commit time, so a newer commit
+        // whose SHA sorts first would lose a plain last-write-wins insert.
+        // Replace only when the incoming record is at least as recent.
+        let replace = nodes
+            .get(id.as_str())
+            .is_none_or(|existing| version_recency_key(record) >= version_recency_key(existing));
+        if replace {
+            nodes.insert(id.as_str(), record);
+        }
     }
 
     let mut ctx = LocationContext {
