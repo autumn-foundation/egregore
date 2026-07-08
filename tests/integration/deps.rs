@@ -630,6 +630,56 @@ fn missing_target_reported_as_unresolved() {
     assert_eq!(unresolved.len(), 3, "got {unresolved:?}");
 }
 
+#[test]
+fn unresolved_resolution_edge_with_absent_marker_stays_unresolved_call() {
+    // A CALLS edge carrying `resolution: "unresolved"` whose Diagnostic marker
+    // record is absent from the graph: the edge itself already identifies an
+    // unresolved call, so the reason must stay `unresolved_call`;
+    // `missing_target` is reserved for dangling edges without that signal.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("absent-marker.jsonl");
+    let mut graph = Graph::new();
+    let repo_id = stable_id(&["node", "Repository", "repo-absent"]);
+    graph.push(GraphRecord::node(
+        repo_id.clone(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo-absent".to_owned()),
+        "Repository repo-absent".to_owned(),
+    ));
+    file(&mut graph, &repo_id, "src/a.rs");
+    let anchor_id = symbol(&mut graph, "src/a.rs", "anchor_absent", (5, 10));
+    let absent_marker_id = format!("codegraph:v{SCHEMA_VERSION}:{}", "e".repeat(64));
+    calls(
+        &mut graph,
+        &anchor_id,
+        &absent_marker_id,
+        Some(CallResolution::Unresolved),
+    );
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let (_, rows) = run_query(&[
+        "query",
+        "deps",
+        &anchor_id,
+        "--graph",
+        path.to_str().unwrap(),
+    ]);
+    let unresolved = unresolved_rows(&rows);
+    assert_eq!(unresolved.len(), 1, "got {unresolved:?}");
+    assert_eq!(
+        unresolved[0]["reason"], "unresolved_call",
+        "the edge's unresolved signal outranks the absent marker record"
+    );
+    assert_eq!(unresolved[0]["resolution"], "unresolved");
+    assert_eq!(unresolved[0]["target_record_id"], absent_marker_id);
+    assert!(
+        unresolved[0].get("record_id").is_none(),
+        "no live marker record to cite"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Direction and label discipline — inbound edges, weak labels, self edges,
 // and tombstoned edges never produce rows.
@@ -1138,6 +1188,162 @@ fn as_of_selects_most_recent_commit_at_or_before_instant() {
         .collect();
     assert!(ids.contains(&dep_a_id.as_str()));
     assert!(!ids.contains(&dep_b_id.as_str()));
+}
+
+/// Multi-repository history fixture: two repositories sharing one store.
+/// Repo A ("repo-ha") has a single commit `aaaa1111` @ T1 where `anchor_ra`
+/// calls `dep_ra`. Repo B ("repo-hb") has `bbbb2222` @ T2 (newer than
+/// everything in repo A) and `aaaa2222` @ T1 (sharing repo A's `aaaa` prefix).
+fn seed_multi_repo_history() -> (tempfile::TempDir, PathBuf, String, String) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("multi-repo-history.jsonl");
+    let mut graph = Graph::new();
+
+    let repo_a_id = stable_id(&["node", "Repository", "repo-ha"]);
+    let repo_b_id = stable_id(&["node", "Repository", "repo-hb"]);
+    for (id, tag) in [(&repo_a_id, "repo-ha"), (&repo_b_id, "repo-hb")] {
+        graph.push(GraphRecord::node(
+            id.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(tag.to_owned()),
+            format!("Repository {tag}"),
+        ));
+    }
+
+    let mut commit_in = |repo_id: &str, repo_tag: &str, sha: &str, vt: &str| {
+        let commit_id = stable_id(&["node", "commit", repo_tag, sha]);
+        graph.push(
+            GraphRecord::node(
+                commit_id.clone(),
+                NodeKind::Commit,
+                None,
+                None,
+                Some(sha.to_owned()),
+                format!("Commit {sha} in {repo_tag}"),
+            )
+            .with_temporal(temporal(sha, &[], vt)),
+        );
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id.to_owned(),
+            commit_id,
+            None,
+            format!("{repo_tag} contains commit {sha}"),
+        ));
+    };
+    commit_in(&repo_a_id, "repo-ha", "aaaa1111", T1);
+    commit_in(&repo_b_id, "repo-hb", "bbbb2222", T2);
+    commit_in(&repo_b_id, "repo-hb", "aaaa2222", T1);
+
+    // Repo A's tree at aaaa1111: anchor_ra calls dep_ra. The file/Defines
+    // topology attributes both symbols to repo A for `--repo` scoping.
+    file(&mut graph, &repo_a_id, "src/ra.rs");
+    let hist_symbol = |graph: &mut Graph, path: &str, name: &str, sha: &str, vt: &str| -> String {
+        let id = sym_id(path, name);
+        graph.push(
+            GraphRecord::syntax_node(
+                id.clone(),
+                NodeKind::Symbol,
+                path.to_owned(),
+                span(1, 10),
+                name.to_owned(),
+                "rust",
+                format!("fn {name}"),
+            )
+            .with_temporal(temporal(sha, &[], vt)),
+        );
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id(path),
+            id.clone(),
+            None,
+            format!("{path} defines {name}"),
+        ));
+        id
+    };
+    let anchor_a_id = hist_symbol(&mut graph, "src/ra.rs", "anchor_ra", "aaaa1111", T1);
+    let dep_a_id = hist_symbol(&mut graph, "src/ra.rs", "dep_ra", "aaaa1111", T1);
+    graph.push(
+        GraphRecord::edge(
+            EdgeLabel::Calls,
+            anchor_a_id.clone(),
+            dep_a_id.clone(),
+            Some("1.0".to_owned()),
+            "anchor_ra calls dep_ra".to_owned(),
+        )
+        .with_resolution(CallResolution::Resolved)
+        .with_temporal(temporal("aaaa1111", &[], T1)),
+    );
+
+    // Repo B's tree at bbbb2222: an unrelated symbol so the foreign commit
+    // carries real records.
+    file(&mut graph, &repo_b_id, "src/rb.rs");
+    hist_symbol(&mut graph, "src/rb.rs", "anchor_rb", "bbbb2222", T2);
+
+    let jsonl = graph.to_jsonl().expect("serialize");
+    fs::write(&path, jsonl).expect("write");
+    (temp, path, anchor_a_id, dep_a_id)
+}
+
+#[test]
+fn repo_scoped_as_of_resolves_within_selected_repository() {
+    let (_t, path, anchor_a_id, dep_a_id) = seed_multi_repo_history();
+    // At an instant after both repos' history, the globally newest commit is
+    // repo B's bbbb2222. Scoped to repo A, the temporal view must resolve to
+    // repo A's newest commit (aaaa1111) — not select the foreign commit and
+    // then filter repo A's records away.
+    let (header, rows) = run_query(&[
+        "query",
+        "deps",
+        &anchor_a_id,
+        "--graph",
+        path.to_str().unwrap(),
+        "--repo",
+        "repo-ha",
+        "--as-of",
+        "2026-03-01T00:00:00Z",
+    ]);
+    assert_eq!(
+        header["at_commit"], "aaaa1111",
+        "--as-of must resolve within the selected repository"
+    );
+    assert!(
+        rows.iter()
+            .filter_map(|r| r["record_id"].as_str())
+            .any(|id| id == dep_a_id),
+        "dep_ra answered at c1"
+    );
+}
+
+#[test]
+fn repo_scoped_at_prefix_ignores_other_repositories_commits() {
+    let (_t, path, anchor_a_id, dep_a_id) = seed_multi_repo_history();
+    // "aaaa" matches repo A's aaaa1111 and repo B's aaaa2222. Scoped to repo
+    // A the prefix is unique and must not be reported ambiguous because of
+    // commits outside the selected repository.
+    let (header, rows) = run_query(&[
+        "query",
+        "deps",
+        &anchor_a_id,
+        "--graph",
+        path.to_str().unwrap(),
+        "--repo",
+        "repo-ha",
+        "--at",
+        "aaaa",
+    ]);
+    assert_eq!(
+        header["at_commit"], "aaaa1111",
+        "--at prefix must resolve within the selected repository"
+    );
+    assert!(
+        rows.iter()
+            .filter_map(|r| r["record_id"].as_str())
+            .any(|id| id == dep_a_id),
+        "dep_ra answered at c1"
+    );
 }
 
 #[test]

@@ -1201,6 +1201,113 @@ fn as_of_selects_most_recent_commit_at_or_before_instant() {
 }
 
 #[test]
+fn repo_scoped_as_of_resolves_within_selected_repository() {
+    // Two repositories in one shared store: repo A's only commit (aaaa1111 @
+    // T1) is older than repo B's (bbbb2222 @ T2). Scoped to repo A, --as-of
+    // must resolve the temporal view within repo A instead of selecting the
+    // globally newest (foreign) commit and filtering repo A's records away.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("multi-repo-history.jsonl");
+    let mut graph = Graph::new();
+
+    let repo_a_id = stable_id(&["node", "Repository", "repo-tha"]);
+    let repo_b_id = stable_id(&["node", "Repository", "repo-thb"]);
+    for (id, tag) in [(&repo_a_id, "repo-tha"), (&repo_b_id, "repo-thb")] {
+        graph.push(GraphRecord::node(
+            id.clone(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(tag.to_owned()),
+            format!("Repository {tag}"),
+        ));
+    }
+    let mut commit_in = |repo_id: &str, repo_tag: &str, sha: &str, vt: &str| {
+        let commit_id = stable_id(&["node", "commit", repo_tag, sha]);
+        graph.push(
+            GraphRecord::node(
+                commit_id.clone(),
+                NodeKind::Commit,
+                None,
+                None,
+                Some(sha.to_owned()),
+                format!("Commit {sha} in {repo_tag}"),
+            )
+            .with_temporal(temporal(sha, &[], vt)),
+        );
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id.to_owned(),
+            commit_id,
+            None,
+            format!("{repo_tag} contains commit {sha}"),
+        ));
+    };
+    commit_in(&repo_a_id, "repo-tha", "aaaa1111", T1);
+    commit_in(&repo_b_id, "repo-thb", "bbbb2222", T2);
+
+    file(&mut graph, &repo_a_id, "src/ta.rs");
+    let hist_symbol = |graph: &mut Graph, name: &str, sha: &str, vt: &str| -> String {
+        let id = sym_id("src/ta.rs", name);
+        graph.push(
+            GraphRecord::syntax_node(
+                id.clone(),
+                NodeKind::Symbol,
+                "src/ta.rs".to_owned(),
+                span(1, 10),
+                name.to_owned(),
+                "rust",
+                format!("fn {name}"),
+            )
+            .with_temporal(temporal(sha, &[], vt)),
+        );
+        graph.push(GraphRecord::edge(
+            EdgeLabel::Defines,
+            file_id("src/ta.rs"),
+            id.clone(),
+            None,
+            format!("src/ta.rs defines {name}"),
+        ));
+        id
+    };
+    let anchor_id = hist_symbol(&mut graph, "anchor_ta", "aaaa1111", T1);
+    let caller_id = hist_symbol(&mut graph, "caller_ta", "aaaa1111", T1);
+    graph.push(
+        GraphRecord::edge(
+            EdgeLabel::Calls,
+            caller_id.clone(),
+            anchor_id.clone(),
+            Some("1.0".to_owned()),
+            "caller_ta calls anchor_ta".to_owned(),
+        )
+        .with_resolution(CallResolution::Resolved)
+        .with_temporal(temporal("aaaa1111", &[], T1)),
+    );
+    fs::write(&path, graph.to_jsonl().expect("serialize")).expect("write");
+
+    let (header, rows) = run_query(&[
+        "query",
+        "transitive-callers",
+        &anchor_id,
+        "--graph",
+        path.to_str().unwrap(),
+        "--repo",
+        "repo-tha",
+        "--as-of",
+        "2026-03-01T00:00:00Z",
+    ]);
+    assert_eq!(
+        header["at_commit"], "aaaa1111",
+        "--as-of must resolve within the selected repository"
+    );
+    let ids = row_ids(&rows);
+    assert!(
+        ids.contains(&caller_id.as_str()),
+        "caller_ta answered at c1"
+    );
+}
+
+#[test]
 fn at_missing_commit_exit2() {
     let (_t, path, anchor_id, _a, _b) = seed_history();
     let stdout = egregore()

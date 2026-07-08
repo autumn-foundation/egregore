@@ -11729,10 +11729,12 @@ pub struct SymbolDependencyRow<'a> {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum UnresolvedDependencyReason {
     /// The call did not resolve to an in-repo definition: the edge targets a
-    /// `Diagnostic` marker recording the callee (issues #152/#134).
+    /// `Diagnostic` marker recording the callee (issues #152/#134) or carries
+    /// `resolution: "unresolved"` itself.
     UnresolvedCall,
     /// The edge's target record is not in the graph (dangling target, or a
-    /// target that exists only as a tombstone).
+    /// target that exists only as a tombstone) and the edge carries no
+    /// unresolved-call signal of its own.
     MissingTarget,
 }
 
@@ -11915,6 +11917,15 @@ pub fn symbol_dependencies<'a>(
                     });
             }
             None => {
+                // An edge already carrying `resolution: "unresolved"`
+                // identifies an unresolved call by itself; the marker record
+                // being absent does not change why the target is unresolved.
+                // `missing_target` is reserved for edges without that signal.
+                let reason = if *resolution == Some(CallResolution::Unresolved) {
+                    UnresolvedDependencyReason::UnresolvedCall
+                } else {
+                    UnresolvedDependencyReason::MissingTarget
+                };
                 unresolved
                     .entry((relation, target.as_str(), edge_id.as_str()))
                     .or_insert(UnresolvedDependencyRow {
@@ -11923,7 +11934,7 @@ pub fn symbol_dependencies<'a>(
                         edge_id: edge_id.as_str(),
                         relation,
                         resolution: *resolution,
-                        reason: UnresolvedDependencyReason::MissingTarget,
+                        reason,
                     });
             }
         }

@@ -29,7 +29,7 @@ and cross-crate targets are outside the extraction contract).
 | `<HANDLE>` | yes | Stable symbol record ID (`codegraph:vN:<hex>`) or exact symbol name. File paths and task/source handles are rejected (exit `1`). |
 | `--graph <PATH>` | one of | Graph JSONL produced by `eg scan` or `eg scan-history`. |
 | `--data-dir <DIR>` | one of | Embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. |
-| `--repo <SELECTOR>` | no | Restrict symbol resolution to one repository (see [query.md](query.md#repository-scope---repo-issue-67)). |
+| `--repo <SELECTOR>` | no | Restrict symbol resolution — and `--at`/`--as-of` commit resolution — to one repository (see [query.md](query.md#repository-scope---repo-issue-67)). |
 | `--at <COMMIT>` | no | Return the dependency set at this commit SHA or unique prefix (requires a history store). Mutually exclusive with `--as-of`. |
 | `--as-of <RFC3339>` | no | Return the dependency set at the most recent commit at or before this instant. Mutually exclusive with `--at`. |
 | `--format` | no | `json` (default) or `text`. |
@@ -114,7 +114,7 @@ Unresolved row fields (`category: "unresolved"`):
 | Field | Type | Description |
 |-------|------|-------------|
 | `relation` | string | Edge label that produced the row. |
-| `reason` | string | `unresolved_call` (the edge targets a Diagnostic marker or carries `resolution: "unresolved"`) or `missing_target` (the target record is not in the graph). |
+| `reason` | string | `unresolved_call` (the edge targets a Diagnostic marker or carries `resolution: "unresolved"` — even when that marker record is absent from the graph) or `missing_target` (the target record is not in the graph and the edge carries no unresolved signal). |
 | `record_id` | string | The Diagnostic marker's record ID, when the marker is in-graph. |
 | `name` / `kind` | string | Callee display name and marker kind, when the marker is in-graph. |
 | `repo_relative_path` / `span` | string / object | The call site recorded by the marker, when present. |
@@ -146,7 +146,11 @@ Over a `scan-history` graph or an ingested history store, the query runs
 against the single-commit snapshot the selector names, reusing recorded
 history output without touching Git state or the working tree. `--as-of`
 resolves to the most recent commit whose valid time is at or before the
-instant; the envelope's `at_commit` reports which commit answered.
+instant; the envelope's `at_commit` reports which commit answered. When
+`--repo` is set, commit resolution happens within the selected repository
+(matching `eg query deltas`): a shared multi-repository store never answers
+from another repository's commits, and an `--at` prefix is never ambiguous
+because of commits outside the selected repository.
 
 ## Example
 

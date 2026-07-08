@@ -9357,18 +9357,30 @@ fn transitive_row_json<'a>(
 /// machine-readable diagnostics on failure.
 fn resolve_transitive_commit_view(
     records: &[GraphRecord],
+    index: &query::RepositoryIndex,
+    repo_scope: Option<&str>,
     at: Option<&str>,
     as_of: Option<&str>,
 ) -> Result<String> {
     let mut commits: BTreeMap<&str, Option<&str>> = BTreeMap::new();
     for r in records {
         if let GraphRecord::Node {
+            id,
             kind: NodeKind::Commit,
             name: Some(sha),
             temporal,
             ..
         } = r
         {
+            // Repository scoping mirrors `range_deltas` (issue #118): in a
+            // shared multi-repository store the temporal view must resolve
+            // within the selected repository, or `--as-of` could select
+            // another repository's newest commit (emptying the scoped view)
+            // and an `--at` prefix could be ambiguous solely because of
+            // commits outside the selected repository.
+            if repo_scope.is_some_and(|scope| index.owner_of(id) != Some(scope)) {
+                continue;
+            }
             commits
                 .entry(sha.as_str())
                 .or_insert_with(|| temporal.as_ref().map(|t| t.valid_time.as_str()));
@@ -9464,7 +9476,7 @@ fn query_transitive_callers_cmd(
     // ── temporal narrowing: one commit's snapshot view (issue #139 AC6) ───────
     let mut at_commit: Option<String> = None;
     let filtered: Option<Vec<GraphRecord>> = if at.is_some() || as_of.is_some() {
-        let sha = resolve_transitive_commit_view(records, at, as_of)?;
+        let sha = resolve_transitive_commit_view(records, index, repo_scope, at, as_of)?;
         let view: Vec<GraphRecord> = records
             .iter()
             .filter(|r| match r {
@@ -9895,7 +9907,7 @@ fn query_deps_cmd(
     // from the same single-commit history slice.
     let mut at_commit: Option<String> = None;
     let filtered: Option<Vec<GraphRecord>> = if at.is_some() || as_of.is_some() {
-        let sha = resolve_transitive_commit_view(records, at, as_of)?;
+        let sha = resolve_transitive_commit_view(records, index, repo_scope, at, as_of)?;
         let view: Vec<GraphRecord> = records
             .iter()
             .filter(|r| match r {
