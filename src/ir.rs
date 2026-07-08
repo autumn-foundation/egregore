@@ -170,6 +170,15 @@ impl Graph {
         &self.records
     }
 
+    /// Returns mutable access to all graph records in insertion order.
+    ///
+    /// Used by post-extraction passes that annotate already-pushed records,
+    /// e.g. same-file `CALLS` resolution labeling (issue #134).
+    #[must_use]
+    pub fn records_mut(&mut self) -> &mut [GraphRecord] {
+        &mut self.records
+    }
+
     /// Consumes the graph and returns the records vector.
     #[must_use]
     pub fn into_records(self) -> Vec<GraphRecord> {
@@ -597,11 +606,12 @@ impl UserContextFields {
     }
 }
 
-/// Resolution status carried by `CALLS` edges emitted by the deterministic
-/// repo-wide cross-file resolution pass (issue #152).
+/// Resolution status carried by labeled `CALLS` edges (issues #152/#134).
 ///
-/// The vocabulary is shared with the precision work in issue #134 so both
-/// slices label call edges through one field:
+/// Emitted by the deterministic repo-wide cross-file resolution pass (issue
+/// #152) and by the same-file labeling pass over per-file `CALLS` edges
+/// backed by Tree-sitter call sites (issue #134). Both slices label call
+/// edges through one field:
 ///
 /// - `resolved` — the call site's name (plus any syntactic path/receiver
 ///   narrowing) matched exactly one in-repo definition.
@@ -985,8 +995,10 @@ pub enum GraphRecord {
         /// Optional extraction confidence.
         #[serde(skip_serializing_if = "Option::is_none")]
         confidence: Option<String>,
-        /// Cross-file call resolution status (issue #152); present on `CALLS`
-        /// edges emitted by the repo-wide resolution pass, absent elsewhere.
+        /// Call resolution status (issues #152/#134); present on `CALLS`
+        /// edges emitted by the repo-wide resolution pass and on same-file
+        /// `CALLS` edges backed by a Tree-sitter call site, absent elsewhere
+        /// (absence means "outside the resolution contract", not "resolved").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resolution: Option<CallResolution>,
         /// Git and bitemporal provenance for history-backed records.

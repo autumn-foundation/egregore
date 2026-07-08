@@ -40,6 +40,7 @@ mod memory_audit;
 mod memory_health;
 mod memory_recall;
 mod memory_recall_corpus;
+mod phantom_call_edges;
 mod preference_approval;
 mod producer_version;
 mod protected_artifacts;

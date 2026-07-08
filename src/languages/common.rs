@@ -58,6 +58,12 @@ pub fn next_symbol_ordinal(
 /// `::name(`, `.name(`) gets a `Calls` edge; any other identifier reference
 /// gets a `References` edge. Self-references (body ID == target ID) and
 /// name-equality guard loops (name == body name) are skipped.
+///
+/// Precision contract (issue #134): callers must supply [`SymbolBody::text`]
+/// built by [`reference_text`], so names that appear only inside comments or
+/// string literals never produce an edge, and substring occurrences never
+/// classify as calls ([`contains_identifier`] / [`looks_like_call`] both
+/// require identifier token boundaries).
 pub fn emit_reference_edges(
     graph: &mut Graph,
     definitions: &BTreeMap<String, String>,
@@ -86,6 +92,60 @@ pub fn emit_reference_edges(
                     format!("{} references {name}", body.name),
                 );
             }
+        }
+    }
+}
+
+/// Returns a symbol body's source text with comment and string-literal
+/// content removed, for same-file reference-edge matching (issue #134).
+///
+/// Every descendant node (named or anonymous, including tokens inside macro
+/// token trees) whose kind appears in `excluded_kinds` is replaced by a single
+/// space, so a definition name that occurs only inside a comment, a string
+/// literal, or another excluded node can never satisfy
+/// [`contains_identifier`] or [`looks_like_call`]. The exclusion list is
+/// per-language because Tree-sitter grammars name their comment and literal
+/// nodes differently. Output is deterministic: ranges come from one pre-order
+/// AST walk that never descends into an excluded node.
+#[must_use]
+pub fn reference_text(node: Node<'_>, source: &str, excluded_kinds: &[&str]) -> String {
+    let mut excluded_ranges: Vec<(usize, usize)> = Vec::new();
+    collect_excluded_ranges(node, excluded_kinds, &mut excluded_ranges);
+    let start = node.start_byte();
+    let text = &source[start..node.end_byte()];
+    if excluded_ranges.is_empty() {
+        return text.to_owned();
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (range_start, range_end) in excluded_ranges {
+        let relative_start = range_start - start;
+        let relative_end = range_end - start;
+        if relative_start > cursor {
+            result.push_str(&text[cursor..relative_start]);
+        }
+        result.push(' ');
+        cursor = cursor.max(relative_end);
+    }
+    if cursor < text.len() {
+        result.push_str(&text[cursor..]);
+    }
+    result
+}
+
+/// Collects the byte ranges of descendant nodes whose kind is excluded from
+/// reference matching, in source order, without descending into matches.
+fn collect_excluded_ranges(
+    node: Node<'_>,
+    excluded_kinds: &[&str],
+    excluded_ranges: &mut Vec<(usize, usize)>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if excluded_kinds.contains(&child.kind()) {
+            excluded_ranges.push((child.start_byte(), child.end_byte()));
+        } else {
+            collect_excluded_ranges(child, excluded_kinds, excluded_ranges);
         }
     }
 }
@@ -261,14 +321,20 @@ const fn is_ident_byte(b: u8) -> bool {
 /// True when `text` invokes `name` — i.e. the (possibly path-qualified) simple
 /// name is immediately followed by `(`, as a direct call `name(`, an associated
 /// call `::name(`, or a method call `.name(`.
+///
+/// The occurrence must start at an identifier token boundary, so `run(` inside
+/// `prerun(` never classifies a mention of `run` as a call (issue #134).
 #[must_use]
 pub fn looks_like_call(text: &str, name: &str) -> bool {
     let simple_name = name.rsplit("::").next().unwrap_or(name);
     let simple_name = simple_name.rsplit('.').next().unwrap_or(simple_name);
-    let direct = format!("{simple_name}(");
-    let associated = format!("::{simple_name}(");
-    let method = format!(".{simple_name}(");
-    text.contains(&direct) || text.contains(&associated) || text.contains(&method)
+    if simple_name.is_empty() {
+        return false;
+    }
+    let needle = format!("{simple_name}(");
+    let bytes = text.as_bytes();
+    text.match_indices(&needle)
+        .any(|(idx, _)| idx == 0 || !is_ident_byte(bytes[idx - 1]))
 }
 
 /// True when `name` occurs in `text` as a standalone identifier.
@@ -321,5 +387,15 @@ mod tests {
         assert!(looks_like_call("Type::assoc()", "assoc"));
         assert!(looks_like_call("pkg.mod.func()", "func"));
         assert!(!looks_like_call("let x = foo;", "foo"));
+    }
+
+    #[test]
+    fn looks_like_call_requires_identifier_boundary() {
+        // `run(` inside `prerun(` must not classify `run` as called (issue #134).
+        assert!(!looks_like_call("prerun()", "run"));
+        assert!(!looks_like_call("let x = run; prerun()", "run"));
+        assert!(looks_like_call("let x = prerun; run()", "run"));
+        assert!(looks_like_call("(run())", "run"));
+        assert!(!looks_like_call("anything", ""));
     }
 }

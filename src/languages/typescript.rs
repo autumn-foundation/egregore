@@ -10,7 +10,7 @@ use crate::{
     ir::{EdgeLabel, Graph, GraphRecord, NodeKind, stable_id},
     languages::common::{
         SymbolBody, add_graph_edge, collapse_whitespace, emit_reference_edges, identifier_text,
-        next_symbol_ordinal, node_name, normalize_c_like_code, path_segments, span,
+        next_symbol_ordinal, node_name, normalize_c_like_code, path_segments, reference_text, span,
     },
 };
 
@@ -92,6 +92,12 @@ struct PendingHeritage {
     base_name: String,
     summary: String,
 }
+
+/// Tree-sitter node kinds whose text never yields reference edges (issue #134):
+/// comment, string, and regex content must not produce `CALLS`/`REFERENCES`
+/// matches. `string_fragment` (not `string`/`template_string`) is excluded so
+/// template-literal `${…}` interpolation expressions still count as code.
+const REFERENCE_EXCLUDED_KINDS: &[&str] = &["comment", "string_fragment", "regex_pattern"];
 
 struct TypeScriptExtractor<'graph, 'source> {
     file: &'source SourceFile,
@@ -265,7 +271,6 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
             self.walk_children(node);
             return;
         };
-        let node_text = self.node_text(node);
         let qualified_name = self.qualify(&local_name);
         let symbol_kind = if self.is_test_file {
             "test"
@@ -278,7 +283,7 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
         self.symbol_bodies.push(SymbolBody {
             id: id.clone(),
             name: qualified_name,
-            text: node_text.to_owned(),
+            text: reference_text(node, self.source, REFERENCE_EXCLUDED_KINDS),
         });
 
         self.scope_stack.push(Scope {
@@ -300,7 +305,6 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
             self.walk_children(node);
             return;
         };
-        let node_text = self.node_text(node);
         let qualified_name = self.qualify(&local_name);
         let symbol_kind = if self.is_test_file { "test" } else { "method" };
         let id = self.add_symbol(node, symbol_kind, &qualified_name);
@@ -309,7 +313,7 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
         self.symbol_bodies.push(SymbolBody {
             id: id.clone(),
             name: qualified_name,
-            text: node_text.to_owned(),
+            text: reference_text(node, self.source, REFERENCE_EXCLUDED_KINDS),
         });
 
         self.scope_stack.push(Scope {
@@ -347,7 +351,6 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
             let is_func = value_node
                 .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression"));
             if is_func {
-                let node_text = self.node_text(declarator);
                 let symbol_kind = if self.is_test_file {
                     "test"
                 } else {
@@ -359,7 +362,7 @@ impl<'graph, 'source> TypeScriptExtractor<'graph, 'source> {
                 self.symbol_bodies.push(SymbolBody {
                     id,
                     name: qualified_name,
-                    text: node_text.to_owned(),
+                    text: reference_text(declarator, self.source, REFERENCE_EXCLUDED_KINDS),
                 });
             } else {
                 let id = self.add_symbol(declarator, "variable", &qualified_name);

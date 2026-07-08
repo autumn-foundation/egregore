@@ -106,7 +106,7 @@ Initial edge labels:
 | `CONTAINS` | Repository/Directory/File/Module -> child | Hierarchical ownership |
 | `DEFINES` | File/Module -> Symbol | Definition lives here |
 | `IMPORTS` | File/Module -> Import | Import declaration appears here |
-| `REFERENCES` | Symbol/Import -> Symbol | Best-effort syntactic reference (same-file) |
+| `REFERENCES` | Symbol/Import -> Symbol | Best-effort syntactic reference (same-file); comment and string-literal text never matches (issue #134) |
 | `CALLS` | Symbol -> Symbol/Diagnostic | Function or method call; resolved repo-wide across files for Rust and labeled with a `resolution` status (see below) |
 | `IMPLEMENTS` | Symbol -> Symbol | Impl/trait relationship where syntactically resolvable |
 | `MENTIONS` | Symbol -> Symbol | Weaker unresolved textual/syntactic mention |
@@ -120,14 +120,25 @@ Initial edge labels:
 
 Rust `CALLS` edges are produced by two deterministic passes:
 
-1. The per-file pass links call sites to definitions in the same file.
+1. The per-file pass links call sites to definitions in the same file. Reference
+   matching runs over AST-derived text with comment and string-literal content
+   removed, so a name that appears only inside a comment or string literal never
+   produces a `CALLS`, `REFERENCES`, or `MENTIONS` edge, and a name occurring only
+   as a substring of a longer identifier never classifies as a call (issue #134).
 2. A repo-wide resolution pass links call sites to definitions in **other files of the
    same scanned repository**, using only facts the scan already extracts (Tree-sitter
    call expressions, module paths, qualified names, impl owners). Call sites come from
    the AST, so names appearing only in comments, string literals, macro token trees, or
    as substrings of longer identifiers never produce edges.
 
-Every edge emitted by the repo-wide pass carries a `resolution` field:
+Every edge emitted by the repo-wide pass carries a `resolution` field. Same-file
+`CALLS` edges backed by a Tree-sitter call site carry the same field, computed
+against the repo-wide definition index (issue #134): a same-file call whose simple
+name also matches definitions in other files is labeled `ambiguous`, and an
+`ambiguous` label clears the asserted `1.0` confidence. Per-file `CALLS` edges with
+no corresponding Tree-sitter call site (calls inside macro token trees,
+constructor-style textual matches) carry no `resolution` field — absence means
+"outside the resolution contract", never "resolved".
 
 | `resolution` | Meaning |
 |--------------|---------|

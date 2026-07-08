@@ -43,3 +43,9 @@ macro_rules! my_macro {
 my_macro!(macro_function);
 
 pub const DECOY_STR: &str = "free_function(20);";
+
+pub fn decoy_host() -> usize {
+    // A comment decoy inside a body: free_function(30);
+    let _decoy = "free_function(40);";
+    9
+}

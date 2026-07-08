@@ -213,6 +213,95 @@ pub fn cross_file_call_records(
     records
 }
 
+/// Attaches a [`CallResolution`] status to same-file `CALLS` edges emitted by
+/// the per-file reference pass (issue #134).
+///
+/// For every Tree-sitter call site whose candidate set includes a definition
+/// in the caller's own file, the (caller, target) pair is labeled `resolved`
+/// (exactly one in-repo candidate) or `ambiguous` (two or more in-repo
+/// candidates) on the already-emitted per-file edge. Edge IDs, sources,
+/// targets, and summaries are untouched, so stable-ID contracts hold; an
+/// `ambiguous` label also clears the asserted `1.0` confidence, matching the
+/// repo-wide pass. Per-file `CALLS` edges with no corresponding call site
+/// (e.g. calls inside macro token trees, constructor-style matches) keep no
+/// resolution field — absence means "outside the resolution contract", never
+/// "resolved".
+///
+/// The pass is deterministic: pair statuses come from `BTreeMap` iteration
+/// and repeated call sites for one pair keep the strongest status.
+pub fn label_same_file_call_resolutions(
+    records: &mut [GraphRecord],
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) {
+    let resolutions = same_file_call_resolutions(facts_by_file);
+    if resolutions.is_empty() {
+        return;
+    }
+    for record in records {
+        let GraphRecord::Edge {
+            label: EdgeLabel::Calls,
+            source,
+            target,
+            confidence,
+            resolution,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if resolution.is_some() {
+            continue;
+        }
+        let Some(status) = resolutions.get(&(source.clone(), target.clone())) else {
+            continue;
+        };
+        *resolution = Some(*status);
+        if *status == CallResolution::Ambiguous {
+            *confidence = None;
+        }
+    }
+}
+
+/// Computes the resolution status for every same-file (caller, target) call
+/// pair backed by a Tree-sitter call site.
+///
+/// Candidate counting is repo-wide (a same-file call whose simple name also
+/// matches definitions in other files is `ambiguous`), but only pairs whose
+/// candidate lives in the caller's file are returned — cross-file pairs are
+/// emitted with their status by [`cross_file_call_records`].
+fn same_file_call_resolutions(
+    facts_by_file: &BTreeMap<String, FileFacts>,
+) -> BTreeMap<(String, String), CallResolution> {
+    let index = DefinitionIndex::build(facts_by_file);
+    let mut resolutions = BTreeMap::new();
+    for (path, facts) in facts_by_file {
+        for call in &facts.call_sites {
+            let Some(simple_name) = call.callee_segments.last() else {
+                continue;
+            };
+            let candidates = index.candidates(call, simple_name);
+            let status = match candidates.len() {
+                0 => continue,
+                1 => CallResolution::Resolved,
+                _ => CallResolution::Ambiguous,
+            };
+            for candidate in candidates {
+                if candidate.repo_relative_path != *path || candidate.id == call.caller_id {
+                    continue;
+                }
+                let entry = resolutions
+                    .entry((call.caller_id.clone(), candidate.id.clone()))
+                    .or_insert(status);
+                // Prefer the strongest status when several call sites hit one pair.
+                if status < *entry {
+                    *entry = status;
+                }
+            }
+        }
+    }
+    resolutions
+}
+
 fn record_candidate_edge(
     caller_path: &str,
     call: &CallSiteFact,
@@ -569,6 +658,112 @@ mod tests {
             records.is_empty(),
             "constructor-style and external method calls stay out of the graph: {records:?}"
         );
+    }
+
+    fn per_file_calls_edge(source: &str, target: &str) -> GraphRecord {
+        GraphRecord::edge(
+            EdgeLabel::Calls,
+            source.to_owned(),
+            target.to_owned(),
+            Some("1.0".to_owned()),
+            format!("{source} calls {target}"),
+        )
+    }
+
+    #[test]
+    fn same_file_unique_call_pair_is_labeled_resolved() {
+        let facts = facts(&[(
+            "src/a.rs",
+            vec![definition(
+                "helper",
+                "function",
+                "src/a.rs",
+                &["a", "helper"],
+            )],
+            vec![call(
+                "caller",
+                "helper",
+                &["helper"],
+                CallKind::Direct,
+                None,
+            )],
+        )]);
+        let mut records = vec![per_file_calls_edge("caller", "helper")];
+        label_same_file_call_resolutions(&mut records, &facts);
+        assert_eq!(records[0].resolution(), Some(CallResolution::Resolved));
+        assert!(
+            matches!(
+                &records[0],
+                GraphRecord::Edge {
+                    confidence: Some(confidence),
+                    ..
+                } if confidence == "1.0"
+            ),
+            "a resolved edge keeps its asserted confidence"
+        );
+    }
+
+    #[test]
+    fn same_file_collision_pair_is_labeled_ambiguous_and_drops_confidence() {
+        let facts = facts(&[
+            (
+                "src/a.rs",
+                vec![definition("a-dupe", "function", "src/a.rs", &["a", "dupe"])],
+                vec![call("caller", "dupe", &["dupe"], CallKind::Direct, None)],
+            ),
+            (
+                "src/b.rs",
+                vec![definition("b-dupe", "function", "src/b.rs", &["b", "dupe"])],
+                vec![],
+            ),
+        ]);
+        let mut records = vec![per_file_calls_edge("caller", "a-dupe")];
+        label_same_file_call_resolutions(&mut records, &facts);
+        assert_eq!(records[0].resolution(), Some(CallResolution::Ambiguous));
+        assert!(
+            matches!(
+                &records[0],
+                GraphRecord::Edge {
+                    confidence: None,
+                    ..
+                }
+            ),
+            "an ambiguous edge must not assert full confidence: {:?}",
+            records[0]
+        );
+    }
+
+    #[test]
+    fn edges_without_a_call_site_or_with_a_status_are_untouched() {
+        let facts = facts(&[(
+            "src/a.rs",
+            vec![definition(
+                "helper",
+                "function",
+                "src/a.rs",
+                &["a", "helper"],
+            )],
+            vec![call(
+                "caller",
+                "helper",
+                &["helper"],
+                CallKind::Direct,
+                None,
+            )],
+        )]);
+        // A macro-arg style per-file edge (no Tree-sitter call site) and an
+        // already-labeled cross-file edge must both stay as-is.
+        let mut records = vec![
+            per_file_calls_edge("other-caller", "helper"),
+            per_file_calls_edge("caller", "helper").with_resolution(CallResolution::Unresolved),
+        ];
+        label_same_file_call_resolutions(&mut records, &facts);
+        assert_eq!(
+            records[0].resolution(),
+            None,
+            "a pair with no call-site backing stays outside the resolution contract"
+        );
+        assert_eq!(records[1].resolution(), Some(CallResolution::Unresolved));
     }
 
     #[test]

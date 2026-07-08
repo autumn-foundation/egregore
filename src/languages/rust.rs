@@ -11,7 +11,7 @@ use crate::{
     languages::{
         common::{
             SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, node_name,
-            path_segments, span,
+            path_segments, reference_text, span,
         },
         cross_file::{CallKind, CallSiteFact, DefinitionFact, FileFacts},
     },
@@ -72,6 +72,16 @@ pub fn extract_file_source(
     extractor.emit_reference_edges();
     Ok(extractor.facts)
 }
+
+/// Tree-sitter node kinds whose text never yields reference edges (issue #134):
+/// comment and literal content must not produce `CALLS`/`REFERENCES` matches.
+const REFERENCE_EXCLUDED_KINDS: &[&str] = &[
+    "line_comment",
+    "block_comment",
+    "string_literal",
+    "raw_string_literal",
+    "char_literal",
+];
 
 #[derive(Debug, Clone)]
 struct ImplContext {
@@ -224,7 +234,6 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             self.walk_children(node);
             return;
         };
-        let node_text = self.node_text(node);
         let (symbol_kind, qualified_name) = self.impl_context.as_ref().map_or_else(
             || {
                 if self.is_test_function(node) {
@@ -256,7 +265,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         self.symbol_bodies.push(SymbolBody {
             id,
             name: qualified_name,
-            text: node_text.to_owned(),
+            text: reference_text(node, self.source, REFERENCE_EXCLUDED_KINDS),
         });
         self.walk_children(node);
     }

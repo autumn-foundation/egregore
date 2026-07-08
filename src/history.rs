@@ -145,6 +145,11 @@ fn scan_repository_history_inner(
         }
 
         let mut facts_by_file = BTreeMap::new();
+        // Records pushed from here on belong to this commit's replayed tree;
+        // the same-file resolution labeling pass (issue #134) must only see
+        // this commit's slice because the same stable edge ID can recur across
+        // commits with different in-repo definition sets.
+        let commit_records_start = graph.records().len();
         for path in list_indexed_source_files(repo_root, &commit.sha)? {
             let change_id = change_ids_by_path.get(&path);
             let source = git_blob(repo_root, &commit.sha, &path)?;
@@ -197,6 +202,11 @@ fn scan_repository_history_inner(
         {
             graph.push(record.with_temporal(commit.temporal()));
         }
+        // Same-file resolution labeling (issue #134) over this commit's slice.
+        crate::languages::cross_file::label_same_file_call_resolutions(
+            &mut graph.records_mut()[commit_records_start..],
+            &facts_by_file,
+        );
     }
 
     let languages = crate::languages_in_graph(&graph);

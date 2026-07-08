@@ -11,7 +11,7 @@ use crate::{
     languages::common::{
         SymbolBody, add_graph_edge, collapse_whitespace, descendant_kinds, emit_reference_edges,
         identifier_text, next_symbol_ordinal, node_name, normalize_c_like_code, path_segments,
-        span,
+        reference_text, span,
     },
 };
 
@@ -72,6 +72,15 @@ struct PendingHeritage {
     base_name: String,
     summary: String,
 }
+
+/// Tree-sitter node kinds whose text never yields reference edges (issue #134):
+/// comment and literal content must not produce `CALLS`/`REFERENCES` matches.
+const REFERENCE_EXCLUDED_KINDS: &[&str] = &[
+    "comment",
+    "interpreted_string_literal",
+    "raw_string_literal",
+    "rune_literal",
+];
 
 struct GoExtractor<'graph, 'source> {
     file: &'source SourceFile,
@@ -181,7 +190,7 @@ impl<'graph, 'source> GoExtractor<'graph, 'source> {
         self.symbol_bodies.push(SymbolBody {
             id,
             name: qualified_name,
-            text: self.node_text(node).to_owned(),
+            text: reference_text(node, self.source, REFERENCE_EXCLUDED_KINDS),
         });
     }
 
@@ -203,7 +212,7 @@ impl<'graph, 'source> GoExtractor<'graph, 'source> {
         self.symbol_bodies.push(SymbolBody {
             id,
             name: qualified_name,
-            text: self.node_text(node).to_owned(),
+            text: reference_text(node, self.source, REFERENCE_EXCLUDED_KINDS),
         });
     }
 
