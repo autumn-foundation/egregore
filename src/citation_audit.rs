@@ -457,7 +457,10 @@ fn classify_code_handle(
         // A `File` source fact is cited by its repo-relative path: a scan emits
         // `File` nodes with a path but no span, and the public context / changes /
         // subsystem rows treat the whole-file path as the citation handle.
-        (Some(p), None) if kind == "File" => Classified {
+        // A `DependencyDeclaration` (issue #180) follows the same rule: the fact
+        // is scoped to a whole `Cargo.toml` manifest, so the repo-relative
+        // manifest path is the citation handle and span absence is legitimate.
+        (Some(p), None) if kind == "File" || kind == "DependencyDeclaration" => Classified {
             row: RowClassification {
                 record_id: record_id.to_owned(),
                 trust_class: "source_fact",

@@ -13006,7 +13006,9 @@ pub(crate) fn trust_class_for(record: &GraphRecord) -> &'static str {
         "Verification" | "CommandEvidence" | "CommandRun" | "TestRun" | "CIStatus"
         | "BenchmarkRun" | "CoverageReport" | "ProofResult" => "verification_evidence",
         "File" | "Symbol" | "Module" | "Import" | "Commit" | "Change" | "Repository"
-        | "PanicRiskSite" | "DebtMarker" | "UnsafeSite" => "source_fact",
+        | "PanicRiskSite" | "DebtMarker" | "UnsafeSite" | "DependencyDeclaration" => {
+            "source_fact"
+        }
         "Task"
         | "AcceptanceCriterion"
         | "LocalTask"

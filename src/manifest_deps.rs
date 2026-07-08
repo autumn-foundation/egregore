@@ -10,7 +10,9 @@
 //! real TOML parser (`toml_edit`); `cargo build`/`cargo check`/`cargo
 //! metadata` are never invoked and no network access occurs. When no lockfile
 //! is present, declarations are still captured and marked with the documented
-//! `no_lockfile` resolution — a resolved version is never fabricated.
+//! `no_lockfile` resolution; when the nearest `Cargo.lock` exists but cannot
+//! be read or parsed, they are marked `lockfile_unreadable` and an ancestor
+//! lockfile is never consulted — a resolved version is never fabricated.
 //!
 //! Out of scope (per issue #180): the transitive dependency tree, feature
 //! unification, target-specific (`[target.'cfg(..)'.dependencies]`) and
@@ -78,6 +80,9 @@ pub enum LockResolution {
     NotInLockfile,
     /// The lockfile lists two or more versions of the crate; none is chosen.
     AmbiguousInLockfile,
+    /// The nearest `Cargo.lock` exists but could not be read or parsed; an
+    /// ancestor lockfile is never consulted in its place (PR #314 review).
+    LockfileUnreadable,
 }
 
 impl LockResolution {
@@ -89,6 +94,7 @@ impl LockResolution {
             Self::NoLockfile => "no_lockfile",
             Self::NotInLockfile => "not_in_lockfile",
             Self::AmbiguousInLockfile => "ambiguous_in_lockfile",
+            Self::LockfileUnreadable => "lockfile_unreadable",
         }
     }
 
@@ -108,10 +114,25 @@ pub struct LockfileIndex {
     versions: BTreeMap<String, BTreeSet<String>>,
 }
 
+/// Outcome of locating the nearest `Cargo.lock` for one manifest.
+#[derive(Debug, Clone)]
+pub enum LockfileStatus {
+    /// The nearest lockfile was read and parsed cleanly.
+    Found(LockfileIndex),
+    /// The nearest `Cargo.lock` exists but could not be read or parsed. The
+    /// search stops here: resolving from an unrelated ancestor lockfile would
+    /// fabricate versions, so every dependency of the manifest is marked
+    /// `lockfile_unreadable` instead (PR #314 review).
+    Invalid,
+    /// No `Cargo.lock` exists between the manifest and the repository root.
+    Absent,
+}
+
 impl LockfileIndex {
     /// Parses a `Cargo.lock` body. Returns `None` when the lockfile is not
-    /// valid TOML — a corrupt lockfile is treated as absent rather than a
-    /// source of guessed versions.
+    /// valid TOML — callers mark the manifest's dependencies
+    /// `lockfile_unreadable` rather than guessing versions or falling back
+    /// to an ancestor lockfile.
     #[must_use]
     pub fn parse(lockfile_text: &str) -> Option<Self> {
         let doc = lockfile_text.parse::<toml_edit::DocumentMut>().ok()?;
@@ -260,7 +281,7 @@ pub fn manifest_dependency_records(
     repository_id: &str,
     manifest_path: &str,
     manifest_text: &str,
-    lockfile: Option<&LockfileIndex>,
+    lockfile: &LockfileStatus,
 ) -> Vec<GraphRecord> {
     let Ok(parsed) = parse_manifest_dependencies(manifest_text) else {
         return vec![unparseable_manifest_diagnostic(
@@ -292,11 +313,13 @@ fn dependency_record(
     manifest_path: &str,
     declaring_package: &str,
     declaration: &DeclaredDependency,
-    lockfile: Option<&LockfileIndex>,
+    lockfile: &LockfileStatus,
 ) -> GraphRecord {
-    let resolution = lockfile.map_or(LockResolution::NoLockfile, |index| {
-        index.resolve(&declaration.name)
-    });
+    let resolution = match lockfile {
+        LockfileStatus::Found(index) => index.resolve(&declaration.name),
+        LockfileStatus::Invalid => LockResolution::LockfileUnreadable,
+        LockfileStatus::Absent => LockResolution::NoLockfile,
+    };
     let id = stable_id(&[
         "node",
         "dependency-declaration",
@@ -365,7 +388,7 @@ fn unparseable_manifest_diagnostic(repository_id: &str, manifest_path: &str) -> 
 /// Returns an error when manifest discovery cannot read the filesystem.
 pub fn scan_dependency_records(repo_root: &Path, repository_id: &str) -> Result<Vec<GraphRecord>> {
     let mut records = Vec::new();
-    let mut lockfile_cache: BTreeMap<String, Option<LockfileIndex>> = BTreeMap::new();
+    let mut lockfile_cache: BTreeMap<String, LockfileStatus> = BTreeMap::new();
     for manifest in discover_cargo_manifests(repo_root)? {
         let Ok(manifest_text) = std::fs::read_to_string(&manifest.path) else {
             // An unreadable manifest is reported like an unparseable one:
@@ -382,45 +405,55 @@ pub fn scan_dependency_records(repo_root: &Path, repository_id: &str) -> Result<
             repository_id,
             &manifest.repo_relative_path,
             &manifest_text,
-            lockfile.as_ref(),
+            &lockfile,
         ));
     }
     Ok(records)
 }
 
 /// Finds and parses the nearest `Cargo.lock`, walking from the manifest's
-/// directory up to the repository root. Parsed lockfiles are cached per
-/// directory so workspace members sharing a root lockfile parse it once.
+/// directory up to the repository root. Per-directory outcomes are cached so
+/// workspace members sharing a root lockfile parse it once.
+///
+/// The nearest `Cargo.lock` that *exists* is authoritative: when it fails to
+/// read or parse, the walk stops with [`LockfileStatus::Invalid`] instead of
+/// consulting an ancestor lockfile whose versions would be unrelated
+/// fabrications (PR #314 review).
 fn nearest_lockfile(
     repo_root: &Path,
     manifest_repo_relative_path: &str,
-    cache: &mut BTreeMap<String, Option<LockfileIndex>>,
-) -> Option<LockfileIndex> {
+    cache: &mut BTreeMap<String, LockfileStatus>,
+) -> LockfileStatus {
     let mut segments: Vec<&str> = manifest_repo_relative_path.split('/').collect();
     // Drop the `Cargo.toml` file name, keeping the containing directory.
     segments.pop();
     loop {
         let dir_key = segments.join("/");
-        if let Some(cached) = cache.get(&dir_key) {
-            if let Some(index) = cached {
-                return Some(index.clone());
-            }
-        } else {
+        let status = cache.get(&dir_key).cloned().unwrap_or_else(|| {
             let mut candidate = repo_root.to_path_buf();
             for segment in &segments {
                 candidate.push(segment);
             }
             candidate.push("Cargo.lock");
-            let parsed = std::fs::read_to_string(&candidate)
-                .ok()
-                .and_then(|text| LockfileIndex::parse(&text));
-            let found = parsed.is_some();
-            cache.insert(dir_key, parsed.clone());
-            if found {
-                return parsed;
-            }
+            let status = match std::fs::read_to_string(&candidate) {
+                Ok(text) => LockfileIndex::parse(&text)
+                    .map_or(LockfileStatus::Invalid, LockfileStatus::Found),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    LockfileStatus::Absent
+                }
+                // The file exists (or its state is unknowable) but cannot be
+                // read: it must not be skipped in favor of an ancestor.
+                Err(_) => LockfileStatus::Invalid,
+            };
+            cache.insert(dir_key, status.clone());
+            status
+        });
+        if !matches!(status, LockfileStatus::Absent) {
+            return status;
         }
-        segments.pop()?;
+        if segments.pop().is_none() {
+            return LockfileStatus::Absent;
+        }
     }
 }
 
@@ -582,14 +615,40 @@ version = "2.0.0"
     }
 
     #[test]
-    fn corrupt_lockfile_is_treated_as_absent() {
+    fn corrupt_lockfile_fails_parse() {
         assert!(LockfileIndex::parse("not [ valid toml").is_none());
     }
 
     #[test]
+    fn invalid_nearest_lockfile_marks_every_fact_lockfile_unreadable() {
+        let records = manifest_dependency_records(
+            "repo-id",
+            "Cargo.toml",
+            "[package]\nname = \"pkg\"\n\n[dependencies]\nserde = \"1\"\n",
+            &LockfileStatus::Invalid,
+        );
+        assert_eq!(records.len(), 1);
+        let payload = records[0].dependency().expect("dependency payload");
+        assert_eq!(payload.resolution, "lockfile_unreadable");
+        assert_eq!(
+            payload.resolved_version, None,
+            "an invalid nearest lockfile must never yield a resolved version"
+        );
+        assert_eq!(
+            payload.declared_requirement.as_deref(),
+            Some("1"),
+            "the declared requirement is still captured as written"
+        );
+    }
+
+    #[test]
     fn malformed_manifest_yields_one_diagnostic_record() {
-        let records =
-            manifest_dependency_records("repo-id", "Cargo.toml", "[package\nbroken", None);
+        let records = manifest_dependency_records(
+            "repo-id",
+            "Cargo.toml",
+            "[package\nbroken",
+            &LockfileStatus::Absent,
+        );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_kind_name(), Some("Diagnostic"));
     }
@@ -600,7 +659,7 @@ version = "2.0.0"
             "repo-id",
             "Cargo.toml",
             "[workspace]\nmembers = [\"a\"]\n",
-            None,
+            &LockfileStatus::Absent,
         );
         assert!(records.is_empty());
     }

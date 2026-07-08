@@ -576,6 +576,58 @@ fn dependency_records_pass_referential_validation() {
 }
 
 // ---------------------------------------------------------------------------
+// PR #314 review: an invalid nearest lockfile must stop the upward search
+// ---------------------------------------------------------------------------
+
+/// A corrupt `Cargo.lock` sitting next to a member manifest must never be
+/// skipped in favor of a valid ancestor lockfile: the nearest lockfile is the
+/// authority, and when it cannot be read or parsed the dependencies are
+/// marked `lockfile_unreadable` — a version from an unrelated parent lockfile
+/// is a fabricated resolution.
+#[test]
+fn corrupt_nearest_lockfile_stops_the_search_never_resolving_from_ancestor() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    write_fixture(&repo);
+    // Nearest lockfile for pkg-a: exists but is not valid TOML.
+    fs::write(repo.join("crates/pkg-a/Cargo.lock"), "not [ valid toml")
+        .expect("corrupt nested lockfile");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("deps-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let nodes = dependency_nodes(&graph);
+    for node in nodes
+        .iter()
+        .filter(|n| n["dependency"]["declaring_package"] == "pkg-a")
+    {
+        assert_eq!(
+            node["dependency"]["resolution"], "lockfile_unreadable",
+            "pkg-a dependency {} must carry the invalid-nearest-lockfile marker",
+            node["name"]
+        );
+        assert!(
+            node["dependency"]["resolved_version"].is_null(),
+            "pkg-a dependency {} must never resolve from the ancestor lockfile",
+            node["name"]
+        );
+    }
+    // The sibling crate has no nested lockfile: it still resolves from the
+    // valid root lockfile.
+    let serde_b = nodes
+        .iter()
+        .find(|n| n["dependency"]["declaring_package"] == "local-b" && n["name"] == "serde")
+        .expect("local-b serde fact");
+    assert_eq!(serde_b["dependency"]["resolution"], "locked");
+    assert_eq!(serde_b["dependency"]["resolved_version"], "1.0.228");
+}
+
+// ---------------------------------------------------------------------------
 // Robustness: a malformed manifest degrades to a diagnostic, never a panic
 // ---------------------------------------------------------------------------
 

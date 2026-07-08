@@ -65,6 +65,7 @@ and `[build-dependencies]` becomes one `DependencyDeclaration` node per
   | `no_lockfile` | no `Cargo.lock` found for this manifest | absent |
   | `not_in_lockfile` | lockfile exists but does not list the crate | absent |
   | `ambiguous_in_lockfile` | the lockfile lists two or more versions | absent — never a guess |
+  | `lockfile_unreadable` | the **nearest** `Cargo.lock` exists but could not be read or parsed | absent — an ancestor lockfile is never consulted in its place |
 
 - **`declaring_package`** — `[package].name` of the owning manifest.
 - **manifest handle** — the node's `repo_relative_path` is the owning
@@ -72,8 +73,11 @@ and `[build-dependencies]` becomes one `DependencyDeclaration` node per
 
 A manifest that fails TOML parsing yields one `Diagnostic` node citing the
 manifest handle; the scan never fails and never invents facts. A virtual
-workspace root (no `[package]`) legitimately declares nothing. A corrupt
-lockfile is treated as absent rather than a source of guessed versions.
+workspace root (no `[package]`) legitimately declares nothing. The nearest
+`Cargo.lock` that exists is authoritative: when it cannot be read or parsed,
+the upward search stops and the manifest's dependencies are marked
+`lockfile_unreadable` — versions are never taken from an unrelated ancestor
+lockfile.
 
 ## Scope and bounds
 
