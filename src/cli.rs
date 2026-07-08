@@ -2470,8 +2470,11 @@ fn import_antigravity_cmd(antigravity_path: &Path, out: &Path) -> Result<()> {
 ///
 /// The report is written after the records, so a matching path would silently
 /// replace the graph JSONL with the report while the command still exits 0.
-/// Paths are compared after lexical absolutization (no filesystem access, so
-/// not-yet-existing outputs still compare); `-` (stdout) never conflicts.
+/// Paths are compared after absolutization, lexical `.`/`..` collapsing, and
+/// canonicalization of the deepest existing ancestor, so aliases such as
+/// `tmp/../records.jsonl` vs `records.jsonl` (and symlinked parent
+/// directories) conflict even though the output files themselves do not exist
+/// yet; `-` (stdout) never conflicts.
 ///
 /// # Errors
 ///
@@ -2483,10 +2486,8 @@ fn ensure_report_path_distinct(out: &Path, redaction_report: Option<&Path>) -> R
     if report_path == Path::new("-") {
         return Ok(());
     }
-    let conflict = match (std::path::absolute(out), std::path::absolute(report_path)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => out == report_path,
-    };
+    let conflict =
+        resolve_output_path_for_collision(out) == resolve_output_path_for_collision(report_path);
     if conflict {
         anyhow::bail!(
             "--redaction-report path {} matches --out; the report would overwrite the \
@@ -2495,6 +2496,60 @@ fn ensure_report_path_distinct(out: &Path, redaction_report: Option<&Path>) -> R
         );
     }
     Ok(())
+}
+
+/// Resolves an output path for the `--out`/`--redaction-report` collision
+/// check without requiring the target file to exist.
+///
+/// Absolutizes against the cwd, lexically collapses `.`/`..` components, then
+/// canonicalizes the deepest existing ancestor and re-joins the remainder, so
+/// differing spellings of the same file (cwd-relative vs `..`-aliased vs
+/// through a symlinked parent directory) compare equal. Falls back to the
+/// lexically normalized form when no ancestor exists.
+fn resolve_output_path_for_collision(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let normalized = lexically_normalize(&abs);
+    let mut existing = normalized.as_path();
+    let mut remainder: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canonical) = existing.canonicalize() {
+            let mut resolved = canonical;
+            for part in remainder.iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                remainder.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return normalized,
+        }
+    }
+}
+
+/// Lexically collapses `.` and `..` components of an already-absolute path.
+///
+/// No filesystem access, so paths that do not exist yet still normalize
+/// deterministically; `..` at the root stays at the root.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop a named component; `..` above the root (or prefix) is
+                // the root itself, so it drops.
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Emits the import status line and, when requested, the issue #266 redaction

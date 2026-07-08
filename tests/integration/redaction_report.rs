@@ -597,6 +597,87 @@ fn import_codex_cli_rejects_report_path_equal_to_out() {
 }
 
 #[test]
+fn import_traj_cli_rejects_report_path_dotdot_alias_of_out() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let traj_path = write_secret_traj(temp.path());
+    fs::create_dir(temp.path().join("tmp")).expect("tmp subdir");
+
+    // `tmp/../records.jsonl` and `records.jsonl` name the same file; the
+    // guard must see through the `..` alias, not just prefix the cwd.
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .current_dir(temp.path())
+        .arg("import-traj")
+        .arg(&traj_path)
+        .arg("--out")
+        .arg("tmp/../records.jsonl")
+        .arg("--redaction-report")
+        .arg("records.jsonl")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--redaction-report"));
+
+    assert!(
+        !temp.path().join("records.jsonl").exists(),
+        "neither artifact may be written when the report path is a `..` alias of --out"
+    );
+}
+
+#[test]
+fn import_codex_cli_rejects_report_path_dotdot_alias_of_out() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let codex_path = write_secret_codex(temp.path());
+    fs::create_dir(temp.path().join("tmp")).expect("tmp subdir");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .current_dir(temp.path())
+        .arg("import-codex")
+        .arg(&codex_path)
+        .arg("--out")
+        .arg("records.jsonl")
+        .arg("--redaction-report")
+        .arg("tmp/../records.jsonl")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--redaction-report"));
+
+    assert!(
+        !temp.path().join("records.jsonl").exists(),
+        "neither artifact may be written when the report path is a `..` alias of --out"
+    );
+}
+
+#[test]
+fn import_traj_cli_accepts_distinct_paths_with_dotdot_components() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let traj_path = write_secret_traj(temp.path());
+    fs::create_dir(temp.path().join("tmp")).expect("tmp subdir");
+
+    // `..` components that resolve to *different* files must still pass.
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .current_dir(temp.path())
+        .arg("import-traj")
+        .arg(&traj_path)
+        .arg("--out")
+        .arg("tmp/../records.jsonl")
+        .arg("--redaction-report")
+        .arg("tmp/../report.json")
+        .assert()
+        .success();
+
+    assert!(
+        temp.path().join("records.jsonl").exists(),
+        "records JSONL must be written for distinct `..`-spelled paths"
+    );
+    let body = fs::read_to_string(temp.path().join("report.json"))
+        .expect("report file must be written for distinct `..`-spelled paths");
+    let report: serde_json::Value = serde_json::from_str(body.trim()).expect("report is JSON");
+    assert_eq!(report["redaction"], "enabled");
+}
+
+#[test]
 fn import_without_report_flag_is_unchanged() {
     let temp = tempfile::tempdir().expect("temp dir");
     let out = temp.path().join("records.jsonl");
