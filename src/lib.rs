@@ -107,10 +107,10 @@ pub use ir::{
 };
 pub use local_project::import_local_tasks;
 pub use query::{
-    ChangesContext, ChangesError, RepositoryIndex, RepositorySelectorError, SubsystemContext,
-    SubsystemPrefixError, SymbolContext, UnresolvedRef, active_policy, audit_trail,
-    changes_context, is_candidate_suppressed, path_is_under_prefix, pending_candidates,
-    subsystem_context, symbol_context,
+    ChangesContext, ChangesError, RangeDeltas, RangeDeltasError, RepositoryIndex,
+    RepositorySelectorError, SubsystemContext, SubsystemPrefixError, SymbolContext, UnresolvedRef,
+    active_policy, audit_trail, changes_context, is_candidate_suppressed, path_is_under_prefix,
+    pending_candidates, range_deltas, subsystem_context, symbol_context,
 };
 pub use schema_version::{
     RecordLineRead, RecordReadError, RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE,

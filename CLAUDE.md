@@ -38,6 +38,11 @@ cargo run -- query change-impact src/lib.rs --graph graph.jsonl           # file
 cargo run -- query change-impact codegraph:v1:zzz --graph graph.jsonl     # exit 1 (Unsupported)
 cargo run -- query change-impact does_not_exist --graph graph.jsonl        # exit 2 (no_match)
 cargo run -- query change-impact <symbol_name> --graph graph.jsonl --depth 2  # wider neighborhood
+
+# Symbol- and file-level deltas across a commit range (issue #118)
+cargo run -- query deltas <base_sha> <head_sha> --graph history.graph.jsonl  # exit 0 on match
+cargo run -- query deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
+cargo run -- query deltas ffffffffffff <head_sha> --graph history.graph.jsonl # exit 2 (missing_commit)
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -51,6 +56,16 @@ Output is a deterministic JSON envelope with trust-separated sections.
 Rows are leads to inspect before editing, not proof of breakage. The response is deterministic
 and byte-identical across runs. Default depth is 1 (direct neighbors only); use `--depth 2`
 for a wider BFS neighborhood. Output is a JSON envelope with an always-present disclaimer.
+
+`eg query deltas <base> <head>` returns the observed structural deltas between two commit
+handles (full SHA or unique prefix) from a `scan-history` graph or embedded store, grouped by
+stable change class (`added_symbols`, `removed_symbols`, `modified_symbols`, `added_files`,
+`removed_files`, `modified_files`, plus an `unresolved` diagnostic group). Renames surface as
+a removed+added pair. Each row carries a stable record ID, schema version, path, span when
+available, and the introducing commit with its valid time. Semantic drift inside the range is
+folded in where drift records exist and marked unavailable otherwise. Rows are observed
+deltas, never proof of behavior change; the response is deterministic and byte-identical
+across runs. See `docs/cli/deltas.md`.
 
 Protected raw-artifact commands (issue #60):
 
