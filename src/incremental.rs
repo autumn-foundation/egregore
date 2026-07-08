@@ -248,12 +248,14 @@ fn scan_repository_incremental_at_inner(
         .iter()
         .map(|record| record.id().to_owned())
         .collect();
-    let reusable_previous_ids = if can_reuse_cache_records {
-        previous_cache.cross_file_record_ids.clone()
-    } else {
-        Vec::new()
-    };
-    for stale_id in reusable_previous_ids
+    // Previous cross-file record IDs are tombstoned even when cache reuse is
+    // disabled (repository identity or cache schema mismatch): those IDs can
+    // embed the old repository identity, so the recomputed pass never re-emits
+    // them and a persisted store would otherwise keep them live forever. This
+    // mirrors the per-file path, which tombstones invalidated cached records
+    // regardless of reuse eligibility.
+    for stale_id in previous_cache
+        .cross_file_record_ids
         .iter()
         .filter(|previous_id| !cross_file_ids.contains(*previous_id))
     {
