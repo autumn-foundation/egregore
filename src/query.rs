@@ -20389,7 +20389,9 @@ fn producer_drift_record_row(record: &GraphRecord) -> ProducerDriftRecord<'_> {
 ///   merged into any other bucket (`docs/schema/producer-version.md` §6).
 ///
 /// With `repo_scope`, only records attributable to the scoped repository are
-/// considered (nodes by ID, edges by source node, tombstones by deleted ID);
+/// considered (nodes by ID, edges by source node, tombstones by deleted ID —
+/// a deleted *edge* ID resolves through the deleted edge's recorded source
+/// node, since the repository index owns node IDs only);
 /// unattributable records are excluded from a scoped run. Deterministic:
 /// output ordering depends only on record content and compile-time constants.
 #[must_use]
@@ -20414,12 +20416,36 @@ pub fn producer_drift<'a>(
     let mut groups: BTreeMap<GroupKey<'a>, GroupAccum<'a>> = BTreeMap::new();
     let mut counts = ProducerDriftCounts::default();
 
+    // A tombstone's `deleted_id` may name an *edge* record (the incremental
+    // cache tombstones stale DEFINES/CALLS/... edges), but the repository
+    // index owns node IDs only — resolving a deleted edge ID directly always
+    // fails and would silently drop every attributable edge tombstone from a
+    // scoped run. Resolve deleted edge IDs through the deleted edge's
+    // recorded source node instead; the superseded edge record stays in the
+    // slice of an ingested incremental stream, so the source is available.
+    // Records that still resolve to no repository stay excluded, as
+    // documented.
+    let deleted_edge_sources: BTreeMap<&str, &str> = if repo_scope.is_some() {
+        records
+            .iter()
+            .filter_map(|record| match record {
+                GraphRecord::Edge { id, source, .. } => Some((id.as_str(), source.as_str())),
+                GraphRecord::Node { .. } | GraphRecord::Tombstone { .. } => None,
+            })
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+
     for record in records {
         if let Some(scope) = repo_scope {
             let anchor = match record {
                 GraphRecord::Node { id, .. } => id.as_str(),
                 GraphRecord::Edge { source, .. } => source.as_str(),
-                GraphRecord::Tombstone { deleted_id, .. } => deleted_id.as_str(),
+                GraphRecord::Tombstone { deleted_id, .. } => deleted_edge_sources
+                    .get(deleted_id.as_str())
+                    .copied()
+                    .unwrap_or(deleted_id.as_str()),
             };
             if index.owner_of(anchor) != Some(scope) {
                 continue;

@@ -30,8 +30,10 @@ eg query producer-drift --data-dir <DIR>  [--repo <SELECTOR>] [--format json|tex
 Reads from either a JSONL file (`--graph`) or an embedded AletheiaDB store
 (`--data-dir`). `--repo <SELECTOR>` scopes a shared multi-repo store to one
 repository (nodes attribute by ID, edges by source node, tombstones by
-deleted ID; records unattributable to any repository are excluded from a
-scoped run). An unknown or ambiguous selector is rejected with a
+deleted ID — a deleted *edge* ID resolves through the deleted edge's recorded
+source node, so cache-invalidation tombstones for stale edges stay in their
+repo's scoped run; records unattributable to any repository are excluded from
+a scoped run). An unknown or ambiguous selector is rejected with a
 machine-readable stderr diagnostic (exit 1), never resolved implicitly.
 
 | Condition | Exit | Output |
