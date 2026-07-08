@@ -3277,6 +3277,18 @@ fn inspect_embedded_store(data_dir: &Path, format: OutputFormat) -> Result<()> {
         )
     })?;
 
+    // A directory can hold engine index/runtime files while containing zero
+    // Egregore records (empty ingest, or a non-Egregore AletheiaDB dir). That
+    // is a wrong-store diagnostic naming the path, never successful zero
+    // counts (issue #125).
+    if report.records.is_empty() && report.unknown_schema_versions.is_empty() {
+        anyhow::bail!(
+            "error: embedded store at {} contains no Egregore records - \
+             run `eg ingest --adapter embedded --data-dir <path>` first",
+            data_dir.display()
+        );
+    }
+
     let mut counts = InspectCounts::from_records(&report.records, &report.unknown_schema_versions);
     // Canonical ordering: repository summaries sort by stable record ID so the
     // output is deterministic regardless of physical store iteration order.

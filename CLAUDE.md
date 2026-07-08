@@ -29,8 +29,9 @@ class, counts unknown `(domain, kind, schema_version)` tuples distinctly, is
 strictly read-only (the store is read via a throwaway temporary copy), and by
 default emits one deterministic JSON line that is byte-identical across runs on
 an unchanged store (`--format text` matches the JSONL inspect style). A missing
-or empty store fails with a diagnostic naming the path. See
-`docs/cli/inspect.md` for the JSON contract.
+store, an empty directory, or an initialized store holding zero Egregore
+records fails with a diagnostic naming the path — never successful zero
+counts. See `docs/cli/inspect.md` for the JSON contract.
 
 Query commands (local JSONL graph, no network):
 

@@ -123,11 +123,15 @@ envelope, which additionally carries a `snapshot_timestamp`.
 
 A missing store, wrong `--data-dir`, or unreadable store fails with a non-zero
 exit and an operator-facing diagnostic that names the path — it is never
-reported as a valid-but-empty store:
+reported as a valid-but-empty store. This includes a directory that is
+non-empty on disk (engine index/runtime files exist) but holds zero Egregore
+records, e.g. after ingesting an empty JSONL or pointing `--data-dir` at a
+non-Egregore AletheiaDB directory:
 
 ```
 error: embedded store not found at <path> - run `eg ingest --adapter embedded --data-dir <path>` first
 error: embedded store at <path> is empty - run `eg ingest --adapter embedded --data-dir <path>` first
+error: embedded store at <path> contains no Egregore records - run `eg ingest --adapter embedded --data-dir <path>` first
 ```
 
 A corrupt record with a *known* schema version fails the whole inspection (it

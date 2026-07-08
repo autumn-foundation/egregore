@@ -424,6 +424,40 @@ fn inspect_data_dir_empty_dir_fails_instead_of_reporting_empty_counts() {
         .stderr(predicate::str::contains(empty.to_string_lossy().as_ref()));
 }
 
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn inspect_data_dir_record_empty_store_fails_naming_the_path() {
+    // A store directory can be non-empty (index/runtime files exist) while
+    // holding zero Egregore records — e.g. after ingesting an empty JSONL, or
+    // pointing --data-dir at a non-Egregore AletheiaDB directory. Issue #125
+    // requires this to fail with a diagnostic naming the path, never to be
+    // reported as successful zero counts.
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let graph_path = temp.path().join("empty.jsonl");
+    let data_dir = temp.path().join("store");
+    fs::write(&graph_path, "").expect("empty fixture should write");
+    ingest_embedded(&graph_path, &data_dir);
+    assert!(
+        fs::read_dir(&data_dir)
+            .expect("store dir should exist after ingest")
+            .next()
+            .is_some(),
+        "fixture precondition: the initialized store directory must be non-empty"
+    );
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("inspect")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("contains no Egregore records"))
+        .stderr(predicate::str::contains(
+            data_dir.to_string_lossy().as_ref(),
+        ));
+}
+
 #[cfg(not(feature = "embedded-aletheiadb"))]
 #[test]
 fn inspect_data_dir_requires_embedded_feature() {
