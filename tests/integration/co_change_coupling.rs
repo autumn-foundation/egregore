@@ -559,6 +559,162 @@ fn coupling_unscoped_multi_repo_store_never_bleeds_partners_across_repos() {
     );
 }
 
+/// Range endpoints resolve within the target's repository (Codex review on
+/// PR #312, round 3): in an unscoped multi-repository store, `--base`/
+/// `--head`, `--at`, and `--as-of` must be resolved against the target
+/// file's owning repository — not every `Commit` node in the store — so
+/// endpoints from another repository are rejected with the same
+/// machine-readable errors the `--repo`-scoped path emits
+/// (`missing_commit` / `no_commit_at_or_before`), never answered with a
+/// misleading zero-change empty success.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn coupling_unscoped_multi_repo_store_rejects_endpoints_from_another_repo() {
+    let repo_node = |repo_id: &str| {
+        GraphRecord::node(
+            repo_id.to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(repo_id.to_owned()),
+            format!("Repository {repo_id}"),
+        )
+    };
+    let commit_in = |repo_id: &str, sha: &str, parents: &[&str], vt: &str| {
+        GraphRecord::node(
+            stable_id(&["node", "commit", repo_id, sha]),
+            NodeKind::Commit,
+            None,
+            None,
+            Some(sha.to_owned()),
+            format!("Commit {sha} in {repo_id}"),
+        )
+        .with_temporal(temporal(sha, parents, vt))
+    };
+    let file_in = |repo_id: &str, path: &str, sha: &str, vt: &str| {
+        GraphRecord::node(
+            stable_id(&["node", "file", repo_id, path]),
+            NodeKind::File,
+            Some(path.to_owned()),
+            None,
+            Some(path.to_owned()),
+            format!("File {path} in {repo_id}"),
+        )
+        .with_temporal(temporal(sha, &[], vt))
+    };
+    let contains = |source: String, target: String| {
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            source,
+            target,
+            Some("1.0".to_owned()),
+            "containment".to_owned(),
+        )
+    };
+    let changed_in_repo = |repo_id: &str, path: &str, sha: &str, vt: &str| {
+        GraphRecord::edge(
+            EdgeLabel::ChangedIn,
+            stable_id(&["node", "file", repo_id, path]),
+            stable_id(&["node", "commit", repo_id, sha]),
+            Some("1.0".to_owned()),
+            format!("{path} changed in {sha}"),
+        )
+        .with_temporal(temporal(sha, &[], vt))
+    };
+
+    // Repo B's history (bbbb1111 -> bbbb2222) predates repo A's
+    // (aaaa1111 -> aaaa2222); the target lives in repo A only.
+    let records = vec![
+        repo_node("repo_a"),
+        repo_node("repo_b"),
+        commit_in("repo_a", "aaaa1111", &[], T3),
+        commit_in("repo_a", "aaaa2222", &["aaaa1111"], T4),
+        commit_in("repo_b", "bbbb1111", &[], T1),
+        commit_in("repo_b", "bbbb2222", &["bbbb1111"], T2),
+        contains(
+            "repo_a".to_owned(),
+            stable_id(&["node", "commit", "repo_a", "aaaa1111"]),
+        ),
+        contains(
+            "repo_a".to_owned(),
+            stable_id(&["node", "commit", "repo_a", "aaaa2222"]),
+        ),
+        contains(
+            "repo_b".to_owned(),
+            stable_id(&["node", "commit", "repo_b", "bbbb1111"]),
+        ),
+        contains(
+            "repo_b".to_owned(),
+            stable_id(&["node", "commit", "repo_b", "bbbb2222"]),
+        ),
+        file_in("repo_a", "src/alpha.rs", "aaaa1111", T3),
+        file_in("repo_b", "src/other.rs", "bbbb1111", T1),
+        contains(
+            "repo_a".to_owned(),
+            stable_id(&["node", "file", "repo_a", "src/alpha.rs"]),
+        ),
+        contains(
+            "repo_b".to_owned(),
+            stable_id(&["node", "file", "repo_b", "src/other.rs"]),
+        ),
+        changed_in_repo("repo_a", "src/alpha.rs", "aaaa1111", T3),
+        changed_in_repo("repo_a", "src/alpha.rs", "aaaa2222", T4),
+        changed_in_repo("repo_b", "src/other.rs", "bbbb1111", T1),
+        changed_in_repo("repo_b", "src/other.rs", "bbbb2222", T2),
+    ];
+
+    // --base/--head from the other repository: missing_commit, never a
+    // zero-change empty success.
+    let mut opts = options();
+    opts.base = Some("bbbb1111");
+    opts.head = Some("bbbb2222");
+    let err = co_change_coupling(&records, "src/alpha.rs", None, &opts).unwrap_err();
+    match err {
+        CoChangeCouplingError::MissingCommit { commit_prefix } => {
+            assert_eq!(commit_prefix, "bbbb1111");
+        }
+        other => panic!("expected MissingCommit for a foreign-repo base, got {other:?}"),
+    }
+
+    // --at from the other repository: missing_commit.
+    let mut opts = options();
+    opts.at = Some("bbbb2222");
+    let err = co_change_coupling(&records, "src/alpha.rs", None, &opts).unwrap_err();
+    assert!(
+        matches!(err, CoChangeCouplingError::MissingCommit { .. }),
+        "expected MissingCommit for a foreign-repo --at, got {err:?}"
+    );
+
+    // --as-of before every commit of the target's repository: the other
+    // repository's older commits must not satisfy the bound.
+    let mut opts = options();
+    opts.as_of = Some(T2);
+    let err = co_change_coupling(&records, "src/alpha.rs", None, &opts).unwrap_err();
+    assert!(
+        matches!(err, CoChangeCouplingError::NoCommitAtOrBefore { .. }),
+        "expected NoCommitAtOrBefore when only foreign-repo commits predate the instant, got {err:?}"
+    );
+
+    // The full-history commit universe is the target repository's timeline.
+    let mut opts = options();
+    opts.min_support = 1;
+    let report =
+        co_change_coupling(&records, "src/alpha.rs", None, &opts).expect("target should resolve");
+    assert_eq!(report.scope.commit_count, 2);
+    assert_eq!(report.target.change_count, 2);
+    assert!(report.partners.is_empty());
+
+    // Same-repo endpoints keep working unscoped.
+    let mut opts = options();
+    opts.base = Some("aaaa1111");
+    opts.head = Some("aaaa2222");
+    opts.min_support = 1;
+    let report =
+        co_change_coupling(&records, "src/alpha.rs", None, &opts).expect("range should resolve");
+    assert_eq!(report.scope.commit_count, 1);
+    assert_eq!(report.target.change_count, 1);
+}
+
 /// Chronological last-co-change selection (Codex review on PR #312, P2 #2):
 /// `scan-history` preserves non-UTC committer offsets (`normalize_timestamp`
 /// only rewrites `+00:00` to `Z`), so `2026-01-01T23:30:00-05:00` is

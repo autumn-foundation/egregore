@@ -116,6 +116,14 @@ The selectors are mutually exclusive; `--base`/`--head` come as a pair. The
 resolved scope (selector kind, resolved SHAs, and in-scope commit count) is
 echoed in the `scope` section of every answer.
 
+Endpoints resolve **within the target file's owning repository**: the target
+is resolved first, and commit handles, temporal bounds, and the commit count
+are then evaluated against that repository's timeline only — even in a
+shared store with no `--repo`. A `--base`/`--head`/`--at` handle from
+another repository fails with `missing_commit`, and an `--as-of` instant
+that only another repository's commits predate fails with
+`no_commit_at_or_before` — never a misleading zero-change empty success.
+
 ## Scope and trust boundaries
 
 - Both target and partners must resolve to `File` nodes recorded by the
@@ -126,11 +134,12 @@ echoed in the `scope` section of every answer.
 - `--repo <SELECTOR>` gates commit resolution, file resolution, and counting
   to one repository in a shared store; a path present in two repositories
   without a scope fails with `ambiguous_file` listing every candidate.
-- Even without `--repo`, partners are always restricted to the target file's
-  owning repository: in a shared store two repositories can carry the same
-  Git commit SHA (forks, mirrored history), and a file from another
-  repository never surfaces as a partner on the strength of a shared SHA
-  alone.
+- Even without `--repo`, partners, commit endpoints, and temporal bounds are
+  always restricted to the target file's owning repository: in a shared
+  store two repositories can carry the same Git commit SHA (forks, mirrored
+  history), and a file from another repository never surfaces as a partner
+  on the strength of a shared SHA alone, nor can another repository's
+  commits satisfy a range, `--at`, or `--as-of` bound.
 - File granularity only: symbol-level co-change is a documented follow-up
   (mirroring how churn deferred symbol granularity).
 - Output is bounded and redaction-safe: record IDs, paths, counts, the

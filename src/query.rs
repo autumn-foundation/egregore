@@ -15874,8 +15874,86 @@ pub fn co_change_coupling<'a>(
         return Err(CoChangeCouplingError::EmptyHistory);
     }
 
+    // ── file index: File nodes only (tracked, non-ignored source files) ─────
+    let mut files: BTreeMap<&str, CouplingFileInfo<'a>> = BTreeMap::new();
+    let mut ids_by_path: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Node {
+            id,
+            kind: NodeKind::File,
+            schema_version,
+            repo_relative_path: Some(path),
+            ..
+        } = r
+        {
+            if !in_scope(id.as_str()) {
+                continue;
+            }
+            files.entry(id.as_str()).or_insert(CouplingFileInfo {
+                record_id: id.as_str(),
+                schema_version: *schema_version,
+                path: path.as_str(),
+            });
+            ids_by_path
+                .entry(path.as_str())
+                .or_default()
+                .insert(id.as_str());
+        }
+    }
+
+    // ── target resolution (must be an existing File node) ───────────────────
+    let target_ids = ids_by_path.get(normalized_path.as_str());
+    let target_id = match target_ids {
+        None => {
+            return Err(CoChangeCouplingError::UnknownFile {
+                path: normalized_path,
+            });
+        }
+        Some(ids) if ids.len() > 1 => {
+            return Err(CoChangeCouplingError::AmbiguousFile {
+                path: normalized_path,
+                candidates: ids.iter().map(|s| (*s).to_owned()).collect(),
+            });
+        }
+        Some(ids) => *ids.iter().next().expect("non-empty id set"),
+    };
+
+    // ── repository gating for the unscoped commit and partner universe ──────
+    // In a shared store two repositories can carry the same Git commit SHA
+    // (forks, mirrored history), and the per-file sets count bare SHAs, so
+    // without gating a file from another repository could surface as a
+    // partner of a target it never co-changed with — and, symmetrically,
+    // `--base`/`--head`/`--at`/`--as-of` could resolve against another
+    // repository's commits and answer with a misleading zero-change empty
+    // result. The target is resolved first, and everything downstream —
+    // commit topology, endpoint resolution, temporal bounds, partner files,
+    // and Change-record folding — is gated to the target file's owning
+    // repository. `--repo` scoping already guarantees this through
+    // `in_scope`; unscoped multi-repository stores are gated here through
+    // record ownership, so a foreign-repository endpoint fails with the
+    // same `missing_commit` / `no_commit_at_or_before` diagnostics the
+    // scoped path emits.
+    let owner_index: OnceCell<RepositoryIndex> = OnceCell::new();
+    let repository_count = records
+        .iter()
+        .filter(|r| matches!(r.node_kind_name(), Some("Repository")))
+        .count();
+    let target_owner: Option<Option<String>> = if repo_scope.is_none() && repository_count > 1 {
+        let index = owner_index.get_or_init(|| RepositoryIndex::build(records));
+        Some(index.owner_of(target_id).map(str::to_owned))
+    } else {
+        None
+    };
+    let effective_in_scope = |id: &str| -> bool {
+        match (&target_owner, owner_index.get()) {
+            (Some(owner), Some(index)) => index.owner_of(id) == owner.as_deref(),
+            _ => in_scope(id),
+        }
+    };
+    files.retain(|id, _| effective_in_scope(id));
+
     // ── commit universe and temporal scope ──────────────────────────────────
-    let (parent_map, commit_valid_time) = commit_topology(records, &in_scope);
+    let (parent_map, commit_valid_time) = commit_topology(records, &effective_in_scope);
     let mut all_shas: BTreeSet<&str> = BTreeSet::new();
     let mut sha_by_commit_id: BTreeMap<&str, &str> = BTreeMap::new();
     for r in records {
@@ -15886,16 +15964,22 @@ pub fn co_change_coupling<'a>(
             ..
         } = r
         {
-            if in_scope(id.as_str()) {
+            if effective_in_scope(id.as_str()) {
                 all_shas.insert(sha.as_str());
                 sha_by_commit_id.insert(id.as_str(), sha.as_str());
             }
         }
     }
+    if all_shas.is_empty() {
+        // The target's repository carries no commits at all: coupling
+        // requires a temporal store, and answering with an empty success
+        // would be indistinguishable from "no coupling".
+        return Err(CoChangeCouplingError::EmptyHistory);
+    }
 
     let (scope, in_scope_shas): (CouplingScope<'a>, BTreeSet<&str>) =
         if let (Some(base), Some(head)) = (options.base, options.head) {
-            let range = resolve_commit_range(records, base, head, &in_scope)?;
+            let range = resolve_commit_range(records, base, head, &effective_in_scope)?;
             let shas = range.range_commit_shas.clone();
             (
                 CouplingScope {
@@ -15909,7 +15993,7 @@ pub fn co_change_coupling<'a>(
                 shas,
             )
         } else if let Some(at) = options.at {
-            let sha = resolve_commit_prefix(records, at, &in_scope)?;
+            let sha = resolve_commit_prefix(records, at, &effective_in_scope)?;
             let shas: BTreeSet<&str> = reachable_commits(&parent_map, sha)
                 .intersection(&all_shas)
                 .copied()
@@ -15972,69 +16056,6 @@ pub fn co_change_coupling<'a>(
             )
         };
 
-    // ── file index: File nodes only (tracked, non-ignored source files) ─────
-    let mut files: BTreeMap<&str, CouplingFileInfo<'a>> = BTreeMap::new();
-    let mut ids_by_path: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for r in records {
-        if let GraphRecord::Node {
-            id,
-            kind: NodeKind::File,
-            schema_version,
-            repo_relative_path: Some(path),
-            ..
-        } = r
-        {
-            if !in_scope(id.as_str()) {
-                continue;
-            }
-            files.entry(id.as_str()).or_insert(CouplingFileInfo {
-                record_id: id.as_str(),
-                schema_version: *schema_version,
-                path: path.as_str(),
-            });
-            ids_by_path
-                .entry(path.as_str())
-                .or_default()
-                .insert(id.as_str());
-        }
-    }
-
-    // ── target resolution (must be an existing File node) ───────────────────
-    let target_ids = ids_by_path.get(normalized_path.as_str());
-    let target_id = match target_ids {
-        None => {
-            return Err(CoChangeCouplingError::UnknownFile {
-                path: normalized_path,
-            });
-        }
-        Some(ids) if ids.len() > 1 => {
-            return Err(CoChangeCouplingError::AmbiguousFile {
-                path: normalized_path,
-                candidates: ids.iter().map(|s| (*s).to_owned()).collect(),
-            });
-        }
-        Some(ids) => *ids.iter().next().expect("non-empty id set"),
-    };
-
-    // ── repository gating for the unscoped partner universe ─────────────────
-    // In a shared store two repositories can carry the same Git commit SHA
-    // (forks, mirrored history), and the per-file sets count bare SHAs, so
-    // without gating a file from another repository could surface as a
-    // partner of a target it never co-changed with. Partners always live in
-    // the target file's owning repository: `--repo` scoping already
-    // guarantees this through `in_scope`, and unscoped multi-repository
-    // stores are gated here through record ownership.
-    let owner_index: OnceCell<RepositoryIndex> = OnceCell::new();
-    let repository_count = records
-        .iter()
-        .filter(|r| matches!(r.node_kind_name(), Some("Repository")))
-        .count();
-    if repo_scope.is_none() && repository_count > 1 {
-        let index = owner_index.get_or_init(|| RepositoryIndex::build(records));
-        let target_owner = index.owner_of(target_id);
-        files.retain(|id, _| index.owner_of(id) == target_owner);
-    }
-
     // ── per-file distinct in-scope commit sets from CHANGED_IN edges ────────
     let mut commits_by_file: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for r in records {
@@ -16078,7 +16099,7 @@ pub fn co_change_coupling<'a>(
         } = r
         {
             let sha = t.git_commit.as_str();
-            if !in_scope_shas.contains(sha) || !in_scope(id.as_str()) {
+            if !in_scope_shas.contains(sha) || !effective_in_scope(id.as_str()) {
                 continue;
             }
             let Some(candidates) = ids_by_path.get(path.as_str()) else {
