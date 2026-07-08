@@ -28,6 +28,7 @@ eg query deltas   <BASE> <HEAD> --graph <PATH> [--repo <SELECTOR>]
 eg query coupling <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--base <COMMIT> --head <COMMIT> | --at <COMMIT> | --as-of <RFC3339>] [--min-support N] [--limit N] [--format json|text]
 eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
 eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--include-private] [--format json|text]
+eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--threshold <PERCENT>] [--limit N] [--format json|text]
 ```
 
 Evidence-backed audit subcommands have their own pages:
@@ -69,6 +70,11 @@ Evidence-backed audit subcommands have their own pages:
   recorded doc comment**, each row carrying citable evidence;
   presence/absence only, never doc quality
   ([undocumented.md](undocumented.md), issue #257).
+- `eg query ownership` — **per-file authorship aggregates with a primary
+  owner and bus-factor signal** from a history store: ranked ownership
+  shares, deterministic tie-breaks, `--at`/`--as-of` time travel, and an
+  explicit empirical-not-declared boundary
+  ([ownership.md](ownership.md), issue #245).
 
 Most subcommands accept exactly one input source:
 

@@ -16273,8 +16273,8 @@ pub struct OwnershipOptions<'q> {
     /// Cumulative ownership-share threshold percent for the bus factor
     /// (`1..=100`, default [`OWNERSHIP_DEFAULT_THRESHOLD_PERCENT`]).
     pub threshold_percent: u32,
-    /// Maximum file rows (`1..=`[`OWNERSHIP_MAX_LIMIT`], default
-    /// [`OWNERSHIP_DEFAULT_LIMIT`]).
+    /// Maximum file rows: from 1 up to [`OWNERSHIP_MAX_LIMIT`], default
+    /// [`OWNERSHIP_DEFAULT_LIMIT`].
     pub limit: usize,
 }
 
@@ -16429,7 +16429,7 @@ pub enum OwnershipError {
         /// The rejected value.
         threshold_percent: u32,
     },
-    /// The row limit is outside `1..=`[`OWNERSHIP_MAX_LIMIT`].
+    /// The row limit is zero or above [`OWNERSHIP_MAX_LIMIT`].
     InvalidLimit {
         /// The rejected value.
         limit: usize,
@@ -16437,6 +16437,16 @@ pub enum OwnershipError {
         max: usize,
     },
 }
+
+/// Normalized author identity key: the exact `(author_email, author_name)`
+/// pair recorded on `Commit` records, with absent fields as empty strings.
+type OwnershipAuthorKey<'a> = (&'a str, &'a str);
+
+/// Aggregation key for one file view: `(owning repository, repo-relative path)`.
+type OwnershipPathKey<'a> = (Option<String>, &'a str);
+
+/// Distinct commit SHAs per author identity for one file view.
+type OwnershipAuthorCommits<'a> = BTreeMap<OwnershipAuthorKey<'a>, BTreeSet<&'a str>>;
 
 /// Recorded metadata for one in-scope commit during ownership aggregation.
 struct OwnershipCommitMeta<'a> {
@@ -16483,10 +16493,9 @@ pub fn ownership_map<'a>(
 
     let repo_index = RepositoryIndex::build(records);
     let in_scope = |id: &str| -> bool {
-        match options.repo_scope {
-            Some(scope) => repo_index.owner_of(id) == Some(scope),
-            None => true,
-        }
+        options
+            .repo_scope
+            .is_none_or(|scope| repo_index.owner_of(id) == Some(scope))
     };
 
     // ── in-scope commits grouped by owning repository ────────────────────────
@@ -16592,12 +16601,11 @@ pub fn ownership_map<'a>(
         None => None,
     };
     let within_as_of = |meta: &OwnershipCommitMeta<'_>| -> bool {
-        match as_of_dt {
-            None => true,
-            Some(cutoff) => meta.valid_time.is_some_and(|vt| {
+        as_of_dt.is_none_or(|cutoff| {
+            meta.valid_time.is_some_and(|vt| {
                 DateTime::parse_from_rfc3339(vt).is_ok_and(|parsed| parsed <= cutoff)
-            }),
-        }
+            })
+        })
     };
 
     let at_anchor: Option<&str> = match options.at_commit {
@@ -16650,28 +16658,27 @@ pub fn ownership_map<'a>(
     // (owner, anchor sha) pairs whose file trees define the reportable rows.
     let mut anchor_shas: BTreeMap<Option<String>, &'a str> = BTreeMap::new();
     for (owner, commits) in &groups {
-        let anchor: Option<&str> = match at_anchor {
-            Some(sha) => commits.contains_key(sha).then_some(sha),
-            None => {
-                let candidates: Vec<&str> = commits
-                    .iter()
-                    .filter(|(_, meta)| within_as_of(meta))
-                    .map(|(sha, _)| *sha)
-                    .collect();
-                if candidates.is_empty() {
-                    None
-                } else {
-                    let head = owner
-                        .as_deref()
-                        .and_then(|repo_id| snapshot_heads.get(repo_id).copied())
-                        .filter(|sha| candidates.contains(sha));
-                    head.or_else(|| {
-                        candidates
-                            .iter()
-                            .copied()
-                            .max_by(|a, b| order.rank(a).cmp(&order.rank(b)).then_with(|| a.cmp(b)))
-                    })
-                }
+        let anchor: Option<&str> = if at_anchor.is_some() {
+            at_anchor.filter(|sha| commits.contains_key(*sha))
+        } else {
+            let candidates: Vec<&str> = commits
+                .iter()
+                .filter(|(_, meta)| within_as_of(meta))
+                .map(|(sha, _)| *sha)
+                .collect();
+            if candidates.is_empty() {
+                None
+            } else {
+                let head = owner
+                    .as_deref()
+                    .and_then(|repo_id| snapshot_heads.get(repo_id).copied())
+                    .filter(|sha| candidates.contains(sha));
+                head.or_else(|| {
+                    candidates
+                        .iter()
+                        .copied()
+                        .max_by(|a, b| order.rank(a).cmp(&order.rank(b)).then_with(|| a.cmp(b)))
+                })
             }
         };
         let Some(anchor) = anchor else {
@@ -16760,13 +16767,9 @@ pub fn ownership_map<'a>(
     }
 
     // ── distinct commits per (owner, path, author identity) ─────────────────
-    type AuthorKey<'a> = (&'a str, &'a str);
-    let mut commits_by_path: BTreeMap<(Option<String>, &'a str), BTreeSet<&'a str>> =
+    let mut commits_by_path: BTreeMap<OwnershipPathKey<'a>, BTreeSet<&'a str>> = BTreeMap::new();
+    let mut commits_by_author: BTreeMap<OwnershipPathKey<'a>, OwnershipAuthorCommits<'a>> =
         BTreeMap::new();
-    let mut commits_by_author: BTreeMap<
-        (Option<String>, &'a str),
-        BTreeMap<AuthorKey<'a>, BTreeSet<&'a str>>,
-    > = BTreeMap::new();
     for r in records {
         if let GraphRecord::Node {
             id,
@@ -16794,7 +16797,7 @@ pub fn ownership_map<'a>(
             let Some(meta) = groups.get(&owner).and_then(|group| group.get(sha)) else {
                 continue;
             };
-            let author_key: AuthorKey<'a> = (
+            let author_key: OwnershipAuthorKey<'a> = (
                 meta.author_email.unwrap_or(""),
                 meta.author_name.unwrap_or(""),
             );

@@ -161,7 +161,7 @@ fn synthetic_ownership_records() -> Vec<GraphRecord> {
 /// alice/bob tie on count; the tie breaks to the smaller author identity.
 const HOT_TOTAL: usize = 5;
 
-fn options<'q>() -> OwnershipOptions<'q> {
+const fn options<'q>() -> OwnershipOptions<'q> {
     OwnershipOptions {
         path: None,
         at_commit: None,
@@ -310,10 +310,10 @@ fn ownership_aggregates_shares_and_bus_factor() {
             (Some("carol@example.com"), 1),
         ]
     );
-    let shares: Vec<f64> = hot.authors.iter().map(|a| a.share).collect();
-    assert!((shares[0] - 0.4).abs() < f64::EPSILON);
-    assert!((shares[1] - 0.4).abs() < f64::EPSILON);
-    assert!((shares[2] - 0.2).abs() < f64::EPSILON);
+    let hot_shares: Vec<f64> = hot.authors.iter().map(|a| a.share).collect();
+    assert!((hot_shares[0] - 0.4).abs() < f64::EPSILON);
+    assert!((hot_shares[1] - 0.4).abs() < f64::EPSILON);
+    assert!((hot_shares[2] - 0.2).abs() < f64::EPSILON);
     // Count tie: primary owner breaks to the smaller identity.
     assert_eq!(hot.primary_owner.author_email, Some("alice@example.com"));
     // 40% < 50% ≤ 80% → two top authors needed.
