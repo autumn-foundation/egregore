@@ -78,6 +78,11 @@ cargo run -- query public-api-deltas <base_sha> <head_sha> --graph history.graph
 cargo run -- query public-api-deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
 cargo run -- query public-api-deltas ffffffffffff <head_sha> --graph history.graph.jsonl # exit 2 (missing_commit)
 cargo run -- query public-api-deltas <base> <head> --graph history.graph.jsonl --include-internal --callers
+
+# Undocumented public API symbols — doc-debt triage (issue #257)
+cargo run -- query undocumented --graph graph.jsonl               # exit 0 (even when nothing is undocumented)
+cargo run -- query undocumented --graph graph.jsonl --limit 20 --format text
+cargo run -- query undocumented --graph graph.jsonl --include-private  # whole-crate doc audit
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -165,6 +170,22 @@ stable record IDs, file/span handles (base-side tombstone handles for removals),
 introducing commit with valid time, and before/after visibility/signature surface text.
 Output (JSON or `--format text`) is deterministic and byte-identical across runs.
 See `docs/cli/public-api-deltas.md`.
+
+`eg query undocumented` lists externally-reachable public symbols whose captured doc-comment
+fact (issue #124) is absent, by joining the issue #213 public surface with the recorded doc
+facts — never a `pub` grep and never a rustdoc build. Any doc form (`///`, `/** */`,
+`#[doc = "..."]`) excludes a symbol; a plain `//` comment does not. Each row carries a stable
+record ID, a repo-relative file/span handle, and the concrete evidence asserted
+(`externally_reachable`, `doc_comment_absent`). Re-export rows are attributed to the `pub use`
+site with the checked target cited; a doc comment at either the re-export site or the target
+counts as documentation. `--include-private` widens to a whole-crate doc audit;
+`--limit` truncates deterministically with a diagnostic. The lane asserts doc presence/absence
+only — never doc quality — and a pre-#124 store yields an explicit `doc_facts_unavailable`
+capability verdict instead of treating every symbol as undocumented. Zero undocumented symbols
+is an explicit success (exit 0, `no_undocumented_items` diagnostic; when unresolved re-exports
+or missing doc capture leave blind spots, `empty_result_with_blind_spots` instead — never a
+certified-clean claim). Output is deterministic and byte-identical across runs.
+See `docs/cli/undocumented.md`.
 
 Protected raw-artifact commands (issue #60):
 

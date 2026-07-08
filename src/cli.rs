@@ -1284,6 +1284,55 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// List externally-reachable public symbols with no doc comment (issue #257).
+    ///
+    /// Joins the issue #213 public-surface set with the issue #124 recorded
+    /// doc-comment facts: a symbol is reported when it is externally
+    /// reachable AND its captured doc-comment fact is absent. Every row
+    /// carries the concrete evidence asserted plus a citable repo-relative
+    /// file/span handle. A symbol carrying any doc comment (`///`, `/** */`,
+    /// or `#[doc = "..."]`) is excluded; a plain `//` comment is not
+    /// documentation. A re-export counts as documented when either the
+    /// `pub use` site or the resolved target carries a doc fact.
+    /// `--include-private` widens the audit to all symbols (adding methods)
+    /// for whole-crate doc audits.
+    ///
+    /// Soundness boundary: asserts the presence/absence of a recorded doc
+    /// comment — never doc quality, accuracy, or completeness. A store that
+    /// predates issue #124 doc capture yields an explicit
+    /// `doc_facts_unavailable` capability verdict (exit 0), never a claim
+    /// that every symbol is undocumented.
+    ///
+    /// An empty result is an explicit machine-readable success (`ok:true`,
+    /// empty `items`, a `no_undocumented_items` diagnostic — or
+    /// `empty_result_with_blind_spots` when unresolved re-exports or missing
+    /// doc capture kept the audit from being certified clean), exit 0 — not
+    /// an error. Exit 1 on malformed input (unknown/ambiguous `--repo`,
+    /// unreadable graph). Output is deterministic and byte-stable.
+    ///
+    /// Documented in `docs/cli/undocumented.md`.
+    Undocumented {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the audit to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum rows returned; excess rows are truncated (deterministic
+        /// sort order preserved) with a `results_truncated` diagnostic.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Widen the audit to all symbols regardless of visibility or
+        /// reachability, for whole-crate doc audits.
+        #[arg(long)]
+        include_private: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Return a repository orientation map for cold-starting in an unfamiliar repository.
     Orient {
         /// Graph JSONL path (mutually exclusive with --data-dir).
@@ -5075,6 +5124,26 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_public_api_cmd(&records, &index, selected.as_deref())
+        }
+        QuerySubcommand::Undocumented {
+            graph,
+            data_dir,
+            repo,
+            limit,
+            include_private,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_undocumented_cmd(
+                &records,
+                &index,
+                selected.as_deref(),
+                limit,
+                include_private,
+                format,
+            )
         }
         QuerySubcommand::Orient {
             graph,
@@ -9754,6 +9823,189 @@ fn query_public_api_cmd(
     let output = serde_json::to_string_pretty(&response)
         .context("failed to serialize public-api surface")?;
     println!("{output}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// undocumented public API lane (issue #257)
+// ---------------------------------------------------------------------------
+
+/// One undocumented-symbol row in the undocumented response.
+#[derive(Serialize)]
+struct UndocumentedItemJson<'a> {
+    record_id: &'a str,
+    kind: &'a str,
+    /// Crate-relative fully-qualified path (alias-aware for re-exports).
+    path: &'a str,
+    /// Recorded visibility class; `public` on externally-reachable rows.
+    visibility: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+    /// Declaration signature persisted by issue #124, joined when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<&'a str>,
+    /// Concrete evidence asserted for this row: `doc_comment_absent` always,
+    /// plus `externally_reachable` on public-surface rows.
+    evidence: &'a [&'static str],
+    /// Present (`true`) only on rows contributed by a `pub use` re-export;
+    /// such rows are attributed to the re-export site.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    via_reexport: bool,
+    /// Crate-relative use-path the re-export points at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<&'a str>,
+    /// Record ID of the resolved re-export target whose doc fact was checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_record_id: Option<&'a str>,
+}
+
+/// Deterministic tallies in the undocumented response.
+#[derive(Serialize)]
+struct UndocumentedCountsJson {
+    considered: usize,
+    documented: usize,
+    undocumented: usize,
+    reexports: usize,
+    modules_excluded: usize,
+    reexports_unresolved: usize,
+    doc_capture_missing: usize,
+}
+
+/// Top-level undocumented response envelope.
+#[derive(Serialize)]
+struct UndocumentedResponse<'a> {
+    ok: bool,
+    language: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_scope: Option<&'a str>,
+    /// Present (`true`) only when the audit was widened to all symbols.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    include_private: bool,
+    /// `doc_facts_recorded` when the store carries issue #124 doc-capture
+    /// facts; `doc_facts_unavailable` when it predates them (explicit
+    /// capability-absent verdict — never "everything is undocumented").
+    capability: &'static str,
+    /// Per-response soundness boundary: presence/absence only, never quality.
+    disclaimer: &'static str,
+    items: Vec<UndocumentedItemJson<'a>>,
+    counts: UndocumentedCountsJson,
+    diagnostics: Vec<PublicApiDiagnosticJson<'a>>,
+}
+
+const UNDOCUMENTED_DISCLAIMER: &str = "Asserts the presence or absence of a recorded doc comment (///, /** */, or #[doc = \
+     \"...\"]) on externally-reachable public symbols. Never a claim about doc quality, \
+     accuracy, or completeness.";
+
+fn query_undocumented_cmd(
+    records: &[GraphRecord],
+    index: &query::RepositoryIndex,
+    repo_scope: Option<&str>,
+    limit: Option<usize>,
+    include_private: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let report = query::undocumented_public_api(records, index, repo_scope, include_private, limit);
+    let capability = if report.capability_absent {
+        "doc_facts_unavailable"
+    } else {
+        "doc_facts_recorded"
+    };
+
+    match format {
+        OutputFormat::Json => {
+            let response = UndocumentedResponse {
+                ok: true,
+                language: "rust",
+                repo_scope,
+                include_private,
+                capability,
+                disclaimer: UNDOCUMENTED_DISCLAIMER,
+                items: report
+                    .items
+                    .iter()
+                    .map(|item| UndocumentedItemJson {
+                        record_id: item.record_id,
+                        kind: &item.kind,
+                        path: &item.path,
+                        visibility: item.visibility,
+                        repo_relative_path: item.repo_relative_path,
+                        span: item.span,
+                        signature: item.signature,
+                        evidence: &item.evidence,
+                        via_reexport: item.via_reexport,
+                        target: item.target.as_deref(),
+                        target_record_id: item.target_record_id,
+                    })
+                    .collect(),
+                counts: UndocumentedCountsJson {
+                    considered: report.counts.considered,
+                    documented: report.counts.documented,
+                    undocumented: report.counts.undocumented,
+                    reexports: report.counts.reexports,
+                    modules_excluded: report.counts.modules_excluded,
+                    reexports_unresolved: report.counts.reexports_unresolved,
+                    doc_capture_missing: report.counts.doc_capture_missing,
+                },
+                diagnostics: report
+                    .diagnostics
+                    .iter()
+                    .map(|d| PublicApiDiagnosticJson {
+                        code: d.code,
+                        record_id: d.record_id.as_deref(),
+                        detail: &d.detail,
+                    })
+                    .collect(),
+            };
+            let output = serde_json::to_string_pretty(&response)
+                .context("failed to serialize undocumented report")?;
+            println!("{output}");
+        }
+        OutputFormat::Text => {
+            println!(
+                "Undocumented public API symbols (doc-comment presence only — never doc quality). \
+                 Capability: {capability}."
+            );
+            for item in &report.items {
+                let citation = match (item.repo_relative_path, item.span) {
+                    (Some(path), Some(span)) => {
+                        format!(" @ {path}:{}-{}", span.start_line, span.end_line)
+                    }
+                    (Some(path), None) => format!(" @ {path}"),
+                    (None, _) => String::new(),
+                };
+                let reexport = item
+                    .target
+                    .as_deref()
+                    .map_or_else(String::new, |target| format!(" via pub use {target}"));
+                println!(
+                    "- {} [{}] {}{}{} evidence={} ({})",
+                    item.path,
+                    item.kind,
+                    item.visibility,
+                    reexport,
+                    citation,
+                    item.evidence.join(","),
+                    item.record_id
+                );
+            }
+            println!(
+                "counts: considered={} documented={} undocumented={} reexports={} \
+                 modules_excluded={} reexports_unresolved={} doc_capture_missing={}",
+                report.counts.considered,
+                report.counts.documented,
+                report.counts.undocumented,
+                report.counts.reexports,
+                report.counts.modules_excluded,
+                report.counts.reexports_unresolved,
+                report.counts.doc_capture_missing
+            );
+            for d in &report.diagnostics {
+                println!("diagnostic: {}: {}", d.code, d.detail);
+            }
+        }
+    }
     Ok(())
 }
 

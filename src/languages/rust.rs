@@ -211,7 +211,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             &self.file.repo_relative_path,
             &name,
         ]);
-        self.graph.push(GraphRecord::syntax_node(
+        let mut record = GraphRecord::syntax_node(
             id.clone(),
             NodeKind::Import,
             self.file.repo_relative_path.clone(),
@@ -219,7 +219,16 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             name.clone(),
             "rust",
             format!("Rust import {name}"),
-        ));
+        );
+        // Doc comments above a `use` declaration attach to the item rustdoc
+        // exposes at the re-export site (issue #257); capture them as the
+        // import's doc fact. Additive, never an identity input.
+        if let Some(doc) = self.symbol_doc(node) {
+            record = record
+                .with_declaration_surface(None, None, Some(doc))
+                .with_redaction_policy_version(REDACTION_POLICY_VERSION);
+        }
+        self.graph.push(record);
         self.add_edge(
             EdgeLabel::Imports,
             self.owner_id(),
@@ -539,14 +548,16 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         normalize_code(self.source.get(start..end).unwrap_or(""))
     }
 
-    /// Collects the item's doc comment (`///` line docs or a `/** */` block
-    /// doc) from the siblings immediately preceding the item, then applies
-    /// redaction policy v1 to the collected text.
+    /// Collects the item's doc comment (`///` line docs, a `/** */` block
+    /// doc, or `#[doc = "..."]` attributes) from the siblings immediately
+    /// preceding the item, then applies redaction policy v1 to the collected
+    /// text.
     ///
-    /// Attribute items between the docs and the item are skipped; any other
-    /// sibling (including plain `//` / `/* */` comments) terminates the doc
-    /// block. Returns `None` when the item has no doc comment or the collected
-    /// text is empty — the `doc` field is omitted, never an empty string.
+    /// Non-doc attribute items between the docs and the item are skipped; any
+    /// other sibling (including plain `//` / `/* */` comments) terminates the
+    /// doc block. Returns `None` when the item has no doc comment or the
+    /// collected text is empty — the `doc` field is omitted, never an empty
+    /// string.
     fn symbol_doc(&self, node: Node<'_>) -> Option<String> {
         let mut doc_parts: Vec<String> = Vec::new();
         let mut current = node.prev_sibling();
@@ -558,7 +569,11 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                     };
                     doc_parts.push(text);
                 }
-                "attribute_item" => {}
+                "attribute_item" => {
+                    if let Some(text) = doc_attribute_text(self.node_text(sibling)) {
+                        doc_parts.push(text);
+                    }
+                }
                 _ => break,
             }
             current = sibling.prev_sibling();
@@ -699,6 +714,120 @@ fn doc_comment_text(text: &str) -> Option<String> {
         return Some(block_doc_text(inner));
     }
     None
+}
+
+/// Extracts doc text from one `#[doc = ...]` attribute item's source text.
+///
+/// Returns the decoded text for outer doc attributes carrying a plain or raw
+/// string literal. A non-literal value (`#[doc = include_str!(...)]`,
+/// `#[doc = concat!(...)]`) still documents the item for rustdoc, so it
+/// yields a labeled marker citing the unexpanded expression — presence is
+/// recorded, text is never guessed by expanding macros. Returns `None` for
+/// every other attribute shape — `#[doc(hidden)]`, `#[doc(alias = "...")]`,
+/// and non-`doc` attributes contribute no doc text.
+fn doc_attribute_text(text: &str) -> Option<String> {
+    let inner = text
+        .trim()
+        .strip_prefix("#[")?
+        .strip_suffix(']')?
+        .trim()
+        .strip_prefix("doc")?
+        .trim_start()
+        .strip_prefix('=')?
+        .trim();
+    if let Some(literal) = string_literal_text(inner) {
+        return Some(literal);
+    }
+    if inner.is_empty() {
+        return None;
+    }
+    Some(format!("[unexpanded doc attribute: {inner}]"))
+}
+
+/// Decodes a Rust string literal (`"..."`, `r"..."`, `r#"..."#`, ...) into
+/// its text. Raw literals are taken verbatim; plain literals are unescaped
+/// via [`unescape_string_literal`]. Returns `None` for anything that is not
+/// a single string literal.
+fn string_literal_text(literal: &str) -> Option<String> {
+    if let Some(raw) = literal.strip_prefix('r') {
+        let hashes = raw.len() - raw.trim_start_matches('#').len();
+        let quoted = raw.get(hashes..raw.len().checked_sub(hashes)?)?;
+        return Some(quoted.strip_prefix('"')?.strip_suffix('"')?.to_owned());
+    }
+    let inner = literal.strip_prefix('"')?.strip_suffix('"')?;
+    Some(unescape_string_literal(inner))
+}
+
+/// Unescapes the interior of a plain Rust string literal: `\n`, `\t`, `\r`,
+/// `\0`, `\\`, `\'`, `\"`, `\xNN`, `\u{...}`, and the `\`-newline line
+/// continuation (which also swallows the next line's leading whitespace).
+///
+/// Any escape this decoder cannot decode returns the interior **verbatim**
+/// — the recorded text is kept raw rather than partially decoded (a dropped
+/// backslash would corrupt the doc fact).
+fn unescape_string_literal(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('\\') => out.push('\\'),
+            Some('\'') => out.push('\''),
+            Some('"') => out.push('"'),
+            Some('x') => {
+                let hex: String = (0..2).filter_map(|_| chars.next()).collect();
+                match u8::from_str_radix(&hex, 16) {
+                    Ok(byte) => out.push(char::from(byte)),
+                    Err(_) => return inner.to_owned(),
+                }
+            }
+            Some('u') => {
+                if chars.next() != Some('{') {
+                    return inner.to_owned();
+                }
+                let mut hex = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some(digit) => hex.push(digit),
+                        None => return inner.to_owned(),
+                    }
+                }
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(decoded) => out.push(decoded),
+                    None => return inner.to_owned(),
+                }
+            }
+            // Line continuation: `\` before a newline (or CRLF) removes the
+            // break and the following leading whitespace.
+            Some('\n') => {
+                while chars
+                    .peek()
+                    .is_some_and(|w| matches!(w, ' ' | '\t' | '\n' | '\r'))
+                {
+                    chars.next();
+                }
+            }
+            Some('\r') if chars.peek() == Some(&'\n') => {
+                while chars
+                    .peek()
+                    .is_some_and(|w| matches!(w, ' ' | '\t' | '\n' | '\r'))
+                {
+                    chars.next();
+                }
+            }
+            // Unknown escape or trailing backslash: keep the text raw.
+            _ => return inner.to_owned(),
+        }
+    }
+    out
 }
 
 /// Normalizes the interior of a `/** */` block doc: strips the per-line
@@ -1582,6 +1711,87 @@ pub fn normalize_file_code(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_doc_attribute_text_extracts_string_forms() {
+        assert_eq!(
+            doc_attribute_text(r#"#[doc = "Plain doc."]"#),
+            Some("Plain doc.".to_owned())
+        );
+        assert_eq!(
+            doc_attribute_text(r##"#[doc = r#"Raw doc."#]"##),
+            Some("Raw doc.".to_owned())
+        );
+        assert_eq!(
+            doc_attribute_text(r#"#[doc="escaped \"quote\" and\nnewline"]"#),
+            Some("escaped \"quote\" and\nnewline".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_string_literal_text_decodes_all_escape_forms() {
+        assert_eq!(
+            string_literal_text(r#""caf\u{e9}""#),
+            Some("café".to_owned())
+        );
+        assert_eq!(string_literal_text(r#""\x41B""#), Some("AB".to_owned()));
+        assert_eq!(
+            string_literal_text(r#""a\rb\0c\'d\"e""#),
+            Some("a\rb\0c'd\"e".to_owned())
+        );
+        // Line continuation: `\` before a newline swallows the newline and
+        // the next line's leading whitespace.
+        assert_eq!(
+            string_literal_text("\"one \\\n    two\""),
+            Some("one two".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_string_literal_text_keeps_undecodable_escapes_raw() {
+        // Never partially decode: an escape this decoder does not understand
+        // keeps the literal content verbatim instead of dropping backslashes.
+        assert_eq!(string_literal_text(r#""caf\q""#), Some(r"caf\q".to_owned()));
+        assert_eq!(
+            string_literal_text(r#""bad \u{ZZ} escape""#),
+            Some(r"bad \u{ZZ} escape".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_doc_attribute_text_decodes_unicode_escapes() {
+        assert_eq!(
+            doc_attribute_text(r#"#[doc = "caf\u{e9}"]"#),
+            Some("café".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_doc_attribute_text_rejects_non_doc_shapes() {
+        assert_eq!(doc_attribute_text("#[doc(hidden)]"), None);
+        assert_eq!(doc_attribute_text(r#"#[doc(alias = "other")]"#), None);
+        assert_eq!(doc_attribute_text("#[derive(Debug)]"), None);
+        assert_eq!(doc_attribute_text(r#"#[deprecated = "note"]"#), None);
+    }
+
+    #[test]
+    fn test_doc_attribute_text_marks_unexpanded_expressions_as_present() {
+        // Rustdoc documents an item carrying `#[doc = <expr>]` even when the
+        // expression needs macro expansion; the fact recorded is presence
+        // with a labeled unexpanded marker, never guessed doc text.
+        let included = doc_attribute_text(r#"#[doc = include_str!("../README.md")]"#)
+            .expect("include_str! doc attribute must count as documentation");
+        assert!(
+            included.contains(r#"include_str!("../README.md")"#),
+            "marker must cite the unexpanded expression, got {included:?}"
+        );
+        let concatenated = doc_attribute_text(r#"#[doc = concat!("a", "b")]"#)
+            .expect("concat! doc attribute must count as documentation");
+        assert!(
+            concatenated.contains("concat!"),
+            "marker must cite the unexpanded expression, got {concatenated:?}"
+        );
+    }
 
     #[test]
     fn test_normalize_raw_strings() {

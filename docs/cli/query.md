@@ -26,6 +26,7 @@ eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N]
 eg query transitive-callers <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query deltas   <BASE> <HEAD> --graph <PATH> [--repo <SELECTOR>]
 eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
+eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--include-private] [--format json|text]
 ```
 
 Evidence-backed audit subcommands have their own pages:
@@ -59,6 +60,10 @@ Evidence-backed audit subcommands have their own pages:
   surface** from recorded visibility and module containment, re-exports
   included, trapped `pub` items excluded
   ([public-api.md](public-api.md), issue #213).
+- `eg query undocumented` — **externally-reachable public symbols with no
+  recorded doc comment**, each row carrying citable evidence;
+  presence/absence only, never doc quality
+  ([undocumented.md](undocumented.md), issue #257).
 
 Most subcommands accept exactly one input source:
 
