@@ -8,7 +8,7 @@ use std::{fs, path::Path, path::PathBuf};
 
 use aletheia_egregore::{
     GraphRecord, NodeKind, TemporalMetadata, ir::EdgeLabel, scan_repository_at_with_override,
-    stable_id,
+    scan_repository_history_with_override, stable_id,
 };
 use assert_cmd::Command;
 use serde_json::Value;
@@ -616,4 +616,155 @@ fn unknown_repo_selector_is_rejected_with_exit_1() {
         .failure()
         .code(1)
         .stderr(predicates::str::contains("unknown_repository_selector"));
+}
+
+// ---------------------------------------------------------------------------
+// History graphs: only edges valid at the stamped HEAD commit count
+// ---------------------------------------------------------------------------
+
+fn run_git<const N: usize>(repo: &Path, args: [&str; N]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("git command should execute");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_commit_all(repo: &Path, message: &str, date: &str) -> String {
+    run_git(repo, ["add", "."]);
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "-m", message])
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("git commit should execute");
+    assert!(
+        output.status.success(),
+        "git commit failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sha = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git rev-parse should execute");
+    String::from_utf8_lossy(&sha.stdout).trim().to_owned()
+}
+
+/// Two-commit history: at c1 `caller` calls both `stale_called` and
+/// `kept_called`, and `gone_fn` exists; at HEAD (c2) the `stale_called` call
+/// and `gone_fn` are removed. Only HEAD-valid edges and symbols may shape the
+/// current-state answer.
+#[test]
+fn history_graph_ignores_stale_edges_and_symbols_from_older_commits() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path();
+    run_git(repo, ["init"]);
+    run_git(repo, ["config", "user.email", "unref@example.invalid"]);
+    run_git(repo, ["config", "user.name", "Unref Test"]);
+    run_git(repo, ["config", "core.autocrlf", "false"]);
+    run_git(repo, ["config", "commit.gpgsign", "false"]);
+
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn caller() -> usize {\n    stale_called() + kept_called()\n}\n\n\
+         pub fn stale_called() -> usize {\n    1\n}\n\n\
+         pub fn kept_called() -> usize {\n    2\n}\n\n\
+         pub fn gone_fn() -> usize {\n    3\n}\n",
+    )
+    .expect("lib.rs at c1");
+    git_commit_all(repo, "c1: call both", "2026-01-01T00:00:00Z");
+
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn caller() -> usize {\n    kept_called()\n}\n\n\
+         pub fn stale_called() -> usize {\n    1\n}\n\n\
+         pub fn kept_called() -> usize {\n    2\n}\n",
+    )
+    .expect("lib.rs at c2");
+    let head_sha = git_commit_all(
+        repo,
+        "c2: drop stale call and gone_fn",
+        "2026-01-02T00:00:00Z",
+    );
+
+    let jsonl = scan_repository_history_with_override(repo, Some("unref-history"))
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let graph_dir = tempfile::tempdir().expect("graph dir");
+    let graph = graph_dir.path().join("history.graph.jsonl");
+    fs::write(&graph, jsonl).expect("write history graph");
+
+    let parsed = run_unreferenced(&graph);
+    let names = candidate_names(&parsed);
+    assert!(
+        names.contains(&"stale_called".to_owned()),
+        "a call edge removed before HEAD must not keep its target out of the \
+         candidate set; got {names:?}"
+    );
+    assert!(
+        !names.contains(&"kept_called".to_owned()),
+        "a call edge still present at HEAD must keep its target referenced"
+    );
+    assert!(
+        !names.contains(&"gone_fn".to_owned()),
+        "a symbol absent at HEAD is deleted and must not be a current-state candidate"
+    );
+    assert_eq!(
+        candidate(&parsed, "stale_called")["git_commit"],
+        Value::String(head_sha),
+        "history candidates must cite the HEAD-commit record"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// --repo scoping must not drop extraction Diagnostic markers (issue #87)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn repo_scoped_run_keeps_extraction_caveats_for_diagnostic_marked_files() {
+    let (_temp, graph) = fixture_graph();
+    let output = egregore()
+        .args([
+            "query",
+            "unreferenced",
+            "--repo",
+            "unref-fixture",
+            "--graph",
+        ])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: Value = serde_json::from_str(std::str::from_utf8(&output).expect("utf8").trim())
+        .expect("stdout must be valid JSON");
+
+    let flagged = candidate(&parsed, "macros::macro_neighbor");
+    assert_eq!(
+        flagged["extraction_caveat"]["code"], "diagnostics_in_file_scope",
+        "repo-scoped runs must keep the documented extraction caveat"
+    );
+    assert!(
+        parsed["counts"]["files_with_diagnostic_markers"]
+            .as_u64()
+            .is_some_and(|n| n >= 1),
+        "Diagnostic-marked files must stay tallied under --repo"
+    );
 }

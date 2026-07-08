@@ -17760,12 +17760,60 @@ pub fn unreferenced_symbols<'a>(
     let is_owned =
         |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
 
+    // Stamped HEAD commit per live repository (`source_snapshot`, issue #82).
+    // History replay re-emits the full graph at every commit with `temporal`
+    // provenance and no tombstones for between-commit removals, so a temporal
+    // record is part of the current state only when its commit is its
+    // repository's stamped HEAD — the same rule `resolve_head_symbols` uses.
+    // Snapshot-less stores (pre-#186 graphs) keep the conservative fallback:
+    // nodes resolve by keep-last dedupe and every recorded edge counts.
+    let mut repo_heads: BTreeMap<&str, &str> = BTreeMap::new();
+    for record in records {
+        if let GraphRecord::Node {
+            id,
+            kind: NodeKind::Repository,
+            source_snapshot: Some(snapshot),
+            ..
+        } = record
+            && !tombstoned.contains(id.as_str())
+            && let SnapshotHead::Commit { sha } = &snapshot.head
+        {
+            repo_heads.insert(id.as_str(), sha.as_str());
+        }
+    }
+    // Current-state check for records attributable through the containment
+    // topology (symbols; reference edges via their target symbol).
+    let owned_record_is_current = |id: &str, temporal: Option<&TemporalMetadata>| -> bool {
+        let Some(t) = temporal else {
+            return true;
+        };
+        index
+            .owner_of(id)
+            .and_then(|owner| repo_heads.get(owner))
+            .is_none_or(|head_sha| t.git_commit == *head_sha)
+    };
+    // Current-state check for records outside the containment topology
+    // (Diagnostic markers, unresolved-call edges): no owner is resolvable, so
+    // a temporal record is current when its commit is any repository's
+    // stamped HEAD. Commit SHAs never collide across repositories in
+    // practice, and snapshot-less stores keep everything (fallback).
+    let unowned_record_is_current = |temporal: Option<&TemporalMetadata>| -> bool {
+        let Some(t) = temporal else {
+            return true;
+        };
+        repo_heads.is_empty() || repo_heads.values().any(|sha| *sha == t.git_commit)
+    };
+
     // Candidate population: live, in-scope Symbol nodes, keep-last dedupe by
     // stable ID so history graphs resolve to their newest version.
     let mut symbols: BTreeMap<&str, &'a GraphRecord> = BTreeMap::new();
     // Active extractor Diagnostic markers per file scope. Code-domain only:
     // trajectory/importer records reuse `NodeKind::Diagnostic` with a `domain`
-    // marker and must not lower confidence in code extraction.
+    // marker and must not lower confidence in code extraction. Markers are
+    // matched by path, never by repository ownership: extractor Diagnostics
+    // are not attached to the containment topology, so an ownership filter
+    // would silently drop every caveat from a repo-scoped run. This mirrors
+    // the issue #87 `eg query file` diagnostics rule.
     let mut file_diagnostics: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for record in records {
         let GraphRecord::Node {
@@ -17774,16 +17822,20 @@ pub fn unreferenced_symbols<'a>(
             repo_relative_path,
             symbol_kind,
             domain,
+            temporal,
             ..
         } = record
         else {
             continue;
         };
-        if tombstoned.contains(id.as_str()) || !is_owned(id) {
+        if tombstoned.contains(id.as_str()) {
             continue;
         }
         match kind {
             NodeKind::Symbol => {
+                if !is_owned(id) || !owned_record_is_current(id, temporal.as_ref()) {
+                    continue;
+                }
                 // impl blocks are unnameable declaration details, never
                 // prune candidates; their methods are considered directly.
                 if symbol_kind.as_deref() == Some("impl") {
@@ -17792,6 +17844,9 @@ pub fn unreferenced_symbols<'a>(
                 symbols.insert(id.as_str(), record);
             }
             NodeKind::Diagnostic if domain.is_none() => {
+                if !unowned_record_is_current(temporal.as_ref()) {
+                    continue;
+                }
                 if let Some(path) = repo_relative_path.as_deref() {
                     file_diagnostics
                         .entry(path)
@@ -17803,7 +17858,11 @@ pub fn unreferenced_symbols<'a>(
         }
     }
 
-    // Inbound reference counting over live edges of the reference classes.
+    // Inbound reference counting over live, current-state edges of the
+    // reference classes. A stale edge — replayed from an older commit and
+    // absent at its repository's stamped HEAD — must not mark its target as
+    // referenced, or a symbol whose last caller was removed would silently
+    // vanish from the candidate set.
     let mut referenced_ids: BTreeSet<&str> = BTreeSet::new();
     let mut unresolved_call_edges = 0usize;
     for record in records {
@@ -17812,6 +17871,7 @@ pub fn unreferenced_symbols<'a>(
             label,
             target,
             resolution,
+            temporal,
             ..
         } = record
         else {
@@ -17826,8 +17886,13 @@ pub fn unreferenced_symbols<'a>(
         if *label == EdgeLabel::Calls && *resolution == Some(CallResolution::Unresolved) {
             // The target is a Diagnostic marker, not a symbol: the callee has
             // no in-repo definition the graph could see. Tallied for the
-            // honesty diagnostic below.
-            unresolved_call_edges += 1;
+            // honesty diagnostic below when current at HEAD.
+            if unowned_record_is_current(temporal.as_ref()) {
+                unresolved_call_edges += 1;
+            }
+            continue;
+        }
+        if !owned_record_is_current(target.as_str(), temporal.as_ref()) {
             continue;
         }
         referenced_ids.insert(target.as_str());

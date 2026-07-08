@@ -65,9 +65,14 @@ node kinds, edge labels, or domains:
 
 Scope: live `Symbol` records at the **current** graph state. Tombstoned
 (deleted) symbols are excluded, in parity with `eg query file` and
-`eg query symbols`; when a stable ID appears more than once (history graphs)
-the latest record wins deterministically, and temporal candidates carry
-their `git_commit`. `impl`-block symbols are excluded from the candidate
+`eg query symbols`. On `scan-history` graphs, only records valid at the
+repository's stamped snapshot HEAD commit shape the answer (the
+`resolve_head_symbols` rule): a call edge that existed in an older commit
+but was removed before HEAD does **not** mark its target as referenced, and
+a symbol absent at HEAD is deleted, not a candidate. Temporal candidates
+carry their `git_commit`; snapshot-less stores (pre-#186 graphs) fall back
+conservatively — the latest record per stable ID wins and every recorded
+edge counts. `impl`-block symbols are excluded from the candidate
 population — they are unnameable declaration details, so a zero inbound
 count carries no pruning signal (their methods are considered
 individually).
@@ -75,7 +80,9 @@ individually).
 ## Extraction-completeness caveat (issue #87)
 
 A candidate whose file scope contains extractor `Diagnostic` markers
-(unparsed macro invocations, unresolved call targets) carries an
+(unparsed macro invocations, unresolved call targets) — matched by file
+path, exactly like the `eg query file` diagnostics rule, so `--repo`
+scoping never drops a caveat — carries an
 `extraction_caveat`: a macro-hidden reference may exist in that scope, so
 the candidate's confidence is lower. The caveat is **advisory** — it cites
 the marker records and never rewrites or hides the code fact.
