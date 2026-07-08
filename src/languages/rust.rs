@@ -168,15 +168,26 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             &self.file.repo_relative_path,
             &qualified_name,
         ]);
-        self.graph.push(GraphRecord::syntax_node(
-            id.clone(),
-            NodeKind::Module,
-            self.file.repo_relative_path.clone(),
-            span(node),
-            qualified_name.clone(),
-            "rust",
-            format!("Rust module {qualified_name}"),
-        ));
+        // Module records carry the declaration visibility class so
+        // reachability queries (issue #213) can resolve the module chain
+        // without re-parsing source. Additive per
+        // `docs/schema/schema-versioning.md §2`; never an identity input.
+        self.graph.push(
+            GraphRecord::syntax_node(
+                id.clone(),
+                NodeKind::Module,
+                self.file.repo_relative_path.clone(),
+                span(node),
+                qualified_name.clone(),
+                "rust",
+                format!("Rust module {qualified_name}"),
+            )
+            .with_declaration_surface(
+                Some(self.symbol_visibility(node).to_owned()),
+                None,
+                None,
+            ),
+        );
         self.add_edge(
             EdgeLabel::Contains,
             self.owner_id(),
@@ -790,7 +801,14 @@ fn macro_invocation_name(text: &str) -> String {
         + "!"
 }
 
-fn file_module_path(repo_relative_path: &str) -> Vec<String> {
+/// Maps a repo-relative Rust file path onto its crate-relative module path
+/// (e.g. `src/api/inner.rs` → `["api", "inner"]`). `src/lib.rs`, `src/main.rs`
+/// and `mod.rs` files map onto their containing directory's module path.
+/// Non-`src/`-rooted paths return an empty path.
+///
+/// Shared with the public-API reachability query (issue #213) so query-time
+/// module attribution matches extraction-time symbol qualification exactly.
+pub(crate) fn file_module_path(repo_relative_path: &str) -> Vec<String> {
     let owned = path_segments(repo_relative_path);
     let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
     if parts.first() != Some(&"src") {

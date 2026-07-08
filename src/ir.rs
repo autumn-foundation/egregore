@@ -695,10 +695,10 @@ pub enum GraphRecord {
         #[serde(skip_serializing_if = "Option::is_none")]
         disambiguator: Option<u64>,
         // ── Symbol declaration-surface fields (issue #124) ────────────────────
-        /// Declaration visibility class for `Symbol` nodes, drawn from the
-        /// closed set `public` / `crate` / `restricted` / `private`.
-        /// Additive per `docs/schema/schema-versioning.md §2`; never an
-        /// identity input.
+        /// Declaration visibility class for `Symbol` nodes (and Rust `Module`
+        /// nodes, issue #213), drawn from the closed set `public` / `crate` /
+        /// `restricted` / `private`. Additive per
+        /// `docs/schema/schema-versioning.md §2`; never an identity input.
         #[serde(skip_serializing_if = "Option::is_none")]
         visibility: Option<String>,
         /// Normalized declaration header for `Symbol` nodes: item keyword

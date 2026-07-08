@@ -22,6 +22,7 @@ eg query memory   <HANDLE> --graph <PATH>   [--verified-only]
 eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>]
 eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N]
 eg query deltas   <BASE> <HEAD> --graph <PATH> [--repo <SELECTOR>]
+eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
 ```
 
 Evidence-backed audit subcommands have their own pages:
@@ -46,6 +47,10 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query deltas` — **symbol- and file-level changes between two commits**,
   grouped by stable change class with citable handles
   ([deltas.md](deltas.md), issue #118).
+- `eg query public-api` — the crate's **externally-reachable public API
+  surface** from recorded visibility and module containment, re-exports
+  included, trapped `pub` items excluded
+  ([public-api.md](public-api.md), issue #213).
 
 Most subcommands accept exactly one input source:
 
