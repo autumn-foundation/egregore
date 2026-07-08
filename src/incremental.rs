@@ -20,7 +20,11 @@ use crate::{
 };
 
 /// Incremental cache schema for extractor output stored on disk.
-const CACHE_SCHEMA_VERSION: u32 = 4;
+///
+/// v5: cached Rust `Symbol` records carry `visibility` / `signature` / `doc`
+/// declaration-surface fields (issue #124); older caches rebuild so reused
+/// records are never missing the new fields.
+const CACHE_SCHEMA_VERSION: u32 = 5;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

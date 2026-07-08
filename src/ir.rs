@@ -634,6 +634,24 @@ pub enum GraphRecord {
         /// but `span` is not; see `docs/adr/0004-symbol-identity.md`.
         #[serde(skip_serializing_if = "Option::is_none")]
         disambiguator: Option<u64>,
+        // ── Symbol declaration-surface fields (issue #124) ────────────────────
+        /// Declaration visibility class for `Symbol` nodes, drawn from the
+        /// closed set `public` / `crate` / `restricted` / `private`.
+        /// Additive per `docs/schema/schema-versioning.md §2`; never an
+        /// identity input.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        visibility: Option<String>,
+        /// Normalized declaration header for `Symbol` nodes: item keyword
+        /// through the end of the parameter list / return type / where-clause
+        /// for callables (or the item header for type-defining items), with the
+        /// body excluded and interior whitespace collapsed deterministically.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+        /// Doc-comment text (`///` or `/** */`) for `Symbol` nodes after
+        /// passing through redaction policy v1. Omitted entirely when the item
+        /// has no doc comment — never an empty string.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        doc: Option<String>,
         /// Git and bitemporal provenance for history-backed records.
         #[serde(skip_serializing_if = "Option::is_none")]
         temporal: Option<TemporalMetadata>,
@@ -982,6 +1000,9 @@ impl GraphRecord {
             language: None,
             symbol_kind: None,
             disambiguator: None,
+            visibility: None,
+            signature: None,
+            doc: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1089,6 +1110,9 @@ impl GraphRecord {
             language: Some(language.to_owned()),
             symbol_kind: None,
             disambiguator: None,
+            visibility: None,
+            signature: None,
+            doc: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1195,6 +1219,9 @@ impl GraphRecord {
             language: Some("rust".to_owned()),
             symbol_kind: Some(symbol_kind.to_owned()),
             disambiguator: Some(0),
+            visibility: None,
+            signature: None,
+            doc: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1307,6 +1334,9 @@ impl GraphRecord {
             language: Some(language.to_owned()),
             symbol_kind: Some(symbol_kind.to_owned()),
             disambiguator: Some(disambiguator),
+            visibility: None,
+            signature: None,
+            doc: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1463,6 +1493,33 @@ impl GraphRecord {
         {
             *author_name = name;
             *author_email = email;
+        }
+        self
+    }
+
+    /// Attaches declaration-surface metadata to a `Symbol` node record
+    /// (issue #124): visibility class, normalized signature header, and
+    /// redacted doc-comment text.
+    ///
+    /// The fields are additive per `docs/schema/schema-versioning.md §2` and
+    /// MUST NOT contribute to stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub fn with_declaration_surface(
+        mut self,
+        symbol_visibility: Option<String>,
+        symbol_signature: Option<String>,
+        symbol_doc: Option<String>,
+    ) -> Self {
+        if let Self::Node {
+            visibility,
+            signature,
+            doc,
+            ..
+        } = &mut self
+        {
+            *visibility = symbol_visibility;
+            *signature = symbol_signature;
+            *doc = symbol_doc;
         }
         self
     }

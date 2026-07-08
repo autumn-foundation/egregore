@@ -233,6 +233,9 @@ eg query symbol <NAME> --graph <PATH> [--at <COMMIT>] [--format json|text]
 | `kind` | string | yes | Always `"Symbol"`. |
 | `repo_relative_path` | string or null | yes | Repository-relative file path, e.g. `"src/lib.rs"`. |
 | `span` | object or null | yes | Source span with `start_byte`, `end_byte`, `start_line`, `end_line`. |
+| `visibility` | string | Rust declaration-surface symbols | Declaration visibility class from the closed set `public` / `crate` / `restricted` / `private`, derived from the source `pub` modifier (`pub(in path)` and `pub(super)` map to `restricted`; `pub(self)` and no modifier map to `private`). Present on Rust `fn` / method / `struct` / `enum` / `trait` / type-alias / `const` / `static` symbols extracted at issue #124 or later; absent on `impl` symbols and records from older graphs. |
+| `signature` | string | Rust declaration-surface symbols | Normalized declaration header: item keyword through the end of the parameter list / return type / where-clause for callables (or the item header for type-defining items), body excluded, interior whitespace collapsed deterministically. Same presence rules as `visibility`. |
+| `doc` | string | when the item has a doc comment | Doc-comment text (`///` or `/** */`) after redaction policy v1 (see [`docs/schema/redaction.md`](../schema/redaction.md)); a secret-shaped value is replaced by a `<REDACTED:class:hash>` marker. Omitted entirely when the item has no doc comment — never an empty string. |
 | `git_commit` | string | only in history graphs | Full commit SHA for history-backed records. |
 | `repository_id` | string | when attributable | Stable `Repository` record ID owning the row. Absent only for legacy graphs without repository topology. |
 | `repository` | string | when attributable | Human-usable repository identity handle, e.g. `acme/widget`. |
@@ -245,7 +248,7 @@ eg query symbol scan_repository --graph g.jsonl
 ```
 
 ```json
-{"record_id":"codegraph:v1:abc...","schema_version":1,"name":"scan_repository","kind":"Symbol","repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":500,"start_line":51,"end_line":71}}
+{"record_id":"codegraph:v1:abc...","schema_version":1,"name":"scan_repository","kind":"Symbol","repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":500,"start_line":51,"end_line":71},"visibility":"public","signature":"fn scan_repository(repo_path:impl AsRef<Path>)->Result<Graph>","doc":"Scans a repository working tree into a code graph."}
 ```
 
 ---
@@ -269,7 +272,7 @@ eg query file <PATH> --graph <PATH> [--format json|text]
 
 ### JSON output fields
 
-Same fields as `eg query symbol` (see above). Results are sorted by `span.start_line` ascending, then `record_id`.
+Same fields as `eg query symbol` (see above), except the declaration-surface fields `visibility`, `signature`, and `doc`, which are omitted from file listing rows to keep the per-file answer lean — use `eg query symbol <NAME>` for a symbol's contract. Results are sorted by `span.start_line` ascending, then `record_id`.
 
 ---
 
