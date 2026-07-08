@@ -215,7 +215,8 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::WorkflowRule
         | NodeKind::NamingDecision
         | NodeKind::Constraint
-        | NodeKind::CostUsage => return None,
+        | NodeKind::CostUsage
+        | NodeKind::Retraction => return None,
     };
 
     Some(EmbeddingCandidate {

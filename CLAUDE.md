@@ -166,6 +166,28 @@ introducing commit with valid time, and before/after visibility/signature surfac
 Output (JSON or `--format text`) is deterministic and byte-identical across runs.
 See `docs/cli/public-api-deltas.md`.
 
+Record retraction (issue #231):
+
+```powershell
+# Retract one persisted agent-authored or sensitive record by stable handle
+cargo run -- forget agent_memory:v1:<hex> --data-dir .egregore --reason "leaked customer name"   # exit 0
+cargo run -- forget agent_memory:v1:<hex> --data-dir .egregore --reason "anything"               # exit 0 (already_retracted no-op)
+cargo run -- forget codegraph:v5:<hex> --data-dir .egregore --reason "wrong"    # exit 1 (deterministic_code_fact)
+cargo run -- forget agent_memory:v1:missing --data-dir .egregore --reason "x"   # exit 2 (not_found)
+```
+
+`eg forget` logically retracts one record from every transaction-time-current read surface
+(structural, semantic/vector, context, task, memory, audit, failures, changes, inspect, and
+the MCP tools) by writing a citable `Retraction` event — actor, transaction time, redacted
+reason, prior record handle — plus a tombstone in the target's domain, through the ordinary
+adapter boundary. Deterministic code-graph facts are refused with a machine-readable error
+naming `eg refresh`/re-scan; tombstones and retraction events are also refused. Citing
+records survive with their link reported as a `stale_evidence_target` diagnostic, historical
+transaction-time views predating the retraction still see the record (bi-temporal honesty),
+and re-running on an already-retracted handle is a no-op success returning the original
+event. With a pinned `--transaction-time` the envelope is deterministic and byte-identical
+across runs. See `docs/cli/forget.md`.
+
 Protected raw-artifact commands (issue #60):
 
 ```powershell

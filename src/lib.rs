@@ -33,6 +33,8 @@ pub mod error;
 pub mod evidence;
 /// Evidence-link freshness verdicts for agent observations (issue #85).
 pub mod evidence_freshness;
+/// Operator-facing logical retraction of persisted records (issue #231).
+pub mod forget;
 /// Read-only store freshness classification (issue #82).
 pub mod freshness;
 /// Filesystem discovery.

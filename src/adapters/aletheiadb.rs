@@ -3306,6 +3306,7 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "NamingDecision" => Ok(NodeKind::NamingDecision),
         "Constraint" => Ok(NodeKind::Constraint),
         "CostUsage" => Ok(NodeKind::CostUsage),
+        "Retraction" => Ok(NodeKind::Retraction),
         _ => Err(read_back_error(
             record_id,
             format!("unknown embedded node kind {kind}"),
@@ -3525,7 +3526,8 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::WorkflowRule
         | NodeKind::NamingDecision
         | NodeKind::Constraint
-        | NodeKind::CostUsage => kind.as_str(),
+        | NodeKind::CostUsage
+        | NodeKind::Retraction => kind.as_str(),
     }
 }
 
@@ -4093,6 +4095,76 @@ mod tests {
                 .and_then(::aletheiadb::PropertyValue::as_vector),
             Some(&[1.0, 0.0][..]),
             "rewritten latest nodes should inherit prior semantic coverage"
+        );
+    }
+
+    /// Issue #231: after `eg forget`, the semantic/vector lane must stop
+    /// returning the retracted record, exactly like the structural lanes.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn semantic_search_excludes_retracted_records() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("retraction-semantic-store");
+        let obs_id = crate::ir::agent_memory_stable_id(&["node", "observation", "sess-231", "0"]);
+        let mut obs = GraphRecord::node(
+            obs_id.clone(),
+            NodeKind::Observation,
+            None,
+            None,
+            Some("obs".to_owned()),
+            "agent observation".to_owned(),
+        );
+        if let GraphRecord::Node {
+            ref mut schema_version,
+            ref mut text,
+            ..
+        } = obs
+        {
+            *schema_version = crate::ir::AGENT_MEMORY_SCHEMA_VERSION;
+            *text = Some("the parser silently skips empty input".to_owned());
+        }
+        let mut vectors = EmbeddingVectorMap::new();
+        vectors.insert(
+            EmbeddingVectorKey::from_record(&obs).expect("observation should be embeddable"),
+            vec![1.0, 0.0],
+        );
+        let mut sink = EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, 2)
+            .expect("semantic store should open");
+        sink.write_record(&obs).expect("observation should write");
+
+        let hits = sink
+            .semantic_search(&[1.0, 0.0], 5)
+            .expect("semantic search should run");
+        assert!(
+            hits.iter().any(|hit| hit.record_id == obs_id),
+            "the observation should be a semantic hit before retraction"
+        );
+
+        let records = sink.read_all_records().expect("store should read");
+        let request = crate::forget::ForgetRequest {
+            handle: obs_id.clone(),
+            reason: "false claim about parser behavior".to_owned(),
+            retracted_by: "op-1".to_owned(),
+            transaction_time: Some("2026-07-01T00:00:00Z".to_owned()),
+        };
+        let crate::forget::ForgetOutcome::Retracted {
+            records: generated, ..
+        } = crate::forget::retract_from_records(&records, &request)
+            .expect("observation should retract")
+        else {
+            panic!("expected a Retracted outcome");
+        };
+        for record in &generated {
+            sink.write_record(record)
+                .expect("retraction records should write");
+        }
+
+        let hits = sink
+            .semantic_search(&[1.0, 0.0], 5)
+            .expect("semantic search should run");
+        assert!(
+            hits.iter().all(|hit| hit.record_id != obs_id),
+            "retracted records must not surface through the vector lane: {hits:?}"
         );
     }
 
