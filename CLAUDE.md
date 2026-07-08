@@ -43,6 +43,10 @@ cargo run -- query change-impact <symbol_name> --graph graph.jsonl --depth 2  # 
 cargo run -- query deltas <base_sha> <head_sha> --graph history.graph.jsonl  # exit 0 on match
 cargo run -- query deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
 cargo run -- query deltas ffffffffffff <head_sha> --graph history.graph.jsonl # exit 2 (missing_commit)
+
+# Externally-reachable public API surface (issue #213)
+cargo run -- query public-api --graph graph.jsonl                 # exit 0 (even when surface is empty)
+cargo run -- query public-api --graph graph.jsonl --repo acme/widget  # scope one repo; bad selector exits 1
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -66,6 +70,16 @@ available, and the introducing commit with its valid time. Semantic drift inside
 folded in where drift records exist and marked unavailable otherwise. Rows are observed
 deltas, never proof of behavior change; the response is deterministic and byte-identical
 across runs. See `docs/cli/deltas.md`.
+
+`eg query public-api` enumerates the Rust library crate's externally-reachable public API
+surface from recorded per-symbol visibility (issue #124) and module containment — never a
+`pub` token grep. `pub` items trapped in non-`pub` modules are excluded; `pub use` re-exports
+are included and attributed to the re-export site; `pub(crate)`/`pub(super)`/`pub(in path)`
+items are crate-internal and tallied, not listed. Every row carries a stable record ID plus a
+repo-relative file/span handle. An empty surface is an explicit machine-readable success
+(exit 0 with an `empty_surface` diagnostic), not an error. Output is deterministic and
+byte-identical across runs. Parse-derived, never a build-verified or semver claim.
+See `docs/cli/public-api.md`.
 
 Protected raw-artifact commands (issue #60):
 

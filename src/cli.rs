@@ -1100,6 +1100,41 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Enumerate the crate's externally-reachable public API surface (issue #213).
+    ///
+    /// Returns the set of externally-reachable public items — functions,
+    /// structs, enums, traits, type aliases, consts, statics, and modules —
+    /// computed from recorded per-symbol visibility (issue #124) and module
+    /// containment, never from a `pub` token grep. A `pub` item inside a
+    /// non-`pub` module is excluded; a `pub use` re-export that widens
+    /// visibility is included and attributed to the re-export site.
+    /// `pub(crate)` / `pub(super)` / `pub(in path)` items are crate-internal
+    /// and excluded (tallied in `counts`).
+    ///
+    /// Scope: the Rust library crate rooted at `src/` (excluding `src/bin/`)
+    /// at the current graph state. Output is deterministic and byte-stable.
+    /// Parse-derived: never a build-verified or semver claim.
+    ///
+    /// An empty surface is an explicit machine-readable success (`ok:true`,
+    /// empty `items`, an `empty_surface` diagnostic), exit 0 — not an error.
+    /// Exit 1 on malformed input (unknown/ambiguous `--repo`, unreadable
+    /// graph).
+    ///
+    /// Documented in `docs/cli/public-api.md`.
+    PublicApi {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the surface to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Return a repository orientation map for cold-starting in an unfamiliar repository.
     Orient {
         /// Graph JSONL path (mutually exclusive with --data-dir).
@@ -4644,6 +4679,17 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_change_impact_cmd(&records, &handle, &index, selected.as_deref(), depth)
+        }
+        QuerySubcommand::PublicApi {
+            graph,
+            data_dir,
+            repo,
+            format: _format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_public_api_cmd(&records, &index, selected.as_deref())
         }
         QuerySubcommand::Orient {
             graph,
@@ -8589,6 +8635,125 @@ fn query_change_impact_cmd(
 
     let output = serde_json::to_string_pretty(&response)
         .context("failed to serialize change-impact context")?;
+    println!("{output}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// public-api surface query (issue #213)
+// ---------------------------------------------------------------------------
+
+/// One externally-reachable item row in the public-api response.
+#[derive(Serialize)]
+struct PublicApiItemJson<'a> {
+    record_id: &'a str,
+    kind: &'a str,
+    /// Externally visible crate-relative fully-qualified path.
+    path: &'a str,
+    visibility: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+    /// Declaration signature persisted by issue #124, joined when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<&'a str>,
+    /// Present (`true`) only on rows contributed by a `pub use` re-export;
+    /// such rows are attributed to the re-export site.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    via_reexport: bool,
+    /// Crate-relative use-path the re-export points at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<&'a str>,
+    /// Record ID of the in-graph re-export target, when it resolves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_record_id: Option<&'a str>,
+}
+
+/// Exclusion-tier tallies in the public-api response.
+#[derive(Serialize)]
+struct PublicApiCountsJson {
+    externally_reachable: usize,
+    reexports: usize,
+    crate_internal: usize,
+    private: usize,
+    trapped_public: usize,
+}
+
+/// One stable machine-readable diagnostic in the public-api response.
+#[derive(Serialize)]
+struct PublicApiDiagnosticJson<'a> {
+    code: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_id: Option<&'a str>,
+    detail: &'a str,
+}
+
+/// Top-level public-api response envelope.
+#[derive(Serialize)]
+struct PublicApiResponse<'a> {
+    ok: bool,
+    language: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_scope: Option<&'a str>,
+    /// Per-response disclaimer: parse-derived enumeration, not a build claim.
+    disclaimer: &'static str,
+    items: Vec<PublicApiItemJson<'a>>,
+    counts: PublicApiCountsJson,
+    diagnostics: Vec<PublicApiDiagnosticJson<'a>>,
+}
+
+const PUBLIC_API_DISCLAIMER: &str = "Parse-derived enumeration of the externally-reachable public API surface from recorded \
+     visibility and module containment. Not a build-verified or semver claim.";
+
+fn query_public_api_cmd(
+    records: &[GraphRecord],
+    index: &query::RepositoryIndex,
+    repo_scope: Option<&str>,
+) -> Result<()> {
+    let surface = query::public_api_surface(records, index, repo_scope);
+
+    let response = PublicApiResponse {
+        ok: true,
+        language: "rust",
+        repo_scope,
+        disclaimer: PUBLIC_API_DISCLAIMER,
+        items: surface
+            .items
+            .iter()
+            .map(|item| PublicApiItemJson {
+                record_id: item.record_id,
+                kind: &item.kind,
+                path: &item.path,
+                visibility: "public",
+                repo_relative_path: item.repo_relative_path,
+                span: item.span,
+                signature: item.signature,
+                via_reexport: item.via_reexport,
+                target: item.target.as_deref(),
+                target_record_id: item.target_record_id,
+            })
+            .collect(),
+        counts: PublicApiCountsJson {
+            externally_reachable: surface.counts.externally_reachable,
+            reexports: surface.counts.reexports,
+            crate_internal: surface.counts.crate_internal,
+            private: surface.counts.private,
+            trapped_public: surface.counts.trapped_public,
+        },
+        diagnostics: surface
+            .diagnostics
+            .iter()
+            .map(|d| PublicApiDiagnosticJson {
+                code: d.code,
+                record_id: d.record_id.as_deref(),
+                detail: &d.detail,
+            })
+            .collect(),
+    };
+
+    let output = serde_json::to_string_pretty(&response)
+        .context("failed to serialize public-api surface")?;
     println!("{output}");
     Ok(())
 }

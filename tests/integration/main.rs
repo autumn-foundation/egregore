@@ -47,6 +47,7 @@ mod query;
 mod query_cli;
 mod query_lifeline;
 mod query_orient;
+mod query_public_api;
 mod query_subsystem;
 mod query_symbols;
 mod query_who;
