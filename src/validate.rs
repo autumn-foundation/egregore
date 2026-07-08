@@ -62,6 +62,9 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
             // `File CONTAINS PanicRiskSite`: unwrap/expect panic-risk call
             // sites are contained by their owning file (issue #223).
             NodeKind::PanicRiskSite,
+            // `File` CONTAINS `UnsafeSite` attributes unsafe-surface sites to
+            // their owning file (issue #222).
+            NodeKind::UnsafeSite,
         ]),
         EdgeLabel::Calls | EdgeLabel::Mentions => Some(&[NodeKind::Diagnostic, NodeKind::Symbol]),
         EdgeLabel::Imports => Some(&[NodeKind::Import]),
@@ -487,6 +490,19 @@ mod tests {
             .filter_map(|d| d.endpoint)
             .collect();
         assert_eq!(endpoints, vec!["source", "target"]);
+    }
+
+    #[test]
+    fn contains_edge_to_unsafe_site_is_allowed() {
+        // `File` CONTAINS `UnsafeSite` is what the issue #222 extractor emits;
+        // the referential-integrity gate must accept it.
+        let records = vec![
+            node("n:file", NodeKind::File),
+            node("n:unsafe", NodeKind::UnsafeSite),
+            edge("e:contains", EdgeLabel::Contains, "n:file", "n:unsafe"),
+        ];
+        let report = validate_records(&records);
+        assert!(report.is_clean(), "got {:?}", report.diagnostics);
     }
 
     #[test]

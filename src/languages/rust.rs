@@ -89,6 +89,12 @@ const REFERENCE_EXCLUDED_KINDS: &[&str] = &[
 /// are intentionally excluded from this slice.
 const PANIC_RISK_METHODS: [&str; 2] = ["expect", "unwrap"];
 
+/// The closed unsafe-site kind set for issue #222: `unsafe { .. }` block
+/// expressions (`block`), `unsafe fn` declarations (`fn`), and `unsafe impl`
+/// blocks (`impl`). `unsafe trait` declarations and `unsafe` introduced by
+/// macro expansion or build scripts are intentionally outside this slice.
+const UNSAFE_SITE_KINDS: [&str; 3] = ["block", "fn", "impl"];
+
 #[derive(Debug, Clone)]
 struct ImplContext {
     display: String,
@@ -112,6 +118,7 @@ struct RustExtractor<'graph, 'source> {
     debt_marker_ordinals: BTreeMap<String, u64>,
     facts: FileFacts,
     panic_risk_ordinals: BTreeMap<String, u64>,
+    unsafe_site_ordinals: BTreeMap<String, u64>,
     /// Inline-module segments currently enclosing the walk (out-of-line
     /// `mod x;` declarations do not push here).
     inline_module_stack: Vec<String>,
@@ -150,6 +157,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             debt_marker_ordinals: BTreeMap::new(),
             facts: FileFacts::default(),
             panic_risk_ordinals: BTreeMap::new(),
+            unsafe_site_ordinals: BTreeMap::new(),
             inline_module_stack: Vec::new(),
             inline_path_override_depth: 0,
             test_scope_depth: 0,
@@ -174,6 +182,8 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             "macro_invocation" => self.extract_macro_diagnostic(node),
             "call_expression" => self.extract_call_expression(node),
             "line_comment" | "block_comment" => self.extract_comment_markers(node),
+            "function_signature_item" => self.extract_function_signature(node),
+            "unsafe_block" => self.extract_unsafe_block(node),
             _ => self.walk_children(node),
         }
     }
@@ -369,6 +379,9 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     fn extract_function(&mut self, node: Node<'_>) {
+        if has_unsafe_modifier(node) {
+            self.emit_unsafe_site(node, "fn");
+        }
         let Some(local_name) = node_name(node, self.source) else {
             self.walk_children(node);
             return;
@@ -543,6 +556,9 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 
     fn extract_impl(&mut self, node: Node<'_>) {
+        if has_unsafe_modifier(node) {
+            self.emit_unsafe_site(node, "impl");
+        }
         let display = impl_display(self.node_text(node));
         let qualified_name = self.qualify(&display);
         let id = self.add_symbol(node, "impl", &qualified_name);
@@ -785,6 +801,73 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let disambiguator = self
             .panic_risk_ordinals
             .entry(category.to_owned())
+            .or_default();
+        let current = *disambiguator;
+        *disambiguator += 1;
+        current
+    }
+
+    /// Visits a trait-method or foreign-function signature: emits a
+    /// deterministic `UnsafeSite` record when the declaration is an
+    /// `unsafe fn` (issue #222). Signature items register no symbol of their
+    /// own today; walking continues unchanged.
+    fn extract_function_signature(&mut self, node: Node<'_>) {
+        if has_unsafe_modifier(node) {
+            self.emit_unsafe_site(node, "fn");
+        }
+        self.walk_children(node);
+    }
+
+    /// Visits an `unsafe { .. }` block expression: emits a deterministic
+    /// `UnsafeSite` record (issue #222), then keeps walking so nested blocks,
+    /// calls, and items are visited too.
+    ///
+    /// Detection is purely AST-shaped — the node kind must be `unsafe_block`
+    /// — so the word `unsafe` inside comments, string literals, doc comments,
+    /// and identifiers can never match.
+    fn extract_unsafe_block(&mut self, node: Node<'_>) {
+        self.emit_unsafe_site(node, "block");
+        self.walk_children(node);
+    }
+
+    /// Emits one deterministic `UnsafeSite` record plus the `CONTAINS` edge
+    /// from the owning file. `site_kind` is drawn from the closed
+    /// [`UNSAFE_SITE_KINDS`] set and carried in the record's `name` field.
+    fn emit_unsafe_site(&mut self, node: Node<'_>, site_kind: &'static str) {
+        debug_assert!(UNSAFE_SITE_KINDS.contains(&site_kind));
+        let disambiguator = self.next_unsafe_site_disambiguator(site_kind);
+        let id = stable_id(&[
+            "node",
+            "unsafe_site",
+            self.repository_id,
+            &self.file.repo_relative_path,
+            site_kind,
+            &disambiguator.to_string(),
+        ]);
+        self.graph.push(GraphRecord::syntax_node(
+            id.clone(),
+            NodeKind::UnsafeSite,
+            self.file.repo_relative_path.clone(),
+            span(node),
+            site_kind.to_owned(),
+            "rust",
+            format!("Rust unsafe {site_kind} site"),
+        ));
+        self.add_edge(
+            EdgeLabel::Contains,
+            self.file_id.to_owned(),
+            id,
+            format!(
+                "{} contains unsafe {site_kind} site",
+                self.file.repo_relative_path
+            ),
+        );
+    }
+
+    fn next_unsafe_site_disambiguator(&mut self, site_kind: &str) -> u64 {
+        let disambiguator = self
+            .unsafe_site_ordinals
+            .entry(site_kind.to_owned())
             .or_default();
         let current = *disambiguator;
         *disambiguator += 1;
@@ -1093,6 +1176,30 @@ fn carries_declaration_surface(symbol_kind: &str) -> bool {
             | "const"
             | "static"
     )
+}
+
+/// `true` when the item carries an `unsafe` keyword token in its modifier
+/// position (issue #222): an `unsafe` token inside a `function_modifiers`
+/// child for callables, or a direct `unsafe` token child for `impl_item`.
+///
+/// Only direct children (and the modifier list's direct children) are
+/// inspected, so `unsafe` constructs nested inside an item's body never mark
+/// the item itself.
+fn has_unsafe_modifier(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "unsafe" => return true,
+            "function_modifiers" => {
+                let mut inner = child.walk();
+                if child.children(&mut inner).any(|m| m.kind() == "unsafe") {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Returns the item's `visibility_modifier` child, if any.

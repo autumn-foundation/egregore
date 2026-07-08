@@ -3502,6 +3502,7 @@ fn parse_node_kind(record_id: &str, kind: &str) -> AdapterResult<NodeKind> {
         "Diagnostic" => Ok(NodeKind::Diagnostic),
         "PanicRiskSite" => Ok(NodeKind::PanicRiskSite),
         "DebtMarker" => Ok(NodeKind::DebtMarker),
+        "UnsafeSite" => Ok(NodeKind::UnsafeSite),
         "Commit" => Ok(NodeKind::Commit),
         "Change" => Ok(NodeKind::Change),
         "SemanticDrift" => Ok(NodeKind::SemanticDrift),
@@ -3725,6 +3726,7 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::Diagnostic
         | NodeKind::PanicRiskSite
         | NodeKind::DebtMarker
+        | NodeKind::UnsafeSite
         | NodeKind::Commit
         | NodeKind::Change
         | NodeKind::SemanticDrift
