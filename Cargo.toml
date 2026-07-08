@@ -73,5 +73,5 @@ assert_cmd = "2.1.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"
 
-[profile.test]
+[profile.dev]
 debug = 1

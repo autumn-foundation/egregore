@@ -1,0 +1,67 @@
+//! Consolidated integration test binary.
+//!
+//! Each module below was previously a standalone `tests/*.rs` integration
+//! test binary. Compiling them as modules of a single test target keeps
+//! link time and on-disk debug artifacts down without changing behavior.
+
+mod accuracy;
+mod antigravity;
+mod bundle;
+mod change_impact;
+mod changes_query;
+mod citation_audit;
+mod claude_code;
+mod cli;
+mod codex;
+mod daemon;
+mod deterministic_scan;
+mod doctor;
+mod embeddings;
+mod evidence_freshness;
+mod evidence_write;
+mod failure_history;
+mod freshness;
+mod git_scope_scan;
+mod go_scan;
+mod history;
+mod history_safety;
+mod identity;
+mod import_github;
+mod import_github_behaviour;
+mod incremental;
+mod ingest;
+mod line_ending_determinism;
+mod link_evidence;
+mod local_project;
+mod local_project_jsonl_doc;
+mod mcp;
+mod memory_audit;
+mod memory_health;
+mod memory_recall;
+mod memory_recall_corpus;
+mod preference_approval;
+mod producer_version;
+mod protected_artifacts;
+mod python_scan;
+mod query;
+mod query_cli;
+mod query_lifeline;
+mod query_orient;
+mod query_subsystem;
+mod query_who;
+mod redaction;
+mod refresh;
+mod repair;
+mod repo_scope;
+mod schema_versioning;
+mod semantic_drift;
+mod semantic_drift_calibration;
+mod semantic_relevance;
+mod task_query;
+mod temporal;
+mod temporal_status;
+mod token_cost;
+mod traj;
+mod transaction_time;
+mod typescript_scan;
+mod watch;
