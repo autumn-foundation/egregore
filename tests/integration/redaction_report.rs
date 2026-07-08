@@ -810,6 +810,108 @@ fn import_traj_cli_rejects_symlink_cycle_report_path() {
     );
 }
 
+/// Two pre-existing hard links to one inode have *different* resolved path
+/// strings, so a string comparison alone passes them as distinct — yet the
+/// records write updates the shared inode and the report write through the
+/// other link replaces what is visible at `--out`. The guard must compare
+/// on-disk file identity (device + inode, or the platform equivalent) when
+/// both targets already exist.
+#[test]
+fn import_traj_cli_rejects_hard_link_report_aliasing_out() {
+    const SENTINEL: &str = "pre-existing sentinel content\n";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let traj_path = write_secret_traj(temp.path());
+    let out = temp.path().join("records.jsonl");
+    let report = temp.path().join("report.json");
+    fs::write(&out, SENTINEL).expect("pre-existing out file");
+    fs::hard_link(&out, &report).expect("hard link report to out");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("import-traj")
+        .arg(&traj_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--redaction-report")
+        .arg(&report)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--redaction-report"));
+
+    assert_eq!(
+        fs::read_to_string(&out).expect("out file must survive"),
+        SENTINEL,
+        "the shared inode must be untouched when --out and --redaction-report \
+         are hard links to the same file"
+    );
+}
+
+#[test]
+fn import_codex_cli_rejects_hard_link_report_aliasing_out() {
+    const SENTINEL: &str = "pre-existing sentinel content\n";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let codex_path = write_secret_codex(temp.path());
+    let out = temp.path().join("records.jsonl");
+    let report = temp.path().join("report.json");
+    fs::write(&out, SENTINEL).expect("pre-existing out file");
+    fs::hard_link(&out, &report).expect("hard link report to out");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("import-codex")
+        .arg(&codex_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--redaction-report")
+        .arg(&report)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--redaction-report"));
+
+    assert_eq!(
+        fs::read_to_string(&out).expect("out file must survive"),
+        SENTINEL,
+        "the shared inode must be untouched when --out and --redaction-report \
+         are hard links to the same file"
+    );
+}
+
+/// Two distinct pre-existing regular files (no link between them) must still
+/// pass the identity check: the import succeeds and overwrites both with the
+/// correct artifact.
+#[test]
+fn import_traj_cli_accepts_distinct_preexisting_files() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let traj_path = write_secret_traj(temp.path());
+    let out = temp.path().join("records.jsonl");
+    let report = temp.path().join("report.json");
+    fs::write(&out, "stale records\n").expect("pre-existing out file");
+    fs::write(&report, "stale report\n").expect("pre-existing report file");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("import-traj")
+        .arg(&traj_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--redaction-report")
+        .arg(&report)
+        .assert()
+        .success();
+
+    let records = fs::read_to_string(&out).expect("records JSONL must be written");
+    assert!(
+        records
+            .lines()
+            .next()
+            .is_some_and(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()),
+        "records output must be graph JSONL, not the report"
+    );
+    let body = fs::read_to_string(&report).expect("report file must be written");
+    let report_json: serde_json::Value = serde_json::from_str(body.trim()).expect("report is JSON");
+    assert_eq!(report_json["redaction"], "enabled");
+}
+
 #[test]
 fn import_traj_cli_accepts_distinct_paths_with_dotdot_components() {
     let temp = tempfile::tempdir().expect("temp dir");

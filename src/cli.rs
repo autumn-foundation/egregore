@@ -2479,7 +2479,10 @@ fn import_antigravity_cmd(antigravity_path: &Path, out: &Path) -> Result<()> {
 /// yet; `-` (stdout) never conflicts. A path whose symlink chain cannot be
 /// resolved within [`SYMLINK_RESOLUTION_LIMIT`] hops (a cycle or an absurdly
 /// deep chain) is treated as conflicting — the guard refuses rather than
-/// guessing the paths are distinct.
+/// guessing the paths are distinct. When both resolved targets already exist,
+/// on-disk file identity (device + inode on Unix, the file-index equivalent
+/// on Windows, via [`same_file`]) is compared as well, so two pre-existing
+/// hard links to one inode conflict even though their path strings differ.
 ///
 /// # Errors
 ///
@@ -2496,7 +2499,10 @@ fn ensure_report_path_distinct(out: &Path, redaction_report: Option<&Path>) -> R
         resolve_output_path_for_collision(out),
         resolve_output_path_for_collision(report_path),
     ) {
-        (Some(resolved_out), Some(resolved_report)) => resolved_out == resolved_report,
+        (Some(resolved_out), Some(resolved_report)) => {
+            resolved_out == resolved_report
+                || existing_files_share_identity(&resolved_out, &resolved_report)
+        }
         // An unresolvable symlink chain means the write target is unknowable;
         // refuse deterministically instead of risking a clobber.
         _ => true,
@@ -2509,6 +2515,24 @@ fn ensure_report_path_distinct(out: &Path, redaction_report: Option<&Path>) -> R
         );
     }
     Ok(())
+}
+
+/// Returns `true` when both paths name *existing* files that share on-disk
+/// identity — the same device + inode on Unix, the same volume serial +
+/// file index on Windows (via [`same_file::is_same_file`]) — catching
+/// pre-existing hard-link aliases whose resolved path strings differ.
+///
+/// Identity is only comparable for files that exist: when either target is
+/// missing ([`fs::metadata`] fails), this returns `false` and the caller's
+/// resolved-path comparison alone decides. If the identity probe itself fails
+/// on two files that were just observed to exist, the write target is
+/// unknowable and this refuses deterministically (`true`, the safe side)
+/// rather than risking a clobber.
+fn existing_files_share_identity(a: &Path, b: &Path) -> bool {
+    if fs::metadata(a).is_err() || fs::metadata(b).is_err() {
+        return false;
+    }
+    same_file::is_same_file(a, b).unwrap_or(true)
 }
 
 /// Upper bound on symlink hops followed while resolving an output path for
