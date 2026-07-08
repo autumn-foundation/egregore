@@ -445,6 +445,14 @@ defined zero symbols returns `ok: true` with an explicit `empty_symbol_set`
 diagnostic (exit `0`), while an unknown path or a path that did not exist at
 the point fails with a machine-readable error and exit `2`.
 
+In a shared multi-repository store, `--as-of` resolves the instant on the
+queried path's **own repository timeline**: an unrelated repository's newer
+commit never wins the at-or-before race, so it cannot make the file look
+absent at a commit its repository never had. When more than one repository
+records the same path, an unscoped `--as-of` query fails closed with
+`ambiguous_repository` (rerun with `--repo <SELECTOR>`), matching the
+issue #67 contract for single-answer time views.
+
 #### Exit codes for `--at` / `--as-of`
 
 Failures print `{"ok":false,"error":{"error_type":...}}` to stdout — never a

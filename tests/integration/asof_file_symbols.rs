@@ -337,6 +337,175 @@ fn empty_history_errors() {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-repository stores: --as-of must resolve on the path's own timeline
+// ---------------------------------------------------------------------------
+
+/// Attributed two-repository fixture: repo A owns `src/f.rs` (symbol `sym_a`
+/// at commit `aaaa1111`, T1); repo B owns `src/other.rs` (symbol `other_fn` at
+/// commit `bbbb2222`, T2 — newer than every repo A commit).
+fn two_repo_history() -> Vec<GraphRecord> {
+    fn repo_node(repo_id: &str, name: &str) -> GraphRecord {
+        GraphRecord::node(
+            repo_id.to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(name.to_owned()),
+            format!("Repository {name}"),
+        )
+    }
+    fn contains(source: &str, target: &str) -> GraphRecord {
+        GraphRecord::edge(
+            aletheia_egregore::EdgeLabel::Contains,
+            source.to_owned(),
+            target.to_owned(),
+            Some("1.0".to_owned()),
+            "containment".to_owned(),
+        )
+    }
+    fn defines(source: &str, target: &str) -> GraphRecord {
+        GraphRecord::edge(
+            aletheia_egregore::EdgeLabel::Defines,
+            source.to_owned(),
+            target.to_owned(),
+            Some("1.0".to_owned()),
+            "defines".to_owned(),
+        )
+    }
+    fn commit_in(repo_id: &str, sha: &str, valid_time: &str) -> GraphRecord {
+        let id = stable_id(&["node", "commit", repo_id, sha]);
+        GraphRecord::node(
+            id,
+            NodeKind::Commit,
+            None,
+            None,
+            Some(sha.to_owned()),
+            format!("Commit {sha}"),
+        )
+        .with_temporal(temporal(sha, &[], valid_time))
+    }
+    fn file_in(repo_id: &str, path: &str, commit: &str, valid_time: &str) -> GraphRecord {
+        let id = stable_id(&["node", "file", repo_id, path]);
+        GraphRecord::node(
+            id,
+            NodeKind::File,
+            Some(path.to_owned()),
+            None,
+            Some(path.to_owned()),
+            format!("Source file {path}"),
+        )
+        .with_temporal(temporal(commit, &[], valid_time))
+    }
+    fn symbol_in(
+        repo_id: &str,
+        name: &str,
+        path: &str,
+        commit: &str,
+        valid_time: &str,
+    ) -> GraphRecord {
+        let id = stable_id(&["node", "symbol", repo_id, path, name]);
+        GraphRecord::node(
+            id,
+            NodeKind::Symbol,
+            Some(path.to_owned()),
+            None,
+            Some(name.to_owned()),
+            format!("Symbol {name} in {path}"),
+        )
+        .with_temporal(temporal(commit, &[], valid_time))
+    }
+
+    let commit_a = stable_id(&["node", "commit", "repo:a", "aaaa1111"]);
+    let file_a = stable_id(&["node", "file", "repo:a", "src/f.rs"]);
+    let sym_a = stable_id(&["node", "symbol", "repo:a", "src/f.rs", "sym_a"]);
+    let commit_b = stable_id(&["node", "commit", "repo:b", "bbbb2222"]);
+    let file_b = stable_id(&["node", "file", "repo:b", "src/other.rs"]);
+    let sym_b = stable_id(&["node", "symbol", "repo:b", "src/other.rs", "other_fn"]);
+
+    vec![
+        repo_node("repo:a", "repo-a"),
+        repo_node("repo:b", "repo-b"),
+        // Repo A history (older commit).
+        commit_in("repo:a", "aaaa1111", T1),
+        file_in("repo:a", "src/f.rs", "aaaa1111", T1),
+        symbol_in("repo:a", "sym_a", "src/f.rs", "aaaa1111", T1),
+        contains("repo:a", &commit_a),
+        contains("repo:a", &file_a),
+        defines(&file_a, &sym_a),
+        // Repo B history (newest commit in the shared store).
+        commit_in("repo:b", "bbbb2222", T2),
+        file_in("repo:b", "src/other.rs", "bbbb2222", T2),
+        symbol_in("repo:b", "other_fn", "src/other.rs", "bbbb2222", T2),
+        contains("repo:b", &commit_b),
+        contains("repo:b", &file_b),
+        defines(&file_b, &sym_b),
+    ]
+}
+
+#[test]
+fn as_of_resolves_on_the_path_owning_repository_timeline() {
+    let records = two_repo_history();
+    // The store-wide newest commit at or before T3 is repo B's bbbb2222, but
+    // src/f.rs lives in repo A: the instant must resolve on repo A's own
+    // timeline (aaaa1111), never report the file absent at an unrelated
+    // repository's commit.
+    let result = file_symbols_at_point(&records, "src/f.rs", FileAtPointSelector::AsOf(T3), None)
+        .expect("path must resolve on its owning repository's timeline");
+    assert_eq!(result.resolved_commit, "aaaa1111");
+    assert_eq!(names(&result), vec!["sym_a"]);
+}
+
+#[test]
+fn as_of_scoped_to_one_repository_resolves_within_it() {
+    let records = two_repo_history();
+    let result = file_symbols_at_point(
+        &records,
+        "src/f.rs",
+        FileAtPointSelector::AsOf(T3),
+        Some("repo:a"),
+    )
+    .expect("scoped query should resolve");
+    assert_eq!(result.resolved_commit, "aaaa1111");
+    assert_eq!(names(&result), vec!["sym_a"]);
+}
+
+#[test]
+fn as_of_unscoped_path_collision_across_repositories_fails_closed() {
+    let mut records = two_repo_history();
+    // Give repo B its own `src/f.rs` too: an unscoped single-answer time view
+    // must never pick one repository's timeline implicitly (issue #67).
+    let file_b2 = stable_id(&["node", "file", "repo:b", "src/f.rs"]);
+    records.push(
+        GraphRecord::node(
+            file_b2.clone(),
+            NodeKind::File,
+            Some("src/f.rs".to_owned()),
+            None,
+            Some("src/f.rs".to_owned()),
+            "Source file src/f.rs".to_owned(),
+        )
+        .with_temporal(temporal("bbbb2222", &[], T2)),
+    );
+    records.push(GraphRecord::edge(
+        aletheia_egregore::EdgeLabel::Contains,
+        "repo:b".to_owned(),
+        file_b2,
+        Some("1.0".to_owned()),
+        "containment".to_owned(),
+    ));
+
+    let err = file_symbols_at_point(&records, "src/f.rs", FileAtPointSelector::AsOf(T3), None)
+        .unwrap_err();
+    match err {
+        FileAtPointError::AmbiguousRepository { path, repositories } => {
+            assert_eq!(path, "src/f.rs");
+            assert_eq!(repositories, vec!["repo:a".to_owned(), "repo:b".to_owned()]);
+        }
+        other => panic!("expected AmbiguousRepository, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Seeded fixture repo: end-to-end through scan-history + CLI
 // ---------------------------------------------------------------------------
 

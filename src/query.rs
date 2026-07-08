@@ -13469,13 +13469,76 @@ pub fn file_symbols_at_point<'a>(
                     detail: e.to_string(),
                 }
             })?;
-            // Most recent commit at or before the instant. Git timestamps are
-            // second-resolution, so equal valid times are broken by
-            // topological rank (a descendant outranks its ancestors), then by
-            // SHA for full determinism.
+            // An instant must resolve on the queried path's own repository
+            // timeline: in a shared multi-repository store, an unrelated
+            // repository's newer commit would otherwise win the at-or-before
+            // race and make the file look absent at a commit its repository
+            // never had. Narrow the candidate commits to the repository
+            // group(s) that actually record the path.
+            let mut path_owner_groups: BTreeSet<Option<&str>> = BTreeSet::new();
+            for r in records {
+                if let GraphRecord::Node {
+                    id,
+                    kind: NodeKind::File | NodeKind::Symbol,
+                    repo_relative_path: Some(p),
+                    temporal: Some(_),
+                    ..
+                } = r
+                {
+                    if p == path && in_scope(id) {
+                        path_owner_groups.insert(index.owner_of(id));
+                    }
+                }
+            }
+            if path_owner_groups.is_empty() {
+                return Err(FileAtPointError::UnknownPath {
+                    path: path.to_owned(),
+                });
+            }
+            // Two repositories recording the same path have two distinct
+            // timelines; an unscoped single-answer time view never picks one
+            // implicitly (issue #67).
+            if path_owner_groups.len() > 1 {
+                return Err(FileAtPointError::AmbiguousRepository {
+                    path: path.to_owned(),
+                    repositories: path_owner_groups
+                        .iter()
+                        .filter_map(|g| *g)
+                        .map(str::to_owned)
+                        .collect(),
+                });
+            }
+            // Exactly one group remains; `flatten` keeps the unattributed
+            // (`None`) group as `None` without a panicking unwrap.
+            let path_owner = path_owner_groups.into_iter().next().flatten();
+            let owned_commit_shas: BTreeSet<&str> = records
+                .iter()
+                .filter_map(|r| {
+                    if let GraphRecord::Node {
+                        kind: NodeKind::Commit,
+                        name: Some(sha),
+                        ..
+                    } = r
+                    {
+                        (index.owner_of(r.id()) == path_owner).then_some(sha.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            // Most recent owned commit at or before the instant. Git
+            // timestamps are second-resolution, so equal valid times are
+            // broken by topological rank (a descendant outranks its
+            // ancestors), then by SHA for full determinism.
             let order = CommitOrder::build(records);
             let best = commit_valid_time
                 .iter()
+                .filter(|&(&sha, _)| {
+                    // Degenerate mixed-attribution stores (path attributed,
+                    // commits not) fall back to the full scoped timeline
+                    // rather than an empty one.
+                    owned_commit_shas.is_empty() || owned_commit_shas.contains(sha)
+                })
                 .filter_map(|(&sha, &vt)| {
                     let parsed = DateTime::parse_from_rfc3339(vt).ok()?;
                     (parsed <= as_of_dt).then_some((parsed, order.rank(sha), sha))
