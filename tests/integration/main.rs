@@ -6,6 +6,7 @@
 
 mod accuracy;
 mod antigravity;
+mod asof_file_symbols;
 mod author_attribution_doc;
 mod bundle;
 mod change_impact;
