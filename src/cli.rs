@@ -178,6 +178,28 @@ enum Commands {
         #[arg(long, default_value = "text")]
         format: OutputFormat,
     },
+    /// Validate a graph JSONL for referential integrity before ingest (issue #103).
+    ///
+    /// One read-only pass that asserts the graph is referentially closed: every
+    /// edge endpoint resolves to a present node, every DEFINES / CONTAINS /
+    /// CALLS / IMPORTS / MENTIONS edge targets a node of an allowed kind, no
+    /// tombstoned record is still referenced by a live edge, and no topology
+    /// node is orphaned. Structural reference closure only — never parse
+    /// correctness, semantic accuracy, schema-version compatibility, or
+    /// extraction completeness. Local and offline; no network access.
+    ///
+    /// Exit 0 with zero diagnostics on a clean graph; exit 1 with one
+    /// machine-readable JSONL diagnostic per defect (deterministic canonical
+    /// order); exit 2 on a load error. Output carries only record IDs, defect
+    /// categories, relation labels, paths, spans, and counts — never record
+    /// payloads. See `docs/cli/validate.md`.
+    Validate {
+        /// Graph JSONL path to validate.
+        graph: PathBuf,
+        /// Output format (JSONL diagnostics by default).
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Ingest graph JSONL through a storage adapter.
     Ingest {
         /// Graph JSONL path to ingest.
@@ -1728,6 +1750,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             repo_id_override.as_deref(),
             format,
         ),
+        Commands::Validate { graph, format } => validate_cmd(&graph, format),
         Commands::Ingest {
             graph,
             adapter,
@@ -3044,6 +3067,69 @@ fn inspect(
         OutputFormat::Text => {
             print_counts_text(&counts);
         }
+    }
+    Ok(())
+}
+
+/// Prints a redaction-safe JSON load error to stderr and exits 2, keeping the
+/// load-error exit code distinct from the defects-found gate failure (1).
+fn validate_load_exit(code: &str, path: &Path, message: &str) -> ! {
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "code": code,
+            "path": path.display().to_string(),
+            "message": message
+        })
+    );
+    std::process::exit(2);
+}
+
+/// Handles `eg validate` (issue #103): pre-ingest referential-integrity
+/// validation of a graph JSONL. Exit 0 clean, 1 with one diagnostic per
+/// defect, 2 on load errors.
+fn validate_cmd(graph: &Path, format: OutputFormat) -> Result<()> {
+    let jsonl = fs::read_to_string(graph)
+        .unwrap_or_else(|error| validate_load_exit("graph_read_error", graph, &error.to_string()));
+    let records = records_from_jsonl(&jsonl)
+        .unwrap_or_else(|error| validate_load_exit("graph_parse_error", graph, &error.to_string()));
+
+    let report = crate::validate::validate_records(&records);
+
+    match format {
+        OutputFormat::Json => {
+            for diagnostic in &report.diagnostics {
+                println!(
+                    "{}",
+                    serde_json::to_string(diagnostic)
+                        .context("failed to serialize validation diagnostic")?
+                );
+            }
+            let summary = serde_json::json!({
+                "ok": report.is_clean(),
+                "records": report.records,
+                "nodes": report.nodes,
+                "edges": report.edges,
+                "tombstones": report.tombstones,
+                "defects": report.diagnostics.len(),
+            });
+            println!("{}", serde_json::to_string(&summary)?);
+        }
+        OutputFormat::Text => {
+            for diagnostic in &report.diagnostics {
+                println!("{}", diagnostic.to_text());
+            }
+            let defects = report.diagnostics.len();
+            let plural = if defects == 1 { "" } else { "s" };
+            println!(
+                "validated {} records ({} nodes, {} edges, {} tombstones): {defects} defect{plural}",
+                report.records, report.nodes, report.edges, report.tombstones
+            );
+        }
+    }
+
+    if !report.is_clean() {
+        std::process::exit(1);
     }
     Ok(())
 }

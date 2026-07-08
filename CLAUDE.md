@@ -81,6 +81,24 @@ repo-relative file/span handle. An empty surface is an explicit machine-readable
 byte-identical across runs. Parse-derived, never a build-verified or semver claim.
 See `docs/cli/public-api.md`.
 
+Pre-ingest referential-integrity validation (issue #103):
+
+```powershell
+# Gate a graph JSONL between scan and ingest
+cargo run -- validate graph.jsonl                 # exit 0 clean, 1 defects, 2 load error
+cargo run -- validate graph.jsonl --format text   # human-readable one-line-per-defect form
+```
+
+`eg validate` runs one read-only, offline pass asserting a graph JSONL (from `scan` or
+`scan-history`) is referentially closed: every edge endpoint resolves to a present node,
+every `DEFINES`/`CONTAINS`/`CALLS`/`IMPORTS`/`MENTIONS` edge targets an allowed node kind,
+no tombstoned-and-unsuperseded record is still referenced by a live edge, and no topology
+node is orphaned. Zero defects exit 0; any defect exits 1 with one machine-readable JSONL
+diagnostic per defect in deterministic canonical order (byte-identical across runs). Output
+is redaction-safe — record IDs, categories, relation labels, paths, spans, and counts only.
+Structural reference closure only: never parse correctness, semantic accuracy, schema-version
+compatibility, or extraction completeness. See `docs/cli/validate.md`.
+
 Protected raw-artifact commands (issue #60):
 
 ```powershell
