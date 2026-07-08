@@ -94,6 +94,13 @@ Guarantees:
   programmatic (dry-run/test) paths.
 - When the report goes to stdout (`-`), the human status line moves to stderr
   so stdout is exactly the JSON report.
+- Only markers whose hash prefix is exactly 12 lowercase-hex characters — the
+  length `redact_value` always emits — are counted; a marker-shaped
+  placeholder merely mentioned in a transcript (e.g. `<REDACTED:api_token:f>`)
+  never inflates the report.
+- `--redaction-report` pointing at the same path as `--out` is rejected
+  before either artifact is written, so the report can never overwrite the
+  records JSONL.
 
 The report covers the two local transcript importers' at-import write
 boundary only — it is not a resting-store leak audit, retraction tool, or

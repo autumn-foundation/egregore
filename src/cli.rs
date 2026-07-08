@@ -2403,6 +2403,7 @@ fn import_github_cmd(
 }
 
 fn import_codex_cmd(codex_path: &Path, out: &Path, redaction_report: Option<&Path>) -> Result<()> {
+    ensure_report_path_distinct(out, redaction_report)?;
     let opts = crate::codex::ImportOptions::default();
     let graph = crate::codex::import_codex(codex_path, &opts)
         .with_context(|| format!("failed to import Codex JSONL from {}", codex_path.display()))?;
@@ -2465,6 +2466,37 @@ fn import_antigravity_cmd(antigravity_path: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Rejects a `--redaction-report` path that would overwrite the `--out` JSONL.
+///
+/// The report is written after the records, so a matching path would silently
+/// replace the graph JSONL with the report while the command still exits 0.
+/// Paths are compared after lexical absolutization (no filesystem access, so
+/// not-yet-existing outputs still compare); `-` (stdout) never conflicts.
+///
+/// # Errors
+///
+/// Returns an error naming both flags when the paths resolve to the same file.
+fn ensure_report_path_distinct(out: &Path, redaction_report: Option<&Path>) -> Result<()> {
+    let Some(report_path) = redaction_report else {
+        return Ok(());
+    };
+    if report_path == Path::new("-") {
+        return Ok(());
+    }
+    let conflict = match (std::path::absolute(out), std::path::absolute(report_path)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => out == report_path,
+    };
+    if conflict {
+        anyhow::bail!(
+            "--redaction-report path {} matches --out; the report would overwrite the \
+             records JSONL — choose distinct paths",
+            report_path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Emits the import status line and, when requested, the issue #266 redaction
 /// report.
 ///
@@ -2502,6 +2534,7 @@ fn emit_import_status_and_report(
 }
 
 fn import_traj_cmd(traj_path: &Path, out: &Path, redaction_report: Option<&Path>) -> Result<()> {
+    ensure_report_path_distinct(out, redaction_report)?;
     let opts = ImportOptions::default();
     let graph = traj::import_traj(traj_path, &opts)
         .with_context(|| format!("failed to import .traj from {}", traj_path.display()))?;

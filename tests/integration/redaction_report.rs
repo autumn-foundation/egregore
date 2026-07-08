@@ -166,6 +166,26 @@ fn parse_markers_ignores_non_hex_hash() {
 }
 
 #[test]
+fn parse_markers_requires_exact_hash_prefix_length() {
+    // `redact_value` always emits exactly 12 hex characters. A marker-shaped
+    // placeholder that merely *mentions* a shorter or longer hex suffix
+    // (e.g. pre-existing text in a transcript) must not count as a redaction.
+    assert!(
+        parse_redaction_markers("<REDACTED:api_token:f>").is_empty(),
+        "a too-short hex suffix must not be counted"
+    );
+    assert!(
+        parse_redaction_markers("<REDACTED:api_token:abc123def4567>").is_empty(),
+        "a too-long hex suffix must not be counted"
+    );
+    assert_eq!(
+        parse_redaction_markers("<REDACTED:api_token:abc123def456>").len(),
+        1,
+        "the exact generated prefix length must still be counted"
+    );
+}
+
+#[test]
 fn parse_markers_finds_multiple_occurrences() {
     let value = "<REDACTED:email:aaaa11112222> and <REDACTED:env_secret:bbbb33334444>";
     let markers = parse_redaction_markers(value);
@@ -525,6 +545,54 @@ fn import_codex_cli_writes_redaction_report_file() {
     assert!(
         !body.contains(SECRET_BEARER_RAW) && !body.contains(SECRET_SK_RAW),
         "report file must never contain raw secrets"
+    );
+}
+
+#[test]
+fn import_traj_cli_rejects_report_path_equal_to_out() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let traj_path = write_secret_traj(temp.path());
+    let out = temp.path().join("records.jsonl");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("import-traj")
+        .arg(&traj_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--redaction-report")
+        .arg(&out)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--redaction-report"));
+
+    assert!(
+        !out.exists(),
+        "neither artifact may be written when --out and --redaction-report collide"
+    );
+}
+
+#[test]
+fn import_codex_cli_rejects_report_path_equal_to_out() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let codex_path = write_secret_codex(temp.path());
+    let out = temp.path().join("records.jsonl");
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("import-codex")
+        .arg(&codex_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--redaction-report")
+        .arg(&out)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--redaction-report"));
+
+    assert!(
+        !out.exists(),
+        "neither artifact may be written when --out and --redaction-report collide"
     );
 }
 

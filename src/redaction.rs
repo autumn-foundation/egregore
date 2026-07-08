@@ -129,8 +129,11 @@ pub fn is_redacted(value: &str) -> bool {
 ///
 /// A well-formed marker is `<REDACTED:secret_class:hash_prefix>` where
 /// `secret_class` is one of the named classes in `docs/schema/redaction.md`
-/// and `hash_prefix` is a non-empty lowercase-hex BLAKE3 prefix. Marker-shaped
-/// substrings with an unknown class or a non-hex hash are ignored. Returns the
+/// and `hash_prefix` is a lowercase-hex BLAKE3 prefix of exactly
+/// [`HASH_PREFIX_LEN`] characters — the length [`redact_value`] always emits.
+/// Marker-shaped substrings with an unknown class, a non-hex hash, or a
+/// wrong-length hash are ignored, so a placeholder merely mentioned in a
+/// transcript cannot be counted as a redaction. Returns the
 /// `(class, hash_prefix)` pairs in order of appearance.
 ///
 /// Used by the at-import redaction report (issue #266) to tie report entries
@@ -147,7 +150,7 @@ pub fn parse_redaction_markers(value: &str) -> Vec<(SecretClass, String)> {
         let inner = &body[..end];
         if let Some((class_name, hash_prefix)) = inner.split_once(':')
             && let Some(class) = SecretClass::from_name(class_name)
-            && !hash_prefix.is_empty()
+            && hash_prefix.len() == HASH_PREFIX_LEN
             && hash_prefix
                 .chars()
                 .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
