@@ -1618,6 +1618,7 @@ fn make_node(
         author: None,
         diff_hunk_handle: None,
         review_side: None,
+        dependency: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,
     }

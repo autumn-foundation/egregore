@@ -219,7 +219,8 @@ fn candidate_from_record(record: &GraphRecord) -> Option<EmbeddingCandidate> {
         | NodeKind::NamingDecision
         | NodeKind::Constraint
         | NodeKind::CostUsage
-        | NodeKind::Retraction => return None,
+        | NodeKind::Retraction
+        | NodeKind::DependencyDeclaration => return None,
     };
 
     Some(EmbeddingCandidate {

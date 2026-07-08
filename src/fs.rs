@@ -31,13 +31,37 @@ pub struct SourceFile {
 /// Returns an error when directory traversal cannot read an entry or when a
 /// discovered source file cannot be relativized against the repository root.
 pub fn discover_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
+    discover_files_matching(repo_root, &languages::is_supported_source, true)
+}
+
+/// Discovers `Cargo.toml` manifests under a repository root for dependency
+/// extraction (issue #180), honoring the same Git-scope and ignore rules as
+/// source discovery.
+///
+/// # Errors
+///
+/// Returns an error when directory traversal cannot read an entry or when a
+/// discovered manifest cannot be relativized against the repository root.
+pub fn discover_cargo_manifests(repo_root: &Path) -> Result<Vec<SourceFile>> {
+    discover_files_matching(repo_root, &is_cargo_manifest, false)
+}
+
+fn is_cargo_manifest(path: &Path) -> bool {
+    path.file_name().and_then(OsStr::to_str) == Some("Cargo.toml")
+}
+
+fn discover_files_matching(
+    repo_root: &Path,
+    matcher: &dyn Fn(&Path) -> bool,
+    log_skipped: bool,
+) -> Result<Vec<SourceFile>> {
     let mut files = Vec::new();
 
     if crate::identity::is_repo_root(repo_root) {
         if let Some(tracked) = git_tracked_files(repo_root) {
             for path in tracked {
                 let is_file = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
-                if !is_file || !languages::is_supported_source(&path) {
+                if !is_file || !matcher(&path) {
                     continue;
                 }
                 let Ok(rel) = repo_relative_path(repo_root, &path) else {
@@ -51,27 +75,29 @@ pub fn discover_source_files(repo_root: &Path) -> Result<Vec<SourceFile>> {
                 }
             }
 
-            // Report skipped files
-            let (
-                skipped_rust_count,
-                skipped_python_count,
-                skipped_typescript_count,
-                skipped_go_count,
-            ) = git_count_skipped_files(repo_root).unwrap_or((0, 0, 0, 0));
+            if log_skipped {
+                // Report skipped files
+                let (
+                    skipped_rust_count,
+                    skipped_python_count,
+                    skipped_typescript_count,
+                    skipped_go_count,
+                ) = git_count_skipped_files(repo_root).unwrap_or((0, 0, 0, 0));
 
-            eprintln!(
-                "Skipped {skipped_rust_count} .rs, {skipped_python_count} .py, {skipped_typescript_count} .ts/.tsx, {skipped_go_count} .go files by ignore rules"
-            );
+                eprintln!(
+                    "Skipped {skipped_rust_count} .rs, {skipped_python_count} .py, {skipped_typescript_count} .ts/.tsx, {skipped_go_count} .go files by ignore rules"
+                );
+            }
         } else {
             // Git command failed, fallback
             let ignored_dirs = git_ignored_dir_prefixes(repo_root);
-            collect_source_files(repo_root, &ignored_dirs, &mut files)?;
+            collect_matching_files(repo_root, matcher, &ignored_dirs, &mut files)?;
             filter_git_ignored(repo_root, &mut files);
         }
     } else {
         // Fallback to pure filesystem walk for non-Git trees
         let ignored_dirs = HashSet::new();
-        collect_source_files(repo_root, &ignored_dirs, &mut files)?;
+        collect_matching_files(repo_root, matcher, &ignored_dirs, &mut files)?;
     }
 
     let mut source_files: Vec<SourceFile> = files
@@ -194,8 +220,9 @@ fn git_count_skipped_files(repo_root: &Path) -> Option<(usize, usize, usize, usi
     Some((skipped_rust, skipped_python, skipped_typescript, skipped_go))
 }
 
-fn collect_source_files(
+fn collect_matching_files(
     directory: &Path,
+    matcher: &dyn Fn(&Path) -> bool,
     ignored_dirs: &HashSet<PathBuf>,
     files: &mut Vec<PathBuf>,
 ) -> Result<()> {
@@ -219,9 +246,9 @@ fn collect_source_files(
 
         if file_type.is_dir() {
             if should_descend(&path) && !ignored_dirs.contains(&path) {
-                collect_source_files(&path, ignored_dirs, files)?;
+                collect_matching_files(&path, matcher, ignored_dirs, files)?;
             }
-        } else if file_type.is_file() && languages::is_supported_source(&path) {
+        } else if file_type.is_file() && matcher(&path) {
             files.push(path);
         }
     }

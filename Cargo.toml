@@ -53,6 +53,10 @@ same-file = "1.0.6"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"
+# TOML parsing for Cargo manifest/lockfile dependency extraction (issue #180).
+# Already present transitively in Cargo.lock, so this pins no new crate
+# version; parse-only (no `display`) keeps the serializer out of the tree.
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 rmcp = { version = "1.7.0", features = ["macros", "server", "transport-io"], optional = true }
 schemars = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }

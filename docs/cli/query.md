@@ -33,6 +33,8 @@ eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [
 eg query unreferenced     --graph <PATH>   [--repo <SELECTOR>]
 
 eg query at       <PATH>:<LINE> --graph <PATH> [--at <COMMIT>] [--repo <SELECTOR>]
+
+eg query deps             --graph <PATH>   [--name <CRATE>] [--format json|text]
 ```
 
 Evidence-backed audit subcommands have their own pages:
@@ -90,6 +92,12 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query at` — resolve a **`file:line` location to its smallest enclosing
   code symbol**, with the enclosing chain reported outermost → innermost
   ([below](#eg-query-at), issue #151).
+
+- `eg query deps` — every **directly-declared Cargo dependency** with its
+  declared requirement, lockfile-resolved version (or a documented unresolved
+  marker), declaring package, and manifest handle; `--name` answers the
+  direct "do we depend on X?" lookup
+  ([deps.md](deps.md), issue #180).
 
 Most subcommands accept exactly one input source:
 

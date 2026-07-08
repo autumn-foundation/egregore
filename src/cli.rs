@@ -1377,6 +1377,38 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// List declared Cargo dependencies as citable graph facts (issue #180).
+    ///
+    /// Reports every directly-declared Cargo dependency captured at scan
+    /// time from `[dependencies]`, `[dev-dependencies]`, and
+    /// `[build-dependencies]`: crate name, dependency kind, the declared
+    /// version requirement as written, the resolved version from the nearest
+    /// `Cargo.lock` (or a documented unresolved marker — never a guess), the
+    /// declaring package, and the repo-relative manifest handle. `--name`
+    /// answers the direct "do we depend on X?" lookup, returning only
+    /// matching declarations.
+    ///
+    /// Rows are parse-derived declaration facts — never proof the dependency
+    /// is used in code, builds, or resolves. Output is deterministic and
+    /// byte-identical across runs; an empty surface or a name miss is a
+    /// machine-readable success (exit 0 with a stable diagnostic), not an
+    /// error.
+    ///
+    /// Documented in `docs/cli/deps.md`.
+    Deps {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Return only declarations of this exact crate name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Classify public-API surface changes across a commit range (issue #157).
     ///
     /// Composes the issue #118 range-delta mechanics with the issue #124
@@ -6012,6 +6044,15 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 limit,
             };
             query_coupling_cmd(&records, &path, selected.as_deref(), &options, format)
+        }
+        QuerySubcommand::Deps {
+            graph,
+            data_dir,
+            name,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_deps_cmd(&records, name.as_deref(), format)
         }
         QuerySubcommand::PublicApiDeltas {
             base,
@@ -11200,6 +11241,168 @@ struct PublicApiResponse<'a> {
 
 const PUBLIC_API_DISCLAIMER: &str = "Parse-derived enumeration of the externally-reachable public API surface from recorded \
      visibility and module containment. Not a build-verified or semver claim.";
+
+// ---------------------------------------------------------------------------
+// declared-dependency query (issue #180)
+// ---------------------------------------------------------------------------
+
+/// Standing disclaimer on every `query deps` response: rows are declaration
+/// facts parsed from manifests, never usage, build, or resolvability proof.
+const DEPS_DISCLAIMER: &str = "Declared-dependency facts parsed from Cargo manifests and the nearest Cargo.lock; never proof the dependency is used in code, builds, or resolves.";
+
+/// One declared-dependency row in the `query deps` response.
+#[derive(serde::Serialize)]
+struct DepsDeclarationJson<'a> {
+    record_id: &'a str,
+    name: &'a str,
+    dependency_kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declared_requirement: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_version: Option<&'a str>,
+    resolution: &'a str,
+    declaring_package: &'a str,
+    manifest_path: &'a str,
+    schema_version: u32,
+}
+
+/// One stable machine-readable diagnostic in the `query deps` response.
+#[derive(serde::Serialize)]
+struct DepsDiagnosticJson<'a> {
+    code: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
+}
+
+/// Top-level `query deps` response envelope.
+#[derive(serde::Serialize)]
+struct DepsResponse<'a> {
+    ok: bool,
+    query: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    count: usize,
+    disclaimer: &'a str,
+    declarations: Vec<DepsDeclarationJson<'a>>,
+    diagnostics: Vec<DepsDiagnosticJson<'a>>,
+}
+
+/// Sort rank keeping the documented dependency-kind order stable:
+/// `normal` < `dev` < `build` < anything unknown.
+const fn dependency_kind_rank(kind: &str) -> u8 {
+    match kind.as_bytes() {
+        b"normal" => 0,
+        b"dev" => 1,
+        b"build" => 2,
+        _ => 3,
+    }
+}
+
+/// `eg query deps` (issue #180): list declared Cargo dependencies with their
+/// lockfile resolution, or answer a direct `--name` lookup. Deterministic,
+/// byte-identical output; an empty surface or a miss is a machine-readable
+/// success, never an error.
+fn query_deps_cmd(
+    records: &[GraphRecord],
+    name_filter: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let mut rows: Vec<DepsDeclarationJson<'_>> = records
+        .iter()
+        .filter_map(|record| {
+            let GraphRecord::Node {
+                id,
+                kind: NodeKind::DependencyDeclaration,
+                schema_version,
+                repo_relative_path: Some(manifest_path),
+                name: Some(name),
+                dependency: Some(payload),
+                ..
+            } = record
+            else {
+                return None;
+            };
+            Some(DepsDeclarationJson {
+                record_id: id,
+                name,
+                dependency_kind: &payload.dependency_kind,
+                declared_requirement: payload.declared_requirement.as_deref(),
+                resolved_version: payload.resolved_version.as_deref(),
+                resolution: &payload.resolution,
+                declaring_package: &payload.declaring_package,
+                manifest_path,
+                schema_version: *schema_version,
+            })
+        })
+        .collect();
+    rows.sort_by(|left, right| {
+        left.manifest_path
+            .cmp(right.manifest_path)
+            .then_with(|| left.declaring_package.cmp(right.declaring_package))
+            .then_with(|| {
+                dependency_kind_rank(left.dependency_kind)
+                    .cmp(&dependency_kind_rank(right.dependency_kind))
+            })
+            .then_with(|| left.name.cmp(right.name))
+            .then_with(|| left.record_id.cmp(right.record_id))
+    });
+    let surface_is_empty = rows.is_empty();
+    if let Some(filter) = name_filter {
+        rows.retain(|row| row.name == filter);
+    }
+
+    let mut diagnostics = Vec::new();
+    if surface_is_empty {
+        diagnostics.push(DepsDiagnosticJson {
+            code: "empty_dependency_surface",
+            detail: None,
+        });
+    } else if rows.is_empty() {
+        diagnostics.push(DepsDiagnosticJson {
+            code: "no_match_for_name",
+            detail: name_filter,
+        });
+    }
+
+    match format {
+        OutputFormat::Json => {
+            let response = DepsResponse {
+                ok: true,
+                query: "deps",
+                name: name_filter,
+                count: rows.len(),
+                disclaimer: DEPS_DISCLAIMER,
+                declarations: rows,
+                diagnostics,
+            };
+            let output = serde_json::to_string_pretty(&response)
+                .context("failed to serialize dependency declarations")?;
+            println!("{output}");
+        }
+        OutputFormat::Text => {
+            println!("{} dependency declaration(s)", rows.len());
+            for row in &rows {
+                let requirement = row.declared_requirement.unwrap_or("(none)");
+                let resolved = row.resolved_version.unwrap_or(row.resolution);
+                println!(
+                    "{package} {kind} {name} requirement={requirement} resolved={resolved} manifest={manifest} ({record_id})",
+                    package = row.declaring_package,
+                    kind = row.dependency_kind,
+                    name = row.name,
+                    manifest = row.manifest_path,
+                    record_id = row.record_id,
+                );
+            }
+            for diagnostic in &diagnostics {
+                match diagnostic.detail {
+                    Some(detail) => println!("diagnostic: {} ({detail})", diagnostic.code),
+                    None => println!("diagnostic: {}", diagnostic.code),
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 fn query_public_api_cmd(
     records: &[GraphRecord],
