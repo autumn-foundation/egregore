@@ -694,7 +694,7 @@ pub enum GraphRecord {
         /// but `span` is not; see `docs/adr/0004-symbol-identity.md`.
         #[serde(skip_serializing_if = "Option::is_none")]
         disambiguator: Option<u64>,
-        // ── Symbol declaration-surface fields (issue #124) ────────────────────
+        // ── Declaration-surface fields (issues #124 / #213 / #257) ────────────
         /// Declaration visibility class for `Symbol` nodes (and Rust `Module`
         /// nodes, issue #213), drawn from the closed set `public` / `crate` /
         /// `restricted` / `private`. Additive per
@@ -707,9 +707,12 @@ pub enum GraphRecord {
         /// body excluded and interior whitespace collapsed deterministically.
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
-        /// Doc-comment text (`///`, `/** */`, or `#[doc = "..."]`) for
-        /// `Symbol` nodes after passing through redaction policy v1. Omitted
-        /// entirely when the item has no doc comment — never an empty string.
+        /// Doc-comment text (`///`, `/** */`, or `#[doc = "..."]`) after
+        /// passing through redaction policy v1. Present on `Symbol` nodes
+        /// (issue #124) and on Rust `Import` nodes when a doc comment sits at
+        /// a `pub use` re-export site (issue #257) — consumers and validators
+        /// MUST preserve the field on both kinds. Omitted entirely when the
+        /// item has no doc comment — never an empty string.
         #[serde(skip_serializing_if = "Option::is_none")]
         doc: Option<String>,
         /// Git and bitemporal provenance for history-backed records.
@@ -1586,9 +1589,12 @@ impl GraphRecord {
         self
     }
 
-    /// Attaches declaration-surface metadata to a `Symbol` node record
-    /// (issue #124): visibility class, normalized signature header, and
-    /// redacted doc-comment text.
+    /// Attaches declaration-surface metadata to a node record (issue #124):
+    /// visibility class, normalized signature header, and redacted
+    /// doc-comment text. Used by `Symbol` nodes for the full surface, and by
+    /// Rust `Import` nodes to carry the doc comment written at a `pub use`
+    /// re-export site (issue #257; doc only — visibility and signature stay
+    /// absent there).
     ///
     /// The fields are additive per `docs/schema/schema-versioning.md §2` and
     /// MUST NOT contribute to stable ID composition. No-op on non-node records.
