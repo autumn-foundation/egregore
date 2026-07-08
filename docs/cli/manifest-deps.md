@@ -105,8 +105,16 @@ lockfile.
   impact analysis.
 - Cargo only; non-Cargo build systems and non-Rust languages are out of
   scope, as is history-backed (as-of) dependency reconstruction.
-- `eg refresh` / incremental scans do not yet re-derive dependency facts;
-  re-run a full `eg scan` + ingest after editing manifests (follow-on slice).
+- **Refreshing after manifest edits.** `eg refresh` / incremental scans do
+  not yet re-derive dependency facts, and re-ingesting a fresh scan into an
+  *existing* embedded store never retires a **removed** dependency: `ingest`
+  writes only the records present in the JSONL and does not tombstone absent
+  IDs, so `query manifest-deps --data-dir` would keep reporting the removed
+  crate as declared. After an edit that removes or renames a dependency,
+  rebuild the store — ingest the fresh scan into a **new** `--data-dir` — or
+  query the fresh `graph.jsonl` directly, which always reflects the current
+  tree. Tombstoning absent dependency IDs on ingest/refresh is a follow-on
+  slice.
 
 ## Output
 
@@ -170,6 +178,12 @@ cargo run -- query manifest-deps --graph graph.jsonl --name serde  # direct look
 cargo run -- ingest graph.jsonl --adapter embedded --data-dir .egregore
 cargo run -- query manifest-deps --data-dir .egregore --name serde # store-backed
 ```
+
+A store-backed answer is only as fresh as the last ingest, and re-ingesting
+into an existing store adds and updates declarations but does not retire
+removed ones (see *Scope and bounds*). When manifests have changed — and
+always after a dependency removal — prefer the `--graph` form on a fresh
+scan, or rebuild the store into a new `--data-dir`.
 
 ## Schema
 
