@@ -39,6 +39,13 @@ cargo run -- query change-impact codegraph:v1:zzz --graph graph.jsonl     # exit
 cargo run -- query change-impact does_not_exist --graph graph.jsonl        # exit 2 (no_match)
 cargo run -- query change-impact <symbol_name> --graph graph.jsonl --depth 2  # wider neighborhood
 
+# Transitive inbound callers with call paths (issue #139)
+cargo run -- query transitive-callers <symbol_name> --graph graph.jsonl       # exit 0 (even when empty)
+cargo run -- query transitive-callers <ambiguous_name> --graph graph.jsonl    # exit 1 (candidates listed)
+cargo run -- query transitive-callers does_not_exist --graph graph.jsonl      # exit 2 (no_match)
+cargo run -- query transitive-callers <symbol_name> --graph graph.jsonl --max-depth 3
+cargo run -- query transitive-callers <symbol_name> --graph history.graph.jsonl --at <sha>  # commit view
+
 # Symbol- and file-level deltas across a commit range (issue #118)
 cargo run -- query deltas <base_sha> <head_sha> --graph history.graph.jsonl  # exit 0 on match
 cargo run -- query deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
@@ -66,6 +73,18 @@ Output is a deterministic JSON envelope with trust-separated sections.
 Rows are leads to inspect before editing, not proof of breakage. The response is deterministic
 and byte-identical across runs. Default depth is 1 (direct neighbors only); use `--depth 2`
 for a wider BFS neighborhood. Output is a JSON envelope with an always-present disclaimer.
+
+`eg query transitive-callers <handle>` walks the transitive inbound `CALLS`/`REFERENCES`
+closure of a symbol (record ID or exact name) up to `--max-depth` (default 5) and returns
+every reachable symbol with its hop distance and one concrete shortest connecting call path
+of record-ID/edge-label handles. Cycles terminate deterministically (each symbol reported
+once, shortest path); reaching the bound emits a truncation diagnostic counting dropped
+frontier nodes per depth. Call-resolution labels (issues #152/#134) propagate along paths:
+each row carries the weakest resolution on its chain. Ambiguous names exit 1 listing all
+candidate record IDs; `--at`/`--as-of` walk a single-commit history view. Output is
+newline-delimited JSON (summary envelope line, then one row per line), byte-identical across
+runs. Rows are reachability leads, never proof of breakage. See
+`docs/cli/transitive-callers.md`.
 
 `eg query deltas <base> <head>` returns the observed structural deltas between two commit
 handles (full SHA or unique prefix) from a `scan-history` graph or embedded store, grouped by

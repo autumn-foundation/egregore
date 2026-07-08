@@ -23,6 +23,7 @@ eg query task     <HANDLE> --graph <PATH>
 eg query memory   <HANDLE> --graph <PATH>   [--verified-only]
 eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>]
 eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N]
+eg query transitive-callers <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query deltas   <BASE> <HEAD> --graph <PATH> [--repo <SELECTOR>]
 eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
 ```
@@ -46,6 +47,11 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query change-impact` — **graph-derived impact leads** grouped by relation
   for a symbol or file handle, for blast-radius triage before editing
   ([change-impact.md](change-impact.md), issue #76).
+- `eg query transitive-callers` — the **transitive inbound-reachable set** of a
+  symbol with one concrete connecting call path per row, bounded by
+  `--max-depth`, deterministic under cycles, honoring `--at`/`--as-of`
+  temporal views, with `CALLS` resolution labels propagated along each path
+  ([transitive-callers.md](transitive-callers.md), issue #139).
 - `eg query deltas` — **symbol- and file-level changes between two commits**,
   grouped by stable change class with citable handles
   ([deltas.md](deltas.md), issue #118).
