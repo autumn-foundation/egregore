@@ -166,6 +166,85 @@ fn incremental_rebuilds_when_cache_record_schema_version_is_unknown() {
 }
 
 #[test]
+fn incremental_rebuilds_when_cache_producer_signature_differs() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    let src = repo.join("src");
+    fs::create_dir_all(&src).expect("fixture src dir should be created");
+    fs::write(src.join("lib.rs"), "pub fn answer() -> usize { 42 }\n")
+        .expect("fixture should write");
+    let cache_path = temp.path().join("codegraph-cache.json");
+
+    scan_repository_incremental(&repo, &cache_path).expect("first scan should write cache");
+    // Simulate a cache written by a binary with an older Rust grammar: if
+    // reuse survived this, unchanged files would be re-stamped with the
+    // running binary's producer envelope and `eg query producer-drift`
+    // would report them as current — a false negative (issue #234).
+    let mut cache_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cache_path).expect("cache should be readable"))
+            .expect("cache should parse");
+    cache_json["producer_components"]["tree_sitter_rust"] =
+        serde_json::json!("0.0.0-superseded-grammar");
+    fs::write(
+        &cache_path,
+        serde_json::to_string_pretty(&cache_json).expect("cache should serialize"),
+    )
+    .expect("fixture should write tampered cache");
+
+    let scan = scan_repository_incremental(&repo, &cache_path)
+        .expect("producer signature mismatch should degrade to a rebuild");
+    assert_eq!(scan.rebuilt_files, ["src/lib.rs"]);
+    assert!(scan.reused_files.is_empty());
+
+    // A rescan with the (now re-written) matching signature reuses again.
+    let rescan = scan_repository_incremental(&repo, &cache_path)
+        .expect("matching producer signature should reuse the cache");
+    assert_eq!(rescan.reused_files, ["src/lib.rs"]);
+    assert!(rescan.rebuilt_files.is_empty());
+}
+
+#[test]
+fn incremental_rebuilds_when_cache_predates_producer_signature() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    let src = repo.join("src");
+    fs::create_dir_all(&src).expect("fixture src dir should be created");
+    fs::write(src.join("lib.rs"), "pub fn answer() -> usize { 42 }\n")
+        .expect("fixture should write");
+    let cache_path = temp.path().join("codegraph-cache.json");
+
+    scan_repository_incremental(&repo, &cache_path).expect("first scan should write cache");
+    // A cache written before the producer signature existed carries no
+    // signature fields; the writing binary is unknown, so reuse must not
+    // vouch for its producer identity.
+    let mut cache_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cache_path).expect("cache should be readable"))
+            .expect("cache should parse");
+    let removed_version = cache_json
+        .as_object_mut()
+        .expect("cache should be a JSON object")
+        .remove("producer_egregore_version");
+    let removed_components = cache_json
+        .as_object_mut()
+        .expect("cache should be a JSON object")
+        .remove("producer_components");
+    assert!(
+        removed_version.is_some() && removed_components.is_some(),
+        "current caches must record the writing binary's producer signature"
+    );
+    fs::write(
+        &cache_path,
+        serde_json::to_string_pretty(&cache_json).expect("cache should serialize"),
+    )
+    .expect("fixture should write signature-less cache");
+
+    let scan = scan_repository_incremental(&repo, &cache_path)
+        .expect("signature-less cache should degrade to a rebuild");
+    assert_eq!(scan.rebuilt_files, ["src/lib.rs"]);
+    assert!(scan.reused_files.is_empty());
+}
+
+#[test]
 fn incremental_tombstones_stale_cross_file_records_when_identity_changes() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path().join("repo");

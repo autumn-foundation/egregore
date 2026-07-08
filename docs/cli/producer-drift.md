@@ -75,6 +75,12 @@ Comparison details:
   subsumed by the version string) are **not** compared. This holds the
   zero-false-positive bar: a store written entirely by one binary version
   always yields an empty drift result with an explicit `no_drift` diagnostic.
+- The `incremental_cache` envelope is trustworthy because the incremental
+  cache invalidates on producer-signature change: a scan by a binary whose
+  `egregore_version` or any producer-component version differs from the
+  binary that wrote the cache rebuilds every file instead of reusing cached
+  records. Records stamped `incremental_cache` were therefore extracted by
+  the binary named in their envelope, never laundered from an older grammar.
 
 ## Output shape
 
