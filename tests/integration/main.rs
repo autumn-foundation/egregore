@@ -74,6 +74,7 @@ mod schema_versioning;
 mod semantic_drift;
 mod semantic_drift_calibration;
 mod semantic_relevance;
+mod store_contention;
 mod symbol_metadata;
 mod task_query;
 mod temporal;

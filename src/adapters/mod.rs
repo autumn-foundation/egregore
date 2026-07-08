@@ -21,6 +21,12 @@ pub use aletheiadb::SemanticMatch;
 /// Result type for adapter operations.
 pub type AdapterResult<T> = std::result::Result<T, AdapterError>;
 
+/// Stable machine code carried by every embedded write-lease contention refusal.
+///
+/// Documented in `docs/cli/embedded-concurrency.md` (issue #200); agents match
+/// on this code to decide between routing through the daemon and retrying.
+pub const STORE_CONTENDED_CODE: &str = "store_contended";
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[cfg(feature = "embedded-aletheiadb")]
 pub(crate) enum ExpectedRecordState {
@@ -47,6 +53,22 @@ pub enum AdapterError {
         /// Graph record ID.
         record_id: String,
         /// Rejection reason.
+        message: String,
+    },
+
+    /// Another live writer (embedded peer or daemon) holds the embedded
+    /// store's exclusive write lease (issue #200).
+    ///
+    /// The refused open performed no partial or interleaved write. The message
+    /// names the holder when it is identifiable and always names the remedy:
+    /// route concurrent writers through the daemon, or retry after the current
+    /// writer releases the store. The display form is prefixed with the stable
+    /// [`STORE_CONTENDED_CODE`] machine code.
+    #[error("store_contended: {message}")]
+    Contended {
+        /// Data directory whose write lease is held.
+        data_dir: String,
+        /// Diagnosis naming the holder (when known) and the remedy.
         message: String,
     },
 

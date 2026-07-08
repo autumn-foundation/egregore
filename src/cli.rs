@@ -35,6 +35,8 @@ use crate::adapters::EmbeddedAletheiaSink;
 #[cfg(feature = "embeddings")]
 use crate::adapters::SemanticMatch;
 #[cfg(feature = "embedded-aletheiadb")]
+use crate::adapters::{AdapterError, STORE_CONTENDED_CODE};
+#[cfg(feature = "embedded-aletheiadb")]
 use crate::daemon::{DaemonClient, DaemonConfig};
 #[cfg(feature = "embedded-aletheiadb")]
 use crate::incremental::scan_repository_incremental_excluding;
@@ -3976,6 +3978,37 @@ fn inspect_embedded_store(data_dir: &Path, _format: OutputFormat) -> Result<()> 
     )
 }
 
+/// Maps an embedded open failure on the ingest write path into a CLI error.
+///
+/// A write-lease contention refusal (issue #200) additionally prints the
+/// structured `{"ok": false, "error": {...}}` envelope on stdout so agents can
+/// machine-parse the `store_contended` contract — the write was refused before
+/// any record was persisted, and the remedy is to route concurrent writers
+/// through the daemon or retry after the current writer releases the store.
+/// Other failures keep the existing human-readable context.
+#[cfg(feature = "embedded-aletheiadb")]
+fn embedded_write_open_error(data_dir: &Path, error: AdapterError) -> anyhow::Error {
+    if let AdapterError::Contended { message, .. } = &error {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": STORE_CONTENDED_CODE,
+                "message": message,
+                "data_dir": data_dir.display().to_string(),
+                "remedy": "route concurrent writers through the daemon (`eg daemon start`, \
+                           then re-run with `--adapter daemon`), or retry after the current \
+                           writer releases the store",
+            },
+        });
+        println!("{envelope}");
+        return anyhow::anyhow!("{error}");
+    }
+    anyhow::Error::new(error).context(format!(
+        "failed to open embedded store {}",
+        data_dir.display()
+    ))
+}
+
 fn ingest(
     graph: &Path,
     adapter: IngestAdapter,
@@ -4009,17 +4042,14 @@ fn ingest(
             let mut sink = if embed {
                 let (vectors, dimensions) = generate_embeddings(&records)?;
                 EmbeddedAletheiaSink::open_with_embeddings(&data_dir, vectors, dimensions)
-                    .with_context(|| {
-                        format!("failed to open embedded store {}", data_dir.display())
-                    })?
+                    .map_err(|error| embedded_write_open_error(&data_dir, error))?
             } else {
-                EmbeddedAletheiaSink::open(&data_dir).with_context(|| {
-                    format!("failed to open embedded store {}", data_dir.display())
-                })?
+                EmbeddedAletheiaSink::open(&data_dir)
+                    .map_err(|error| embedded_write_open_error(&data_dir, error))?
             };
             #[cfg(not(feature = "embeddings"))]
             let mut sink = EmbeddedAletheiaSink::open(&data_dir)
-                .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+                .map_err(|error| embedded_write_open_error(&data_dir, error))?;
             let report = ingest_records(&records, &mut sink);
             if report.is_success() {
                 sink.persist_indexes().with_context(|| {

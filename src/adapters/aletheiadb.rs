@@ -217,9 +217,10 @@ impl EmbeddedAletheiaSink {
     ///
     /// # Errors
     ///
-    /// Returns an error when the store is already leased, stale daemon metadata
-    /// requires repair (run `eg repair run --confirm`), or `AletheiaDB` cannot
-    /// open the requested data dir.
+    /// Returns [`AdapterError::Contended`] when another live writer (embedded
+    /// peer or daemon) holds the write lease, or [`AdapterError::Rejected`]
+    /// when stale daemon metadata requires repair (run `eg repair run
+    /// --confirm`) or `AletheiaDB` cannot open the requested data dir.
     pub fn open(data_dir: impl AsRef<Path>) -> AdapterResult<Self> {
         let data_dir = data_dir.as_ref();
         // AC 8: block embedded opens when stale non-stopped daemon metadata exists.
@@ -231,10 +232,7 @@ impl EmbeddedAletheiaSink {
                 message: msg,
             });
         }
-        let lease = StoreLease::acquire(data_dir).map_err(|error| AdapterError::Rejected {
-            record_id: "embedded-store".to_owned(),
-            message: error.to_string(),
-        })?;
+        let lease = acquire_write_lease(data_dir)?;
         Self::open_inner(data_dir, Some(lease))
     }
 
@@ -307,10 +305,7 @@ impl EmbeddedAletheiaSink {
                 message: msg,
             });
         }
-        let lease = StoreLease::acquire(data_dir).map_err(|error| AdapterError::Rejected {
-            record_id: "embedded-store".to_owned(),
-            message: error.to_string(),
-        })?;
+        let lease = acquire_write_lease(data_dir)?;
         let mut sink = Self::open_inner(data_dir, Some(lease))?;
         sink.embedding_vectors = vectors;
         let metric = ::aletheiadb::index::vector::DistanceMetric::Cosine;
@@ -3781,6 +3776,56 @@ const fn _edge_label(label: EdgeLabel) -> &'static str {
     label.as_str()
 }
 
+/// Acquires the exclusive embedded write lease for `data_dir`.
+///
+/// A lease held by another live writer maps to the structured
+/// [`AdapterError::Contended`] contract (issue #200): the refusal names the
+/// holder when identifiable and always names the remedy, and no partial or
+/// interleaved write is performed. Real I/O failures stay
+/// [`AdapterError::Rejected`].
+fn acquire_write_lease(data_dir: &Path) -> AdapterResult<StoreLease> {
+    match StoreLease::try_acquire(data_dir) {
+        Ok(Some(lease)) => Ok(lease),
+        Ok(None) => Err(AdapterError::Contended {
+            data_dir: data_dir.display().to_string(),
+            message: write_lease_contention_message(data_dir),
+        }),
+        Err(error) => Err(AdapterError::Rejected {
+            record_id: "embedded-store".to_owned(),
+            message: error.to_string(),
+        }),
+    }
+}
+
+/// Builds the contention diagnosis for a held write lease.
+///
+/// When runtime metadata identifies a running daemon as the holder, the
+/// message says so and points writes at the daemon adapter. Otherwise the
+/// holder is an unidentified live embedded peer and the message names both
+/// remedies: route concurrent writers through the daemon, or retry after the
+/// current writer releases the store.
+fn write_lease_contention_message(data_dir: &Path) -> String {
+    let dir = data_dir.display();
+    crate::daemon::live_daemon_holder_hint(data_dir).map_or_else(
+        || {
+            format!(
+                "another live writer holds the exclusive embedded write lease for store {dir}; \
+                 no write was performed. Remedy: route concurrent writers through the daemon \
+                 (`eg daemon start --data-dir {dir}`, then re-run with `--adapter daemon`), or \
+                 retry after the current writer releases the store"
+            )
+        },
+        |holder| {
+            format!(
+                "{holder} holds the exclusive embedded write lease for store {dir}; \
+                 no write was performed. Remedy: route this write through the daemon \
+                 (re-run with `--adapter daemon`), or stop it \
+                 (`eg daemon stop --data-dir {dir}`) and retry"
+            )
+        },
+    )
+}
+
 fn is_fresh_data_dir(data_dir: &Path) -> bool {
     match fs::read_dir(data_dir) {
         Ok(mut entries) => entries.next().is_none(),
@@ -3948,6 +3993,88 @@ mod embedded_store_gate {
 mod tests {
     use super::*;
     use crate::ir::{GraphRecord, SourceSpan, TemporalMetadata, stable_id};
+
+    /// Issue #200 AC2: a second embedded writer is refused with the typed
+    /// contention error while a live embedded peer holds the write lease, and
+    /// the store opens normally once the peer releases it.
+    #[test]
+    fn second_embedded_open_is_refused_with_contended_error_then_recovers() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("contended-store");
+        let first =
+            EmbeddedAletheiaSink::open(&data_dir).expect("first embedded open should succeed");
+
+        let error = EmbeddedAletheiaSink::open(&data_dir)
+            .err()
+            .expect("second concurrent embedded open must be refused");
+        let AdapterError::Contended {
+            data_dir: contended_dir,
+            message,
+        } = &error
+        else {
+            panic!("live-peer contention must be typed AdapterError::Contended, got: {error:?}");
+        };
+        assert_eq!(contended_dir, &data_dir.display().to_string());
+        assert!(
+            message.contains("--adapter daemon"),
+            "contention error must name the daemon remedy: {message}"
+        );
+        assert!(
+            message.contains("retry"),
+            "contention error must name the retry remedy: {message}"
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with(crate::adapters::STORE_CONTENDED_CODE),
+            "contention display must carry the stable machine code: {error}"
+        );
+
+        drop(first);
+        EmbeddedAletheiaSink::open(&data_dir)
+            .expect("embedded open must succeed after the peer releases the lease");
+    }
+
+    /// Issue #200 AC3: an embedded write attempt while a live daemon holds the
+    /// exclusive lease is refused with the same contention contract, and the
+    /// error names the daemon holder so the remedy is unambiguous.
+    #[test]
+    fn contention_error_names_live_daemon_when_running_metadata_exists() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("daemon-held-store");
+        let _lease = crate::daemon::StoreLease::acquire(&data_dir)
+            .expect("test should hold the store lease like a live daemon");
+        let runtime_dir = crate::daemon::runtime_dir_for_data_dir(&data_dir);
+        std::fs::write(
+            runtime_dir.join("egregored.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "pid": 4_242,
+                "address": "127.0.0.1:9",
+                "token": "contention-test-token",
+                "data_dir": data_dir,
+                "version": "test",
+                "started_at_unix_ms": 0_u64,
+                "state": "running",
+            }))
+            .expect("daemon metadata should serialize"),
+        )
+        .expect("daemon metadata should write");
+
+        let error = EmbeddedAletheiaSink::open(&data_dir)
+            .err()
+            .expect("embedded open must be refused while a live daemon holds the lease");
+        let AdapterError::Contended { message, .. } = &error else {
+            panic!("live-daemon contention must be typed AdapterError::Contended, got: {error:?}");
+        };
+        assert!(
+            message.contains("egregored daemon") && message.contains("4242"),
+            "contention error must name the live daemon holder: {message}"
+        );
+        assert!(
+            message.contains("--adapter daemon"),
+            "contention error must name the daemon remedy: {message}"
+        );
+    }
 
     #[test]
     fn open_rebuilds_endpoint_index_from_persisted_nodes() {

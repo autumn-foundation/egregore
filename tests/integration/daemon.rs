@@ -1310,7 +1310,10 @@ fn embedded_cli_ingest_refuses_while_daemon_owns_data_dir() {
         .arg(&data_dir)
         .assert()
         .failure()
-        .stderr(predicate::str::contains("embedded store is already leased"));
+        .stdout(predicate::str::contains(r#""code":"store_contended""#))
+        .stderr(predicate::str::contains("store_contended"))
+        .stderr(predicate::str::contains("egregored daemon"))
+        .stderr(predicate::str::contains("--adapter daemon"));
 
     daemon.stop();
 }
@@ -1349,7 +1352,9 @@ fn embedded_cli_ingest_refuses_when_daemon_lock_exists_without_metadata() {
         .arg(&data_dir)
         .assert()
         .failure()
-        .stderr(predicate::str::contains("embedded store is already leased"));
+        .stdout(predicate::str::contains(r#""code":"store_contended""#))
+        .stderr(predicate::str::contains("store_contended"))
+        .stderr(predicate::str::contains("retry"));
 
     fs::write(metadata_path, metadata).expect("metadata should be restored for shutdown");
     daemon.stop();
