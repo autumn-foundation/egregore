@@ -113,6 +113,7 @@ compile time.
 | `FileEdit` | `agent_memory` | see `docs/schema/agent-actions.md` | `FileEdit {repo_relative_path} kind={edit_kind}` | Full field set belongs to [`docs/schema/agent-actions.md`](agent-actions.md). |
 | `Failure` | `agent_memory` | `["node", "failure", kind, turn_id, action_idx]` | `Failure {kind} turn={t}` | Failed command or invalid patch; `failure_kind` = `command_failure` or `patch_invalid`. |
 | `Observation` | `agent_memory` | writer-chosen | free | Agent-authored claim with confidence and provenance. Carries `evidence_links`. |
+| `Retraction` | `agent_memory` | `["node", "retraction", target_record_id]` | `Retraction event for {target_record_id}` | Auditable operator retraction event written by `eg forget` (issue #231). One per target: the ID is deterministic in the retracted handle. |
 
 #### `Agent` record shape
 
@@ -160,6 +161,28 @@ or discovery.
 | `redaction_policy_version` | string | when redacted | See §3. |
 | `superseded_by` | record ID | optional | ID of the record that supersedes this one. |
 | `evidence_links` | `EvidenceLink[]` | required | Must contain at least one link. See §5. |
+
+#### `Retraction` record shape
+
+The auditable event `eg forget` writes when an operator logically retracts a
+persisted record (issue #231). It is always accompanied by a tombstone (in the
+retracted record's domain) whose `deleted_id` is the target; the event itself
+is never tombstoned, so the act of forgetting stays citable. See
+[`docs/cli/forget.md`](../cli/forget.md).
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | `agent_memory:v1:{hash}` | yes | Deterministic per target: `["node", "retraction", target_record_id]`. |
+| `kind` | `"Retraction"` | yes | |
+| `schema_version` | `1` | yes | |
+| `text` | string | yes | Post-redaction retraction reason. |
+| `summary` | string | yes | `Retraction event for {target_record_id}` |
+| `agent_id` | string | yes | Operator handle recorded as the retraction actor. |
+| `transaction_time` | RFC 3339 | yes | When the retraction was committed (transaction-time axis). |
+| `source_handle` | record ID | yes | The prior record handle (the retracted record's stable ID). |
+| `valid_time` | RFC 3339 | yes | Mirrors `transaction_time`. |
+| `valid_time_source` | `"inferred_from_transaction_time"` | yes | |
+| `redaction_policy_version` | string | when redacted | See §3. |
 
 #### `AgentRun` record shape
 

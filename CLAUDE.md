@@ -198,6 +198,32 @@ introducing commit with valid time, and before/after visibility/signature surfac
 Output (JSON or `--format text`) is deterministic and byte-identical across runs.
 See `docs/cli/public-api-deltas.md`.
 
+Record retraction (issue #231):
+
+```powershell
+# Retract one persisted agent-authored or sensitive record by stable handle
+cargo run -- forget agent_memory:v1:<hex> --data-dir .egregore --reason "leaked customer name"   # exit 0
+cargo run -- forget agent_memory:v1:<hex> --data-dir .egregore --reason "anything"               # exit 0 (already_retracted no-op)
+cargo run -- forget codegraph:v5:<hex> --data-dir .egregore --reason "wrong"    # exit 1 (deterministic_code_fact)
+cargo run -- forget agent_memory:v1:missing --data-dir .egregore --reason "x"   # exit 2 (not_found)
+```
+
+`eg forget` logically retracts one record from every transaction-time-current read surface
+(structural, semantic/vector, context, task, memory, audit, failures, changes, inspect, the
+MCP tools, and the daemon's record lookups — direct `GET /v1/records/{id}` and the bulk
+`GET /v1/records` serving view) by writing a citable `Retraction` event —
+actor, transaction time, redacted reason, prior record handle — plus a tombstone in the
+target's domain, through the ordinary
+adapter boundary. Deterministic code-graph facts are refused with a machine-readable error
+naming `eg refresh`/re-scan; derived semantic measurements (`SemanticDrift` and its edges)
+are refused the same way naming re-scan/re-ingest, as is any other commit-anchored temporal
+node (`temporal_record`) a tombstone could never suppress; tombstones and retraction events
+are also refused. Citing
+records survive with their link reported as a `stale_evidence_target` diagnostic, historical
+transaction-time views predating the retraction still see the record (bi-temporal honesty),
+and re-running on an already-retracted handle is a no-op success returning the original
+event. With a pinned `--transaction-time` the envelope is deterministic and byte-identical
+across runs. See `docs/cli/forget.md`.
 `eg query undocumented` lists externally-reachable public symbols whose captured doc-comment
 fact (issue #124) is absent, by joining the issue #213 public surface with the recorded doc
 facts — never a `pub` grep and never a rustdoc build. Any doc form (`///`, `/** */`,
@@ -229,6 +255,24 @@ redaction-eligible PII per `docs/schema/redaction.md`: raw at rest in a local st
 commits, malformed timestamps, and out-of-range threshold/limit fail with stable
 machine-readable diagnostics (deltas-style exit codes); output is deterministic and
 byte-identical across runs. See `docs/cli/ownership.md`.
+`eg query unwrap-expect` inventories `.unwrap()` / `.expect()` panic-risk method-call sites
+detected over the Tree-sitter AST (never text in comments, strings, or doc comments). Each row
+carries a closed category (`unwrap` / `expect`), a `production` vs `test` context, the stable
+record ID, the repo-relative file/span handle, and the enclosing symbol handle (explicit `null`
+when top-level). Rows are advisory triage leads from deterministic extractor facts, never
+verdicts. Accepts `--path` (subsystem prefix), `--repo`, and `--at <commit>` (valid-time pin).
+An empty scope reports `no_sites_in_scope`; an out-of-store scope is `scope_not_found` (exit 2).
+The method set is closed for this slice. See `docs/cli/unwrap-expect.md`.
+
+`eg query debt-markers` inventories human-authored `TODO` / `FIXME` / `HACK` / `XXX`
+debt-comment markers detected inside Tree-sitter comment nodes (never text in string or
+character literals, never identifier substrings). Each row carries a closed lowercase
+category, the trimmed single-line note text, the stable record ID, the repo-relative
+file/span handle, and the enclosing symbol handle (explicit `null` at module top level).
+Rows are advisory triage leads from deterministic extractor facts, never verdicts. Accepts
+`--path` (subsystem prefix), `--repo`, and `--at <commit>` (valid-time pin). An empty scope
+reports `no_markers_in_scope`; an out-of-store scope is `scope_not_found` (exit 2). The
+marker set is closed for this slice. See `docs/cli/debt-markers.md`.
 
 Protected raw-artifact commands (issue #60):
 

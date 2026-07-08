@@ -89,6 +89,7 @@ dependencies = [
  "predicates",
  "rand 0.8.6",
  "rmcp",
+ "same-file",
  "schemars",
  "serde",
  "serde_json",

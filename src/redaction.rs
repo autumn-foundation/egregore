@@ -12,6 +12,8 @@
 //! - [`detect_secret`]: detect the first secret in a string value.
 //! - [`redact_value`]: replace the value with a `<REDACTED:class:hash>` marker.
 //! - [`is_redacted`]: check whether a value already carries a redaction marker.
+//! - [`parse_redaction_markers`]: extract embedded `<REDACTED:...>` markers.
+//! - [`sensitive_fields`]: enumerate present sensitive fields on a record.
 //! - [`validate_record`]: gate — reject records with unredacted sensitive fields.
 
 use crate::{
@@ -69,6 +71,25 @@ impl SecretClass {
             Self::Email => "email",
         }
     }
+
+    /// Resolves a canonical class name back to its [`SecretClass`].
+    ///
+    /// Returns `None` for any name outside the closed class set defined in
+    /// `docs/schema/redaction.md §Secret Classes`.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "api_token" => Some(Self::ApiToken),
+            "ssh_private_key" => Some(Self::SshPrivateKey),
+            "database_url" => Some(Self::DatabaseUrl),
+            "cloud_credential" => Some(Self::CloudCredential),
+            "webhook_secret" => Some(Self::WebhookSecret),
+            "session_cookie" => Some(Self::SessionCookie),
+            "env_secret" => Some(Self::EnvSecret),
+            "email" => Some(Self::Email),
+            _ => None,
+        }
+    }
 }
 
 // ── Detection ──────────────────────────────────────────────────────────────────
@@ -102,6 +123,45 @@ pub fn detect_secret(value: &str) -> Option<(SecretClass, usize)> {
 #[must_use]
 pub fn is_redacted(value: &str) -> bool {
     value.contains("<REDACTED:")
+}
+
+/// Parses every well-formed redaction marker embedded in `value`.
+///
+/// A well-formed marker is `<REDACTED:secret_class:hash_prefix>` where
+/// `secret_class` is one of the named classes in `docs/schema/redaction.md`
+/// and `hash_prefix` is a lowercase-hex BLAKE3 prefix of exactly
+/// [`HASH_PREFIX_LEN`] characters — the length [`redact_value`] always emits.
+/// Marker-shaped substrings with an unknown class, a non-hex hash, or a
+/// wrong-length hash are ignored, so a placeholder merely mentioned in a
+/// transcript cannot be counted as a redaction. Returns the
+/// `(class, hash_prefix)` pairs in order of appearance.
+///
+/// Used by the at-import redaction report (issue #266) to tie report entries
+/// to the markers actually stored on emitted records.
+#[must_use]
+pub fn parse_redaction_markers(value: &str) -> Vec<(SecretClass, String)> {
+    const PREFIX: &str = "<REDACTED:";
+    let mut markers = Vec::new();
+    let mut search_from = 0_usize;
+    while let Some(rel) = value[search_from..].find(PREFIX) {
+        let start = search_from + rel;
+        let body = &value[start + PREFIX.len()..];
+        let Some(end) = body.find('>') else { break };
+        let inner = &body[..end];
+        if let Some((class_name, hash_prefix)) = inner.split_once(':')
+            && let Some(class) = SecretClass::from_name(class_name)
+            && hash_prefix.len() == HASH_PREFIX_LEN
+            && hash_prefix
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        {
+            markers.push((class, hash_prefix.to_owned()));
+            search_from = start + PREFIX.len() + end + 1;
+        } else {
+            search_from = start + PREFIX.len();
+        }
+    }
+    markers
 }
 
 // ── Redaction ──────────────────────────────────────────────────────────────────
@@ -179,6 +239,8 @@ const fn is_code_graph_kind(kind: NodeKind) -> bool {
             | NodeKind::Symbol
             | NodeKind::Import
             | NodeKind::Diagnostic
+            | NodeKind::PanicRiskSite
+            | NodeKind::DebtMarker
             | NodeKind::Commit
             | NodeKind::Change
             | NodeKind::SemanticDrift
@@ -187,9 +249,20 @@ const fn is_code_graph_kind(kind: NodeKind) -> bool {
     )
 }
 
-/// Checks all sensitive fields on a non-code-graph node.
+/// Enumerates the present sensitive field `(field_path, value)` pairs on a
+/// node record, in canonical field order.
+///
+/// This is the single source of truth for the sensitive-field index documented
+/// in `docs/cli/redaction.md §Sensitive field index`. Absent fields are never
+/// enumerated, so a caller can rely on the absent-vs-present distinction.
+/// Edge and Tombstone records enumerate no fields.
+///
+/// Note: enumeration does **not** apply the code-graph exemption —
+/// [`validate_record`] exempts code-graph kinds before checking, and the
+/// redaction report (issue #266) deliberately scans every emitted record.
+#[must_use]
 #[allow(clippy::too_many_lines)]
-fn check_sensitive_fields(record: &GraphRecord) -> Result<()> {
+pub fn sensitive_fields(record: &GraphRecord) -> Vec<(String, &str)> {
     let GraphRecord::Node {
         text,
         validation_summary,
@@ -206,117 +279,122 @@ fn check_sensitive_fields(record: &GraphRecord) -> Result<()> {
         labels,
         url,
         user_context,
+        ..
+    } = record
+    else {
+        return Vec::new();
+    };
+
+    let mut fields: Vec<(String, &str)> = Vec::new();
+    add(&mut fields, "text", text.as_deref());
+    add(
+        &mut fields,
+        "validation_summary",
+        validation_summary.as_deref(),
+    );
+    add(
+        &mut fields,
+        "arguments_summary",
+        arguments_summary.as_deref(),
+    );
+    if let Some(h) = arguments_handle {
+        add(&mut fields, "arguments_handle.inline", h.inline.as_deref());
+    }
+    if let Some(h) = result_handle {
+        add(&mut fields, "result_handle.inline", h.inline.as_deref());
+    }
+    if let Some(h) = patch_handle {
+        add(&mut fields, "patch_handle.inline", h.inline.as_deref());
+    }
+    if let Some(h) = stdout_handle {
+        add(&mut fields, "stdout_handle.inline", h.inline.as_deref());
+    }
+    if let Some(h) = stderr_handle {
+        add(&mut fields, "stderr_handle.inline", h.inline.as_deref());
+    }
+    add(&mut fields, "title", title.as_deref());
+    if let Some(h) = body_handle {
+        add(&mut fields, "body_handle.inline", h.inline.as_deref());
+    }
+    if let Some(h) = diff_hunk_handle {
+        add(&mut fields, "diff_hunk_handle.inline", h.inline.as_deref());
+    }
+    add(&mut fields, "url", url.as_deref());
+    if let Some(items) = assignees {
+        for (i, item) in items.iter().enumerate() {
+            add(&mut fields, &format!("assignees[{i}]"), Some(item.as_str()));
+        }
+    }
+    if let Some(items) = labels {
+        for (i, item) in items.iter().enumerate() {
+            add(&mut fields, &format!("labels[{i}]"), Some(item.as_str()));
+        }
+    }
+    add(
+        &mut fields,
+        "proposed_rule_text",
+        user_context.proposed_rule_text.as_deref(),
+    );
+    add(
+        &mut fields,
+        "prompt_text",
+        user_context.prompt_text.as_deref(),
+    );
+    add(
+        &mut fields,
+        "decision_rationale",
+        user_context.decision_rationale.as_deref(),
+    );
+    add(
+        &mut fields,
+        "edited_rule_text",
+        user_context.edited_rule_text.as_deref(),
+    );
+    add(&mut fields, "rule_text", user_context.rule_text.as_deref());
+    add(
+        &mut fields,
+        "action_summary",
+        user_context.action_summary.as_deref(),
+    );
+    add(
+        &mut fields,
+        "constraint_text",
+        user_context.constraint_text.as_deref(),
+    );
+
+    fields
+}
+
+/// Appends a `(field_path, value)` pair when the field is present.
+fn add<'a>(fields: &mut Vec<(String, &'a str)>, path: &str, value: Option<&'a str>) {
+    if let Some(v) = value {
+        fields.push((path.to_owned(), v));
+    }
+}
+
+/// Checks all sensitive fields on a non-code-graph node.
+fn check_sensitive_fields(record: &GraphRecord) -> Result<()> {
+    let fields = sensitive_fields(record);
+
+    // Pass 1: reject raw (unredacted) secrets.
+    for (field_path, value) in &fields {
+        check_field(field_path, Some(value))?;
+    }
+
+    // Pass 2: if any sensitive field carries a redaction marker, the node must
+    // also carry `redaction_policy_version` so auditors can trace the policy
+    // that was applied.  Reject marker-bearing fields when the version is absent.
+    let GraphRecord::Node {
         redaction_policy_version,
         ..
     } = record
     else {
         return Ok(());
     };
-
-    // Pass 1: reject raw (unredacted) secrets.
-    check_field("text", text.as_deref())?;
-    check_field("validation_summary", validation_summary.as_deref())?;
-    check_field("arguments_summary", arguments_summary.as_deref())?;
-    if let Some(h) = arguments_handle {
-        check_field("arguments_handle.inline", h.inline.as_deref())?;
-    }
-    if let Some(h) = result_handle {
-        check_field("result_handle.inline", h.inline.as_deref())?;
-    }
-    if let Some(h) = patch_handle {
-        check_field("patch_handle.inline", h.inline.as_deref())?;
-    }
-    if let Some(h) = stdout_handle {
-        check_field("stdout_handle.inline", h.inline.as_deref())?;
-    }
-    if let Some(h) = stderr_handle {
-        check_field("stderr_handle.inline", h.inline.as_deref())?;
-    }
-    check_field("title", title.as_deref())?;
-    if let Some(h) = body_handle {
-        check_field("body_handle.inline", h.inline.as_deref())?;
-    }
-    if let Some(h) = diff_hunk_handle {
-        check_field("diff_hunk_handle.inline", h.inline.as_deref())?;
-    }
-    check_field("url", url.as_deref())?;
-    if let Some(items) = assignees {
-        for (i, item) in items.iter().enumerate() {
-            check_field(&format!("assignees[{i}]"), Some(item.as_str()))?;
-        }
-    }
-    if let Some(items) = labels {
-        for (i, item) in items.iter().enumerate() {
-            check_field(&format!("labels[{i}]"), Some(item.as_str()))?;
-        }
-    }
-    check_field(
-        "proposed_rule_text",
-        user_context.proposed_rule_text.as_deref(),
-    )?;
-    check_field("prompt_text", user_context.prompt_text.as_deref())?;
-    check_field(
-        "decision_rationale",
-        user_context.decision_rationale.as_deref(),
-    )?;
-    check_field("edited_rule_text", user_context.edited_rule_text.as_deref())?;
-    check_field("rule_text", user_context.rule_text.as_deref())?;
-    check_field("action_summary", user_context.action_summary.as_deref())?;
-    check_field("constraint_text", user_context.constraint_text.as_deref())?;
-
-    // Pass 2: if any sensitive field carries a redaction marker, the node must
-    // also carry `redaction_policy_version` so auditors can trace the policy
-    // that was applied.  Reject marker-bearing fields when the version is absent.
     if redaction_policy_version.is_none() {
-        check_marker_field("text", text.as_deref())?;
-        check_marker_field("validation_summary", validation_summary.as_deref())?;
-        check_marker_field("arguments_summary", arguments_summary.as_deref())?;
-        if let Some(h) = arguments_handle {
-            check_marker_field("arguments_handle.inline", h.inline.as_deref())?;
+        for (field_path, value) in &fields {
+            check_marker_field(field_path, Some(value))?;
         }
-        if let Some(h) = result_handle {
-            check_marker_field("result_handle.inline", h.inline.as_deref())?;
-        }
-        if let Some(h) = patch_handle {
-            check_marker_field("patch_handle.inline", h.inline.as_deref())?;
-        }
-        if let Some(h) = stdout_handle {
-            check_marker_field("stdout_handle.inline", h.inline.as_deref())?;
-        }
-        if let Some(h) = stderr_handle {
-            check_marker_field("stderr_handle.inline", h.inline.as_deref())?;
-        }
-        check_marker_field("title", title.as_deref())?;
-        if let Some(h) = body_handle {
-            check_marker_field("body_handle.inline", h.inline.as_deref())?;
-        }
-        if let Some(h) = diff_hunk_handle {
-            check_marker_field("diff_hunk_handle.inline", h.inline.as_deref())?;
-        }
-        check_marker_field("url", url.as_deref())?;
-        if let Some(items) = assignees {
-            for (i, item) in items.iter().enumerate() {
-                check_marker_field(&format!("assignees[{i}]"), Some(item.as_str()))?;
-            }
-        }
-        if let Some(items) = labels {
-            for (i, item) in items.iter().enumerate() {
-                check_marker_field(&format!("labels[{i}]"), Some(item.as_str()))?;
-            }
-        }
-        check_marker_field(
-            "proposed_rule_text",
-            user_context.proposed_rule_text.as_deref(),
-        )?;
-        check_marker_field("prompt_text", user_context.prompt_text.as_deref())?;
-        check_marker_field(
-            "decision_rationale",
-            user_context.decision_rationale.as_deref(),
-        )?;
-        check_marker_field("edited_rule_text", user_context.edited_rule_text.as_deref())?;
-        check_marker_field("rule_text", user_context.rule_text.as_deref())?;
-        check_marker_field("action_summary", user_context.action_summary.as_deref())?;
-        check_marker_field("constraint_text", user_context.constraint_text.as_deref())?;
     }
 
     Ok(())
