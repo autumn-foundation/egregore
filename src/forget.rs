@@ -25,7 +25,12 @@
 //! Retraction is logical and bi-temporally honest: the physical record stays
 //! in the store, so a transaction-time view predating the retraction still
 //! reflects that the record existed then. Re-running `eg forget` on an
-//! already-retracted handle is a no-op success returning the original event.
+//! already-retracted handle is a no-op success returning the original event —
+//! but only after verifying the target is still suppressed by an active
+//! tombstone. When the event exists without the tombstone (a crash between
+//! the two writes, or a later write superseding the tombstone), the re-run
+//! repairs the retraction by re-issuing the tombstone instead of falsely
+//! reporting the retraction complete.
 
 use chrono::Utc;
 use serde::Serialize;
@@ -79,6 +84,9 @@ pub enum ForgetOutcome {
         /// The auditable retraction event.
         event: RetractionEvent,
         /// Records to persist: the retraction event node, then the tombstone.
+        /// When repairing a partial retraction (the event exists but no
+        /// active tombstone suppresses the target), only the missing
+        /// tombstone is present.
         records: Vec<GraphRecord>,
     },
     /// The target was already retracted; nothing to write.
@@ -333,9 +341,9 @@ pub fn retract_from_records(
     let retraction_id = retraction_event_id(handle);
 
     // Idempotency wins before any other resolution: once a retraction event
-    // exists for this handle, re-running is a no-op success returning the
-    // original event — even though the retracted target is no longer visible
-    // in the current-state read.
+    // exists for this handle, re-running never writes a second event — the
+    // original event is returned as-is (even though the retracted target is
+    // no longer visible in the current-state read).
     if let Some(GraphRecord::Node {
         kind: NodeKind::Retraction,
         text,
@@ -344,15 +352,42 @@ pub fn retract_from_records(
         ..
     }) = records.iter().rfind(|record| record.id() == retraction_id)
     {
+        let (tombstone_id, tombstone_version) = retraction_tombstone_id(handle);
         let event = RetractionEvent {
             retraction_id,
-            tombstone_id: retraction_tombstone_id(handle).0,
+            tombstone_id: tombstone_id.clone(),
             retracted_record_id: handle.to_owned(),
             retracted_by: agent_id.clone().unwrap_or_default(),
             retracted_at: transaction_time.clone().unwrap_or_default(),
             reason: text.clone().unwrap_or_default(),
         };
-        return Ok(ForgetOutcome::AlreadyRetracted { event });
+        // The no-op is only safe when an active tombstone actually suppresses
+        // the target. A crash between the event write and the tombstone write
+        // (or a later write superseding the tombstone) leaves the event
+        // present while the target is still queryable; repair by re-issuing
+        // the tombstone instead of falsely reporting the retraction complete.
+        // The current-state read emits active tombstone records and drops
+        // superseded ones, so presence here means the target is suppressed.
+        let tombstone_active = records.iter().any(|record| {
+            matches!(record, GraphRecord::Tombstone { deleted_id, .. } if deleted_id == handle)
+        });
+        if tombstone_active {
+            return Ok(ForgetOutcome::AlreadyRetracted { event });
+        }
+        let tombstone = GraphRecord::Tombstone {
+            id: tombstone_id,
+            schema_version: tombstone_version,
+            deleted_id: handle.to_owned(),
+            summary: format!(
+                "Operator retraction of {handle}; see retraction event {}",
+                event.retraction_id
+            ),
+            producer: None,
+        };
+        return Ok(ForgetOutcome::Retracted {
+            event,
+            records: vec![tombstone],
+        });
     }
 
     let Some(target) = records.iter().rfind(|record| record.id() == handle) else {
@@ -647,6 +682,83 @@ mod tests {
             panic!("expected AlreadyRetracted outcome");
         };
         assert_eq!(event, original, "no duplicate event; original preserved");
+    }
+
+    #[test]
+    fn rerun_repairs_missing_tombstone_after_partial_write() {
+        let mut records = seeded();
+        let ForgetOutcome::Retracted {
+            event: original,
+            records: generated,
+        } = retract_from_records(&records, &request(&obs_id())).expect("retracts")
+        else {
+            panic!("expected Retracted outcome");
+        };
+        // Simulate a crash after the event write but before the tombstone
+        // write: only the event node lands in the store, so the target is
+        // still visible in the current-state read.
+        records.extend(generated.into_iter().take(1));
+
+        let mut rerun = request(&obs_id());
+        rerun.transaction_time = Some("2026-07-02T09:00:00Z".to_owned());
+        rerun.reason = "different reason".to_owned();
+        let outcome = retract_from_records(&records, &rerun).expect("repairs");
+        let ForgetOutcome::Retracted {
+            event,
+            records: repair,
+        } = outcome
+        else {
+            panic!("a rerun without an active tombstone must repair, not no-op");
+        };
+        assert_eq!(event, original, "the original event is preserved verbatim");
+        assert_eq!(repair.len(), 1, "only the missing tombstone is re-issued");
+        let GraphRecord::Tombstone {
+            id,
+            deleted_id,
+            schema_version,
+            ..
+        } = &repair[0]
+        else {
+            panic!("the repair record must be the tombstone");
+        };
+        assert_eq!(id, &original.tombstone_id);
+        assert_eq!(deleted_id, &obs_id());
+        assert_eq!(*schema_version, AGENT_MEMORY_SCHEMA_VERSION);
+        assert!(
+            !repair.iter().any(|r| matches!(r, GraphRecord::Node { .. })),
+            "no duplicate retraction event node on repair"
+        );
+    }
+
+    #[test]
+    fn rerun_with_foreign_active_tombstone_is_no_op() {
+        // The event node exists and the target is suppressed by a tombstone
+        // written through some other path (different record ID, same
+        // deleted_id): nothing is missing, so the rerun stays a no-op.
+        let mut records = seeded();
+        let ForgetOutcome::Retracted {
+            event: original,
+            records: generated,
+        } = retract_from_records(&records, &request(&obs_id())).expect("retracts")
+        else {
+            panic!("expected Retracted outcome");
+        };
+        // Keep only the event node, then suppress the target via a foreign
+        // tombstone.
+        records.extend(generated.into_iter().take(1));
+        records.push(GraphRecord::Tombstone {
+            id: agent_memory_stable_id(&["tombstone", "other-path", &obs_id()]),
+            schema_version: AGENT_MEMORY_SCHEMA_VERSION,
+            deleted_id: obs_id(),
+            summary: "unrelated deletion of the same target".to_owned(),
+            producer: None,
+        });
+
+        let second = retract_from_records(&records, &request(&obs_id())).expect("no-op success");
+        let ForgetOutcome::AlreadyRetracted { event } = second else {
+            panic!("an actively suppressed target must not be re-tombstoned");
+        };
+        assert_eq!(event, original, "original event preserved");
     }
 
     #[test]

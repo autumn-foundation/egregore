@@ -52,6 +52,14 @@ Exactly two records, through the ordinary adapter boundary:
 
 The act of forgetting is therefore itself auditable, never a silent hole.
 
+Re-running `eg forget` on an already-retracted handle never writes a second
+event. When an active tombstone still suppresses the target, the re-run is a
+no-op success returning the original event (`action: already_retracted`). When
+the event exists but no active tombstone suppresses the target — a crash
+between the two writes, or a later write superseding the tombstone — the
+re-run repairs the retraction by re-issuing the tombstone
+(`action: retracted`) while preserving the original event verbatim.
+
 ## What stops returning the record
 
 After retraction, no transaction-time-current read surface returns the
