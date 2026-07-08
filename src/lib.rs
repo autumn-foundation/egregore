@@ -255,6 +255,10 @@ fn scan_repository_at_with_override_inner(
     // Same-file resolution labeling (issue #134): stamp per-file CALLS edges
     // backed by Tree-sitter call sites with the shared resolution status.
     languages::cross_file::label_same_file_call_resolutions(graph.records_mut(), &facts_by_file);
+    // Out-of-line `#[cfg(test)] mod x;` test-scope marking (issue #223): the
+    // module file is extracted with no view of the gating attribute, so the
+    // repo-wide pass rewrites its panic-risk sites to test context.
+    languages::cross_file::apply_out_of_line_test_scope(graph.records_mut(), &facts_by_file);
 
     let languages = languages_in_graph(&graph);
     Ok(graph.stamp_producer(&code_graph_producer(&languages)))

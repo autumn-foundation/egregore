@@ -58,6 +58,7 @@ mod query_public_api;
 mod query_subsystem;
 mod query_symbols;
 mod query_undocumented;
+mod query_unwrap_expect;
 mod query_who;
 mod range_deltas;
 mod redaction;

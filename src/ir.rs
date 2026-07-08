@@ -715,6 +715,13 @@ pub enum GraphRecord {
         /// item has no doc comment — never an empty string.
         #[serde(skip_serializing_if = "Option::is_none")]
         doc: Option<String>,
+        // ── Panic-risk call-site fields (issue #223) ──────────────────────────
+        /// Production-vs-test context class for `PanicRiskSite` nodes, drawn
+        /// from the closed set `production` / `test`. Absent on all other node
+        /// kinds. Additive per `docs/schema/schema-versioning.md §2`; never an
+        /// identity input.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call_context: Option<String>,
         /// Git and bitemporal provenance for history-backed records.
         #[serde(skip_serializing_if = "Option::is_none")]
         temporal: Option<TemporalMetadata>,
@@ -1072,6 +1079,7 @@ impl GraphRecord {
             visibility: None,
             signature: None,
             doc: None,
+            call_context: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1182,6 +1190,7 @@ impl GraphRecord {
             visibility: None,
             signature: None,
             doc: None,
+            call_context: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1291,6 +1300,7 @@ impl GraphRecord {
             visibility: None,
             signature: None,
             doc: None,
+            call_context: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1406,6 +1416,7 @@ impl GraphRecord {
             visibility: None,
             signature: None,
             doc: None,
+            call_context: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1626,6 +1637,27 @@ impl GraphRecord {
             *semantic_drift = Some(Box::new(drift));
         }
         self
+    }
+
+    /// Stamps the production-vs-test context class on a `PanicRiskSite` node
+    /// record (issue #223). The value is drawn from the closed set
+    /// `production` / `test`; it is additive metadata and MUST NOT contribute
+    /// to stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub fn with_call_context(mut self, context: &str) -> Self {
+        if let Self::Node { call_context, .. } = &mut self {
+            *call_context = Some(context.to_owned());
+        }
+        self
+    }
+
+    /// Returns the panic-risk call-site context class when present.
+    #[must_use]
+    pub fn call_context(&self) -> Option<&str> {
+        match self {
+            Self::Node { call_context, .. } => call_context.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
     }
 
     /// Sets an explicit domain and schema version on a node record.
@@ -1982,6 +2014,10 @@ pub enum NodeKind {
     Import,
     /// Extractor warning or unsupported construct.
     Diagnostic,
+    /// Deterministic `.unwrap()` / `.expect()` panic-risk method-call site
+    /// (issue #223). The `name` field carries the closed category (`unwrap`
+    /// or `expect`) and `call_context` carries the production-vs-test class.
+    PanicRiskSite,
     /// Git commit observed during history replay.
     Commit,
     /// File-level change observed in a commit.
@@ -2083,6 +2119,7 @@ impl NodeKind {
             Self::Symbol => "Symbol",
             Self::Import => "Import",
             Self::Diagnostic => "Diagnostic",
+            Self::PanicRiskSite => "PanicRiskSite",
             Self::Commit => "Commit",
             Self::Change => "Change",
             Self::SemanticDrift => "SemanticDrift",

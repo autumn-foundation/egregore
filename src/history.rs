@@ -207,6 +207,12 @@ fn scan_repository_history_inner(
             &mut graph.records_mut()[commit_records_start..],
             &facts_by_file,
         );
+        // Out-of-line `#[cfg(test)] mod x;` test-scope marking (issue #223)
+        // over this commit's replayed tree.
+        crate::languages::cross_file::apply_out_of_line_test_scope(
+            &mut graph.records_mut()[commit_records_start..],
+            &facts_by_file,
+        );
     }
 
     let languages = crate::languages_in_graph(&graph);
