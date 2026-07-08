@@ -1089,6 +1089,36 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Symbol- and file-level deltas between two commits, grouped by change class (issue #118).
+    ///
+    /// Resolves two commit handles (full SHA or unique prefix) against the
+    /// store's history and reports the observed structural deltas between
+    /// them: `added_symbols`, `removed_symbols`, `modified_symbols`,
+    /// `added_files`, `removed_files`, `modified_files`, plus an `unresolved`
+    /// diagnostic group. Semantic drift falling inside the range is surfaced
+    /// where drift records exist, labeled as semantic movement rather than
+    /// structural change; without them the section is marked unavailable, not
+    /// empty. Rows are observed deltas with citable handles, never proof of
+    /// behavior change — and absence of a delta is not proof a behavior was
+    /// preserved. Reads only the supplied store; never touches Git state or
+    /// the working tree.
+    ///
+    /// Documented in `docs/cli/deltas.md`.
+    Deltas {
+        /// Base commit SHA or unique prefix (older endpoint).
+        base: String,
+        /// Head commit SHA or unique prefix (newer endpoint).
+        head: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict commit resolution and delta selection to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Trace a single symbol's lifecycle across Git history.
     Lifeline {
         /// Graph JSONL path (mutually exclusive with --data-dir).
@@ -4570,6 +4600,16 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_orient_cmd(&records, selected.as_deref(), limit, format)
+        }
+        QuerySubcommand::Deltas {
+            base,
+            head,
+            graph,
+            data_dir,
+            repo,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            query_deltas_cmd(&records, &base, &head, repo.as_deref())
         }
         QuerySubcommand::Lifeline {
             graph,
@@ -9665,6 +9705,59 @@ fn query_changes_cmd(
             println!("{output}");
             let exit_code = match err {
                 query::ChangesError::MissingCommit { .. } | query::ChangesError::EmptyHistory => 2,
+                _ => 1,
+            };
+            std::process::exit(exit_code);
+        }
+    }
+}
+
+/// `eg query deltas` (issue #118): symbol- and file-level deltas between two
+/// commit handles, grouped by stable change class.
+///
+/// Exit codes follow the `eg query changes` convention: `0` on success
+/// (including a resolved range with no deltas), `2` when a commit handle
+/// resolves to nothing or the history is empty (no match), and `1` for the
+/// remaining stable diagnostics (ambiguous prefix, identical endpoints,
+/// reversed range, no ancestor path).
+fn query_deltas_cmd(
+    records: &[GraphRecord],
+    base: &str,
+    head: &str,
+    repo: Option<&str>,
+) -> Result<()> {
+    let index = query::RepositoryIndex::build(records);
+    let repo_scope = resolve_repo_scope(&index, repo);
+    match query::range_deltas(records, base, head, repo_scope.as_deref()) {
+        Ok(deltas) => {
+            #[derive(Debug, Clone, serde::Serialize)]
+            struct DeltasResponse<'a> {
+                ok: bool,
+                #[serde(flatten)]
+                deltas: query::RangeDeltas<'a>,
+            }
+            let response = DeltasResponse { ok: true, deltas };
+            let output = serde_json::to_string_pretty(&response)
+                .context("failed to serialize range deltas")?;
+            println!("{output}");
+            Ok(())
+        }
+        Err(err) => {
+            #[derive(Debug, Clone, serde::Serialize)]
+            struct DeltasErrorResponse {
+                ok: bool,
+                error: query::RangeDeltasError,
+            }
+            let response = DeltasErrorResponse {
+                ok: false,
+                error: err.clone(),
+            };
+            let output = serde_json::to_string(&response)
+                .context("failed to serialize range-deltas error")?;
+            println!("{output}");
+            let exit_code = match err {
+                query::RangeDeltasError::MissingCommit { .. }
+                | query::RangeDeltasError::EmptyHistory => 2,
                 _ => 1,
             };
             std::process::exit(exit_code);

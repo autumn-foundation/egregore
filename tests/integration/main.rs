@@ -49,6 +49,7 @@ mod query_lifeline;
 mod query_orient;
 mod query_subsystem;
 mod query_who;
+mod range_deltas;
 mod redaction;
 mod refresh;
 mod repair;
