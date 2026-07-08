@@ -25,8 +25,6 @@ pub mod codex;
 pub mod daemon;
 /// Decision record generation for user-context candidates.
 pub mod decide;
-/// Cargo manifest dependency-declaration extraction (issue #180).
-pub mod deps;
 /// Semantic enrichment and embedding boundaries.
 pub mod embeddings;
 /// Error and result types.
@@ -57,6 +55,8 @@ pub mod languages;
 pub mod link_evidence;
 /// Local project/task JSONL importer (issue #42).
 pub mod local_project;
+/// Cargo manifest dependency-declaration extraction (issue #180).
+pub mod manifest_deps;
 /// MCP server exposing read-only evidence-query tools (issue #53).
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod mcp;
@@ -268,7 +268,7 @@ fn scan_repository_at_with_override_inner(
     // Declared Cargo dependencies (issue #180): every manifest's directly-
     // declared dependencies become deterministic, citable graph facts joined
     // with the nearest lockfile's resolved versions.
-    for record in deps::scan_dependency_records(repo_root, &repository_id)? {
+    for record in manifest_deps::scan_dependency_records(repo_root, &repository_id)? {
         graph.push(record.with_valid_time_inferred(transaction_time));
     }
 

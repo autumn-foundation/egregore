@@ -4221,7 +4221,7 @@ fn first_record_id(graph_path: &Path) -> String {
 fn all_node_kinds_have_documented_schema() {
     let _ = |k: NodeKind| match k {
         // Documented in docs/prd/0001-codebase-knowledge-graph.md;
-        // DependencyDeclaration documented in docs/cli/deps.md (issue #180)
+        // DependencyDeclaration documented in docs/cli/manifest-deps.md (issue #180)
         NodeKind::Repository
         | NodeKind::File
         | NodeKind::Module

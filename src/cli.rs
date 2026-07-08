@@ -1394,8 +1394,8 @@ enum QuerySubcommand {
     /// machine-readable success (exit 0 with a stable diagnostic), not an
     /// error.
     ///
-    /// Documented in `docs/cli/deps.md`.
-    Deps {
+    /// Documented in `docs/cli/manifest-deps.md`.
+    ManifestDeps {
         /// Graph JSONL path (mutually exclusive with --data-dir).
         #[arg(long)]
         graph: Option<PathBuf>,
@@ -6045,14 +6045,14 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             };
             query_coupling_cmd(&records, &path, selected.as_deref(), &options, format)
         }
-        QuerySubcommand::Deps {
+        QuerySubcommand::ManifestDeps {
             graph,
             data_dir,
             name,
             format,
         } => {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
-            query_deps_cmd(&records, name.as_deref(), format)
+            query_manifest_deps_cmd(&records, name.as_deref(), format)
         }
         QuerySubcommand::PublicApiDeltas {
             base,
@@ -11243,16 +11243,16 @@ const PUBLIC_API_DISCLAIMER: &str = "Parse-derived enumeration of the externally
      visibility and module containment. Not a build-verified or semver claim.";
 
 // ---------------------------------------------------------------------------
-// declared-dependency query (issue #180)
+// manifest-declared dependency query (issue #180)
 // ---------------------------------------------------------------------------
 
-/// Standing disclaimer on every `query deps` response: rows are declaration
+/// Standing disclaimer on every `query manifest-deps` response: rows are declaration
 /// facts parsed from manifests, never usage, build, or resolvability proof.
-const DEPS_DISCLAIMER: &str = "Declared-dependency facts parsed from Cargo manifests and the nearest Cargo.lock; never proof the dependency is used in code, builds, or resolves.";
+const MANIFEST_DEPS_DISCLAIMER: &str = "Declared-dependency facts parsed from Cargo manifests and the nearest Cargo.lock; never proof the dependency is used in code, builds, or resolves.";
 
-/// One declared-dependency row in the `query deps` response.
+/// One declared-dependency row in the `query manifest-deps` response.
 #[derive(serde::Serialize)]
-struct DepsDeclarationJson<'a> {
+struct ManifestDepsDeclarationJson<'a> {
     record_id: &'a str,
     name: &'a str,
     dependency_kind: &'a str,
@@ -11266,25 +11266,25 @@ struct DepsDeclarationJson<'a> {
     schema_version: u32,
 }
 
-/// One stable machine-readable diagnostic in the `query deps` response.
+/// One stable machine-readable diagnostic in the `query manifest-deps` response.
 #[derive(serde::Serialize)]
-struct DepsDiagnosticJson<'a> {
+struct ManifestDepsDiagnosticJson<'a> {
     code: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<&'a str>,
 }
 
-/// Top-level `query deps` response envelope.
+/// Top-level `query manifest-deps` response envelope.
 #[derive(serde::Serialize)]
-struct DepsResponse<'a> {
+struct ManifestDepsResponse<'a> {
     ok: bool,
     query: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
     count: usize,
     disclaimer: &'a str,
-    declarations: Vec<DepsDeclarationJson<'a>>,
-    diagnostics: Vec<DepsDiagnosticJson<'a>>,
+    declarations: Vec<ManifestDepsDeclarationJson<'a>>,
+    diagnostics: Vec<ManifestDepsDiagnosticJson<'a>>,
 }
 
 /// Sort rank keeping the documented dependency-kind order stable:
@@ -11298,16 +11298,16 @@ const fn dependency_kind_rank(kind: &str) -> u8 {
     }
 }
 
-/// `eg query deps` (issue #180): list declared Cargo dependencies with their
+/// `eg query manifest-deps` (issue #180): list declared Cargo dependencies with their
 /// lockfile resolution, or answer a direct `--name` lookup. Deterministic,
 /// byte-identical output; an empty surface or a miss is a machine-readable
 /// success, never an error.
-fn query_deps_cmd(
+fn query_manifest_deps_cmd(
     records: &[GraphRecord],
     name_filter: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
-    let mut rows: Vec<DepsDeclarationJson<'_>> = records
+    let mut rows: Vec<ManifestDepsDeclarationJson<'_>> = records
         .iter()
         .filter_map(|record| {
             let GraphRecord::Node {
@@ -11322,7 +11322,7 @@ fn query_deps_cmd(
             else {
                 return None;
             };
-            Some(DepsDeclarationJson {
+            Some(ManifestDepsDeclarationJson {
                 record_id: id,
                 name,
                 dependency_kind: &payload.dependency_kind,
@@ -11353,12 +11353,12 @@ fn query_deps_cmd(
 
     let mut diagnostics = Vec::new();
     if surface_is_empty {
-        diagnostics.push(DepsDiagnosticJson {
+        diagnostics.push(ManifestDepsDiagnosticJson {
             code: "empty_dependency_surface",
             detail: None,
         });
     } else if rows.is_empty() {
-        diagnostics.push(DepsDiagnosticJson {
+        diagnostics.push(ManifestDepsDiagnosticJson {
             code: "no_match_for_name",
             detail: name_filter,
         });
@@ -11366,12 +11366,12 @@ fn query_deps_cmd(
 
     match format {
         OutputFormat::Json => {
-            let response = DepsResponse {
+            let response = ManifestDepsResponse {
                 ok: true,
-                query: "deps",
+                query: "manifest-deps",
                 name: name_filter,
                 count: rows.len(),
-                disclaimer: DEPS_DISCLAIMER,
+                disclaimer: MANIFEST_DEPS_DISCLAIMER,
                 declarations: rows,
                 diagnostics,
             };

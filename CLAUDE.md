@@ -127,9 +127,9 @@ cargo run -- query at src/lib.rs:42 --graph history.graph.jsonl --at <sha>  # sp
 cargo run -- query at src/lib.rs --graph graph.jsonl              # exit 1 (malformed_location)
 
 # Declared Cargo dependencies with lockfile resolution (issue #180)
-cargo run -- query deps --graph graph.jsonl                    # exit 0 (even when surface is empty)
-cargo run -- query deps --graph graph.jsonl --name serde       # direct "do we depend on X?" lookup
-cargo run -- query deps --data-dir .egregore --format text     # store-backed, human-readable
+cargo run -- query manifest-deps --graph graph.jsonl                # exit 0 (even when surface is empty)
+cargo run -- query manifest-deps --graph graph.jsonl --name serde   # direct "do we depend on X?" lookup
+cargo run -- query manifest-deps --data-dir .egregore --format text # store-backed, human-readable
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -350,7 +350,7 @@ excluded; an empty candidate set is an explicit success (exit 0 with a `no_candi
 diagnostic, distinct from `no_symbols`). Output is deterministic, byte-identical across
 runs, and sorted by path, start line, then record ID. See `docs/cli/unreferenced.md`.
 
-`eg query deps` lists every directly-declared Cargo dependency captured at scan time from
+`eg query manifest-deps` lists every directly-declared Cargo dependency captured at scan time from
 `[dependencies]`, `[dev-dependencies]`, and `[build-dependencies]` as citable
 `DependencyDeclaration` facts: crate name, kind (`normal`/`dev`/`build`), the declared version
 requirement as written, the resolved version from the nearest `Cargo.lock` (markers `locked` /
@@ -360,7 +360,7 @@ declaring package, and the repo-relative manifest handle. `--name <crate>` answe
 never invoked and the scan stays read-only. An empty surface or a name miss is a machine-
 readable success (exit 0 with a stable diagnostic). Output (JSON or `--format text`) is
 deterministic and byte-identical across runs. Rows are declaration facts, never usage or build
-proof. See `docs/cli/deps.md`.
+proof. See `docs/cli/manifest-deps.md`.
 
 Protected raw-artifact commands (issue #60):
 
