@@ -900,3 +900,67 @@ fn unreferenced_query_is_read_only_for_embedded_store() {
         "querying must leave the live embedded store byte-for-byte untouched"
     );
 }
+
+// ---------------------------------------------------------------------------
+// --repo scoping must not import another repository's unresolved-call noise
+// ---------------------------------------------------------------------------
+
+/// Only `repo-noisy` contains an unresolved call. A run scoped to the clean
+/// repository must not report `unresolved_call_edges_present`, and a run
+/// scoped to the noisy repository must keep it.
+#[test]
+fn repo_scope_excludes_other_repositories_unresolved_call_diagnostic() {
+    let temp_quiet = tempfile::tempdir().expect("temp dir quiet");
+    fs::create_dir_all(temp_quiet.path().join("src")).expect("src dir");
+    fs::write(
+        temp_quiet.path().join("src/lib.rs"),
+        "fn quiet_orphan() -> usize {\n    1\n}\n",
+    )
+    .expect("quiet lib.rs");
+    let temp_noisy = tempfile::tempdir().expect("temp dir noisy");
+    fs::create_dir_all(temp_noisy.path().join("src")).expect("src dir");
+    fs::write(
+        temp_noisy.path().join("src/lib.rs"),
+        "pub fn noisy_caller() -> usize {\n    missing_helper_fn()\n}\n",
+    )
+    .expect("noisy lib.rs");
+
+    let jsonl_quiet =
+        scan_repository_at_with_override(temp_quiet.path(), FIXED_TIME, Some("repo-quiet"))
+            .expect("scan quiet")
+            .to_jsonl()
+            .expect("serialize quiet");
+    let jsonl_noisy =
+        scan_repository_at_with_override(temp_noisy.path(), FIXED_TIME, Some("repo-noisy"))
+            .expect("scan noisy")
+            .to_jsonl()
+            .expect("serialize noisy");
+    let graph = temp_quiet.path().join("merged.graph.jsonl");
+    fs::write(&graph, format!("{jsonl_quiet}{jsonl_noisy}")).expect("write merged graph");
+
+    let scoped = |selector: &str| -> Value {
+        let output = egregore()
+            .args(["query", "unreferenced", "--repo", selector, "--graph"])
+            .arg(&graph)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_str(std::str::from_utf8(&output).expect("utf8").trim())
+            .expect("stdout must be valid JSON")
+    };
+
+    let quiet = scoped("repo-quiet");
+    assert!(
+        !diagnostic_codes(&quiet).contains(&"unresolved_call_edges_present".to_owned()),
+        "a clean repository must not report another repository's unresolved calls; got {:?}",
+        quiet["diagnostics"]
+    );
+
+    let noisy = scoped("repo-noisy");
+    assert!(
+        diagnostic_codes(&noisy).contains(&"unresolved_call_edges_present".to_owned()),
+        "the owning repository keeps its unresolved-call diagnostic"
+    );
+}

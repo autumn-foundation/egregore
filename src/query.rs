@@ -17947,6 +17947,7 @@ pub fn unreferenced_symbols<'a>(
         let GraphRecord::Edge {
             id,
             label,
+            source,
             target,
             resolution,
             temporal,
@@ -17963,9 +17964,15 @@ pub fn unreferenced_symbols<'a>(
         }
         if *label == EdgeLabel::Calls && *resolution == Some(CallResolution::Unresolved) {
             // The target is a Diagnostic marker, not a symbol: the callee has
-            // no in-repo definition the graph could see. Tallied for the
-            // honesty diagnostic below when current at HEAD.
-            if unowned_record_is_current(temporal.as_ref()) {
+            // no in-repo definition the graph could see. The edge is
+            // attributed through its SOURCE symbol (a caller in the
+            // containment topology), so a repo-scoped run tallies only its
+            // own repository's unresolved calls — never another repository's
+            // noise — and currency is checked against the source
+            // repository's stamped HEAD.
+            if is_owned(source.as_str())
+                && owned_record_is_current(source.as_str(), temporal.as_ref())
+            {
                 unresolved_call_edges += 1;
             }
             continue;

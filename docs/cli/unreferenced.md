@@ -61,7 +61,10 @@ node kinds, edge labels, or domains:
 - **Unresolved call edges** (no in-repo definition matched; issue #152)
   target a `Diagnostic` marker, not a symbol. When any exist, the response
   carries an `unresolved_call_edges_present` diagnostic with the count: an
-  unrecorded reference to a listed candidate may exist.
+  unrecorded reference to a listed candidate may exist. Each unresolved
+  edge is attributed through its source symbol's repository, so a
+  `--repo`-scoped run tallies only the scoped repository's unresolved
+  calls, checked against that repository's stamped HEAD.
 
 Scope: live `Symbol` records at the **current** graph state. Tombstoned
 (deleted) symbols are excluded, in parity with `eg query file` and
