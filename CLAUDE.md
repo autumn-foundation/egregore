@@ -69,6 +69,13 @@ cargo run -- query file src/lib.rs --graph history.graph.jsonl --as-of 2026-01-0
 cargo run -- query file src/nope.rs --graph history.graph.jsonl --at <commit_sha>            # exit 2 (unknown_path)
 cargo run -- query file src/lib.rs --graph history.graph.jsonl --tx-as-of <instant>          # exit 1 (not_implemented)
 
+# Ranked historical co-change partners for a file (issue #153)
+cargo run -- query coupling src/lib.rs --graph history.graph.jsonl            # exit 0 (even when empty)
+cargo run -- query coupling src/lib.rs --graph history.graph.jsonl --min-support 5 --limit 10
+cargo run -- query coupling src/lib.rs --graph history.graph.jsonl --base <sha> --head <sha>
+cargo run -- query coupling src/lib.rs --graph history.graph.jsonl --at <sha>   # history as of one commit
+cargo run -- query coupling src/nope.rs --graph history.graph.jsonl            # exit 2 (unknown_file)
+
 # Externally-reachable public API surface (issue #213)
 cargo run -- query public-api --graph graph.jsonl                 # exit 0 (even when surface is empty)
 cargo run -- query public-api --graph graph.jsonl --repo acme/widget  # scope one repo; bad selector exits 1
@@ -78,6 +85,23 @@ cargo run -- query public-api-deltas <base_sha> <head_sha> --graph history.graph
 cargo run -- query public-api-deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
 cargo run -- query public-api-deltas ffffffffffff <head_sha> --graph history.graph.jsonl # exit 2 (missing_commit)
 cargo run -- query public-api-deltas <base> <head> --graph history.graph.jsonl --include-internal --callers
+
+# Undocumented public API symbols — doc-debt triage (issue #257)
+cargo run -- query undocumented --graph graph.jsonl               # exit 0 (even when nothing is undocumented)
+cargo run -- query undocumented --graph graph.jsonl --limit 20 --format text
+cargo run -- query undocumented --graph graph.jsonl --include-private  # whole-crate doc audit
+
+# Unwrap/expect panic-risk call-site inventory (issue #223)
+cargo run -- query unwrap-expect --graph graph.jsonl                       # exit 0, full inventory
+cargo run -- query unwrap-expect --graph graph.jsonl --path src/adapters   # subsystem-scoped
+cargo run -- query unwrap-expect --graph graph.jsonl --path src/nonexistent  # exit 2 (scope_not_found)
+cargo run -- query unwrap-expect --graph history.graph.jsonl --at <commit>   # pinned valid-time view
+
+# TODO/FIXME/HACK/XXX debt-comment marker inventory (issue #218)
+cargo run -- query debt-markers --graph graph.jsonl                         # exit 0, full inventory
+cargo run -- query debt-markers --graph graph.jsonl --path src/adapters     # subsystem-scoped
+cargo run -- query debt-markers --graph graph.jsonl --path src/nonexistent  # exit 2 (scope_not_found)
+cargo run -- query debt-markers --graph history.graph.jsonl --at <commit>   # pinned valid-time view
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -124,6 +148,19 @@ explicit `empty_symbol_set` success (exit 0); an unknown path or a path absent a
 is a machine-readable error (exit 2); `--tx-as-of` on `query file` is reserved and returns
 `not_implemented` (exit 1). Code-facts only, read-only, and byte-identical across runs.
 See the `eg query file` section of `docs/cli/query.md`.
+
+`eg query coupling <path>` ranks the files that historically changed in the same commits as
+a target file over a `scan-history` store, using the distinct-commit co-change count and a
+documented normalized strength (`jaccard_v1`: shared commits over the union of both files'
+change sets) plus a directional confidence (shared commits over the target's changes), so
+high-churn files cannot dominate purely by volume. A minimum-support threshold
+(`--min-support`, default 2, max 100) suppresses noise pairs and is echoed in the answer;
+`--limit` (default 20, max 500) caps rows with an explicit truncation signal. Temporal scope
+follows the existing selector contract: full history, `--base`+`--head` range, `--at`, or
+`--as-of`. Both target and partners must resolve to `File` nodes, so untracked, ignored, and
+non-source paths never appear. Rows are historical co-change leads — never proof of
+dependency, and absence of coupling is not proof of independence. Output is deterministic
+and byte-identical across runs. See `docs/cli/coupling.md`.
 
 `eg query public-api` enumerates the Rust library crate's externally-reachable public API
 surface from recorded per-symbol visibility (issue #124) and module containment — never a
@@ -192,6 +229,40 @@ transaction-time views predating the retraction still see the record (bi-tempora
 and re-running on an already-retracted handle is a no-op success returning the original
 event. With a pinned `--transaction-time` the envelope is deterministic and byte-identical
 across runs. See `docs/cli/forget.md`.
+`eg query undocumented` lists externally-reachable public symbols whose captured doc-comment
+fact (issue #124) is absent, by joining the issue #213 public surface with the recorded doc
+facts — never a `pub` grep and never a rustdoc build. Any doc form (`///`, `/** */`,
+`#[doc = "..."]`) excludes a symbol; a plain `//` comment does not. Each row carries a stable
+record ID, a repo-relative file/span handle, and the concrete evidence asserted
+(`externally_reachable`, `doc_comment_absent`). Re-export rows are attributed to the `pub use`
+site with the checked target cited; a doc comment at either the re-export site or the target
+counts as documentation. `--include-private` widens to a whole-crate doc audit;
+`--limit` truncates deterministically with a diagnostic. The lane asserts doc presence/absence
+only — never doc quality — and a pre-#124 store yields an explicit `doc_facts_unavailable`
+capability verdict instead of treating every symbol as undocumented. Zero undocumented symbols
+is an explicit success (exit 0, `no_undocumented_items` diagnostic; when unresolved re-exports
+or missing doc capture leave blind spots, `empty_result_with_blind_spots` instead — never a
+certified-clean claim). Output is deterministic and byte-identical across runs.
+See `docs/cli/undocumented.md`.
+
+`eg query unwrap-expect` inventories `.unwrap()` / `.expect()` panic-risk method-call sites
+detected over the Tree-sitter AST (never text in comments, strings, or doc comments). Each row
+carries a closed category (`unwrap` / `expect`), a `production` vs `test` context, the stable
+record ID, the repo-relative file/span handle, and the enclosing symbol handle (explicit `null`
+when top-level). Rows are advisory triage leads from deterministic extractor facts, never
+verdicts. Accepts `--path` (subsystem prefix), `--repo`, and `--at <commit>` (valid-time pin).
+An empty scope reports `no_sites_in_scope`; an out-of-store scope is `scope_not_found` (exit 2).
+The method set is closed for this slice. See `docs/cli/unwrap-expect.md`.
+
+`eg query debt-markers` inventories human-authored `TODO` / `FIXME` / `HACK` / `XXX`
+debt-comment markers detected inside Tree-sitter comment nodes (never text in string or
+character literals, never identifier substrings). Each row carries a closed lowercase
+category, the trimmed single-line note text, the stable record ID, the repo-relative
+file/span handle, and the enclosing symbol handle (explicit `null` at module top level).
+Rows are advisory triage leads from deterministic extractor facts, never verdicts. Accepts
+`--path` (subsystem prefix), `--repo`, and `--at <commit>` (valid-time pin). An empty scope
+reports `no_markers_in_scope`; an out-of-store scope is `scope_not_found` (exit 2). The
+marker set is closed for this slice. See `docs/cli/debt-markers.md`.
 
 Protected raw-artifact commands (issue #60):
 

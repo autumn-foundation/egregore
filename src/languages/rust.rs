@@ -7,13 +7,13 @@ use tree_sitter::{Node, Parser};
 use crate::{
     error::{CodegraphError, Result},
     fs::SourceFile,
-    ir::{EdgeLabel, Graph, GraphRecord, NodeKind, stable_id},
+    ir::{EdgeLabel, Graph, GraphRecord, NodeKind, SourceSpan, stable_id},
     languages::{
         common::{
             SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, node_name,
             path_segments, reference_text, span,
         },
-        cross_file::{CallKind, CallSiteFact, DefinitionFact, FileFacts},
+        cross_file::{CallKind, CallSiteFact, DefinitionFact, FileFacts, OutOfLineModFact},
     },
     redaction::REDACTION_POLICY_VERSION,
 };
@@ -83,6 +83,12 @@ const REFERENCE_EXCLUDED_KINDS: &[&str] = &[
     "char_literal",
 ];
 
+/// The closed panic-risk method-call set for issue #223: safe `.unwrap()` and
+/// `.expect(..)` method calls only. Unsafe variants such as
+/// `.unwrap_unchecked()` and non-panicking variants such as `.unwrap_or(..)`
+/// are intentionally excluded from this slice.
+const PANIC_RISK_METHODS: [&str; 2] = ["expect", "unwrap"];
+
 #[derive(Debug, Clone)]
 struct ImplContext {
     display: String,
@@ -103,7 +109,21 @@ struct RustExtractor<'graph, 'source> {
     symbol_bodies: Vec<SymbolBody>,
     symbol_ordinals: BTreeMap<(String, String), u64>,
     diagnostic_ordinals: BTreeMap<String, u64>,
+    debt_marker_ordinals: BTreeMap<String, u64>,
     facts: FileFacts,
+    panic_risk_ordinals: BTreeMap<String, u64>,
+    /// Inline-module segments currently enclosing the walk (out-of-line
+    /// `mod x;` declarations do not push here).
+    inline_module_stack: Vec<String>,
+    /// Count of enclosing inline modules that carry a `#[path]` attribute
+    /// (which rebases everything nested in them; see issue #223 resolution
+    /// gap).
+    inline_path_override_depth: usize,
+    /// Depth of enclosing test scopes (`#[cfg(test)]` modules and `#[test]`
+    /// functions). Non-zero means panic-risk call sites classify as `test`.
+    test_scope_depth: usize,
+    /// `true` when the whole file lives under a top-level `tests/` directory.
+    file_in_tests_dir: bool,
 }
 
 impl<'graph, 'source> RustExtractor<'graph, 'source> {
@@ -127,7 +147,15 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             symbol_bodies: Vec::new(),
             symbol_ordinals: BTreeMap::new(),
             diagnostic_ordinals: BTreeMap::new(),
+            debt_marker_ordinals: BTreeMap::new(),
             facts: FileFacts::default(),
+            panic_risk_ordinals: BTreeMap::new(),
+            inline_module_stack: Vec::new(),
+            inline_path_override_depth: 0,
+            test_scope_depth: 0,
+            file_in_tests_dir: path_segments(&file.repo_relative_path)
+                .first()
+                .is_some_and(|segment| segment == "tests"),
         }
     }
 
@@ -144,6 +172,8 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             "static_item" => self.extract_named_symbol(node, "static"),
             "type_item" => self.extract_named_symbol(node, "type_alias"),
             "macro_invocation" => self.extract_macro_diagnostic(node),
+            "call_expression" => self.extract_call_expression(node),
+            "line_comment" | "block_comment" => self.extract_comment_markers(node),
             _ => self.walk_children(node),
         }
     }
@@ -195,11 +225,100 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             format!("{} contains module {qualified_name}", self.owner_name()),
         );
 
-        self.module_names.push(local_name);
+        let is_test_module = self.has_cfg_test_attribute(node);
+        let is_inline = node.child_by_field_name("body").is_some();
+        if !is_inline {
+            // Out-of-line declaration (`mod name;`): the module body lives in
+            // its own file, extracted with no view of this gating attribute.
+            // Export the declaration so the repo-wide pass (issue #223) can
+            // mark the module file's panic-risk sites as test context.
+            self.facts.out_of_line_mods.push(OutOfLineModFact {
+                name: local_name.clone(),
+                inline_module_path: self.inline_module_stack.clone(),
+                test_gated: is_test_module || self.in_test_context(),
+                path_override: self.mod_path_override(node),
+                under_inline_path_override: self.inline_path_override_depth > 0,
+            });
+        }
+
+        let inline_has_path_override = is_inline && self.has_path_attribute(node);
+        self.module_names.push(local_name.clone());
         self.owner_ids.push(id);
+        if is_inline {
+            self.inline_module_stack.push(local_name);
+        }
+        if inline_has_path_override {
+            self.inline_path_override_depth += 1;
+        }
+        if is_test_module {
+            self.test_scope_depth += 1;
+        }
         self.walk_children(node);
+        if is_test_module {
+            self.test_scope_depth -= 1;
+        }
+        if inline_has_path_override {
+            self.inline_path_override_depth -= 1;
+        }
+        if is_inline {
+            self.inline_module_stack.pop();
+        }
         self.owner_ids.pop();
         self.module_names.pop();
+    }
+
+    /// `true` when the item carries any `#[path ...]` attribute in the
+    /// attribute items immediately preceding it (comments are skipped).
+    fn has_path_attribute(&self, node: Node<'_>) -> bool {
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            match sibling.kind() {
+                "attribute_item" => {
+                    let text: String = self
+                        .node_text(sibling)
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
+                    if text.starts_with("#[path=") || text.starts_with("#[path]") {
+                        return true;
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            current = sibling.prev_sibling();
+        }
+        false
+    }
+
+    /// Extracts a trivial `#[path = "literal"]` override from the attribute
+    /// items immediately preceding an out-of-line module declaration.
+    /// Non-literal path attributes yield `None` (documented resolution gap).
+    fn mod_path_override(&self, node: Node<'_>) -> Option<String> {
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            match sibling.kind() {
+                "attribute_item" => {
+                    let text: String = self
+                        .node_text(sibling)
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
+                    if let Some(literal) = text
+                        .strip_prefix("#[path=\"")
+                        .and_then(|rest| rest.strip_suffix("\"]"))
+                        && !literal.is_empty()
+                        && !literal.contains('"')
+                    {
+                        return Some(literal.to_owned());
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            current = sibling.prev_sibling();
+        }
+        None
     }
 
     fn extract_import(&mut self, node: Node<'_>) {
@@ -211,7 +330,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             &self.file.repo_relative_path,
             &name,
         ]);
-        self.graph.push(GraphRecord::syntax_node(
+        let mut record = GraphRecord::syntax_node(
             id.clone(),
             NodeKind::Import,
             self.file.repo_relative_path.clone(),
@@ -219,7 +338,16 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             name.clone(),
             "rust",
             format!("Rust import {name}"),
-        ));
+        );
+        // Doc comments above a `use` declaration attach to the item rustdoc
+        // exposes at the re-export site (issue #257); capture them as the
+        // import's doc fact. Additive, never an identity input.
+        if let Some(doc) = self.symbol_doc(node) {
+            record = record
+                .with_declaration_surface(None, None, Some(doc))
+                .with_redaction_policy_version(REDACTION_POLICY_VERSION);
+        }
+        self.graph.push(record);
         self.add_edge(
             EdgeLabel::Imports,
             self.owner_id(),
@@ -278,7 +406,14 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             name: qualified_name,
             text: reference_text(node, self.source, REFERENCE_EXCLUDED_KINDS),
         });
+        let is_test_fn = self.has_test_attribute(node);
+        if is_test_fn {
+            self.test_scope_depth += 1;
+        }
         self.walk_children(node);
+        if is_test_fn {
+            self.test_scope_depth -= 1;
+        }
     }
 
     /// Match segments for a callable definition: the module path, plus the
@@ -431,6 +566,76 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         self.impl_context = previous;
     }
 
+    /// Visits a Tree-sitter comment node (`line_comment` / `block_comment` —
+    /// rustdoc `///`, `//!`, and `/** */` docs included) and emits one
+    /// deterministic `DebtMarker` record per debt-marker token occurrence
+    /// (issue #218).
+    ///
+    /// Comment ranges come exclusively from the Tree-sitter parse tree, so a
+    /// marker token inside a string or character literal can never match;
+    /// scanning within the identified comment's text enforces word
+    /// boundaries, so identifier substrings (`TODOIST`, `fixmeup`) and longer
+    /// words (`XXXL`) never match either.
+    fn extract_comment_markers(&mut self, node: Node<'_>) {
+        let text = self.node_text(node);
+        let comment_start_byte = node.start_byte();
+        let comment_start_row = node.start_position().row;
+        for marker in comment_debt_markers(text) {
+            let disambiguator = self.next_debt_marker_disambiguator(marker.category);
+            let id = stable_id(&[
+                "node",
+                "debt_marker",
+                self.repository_id,
+                &self.file.repo_relative_path,
+                marker.category,
+                &disambiguator.to_string(),
+            ]);
+            let line = comment_start_row + 1 + marker.line_offset;
+            let marker_span = SourceSpan {
+                start_byte: comment_start_byte + marker.token_start,
+                end_byte: comment_start_byte + marker.note_end,
+                start_line: line,
+                end_line: line,
+            };
+            self.graph.push(
+                GraphRecord::syntax_node(
+                    id.clone(),
+                    NodeKind::DebtMarker,
+                    self.file.repo_relative_path.clone(),
+                    marker_span,
+                    marker.category.to_owned(),
+                    "rust",
+                    format!(
+                        "Rust {} debt-comment marker",
+                        marker.category.to_ascii_uppercase()
+                    ),
+                )
+                .with_note(&crate::redaction::redact_value(&marker.note))
+                .with_redaction_policy_version(REDACTION_POLICY_VERSION),
+            );
+            self.add_edge(
+                EdgeLabel::Contains,
+                self.file_id.to_owned(),
+                id,
+                format!(
+                    "{} contains {} debt-comment marker",
+                    self.file.repo_relative_path,
+                    marker.category.to_ascii_uppercase()
+                ),
+            );
+        }
+    }
+
+    fn next_debt_marker_disambiguator(&mut self, category: &str) -> u64 {
+        let disambiguator = self
+            .debt_marker_ordinals
+            .entry(category.to_owned())
+            .or_default();
+        let current = *disambiguator;
+        *disambiguator += 1;
+        current
+    }
+
     fn extract_macro_diagnostic(&mut self, node: Node<'_>) {
         let invocation = macro_invocation_name(self.node_text(node));
         let disambiguator = self.next_diagnostic_disambiguator(&invocation);
@@ -451,6 +656,139 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             "rust",
             format!("unsupported macro invocation {invocation}"),
         ));
+    }
+
+    /// Visits a `call_expression`: emits a deterministic `PanicRiskSite`
+    /// record when the call is a `.unwrap()` / `.expect(..)` method call
+    /// (issue #223), then keeps walking so nested and chained calls are
+    /// visited too.
+    ///
+    /// Detection is purely AST-shaped — the callee must be a
+    /// `field_expression` whose `field` child is a `field_identifier` in the
+    /// closed [`PANIC_RISK_METHODS`] set — so text inside comments, string
+    /// literals, doc comments, and unrelated `unwrap` identifiers can never
+    /// match.
+    fn extract_call_expression(&mut self, node: Node<'_>) {
+        if let Some(category) = self.panic_risk_category(node) {
+            self.emit_panic_risk_site(node, category);
+        }
+        self.walk_children(node);
+    }
+
+    /// Returns the closed panic-risk category (`unwrap` / `expect`) when the
+    /// call expression is a matching method call; `None` otherwise.
+    fn panic_risk_category(&self, node: Node<'_>) -> Option<&'static str> {
+        let function = node.child_by_field_name("function")?;
+        if function.kind() != "field_expression" {
+            return None;
+        }
+        let field = function.child_by_field_name("field")?;
+        if field.kind() != "field_identifier" {
+            return None;
+        }
+        let name = self.node_text(field);
+        PANIC_RISK_METHODS.iter().find(|m| **m == name).copied()
+    }
+
+    fn emit_panic_risk_site(&mut self, node: Node<'_>, category: &'static str) {
+        let context = if self.in_test_context() {
+            "test"
+        } else {
+            "production"
+        };
+        let disambiguator = self.next_panic_risk_disambiguator(category);
+        let id = stable_id(&[
+            "node",
+            "panic_risk_site",
+            self.repository_id,
+            &self.file.repo_relative_path,
+            category,
+            &disambiguator.to_string(),
+        ]);
+        self.graph.push(
+            GraphRecord::syntax_node(
+                id.clone(),
+                NodeKind::PanicRiskSite,
+                self.file.repo_relative_path.clone(),
+                span(node),
+                category.to_owned(),
+                "rust",
+                format!("Rust .{category}() panic-risk call site"),
+            )
+            .with_call_context(context),
+        );
+        self.add_edge(
+            EdgeLabel::Contains,
+            self.file_id.to_owned(),
+            id,
+            format!(
+                "{} contains .{category}() panic-risk call site",
+                self.file.repo_relative_path
+            ),
+        );
+    }
+
+    /// `true` when the cursor is inside any test scope: a file under a
+    /// top-level `tests/` directory, a `#[cfg(test)]` module, or a `#[test]`
+    /// function. The classification set is closed for issue #223.
+    const fn in_test_context(&self) -> bool {
+        self.file_in_tests_dir || self.test_scope_depth > 0
+    }
+
+    /// `true` when the function carries a dedicated test attribute in the
+    /// attribute items immediately preceding it: `#[test]` or a path
+    /// attribute ending in `::test` (e.g. `#[tokio::test]`), including
+    /// parameterized forms. `#[cfg(not(test))]` and `#[cfg_attr(test, ...)]`
+    /// never match — the issue #223 panic-risk context contract is closed.
+    fn has_test_attribute(&self, node: Node<'_>) -> bool {
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            match sibling.kind() {
+                "attribute_item" => {
+                    if attribute_is_test(self.node_text(sibling)) {
+                        return true;
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            current = sibling.prev_sibling();
+        }
+        false
+    }
+
+    /// `true` when the item is annotated with exactly `#[cfg(test)]` in the
+    /// attribute items immediately preceding it (comments are skipped).
+    fn has_cfg_test_attribute(&self, node: Node<'_>) -> bool {
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            match sibling.kind() {
+                "attribute_item" => {
+                    let text: String = self
+                        .node_text(sibling)
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
+                    if text == "#[cfg(test)]" {
+                        return true;
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            current = sibling.prev_sibling();
+        }
+        false
+    }
+
+    fn next_panic_risk_disambiguator(&mut self, category: &str) -> u64 {
+        let disambiguator = self
+            .panic_risk_ordinals
+            .entry(category.to_owned())
+            .or_default();
+        let current = *disambiguator;
+        *disambiguator += 1;
+        current
     }
 
     fn add_symbol(&mut self, node: Node<'_>, symbol_kind: &str, qualified_name: &str) -> String {
@@ -539,14 +877,16 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         normalize_code(self.source.get(start..end).unwrap_or(""))
     }
 
-    /// Collects the item's doc comment (`///` line docs or a `/** */` block
-    /// doc) from the siblings immediately preceding the item, then applies
-    /// redaction policy v1 to the collected text.
+    /// Collects the item's doc comment (`///` line docs, a `/** */` block
+    /// doc, or `#[doc = "..."]` attributes) from the siblings immediately
+    /// preceding the item, then applies redaction policy v1 to the collected
+    /// text.
     ///
-    /// Attribute items between the docs and the item are skipped; any other
-    /// sibling (including plain `//` / `/* */` comments) terminates the doc
-    /// block. Returns `None` when the item has no doc comment or the collected
-    /// text is empty — the `doc` field is omitted, never an empty string.
+    /// Non-doc attribute items between the docs and the item are skipped; any
+    /// other sibling (including plain `//` / `/* */` comments) terminates the
+    /// doc block. Returns `None` when the item has no doc comment or the
+    /// collected text is empty — the `doc` field is omitted, never an empty
+    /// string.
     fn symbol_doc(&self, node: Node<'_>) -> Option<String> {
         let mut doc_parts: Vec<String> = Vec::new();
         let mut current = node.prev_sibling();
@@ -558,7 +898,11 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                     };
                     doc_parts.push(text);
                 }
-                "attribute_item" => {}
+                "attribute_item" => {
+                    if let Some(text) = doc_attribute_text(self.node_text(sibling)) {
+                        doc_parts.push(text);
+                    }
+                }
                 _ => break,
             }
             current = sibling.prev_sibling();
@@ -652,6 +996,86 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
     }
 }
 
+/// The closed debt-marker vocabulary for issue #218, keyed by the lowercase
+/// machine-readable category. Matching is case-insensitive on the marker
+/// token only and is closed for this slice — no user-configurable
+/// vocabularies.
+const DEBT_MARKER_CATEGORIES: [&str; 4] = ["fixme", "hack", "todo", "xxx"];
+
+/// One detected debt-marker occurrence inside a comment node's text.
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct CommentMarker {
+    /// Closed lowercase category: `todo` / `fixme` / `hack` / `xxx`.
+    category: &'static str,
+    /// Trimmed single-line note text following the marker token.
+    note: String,
+    /// Byte offset of the marker token within the comment text.
+    token_start: usize,
+    /// Byte offset just past the trimmed single-line note within the comment
+    /// text (always past the marker token itself).
+    note_end: usize,
+    /// Number of newlines in the comment text before the marker token.
+    line_offset: usize,
+}
+
+/// Scans one comment node's text for debt-marker tokens (issue #218).
+///
+/// The scan is word-boundary conservative: a candidate token is a maximal
+/// ASCII `[A-Za-z0-9_]` run, so `TODOIST`, `fixmeup`, `XXXL`, and `TODO2`
+/// never match. Matching against the closed [`DEBT_MARKER_CATEGORIES`] set is
+/// case-insensitive on the token only. The note is the text following the
+/// marker to the end of its line (or the end of the comment), with a trailing
+/// `*/` block terminator removed, one leading `:` or `-` separator dropped,
+/// and surrounding whitespace trimmed. One marker is returned per token
+/// occurrence, in source order.
+fn comment_debt_markers(text: &str) -> Vec<CommentMarker> {
+    let bytes = text.as_bytes();
+    let mut markers = Vec::new();
+    let mut newlines = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'\n' {
+            newlines += 1;
+            i += 1;
+            continue;
+        }
+        if !byte.is_ascii_alphanumeric() && byte != b'_' {
+            i += 1;
+            continue;
+        }
+        let token_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        let token = &text[token_start..i];
+        let Some(category) = DEBT_MARKER_CATEGORIES
+            .iter()
+            .find(|category| token.eq_ignore_ascii_case(category))
+            .copied()
+        else {
+            continue;
+        };
+        let line_end = text[i..].find('\n').map_or(text.len(), |offset| i + offset);
+        let raw_note = text[i..line_end].trim_end();
+        let without_terminator = raw_note.strip_suffix("*/").unwrap_or(raw_note).trim_end();
+        let note_end = i + without_terminator.len();
+        let cleaned = without_terminator.trim_start();
+        let cleaned = cleaned
+            .strip_prefix(':')
+            .or_else(|| cleaned.strip_prefix('-'))
+            .unwrap_or(cleaned);
+        markers.push(CommentMarker {
+            category,
+            note: cleaned.trim().to_owned(),
+            token_start,
+            note_end,
+            line_offset: newlines,
+        });
+    }
+    markers
+}
+
 /// Returns `true` when `symbol_kind` belongs to the issue #124 declaration-
 /// surface set: the extracted Rust item kinds that carry `visibility` and
 /// `signature` fields (`impl` blocks are excluded — they have no visibility
@@ -699,6 +1123,120 @@ fn doc_comment_text(text: &str) -> Option<String> {
         return Some(block_doc_text(inner));
     }
     None
+}
+
+/// Extracts doc text from one `#[doc = ...]` attribute item's source text.
+///
+/// Returns the decoded text for outer doc attributes carrying a plain or raw
+/// string literal. A non-literal value (`#[doc = include_str!(...)]`,
+/// `#[doc = concat!(...)]`) still documents the item for rustdoc, so it
+/// yields a labeled marker citing the unexpanded expression — presence is
+/// recorded, text is never guessed by expanding macros. Returns `None` for
+/// every other attribute shape — `#[doc(hidden)]`, `#[doc(alias = "...")]`,
+/// and non-`doc` attributes contribute no doc text.
+fn doc_attribute_text(text: &str) -> Option<String> {
+    let inner = text
+        .trim()
+        .strip_prefix("#[")?
+        .strip_suffix(']')?
+        .trim()
+        .strip_prefix("doc")?
+        .trim_start()
+        .strip_prefix('=')?
+        .trim();
+    if let Some(literal) = string_literal_text(inner) {
+        return Some(literal);
+    }
+    if inner.is_empty() {
+        return None;
+    }
+    Some(format!("[unexpanded doc attribute: {inner}]"))
+}
+
+/// Decodes a Rust string literal (`"..."`, `r"..."`, `r#"..."#`, ...) into
+/// its text. Raw literals are taken verbatim; plain literals are unescaped
+/// via [`unescape_string_literal`]. Returns `None` for anything that is not
+/// a single string literal.
+fn string_literal_text(literal: &str) -> Option<String> {
+    if let Some(raw) = literal.strip_prefix('r') {
+        let hashes = raw.len() - raw.trim_start_matches('#').len();
+        let quoted = raw.get(hashes..raw.len().checked_sub(hashes)?)?;
+        return Some(quoted.strip_prefix('"')?.strip_suffix('"')?.to_owned());
+    }
+    let inner = literal.strip_prefix('"')?.strip_suffix('"')?;
+    Some(unescape_string_literal(inner))
+}
+
+/// Unescapes the interior of a plain Rust string literal: `\n`, `\t`, `\r`,
+/// `\0`, `\\`, `\'`, `\"`, `\xNN`, `\u{...}`, and the `\`-newline line
+/// continuation (which also swallows the next line's leading whitespace).
+///
+/// Any escape this decoder cannot decode returns the interior **verbatim**
+/// — the recorded text is kept raw rather than partially decoded (a dropped
+/// backslash would corrupt the doc fact).
+fn unescape_string_literal(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('\\') => out.push('\\'),
+            Some('\'') => out.push('\''),
+            Some('"') => out.push('"'),
+            Some('x') => {
+                let hex: String = (0..2).filter_map(|_| chars.next()).collect();
+                match u8::from_str_radix(&hex, 16) {
+                    Ok(byte) => out.push(char::from(byte)),
+                    Err(_) => return inner.to_owned(),
+                }
+            }
+            Some('u') => {
+                if chars.next() != Some('{') {
+                    return inner.to_owned();
+                }
+                let mut hex = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some(digit) => hex.push(digit),
+                        None => return inner.to_owned(),
+                    }
+                }
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(decoded) => out.push(decoded),
+                    None => return inner.to_owned(),
+                }
+            }
+            // Line continuation: `\` before a newline (or CRLF) removes the
+            // break and the following leading whitespace.
+            Some('\n') => {
+                while chars
+                    .peek()
+                    .is_some_and(|w| matches!(w, ' ' | '\t' | '\n' | '\r'))
+                {
+                    chars.next();
+                }
+            }
+            Some('\r') if chars.peek() == Some(&'\n') => {
+                while chars
+                    .peek()
+                    .is_some_and(|w| matches!(w, ' ' | '\t' | '\n' | '\r'))
+                {
+                    chars.next();
+                }
+            }
+            // Unknown escape or trailing backslash: keep the text raw.
+            _ => return inner.to_owned(),
+        }
+    }
+    out
 }
 
 /// Normalizes the interior of a `/** */` block doc: strips the per-line
@@ -789,6 +1327,23 @@ fn strip_impl_prefix(owner: &str) -> &str {
 /// True when `text` is a plain identifier (letters, digits, underscores).
 fn is_simple_ident(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// `true` when one attribute item's source text is a dedicated test attribute:
+/// `#[test]` or a path attribute whose name ends in `::test` (such as
+/// `#[tokio::test]`), with or without arguments. Configuration attributes that
+/// merely mention `test` — `#[cfg(test)]`, `#[cfg(not(test))]`,
+/// `#[cfg_attr(test, ...)]` — never match.
+fn attribute_is_test(text: &str) -> bool {
+    let stripped: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let Some(inner) = stripped
+        .strip_prefix("#[")
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
+        return false;
+    };
+    let name = inner.split('(').next().unwrap_or(inner);
+    name == "test" || name.ends_with("::test")
 }
 
 fn macro_invocation_name(text: &str) -> String {
@@ -1584,6 +2139,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_doc_attribute_text_extracts_string_forms() {
+        assert_eq!(
+            doc_attribute_text(r#"#[doc = "Plain doc."]"#),
+            Some("Plain doc.".to_owned())
+        );
+        assert_eq!(
+            doc_attribute_text(r##"#[doc = r#"Raw doc."#]"##),
+            Some("Raw doc.".to_owned())
+        );
+        assert_eq!(
+            doc_attribute_text(r#"#[doc="escaped \"quote\" and\nnewline"]"#),
+            Some("escaped \"quote\" and\nnewline".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_string_literal_text_decodes_all_escape_forms() {
+        assert_eq!(
+            string_literal_text(r#""caf\u{e9}""#),
+            Some("café".to_owned())
+        );
+        assert_eq!(string_literal_text(r#""\x41B""#), Some("AB".to_owned()));
+        assert_eq!(
+            string_literal_text(r#""a\rb\0c\'d\"e""#),
+            Some("a\rb\0c'd\"e".to_owned())
+        );
+        // Line continuation: `\` before a newline swallows the newline and
+        // the next line's leading whitespace.
+        assert_eq!(
+            string_literal_text("\"one \\\n    two\""),
+            Some("one two".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_string_literal_text_keeps_undecodable_escapes_raw() {
+        // Never partially decode: an escape this decoder does not understand
+        // keeps the literal content verbatim instead of dropping backslashes.
+        assert_eq!(string_literal_text(r#""caf\q""#), Some(r"caf\q".to_owned()));
+        assert_eq!(
+            string_literal_text(r#""bad \u{ZZ} escape""#),
+            Some(r"bad \u{ZZ} escape".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_doc_attribute_text_decodes_unicode_escapes() {
+        assert_eq!(
+            doc_attribute_text(r#"#[doc = "caf\u{e9}"]"#),
+            Some("café".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_doc_attribute_text_rejects_non_doc_shapes() {
+        assert_eq!(doc_attribute_text("#[doc(hidden)]"), None);
+        assert_eq!(doc_attribute_text(r#"#[doc(alias = "other")]"#), None);
+        assert_eq!(doc_attribute_text("#[derive(Debug)]"), None);
+        assert_eq!(doc_attribute_text(r#"#[deprecated = "note"]"#), None);
+    }
+
+    #[test]
+    fn test_doc_attribute_text_marks_unexpanded_expressions_as_present() {
+        // Rustdoc documents an item carrying `#[doc = <expr>]` even when the
+        // expression needs macro expansion; the fact recorded is presence
+        // with a labeled unexpanded marker, never guessed doc text.
+        let included = doc_attribute_text(r#"#[doc = include_str!("../README.md")]"#)
+            .expect("include_str! doc attribute must count as documentation");
+        assert!(
+            included.contains(r#"include_str!("../README.md")"#),
+            "marker must cite the unexpanded expression, got {included:?}"
+        );
+        let concatenated = doc_attribute_text(r#"#[doc = concat!("a", "b")]"#)
+            .expect("concat! doc attribute must count as documentation");
+        assert!(
+            concatenated.contains("concat!"),
+            "marker must cite the unexpanded expression, got {concatenated:?}"
+        );
+    }
+
+    #[test]
     fn test_normalize_raw_strings() {
         // Raw strings should preserve their contents, including comments-like delimiters
         let code = r###"
@@ -1688,5 +2324,124 @@ mod tests {
         let code = "pub const abuse: i32 = 1;";
         let normalized = normalize_file_code(code);
         assert_eq!(normalized, "pub const abuse:i32=1;");
+    }
+
+    // ── Debt-marker comment scanning (issue #218) ─────────────────────────────
+
+    fn categories_and_notes(text: &str) -> Vec<(&'static str, String)> {
+        comment_debt_markers(text)
+            .into_iter()
+            .map(|m| (m.category, m.note))
+            .collect()
+    }
+
+    #[test]
+    fn debt_marker_scan_matches_line_comment_markers() {
+        assert_eq!(
+            categories_and_notes("// TODO: wire retry logic"),
+            vec![("todo", "wire retry logic".to_owned())]
+        );
+        assert_eq!(
+            categories_and_notes("// FIXME - handle empty input"),
+            vec![("fixme", "handle empty input".to_owned())]
+        );
+        assert_eq!(
+            categories_and_notes("// HACK bypasses cache"),
+            vec![("hack", "bypasses cache".to_owned())]
+        );
+    }
+
+    #[test]
+    fn debt_marker_scan_is_case_insensitive_on_the_token_only() {
+        assert_eq!(
+            categories_and_notes("// todo lowercase works"),
+            vec![("todo", "lowercase works".to_owned())]
+        );
+        assert_eq!(
+            categories_and_notes("// xXx MiXeD"),
+            vec![("xxx", "MiXeD".to_owned())],
+            "the note text keeps its original case"
+        );
+    }
+
+    #[test]
+    fn debt_marker_scan_never_matches_identifier_substrings() {
+        assert_eq!(categories_and_notes("// TODOIST integration"), vec![]);
+        assert_eq!(categories_and_notes("// call fixmeup() next"), vec![]);
+        assert_eq!(categories_and_notes("// sizes XXXL and up"), vec![]);
+        assert_eq!(categories_and_notes("// TODO2 is not a marker"), vec![]);
+        assert_eq!(categories_and_notes("// TODO_LIST const"), vec![]);
+        assert_eq!(categories_and_notes("// nothing to see here"), vec![]);
+    }
+
+    #[test]
+    fn debt_marker_scan_strips_block_terminator_and_stays_single_line() {
+        assert_eq!(
+            categories_and_notes("/* FIXME handle empty input */"),
+            vec![("fixme", "handle empty input".to_owned())]
+        );
+        assert_eq!(
+            categories_and_notes("/* first line\n * TODO: second line note\n */"),
+            vec![("todo", "second line note".to_owned())],
+            "a multi-line block note is cut at the end of the marker's line"
+        );
+    }
+
+    #[test]
+    fn debt_marker_scan_captures_raw_note_and_empty_notes() {
+        // Structured metadata is out of scope: the raw text is kept verbatim.
+        assert_eq!(
+            categories_and_notes("// TODO(alice): assign later"),
+            vec![("todo", "(alice): assign later".to_owned())]
+        );
+        assert_eq!(
+            categories_and_notes("// TODO"),
+            vec![("todo", String::new())],
+            "a bare marker keeps an empty note"
+        );
+    }
+
+    #[test]
+    fn debt_marker_scan_returns_one_marker_per_occurrence_in_source_order() {
+        assert_eq!(
+            categories_and_notes("// TODO: fix\n// FIXME: later"),
+            vec![("todo", "fix".to_owned()), ("fixme", "later".to_owned()),]
+        );
+        let markers = comment_debt_markers("/* line one\n TODO: on line two */");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].line_offset, 1, "line offset counts newlines");
+        assert!(markers[0].token_start > 0);
+        assert!(markers[0].note_end > markers[0].token_start);
+    }
+
+    #[test]
+    fn debt_marker_extraction_skips_string_literals_via_tree_sitter() {
+        let source = "pub fn f() -> &'static str {\n    // TODO: real marker\n    \"TODO: not a marker\"\n}\n";
+        let file = SourceFile {
+            path: PathBuf::from("src/lib.rs"),
+            repo_relative_path: "src/lib.rs".to_owned(),
+        };
+        let mut graph = Graph::default();
+        extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
+            .expect("source should parse");
+        let markers: Vec<&GraphRecord> = graph
+            .records()
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Node {
+                        kind: NodeKind::DebtMarker,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(
+            markers.len(),
+            1,
+            "only the comment marker may match; the string literal never does"
+        );
+        assert_eq!(markers[0].note(), Some("real marker"));
     }
 }

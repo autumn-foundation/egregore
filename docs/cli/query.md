@@ -25,7 +25,9 @@ eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>]
 eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N]
 eg query transitive-callers <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query deltas   <BASE> <HEAD> --graph <PATH> [--repo <SELECTOR>]
+eg query coupling <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--base <COMMIT> --head <COMMIT> | --at <COMMIT> | --as-of <RFC3339>] [--min-support N] [--limit N] [--format json|text]
 eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
+eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--include-private] [--format json|text]
 ```
 
 Evidence-backed audit subcommands have their own pages:
@@ -55,10 +57,18 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query deltas` — **symbol- and file-level changes between two commits**,
   grouped by stable change class with citable handles
   ([deltas.md](deltas.md), issue #118).
+- `eg query coupling` — the files that **historically changed in the same
+  commits** as a target file, ranked by a documented normalized coupling
+  strength with a minimum-support threshold; historical co-change leads,
+  never dependency proof ([coupling.md](coupling.md), issue #153).
 - `eg query public-api` — the crate's **externally-reachable public API
   surface** from recorded visibility and module containment, re-exports
   included, trapped `pub` items excluded
   ([public-api.md](public-api.md), issue #213).
+- `eg query undocumented` — **externally-reachable public symbols with no
+  recorded doc comment**, each row carrying citable evidence;
+  presence/absence only, never doc quality
+  ([undocumented.md](undocumented.md), issue #257).
 
 Most subcommands accept exactly one input source:
 

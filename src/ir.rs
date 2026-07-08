@@ -694,7 +694,7 @@ pub enum GraphRecord {
         /// but `span` is not; see `docs/adr/0004-symbol-identity.md`.
         #[serde(skip_serializing_if = "Option::is_none")]
         disambiguator: Option<u64>,
-        // ── Symbol declaration-surface fields (issue #124) ────────────────────
+        // ── Declaration-surface fields (issues #124 / #213 / #257) ────────────
         /// Declaration visibility class for `Symbol` nodes (and Rust `Module`
         /// nodes, issue #213), drawn from the closed set `public` / `crate` /
         /// `restricted` / `private`. Additive per
@@ -707,11 +707,28 @@ pub enum GraphRecord {
         /// body excluded and interior whitespace collapsed deterministically.
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
-        /// Doc-comment text (`///` or `/** */`) for `Symbol` nodes after
-        /// passing through redaction policy v1. Omitted entirely when the item
-        /// has no doc comment — never an empty string.
+        /// Doc-comment text (`///`, `/** */`, or `#[doc = "..."]`) after
+        /// passing through redaction policy v1. Present on `Symbol` nodes
+        /// (issue #124) and on Rust `Import` nodes when a doc comment sits at
+        /// a `pub use` re-export site (issue #257) — consumers and validators
+        /// MUST preserve the field on both kinds. Omitted entirely when the
+        /// item has no doc comment — never an empty string.
         #[serde(skip_serializing_if = "Option::is_none")]
         doc: Option<String>,
+        // ── Panic-risk call-site fields (issue #223) ──────────────────────────
+        /// Production-vs-test context class for `PanicRiskSite` nodes, drawn
+        /// from the closed set `production` / `test`. Absent on all other node
+        /// kinds. Additive per `docs/schema/schema-versioning.md §2`; never an
+        /// identity input.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call_context: Option<String>,
+        // ── Debt-comment marker fields (issue #218) ───────────────────────────
+        /// Trimmed single-line note text following the marker token on
+        /// `DebtMarker` nodes, after passing through redaction policy v1.
+        /// Absent on all other node kinds. Additive per
+        /// `docs/schema/schema-versioning.md §2`; never an identity input.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
         /// Git and bitemporal provenance for history-backed records.
         #[serde(skip_serializing_if = "Option::is_none")]
         temporal: Option<TemporalMetadata>,
@@ -1069,6 +1086,8 @@ impl GraphRecord {
             visibility: None,
             signature: None,
             doc: None,
+            call_context: None,
+            note: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1179,6 +1198,8 @@ impl GraphRecord {
             visibility: None,
             signature: None,
             doc: None,
+            call_context: None,
+            note: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1288,6 +1309,8 @@ impl GraphRecord {
             visibility: None,
             signature: None,
             doc: None,
+            call_context: None,
+            note: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1403,6 +1426,8 @@ impl GraphRecord {
             visibility: None,
             signature: None,
             doc: None,
+            call_context: None,
+            note: None,
             temporal: None,
             semantic_drift: None,
             evidence_links: None,
@@ -1586,9 +1611,12 @@ impl GraphRecord {
         self
     }
 
-    /// Attaches declaration-surface metadata to a `Symbol` node record
-    /// (issue #124): visibility class, normalized signature header, and
-    /// redacted doc-comment text.
+    /// Attaches declaration-surface metadata to a node record (issue #124):
+    /// visibility class, normalized signature header, and redacted
+    /// doc-comment text. Used by `Symbol` nodes for the full surface, and by
+    /// Rust `Import` nodes to carry the doc comment written at a `pub use`
+    /// re-export site (issue #257; doc only — visibility and signature stay
+    /// absent there).
     ///
     /// The fields are additive per `docs/schema/schema-versioning.md §2` and
     /// MUST NOT contribute to stable ID composition. No-op on non-node records.
@@ -1613,6 +1641,27 @@ impl GraphRecord {
         self
     }
 
+    /// Stamps the trimmed single-line note text on a `DebtMarker` node record
+    /// (issue #218). The value is additive metadata per
+    /// `docs/schema/schema-versioning.md §2` and MUST NOT contribute to
+    /// stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub fn with_note(mut self, marker_note: &str) -> Self {
+        if let Self::Node { note, .. } = &mut self {
+            *note = Some(marker_note.to_owned());
+        }
+        self
+    }
+
+    /// Returns the debt-marker note text when present.
+    #[must_use]
+    pub fn note(&self) -> Option<&str> {
+        match self {
+            Self::Node { note, .. } => note.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
     /// Attaches semantic drift metadata to a node record.
     #[must_use]
     pub fn with_semantic_drift(mut self, drift: SemanticDriftMetadata) -> Self {
@@ -1620,6 +1669,27 @@ impl GraphRecord {
             *semantic_drift = Some(Box::new(drift));
         }
         self
+    }
+
+    /// Stamps the production-vs-test context class on a `PanicRiskSite` node
+    /// record (issue #223). The value is drawn from the closed set
+    /// `production` / `test`; it is additive metadata and MUST NOT contribute
+    /// to stable ID composition. No-op on non-node records.
+    #[must_use]
+    pub fn with_call_context(mut self, context: &str) -> Self {
+        if let Self::Node { call_context, .. } = &mut self {
+            *call_context = Some(context.to_owned());
+        }
+        self
+    }
+
+    /// Returns the panic-risk call-site context class when present.
+    #[must_use]
+    pub fn call_context(&self) -> Option<&str> {
+        match self {
+            Self::Node { call_context, .. } => call_context.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
     }
 
     /// Sets an explicit domain and schema version on a node record.
@@ -1976,6 +2046,15 @@ pub enum NodeKind {
     Import,
     /// Extractor warning or unsupported construct.
     Diagnostic,
+    /// Deterministic `.unwrap()` / `.expect()` panic-risk method-call site
+    /// (issue #223). The `name` field carries the closed category (`unwrap`
+    /// or `expect`) and `call_context` carries the production-vs-test class.
+    PanicRiskSite,
+    /// Deterministic human-authored debt-comment marker (issue #218): a
+    /// `TODO` / `FIXME` / `HACK` / `XXX` token inside a Tree-sitter comment
+    /// node. The `name` field carries the closed lowercase category and
+    /// `note` carries the trimmed single-line note text.
+    DebtMarker,
     /// Git commit observed during history replay.
     Commit,
     /// File-level change observed in a commit.
@@ -2082,6 +2161,8 @@ impl NodeKind {
             Self::Symbol => "Symbol",
             Self::Import => "Import",
             Self::Diagnostic => "Diagnostic",
+            Self::PanicRiskSite => "PanicRiskSite",
+            Self::DebtMarker => "DebtMarker",
             Self::Commit => "Commit",
             Self::Change => "Change",
             Self::SemanticDrift => "SemanticDrift",

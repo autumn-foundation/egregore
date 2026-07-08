@@ -243,6 +243,10 @@ enum Commands {
         /// Output JSONL path.
         #[arg(long)]
         out: PathBuf,
+        /// Emit a secret-free JSON redaction summary to this path (`-` for
+        /// stdout). Emitted even when zero redactions occur (issue #266).
+        #[arg(long)]
+        redaction_report: Option<PathBuf>,
     },
     /// Import a Codex session or rollout JSONL into agent-memory JSONL.
     ImportCodex {
@@ -251,6 +255,10 @@ enum Commands {
         /// Output JSONL path.
         #[arg(long)]
         out: PathBuf,
+        /// Emit a secret-free JSON redaction summary to this path (`-` for
+        /// stdout). Emitted even when zero redactions occur (issue #266).
+        #[arg(long)]
+        redaction_report: Option<PathBuf>,
     },
     /// Import a Claude Code transcript JSONL into agent-memory JSONL.
     ///
@@ -1321,6 +1329,55 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// List externally-reachable public symbols with no doc comment (issue #257).
+    ///
+    /// Joins the issue #213 public-surface set with the issue #124 recorded
+    /// doc-comment facts: a symbol is reported when it is externally
+    /// reachable AND its captured doc-comment fact is absent. Every row
+    /// carries the concrete evidence asserted plus a citable repo-relative
+    /// file/span handle. A symbol carrying any doc comment (`///`, `/** */`,
+    /// or `#[doc = "..."]`) is excluded; a plain `//` comment is not
+    /// documentation. A re-export counts as documented when either the
+    /// `pub use` site or the resolved target carries a doc fact.
+    /// `--include-private` widens the audit to all symbols (adding methods)
+    /// for whole-crate doc audits.
+    ///
+    /// Soundness boundary: asserts the presence/absence of a recorded doc
+    /// comment — never doc quality, accuracy, or completeness. A store that
+    /// predates issue #124 doc capture yields an explicit
+    /// `doc_facts_unavailable` capability verdict (exit 0), never a claim
+    /// that every symbol is undocumented.
+    ///
+    /// An empty result is an explicit machine-readable success (`ok:true`,
+    /// empty `items`, a `no_undocumented_items` diagnostic — or
+    /// `empty_result_with_blind_spots` when unresolved re-exports or missing
+    /// doc capture kept the audit from being certified clean), exit 0 — not
+    /// an error. Exit 1 on malformed input (unknown/ambiguous `--repo`,
+    /// unreadable graph). Output is deterministic and byte-stable.
+    ///
+    /// Documented in `docs/cli/undocumented.md`.
+    Undocumented {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the audit to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum rows returned; excess rows are truncated (deterministic
+        /// sort order preserved) with a `results_truncated` diagnostic.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Widen the audit to all symbols regardless of visibility or
+        /// reachability, for whole-crate doc audits.
+        #[arg(long)]
+        include_private: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Return a repository orientation map for cold-starting in an unfamiliar repository.
     Orient {
         /// Graph JSONL path (mutually exclusive with --data-dir).
@@ -1368,6 +1425,172 @@ enum QuerySubcommand {
         /// Restrict commit resolution and delta selection to one repository.
         #[arg(long)]
         repo: Option<String>,
+    },
+    /// Rank the files that historically changed in the same commits as a target file (issue #153).
+    ///
+    /// Over a temporal store produced by `scan-history`, counts the distinct
+    /// commits in which each other file changed together with the target
+    /// file and ranks partners by a documented normalized coupling strength
+    /// (`jaccard_v1`: shared commits over the union of both files' change
+    /// sets), with a directional confidence (shared commits over the
+    /// target's changes) on every row. A minimum-support threshold
+    /// (`--min-support`, default 2, max 100) suppresses noise pairs; the
+    /// threshold used is echoed in the answer. `--limit` (default 20, max
+    /// 500) caps output and the answer states whether it was truncated.
+    ///
+    /// Temporal scope: full history by default; `--base`+`--head` bound it
+    /// to the `(base, head]` commit range (issue #118 semantics), `--at` to
+    /// the ancestor closure of one commit, `--as-of` to commits recorded at
+    /// or before an RFC 3339 instant.
+    ///
+    /// Rows are historical co-change LEADS — files observed changing in the
+    /// same commits — never proof of dependency, breakage, or behavior
+    /// change, and absence of coupling is not proof of independence. Because
+    /// partners must resolve to `File` nodes, untracked, ignored, and
+    /// non-source paths never appear. Reads only the supplied store; never
+    /// touches Git state or the working tree.
+    ///
+    /// Exit codes:
+    ///   0 — ranked partners returned (including an explicit empty set).
+    ///   1 — malformed path/selector/threshold, ambiguous handle, identical
+    ///       endpoints, or reversed range (machine-readable JSON).
+    ///   2 — unknown file (no `File` node), missing commit, empty history,
+    ///       or no commit at/before the --as-of instant.
+    ///
+    /// Documented in `docs/cli/coupling.md`.
+    Coupling {
+        /// Repo-relative path of the target file (e.g. `src/lib.rs`).
+        path: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict commit and file resolution to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Range base commit SHA or unique prefix (older, exclusive
+        /// endpoint). Requires --head.
+        #[arg(long, requires = "head", conflicts_with_all = ["at", "as_of"])]
+        base: Option<String>,
+        /// Range head commit SHA or unique prefix (newer, inclusive
+        /// endpoint). Requires --base.
+        #[arg(long, requires = "base", conflicts_with_all = ["at", "as_of"])]
+        head: Option<String>,
+        /// Bound the in-scope commits to the ancestor closure of this commit
+        /// SHA or unique prefix. Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Bound the in-scope commits to those recorded at or before this
+        /// RFC 3339 instant. Mutually exclusive with --at.
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Minimum shared-commit count for a partner row (1..=100).
+        #[arg(long, default_value_t = query::CO_CHANGE_DEFAULT_MIN_SUPPORT)]
+        min_support: usize,
+        /// Maximum partner rows returned (1..=500); truncation is reported.
+        #[arg(long, default_value_t = query::CO_CHANGE_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Inventory `.unwrap()` / `.expect()` panic-risk call sites (issue #223).
+    ///
+    /// Returns every Tree-sitter-detected `.unwrap()` / `.expect()` method-call
+    /// expression as an advisory triage lead: a stable record ID, the closed
+    /// category (`unwrap` / `expect`), a `production` vs `test` context class
+    /// (`#[cfg(test)]` modules, `#[test]` fns, and files under `tests/` are
+    /// test context), the repo-relative file/span handle, and the enclosing
+    /// symbol handle (explicit `null` when top-level). Text inside comments,
+    /// string literals, and doc comments is never returned. The known-risk
+    /// method set is closed for this slice: `unwrap`, `expect`.
+    ///
+    /// Rows derive solely from deterministic extractor facts and assert only
+    /// that a call exists at a span in a context — never a verdict on whether
+    /// it is justified. Strictly read-only; byte-identical across runs on an
+    /// unchanged store.
+    ///
+    /// Exit codes:
+    ///   0 — sites returned (or the scoped slice contains zero sites, with
+    ///       `empty_reason: "no_sites_in_scope"`).
+    ///   1 — malformed prefix, ambiguous commit prefix, or unknown/ambiguous
+    ///       repository selector.
+    ///   2 — scope not found (`scope_not_found`) or unknown commit
+    ///       (`unknown_commit`).
+    ///
+    /// Documented in `docs/cli/unwrap-expect.md`.
+    UnwrapExpect {
+        /// Optional repo-relative directory or module path prefix scoping the
+        /// inventory (segment-aware; same contract as `eg query subsystem`).
+        #[arg(long)]
+        path: Option<String>,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Pin the inventory to a commit SHA or unique prefix on the
+        /// valid-time axis (same selector contract as `eg query symbol --at`).
+        #[arg(long)]
+        at: Option<String>,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Inventory TODO/FIXME/HACK/XXX debt-comment markers (issue #218).
+    ///
+    /// Returns every human-authored debt-comment marker detected inside a
+    /// Tree-sitter comment node (line, block, and doc comments) as an
+    /// advisory triage lead: a stable record ID, the closed category
+    /// (`todo` / `fixme` / `hack` / `xxx`), the trimmed single-line note
+    /// text, the repo-relative file/span handle, and the enclosing symbol
+    /// handle (explicit `null` at module top level). A marker token inside a
+    /// string or character literal is never returned, and identifier
+    /// substrings (`TODOIST`, `fixmeup`) never match. The recognized marker
+    /// set is closed for this slice; matching is case-insensitive on the
+    /// marker token only.
+    ///
+    /// Rows derive solely from deterministic extractor facts and assert only
+    /// that a comment of category C with note text T exists at a span —
+    /// never that the surrounding code is correct or incorrect. Strictly
+    /// read-only; byte-identical across runs on an unchanged store.
+    ///
+    /// Exit codes:
+    ///   0 — markers returned (or the scoped slice contains zero markers,
+    ///       with `empty_reason: "no_markers_in_scope"`).
+    ///   1 — malformed prefix, ambiguous commit prefix, or unknown/ambiguous
+    ///       repository selector.
+    ///   2 — scope not found (`scope_not_found`) or unknown commit
+    ///       (`unknown_commit`).
+    ///
+    /// Documented in `docs/cli/debt-markers.md`.
+    DebtMarkers {
+        /// Optional repo-relative directory or module path prefix scoping the
+        /// inventory (segment-aware; same contract as `eg query subsystem`).
+        #[arg(long)]
+        path: Option<String>,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Pin the inventory to a commit SHA or unique prefix on the
+        /// valid-time axis (same selector contract as `eg query symbol --at`).
+        #[arg(long)]
+        at: Option<String>,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
     },
     /// Trace a single symbol's lifecycle across Git history.
     Lifeline {
@@ -1931,8 +2154,16 @@ fn run_cli(cli: Cli) -> Result<()> {
             #[cfg(feature = "embeddings")]
             embed,
         ),
-        Commands::ImportTraj { traj_path, out } => import_traj_cmd(&traj_path, &out),
-        Commands::ImportCodex { codex_path, out } => import_codex_cmd(&codex_path, &out),
+        Commands::ImportTraj {
+            traj_path,
+            out,
+            redaction_report,
+        } => import_traj_cmd(&traj_path, &out, redaction_report.as_deref()),
+        Commands::ImportCodex {
+            codex_path,
+            out,
+            redaction_report,
+        } => import_codex_cmd(&codex_path, &out, redaction_report.as_deref()),
         Commands::ImportClaudeCode {
             transcript_path,
             out,
@@ -2431,7 +2662,8 @@ fn import_github_cmd(
     }
 }
 
-fn import_codex_cmd(codex_path: &Path, out: &Path) -> Result<()> {
+fn import_codex_cmd(codex_path: &Path, out: &Path, redaction_report: Option<&Path>) -> Result<()> {
+    ensure_report_path_distinct(out, redaction_report)?;
     let opts = crate::codex::ImportOptions::default();
     let graph = crate::codex::import_codex(codex_path, &opts)
         .with_context(|| format!("failed to import Codex JSONL from {}", codex_path.display()))?;
@@ -2439,12 +2671,21 @@ fn import_codex_cmd(codex_path: &Path, out: &Path) -> Result<()> {
         .to_jsonl()
         .context("failed to serialize agent-memory JSONL")?;
     fs::write(out, jsonl).with_context(|| format!("failed to write JSONL to {}", out.display()))?;
-    println!(
+    // Now that --out exists, aliases invisible to the pre-write guard (e.g.
+    // case-insensitive name folding) are observable; recheck before the
+    // report write. Refusal leaves the records JSONL intact on disk.
+    ensure_report_still_distinct_after_write(out, redaction_report)?;
+    let status = format!(
         "imported {} records from {}",
         graph.records().len(),
         codex_path.display()
     );
-    Ok(())
+    emit_import_status_and_report(
+        &status,
+        graph.records(),
+        opts.policy_version,
+        redaction_report,
+    )
 }
 
 fn import_claude_code_cmd(transcript_path: &Path, out: &Path) -> Result<()> {
@@ -2489,7 +2730,280 @@ fn import_antigravity_cmd(antigravity_path: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn import_traj_cmd(traj_path: &Path, out: &Path) -> Result<()> {
+/// Rejects a `--redaction-report` path that would overwrite the `--out` JSONL.
+///
+/// The report is written after the records, so a matching path would silently
+/// replace the graph JSONL with the report while the command still exits 0.
+/// Paths are compared after resolving their components in filesystem order —
+/// symlinks followed as encountered, `.`/`..` applied where the OS applies
+/// them, never collapsed lexically up front — so aliases such as
+/// `tmp/../records.jsonl` vs `records.jsonl`, `..` after a symlinked
+/// directory (`link/../records.jsonl` with `link -> target/child`), symlinked
+/// parent directories, and a pre-existing dangling symlink pointing at the
+/// other output all conflict even though the output files themselves do not
+/// exist yet; `-` (stdout) never conflicts. A path whose symlink chain cannot be
+/// resolved within [`SYMLINK_RESOLUTION_LIMIT`] hops (a cycle or an absurdly
+/// deep chain) is treated as conflicting — the guard refuses rather than
+/// guessing the paths are distinct. When both resolved targets already exist,
+/// on-disk file identity (device + inode on Unix, the file-index equivalent
+/// on Windows, via [`same_file`]) is compared as well, so two pre-existing
+/// hard links to one inode conflict even though their path strings differ.
+///
+/// One aliasing class is invisible to this pre-write pass by construction:
+/// on a case-insensitive filesystem (Windows NTFS, default APFS) two
+/// spellings differing only by case name one file, but while *neither*
+/// destination exists the resolved paths compare unequal and no metadata
+/// exists to probe for identity. Case folding is not second-guessed
+/// lexically here — on a case-sensitive filesystem those spellings are
+/// genuinely distinct files and must pass. Instead,
+/// [`ensure_report_still_distinct_after_write`] reruns the check after the
+/// records write, when the alias (if any) has become observable on the
+/// actual filesystem; behavior stays deterministic per filesystem.
+///
+/// # Errors
+///
+/// Returns an error naming both flags when the paths resolve to the same file
+/// or when a symlink chain on either path cannot be resolved.
+fn ensure_report_path_distinct(out: &Path, redaction_report: Option<&Path>) -> Result<()> {
+    let Some(report_path) = redaction_report else {
+        return Ok(());
+    };
+    if report_path == Path::new("-") {
+        return Ok(());
+    }
+    if report_and_out_paths_conflict(out, report_path) {
+        anyhow::bail!(
+            "--redaction-report path {} matches --out; the report would overwrite the \
+             records JSONL — choose distinct paths",
+            report_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Reruns the `--out`/`--redaction-report` collision check after the records
+/// JSONL has been written, immediately before the report write.
+///
+/// The pre-write [`ensure_report_path_distinct`] pass cannot see aliases that
+/// only exist at the filesystem level while neither destination exists —
+/// canonically, case-folded spellings (`Records.JSONL` vs `records.jsonl`)
+/// on a case-insensitive filesystem such as Windows NTFS or default APFS. At
+/// this point `--out` exists, so resolving the report path probes real
+/// metadata: if the two names alias one file, the identity comparison
+/// ([`existing_files_share_identity`]) now detects it and the report write is
+/// refused. This also covers any other OS-level aliasing the pre-write probe
+/// cannot observe. On a case-sensitive filesystem the same spellings remain
+/// distinct files and pass — deterministic per filesystem, never a lexical
+/// case-folding guess.
+///
+/// Refusal here is late but lossless: the records JSONL is already on disk,
+/// untouched and valid; only the report is withheld and the command exits
+/// nonzero. `-` (stdout) never conflicts.
+///
+/// # Errors
+///
+/// Returns an error naming both flags when the report path resolves to the
+/// just-written records file or a symlink chain cannot be resolved.
+fn ensure_report_still_distinct_after_write(
+    out: &Path,
+    redaction_report: Option<&Path>,
+) -> Result<()> {
+    let Some(report_path) = redaction_report else {
+        return Ok(());
+    };
+    if report_path == Path::new("-") {
+        return Ok(());
+    }
+    if report_and_out_paths_conflict(out, report_path) {
+        anyhow::bail!(
+            "--redaction-report path {} resolves to the just-written --out records JSONL \
+             (a filesystem-level alias, e.g. case-insensitive name folding); the records \
+             file was written and remains valid, but the report was not written — choose \
+             distinct paths",
+            report_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Returns `true` when `out` and `report_path` cannot be shown to name
+/// distinct files: their filesystem-order resolutions compare equal, both
+/// resolve but the existing files share on-disk identity, or either path
+/// fails to resolve (unknowable target — the safe side). Shared by the
+/// pre-write guard and the post-records-write recheck.
+fn report_and_out_paths_conflict(out: &Path, report_path: &Path) -> bool {
+    match (
+        resolve_output_path_for_collision(out),
+        resolve_output_path_for_collision(report_path),
+    ) {
+        (Some(resolved_out), Some(resolved_report)) => {
+            resolved_out == resolved_report
+                || existing_files_share_identity(&resolved_out, &resolved_report)
+        }
+        // An unresolvable symlink chain means the write target is unknowable;
+        // refuse deterministically instead of risking a clobber.
+        _ => true,
+    }
+}
+
+/// Returns `true` when both paths name *existing* files that share on-disk
+/// identity — the same device + inode on Unix, the same volume serial +
+/// file index on Windows (via [`same_file::is_same_file`]) — catching
+/// pre-existing hard-link aliases whose resolved path strings differ.
+///
+/// Identity is only comparable for files that exist: when either target is
+/// missing ([`fs::metadata`] fails), this returns `false` and the caller's
+/// resolved-path comparison alone decides. If the identity probe itself fails
+/// on two files that were just observed to exist, the write target is
+/// unknowable and this refuses deterministically (`true`, the safe side)
+/// rather than risking a clobber.
+fn existing_files_share_identity(a: &Path, b: &Path) -> bool {
+    if fs::metadata(a).is_err() || fs::metadata(b).is_err() {
+        return false;
+    }
+    same_file::is_same_file(a, b).unwrap_or(true)
+}
+
+/// Upper bound on symlink hops followed while resolving an output path for
+/// the collision check, mirroring the kernel's `ELOOP` limit of 40. Hitting
+/// the bound (a symlink cycle, or a chain deeper than any legitimate layout)
+/// yields `None`, which [`ensure_report_path_distinct`] treats as a conflict.
+const SYMLINK_RESOLUTION_LIMIT: u32 = 40;
+
+/// Resolves an output path for the `--out`/`--redaction-report` collision
+/// check without requiring the target file to exist.
+///
+/// Components are resolved in *filesystem order* — the order the OS applies
+/// when the write finally happens — never by collapsing `.`/`..` lexically up
+/// front. Starting from the canonicalized cwd (relative paths) or the
+/// root/prefix (absolute paths), each raw component is applied left to right:
+/// `.` is skipped; `..` pops the last resolved component (safe because the
+/// resolved prefix is already fully symlink-free; at the root it stays at the
+/// root); a normal component is appended and, when [`fs::symlink_metadata`]
+/// reports a symlink, its [`fs::read_link`] target is resolved through this
+/// same walk (relative targets against the link's parent). With
+/// `link -> target/child`, `link/../records.jsonl` therefore resolves to
+/// `target/records.jsonl` — where the OS actually writes — not the lexical
+/// `./records.jsonl`. Components that do not exist yet never test as symlinks
+/// and are appended as-is, so the guard works before either output exists;
+/// dangling symlinks still resolve to their eventual targets.
+///
+/// Returns `None` when a symlink chain exceeds [`SYMLINK_RESOLUTION_LIMIT`]
+/// hops, a discovered link cannot be read, or the cwd cannot be
+/// canonicalized; callers must treat `None` as "possibly the same file" (the
+/// safe side).
+fn resolve_output_path_for_collision(path: &Path) -> Option<PathBuf> {
+    let mut resolved = if path.is_absolute() {
+        // The walk's prefix/root components establish the base themselves.
+        PathBuf::new()
+    } else {
+        std::env::current_dir().ok()?.canonicalize().ok()?
+    };
+    let mut hops: u32 = 0;
+    resolve_components_in_filesystem_order(&mut resolved, path, &mut hops)?;
+    Some(resolved)
+}
+
+/// Applies `path`'s raw components onto `resolved` in filesystem order,
+/// following symlinks as they are encountered (recursing for link targets,
+/// bounded by [`SYMLINK_RESOLUTION_LIMIT`] total hops via `hops`).
+///
+/// `resolved` must be fully symlink-free on entry — either empty (an absolute
+/// `path` supplies its own prefix/root) or a canonicalized directory — so
+/// popping a component for `..` is exactly what the OS would do.
+///
+/// Returns `None` on an unresolvable chain (hop limit or unreadable link);
+/// the caller treats that as a possible collision.
+fn resolve_components_in_filesystem_order(
+    resolved: &mut PathBuf,
+    path: &Path,
+    hops: &mut u32,
+) -> Option<()> {
+    use std::path::Component;
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                *resolved = PathBuf::from(prefix.as_os_str());
+            }
+            // Pushing a rooted component drops everything after any prefix,
+            // matching the OS restart-at-root behavior for absolute targets.
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // `resolved` is symlink-free, so popping the last component
+                // is the filesystem-order meaning of `..`; at the root there
+                // is nothing to pop and `..` stays at the root.
+                if matches!(
+                    resolved.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    resolved.pop();
+                }
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                // Nonexistent components never test as symlinks and stay
+                // appended as-is — outputs need not exist yet.
+                let is_symlink = fs::symlink_metadata(&resolved)
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false);
+                if !is_symlink {
+                    continue;
+                }
+                if *hops >= SYMLINK_RESOLUTION_LIMIT {
+                    return None;
+                }
+                *hops += 1;
+                let target = fs::read_link(&resolved).ok()?;
+                // Resolve the target through this same walk: relative targets
+                // continue from the link's parent; absolute targets reset at
+                // their root/prefix via the components above.
+                resolved.pop();
+                resolve_components_in_filesystem_order(resolved, &target, hops)?;
+            }
+        }
+    }
+    Some(())
+}
+
+/// Emits the import status line and, when requested, the issue #266 redaction
+/// report.
+///
+/// The report is a single deterministic JSON line built from the emitted
+/// records' stored markers — record IDs, field paths, class names, hash
+/// prefixes, and counts only, never raw payloads. `-` writes the report to
+/// stdout (the status line moves to stderr so stdout is exactly the report);
+/// any other path writes a file and keeps the status line on stdout.
+fn emit_import_status_and_report(
+    status: &str,
+    records: &[crate::ir::GraphRecord],
+    policy_version: Option<&str>,
+    redaction_report: Option<&Path>,
+) -> Result<()> {
+    let Some(report_path) = redaction_report else {
+        println!("{status}");
+        return Ok(());
+    };
+    let report = crate::redaction_report::build_redaction_report(records, policy_version);
+    let json = serde_json::to_string(&report).context("failed to serialize redaction report")?;
+    if report_path == Path::new("-") {
+        println!("{json}");
+        eprintln!("{status}");
+    } else {
+        fs::write(report_path, format!("{json}\n")).with_context(|| {
+            format!(
+                "failed to write redaction report to {}",
+                report_path.display()
+            )
+        })?;
+        println!("{status}");
+        println!("redaction report written to {}", report_path.display());
+    }
+    Ok(())
+}
+
+fn import_traj_cmd(traj_path: &Path, out: &Path, redaction_report: Option<&Path>) -> Result<()> {
+    ensure_report_path_distinct(out, redaction_report)?;
     let opts = ImportOptions::default();
     let graph = traj::import_traj(traj_path, &opts)
         .with_context(|| format!("failed to import .traj from {}", traj_path.display()))?;
@@ -2497,12 +3011,21 @@ fn import_traj_cmd(traj_path: &Path, out: &Path) -> Result<()> {
         .to_jsonl()
         .context("failed to serialize agent-memory JSONL")?;
     fs::write(out, jsonl).with_context(|| format!("failed to write JSONL to {}", out.display()))?;
-    println!(
+    // Now that --out exists, aliases invisible to the pre-write guard (e.g.
+    // case-insensitive name folding) are observable; recheck before the
+    // report write. Refusal leaves the records JSONL intact on disk.
+    ensure_report_still_distinct_after_write(out, redaction_report)?;
+    let status = format!(
         "imported {} records from {}",
         graph.records().len(),
         traj_path.display()
     );
-    Ok(())
+    emit_import_status_and_report(
+        &status,
+        graph.records(),
+        opts.policy_version,
+        redaction_report,
+    )
 }
 
 fn link_evidence_cmd(code_graph_path: &Path, evidence_path: &Path, out: &Path) -> Result<()> {
@@ -5121,6 +5644,26 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_public_api_cmd(&records, &index, selected.as_deref())
         }
+        QuerySubcommand::Undocumented {
+            graph,
+            data_dir,
+            repo,
+            limit,
+            include_private,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_undocumented_cmd(
+                &records,
+                &index,
+                selected.as_deref(),
+                limit,
+                include_private,
+                format,
+            )
+        }
         QuerySubcommand::Orient {
             graph,
             data_dir,
@@ -5143,6 +5686,32 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
             query_deltas_cmd(&records, &base, &head, repo.as_deref())
         }
+        QuerySubcommand::Coupling {
+            path,
+            graph,
+            data_dir,
+            repo,
+            base,
+            head,
+            at,
+            as_of,
+            min_support,
+            limit,
+            format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            let options = query::CoChangeCouplingOptions {
+                base: base.as_deref(),
+                head: head.as_deref(),
+                at: at.as_deref(),
+                as_of: as_of.as_deref(),
+                min_support,
+                limit,
+            };
+            query_coupling_cmd(&records, &path, selected.as_deref(), &options, format)
+        }
         QuerySubcommand::PublicApiDeltas {
             base,
             head,
@@ -5159,6 +5728,66 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 with_callers: callers,
             };
             query_public_api_deltas_cmd(&records, &base, &head, repo.as_deref(), options, format)
+        }
+        QuerySubcommand::UnwrapExpect {
+            path,
+            graph,
+            data_dir,
+            at,
+            repo,
+            format,
+        } => {
+            // Strictly read-only lane (issue #223): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_unwrap_expect_cmd(
+                &records,
+                path.as_deref(),
+                at.as_deref(),
+                &index,
+                selected.as_deref(),
+                format,
+            )
+        }
+        QuerySubcommand::DebtMarkers {
+            path,
+            graph,
+            data_dir,
+            at,
+            repo,
+            format,
+        } => {
+            // Strictly read-only lane (issue #218): same throwaway-copy
+            // `--data-dir` contract as the other read-only lanes.
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_debt_markers_cmd(
+                &records,
+                path.as_deref(),
+                at.as_deref(),
+                &index,
+                selected.as_deref(),
+                format,
+            )
         }
         QuerySubcommand::Lifeline {
             graph,
@@ -9802,6 +10431,684 @@ fn query_public_api_cmd(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// undocumented public API lane (issue #257)
+// ---------------------------------------------------------------------------
+
+/// One undocumented-symbol row in the undocumented response.
+#[derive(Serialize)]
+struct UndocumentedItemJson<'a> {
+    record_id: &'a str,
+    kind: &'a str,
+    /// Crate-relative fully-qualified path (alias-aware for re-exports).
+    path: &'a str,
+    /// Recorded visibility class; `public` on externally-reachable rows.
+    visibility: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+    /// Declaration signature persisted by issue #124, joined when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<&'a str>,
+    /// Concrete evidence asserted for this row: `doc_comment_absent` always,
+    /// plus `externally_reachable` on public-surface rows.
+    evidence: &'a [&'static str],
+    /// Present (`true`) only on rows contributed by a `pub use` re-export;
+    /// such rows are attributed to the re-export site.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    via_reexport: bool,
+    /// Crate-relative use-path the re-export points at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<&'a str>,
+    /// Record ID of the resolved re-export target whose doc fact was checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_record_id: Option<&'a str>,
+}
+
+/// Deterministic tallies in the undocumented response.
+#[derive(Serialize)]
+struct UndocumentedCountsJson {
+    considered: usize,
+    documented: usize,
+    undocumented: usize,
+    reexports: usize,
+    modules_excluded: usize,
+    reexports_unresolved: usize,
+    doc_capture_missing: usize,
+}
+
+/// Top-level undocumented response envelope.
+#[derive(Serialize)]
+struct UndocumentedResponse<'a> {
+    ok: bool,
+    language: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_scope: Option<&'a str>,
+    /// Present (`true`) only when the audit was widened to all symbols.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    include_private: bool,
+    /// `doc_facts_recorded` when the store carries issue #124 doc-capture
+    /// facts; `doc_facts_unavailable` when it predates them (explicit
+    /// capability-absent verdict — never "everything is undocumented").
+    capability: &'static str,
+    /// Per-response soundness boundary: presence/absence only, never quality.
+    disclaimer: &'static str,
+    items: Vec<UndocumentedItemJson<'a>>,
+    counts: UndocumentedCountsJson,
+    diagnostics: Vec<PublicApiDiagnosticJson<'a>>,
+}
+
+const UNDOCUMENTED_DISCLAIMER: &str = "Asserts the presence or absence of a recorded doc comment (///, /** */, or #[doc = \
+     \"...\"]) on externally-reachable public symbols. Never a claim about doc quality, \
+     accuracy, or completeness.";
+
+fn query_undocumented_cmd(
+    records: &[GraphRecord],
+    index: &query::RepositoryIndex,
+    repo_scope: Option<&str>,
+    limit: Option<usize>,
+    include_private: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let report = query::undocumented_public_api(records, index, repo_scope, include_private, limit);
+    let capability = if report.capability_absent {
+        "doc_facts_unavailable"
+    } else {
+        "doc_facts_recorded"
+    };
+
+    match format {
+        OutputFormat::Json => {
+            let response = UndocumentedResponse {
+                ok: true,
+                language: "rust",
+                repo_scope,
+                include_private,
+                capability,
+                disclaimer: UNDOCUMENTED_DISCLAIMER,
+                items: report
+                    .items
+                    .iter()
+                    .map(|item| UndocumentedItemJson {
+                        record_id: item.record_id,
+                        kind: &item.kind,
+                        path: &item.path,
+                        visibility: item.visibility,
+                        repo_relative_path: item.repo_relative_path,
+                        span: item.span,
+                        signature: item.signature,
+                        evidence: &item.evidence,
+                        via_reexport: item.via_reexport,
+                        target: item.target.as_deref(),
+                        target_record_id: item.target_record_id,
+                    })
+                    .collect(),
+                counts: UndocumentedCountsJson {
+                    considered: report.counts.considered,
+                    documented: report.counts.documented,
+                    undocumented: report.counts.undocumented,
+                    reexports: report.counts.reexports,
+                    modules_excluded: report.counts.modules_excluded,
+                    reexports_unresolved: report.counts.reexports_unresolved,
+                    doc_capture_missing: report.counts.doc_capture_missing,
+                },
+                diagnostics: report
+                    .diagnostics
+                    .iter()
+                    .map(|d| PublicApiDiagnosticJson {
+                        code: d.code,
+                        record_id: d.record_id.as_deref(),
+                        detail: &d.detail,
+                    })
+                    .collect(),
+            };
+            let output = serde_json::to_string_pretty(&response)
+                .context("failed to serialize undocumented report")?;
+            println!("{output}");
+        }
+        OutputFormat::Text => {
+            println!(
+                "Undocumented public API symbols (doc-comment presence only — never doc quality). \
+                 Capability: {capability}."
+            );
+            for item in &report.items {
+                let citation = match (item.repo_relative_path, item.span) {
+                    (Some(path), Some(span)) => {
+                        format!(" @ {path}:{}-{}", span.start_line, span.end_line)
+                    }
+                    (Some(path), None) => format!(" @ {path}"),
+                    (None, _) => String::new(),
+                };
+                let reexport = item
+                    .target
+                    .as_deref()
+                    .map_or_else(String::new, |target| format!(" via pub use {target}"));
+                println!(
+                    "- {} [{}] {}{}{} evidence={} ({})",
+                    item.path,
+                    item.kind,
+                    item.visibility,
+                    reexport,
+                    citation,
+                    item.evidence.join(","),
+                    item.record_id
+                );
+            }
+            println!(
+                "counts: considered={} documented={} undocumented={} reexports={} \
+                 modules_excluded={} reexports_unresolved={} doc_capture_missing={}",
+                report.counts.considered,
+                report.counts.documented,
+                report.counts.undocumented,
+                report.counts.reexports,
+                report.counts.modules_excluded,
+                report.counts.reexports_unresolved,
+                report.counts.doc_capture_missing
+            );
+            for d in &report.diagnostics {
+                println!("diagnostic: {}: {}", d.code, d.detail);
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// unwrap/expect panic-risk call-site inventory (issue #223)
+// ---------------------------------------------------------------------------
+
+/// The enclosing-symbol handle carried by an unwrap/expect site row.
+#[derive(Serialize)]
+struct UnwrapExpectSymbolJson<'a> {
+    record_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+}
+
+/// One unwrap/expect panic-risk call-site row.
+#[derive(Serialize)]
+struct UnwrapExpectSiteJson<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    schema_version: u32,
+    /// Closed machine-readable category: `unwrap` or `expect`.
+    category: &'a str,
+    /// Closed context class: `production` or `test`.
+    context: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid_time: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_commit: Option<&'a str>,
+    /// Always serialized: an explicit `null` states that no `DEFINES` owner
+    /// encloses the site (top-level), never silently omitted.
+    enclosing_symbol: Option<UnwrapExpectSymbolJson<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
+    /// Every row is a deterministic extractor fact, advisory by contract.
+    trust: &'static str,
+}
+
+/// Machine-readable per-category and per-context totals.
+#[derive(Serialize)]
+struct UnwrapExpectCounts {
+    total: usize,
+    unwrap: usize,
+    expect: usize,
+    production: usize,
+    test: usize,
+}
+
+/// Top-level unwrap/expect inventory response envelope.
+#[derive(Serialize)]
+struct UnwrapExpectResponse<'a> {
+    ok: bool,
+    lane: &'static str,
+    /// The closed known-risk method set for this slice.
+    method_set: [&'static str; 2],
+    path_prefix: Option<&'a str>,
+    at_commit: Option<&'a str>,
+    disclaimer: &'static str,
+    sites: Vec<UnwrapExpectSiteJson<'a>>,
+    counts: UnwrapExpectCounts,
+    /// Distinguishes "scope contains zero unwrap/expect sites" from
+    /// "scope not found" (which is an error envelope, exit 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    empty_reason: Option<&'static str>,
+    diagnostics: Vec<AuditDiagnostic<'a>>,
+    page: AuditPage,
+}
+
+const UNWRAP_EXPECT_DISCLAIMER: &str = "Rows are advisory panic-risk triage leads derived solely from deterministic \
+     extractor facts. Each row asserts only that an unwrap/expect call exists at \
+     this span in this context — never a verdict on whether it is justified.";
+
+#[allow(clippy::too_many_lines)]
+fn query_unwrap_expect_cmd(
+    records: &[GraphRecord],
+    path_prefix: Option<&str>,
+    at: Option<&str>,
+    index: &query::RepositoryIndex,
+    repo_scope: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let inventory = match query::unwrap_expect_sites(records, path_prefix, at, index, repo_scope) {
+        Ok(inventory) => inventory,
+        Err(err) => {
+            let (selector_key, selector_value, message): (&str, &str, String) = match &err {
+                query::UnwrapExpectScopeError::MalformedPrefix { prefix } => (
+                    "prefix",
+                    prefix,
+                    "prefix must be non-empty after stripping trailing slashes".to_owned(),
+                ),
+                query::UnwrapExpectScopeError::ScopeNotFound { prefix } => (
+                    "prefix",
+                    prefix,
+                    format!("no file in the selected store slice lies under `{prefix}`"),
+                ),
+                query::UnwrapExpectScopeError::UnknownCommit { commit } => (
+                    "commit",
+                    commit,
+                    format!("no record in the selected store slice carries commit `{commit}`"),
+                ),
+                query::UnwrapExpectScopeError::AmbiguousCommit { commit, count } => (
+                    "commit",
+                    commit,
+                    format!("commit prefix `{commit}` matches {count} commits"),
+                ),
+            };
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": err.code(),
+                    selector_key: selector_value,
+                    "message": message,
+                }
+            });
+            println!("{}", serde_json::to_string(&envelope)?);
+            let exit_code = match &err {
+                query::UnwrapExpectScopeError::MalformedPrefix { .. }
+                | query::UnwrapExpectScopeError::AmbiguousCommit { .. } => 1,
+                query::UnwrapExpectScopeError::ScopeNotFound { .. }
+                | query::UnwrapExpectScopeError::UnknownCommit { .. } => 2,
+            };
+            std::process::exit(exit_code);
+        }
+    };
+
+    let rows: Vec<UnwrapExpectSiteJson<'_>> = inventory
+        .sites
+        .iter()
+        .filter_map(|site| {
+            let GraphRecord::Node {
+                id,
+                schema_version,
+                repo_relative_path,
+                span,
+                language,
+                temporal,
+                valid_time,
+                ..
+            } = site.record
+            else {
+                return None;
+            };
+            let enclosing_symbol = site.enclosing_symbol.and_then(|symbol| {
+                let GraphRecord::Node {
+                    id: symbol_id,
+                    name: symbol_name,
+                    symbol_kind,
+                    span: symbol_span,
+                    ..
+                } = symbol
+                else {
+                    return None;
+                };
+                Some(UnwrapExpectSymbolJson {
+                    record_id: symbol_id,
+                    name: symbol_name.as_deref(),
+                    symbol_kind: symbol_kind.as_deref(),
+                    span: *symbol_span,
+                })
+            });
+            let repository_id = index.owner_of(id);
+            Some(UnwrapExpectSiteJson {
+                record_id: id,
+                kind: "PanicRiskSite",
+                schema_version: *schema_version,
+                category: site.category,
+                context: site.context,
+                repo_relative_path: repo_relative_path.as_deref(),
+                span: *span,
+                language: language.as_deref(),
+                valid_time: temporal
+                    .as_ref()
+                    .map(|t| t.valid_time.as_str())
+                    .or(valid_time.as_deref()),
+                git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+                enclosing_symbol,
+                repository_id,
+                repository: repository_id.and_then(|repo| index.display_of(repo)),
+                trust: "source_fact",
+            })
+        })
+        .collect();
+
+    let counts = UnwrapExpectCounts {
+        total: rows.len(),
+        unwrap: rows.iter().filter(|r| r.category == "unwrap").count(),
+        expect: rows.iter().filter(|r| r.category == "expect").count(),
+        production: rows.iter().filter(|r| r.context == "production").count(),
+        test: rows.iter().filter(|r| r.context == "test").count(),
+    };
+
+    if format == OutputFormat::Text {
+        for row in &rows {
+            let path = row.repo_relative_path.unwrap_or("(unknown)");
+            let line = row.span.map_or(0, |s| s.start_line);
+            let owner = row
+                .enclosing_symbol
+                .as_ref()
+                .and_then(|s| s.name)
+                .unwrap_or("(top-level)");
+            println!(
+                "{} ({}) @ {path}:{line} in {owner}",
+                row.category, row.context
+            );
+        }
+        if rows.is_empty() {
+            println!("# no_sites_in_scope: scope contains zero unwrap/expect sites");
+        }
+        return Ok(());
+    }
+
+    let response = UnwrapExpectResponse {
+        ok: true,
+        lane: "unwrap_expect",
+        method_set: ["expect", "unwrap"],
+        path_prefix,
+        at_commit: inventory.at_commit.as_deref(),
+        disclaimer: UNWRAP_EXPECT_DISCLAIMER,
+        counts,
+        empty_reason: if rows.is_empty() {
+            Some("no_sites_in_scope")
+        } else {
+            None
+        },
+        page: AuditPage {
+            cursor: None,
+            has_more: false,
+            returned: rows.len(),
+        },
+        sites: rows,
+        diagnostics: Vec::new(),
+    };
+
+    let output = serde_json::to_string_pretty(&response)
+        .context("failed to serialize unwrap/expect inventory")?;
+    println!("{output}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Debt-comment marker inventory (issue #218)
+// ---------------------------------------------------------------------------
+
+/// The enclosing-symbol handle carried by a debt-marker row.
+#[derive(Serialize)]
+struct DebtMarkerSymbolJson<'a> {
+    record_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+}
+
+/// One debt-comment marker row.
+#[derive(Serialize)]
+struct DebtMarkerJson<'a> {
+    record_id: &'a str,
+    kind: &'static str,
+    schema_version: u32,
+    /// Closed machine-readable category: `todo` / `fixme` / `hack` / `xxx`.
+    category: &'a str,
+    /// Trimmed single-line note text following the marker token.
+    note: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid_time: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_commit: Option<&'a str>,
+    /// Always serialized: an explicit `null` states that no
+    /// `DEFINES`/`CONTAINS` owner encloses the marker (module top level),
+    /// never silently omitted.
+    enclosing_symbol: Option<DebtMarkerSymbolJson<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
+    /// Every row is a deterministic extractor fact, advisory by contract.
+    trust: &'static str,
+}
+
+/// Machine-readable per-category totals.
+#[derive(Serialize)]
+struct DebtMarkerCounts {
+    total: usize,
+    todo: usize,
+    fixme: usize,
+    hack: usize,
+    xxx: usize,
+}
+
+/// Top-level debt-marker inventory response envelope.
+#[derive(Serialize)]
+struct DebtMarkerResponse<'a> {
+    ok: bool,
+    lane: &'static str,
+    /// The closed recognized marker set for this slice.
+    marker_set: [&'static str; 4],
+    path_prefix: Option<&'a str>,
+    at_commit: Option<&'a str>,
+    disclaimer: &'static str,
+    markers: Vec<DebtMarkerJson<'a>>,
+    counts: DebtMarkerCounts,
+    /// Distinguishes "scope contains zero debt markers" from "scope not
+    /// found" (which is an error envelope, exit 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    empty_reason: Option<&'static str>,
+    diagnostics: Vec<AuditDiagnostic<'a>>,
+    page: AuditPage,
+}
+
+const DEBT_MARKER_DISCLAIMER: &str = "Rows are advisory debt-triage leads derived solely from deterministic \
+     extractor facts. Each row asserts only that a comment of this category \
+     with this note text exists at this span — never that the surrounding \
+     code is correct or incorrect.";
+
+#[allow(clippy::too_many_lines)]
+fn query_debt_markers_cmd(
+    records: &[GraphRecord],
+    path_prefix: Option<&str>,
+    at: Option<&str>,
+    index: &query::RepositoryIndex,
+    repo_scope: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let inventory = match query::debt_markers(records, path_prefix, at, index, repo_scope) {
+        Ok(inventory) => inventory,
+        Err(err) => {
+            let (selector_key, selector_value, message): (&str, &str, String) = match &err {
+                query::DebtMarkerScopeError::MalformedPrefix { prefix } => (
+                    "prefix",
+                    prefix,
+                    "prefix must be non-empty after stripping trailing slashes".to_owned(),
+                ),
+                query::DebtMarkerScopeError::ScopeNotFound { prefix } => (
+                    "prefix",
+                    prefix,
+                    format!("no file in the selected store slice lies under `{prefix}`"),
+                ),
+                query::DebtMarkerScopeError::UnknownCommit { commit } => (
+                    "commit",
+                    commit,
+                    format!("no record in the selected store slice carries commit `{commit}`"),
+                ),
+                query::DebtMarkerScopeError::AmbiguousCommit { commit, count } => (
+                    "commit",
+                    commit,
+                    format!("commit prefix `{commit}` matches {count} commits"),
+                ),
+            };
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": err.code(),
+                    selector_key: selector_value,
+                    "message": message,
+                }
+            });
+            println!("{}", serde_json::to_string(&envelope)?);
+            let exit_code = match &err {
+                query::DebtMarkerScopeError::MalformedPrefix { .. }
+                | query::DebtMarkerScopeError::AmbiguousCommit { .. } => 1,
+                query::DebtMarkerScopeError::ScopeNotFound { .. }
+                | query::DebtMarkerScopeError::UnknownCommit { .. } => 2,
+            };
+            std::process::exit(exit_code);
+        }
+    };
+
+    let rows: Vec<DebtMarkerJson<'_>> = inventory
+        .markers
+        .iter()
+        .filter_map(|marker| {
+            let GraphRecord::Node {
+                id,
+                schema_version,
+                repo_relative_path,
+                span,
+                language,
+                temporal,
+                valid_time,
+                ..
+            } = marker.record
+            else {
+                return None;
+            };
+            let enclosing_symbol = marker.enclosing_symbol.and_then(|symbol| {
+                let GraphRecord::Node {
+                    id: symbol_id,
+                    name: symbol_name,
+                    symbol_kind,
+                    span: symbol_span,
+                    ..
+                } = symbol
+                else {
+                    return None;
+                };
+                Some(DebtMarkerSymbolJson {
+                    record_id: symbol_id,
+                    name: symbol_name.as_deref(),
+                    symbol_kind: symbol_kind.as_deref(),
+                    span: *symbol_span,
+                })
+            });
+            let repository_id = index.owner_of(id);
+            Some(DebtMarkerJson {
+                record_id: id,
+                kind: "DebtMarker",
+                schema_version: *schema_version,
+                category: marker.category,
+                note: marker.note,
+                repo_relative_path: repo_relative_path.as_deref(),
+                span: *span,
+                language: language.as_deref(),
+                valid_time: temporal
+                    .as_ref()
+                    .map(|t| t.valid_time.as_str())
+                    .or(valid_time.as_deref()),
+                git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+                enclosing_symbol,
+                repository_id,
+                repository: repository_id.and_then(|repo| index.display_of(repo)),
+                trust: "source_fact",
+            })
+        })
+        .collect();
+
+    let counts = DebtMarkerCounts {
+        total: rows.len(),
+        todo: rows.iter().filter(|r| r.category == "todo").count(),
+        fixme: rows.iter().filter(|r| r.category == "fixme").count(),
+        hack: rows.iter().filter(|r| r.category == "hack").count(),
+        xxx: rows.iter().filter(|r| r.category == "xxx").count(),
+    };
+
+    if format == OutputFormat::Text {
+        for row in &rows {
+            let path = row.repo_relative_path.unwrap_or("(unknown)");
+            let line = row.span.map_or(0, |s| s.start_line);
+            let owner = row
+                .enclosing_symbol
+                .as_ref()
+                .and_then(|s| s.name)
+                .unwrap_or("(top-level)");
+            println!("{} @ {path}:{line} in {owner}: {}", row.category, row.note);
+        }
+        if rows.is_empty() {
+            println!("# no_markers_in_scope: scope contains zero debt markers");
+        }
+        return Ok(());
+    }
+
+    let response = DebtMarkerResponse {
+        ok: true,
+        lane: "debt_markers",
+        marker_set: ["fixme", "hack", "todo", "xxx"],
+        path_prefix,
+        at_commit: inventory.at_commit.as_deref(),
+        disclaimer: DEBT_MARKER_DISCLAIMER,
+        counts,
+        empty_reason: if rows.is_empty() {
+            Some("no_markers_in_scope")
+        } else {
+            None
+        },
+        page: AuditPage {
+            cursor: None,
+            has_more: false,
+            returned: rows.len(),
+        },
+        markers: rows,
+        diagnostics: Vec::new(),
+    };
+
+    let output = serde_json::to_string_pretty(&response)
+        .context("failed to serialize debt-marker inventory")?;
+    println!("{output}");
+    Ok(())
+}
+
 fn query_orient_cmd(
     records: &[GraphRecord],
     repo_id: Option<&str>,
@@ -10194,9 +11501,8 @@ pub(crate) fn trust_class_for(record: &GraphRecord) -> &'static str {
         "Observation" | "Decision" | "Failure" | "Lesson" => "agent_authored",
         "Verification" | "CommandEvidence" | "CommandRun" | "TestRun" | "CIStatus"
         | "BenchmarkRun" | "CoverageReport" | "ProofResult" => "verification_evidence",
-        "File" | "Symbol" | "Module" | "Import" | "Commit" | "Change" | "Repository" => {
-            "source_fact"
-        }
+        "File" | "Symbol" | "Module" | "Import" | "Commit" | "Change" | "Repository"
+        | "PanicRiskSite" | "DebtMarker" => "source_fact",
         "Task"
         | "AcceptanceCriterion"
         | "LocalTask"
@@ -11114,6 +12420,119 @@ fn query_deltas_cmd(
             std::process::exit(exit_code);
         }
     }
+}
+
+/// `eg query coupling` (issue #153): ranked historical co-change partners
+/// for one target file over a `scan-history` temporal store.
+///
+/// Exit codes follow the history-query convention: `0` on success (including
+/// an explicit empty partner set), `2` when the target or a commit handle
+/// resolves to nothing (`unknown_file`, `missing_commit`, `empty_history`,
+/// `no_commit_at_or_before`), and `1` for malformed or ambiguous input
+/// (paths, selectors, thresholds, identical endpoints, reversed ranges).
+fn query_coupling_cmd(
+    records: &[GraphRecord],
+    path: &str,
+    repo_scope: Option<&str>,
+    options: &query::CoChangeCouplingOptions<'_>,
+    format: OutputFormat,
+) -> Result<()> {
+    match query::co_change_coupling(records, path, repo_scope, options) {
+        Ok(report) => {
+            match format {
+                OutputFormat::Json => {
+                    #[derive(Debug, Clone, serde::Serialize)]
+                    struct CouplingResponse<'a> {
+                        ok: bool,
+                        #[serde(flatten)]
+                        report: query::CoChangeCoupling<'a>,
+                    }
+                    let response = CouplingResponse { ok: true, report };
+                    let output = serde_json::to_string(&response)
+                        .context("failed to serialize co-change coupling")?;
+                    println!("{output}");
+                }
+                OutputFormat::Text => print!("{}", render_coupling_text(&report)),
+            }
+            Ok(())
+        }
+        Err(err) => {
+            #[derive(Debug, Clone, serde::Serialize)]
+            struct CouplingErrorResponse {
+                ok: bool,
+                error: query::CoChangeCouplingError,
+            }
+            let response = CouplingErrorResponse {
+                ok: false,
+                error: err.clone(),
+            };
+            let output = serde_json::to_string(&response)
+                .context("failed to serialize co-change coupling error")?;
+            println!("{output}");
+            let exit_code = match err {
+                query::CoChangeCouplingError::UnknownFile { .. }
+                | query::CoChangeCouplingError::MissingCommit { .. }
+                | query::CoChangeCouplingError::EmptyHistory
+                | query::CoChangeCouplingError::NoCommitAtOrBefore { .. } => 2,
+                _ => 1,
+            };
+            std::process::exit(exit_code);
+        }
+    }
+}
+
+/// Deterministic human-readable rendering of a co-change coupling report.
+fn render_coupling_text(report: &query::CoChangeCoupling<'_>) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let scope_detail = match report.scope.selector {
+        "commit_range" => format!(
+            " range {}..{}",
+            report.scope.base.unwrap_or("?"),
+            report.scope.head.unwrap_or("?")
+        ),
+        "at_commit" => format!(" at {}", report.scope.at.unwrap_or("?")),
+        "as_of" => format!(" as of {}", report.scope.as_of.unwrap_or("?")),
+        _ => String::new(),
+    };
+    let _ = writeln!(
+        out,
+        "co-change coupling for {} — {} in-scope change(s) across {} commit(s) [{}{}]",
+        report.target.repo_relative_path,
+        report.target.change_count,
+        report.scope.commit_count,
+        report.scope.selector,
+        scope_detail,
+    );
+    let _ = writeln!(
+        out,
+        "min support {}; metric {}; showing {} of {} partner(s){}",
+        report.min_support,
+        report.coupling_metric,
+        report.partners.len(),
+        report.total_partners,
+        if report.truncated { " (truncated)" } else { "" },
+    );
+    for partner in &report.partners {
+        let short_sha =
+            &partner.last_co_change_commit[..partner.last_co_change_commit.len().min(12)];
+        let _ = writeln!(
+            out,
+            "  {}  co_changes={}  partner_changes={}  coupling={:.4}  confidence={:.4}  last={}",
+            partner.repo_relative_path,
+            partner.co_change_count,
+            partner.partner_change_count,
+            partner.coupling,
+            partner.confidence,
+            short_sha,
+        );
+    }
+    for diagnostic in &report.diagnostics {
+        let _ = writeln!(out, "  [{}] {}", diagnostic.code, diagnostic.detail);
+    }
+    let _ = writeln!(out, "note: {}", report.disclaimer);
+    out
 }
 
 /// `eg query public-api-deltas` (issue #157): classified public-API surface
@@ -12941,6 +14360,93 @@ fn watch_cmd(
     )?;
 
     Ok(())
+}
+
+// -----------------------------------------------------------------------------------------------------------
+// Issue #266: post-records-write recheck of the --out/--redaction-report
+// collision guard.
+//
+// On case-insensitive filesystems (Windows NTFS, default APFS) two spellings
+// that differ only by case alias one file, but while NEITHER destination
+// exists the pre-write guard cannot see that: the resolved paths compare
+// unequal and both identity probes miss. The alias becomes observable the
+// moment the records write creates `--out` — so the recheck runs then,
+// before the report write. A hard link created between the two checks stands
+// in for that aliasing here, reproducible on every filesystem (the true
+// casing scenario is exercised by the `#[cfg(any(windows, target_os =
+// "macos"))]` integration tests in tests/integration/redaction_report.rs).
+// -----------------------------------------------------------------------------------------------------------
+#[cfg(test)]
+mod report_collision_recheck {
+    use super::*;
+
+    #[test]
+    fn recheck_refuses_alias_observable_only_after_records_write() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("records.jsonl");
+        let report = temp.path().join("report.json");
+
+        // Pre-write guard passes: neither destination exists yet and the
+        // spellings resolve to distinct paths.
+        ensure_report_path_distinct(&out, Some(&report))
+            .expect("pre-write guard must pass while both destinations are missing");
+
+        // The records write creates --out, and the report spelling turns out
+        // to alias it at the OS level (as differing case does on a
+        // case-insensitive filesystem).
+        fs::write(&out, "records line\n").expect("records write");
+        fs::hard_link(&out, &report).expect("alias report path to out");
+
+        let err = ensure_report_still_distinct_after_write(&out, Some(&report))
+            .expect_err("recheck must refuse once the alias is observable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--redaction-report"),
+            "refusal must name the flag: {msg}"
+        );
+        assert!(
+            msg.contains("report was not written"),
+            "refusal must state the report was withheld: {msg}"
+        );
+        assert_eq!(
+            fs::read_to_string(&out).expect("records file must survive"),
+            "records line\n",
+            "the just-written records JSONL must remain untouched"
+        );
+    }
+
+    #[test]
+    fn recheck_passes_for_distinct_report_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("records.jsonl");
+        let report = temp.path().join("report.json");
+        fs::write(&out, "records line\n").expect("records write");
+
+        ensure_report_still_distinct_after_write(&out, Some(&report))
+            .expect("distinct missing report path must pass");
+
+        fs::write(&report, "stale report\n").expect("pre-existing report");
+        ensure_report_still_distinct_after_write(&out, Some(&report))
+            .expect("distinct existing report file must pass");
+    }
+
+    #[test]
+    fn recheck_exempts_stdout_report() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("records.jsonl");
+        fs::write(&out, "records line\n").expect("records write");
+        ensure_report_still_distinct_after_write(&out, Some(Path::new("-")))
+            .expect("stdout report never conflicts");
+    }
+
+    #[test]
+    fn recheck_is_noop_without_report_flag() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("records.jsonl");
+        fs::write(&out, "records line\n").expect("records write");
+        ensure_report_still_distinct_after_write(&out, None)
+            .expect("no report flag, nothing to recheck");
+    }
 }
 
 // -----------------------------------------------------------------------------------------------------------

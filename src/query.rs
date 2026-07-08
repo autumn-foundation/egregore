@@ -9,6 +9,7 @@
     clippy::cast_precision_loss
 )]
 
+use std::cell::OnceCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -2694,6 +2695,671 @@ pub fn subsystem_context<'a>(
             u
         },
     })
+}
+
+// ── Unwrap/expect panic-risk call-site inventory (issue #223) ─────────────────
+
+/// Why the unwrap/expect lane rejected its scope selectors.
+///
+/// Every variant carries a stable machine-readable code so an out-of-store
+/// path, unknown commit, or malformed prefix is a documented diagnostic and
+/// never a silent empty result (issue #196 honesty contract).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum UnwrapExpectScopeError {
+    /// The path prefix is empty after stripping trailing slashes.
+    MalformedPrefix {
+        /// The prefix as supplied by the caller.
+        prefix: String,
+    },
+    /// The path prefix matches no file in the selected store slice.
+    ScopeNotFound {
+        /// The normalized prefix that matched nothing.
+        prefix: String,
+    },
+    /// No record in the selected store slice carries this commit.
+    UnknownCommit {
+        /// The commit selector as supplied by the caller.
+        commit: String,
+    },
+    /// The commit prefix matches more than one commit.
+    AmbiguousCommit {
+        /// The commit selector as supplied by the caller.
+        commit: String,
+        /// Number of distinct commits matching the prefix.
+        count: usize,
+    },
+}
+
+impl UnwrapExpectScopeError {
+    /// Stable machine-readable diagnostic code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::MalformedPrefix { .. } => "malformed_prefix",
+            Self::ScopeNotFound { .. } => "scope_not_found",
+            Self::UnknownCommit { .. } => "unknown_commit",
+            Self::AmbiguousCommit { .. } => "ambiguous_commit",
+        }
+    }
+}
+
+/// One `.unwrap()` / `.expect()` panic-risk call site returned by
+/// [`unwrap_expect_sites`].
+#[derive(Debug, Clone)]
+pub struct UnwrapExpectSite<'a> {
+    /// The `PanicRiskSite` record itself.
+    pub record: &'a GraphRecord,
+    /// Closed machine-readable category: `unwrap` or `expect`.
+    pub category: &'a str,
+    /// Closed context class: `production` or `test`.
+    pub context: &'a str,
+    /// Innermost `Symbol` record whose span encloses the site in the same
+    /// file version; `None` when the site is top-level (no `DEFINES` owner).
+    pub enclosing_symbol: Option<&'a GraphRecord>,
+}
+
+/// Deterministic unwrap/expect inventory returned by [`unwrap_expect_sites`].
+#[derive(Debug, Clone, Default)]
+pub struct UnwrapExpectInventory<'a> {
+    /// Sites ordered by `(repo_relative_path, span.start_byte, git_commit,
+    /// record_id)` — byte-identical across repeated runs on an unchanged store.
+    pub sites: Vec<UnwrapExpectSite<'a>>,
+    /// Full commit SHA the inventory was pinned to, when `--at` was supplied.
+    pub at_commit: Option<String>,
+}
+
+/// Inventories `.unwrap()` / `.expect()` panic-risk call sites (issue #223).
+///
+/// Results derive solely from deterministic `PanicRiskSite` extractor facts:
+/// the lane never rewrites or re-scores a code fact, and each row asserts only
+/// that a call exists at a span in a context. Strictly read-only.
+///
+/// * `path_prefix` — optional segment-aware repo-relative prefix (the same
+///   matching contract as `eg query subsystem`).
+/// * `at` — optional commit SHA or unique prefix pinning the valid-time axis
+///   (the same selector contract as `eg query symbol --at`). Without it the
+///   current view is returned: non-temporal records that are not tombstoned,
+///   plus every history-backed version present in the store.
+/// * `repo` — optional resolved repository record ID (issue #67 scoping).
+///
+/// # Errors
+///
+/// Returns [`UnwrapExpectScopeError`] when the prefix is malformed or matches
+/// nothing, or when the commit selector is unknown or ambiguous.
+pub fn unwrap_expect_sites<'a>(
+    records: &'a [GraphRecord],
+    path_prefix: Option<&str>,
+    at: Option<&str>,
+    index: &RepositoryIndex,
+    repo: Option<&str>,
+) -> Result<UnwrapExpectInventory<'a>, UnwrapExpectScopeError> {
+    // 1. Prefix validation (mirrors the subsystem lane).
+    let normalized_prefix = match path_prefix {
+        Some(prefix) => {
+            let normalized = prefix.trim_end_matches('/');
+            if normalized.is_empty() {
+                return Err(UnwrapExpectScopeError::MalformedPrefix {
+                    prefix: prefix.to_owned(),
+                });
+            }
+            Some(normalized)
+        }
+        None => None,
+    };
+
+    let record_in_repo_scope = |record: &GraphRecord| -> bool {
+        let Some(repo_id) = repo else { return true };
+        match record {
+            GraphRecord::Node { id, .. } => index.owner_of(id) == Some(repo_id),
+            GraphRecord::Edge { source, target, .. } => {
+                index.owner_of(source) == Some(repo_id) || index.owner_of(target) == Some(repo_id)
+            }
+            GraphRecord::Tombstone { .. } => false,
+        }
+    };
+
+    // 2. Commit resolution (mirrors `eg query symbol --at` prefix handling,
+    //    repo-scoped so a prefix colliding only across the repository boundary
+    //    stays unambiguous within the selected repository).
+    let at_commit: Option<String> = match at {
+        None => None,
+        Some(selector) => {
+            let matching: BTreeSet<&str> = records
+                .iter()
+                .filter(|r| record_in_repo_scope(r))
+                .filter_map(|r| match r {
+                    GraphRecord::Node {
+                        temporal: Some(t), ..
+                    }
+                    | GraphRecord::Edge {
+                        temporal: Some(t), ..
+                    } if t.git_commit.starts_with(selector) => Some(t.git_commit.as_str()),
+                    _ => None,
+                })
+                .collect();
+            match matching.len() {
+                0 => {
+                    return Err(UnwrapExpectScopeError::UnknownCommit {
+                        commit: selector.to_owned(),
+                    });
+                }
+                1 => matching.iter().next().map(|c| (*c).to_owned()),
+                count => {
+                    return Err(UnwrapExpectScopeError::AmbiguousCommit {
+                        commit: selector.to_owned(),
+                        count,
+                    });
+                }
+            }
+        }
+    };
+
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Tombstone { deleted_id, .. } = r {
+                Some(deleted_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // A node participates in the selected valid-time view when it belongs to
+    // the pinned commit (`--at`), or — in the current view — when it is either
+    // history-backed or a live (non-tombstoned) current-tree record.
+    let in_selected_view = |record: &GraphRecord| -> bool {
+        let GraphRecord::Node { id, temporal, .. } = record else {
+            return false;
+        };
+        match (&at_commit, temporal) {
+            (Some(commit), Some(t)) => t.git_commit == *commit,
+            (Some(_), None) => false,
+            (None, Some(_)) => true,
+            (None, None) => !tombstoned.contains(id.as_str()),
+        }
+    };
+
+    // 3. Scope-existence honesty check: a prefix that matches no file-backed
+    //    record in the selected view is `scope_not_found`, never a silent
+    //    empty result.
+    if let Some(prefix) = normalized_prefix {
+        let scope_exists = records.iter().any(|r| {
+            let GraphRecord::Node {
+                kind,
+                repo_relative_path: Some(path),
+                ..
+            } = r
+            else {
+                return false;
+            };
+            matches!(
+                kind,
+                NodeKind::File | NodeKind::Symbol | NodeKind::PanicRiskSite
+            ) && record_in_repo_scope(r)
+                && in_selected_view(r)
+                && path_is_under_prefix(path.as_str(), prefix)
+        });
+        if !scope_exists {
+            return Err(UnwrapExpectScopeError::ScopeNotFound {
+                prefix: prefix.to_owned(),
+            });
+        }
+    }
+
+    // 4. Symbol spans per path, for enclosing-symbol resolution.
+    let mut symbols_by_path: BTreeMap<&str, Vec<&GraphRecord>> = BTreeMap::new();
+    for record in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Symbol,
+            repo_relative_path: Some(path),
+            span: Some(_),
+            ..
+        } = record
+        {
+            symbols_by_path
+                .entry(path.as_str())
+                .or_default()
+                .push(record);
+        }
+    }
+
+    let same_file_version = |site: &GraphRecord, symbol: &GraphRecord| -> bool {
+        let site_commit = match site {
+            GraphRecord::Node { temporal, .. } => temporal.as_ref().map(|t| t.git_commit.as_str()),
+            _ => None,
+        };
+        let symbol_commit = match symbol {
+            GraphRecord::Node { temporal, .. } => temporal.as_ref().map(|t| t.git_commit.as_str()),
+            _ => None,
+        };
+        match (site_commit, symbol_commit) {
+            (Some(site_sha), Some(symbol_sha)) => site_sha == symbol_sha,
+            (None, None) => !tombstoned.contains(symbol.id()),
+            _ => false,
+        }
+    };
+
+    // 5. Collect, resolve enclosing symbols, and order deterministically.
+    let mut sites: Vec<UnwrapExpectSite<'a>> = Vec::new();
+    for record in records {
+        let GraphRecord::Node {
+            kind: NodeKind::PanicRiskSite,
+            name: Some(category),
+            call_context: Some(context),
+            repo_relative_path: Some(path),
+            span: Some(site_span),
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if !record_in_repo_scope(record) || !in_selected_view(record) {
+            continue;
+        }
+        if let Some(prefix) = normalized_prefix
+            && !path_is_under_prefix(path.as_str(), prefix)
+        {
+            continue;
+        }
+
+        let enclosing_symbol = symbols_by_path
+            .get(path.as_str())
+            .into_iter()
+            .flatten()
+            .filter(|symbol| {
+                let GraphRecord::Node {
+                    span: Some(symbol_span),
+                    ..
+                } = symbol
+                else {
+                    return false;
+                };
+                symbol_span.start_byte <= site_span.start_byte
+                    && site_span.end_byte <= symbol_span.end_byte
+                    && same_file_version(record, symbol)
+                    // Repository-boundary honesty: two repositories can share
+                    // a repo-relative path (and, for clones of one history,
+                    // even a commit SHA), so the enclosing symbol must belong
+                    // to the site's own repository — never a same-path symbol
+                    // from another repository.
+                    && index.owner_of(symbol.id()) == index.owner_of(record.id())
+            })
+            .min_by(|a, b| {
+                let width = |r: &GraphRecord| match r {
+                    GraphRecord::Node {
+                        span: Some(span), ..
+                    } => span.end_byte - span.start_byte,
+                    _ => usize::MAX,
+                };
+                width(a).cmp(&width(b)).then_with(|| a.id().cmp(b.id()))
+            })
+            .copied();
+
+        sites.push(UnwrapExpectSite {
+            record,
+            category,
+            context,
+            enclosing_symbol,
+        });
+    }
+
+    sites.sort_by(|a, b| unwrap_expect_sort_key(a).cmp(&unwrap_expect_sort_key(b)));
+
+    Ok(UnwrapExpectInventory { sites, at_commit })
+}
+
+/// Deterministic ordering key for unwrap/expect site rows:
+/// `(repo_relative_path, span.start_byte, git_commit, record_id)`.
+fn unwrap_expect_sort_key<'k>(site: &UnwrapExpectSite<'k>) -> (&'k str, usize, &'k str, &'k str) {
+    match site.record {
+        GraphRecord::Node {
+            repo_relative_path,
+            span,
+            temporal,
+            id,
+            ..
+        } => (
+            repo_relative_path.as_deref().unwrap_or(""),
+            span.map_or(0, |s| s.start_byte),
+            temporal.as_ref().map_or("", |t| t.git_commit.as_str()),
+            id.as_str(),
+        ),
+        _ => ("", 0, "", ""),
+    }
+}
+
+// ── Debt-comment marker inventory (issue #218) ────────────────────────────────
+
+/// Why the debt-marker lane rejected its scope selectors.
+///
+/// Every variant carries a stable machine-readable code so an out-of-store
+/// path, unknown commit, or malformed prefix is a documented diagnostic and
+/// never a silent empty result (issue #196 honesty contract).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum DebtMarkerScopeError {
+    /// The path prefix is empty after stripping trailing slashes.
+    MalformedPrefix {
+        /// The prefix as supplied by the caller.
+        prefix: String,
+    },
+    /// The path prefix matches no file in the selected store slice.
+    ScopeNotFound {
+        /// The normalized prefix that matched nothing.
+        prefix: String,
+    },
+    /// No record in the selected store slice carries this commit.
+    UnknownCommit {
+        /// The commit selector as supplied by the caller.
+        commit: String,
+    },
+    /// The commit prefix matches more than one commit.
+    AmbiguousCommit {
+        /// The commit selector as supplied by the caller.
+        commit: String,
+        /// Number of distinct commits matching the prefix.
+        count: usize,
+    },
+}
+
+impl DebtMarkerScopeError {
+    /// Stable machine-readable diagnostic code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::MalformedPrefix { .. } => "malformed_prefix",
+            Self::ScopeNotFound { .. } => "scope_not_found",
+            Self::UnknownCommit { .. } => "unknown_commit",
+            Self::AmbiguousCommit { .. } => "ambiguous_commit",
+        }
+    }
+}
+
+/// One debt-comment marker returned by [`debt_markers`].
+#[derive(Debug, Clone)]
+pub struct DebtMarkerRow<'a> {
+    /// The `DebtMarker` record itself.
+    pub record: &'a GraphRecord,
+    /// Closed machine-readable category: `todo` / `fixme` / `hack` / `xxx`.
+    pub category: &'a str,
+    /// Trimmed single-line note text following the marker token.
+    pub note: &'a str,
+    /// Innermost `Symbol` record whose span encloses the marker in the same
+    /// file version; `None` when the marker sits at module top level (no
+    /// `DEFINES`/`CONTAINS` owner).
+    pub enclosing_symbol: Option<&'a GraphRecord>,
+}
+
+/// Deterministic debt-marker inventory returned by [`debt_markers`].
+#[derive(Debug, Clone, Default)]
+pub struct DebtMarkerInventory<'a> {
+    /// Markers ordered by `(repo_relative_path, span.start_byte, git_commit,
+    /// record_id)` — byte-identical across repeated runs on an unchanged store.
+    pub markers: Vec<DebtMarkerRow<'a>>,
+    /// Full commit SHA the inventory was pinned to, when `--at` was supplied.
+    pub at_commit: Option<String>,
+}
+
+/// Inventories human-authored debt-comment markers (issue #218).
+///
+/// Results derive solely from deterministic `DebtMarker` extractor facts: the
+/// lane never rewrites or re-scores a code fact, never asserts the
+/// surrounding code is correct or incorrect, and introduces no agent-authored
+/// observation. Strictly read-only.
+///
+/// * `path_prefix` — optional segment-aware repo-relative prefix (the same
+///   matching contract as `eg query subsystem`).
+/// * `at` — optional commit SHA or unique prefix pinning the valid-time axis
+///   (the same selector contract as `eg query symbol --at`). Without it the
+///   current view is returned: non-temporal records that are not tombstoned,
+///   plus every history-backed version present in the store.
+/// * `repo` — optional resolved repository record ID (issue #67 scoping).
+///
+/// # Errors
+///
+/// Returns [`DebtMarkerScopeError`] when the prefix is malformed or matches
+/// nothing, or when the commit selector is unknown or ambiguous.
+pub fn debt_markers<'a>(
+    records: &'a [GraphRecord],
+    path_prefix: Option<&str>,
+    at: Option<&str>,
+    index: &RepositoryIndex,
+    repo: Option<&str>,
+) -> Result<DebtMarkerInventory<'a>, DebtMarkerScopeError> {
+    // 1. Prefix validation (mirrors the subsystem lane).
+    let normalized_prefix = match path_prefix {
+        Some(prefix) => {
+            let normalized = prefix.trim_end_matches('/');
+            if normalized.is_empty() {
+                return Err(DebtMarkerScopeError::MalformedPrefix {
+                    prefix: prefix.to_owned(),
+                });
+            }
+            Some(normalized)
+        }
+        None => None,
+    };
+
+    let record_in_repo_scope = |record: &GraphRecord| -> bool {
+        let Some(repo_id) = repo else { return true };
+        match record {
+            GraphRecord::Node { id, .. } => index.owner_of(id) == Some(repo_id),
+            GraphRecord::Edge { source, target, .. } => {
+                index.owner_of(source) == Some(repo_id) || index.owner_of(target) == Some(repo_id)
+            }
+            GraphRecord::Tombstone { .. } => false,
+        }
+    };
+
+    // 2. Commit resolution (mirrors `eg query symbol --at` prefix handling,
+    //    repo-scoped so a prefix colliding only across the repository boundary
+    //    stays unambiguous within the selected repository).
+    let at_commit: Option<String> = match at {
+        None => None,
+        Some(selector) => {
+            let matching: BTreeSet<&str> = records
+                .iter()
+                .filter(|r| record_in_repo_scope(r))
+                .filter_map(|r| match r {
+                    GraphRecord::Node {
+                        temporal: Some(t), ..
+                    }
+                    | GraphRecord::Edge {
+                        temporal: Some(t), ..
+                    } if t.git_commit.starts_with(selector) => Some(t.git_commit.as_str()),
+                    _ => None,
+                })
+                .collect();
+            match matching.len() {
+                0 => {
+                    return Err(DebtMarkerScopeError::UnknownCommit {
+                        commit: selector.to_owned(),
+                    });
+                }
+                1 => matching.iter().next().map(|c| (*c).to_owned()),
+                count => {
+                    return Err(DebtMarkerScopeError::AmbiguousCommit {
+                        commit: selector.to_owned(),
+                        count,
+                    });
+                }
+            }
+        }
+    };
+
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Tombstone { deleted_id, .. } = r {
+                Some(deleted_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // A node participates in the selected valid-time view when it belongs to
+    // the pinned commit (`--at`), or — in the current view — when it is either
+    // history-backed or a live (non-tombstoned) current-tree record.
+    let in_selected_view = |record: &GraphRecord| -> bool {
+        let GraphRecord::Node { id, temporal, .. } = record else {
+            return false;
+        };
+        match (&at_commit, temporal) {
+            (Some(commit), Some(t)) => t.git_commit == *commit,
+            (Some(_), None) => false,
+            (None, Some(_)) => true,
+            (None, None) => !tombstoned.contains(id.as_str()),
+        }
+    };
+
+    // 3. Scope-existence honesty check: a prefix that matches no file-backed
+    //    record in the selected view is `scope_not_found`, never a silent
+    //    empty result.
+    if let Some(prefix) = normalized_prefix {
+        let scope_exists = records.iter().any(|r| {
+            let GraphRecord::Node {
+                kind,
+                repo_relative_path: Some(path),
+                ..
+            } = r
+            else {
+                return false;
+            };
+            matches!(
+                kind,
+                NodeKind::File | NodeKind::Symbol | NodeKind::DebtMarker
+            ) && record_in_repo_scope(r)
+                && in_selected_view(r)
+                && path_is_under_prefix(path.as_str(), prefix)
+        });
+        if !scope_exists {
+            return Err(DebtMarkerScopeError::ScopeNotFound {
+                prefix: prefix.to_owned(),
+            });
+        }
+    }
+
+    // 4. Symbol spans per path, for enclosing-symbol resolution.
+    let mut symbols_by_path: BTreeMap<&str, Vec<&GraphRecord>> = BTreeMap::new();
+    for record in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Symbol,
+            repo_relative_path: Some(path),
+            span: Some(_),
+            ..
+        } = record
+        {
+            symbols_by_path
+                .entry(path.as_str())
+                .or_default()
+                .push(record);
+        }
+    }
+
+    let same_file_version = |marker: &GraphRecord, symbol: &GraphRecord| -> bool {
+        let marker_commit = match marker {
+            GraphRecord::Node { temporal, .. } => temporal.as_ref().map(|t| t.git_commit.as_str()),
+            _ => None,
+        };
+        let symbol_commit = match symbol {
+            GraphRecord::Node { temporal, .. } => temporal.as_ref().map(|t| t.git_commit.as_str()),
+            _ => None,
+        };
+        match (marker_commit, symbol_commit) {
+            (Some(marker_sha), Some(symbol_sha)) => marker_sha == symbol_sha,
+            (None, None) => !tombstoned.contains(symbol.id()),
+            _ => false,
+        }
+    };
+
+    // 5. Collect, resolve enclosing symbols, and order deterministically.
+    let mut markers: Vec<DebtMarkerRow<'a>> = Vec::new();
+    for record in records {
+        let GraphRecord::Node {
+            kind: NodeKind::DebtMarker,
+            name: Some(category),
+            note: Some(note),
+            repo_relative_path: Some(path),
+            span: Some(marker_span),
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if !record_in_repo_scope(record) || !in_selected_view(record) {
+            continue;
+        }
+        if let Some(prefix) = normalized_prefix
+            && !path_is_under_prefix(path.as_str(), prefix)
+        {
+            continue;
+        }
+
+        let enclosing_symbol = symbols_by_path
+            .get(path.as_str())
+            .into_iter()
+            .flatten()
+            .filter(|symbol| {
+                let GraphRecord::Node {
+                    span: Some(symbol_span),
+                    ..
+                } = symbol
+                else {
+                    return false;
+                };
+                symbol_span.start_byte <= marker_span.start_byte
+                    && marker_span.end_byte <= symbol_span.end_byte
+                    && same_file_version(record, symbol)
+                    // In a shared multi-repository store two repositories can
+                    // define the same repo-relative path; a candidate symbol
+                    // must belong to the marker's own repository or the lane
+                    // could cite an unrelated repo's symbol whenever its span
+                    // is narrower.
+                    && index.owner_of(symbol.id()) == index.owner_of(record.id())
+            })
+            .min_by(|a, b| {
+                let width = |r: &GraphRecord| match r {
+                    GraphRecord::Node {
+                        span: Some(span), ..
+                    } => span.end_byte - span.start_byte,
+                    _ => usize::MAX,
+                };
+                width(a).cmp(&width(b)).then_with(|| a.id().cmp(b.id()))
+            })
+            .copied();
+
+        markers.push(DebtMarkerRow {
+            record,
+            category,
+            note,
+            enclosing_symbol,
+        });
+    }
+
+    markers.sort_by(|a, b| debt_marker_sort_key(a).cmp(&debt_marker_sort_key(b)));
+
+    Ok(DebtMarkerInventory { markers, at_commit })
+}
+
+/// Deterministic ordering key for debt-marker rows:
+/// `(repo_relative_path, span.start_byte, git_commit, record_id)`.
+fn debt_marker_sort_key<'k>(marker: &DebtMarkerRow<'k>) -> (&'k str, usize, &'k str, &'k str) {
+    match marker.record {
+        GraphRecord::Node {
+            repo_relative_path,
+            span,
+            temporal,
+            id,
+            ..
+        } => (
+            repo_relative_path.as_deref().unwrap_or(""),
+            span.map_or(0, |s| s.start_byte),
+            temporal.as_ref().map_or("", |t| t.git_commit.as_str()),
+            id.as_str(),
+        ),
+        _ => ("", 0, "", ""),
+    }
 }
 
 /// Finds a symbol record by name at the most recent commit at or before `as_of`.
@@ -12765,65 +13431,56 @@ impl<'a> ResolvedCommitRange<'a> {
     }
 }
 
-/// Resolves two commit handles (full SHA or unique prefix) against the
-/// store's `Commit` nodes into a [`ResolvedCommitRange`], reporting every
-/// failure as a stable [`RangeDeltasError`] rather than partial output.
+/// Resolves one commit handle (full SHA or unique prefix) against the
+/// store's in-scope `Commit` nodes. Shared by the range queries (issues
+/// #118 and #157) and the co-change coupling query (issue #153).
 #[allow(clippy::missing_panics_doc)]
-fn resolve_commit_range<'a>(
+fn resolve_commit_prefix<'a>(
     records: &'a [GraphRecord],
-    base_prefix: &str,
-    head_prefix: &str,
+    prefix: &str,
     in_scope: &dyn Fn(&str) -> bool,
-) -> Result<ResolvedCommitRange<'a>, RangeDeltasError> {
-    let has_any_commits = records
-        .iter()
-        .any(|r| matches!(r.node_kind_name(), Some("Commit")));
-    if !has_any_commits {
-        return Err(RangeDeltasError::EmptyHistory);
-    }
-
-    // ── endpoint resolution (full SHA or unique prefix) ─────────────────────
-    let resolve_prefix = |prefix: &str| -> Result<&'a str, RangeDeltasError> {
-        let mut matches = Vec::new();
-        for r in records {
-            if let GraphRecord::Node {
-                kind: NodeKind::Commit,
-                name: Some(sha),
-                ..
-            } = r
-            {
-                if sha.to_lowercase().starts_with(&prefix.to_lowercase()) && in_scope(r.id()) {
-                    matches.push(sha.as_str());
-                }
+) -> Result<&'a str, RangeDeltasError> {
+    let mut matches = Vec::new();
+    for r in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Commit,
+            name: Some(sha),
+            ..
+        } = r
+        {
+            if sha.to_lowercase().starts_with(&prefix.to_lowercase()) && in_scope(r.id()) {
+                matches.push(sha.as_str());
             }
         }
-        matches.sort_unstable();
-        matches.dedup();
+    }
+    matches.sort_unstable();
+    matches.dedup();
 
-        if matches.is_empty() {
-            return Err(RangeDeltasError::MissingCommit {
-                commit_prefix: prefix.to_owned(),
-            });
-        }
-        if matches.len() > 1 {
-            let string_matches = matches.iter().map(|s| (*s).to_owned()).collect();
-            return Err(RangeDeltasError::AmbiguousCommitPrefix {
-                commit_prefix: prefix.to_owned(),
-                matches: string_matches,
-            });
-        }
-        Ok(matches.into_iter().next().unwrap())
-    };
-
-    let base_sha = resolve_prefix(base_prefix)?;
-    let head_sha = resolve_prefix(head_prefix)?;
-    if base_sha == head_sha {
-        return Err(RangeDeltasError::IdenticalEndpoints {
-            commit: base_sha.to_owned(),
+    if matches.is_empty() {
+        return Err(RangeDeltasError::MissingCommit {
+            commit_prefix: prefix.to_owned(),
         });
     }
+    if matches.len() > 1 {
+        let string_matches = matches.iter().map(|s| (*s).to_owned()).collect();
+        return Err(RangeDeltasError::AmbiguousCommitPrefix {
+            commit_prefix: prefix.to_owned(),
+            matches: string_matches,
+        });
+    }
+    Ok(matches.into_iter().next().unwrap())
+}
 
-    // ── commit topology (temporal parents + PARENT_OF edges) ────────────────
+/// Commit topology over the in-scope `Commit` nodes: commit SHA →
+/// deduplicated parent SHAs (temporal parents + `PARENT_OF` edges), plus
+/// commit SHA → valid time (committer date) where recorded. Shared by the
+/// range queries (issues #118 and #157) and the co-change coupling query
+/// (issue #153).
+#[allow(clippy::type_complexity)]
+fn commit_topology<'a>(
+    records: &'a [GraphRecord],
+    in_scope: &dyn Fn(&str) -> bool,
+) -> (BTreeMap<&'a str, Vec<&'a str>>, BTreeMap<&'a str, &'a str>) {
     let by_id: BTreeMap<&str, &GraphRecord> = records.iter().map(|r| (r.id(), r)).collect();
     let mut parent_map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut commit_valid_time: BTreeMap<&str, &str> = BTreeMap::new();
@@ -12881,27 +13538,61 @@ fn resolve_commit_range<'a>(
         parents.sort_unstable();
         parents.dedup();
     }
+    (parent_map, commit_valid_time)
+}
 
-    let get_reachable = |start_sha: &'a str| -> BTreeSet<&'a str> {
-        let mut reachable = BTreeSet::new();
-        let mut queue = vec![start_sha];
-        while let Some(current) = queue.pop() {
-            if !reachable.insert(current) {
-                continue;
-            }
-            if let Some(parents) = parent_map.get(current) {
-                for parent in parents {
-                    if !reachable.contains(*parent) {
-                        queue.push(*parent);
-                    }
+/// Ancestor closure of `start_sha` (inclusive) over a commit parent map.
+fn reachable_commits<'a>(
+    parent_map: &BTreeMap<&'a str, Vec<&'a str>>,
+    start_sha: &'a str,
+) -> BTreeSet<&'a str> {
+    let mut reachable = BTreeSet::new();
+    let mut queue = vec![start_sha];
+    while let Some(current) = queue.pop() {
+        if !reachable.insert(current) {
+            continue;
+        }
+        if let Some(parents) = parent_map.get(current) {
+            for parent in parents {
+                if !reachable.contains(*parent) {
+                    queue.push(*parent);
                 }
             }
         }
-        reachable
-    };
+    }
+    reachable
+}
 
-    let reachable_head = get_reachable(head_sha);
-    let reachable_base = get_reachable(base_sha);
+/// Resolves two commit handles (full SHA or unique prefix) against the
+/// store's `Commit` nodes into a [`ResolvedCommitRange`], reporting every
+/// failure as a stable [`RangeDeltasError`] rather than partial output.
+fn resolve_commit_range<'a>(
+    records: &'a [GraphRecord],
+    base_prefix: &str,
+    head_prefix: &str,
+    in_scope: &dyn Fn(&str) -> bool,
+) -> Result<ResolvedCommitRange<'a>, RangeDeltasError> {
+    let has_any_commits = records
+        .iter()
+        .any(|r| matches!(r.node_kind_name(), Some("Commit")));
+    if !has_any_commits {
+        return Err(RangeDeltasError::EmptyHistory);
+    }
+
+    // ── endpoint resolution (full SHA or unique prefix) ─────────────────────
+    let base_sha = resolve_commit_prefix(records, base_prefix, in_scope)?;
+    let head_sha = resolve_commit_prefix(records, head_prefix, in_scope)?;
+    if base_sha == head_sha {
+        return Err(RangeDeltasError::IdenticalEndpoints {
+            commit: base_sha.to_owned(),
+        });
+    }
+
+    // ── commit topology (temporal parents + PARENT_OF edges) ────────────────
+    let (parent_map, commit_valid_time) = commit_topology(records, in_scope);
+
+    let reachable_head = reachable_commits(&parent_map, head_sha);
+    let reachable_base = reachable_commits(&parent_map, base_sha);
     if !reachable_head.contains(base_sha) {
         if reachable_base.contains(head_sha) {
             return Err(RangeDeltasError::ReversedRange {
@@ -14998,6 +15689,1212 @@ pub fn public_api_deltas<'a>(
                 rows: internal_rows,
             }),
         counts,
+        diagnostics,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// undocumented public API lane (issue #257)
+// ---------------------------------------------------------------------------
+
+/// One symbol reported by the undocumented-public-API lane: a doc-auditable
+/// symbol whose recorded doc-comment fact is absent.
+///
+/// For declared items the citation fields point at the declaration; for
+/// re-exports (`via_reexport` = `true`) they point at the `pub use` site and
+/// `target_record_id` cites the resolved declaration whose doc fact was
+/// checked.
+#[derive(Debug, Clone)]
+pub struct UndocumentedItem<'a> {
+    /// Stable record ID of the declaring `Symbol` node, or of the `Import`
+    /// node at the re-export site.
+    pub record_id: &'a str,
+    /// Symbol kind (`function`, `struct`, `enum`, `trait`, `type_alias`,
+    /// `const`, `static`, or `method` under `--include-private`).
+    pub kind: String,
+    /// Crate-relative fully-qualified path (alias-aware for re-exports).
+    pub path: String,
+    /// Recorded visibility class: `public` for externally-reachable rows;
+    /// the declared class for `--include-private` rows.
+    pub visibility: &'a str,
+    /// Repo-relative file of the declaration or re-export site.
+    pub repo_relative_path: Option<&'a str>,
+    /// Source span of the declaration or re-export site.
+    pub span: Option<SourceSpan>,
+    /// Persisted declaration signature (issue #124), joined when present.
+    pub signature: Option<&'a str>,
+    /// Concrete evidence asserted for this row, as stable markers:
+    /// `doc_comment_absent` always, plus `externally_reachable` when the
+    /// symbol is on the issue #213 public surface.
+    pub evidence: Vec<&'static str>,
+    /// `true` when the symbol reaches the surface through a `pub use`.
+    pub via_reexport: bool,
+    /// Crate-relative use-path the re-export points at (re-exports only).
+    pub target: Option<String>,
+    /// Record ID of the resolved re-export target whose doc fact was checked.
+    pub target_record_id: Option<&'a str>,
+}
+
+/// Deterministic tallies for the undocumented-public-API lane.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct UndocumentedCounts {
+    /// Doc-auditable candidates whose doc fact was asserted
+    /// (`documented + undocumented`).
+    pub considered: usize,
+    /// Candidates carrying a recorded doc comment — excluded from `items`.
+    pub documented: usize,
+    /// Candidates with no recorded doc comment — the returned rows (before
+    /// any `--limit` truncation).
+    pub undocumented: usize,
+    /// Undocumented rows contributed by `pub use` re-exports.
+    pub reexports: usize,
+    /// Surface `module` rows: modules carry no doc-comment fact and are
+    /// excluded from the audit, never guessed.
+    pub modules_excluded: usize,
+    /// Re-export rows whose target did not resolve in-graph: doc presence
+    /// cannot be asserted, so they are diagnosed, never reported.
+    pub reexports_unresolved: usize,
+    /// Doc-auditable symbol records carrying no issue #124 declaration
+    /// surface (pre-#124 scan): their doc fact was never captured.
+    pub doc_capture_missing: usize,
+}
+
+/// The undocumented-public-API report: rows, tallies, and diagnostics.
+#[derive(Debug, Clone, Default)]
+pub struct UndocumentedReport<'a> {
+    /// `true` when the store carries no doc-capture facts at all (pre-#124
+    /// scan): the lane reports this verdict instead of treating every symbol
+    /// as undocumented.
+    pub capability_absent: bool,
+    /// Undocumented symbols, sorted by (path, kind, record ID).
+    pub items: Vec<UndocumentedItem<'a>>,
+    /// Deterministic tallies.
+    pub counts: UndocumentedCounts,
+    /// Stable diagnostics, sorted and de-duplicated. Reuses the public-api
+    /// diagnostic shape; surface diagnostics pass through (except
+    /// `empty_surface`, which this lane replaces with its own verdicts).
+    pub diagnostics: Vec<PublicApiDiagnostic>,
+}
+
+/// Returns the recorded (`doc`, `visibility`) facts of a symbol record.
+fn symbol_doc_facts(record: &GraphRecord) -> (Option<&str>, Option<&str>) {
+    if let GraphRecord::Node {
+        doc, visibility, ..
+    } = record
+    {
+        (doc.as_deref(), visibility.as_deref())
+    } else {
+        (None, None)
+    }
+}
+
+/// Lists externally-reachable public symbols whose captured doc-comment fact
+/// is absent (issue #257).
+///
+/// The result is the issue #213 public surface minus the has-doc set from
+/// issue #124 — a graph-native join, never a `pub`-token grep.
+///
+/// The reachability rule is `public_api_surface`'s, reused verbatim: items
+/// not externally reachable are excluded by default. A re-export counts as
+/// documented when either the `pub use` site or the resolved target carries
+/// a doc fact — rustdoc exposes site docs on the public item.
+/// `include_private` widens the audit to every doc-auditable symbol (adding
+/// `method` declarations) regardless of visibility, for whole-crate doc
+/// audits; such rows carry their declared visibility class and never claim
+/// `externally_reachable`.
+///
+/// Soundness boundary: the lane asserts the **presence or absence of a
+/// recorded doc comment** (`///`, `/** */`, or `#[doc = "..."]`) — never doc
+/// quality, accuracy, or completeness. When the store predates issue #124
+/// doc capture, the report carries `capability_absent = true` and a
+/// `doc_capture_unavailable` diagnostic instead of silently treating every
+/// symbol as undocumented. Deterministic: output ordering depends only on
+/// record content. `limit` truncates the sorted rows and adds a
+/// `results_truncated` diagnostic; it never changes row order.
+#[must_use]
+pub fn undocumented_public_api<'a>(
+    records: &'a [GraphRecord],
+    index: &RepositoryIndex,
+    repo_scope: Option<&str>,
+    include_private: bool,
+    limit: Option<usize>,
+) -> UndocumentedReport<'a> {
+    let surface = public_api_surface(records, index, repo_scope);
+
+    // Doc-auditable symbol records (keep-last, current-state view), mirroring
+    // the surface's scope: the Rust library crate, minus tombstones, within
+    // the repo scope. Reachability itself is *not* re-derived here — it comes
+    // from `public_api_surface` above.
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Tombstone { deleted_id, .. } = r {
+                Some(deleted_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let is_owned =
+        |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
+    let mut symbols: BTreeMap<&str, &'a GraphRecord> = BTreeMap::new();
+    // Doc facts recorded at `pub use` sites: rustdoc exposes a doc comment
+    // written above the re-export on the public item, so a site doc counts
+    // as documentation for the re-exported symbol.
+    let mut import_docs: BTreeMap<&str, &'a str> = BTreeMap::new();
+    for record in records {
+        let GraphRecord::Node {
+            id,
+            kind,
+            language,
+            repo_relative_path,
+            symbol_kind,
+            doc,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if language.as_deref() != Some("rust")
+            || tombstoned.contains(id.as_str())
+            || !is_owned(id)
+            || !repo_relative_path
+                .as_deref()
+                .is_some_and(is_library_crate_path)
+        {
+            continue;
+        }
+        match kind {
+            NodeKind::Symbol => {
+                let auditable = symbol_kind
+                    .as_deref()
+                    .is_some_and(|k| PUBLIC_API_SYMBOL_KINDS.contains(&k) || k == "method");
+                if !auditable {
+                    continue;
+                }
+                symbols.insert(id.as_str(), record);
+            }
+            NodeKind::Import => {
+                if let Some(doc) = doc.as_deref() {
+                    import_docs.insert(id.as_str(), doc);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut report = UndocumentedReport::default();
+
+    // Capability check: a store where no doc-auditable symbol carries the
+    // issue #124 declaration surface never captured doc facts. Report that
+    // verdict — never treat "no doc field" in a pre-#124 store as "no docs".
+    let mut facts_recorded = 0usize;
+    for record in symbols.values() {
+        let (_, visibility) = symbol_doc_facts(record);
+        if visibility.is_some() {
+            facts_recorded += 1;
+        } else {
+            report.counts.doc_capture_missing += 1;
+        }
+    }
+    report.capability_absent = facts_recorded == 0 && report.counts.doc_capture_missing > 0;
+
+    // Surface diagnostics pass through so glob re-exports and unknown module
+    // visibility stay visible; `empty_surface` is replaced by this lane's own
+    // explicit verdicts.
+    report.diagnostics.extend(
+        surface
+            .diagnostics
+            .iter()
+            .filter(|d| d.code != "empty_surface")
+            .cloned(),
+    );
+
+    if report.capability_absent {
+        report.diagnostics.push(PublicApiDiagnostic {
+            code: "doc_capture_unavailable",
+            record_id: None,
+            detail: format!(
+                "{} doc-auditable symbol record(s) carry no issue #124 declaration \
+                 surface; doc-comment facts were never captured. Re-scan with a \
+                 current build to audit documentation",
+                report.counts.doc_capture_missing
+            ),
+        });
+        sort_undocumented(&mut report);
+        return report;
+    }
+
+    // IDs whose doc fact was already asserted via the surface, so the
+    // `--include-private` widening never double-reports a symbol.
+    let mut asserted: BTreeSet<&str> = BTreeSet::new();
+
+    for item in surface.items {
+        if item.kind == "module" {
+            report.counts.modules_excluded += 1;
+            continue;
+        }
+        // A doc comment at the `pub use` site documents the re-exported item
+        // (rustdoc attaches it to the public name), regardless of whether the
+        // target declaration carries its own doc.
+        if item.via_reexport && import_docs.contains_key(item.record_id) {
+            report.counts.considered += 1;
+            report.counts.documented += 1;
+            continue;
+        }
+        if item.kind == "reexport" {
+            report.counts.reexports_unresolved += 1;
+            report.diagnostics.push(PublicApiDiagnostic {
+                code: "reexport_target_unresolved",
+                record_id: Some(item.record_id.to_owned()),
+                detail: format!(
+                    "pub use target `{}` does not resolve in-graph; doc presence \
+                     cannot be asserted for it",
+                    item.target.as_deref().unwrap_or("")
+                ),
+            });
+            continue;
+        }
+        // The record whose doc fact backs this row: the declaration itself,
+        // or the resolved target for a re-export row. A re-export row without
+        // a target record ID is unresolved; count it, never guess.
+        let fact_id = match (item.via_reexport, item.target_record_id) {
+            (false, _) => item.record_id,
+            (true, Some(target_id)) => target_id,
+            (true, None) => {
+                report.counts.reexports_unresolved += 1;
+                continue;
+            }
+        };
+        let Some(record) = symbols.get(fact_id) else {
+            // Resolved to a non-auditable record (e.g. a module alias row is
+            // already handled above); never guess a doc fact.
+            report.counts.reexports_unresolved += 1;
+            continue;
+        };
+        let (doc, visibility) = symbol_doc_facts(record);
+        if visibility.is_none() {
+            // Pre-#124 record in a mixed store: already tallied in
+            // `doc_capture_missing`; its doc fact cannot be asserted.
+            continue;
+        }
+        asserted.insert(fact_id);
+        report.counts.considered += 1;
+        if doc.is_some() {
+            report.counts.documented += 1;
+            continue;
+        }
+        report.counts.undocumented += 1;
+        if item.via_reexport {
+            report.counts.reexports += 1;
+        }
+        report.items.push(UndocumentedItem {
+            record_id: item.record_id,
+            kind: item.kind,
+            path: item.path,
+            visibility: "public",
+            repo_relative_path: item.repo_relative_path,
+            span: item.span,
+            signature: item.signature,
+            evidence: vec!["externally_reachable", "doc_comment_absent"],
+            via_reexport: item.via_reexport,
+            target: item.target,
+            target_record_id: item.target_record_id,
+        });
+    }
+
+    if include_private {
+        for (id, record) in &symbols {
+            if asserted.contains(id) {
+                continue;
+            }
+            let GraphRecord::Node {
+                name: Some(name),
+                repo_relative_path,
+                span,
+                symbol_kind: Some(symbol_kind),
+                signature,
+                ..
+            } = record
+            else {
+                continue;
+            };
+            let (doc, visibility) = symbol_doc_facts(record);
+            let Some(visibility) = visibility else {
+                continue; // pre-#124 record: already tallied, never guessed.
+            };
+            report.counts.considered += 1;
+            if doc.is_some() {
+                report.counts.documented += 1;
+                continue;
+            }
+            report.counts.undocumented += 1;
+            report.items.push(UndocumentedItem {
+                record_id: id,
+                kind: symbol_kind.clone(),
+                path: name.clone(),
+                visibility,
+                repo_relative_path: repo_relative_path.as_deref(),
+                span: *span,
+                signature: signature.as_deref(),
+                evidence: vec!["doc_comment_absent"],
+                via_reexport: false,
+                target: None,
+                target_record_id: None,
+            });
+        }
+    }
+
+    if report.items.is_empty() {
+        // `no_undocumented_items` certifies the audit clean, so it requires
+        // an audit with no blind spots. When unresolved re-exports or
+        // missing doc capture left symbols unasserted, the empty result gets
+        // an honest distinct verdict instead — still exit 0, never an error.
+        let blind_spots =
+            report.counts.reexports_unresolved > 0 || report.counts.doc_capture_missing > 0;
+        report.diagnostics.push(if blind_spots {
+            PublicApiDiagnostic {
+                code: "empty_result_with_blind_spots",
+                record_id: None,
+                detail: format!(
+                    "no undocumented symbols found, but the audit has blind spots \
+                     ({} unresolved re-export(s), {} symbol record(s) without doc \
+                     capture); this is not a certified-clean claim",
+                    report.counts.reexports_unresolved, report.counts.doc_capture_missing
+                ),
+            }
+        } else {
+            PublicApiDiagnostic {
+                code: "no_undocumented_items",
+                record_id: None,
+                detail: format!(
+                    "every doc-auditable symbol in scope carries a recorded doc \
+                     comment ({} considered)",
+                    report.counts.considered
+                ),
+            }
+        });
+    }
+
+    sort_undocumented(&mut report);
+
+    if let Some(limit) = limit {
+        if report.items.len() > limit {
+            let total = report.items.len();
+            report.items.truncate(limit);
+            report.diagnostics.push(PublicApiDiagnostic {
+                code: "results_truncated",
+                record_id: None,
+                detail: format!(
+                    "showing {limit} of {total} undocumented rows; raise --limit \
+                     to see the rest"
+                ),
+            });
+            // Re-sort so the appended diagnostic keeps the stable order.
+            sort_undocumented_diagnostics(&mut report.diagnostics);
+        }
+    }
+
+    report
+}
+
+/// Sorts an undocumented report's rows and diagnostics deterministically.
+fn sort_undocumented(report: &mut UndocumentedReport<'_>) {
+    report.items.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.record_id.cmp(b.record_id))
+    });
+    sort_undocumented_diagnostics(&mut report.diagnostics);
+}
+
+/// Sorts and de-duplicates a diagnostics list deterministically.
+fn sort_undocumented_diagnostics(diagnostics: &mut Vec<PublicApiDiagnostic>) {
+    diagnostics.sort_by(|a, b| {
+        a.code
+            .cmp(b.code)
+            .then_with(|| a.record_id.cmp(&b.record_id))
+            .then_with(|| a.detail.cmp(&b.detail))
+    });
+    diagnostics.dedup();
+}
+
+// ---------------------------------------------------------------------------
+// Historical co-change coupling (issue #153)
+// ---------------------------------------------------------------------------
+
+/// Default minimum-support threshold for [`co_change_coupling`]: partner
+/// files sharing fewer distinct in-scope commits with the target are
+/// suppressed as noise.
+pub const CO_CHANGE_DEFAULT_MIN_SUPPORT: usize = 2;
+
+/// Upper bound accepted for the [`co_change_coupling`] min-support threshold.
+pub const CO_CHANGE_MAX_MIN_SUPPORT: usize = 100;
+
+/// Default partner-row cap for [`co_change_coupling`] responses.
+pub const CO_CHANGE_DEFAULT_LIMIT: usize = 20;
+
+/// Upper bound accepted for the [`co_change_coupling`] partner-row cap.
+pub const CO_CHANGE_MAX_LIMIT: usize = 500;
+
+/// Stable identifier of the normalized coupling-strength ranking metric.
+///
+/// The metric is the Jaccard index `co / (target + partner - co)` over
+/// distinct in-scope commit sets. Documented in `docs/cli/coupling.md`.
+pub const CO_CHANGE_COUPLING_METRIC: &str = "jaccard_v1";
+
+/// Trust label stamped on every partner row: rows are historical co-change
+/// leads, never dependency proof.
+pub const CO_CHANGE_COUPLING_TRUST: &str = "historical_co_change_lead";
+
+/// Always-present advisory disclaimer on co-change coupling responses.
+pub const CO_CHANGE_COUPLING_DISCLAIMER: &str = "Rows are historical co-change leads - files \
+     observed changing in the same commits as the target - and are not proof of dependency, \
+     breakage, behavior change, or verification; no causality is inferred from commit \
+     messages, file names, or proximity, and absence of coupling is not proof of independence.";
+
+/// Selector and threshold options for [`co_change_coupling`].
+///
+/// The temporal selectors follow the existing contract: `base`+`head` bound
+/// the in-scope commits to the `(base, head]` range exactly like
+/// `eg query deltas` (issue #118); `at` bounds them to the ancestor closure
+/// of one commit handle; `as_of` bounds them by valid time (committer date).
+/// The selectors are mutually exclusive; `base` and `head` come as a pair.
+#[derive(Debug, Clone)]
+pub struct CoChangeCouplingOptions<'a> {
+    /// Range base commit handle (older, exclusive endpoint); requires `head`.
+    pub base: Option<&'a str>,
+    /// Range head commit handle (newer, inclusive endpoint); requires `base`.
+    pub head: Option<&'a str>,
+    /// Single-commit bound: in-scope commits are the ancestor closure
+    /// (inclusive) of this commit handle.
+    pub at: Option<&'a str>,
+    /// Valid-time bound: in-scope commits are those recorded at or before
+    /// this RFC 3339 instant.
+    pub as_of: Option<&'a str>,
+    /// Minimum shared-commit count for a partner row
+    /// (1..=[`CO_CHANGE_MAX_MIN_SUPPORT`]).
+    pub min_support: usize,
+    /// Partner-row cap (1..=[`CO_CHANGE_MAX_LIMIT`]).
+    pub limit: usize,
+}
+
+impl Default for CoChangeCouplingOptions<'_> {
+    fn default() -> Self {
+        Self {
+            base: None,
+            head: None,
+            at: None,
+            as_of: None,
+            min_support: CO_CHANGE_DEFAULT_MIN_SUPPORT,
+            limit: CO_CHANGE_DEFAULT_LIMIT,
+        }
+    }
+}
+
+/// The resolved target file of a co-change coupling response.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CouplingTarget<'a> {
+    /// Stable record ID of the target's `File` node.
+    pub record_id: &'a str,
+    /// Schema version stamped on the `File` node.
+    pub schema_version: u32,
+    /// Repo-relative path of the target file.
+    pub repo_relative_path: &'a str,
+    /// Distinct in-scope commits that modified the target.
+    pub change_count: usize,
+}
+
+/// The resolved temporal scope of a co-change coupling response.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CouplingScope<'a> {
+    /// Stable selector label: `full_history` / `commit_range` / `at_commit`
+    /// / `as_of`.
+    pub selector: &'static str,
+    /// Resolved full SHA of the range base (commit_range only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<&'a str>,
+    /// Resolved full SHA of the range head (commit_range only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<&'a str>,
+    /// Resolved full SHA of the `--at` bound (at_commit only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<&'a str>,
+    /// The `--as-of` instant as supplied (as_of only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<&'a str>,
+    /// Number of distinct in-scope commits considered.
+    pub commit_count: usize,
+}
+
+/// One ranked co-change partner row. Serialization is bounded to handles,
+/// counts, and the documented metrics - never blob contents or patch hunks.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CouplingPartner<'a> {
+    /// Stable record ID of the partner's `File` node.
+    pub record_id: &'a str,
+    /// Schema version stamped on the `File` node.
+    pub schema_version: u32,
+    /// Repo-relative path of the partner file.
+    pub repo_relative_path: &'a str,
+    /// Distinct in-scope commits that modified both target and partner.
+    pub co_change_count: usize,
+    /// Distinct in-scope commits that modified the partner.
+    pub partner_change_count: usize,
+    /// Distinct in-scope commits that modified the target (same for every
+    /// row; repeated so each row is independently citable).
+    pub target_change_count: usize,
+    /// Normalized symmetric coupling strength ([`CO_CHANGE_COUPLING_METRIC`]):
+    /// `co / (target + partner - co)`. High-churn partners cannot dominate
+    /// purely by volume because their own change count grows the denominator.
+    pub coupling: f64,
+    /// Directional confidence `co / target`: the fraction of the target's
+    /// in-scope changes that also touched this partner.
+    pub confidence: f64,
+    /// Newest in-scope commit where both changed (by chronological valid
+    /// time — parsed, offset-aware — with ties broken by SHA).
+    pub last_co_change_commit: &'a str,
+    /// Valid time of `last_co_change_commit`, when recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_co_change_valid_time: Option<&'a str>,
+    /// Always [`CO_CHANGE_COUPLING_TRUST`].
+    pub trust: &'static str,
+}
+
+/// Stable machine-readable diagnostic attached to an otherwise-successful
+/// co-change coupling response (explicit empty results, never silence).
+#[derive(Debug, Clone, serde::Serialize, Eq, PartialEq)]
+pub struct CouplingDiagnostic {
+    /// Stable diagnostic code (`target_never_changed_in_scope`,
+    /// `no_partner_at_or_above_min_support`).
+    pub code: &'static str,
+    /// Bounded human-readable detail (identity fields and counts only).
+    pub detail: String,
+}
+
+/// Ranked historical co-change partners for one target file. Returned by
+/// [`co_change_coupling`]; deterministic and byte-identical across runs on
+/// unchanged history.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CoChangeCoupling<'a> {
+    /// The resolved target file.
+    pub target: CouplingTarget<'a>,
+    /// The resolved temporal scope.
+    pub scope: CouplingScope<'a>,
+    /// The minimum-support threshold that was applied (echoed).
+    pub min_support: usize,
+    /// The partner-row cap that was applied (echoed).
+    pub limit: usize,
+    /// Always [`CO_CHANGE_COUPLING_METRIC`].
+    pub coupling_metric: &'static str,
+    /// Always-present advisory disclaimer
+    /// ([`CO_CHANGE_COUPLING_DISCLAIMER`]).
+    pub disclaimer: &'static str,
+    /// Partners at or above `min_support`, before the `limit` cap.
+    pub total_partners: usize,
+    /// Whether `partners` was truncated by `limit` (completeness signal).
+    pub truncated: bool,
+    /// Ranked partner rows: coupling strength descending, then co-change
+    /// count descending, then repo-relative path ascending, then record ID.
+    pub partners: Vec<CouplingPartner<'a>>,
+    /// Explicit-empty and advisory diagnostics.
+    pub diagnostics: Vec<CouplingDiagnostic>,
+}
+
+/// Errors that can occur while resolving a co-change coupling query.
+///
+/// Each variant serializes to a stable machine-readable diagnostic
+/// (`error_type` + snake_case payload) rather than partial or silent output.
+/// Commit-handle variants mirror [`RangeDeltasError`] so range failures keep
+/// one taxonomy across the history-backed queries.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "error_type", rename_all = "snake_case")]
+pub enum CoChangeCouplingError {
+    /// The target path was empty (or empty after normalization).
+    MalformedPath {
+        /// The path as supplied.
+        path: String,
+    },
+    /// No in-scope `File` node carries the normalized repo-relative path.
+    /// Untracked, ignored, and non-source paths never have `File` nodes.
+    UnknownFile {
+        /// The normalized repo-relative path that failed to resolve.
+        path: String,
+    },
+    /// The path resolved to more than one `File` node (multi-repository
+    /// store without a repository scope).
+    AmbiguousFile {
+        /// The normalized repo-relative path.
+        path: String,
+        /// Stable record IDs of every matching `File` node.
+        candidates: Vec<String>,
+    },
+    /// The min-support threshold was outside the documented bounds.
+    InvalidMinSupport {
+        /// The rejected value.
+        min_support: usize,
+        /// The inclusive minimum (always 1).
+        min: usize,
+        /// The inclusive maximum ([`CO_CHANGE_MAX_MIN_SUPPORT`]).
+        max: usize,
+    },
+    /// The partner-row cap was outside the documented bounds.
+    InvalidLimit {
+        /// The rejected value.
+        limit: usize,
+        /// The inclusive minimum (always 1).
+        min: usize,
+        /// The inclusive maximum ([`CO_CHANGE_MAX_LIMIT`]).
+        max: usize,
+    },
+    /// The `as_of` bound was not a valid RFC 3339 instant.
+    InvalidAsOfTimestamp {
+        /// The rejected value.
+        as_of: String,
+        /// Parse failure detail.
+        message: String,
+    },
+    /// No in-scope commit is recorded at or before the `as_of` instant.
+    NoCommitAtOrBefore {
+        /// The instant as supplied.
+        as_of: String,
+    },
+    /// The selector combination was invalid (`base` without `head`, or
+    /// mixing range / `at` / `as_of` selectors).
+    MalformedSelector {
+        /// Stable description of the rejected combination.
+        message: String,
+    },
+    /// A commit prefix could not be resolved to any commit.
+    MissingCommit {
+        /// The prefix that could not be resolved.
+        commit_prefix: String,
+    },
+    /// A commit prefix was ambiguous.
+    AmbiguousCommitPrefix {
+        /// The prefix that resolved to multiple commits.
+        commit_prefix: String,
+        /// The full SHAs of the matching commits.
+        matches: Vec<String>,
+    },
+    /// Both range endpoints resolved to the same commit.
+    IdenticalEndpoints {
+        /// The full SHA both endpoints resolved to.
+        commit: String,
+    },
+    /// The range is reversed (base is a descendant of head).
+    ReversedRange {
+        /// The base commit input.
+        base: String,
+        /// The head commit input.
+        head: String,
+    },
+    /// There is no ancestor path between base and head.
+    NoPath {
+        /// The base commit input.
+        base: String,
+        /// The head commit input.
+        head: String,
+    },
+    /// The store history is empty (no commits present). Coupling requires a
+    /// temporal store produced by `scan-history`.
+    EmptyHistory,
+}
+
+impl From<RangeDeltasError> for CoChangeCouplingError {
+    fn from(err: RangeDeltasError) -> Self {
+        match err {
+            RangeDeltasError::MissingCommit { commit_prefix } => {
+                Self::MissingCommit { commit_prefix }
+            }
+            RangeDeltasError::AmbiguousCommitPrefix {
+                commit_prefix,
+                matches,
+            } => Self::AmbiguousCommitPrefix {
+                commit_prefix,
+                matches,
+            },
+            RangeDeltasError::IdenticalEndpoints { commit } => Self::IdenticalEndpoints { commit },
+            RangeDeltasError::ReversedRange { base, head } => Self::ReversedRange { base, head },
+            RangeDeltasError::NoPath { base, head } => Self::NoPath { base, head },
+            RangeDeltasError::EmptyHistory => Self::EmptyHistory,
+        }
+    }
+}
+
+/// Normalizes a user-supplied target path to the repo-relative form recorded
+/// on `File` nodes: forward slashes, no leading `./`, no trailing slash.
+fn normalize_coupling_path(raw: &str) -> Result<String, CoChangeCouplingError> {
+    let forward = raw.trim().replace('\\', "/");
+    let normalized = forward
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    if normalized.is_empty() {
+        return Err(CoChangeCouplingError::MalformedPath {
+            path: raw.to_owned(),
+        });
+    }
+    Ok(normalized)
+}
+
+/// Identity fields of one indexed `File` node used by [`co_change_coupling`].
+struct CouplingFileInfo<'a> {
+    /// Stable record ID of the `File` node.
+    record_id: &'a str,
+    /// Schema version stamped on the `File` node.
+    schema_version: u32,
+    /// Repo-relative path recorded on the `File` node.
+    path: &'a str,
+}
+
+/// Rank the files that historically changed in the same commits as
+/// `target_path` (issue #153).
+///
+/// Co-change is counted over distinct in-scope commits carrying
+/// `CHANGED_IN` edges from `File` nodes to `Commit` nodes, as recorded by
+/// `eg scan-history`. Because partners must resolve to `File` nodes, scope
+/// automatically honors the Git-tracked / `.gitignore` / supported-language
+/// boundaries of the scanner: untracked, ignored, and non-source paths never
+/// appear as target or partner.
+///
+/// Partners below `min_support` shared commits are suppressed. Rows are
+/// ranked by the symmetric Jaccard strength ([`CO_CHANGE_COUPLING_METRIC`])
+/// descending, compared exactly (integer cross-multiplication, no float
+/// rounding), with ties broken by co-change count descending, then
+/// repo-relative path ascending, then record ID - so output is byte-identical
+/// across runs on unchanged history.
+///
+/// `repo_scope`, when set, must be a resolved repository record ID (the CLI
+/// resolves `--repo` selectors first); commit resolution, file resolution,
+/// and counting are then gated to that repository.
+///
+/// Purely read-time: reads only the provided records, never Git state or the
+/// working tree.
+///
+/// # Errors
+///
+/// Returns a [`CoChangeCouplingError`] when the path is malformed, unknown,
+/// or ambiguous; when a threshold is out of bounds; when a commit handle is
+/// missing or ambiguous; when the range is identical, reversed, or
+/// unconnected; when the `as_of` bound is invalid or precedes all recorded
+/// commits; or when the store has no commit history at all.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    clippy::missing_panics_doc
+)]
+pub fn co_change_coupling<'a>(
+    records: &'a [GraphRecord],
+    target_path: &str,
+    repo_scope: Option<&str>,
+    options: &CoChangeCouplingOptions<'a>,
+) -> Result<CoChangeCoupling<'a>, CoChangeCouplingError> {
+    // ── threshold and selector validation (before any store traversal) ──────
+    if options.min_support < 1 || options.min_support > CO_CHANGE_MAX_MIN_SUPPORT {
+        return Err(CoChangeCouplingError::InvalidMinSupport {
+            min_support: options.min_support,
+            min: 1,
+            max: CO_CHANGE_MAX_MIN_SUPPORT,
+        });
+    }
+    if options.limit < 1 || options.limit > CO_CHANGE_MAX_LIMIT {
+        return Err(CoChangeCouplingError::InvalidLimit {
+            limit: options.limit,
+            min: 1,
+            max: CO_CHANGE_MAX_LIMIT,
+        });
+    }
+    if options.base.is_some() != options.head.is_some() {
+        return Err(CoChangeCouplingError::MalformedSelector {
+            message: "--base and --head must be provided together".to_owned(),
+        });
+    }
+    let selector_count = usize::from(options.base.is_some())
+        + usize::from(options.at.is_some())
+        + usize::from(options.as_of.is_some());
+    if selector_count > 1 {
+        return Err(CoChangeCouplingError::MalformedSelector {
+            message: "provide at most one of --base/--head, --at, or --as-of".to_owned(),
+        });
+    }
+
+    let normalized_path = normalize_coupling_path(target_path)?;
+
+    // ── repository scoping (record IDs gated by owning repository) ──────────
+    let repo_index = repo_scope.map(|_| RepositoryIndex::build(records));
+    let in_scope = |id: &str| -> bool {
+        match (repo_scope, repo_index.as_ref()) {
+            (Some(scope), Some(index)) => index.owner_of(id) == Some(scope),
+            _ => true,
+        }
+    };
+
+    let has_any_commits = records
+        .iter()
+        .any(|r| matches!(r.node_kind_name(), Some("Commit")));
+    if !has_any_commits {
+        return Err(CoChangeCouplingError::EmptyHistory);
+    }
+
+    // ── file index: File nodes only (tracked, non-ignored source files) ─────
+    let mut files: BTreeMap<&str, CouplingFileInfo<'a>> = BTreeMap::new();
+    let mut ids_by_path: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Node {
+            id,
+            kind: NodeKind::File,
+            schema_version,
+            repo_relative_path: Some(path),
+            ..
+        } = r
+        {
+            if !in_scope(id.as_str()) {
+                continue;
+            }
+            files.entry(id.as_str()).or_insert(CouplingFileInfo {
+                record_id: id.as_str(),
+                schema_version: *schema_version,
+                path: path.as_str(),
+            });
+            ids_by_path
+                .entry(path.as_str())
+                .or_default()
+                .insert(id.as_str());
+        }
+    }
+
+    // ── target resolution (must be an existing File node) ───────────────────
+    let target_ids = ids_by_path.get(normalized_path.as_str());
+    let target_id = match target_ids {
+        None => {
+            return Err(CoChangeCouplingError::UnknownFile {
+                path: normalized_path,
+            });
+        }
+        Some(ids) if ids.len() > 1 => {
+            return Err(CoChangeCouplingError::AmbiguousFile {
+                path: normalized_path,
+                candidates: ids.iter().map(|s| (*s).to_owned()).collect(),
+            });
+        }
+        Some(ids) => *ids.iter().next().expect("non-empty id set"),
+    };
+
+    // ── repository gating for the unscoped commit and partner universe ──────
+    // In a shared store two repositories can carry the same Git commit SHA
+    // (forks, mirrored history), and the per-file sets count bare SHAs, so
+    // without gating a file from another repository could surface as a
+    // partner of a target it never co-changed with — and, symmetrically,
+    // `--base`/`--head`/`--at`/`--as-of` could resolve against another
+    // repository's commits and answer with a misleading zero-change empty
+    // result. The target is resolved first, and everything downstream —
+    // commit topology, endpoint resolution, temporal bounds, partner files,
+    // and Change-record folding — is gated to the target file's owning
+    // repository. `--repo` scoping already guarantees this through
+    // `in_scope`; unscoped multi-repository stores are gated here through
+    // record ownership, so a foreign-repository endpoint fails with the
+    // same `missing_commit` / `no_commit_at_or_before` diagnostics the
+    // scoped path emits.
+    let owner_index: OnceCell<RepositoryIndex> = OnceCell::new();
+    let repository_count = records
+        .iter()
+        .filter(|r| matches!(r.node_kind_name(), Some("Repository")))
+        .count();
+    let target_owner: Option<Option<String>> = if repo_scope.is_none() && repository_count > 1 {
+        let index = owner_index.get_or_init(|| RepositoryIndex::build(records));
+        Some(index.owner_of(target_id).map(str::to_owned))
+    } else {
+        None
+    };
+    let effective_in_scope = |id: &str| -> bool {
+        match (&target_owner, owner_index.get()) {
+            (Some(owner), Some(index)) => index.owner_of(id) == owner.as_deref(),
+            _ => in_scope(id),
+        }
+    };
+    files.retain(|id, _| effective_in_scope(id));
+
+    // ── commit universe and temporal scope ──────────────────────────────────
+    let (parent_map, commit_valid_time) = commit_topology(records, &effective_in_scope);
+    let mut all_shas: BTreeSet<&str> = BTreeSet::new();
+    let mut sha_by_commit_id: BTreeMap<&str, &str> = BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Node {
+            id,
+            kind: NodeKind::Commit,
+            name: Some(sha),
+            ..
+        } = r
+        {
+            if effective_in_scope(id.as_str()) {
+                all_shas.insert(sha.as_str());
+                sha_by_commit_id.insert(id.as_str(), sha.as_str());
+            }
+        }
+    }
+    if all_shas.is_empty() {
+        // The target's repository carries no commits at all: coupling
+        // requires a temporal store, and answering with an empty success
+        // would be indistinguishable from "no coupling".
+        return Err(CoChangeCouplingError::EmptyHistory);
+    }
+
+    let (scope, in_scope_shas): (CouplingScope<'a>, BTreeSet<&str>) =
+        if let (Some(base), Some(head)) = (options.base, options.head) {
+            let range = resolve_commit_range(records, base, head, &effective_in_scope)?;
+            let shas = range.range_commit_shas.clone();
+            (
+                CouplingScope {
+                    selector: "commit_range",
+                    base: Some(range.base_sha),
+                    head: Some(range.head_sha),
+                    at: None,
+                    as_of: None,
+                    commit_count: shas.len(),
+                },
+                shas,
+            )
+        } else if let Some(at) = options.at {
+            let sha = resolve_commit_prefix(records, at, &effective_in_scope)?;
+            let shas: BTreeSet<&str> = reachable_commits(&parent_map, sha)
+                .intersection(&all_shas)
+                .copied()
+                .collect();
+            (
+                CouplingScope {
+                    selector: "at_commit",
+                    base: None,
+                    head: None,
+                    at: Some(sha),
+                    as_of: None,
+                    commit_count: shas.len(),
+                },
+                shas,
+            )
+        } else if let Some(as_of) = options.as_of {
+            let as_of_dt = DateTime::parse_from_rfc3339(as_of).map_err(|e| {
+                CoChangeCouplingError::InvalidAsOfTimestamp {
+                    as_of: as_of.to_owned(),
+                    message: e.to_string(),
+                }
+            })?;
+            let mut shas: BTreeSet<&str> = BTreeSet::new();
+            for sha in &all_shas {
+                if let Some(vt) = commit_valid_time.get(sha) {
+                    if let Ok(vt) = DateTime::parse_from_rfc3339(vt) {
+                        if vt <= as_of_dt {
+                            shas.insert(sha);
+                        }
+                    }
+                }
+            }
+            if shas.is_empty() {
+                return Err(CoChangeCouplingError::NoCommitAtOrBefore {
+                    as_of: as_of.to_owned(),
+                });
+            }
+            (
+                CouplingScope {
+                    selector: "as_of",
+                    base: None,
+                    head: None,
+                    at: None,
+                    as_of: Some(as_of),
+                    commit_count: shas.len(),
+                },
+                shas,
+            )
+        } else {
+            (
+                CouplingScope {
+                    selector: "full_history",
+                    base: None,
+                    head: None,
+                    at: None,
+                    as_of: None,
+                    commit_count: all_shas.len(),
+                },
+                all_shas.clone(),
+            )
+        };
+
+    // ── per-file distinct in-scope commit sets from CHANGED_IN edges ────────
+    let mut commits_by_file: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for r in records {
+        if let GraphRecord::Edge {
+            label: EdgeLabel::ChangedIn,
+            source,
+            target,
+            ..
+        } = r
+        {
+            let Some(sha) = sha_by_commit_id.get(target.as_str()) else {
+                continue; // File -> Change edges and out-of-scope commits.
+            };
+            if !files.contains_key(source.as_str()) || !in_scope_shas.contains(sha) {
+                continue;
+            }
+            commits_by_file
+                .entry(files.get(source.as_str()).expect("checked above").record_id)
+                .or_default()
+                .insert(sha);
+        }
+    }
+
+    // ── fold Change records into the commit sets (deletion coverage) ────────
+    // `scan-history` replays only paths present in a commit's tree, so a
+    // deleted path has a `Change` record for the deletion commit but no
+    // `File` snapshot and no `CHANGED_IN` edge there. Co-deletion is real
+    // co-change, so every `Change` record whose path resolves to a known
+    // `File` node contributes its commit to that file's set (a union with
+    // the edge-derived sets: add/modify entries are already covered and
+    // deduplicate). In a multi-repository store a Change record is
+    // attributed through its owning repository; an unattributable
+    // collision is skipped deterministically rather than guessed.
+    for r in records {
+        if let GraphRecord::Node {
+            id,
+            kind: NodeKind::Change,
+            repo_relative_path: Some(path),
+            temporal: Some(t),
+            ..
+        } = r
+        {
+            let sha = t.git_commit.as_str();
+            if !in_scope_shas.contains(sha) || !effective_in_scope(id.as_str()) {
+                continue;
+            }
+            let Some(candidates) = ids_by_path.get(path.as_str()) else {
+                continue; // Non-source / never-indexed paths have no File node.
+            };
+            // The candidate must survive the repository gate above, and in a
+            // multi-repository store its owner must match the Change's owner.
+            let mut viable: Vec<&str> = candidates
+                .iter()
+                .copied()
+                .filter(|candidate| files.contains_key(*candidate))
+                .filter(|candidate| {
+                    owner_index.get().is_none_or(|index| {
+                        index.owner_of(candidate) == index.owner_of(id.as_str())
+                    })
+                })
+                .collect();
+            if viable.len() != 1 {
+                continue;
+            }
+            let file_id = viable.pop().expect("len checked");
+            commits_by_file.entry(file_id).or_default().insert(sha);
+        }
+    }
+
+    let empty = BTreeSet::new();
+    let target_commits = commits_by_file.get(target_id).unwrap_or(&empty);
+    let target_change_count = target_commits.len();
+    let target_info = files.get(target_id).expect("target resolved above");
+
+    // ── partner counting, threshold, metric ─────────────────────────────────
+    let mut partners: Vec<CouplingPartner<'a>> = Vec::new();
+    for (file_id, commits) in &commits_by_file {
+        if *file_id == target_id {
+            continue;
+        }
+        let co: BTreeSet<&str> = commits.intersection(target_commits).copied().collect();
+        let co_change_count = co.len();
+        if co_change_count < options.min_support {
+            continue;
+        }
+        let partner_change_count = commits.len();
+        let union = target_change_count + partner_change_count - co_change_count;
+        let info = files.get(file_id).expect("counted files are indexed");
+        // Newest shared commit by chronological valid time, ties (and
+        // unparseable/missing times) broken by SHA: the citable handle.
+        // Valid times are parsed, never string-compared — `scan-history`
+        // preserves non-UTC committer offsets, and a lexicographic compare
+        // would mis-order them across offsets.
+        let last = co
+            .iter()
+            .max_by_key(|sha| {
+                (
+                    commit_valid_time
+                        .get(*sha)
+                        .and_then(|vt| DateTime::parse_from_rfc3339(vt).ok()),
+                    *sha,
+                )
+            })
+            .copied()
+            .expect("co_change_count >= min_support >= 1");
+        partners.push(CouplingPartner {
+            record_id: info.record_id,
+            schema_version: info.schema_version,
+            repo_relative_path: info.path,
+            co_change_count,
+            partner_change_count,
+            target_change_count,
+            coupling: co_change_count as f64 / union as f64,
+            confidence: co_change_count as f64 / target_change_count as f64,
+            last_co_change_commit: last,
+            last_co_change_valid_time: commit_valid_time.get(last).copied(),
+            trust: CO_CHANGE_COUPLING_TRUST,
+        });
+    }
+
+    // Deterministic ranking: Jaccard descending compared exactly through
+    // integer cross-multiplication (never float rounding), then co-change
+    // count descending, then path ascending, then record ID ascending.
+    partners.sort_by(|a, b| {
+        let a_union = (a.target_change_count + a.partner_change_count - a.co_change_count) as u128;
+        let b_union = (b.target_change_count + b.partner_change_count - b.co_change_count) as u128;
+        let lhs = a.co_change_count as u128 * b_union;
+        let rhs = b.co_change_count as u128 * a_union;
+        rhs.cmp(&lhs)
+            .then_with(|| b.co_change_count.cmp(&a.co_change_count))
+            .then_with(|| a.repo_relative_path.cmp(b.repo_relative_path))
+            .then_with(|| a.record_id.cmp(b.record_id))
+    });
+
+    let total_partners = partners.len();
+    let truncated = total_partners > options.limit;
+    partners.truncate(options.limit);
+
+    let mut diagnostics = Vec::new();
+    if target_change_count == 0 {
+        diagnostics.push(CouplingDiagnostic {
+            code: "target_never_changed_in_scope",
+            detail: format!(
+                "{} has a File node but no recorded change in the {} in-scope commit(s); \
+                 co-change requires at least one shared commit",
+                target_info.path, scope.commit_count
+            ),
+        });
+    } else if total_partners == 0 {
+        diagnostics.push(CouplingDiagnostic {
+            code: "no_partner_at_or_above_min_support",
+            detail: format!(
+                "no file shares at least {} in-scope commit(s) with {}; absence of coupling \
+                 is not proof of independence",
+                options.min_support, target_info.path
+            ),
+        });
+    }
+
+    Ok(CoChangeCoupling {
+        target: CouplingTarget {
+            record_id: target_info.record_id,
+            schema_version: target_info.schema_version,
+            repo_relative_path: target_info.path,
+            change_count: target_change_count,
+        },
+        scope,
+        min_support: options.min_support,
+        limit: options.limit,
+        coupling_metric: CO_CHANGE_COUPLING_METRIC,
+        disclaimer: CO_CHANGE_COUPLING_DISCLAIMER,
+        total_partners,
+        truncated,
+        partners,
         diagnostics,
     })
 }
