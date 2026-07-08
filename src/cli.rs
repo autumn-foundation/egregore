@@ -631,6 +631,35 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// List symbol nodes whose name matches a partial-name pattern.
+    ///
+    /// A pattern containing `*` is an anchored glob over the whole name
+    /// (`handle_*` for a prefix, `*_sink` for a suffix); otherwise the
+    /// pattern matches as a literal substring anywhere in the name.
+    /// Deterministic and structural-store only: no embedding model or
+    /// `--embed` store is required, and only `Symbol` node names are
+    /// searched — comments, string literals, and doc text never match
+    /// (issue #102).
+    Symbols {
+        /// Name pattern: literal substring, or an anchored `*` glob when it
+        /// contains `*`. Case-sensitive unless --case-insensitive is set.
+        pattern: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict results to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Match case-insensitively (default is case-sensitive).
+        #[arg(long)]
+        case_insensitive: bool,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Find who last changed a symbol.
     Who {
         /// Symbol name to look up.
@@ -4162,6 +4191,33 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 },
             )
         }
+        QuerySubcommand::Symbols {
+            pattern,
+            graph,
+            data_dir,
+            repo,
+            case_insensitive,
+            format,
+        } => {
+            // An empty pattern would substring-match every symbol in the
+            // store; reject it as malformed (exit 1) so the caller's typo is
+            // never conflated with a real match set or a no-match signal.
+            if pattern.is_empty() {
+                eprintln!("error: empty pattern; provide a substring or `*` glob");
+                std::process::exit(1);
+            }
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_symbols_matching(
+                &records,
+                &pattern,
+                case_insensitive,
+                format,
+                &index,
+                selected.as_deref(),
+            )
+        }
         QuerySubcommand::Who {
             name,
             graph,
@@ -7025,6 +7081,28 @@ fn symbol_result<'a>(
     all_records: &'a [GraphRecord],
     deleted: &std::collections::BTreeSet<&str>,
 ) -> Option<SymbolResult<'a>> {
+    if let GraphRecord::Node {
+        kind: NodeKind::Symbol,
+        name: node_name,
+        ..
+    } = record
+        && node_name.as_deref() == Some(name)
+    {
+        symbol_row(record, index, all_records, deleted)
+    } else {
+        None
+    }
+}
+
+/// Builds a `SymbolResult` row for any `Symbol` node record, without a name
+/// predicate. Shared by the exact-name (`query symbol`) and partial-name
+/// (`query symbols`, issue #102) paths so both emit the same row shape.
+fn symbol_row<'a>(
+    record: &'a GraphRecord,
+    index: &'a query::RepositoryIndex,
+    all_records: &'a [GraphRecord],
+    deleted: &std::collections::BTreeSet<&str>,
+) -> Option<SymbolResult<'a>> {
     let GraphRecord::Node {
         id,
         kind: NodeKind::Symbol,
@@ -7041,9 +7119,6 @@ fn symbol_result<'a>(
     else {
         return None;
     };
-    if node_name.as_deref() != Some(name) {
-        return None;
-    }
     let (completeness, _) = repo_relative_path
         .as_deref()
         .map_or(("complete", None), |path| {
@@ -7067,6 +7142,73 @@ fn symbol_result<'a>(
         extraction_completeness: completeness,
         diagnostics: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// query symbols (partial-name pattern, issue #102)
+// ---------------------------------------------------------------------------
+
+/// Lists `Symbol` nodes whose name matches a substring or anchored `*`-glob
+/// pattern against the structural store — no embedding model required.
+///
+/// Only `Symbol` node names are searched, so comments, string literals, and
+/// doc text can never produce a match. Tombstoned current-state symbols are
+/// excluded (parity with `file_defines`). Output is deterministic and
+/// byte-stable: rows are sorted by `(repo_relative_path, span.start_line,
+/// record_id)`.
+fn query_symbols_matching(
+    records: &[GraphRecord],
+    pattern: &str,
+    case_insensitive: bool,
+    format: OutputFormat,
+    index: &query::RepositoryIndex,
+    selected_repo: Option<&str>,
+) -> Result<()> {
+    let deleted = current_deleted_ids(records);
+    let mut results: Vec<SymbolResult<'_>> = records
+        .iter()
+        .filter(|r| {
+            if let GraphRecord::Node {
+                id, temporal: None, ..
+            } = r
+            {
+                !deleted.contains(id.as_str())
+            } else {
+                true
+            }
+        })
+        .filter(|r| {
+            matches!(
+                r,
+                GraphRecord::Node {
+                    kind: NodeKind::Symbol,
+                    name: Some(node_name),
+                    ..
+                } if query::symbol_name_matches(pattern, node_name, case_insensitive)
+            )
+        })
+        .filter_map(|r| symbol_row(r, index, records, &deleted))
+        .collect();
+    if let Some(repo) = selected_repo {
+        results.retain(|r| r.repository_id == Some(repo));
+    }
+
+    if results.is_empty() {
+        eprintln!("error: no match found for pattern `{pattern}`");
+        std::process::exit(2);
+    }
+
+    results.sort_by_key(|r| {
+        (
+            r.repo_relative_path,
+            r.span.map(|s| s.start_line),
+            r.record_id,
+        )
+    });
+    for result in &results {
+        print_result(result, format)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -48,6 +48,7 @@ mod query_cli;
 mod query_lifeline;
 mod query_orient;
 mod query_subsystem;
+mod query_symbols;
 mod query_who;
 mod redaction;
 mod refresh;

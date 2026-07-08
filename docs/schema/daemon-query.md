@@ -148,6 +148,13 @@ Error responses follow the standard envelope in
 | `agent_sessions_for_repo` | reserved  | —                             | Returns `not_implemented` |
 | `criteria_for_task`      | reserved  | `task_id: string`              | Future project-graph query over [`docs/schema/project-graph.md`](project-graph.md); returns `not_implemented` until wired. |
 
+Partial-name symbol matching (`eg query symbols <PATTERN>`, issue #102) is
+**CLI-only in this slice**: the daemon exposes no substring/glob symbol verb,
+and `symbol_by_name` remains exact-match. A future daemon exposure would be a
+purely additive verb (no change to existing verbs and no
+`DAEMON_QUERY_SCHEMA_VERSION` break). See
+[`docs/cli/query.md`](../cli/query.md#eg-query-symbols).
+
 ---
 
 ## 5.1 — Repository scope (`params.repo`, issue #67)

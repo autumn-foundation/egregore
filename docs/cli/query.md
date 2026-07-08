@@ -7,6 +7,8 @@ Query an existing graph JSONL for symbols, files, semantic drift records, or by 
 ```text
 eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query symbols  <PATTERN> --graph <PATH>  [--case-insensitive] [--repo <SELECTOR>] [--format json|text]
+eg query symbols  <PATTERN> --data-dir <DIR> [--case-insensitive] [--repo <SELECTOR>] [--format json|text]
 eg query file     <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query file     <PATH>  --data-dir <DIR>  [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query drift            --graph <PATH>    [--limit N] [--repo <SELECTOR>] [--format json|text]
@@ -250,6 +252,89 @@ eg query symbol scan_repository --graph g.jsonl
 ```json
 {"record_id":"codegraph:v1:abc...","schema_version":1,"name":"scan_repository","kind":"Symbol","repo_relative_path":"src/lib.rs","span":{"start_byte":0,"end_byte":500,"start_line":51,"end_line":71},"visibility":"public","signature":"fn scan_repository(repo_path:impl AsRef<Path>)->Result<Graph>","doc":"Scans a repository working tree into a code graph."}
 ```
+
+---
+
+## eg query symbols
+
+Find `Symbol` nodes by **partial name** — a literal substring or an anchored
+`*` glob — against the structural store, with no embedding model or `--embed`
+store required (issue #102).
+
+```text
+eg query symbols <PATTERN> --graph <PATH> [--case-insensitive] [--repo <SELECTOR>] [--format json|text]
+```
+
+### Pattern semantics
+
+| Pattern | Meaning | Example matches |
+|---------|---------|-----------------|
+| no `*` | Literal substring anywhere in the name. | `handle_` matches `handle_input`, `try_handle_x`. |
+| contains `*` | Anchored glob over the **whole** name: each `*` matches any (possibly empty) run of characters; every other character is literal. | `handle_*` (prefix), `*_sink` (suffix), `Embedded*Adapter`. |
+
+No other metacharacters are supported: this slice is literal substring plus
+`*` glob only — full regular expressions and fuzzy/typo-tolerant ranking are
+out of scope. An empty pattern is rejected as malformed (exit `1`).
+
+Matching is **case-sensitive by default**; pass `--case-insensitive` to
+compare both sides Unicode-lowercased.
+
+Only `Symbol` node names are searched. Comments, string literals, and doc
+text never produce a match — the false-positive class a raw `rg` search
+cannot avoid. Tombstoned (deleted) symbols are excluded from current-state
+results, in parity with `eg query file`.
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `<PATTERN>` | yes | Substring or anchored `*`-glob name pattern (must be non-empty). |
+| `--graph <PATH>` | one of | Graph JSONL produced by `eg scan` or `eg scan-history`. |
+| `--data-dir <DIR>` | one of | Embedded `AletheiaDB` store. Structural records only — the store does **not** need `--embed`. |
+| `--case-insensitive` | no | Lowercase both pattern and names before matching. |
+| `--repo <SELECTOR>` | no | Restrict results to one repository (see [Repository scope](#repository-scope---repo-issue-67)). |
+| `--format` | no | `json` (default) or `text`. |
+
+### Output
+
+Rows have the same shape and fields as [`eg query symbol`](#eg-query-symbol):
+`record_id`, `schema_version`, `name`, `kind`, `repo_relative_path`, `span`,
+the declaration-surface fields when present, `git_commit` for temporal
+(history-graph) records, repository identity, and
+`extraction_completeness`.
+
+Output is deterministic and byte-stable: identical inputs produce identical
+bytes, with rows sorted by `(repo_relative_path, span.start_line,
+record_id)` ascending.
+
+### Exit codes
+
+Same contract as the other query subcommands, so a no-match is never
+conflated with a store-absent or malformed-input condition:
+
+| Code | Meaning |
+|------|---------|
+| `0` | At least one symbol matched and was printed. |
+| `1` | Error: missing/malformed store, both or neither of `--graph`/`--data-dir`, empty pattern, unknown/ambiguous `--repo` selector. Stderr carries the message; stdout stays empty. |
+| `2` | No symbol name matched the pattern. Stderr says `no match found for pattern ...`; stdout stays empty. |
+
+### Example
+
+```sh
+eg scan . --out g.jsonl
+eg query symbols 'handle_*' --graph g.jsonl
+```
+
+```json
+{"record_id":"codegraph:v1:abc...","schema_version":1,"name":"handle_input","kind":"Symbol","repo_relative_path":"src/alpha.rs","span":{"start_byte":0,"end_byte":100,"start_line":10,"end_line":20},"extraction_completeness":"complete"}
+{"record_id":"codegraph:v1:def...","schema_version":1,"name":"handle_request","kind":"Symbol","repo_relative_path":"src/beta.rs","span":{"start_byte":0,"end_byte":100,"start_line":30,"end_line":40},"extraction_completeness":"complete"}
+```
+
+This subcommand is **CLI-only** in this slice: the daemon exposes no
+partial-name verb (see
+[`docs/schema/daemon-query.md`](../schema/daemon-query.md)), and it does not
+accept `--at`/`--as-of`/`--tx-as-of` temporal selectors or `--daemon`
+routing.
 
 ---
 
