@@ -886,6 +886,29 @@ impl EmbeddedAletheiaSink {
         Ok(report)
     }
 
+    /// Reads the transaction-time-current serving view of the store: every
+    /// physical record from [`Self::inspect_all_records`] minus records
+    /// suppressed by an active tombstone (issue #231 retraction). Tombstones
+    /// themselves and stale-tombstoned (revived) records stay, so the fact
+    /// that a retraction happened remains visible and countable while the
+    /// retracted content is never serialized to callers. This is the bulk
+    /// analog of [`Self::read_back_current_until`] and must back any surface
+    /// that hands raw records to clients (e.g. the daemon's `GET /v1/records`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a physical record or tombstone cannot be read.
+    pub fn inspect_current_records(&self) -> AdapterResult<InspectStoreReport> {
+        let mut report = self.inspect_all_records()?;
+        let retracted = self.active_deleted_ids()?;
+        if !retracted.is_empty() {
+            report.records.retain(|record| {
+                matches!(record, GraphRecord::Tombstone { .. }) || !retracted.contains(record.id())
+            });
+        }
+        Ok(report)
+    }
+
     fn node_record_version_from_properties(
         node: &::aletheiadb::Node,
         record_id: &str,

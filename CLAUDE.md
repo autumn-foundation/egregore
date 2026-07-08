@@ -178,7 +178,8 @@ cargo run -- forget agent_memory:v1:missing --data-dir .egregore --reason "x"   
 
 `eg forget` logically retracts one record from every transaction-time-current read surface
 (structural, semantic/vector, context, task, memory, audit, failures, changes, inspect, the
-MCP tools, and the daemon's direct record lookups) by writing a citable `Retraction` event —
+MCP tools, and the daemon's record lookups — direct `GET /v1/records/{id}` and the bulk
+`GET /v1/records` serving view) by writing a citable `Retraction` event —
 actor, transaction time, redacted reason, prior record handle — plus a tombstone in the
 target's domain, through the ordinary
 adapter boundary. Deterministic code-graph facts are refused with a machine-readable error

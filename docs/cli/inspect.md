@@ -119,6 +119,13 @@ Field notes:
 JSONL-file and daemon inspection keep their existing pretty-printed JSON
 envelope, which additionally carries a `snapshot_timestamp`.
 
+Count semantics after a retraction (`eg forget`, issue #231): daemon-free
+`--data-dir` inspection is a physical inventory, so its counts include a
+retracted record's physical versions (inspect never shows content). Daemon
+inspection (`--daemon`) counts the daemon's transaction-time-current serving
+view (`GET /v1/records`), which excludes actively retracted records while
+still counting their tombstones and retraction events.
+
 ## Errors
 
 A missing store, wrong `--data-dir`, or unreadable store fails with a non-zero

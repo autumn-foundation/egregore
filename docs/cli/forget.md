@@ -71,10 +71,20 @@ record's content: `query symbol`, `file`, `semantic`, `context`, `task`,
 (`inspect_store`, `symbol_context`, `task_evidence`) all exclude it, including
 the semantic/vector index — a retracted record is filtered out of similarity
 results even though its embedding bytes remain at rest. The daemon's
-direct-lookup surfaces suppress it too: `GET /v1/records/{id}` and the
-`get_records` query verb resolve a retracted handle to no record, so knowing
-the handle is not enough to fetch the content back. The retraction event and
-the tombstone themselves stay fetchable — they are the audit trail.
+record-serving surfaces suppress it too: `GET /v1/records/{id}` and the
+`get_records` query verb resolve a retracted handle to no record, and the bulk
+`GET /v1/records` endpoint (which backs `DaemonClient::get_all_records`,
+`eg inspect --daemon`, and the MCP tools) never serializes the retracted
+record, so knowing the handle is not enough to fetch the content back. The
+retraction event and the tombstone themselves stay fetchable — they are the
+audit trail.
+
+One deliberate nuance: daemon-free `eg inspect --data-dir` reports a physical
+inventory, so its *counts* still include a retracted record's physical
+versions (content is never shown by inspect). Daemon-backed
+`eg inspect --daemon` counts the daemon's current serving view instead, which
+excludes actively retracted records while still counting their tombstones and
+retraction events.
 
 `eg query memory <handle>` on a retracted handle reports `stale_handle`
 (exit 2) rather than the content.
