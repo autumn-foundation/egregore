@@ -17,6 +17,7 @@ mod cli;
 mod codex;
 mod cross_file_calls;
 mod daemon;
+mod deps;
 mod deterministic_scan;
 mod doctor;
 mod embeddings;
