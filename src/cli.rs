@@ -11271,6 +11271,10 @@ struct ManifestDepsDeclarationJson<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<&'a str>,
     name: &'a str,
+    /// Manifest key when the entry was declared under a `package = "…"`
+    /// rename; absent for plain declarations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declared_as: Option<&'a str>,
     dependency_kind: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     declared_requirement: Option<&'a str>,
@@ -11350,6 +11354,7 @@ fn collect_manifest_deps_rows<'a>(
                 record_id: id,
                 repository: owner.and_then(|repo_id| index.display_of(repo_id)),
                 name,
+                declared_as: payload.declared_as.as_deref(),
                 dependency_kind: &payload.dependency_kind,
                 declared_requirement: payload.declared_requirement.as_deref(),
                 resolved_version: payload.resolved_version.as_deref(),
@@ -11371,6 +11376,11 @@ fn collect_manifest_deps_rows<'a>(
                     .cmp(&dependency_kind_rank(right.dependency_kind))
             })
             .then_with(|| left.name.cmp(right.name))
+            .then_with(|| {
+                left.declared_as
+                    .unwrap_or("")
+                    .cmp(right.declared_as.unwrap_or(""))
+            })
             .then_with(|| left.record_id.cmp(right.record_id))
     });
     rows
@@ -11431,8 +11441,12 @@ fn query_manifest_deps_cmd(
                     .repository
                     .map(|label| format!(" repo={label}"))
                     .unwrap_or_default();
+                let declared_as = row
+                    .declared_as
+                    .map(|key| format!(" declared-as={key}"))
+                    .unwrap_or_default();
                 println!(
-                    "{package} {kind} {name} requirement={requirement} resolved={resolved} manifest={manifest}{repository} ({record_id})",
+                    "{package} {kind} {name}{declared_as} requirement={requirement} resolved={resolved} manifest={manifest}{repository} ({record_id})",
                     package = row.declaring_package,
                     kind = row.dependency_kind,
                     name = row.name,

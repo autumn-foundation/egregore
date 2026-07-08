@@ -396,6 +396,12 @@ pub struct DependencyDeclarationPayload {
     /// set `normal` (`[dependencies]`), `dev` (`[dev-dependencies]`), or
     /// `build` (`[build-dependencies]`).
     pub dependency_kind: String,
+    /// Manifest key the entry was declared under when it differs from the
+    /// crate name (Cargo `package = "…"` rename syntax, which legitimately
+    /// declares several versions of one crate). Absent for plain
+    /// declarations. Additive per `docs/schema/schema-versioning.md §2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_as: Option<String>,
     /// Declared version requirement string exactly as written (`"1.0.228"`).
     /// Absent when the declaration carries no `version` key (e.g. a pure
     /// `path`/`git`/`workspace = true` dependency) — never fabricated.

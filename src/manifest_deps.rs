@@ -157,19 +157,49 @@ impl LockfileIndex {
         Some(Self { versions })
     }
 
-    /// Resolves one crate name against the locked versions.
+    /// Resolves one crate name against the locked versions, using the
+    /// declared version requirement to select among multiple locked versions
+    /// of the same crate (Cargo `package = "…"` rename pairs; PR #314
+    /// review).
+    ///
+    /// A single locked version resolves directly. With two or more locked
+    /// versions, the declared requirement is matched with Cargo semantics
+    /// (`semver`): exactly one satisfying version resolves as `locked`;
+    /// an absent or unparseable requirement, or one satisfying zero or
+    /// several locked versions, stays `ambiguous_in_lockfile` — never a
+    /// guess.
     #[must_use]
-    pub fn resolve(&self, crate_name: &str) -> LockResolution {
+    pub fn resolve(&self, crate_name: &str, declared_requirement: Option<&str>) -> LockResolution {
         self.versions
             .get(crate_name)
             .map_or(LockResolution::NotInLockfile, |versions| {
                 let mut iter = versions.iter();
                 match (iter.next(), iter.next()) {
                     (Some(version), None) => LockResolution::Locked(version.clone()),
-                    _ => LockResolution::AmbiguousInLockfile,
+                    _ => requirement_selects_one(versions, declared_requirement)
+                        .map_or(LockResolution::AmbiguousInLockfile, LockResolution::Locked),
                 }
             })
     }
+}
+
+/// Returns the single locked version satisfying the declared requirement,
+/// when exactly one does. Uses Cargo requirement semantics via `semver`
+/// (`"1"` means `^1`, `"0.2"` means `^0.2`). Unparseable requirements and
+/// unparseable locked versions never match.
+fn requirement_selects_one(
+    versions: &BTreeSet<String>,
+    declared_requirement: Option<&str>,
+) -> Option<String> {
+    let requirement = semver::VersionReq::parse(declared_requirement?).ok()?;
+    let mut matches = versions.iter().filter(|version| {
+        semver::Version::parse(version).is_ok_and(|parsed| requirement.matches(&parsed))
+    });
+    let selected = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(selected.clone())
 }
 
 /// One directly-declared dependency parsed from a manifest.
@@ -177,6 +207,10 @@ impl LockfileIndex {
 pub struct DeclaredDependency {
     /// Crate name (the `package` rename when present, else the table key).
     pub name: String,
+    /// Manifest key the entry was declared under, when it differs from the
+    /// crate name (Cargo `package = "…"` rename syntax). `None` for plain
+    /// declarations.
+    pub declared_as: Option<String>,
     /// Dependency table the declaration was written in.
     pub kind: DependencyKind,
     /// Version requirement string exactly as written; `None` when the
@@ -190,7 +224,7 @@ pub struct ManifestDependencies {
     /// `[package].name`; `None` for a virtual workspace manifest.
     pub package_name: Option<String>,
     /// Declarations in documented order: table order (`normal`, `dev`,
-    /// `build`), then crate name.
+    /// `build`), then crate name, then the declared-as manifest key.
     pub declarations: Vec<DeclaredDependency>,
 }
 
@@ -224,12 +258,14 @@ pub fn parse_manifest_dependencies(
             .iter()
             .map(|(key, item)| declared_dependency(key, item, kind))
             .collect();
-        entries.sort_by(|left, right| left.name.cmp(&right.name));
-        // One fact per (declaring package, name, kind): a `package = "…"`
-        // rename can collide with a plain entry of the same crate name; the
-        // stable sort keeps manifest order among equal names, so the first
-        // declaration in the table wins and stable record IDs never duplicate.
-        entries.dedup_by(|right, left| left.name == right.name);
+        // One fact per declared entry: TOML keys are unique per table, and a
+        // `package = "…"` rename legitimately declares a second version of
+        // the same crate (PR #314 review) — entries are never collapsed.
+        entries.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.declared_as.cmp(&right.declared_as))
+        });
         declarations.extend(entries);
     }
     Ok(ManifestDependencies {
@@ -251,12 +287,14 @@ fn declared_dependency(
     kind: DependencyKind,
 ) -> DeclaredDependency {
     let mut name = key.to_owned();
+    let mut declared_as = None;
     let mut declared_requirement = None;
     if let Some(requirement) = item.as_str() {
         declared_requirement = Some(requirement.to_owned());
     } else if let Some(spec) = item.as_table_like() {
         if let Some(package) = spec.get("package").and_then(|v| v.as_str()) {
             package.clone_into(&mut name);
+            declared_as = Some(key.to_owned());
         }
         if let Some(version) = spec.get("version").and_then(|v| v.as_str()) {
             declared_requirement = Some(version.to_owned());
@@ -264,6 +302,7 @@ fn declared_dependency(
     }
     DeclaredDependency {
         name,
+        declared_as,
         kind,
         declared_requirement,
     }
@@ -316,11 +355,17 @@ fn dependency_record(
     lockfile: &LockfileStatus,
 ) -> GraphRecord {
     let resolution = match lockfile {
-        LockfileStatus::Found(index) => index.resolve(&declaration.name),
+        LockfileStatus::Found(index) => index.resolve(
+            &declaration.name,
+            declaration.declared_requirement.as_deref(),
+        ),
         LockfileStatus::Invalid => LockResolution::LockfileUnreadable,
         LockfileStatus::Absent => LockResolution::NoLockfile,
     };
-    let id = stable_id(&[
+    // The declared-as manifest key joins the identity when present so a
+    // `package = "…"` rename pair yields two distinct stable IDs; plain
+    // declarations keep the historical identity inputs.
+    let mut id_parts = vec![
         "node",
         "dependency-declaration",
         repository_id,
@@ -328,7 +373,11 @@ fn dependency_record(
         declaring_package,
         declaration.kind.as_str(),
         &declaration.name,
-    ]);
+    ];
+    if let Some(declared_as) = declaration.declared_as.as_deref() {
+        id_parts.push(declared_as);
+    }
+    let id = stable_id(&id_parts);
     let requirement_text = declaration
         .declared_requirement
         .as_deref()
@@ -337,8 +386,13 @@ fn dependency_record(
         LockResolution::Locked(version) => format!("locked {version}"),
         other => other.marker().to_owned(),
     };
+    let declared_as_text = declaration
+        .declared_as
+        .as_deref()
+        .map(|key| format!(" (declared as {key})"))
+        .unwrap_or_default();
     let summary = format!(
-        "Cargo dependency {name} ({kind}) declared by {declaring_package} in {manifest_path}: requirement {requirement_text}, {resolved_text}",
+        "Cargo dependency {name}{declared_as_text} ({kind}) declared by {declaring_package} in {manifest_path}: requirement {requirement_text}, {resolved_text}",
         name = declaration.name,
         kind = declaration.kind.as_str(),
     );
@@ -353,6 +407,7 @@ fn dependency_record(
     .with_dependency(DependencyDeclarationPayload {
         declaring_package: declaring_package.to_owned(),
         dependency_kind: declaration.kind.as_str().to_owned(),
+        declared_as: declaration.declared_as.clone(),
         declared_requirement: declaration.declared_requirement.clone(),
         resolved_version: resolution.version().map(str::to_owned),
         resolution: resolution.marker().to_owned(),
@@ -520,11 +575,13 @@ clap = { version = "4.6.1", features = ["derive"] }
             vec![
                 DeclaredDependency {
                     name: "clap".to_owned(),
+                    declared_as: None,
                     kind: DependencyKind::Normal,
                     declared_requirement: Some("4.6.1".to_owned()),
                 },
                 DeclaredDependency {
                     name: "serde".to_owned(),
+                    declared_as: None,
                     kind: DependencyKind::Normal,
                     declared_requirement: Some("1.0.228".to_owned()),
                 },
@@ -551,24 +608,105 @@ alias = { package = "real-crate", version = "2" }
     }
 
     #[test]
-    fn rename_collision_yields_one_fact_per_name_and_kind() {
+    fn rename_pair_preserves_both_declarations() {
+        // Cargo's `package` rename syntax legitimately declares two versions
+        // of the same crate (PR #314 review): both entries must survive.
         let parsed = parse_manifest_dependencies(
             r#"[package]
 name = "pkg"
 
 [dependencies]
-serde = "1"
-serde-alias = { package = "serde", version = "1.0.200" }
+embedded-hal = "0.2"
+embedded-hal-1 = { package = "embedded-hal", version = "1" }
 "#,
         )
         .expect("manifest parses");
-        assert_eq!(parsed.declarations.len(), 1, "one fact per (name, kind)");
-        assert_eq!(parsed.declarations[0].name, "serde");
         assert_eq!(
-            parsed.declarations[0].declared_requirement.as_deref(),
-            Some("1"),
-            "the first declaration in the table wins deterministically"
+            parsed.declarations.len(),
+            2,
+            "one fact per declared entry — a rename never collapses a declaration"
         );
+        let plain = &parsed.declarations[0];
+        assert_eq!(plain.name, "embedded-hal");
+        assert_eq!(plain.declared_as, None);
+        assert_eq!(plain.declared_requirement.as_deref(), Some("0.2"));
+        let renamed = &parsed.declarations[1];
+        assert_eq!(renamed.name, "embedded-hal");
+        assert_eq!(renamed.declared_as.as_deref(), Some("embedded-hal-1"));
+        assert_eq!(renamed.declared_requirement.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn rename_pair_resolves_each_entry_against_its_own_requirement() {
+        let index = LockfileIndex::parse(
+            r#"version = 4
+
+[[package]]
+name = "embedded-hal"
+version = "0.2.7"
+
+[[package]]
+name = "embedded-hal"
+version = "1.0.0"
+"#,
+        )
+        .expect("lockfile parses");
+        assert_eq!(
+            index.resolve("embedded-hal", Some("0.2")),
+            LockResolution::Locked("0.2.7".to_owned()),
+            "the requirement selects among multiple locked versions"
+        );
+        assert_eq!(
+            index.resolve("embedded-hal", Some("1")),
+            LockResolution::Locked("1.0.0".to_owned())
+        );
+        // No requirement, an unparseable requirement, or a requirement that
+        // matches zero or several locked versions never picks one.
+        assert_eq!(
+            index.resolve("embedded-hal", None),
+            LockResolution::AmbiguousInLockfile
+        );
+        assert_eq!(
+            index.resolve("embedded-hal", Some("not a requirement")),
+            LockResolution::AmbiguousInLockfile
+        );
+        assert_eq!(
+            index.resolve("embedded-hal", Some(">=0.2")),
+            LockResolution::AmbiguousInLockfile,
+            "a requirement matching several locked versions stays ambiguous"
+        );
+        assert_eq!(
+            index.resolve("embedded-hal", Some("2")),
+            LockResolution::AmbiguousInLockfile,
+            "a requirement matching no locked version never guesses"
+        );
+    }
+
+    #[test]
+    fn rename_pair_records_carry_distinct_stable_ids() {
+        let records = manifest_dependency_records(
+            "repo-id",
+            "Cargo.toml",
+            r#"[package]
+name = "pkg"
+
+[dependencies]
+embedded-hal = "0.2"
+embedded-hal-1 = { package = "embedded-hal", version = "1" }
+"#,
+            &LockfileStatus::Absent,
+        );
+        assert_eq!(records.len(), 2, "both declared entries become facts");
+        assert_ne!(
+            records[0].id(),
+            records[1].id(),
+            "the manifest key participates in record identity"
+        );
+        let aliases: Vec<Option<&str>> = records
+            .iter()
+            .map(|r| r.dependency().expect("payload").declared_as.as_deref())
+            .collect();
+        assert_eq!(aliases, vec![None, Some("embedded-hal-1")]);
     }
 
     #[test]
@@ -645,14 +783,14 @@ version = "2.0.0"
         )
         .expect("lockfile parses");
         assert_eq!(
-            index.resolve("single"),
+            index.resolve("single", None),
             LockResolution::Locked("1.2.3".to_owned())
         );
         assert_eq!(
-            index.resolve("doubled"),
+            index.resolve("doubled", None),
             LockResolution::AmbiguousInLockfile
         );
-        assert_eq!(index.resolve("absent"), LockResolution::NotInLockfile);
+        assert_eq!(index.resolve("absent", None), LockResolution::NotInLockfile);
     }
 
     #[test]

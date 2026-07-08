@@ -25,7 +25,10 @@ eg query manifest-deps --data-dir <DIR>  [--name <CRATE>] [--repo <SELECTOR>] [-
 
 Reads from either a JSONL file (`--graph`) or an embedded AletheiaDB store
 (`--data-dir`). `--name <CRATE>` answers the direct lookup, returning only
-declarations of that exact crate name. In a shared multi-repo store every row
+declarations of that exact **real** crate name — both entries of a
+`package = "…"` rename pair match, since both declare the same crate; the
+local alias key is reported per row in `declared_as` but is not a lookup
+key. In a shared multi-repo store every row
 carries its owning repository's display label (`repository`), and
 `--repo <SELECTOR>` restricts the surface to one repository; an unknown or
 ambiguous selector is rejected with a machine-readable stderr diagnostic
@@ -48,11 +51,15 @@ under the repository root — honoring the same Git-scope and ignore rules as
 source discovery — and parses it with a real TOML parser (`toml_edit`), never
 a regex or token grep. Each entry in `[dependencies]`, `[dev-dependencies]`,
 and `[build-dependencies]` becomes one `DependencyDeclaration` node per
-(declaring package, dependency name, dependency kind):
+declared entry (manifest key):
 
 - **`name`** — the crate name. A `package = "real-name"` rename records the
   *real* crate name, since that is what the lockfile lists and what "do we
-  depend on X?" means.
+  depend on X?" means; the manifest key it was declared under is kept in
+  **`declared_as`** (absent for plain declarations). A rename pair that
+  declares two versions of the same crate (e.g. `embedded-hal = "0.2"` plus
+  `embedded-hal-1 = { package = "embedded-hal", version = "1" }`) yields two
+  facts with distinct stable IDs — declarations are never collapsed.
 - **`dependency_kind`** — `normal`, `dev`, or `build`, from the table the
   declaration was written in.
 - **`declared_requirement`** — the `version` string exactly as written
@@ -61,14 +68,20 @@ and `[build-dependencies]` becomes one `DependencyDeclaration` node per
 - **`resolved_version`** / **`resolution`** — the manifest resolves against
   the nearest `Cargo.lock`, walking up from the manifest's directory to the
   repository root (the standard workspace layout keeps one root lockfile).
-  The `resolution` marker is drawn from a closed set:
+  A single locked version of the crate resolves directly. When the lockfile
+  lists several versions (rename pairs), the entry's own declared requirement
+  selects among them with Cargo semantics (`"1"` means `^1`): exactly one
+  satisfying version is `locked`; an absent or unparseable requirement, or
+  one satisfying zero or several locked versions, stays
+  `ambiguous_in_lockfile` — never a guess. The `resolution` marker is drawn
+  from a closed set:
 
   | Marker | Meaning | `resolved_version` |
   |--------|---------|--------------------|
   | `locked` | exactly one version of the crate is in the lockfile | present |
   | `no_lockfile` | no `Cargo.lock` found for this manifest | absent |
   | `not_in_lockfile` | lockfile exists but does not list the crate | absent |
-  | `ambiguous_in_lockfile` | the lockfile lists two or more versions | absent — never a guess |
+  | `ambiguous_in_lockfile` | the lockfile lists two or more versions and the declared requirement cannot select exactly one | absent — never a guess |
   | `lockfile_unreadable` | the **nearest** `Cargo.lock` exists but could not be read or parsed | absent — an ancestor lockfile is never consulted in its place |
 
 - **`declaring_package`** — `[package].name` of the owning manifest.

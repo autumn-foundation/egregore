@@ -352,8 +352,10 @@ runs, and sorted by path, start line, then record ID. See `docs/cli/unreferenced
 
 `eg query manifest-deps` lists every directly-declared Cargo dependency captured at scan time from
 `[dependencies]`, `[dev-dependencies]`, and `[build-dependencies]` as citable
-`DependencyDeclaration` facts: crate name, kind (`normal`/`dev`/`build`), the declared version
-requirement as written, the resolved version from the nearest `Cargo.lock` (markers `locked` /
+`DependencyDeclaration` facts: crate name (plus the `declared_as` manifest key for
+`package = "…"` rename pairs, which are never collapsed), kind (`normal`/`dev`/`build`), the
+declared version requirement as written, the resolved version from the nearest `Cargo.lock`
+(the declared requirement selects among multiple locked versions; markers `locked` /
 `no_lockfile` / `not_in_lockfile` / `ambiguous_in_lockfile` / `lockfile_unreadable` — never a
 guessed version, and never a fallback past an invalid nearest lockfile), the
 declaring package, and the repo-relative manifest handle. `--name <crate>` answers the direct
