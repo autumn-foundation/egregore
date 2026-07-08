@@ -861,6 +861,112 @@ fn query_file_at_data_dir_is_strictly_read_only() {
     );
 }
 
+/// A re-ingest that rewrites a snapshot for an existing commit (e.g. after an
+/// extractor change) supersedes the prior physical version of the same
+/// `(record_id, git_commit)` pair. A plain valid-time point query against
+/// `--data-dir` must return exactly one row per symbol — the current version —
+/// never a duplicate or stale superseded row (those belong to the
+/// transaction-time lane, issue #66).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_file_at_data_dir_collapses_reingested_snapshots() {
+    use aletheia_egregore::SourceSpan;
+    use aletheia_egregore::ir::Graph;
+
+    const fn line_span(start_line: usize, end_line: usize) -> SourceSpan {
+        SourceSpan {
+            start_byte: 0,
+            end_byte: 100,
+            start_line,
+            end_line,
+        }
+    }
+    fn spanned_symbol(
+        name: &str,
+        path: &str,
+        body: &str,
+        sha: &str,
+        end_line: usize,
+    ) -> GraphRecord {
+        let id = stable_id(&["node", "symbol", "repo_test", path, name]);
+        GraphRecord::node(
+            id,
+            NodeKind::Symbol,
+            Some(path.to_owned()),
+            Some(line_span(1, end_line)),
+            Some(name.to_owned()),
+            format!("Symbol {name} in {path}\nSource:\n{body}"),
+        )
+        .with_temporal(temporal(sha, &[], T1))
+    }
+
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+
+    // First ingest: original extraction of commit c1sha0000.
+    let mut graph_v1 = Graph::new();
+    graph_v1.push(commit("c1sha0000", &[], T1));
+    graph_v1.push(file_snapshot("src/f.rs", "F1", "c1sha0000", T1));
+    graph_v1.push(spanned_symbol("sym_a", "src/f.rs", "A1", "c1sha0000", 5));
+    let graph_v1_path = temp.path().join("v1.graph.jsonl");
+    fs::write(&graph_v1_path, graph_v1.to_jsonl().expect("serialize"))
+        .expect("fixture graph should be written");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_v1_path)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    // Re-ingest: an extractor change rewrote the same commit's snapshot with a
+    // different span. Same stable IDs, same commit — the prior physical
+    // version is superseded, not tombstoned.
+    let mut graph_v2 = Graph::new();
+    graph_v2.push(commit("c1sha0000", &[], T1));
+    graph_v2.push(file_snapshot("src/f.rs", "F1", "c1sha0000", T1));
+    graph_v2.push(spanned_symbol("sym_a", "src/f.rs", "A2", "c1sha0000", 9));
+    let graph_v2_path = temp.path().join("v2.graph.jsonl");
+    fs::write(&graph_v2_path, graph_v2.to_jsonl().expect("serialize"))
+        .expect("fixture graph should be written");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_v2_path)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let assert = CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .args([
+            "query",
+            "file",
+            "src/f.rs",
+            "--at",
+            "c1sha0000",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&out).expect("stdout should be JSON");
+    let symbols = body["symbols"].as_array().expect("symbols array");
+    assert_eq!(
+        symbols.len(),
+        1,
+        "one symbol must yield exactly one row — never a superseded duplicate: {out}"
+    );
+    assert_eq!(symbols[0]["name"], "sym_a");
+    assert_eq!(
+        symbols[0]["span"]["end_line"], 9,
+        "the row must carry the current (re-ingested) span, not the stale one"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Fixture helpers (mirrors tests/integration/range_deltas.rs)
 // ---------------------------------------------------------------------------

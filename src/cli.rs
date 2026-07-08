@@ -4641,11 +4641,17 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 }
                 // Strictly read-only lane (issue #158): opening the embedded
                 // engine in place re-persists its on-disk index files, so
-                // `--data-dir` reads the history-inclusive view from a
-                // throwaway copy (issue #85 contract), never the live store.
+                // `--data-dir` reads from a throwaway copy, never the live
+                // store. The copy uses the *current-state* read — the same
+                // view `query deltas` and `query symbol --at` resolve
+                // against: it still includes every commit snapshot, but
+                // collapses a re-ingested snapshot of the same
+                // `(record_id, commit)` pair to its current version.
+                // Superseded prior versions are a transaction-time concern
+                // (issue #66), not part of a plain valid-time point query.
                 let records = match (graph.as_deref(), data_dir.as_deref()) {
                     (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
-                    (None, Some(dir)) => load_records_from_db_history_readonly(dir)?,
+                    (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
                     (Some(_), Some(_)) => {
                         anyhow::bail!("provide only one of --graph or --data-dir, not both")
                     }
