@@ -792,6 +792,75 @@ fn query_file_at_cli_exit_codes() {
     assert_eq!(body["diagnostics"][0]["code"], "empty_symbol_set");
 }
 
+/// Sorted `(relative path, bytes)` fingerprint of every file under `root`
+/// (mirrors `tests/integration/evidence_freshness.rs`).
+#[cfg(feature = "embedded-aletheiadb")]
+fn dir_fingerprint(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let ft = entry.file_type().unwrap();
+            let path = entry.path();
+            if ft.is_dir() {
+                walk(&path, base, out);
+            } else if ft.is_file() {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// The point-in-time listing is strictly read-only for `--data-dir` too:
+/// opening the embedded engine in place re-persists its on-disk index files,
+/// so the query must read a throwaway copy and leave the live store
+/// byte-for-byte untouched (issue #158 read-only contract; mirrors the
+/// evidence-freshness and audit lanes).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_file_at_data_dir_is_strictly_read_only() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+    let [_first, second, _third] = seed_fixture_repo(&repo);
+    let graph_path = temp.path().join("history.graph.jsonl");
+    scan_history_graph(&repo, &graph_path);
+
+    let data_dir = temp.path().join("store");
+    CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .arg("ingest")
+        .arg(&graph_path)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let before = dir_fingerprint(&data_dir);
+    let assert = CargoCommand::cargo_bin("egregore")
+        .expect("binary should run")
+        .args(["query", "file", "src/f.rs", "--at", &second, "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_eq!(row_names(&out), vec!["f::alpha", "f::beta", "f::gamma"]);
+
+    let after = dir_fingerprint(&data_dir);
+    assert_eq!(
+        before, after,
+        "query file --at must not modify any store file when reading --data-dir"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Fixture helpers (mirrors tests/integration/range_deltas.rs)
 // ---------------------------------------------------------------------------

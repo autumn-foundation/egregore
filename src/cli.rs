@@ -4639,7 +4639,18 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                     );
                     std::process::exit(1);
                 }
-                let records = load_query_records_history(graph.as_deref(), data_dir.as_deref())?;
+                // Strictly read-only lane (issue #158): opening the embedded
+                // engine in place re-persists its on-disk index files, so
+                // `--data-dir` reads the history-inclusive view from a
+                // throwaway copy (issue #85 contract), never the live store.
+                let records = match (graph.as_deref(), data_dir.as_deref()) {
+                    (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                    (None, Some(dir)) => load_records_from_db_history_readonly(dir)?,
+                    (Some(_), Some(_)) => {
+                        anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                    }
+                    (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+                };
                 let index = query::RepositoryIndex::build(&records);
                 let selected = resolve_repo_scope(&index, repo.as_deref());
                 return query_file_at_point(
