@@ -18,9 +18,13 @@
 //! Retraction is refused for deterministic code-graph facts (`codegraph:`
 //! domain: File / Symbol / Import / CALLS edges / Commit / Change and every
 //! other scan-derived record); those are reproducible from source and must be
-//! corrected with `eg refresh` or a re-scan. It is also refused for tombstones
-//! and for retraction events themselves — forgetting the audit trail would
-//! turn retraction back into a silent hole.
+//! corrected with `eg refresh` or a re-scan. Derived semantic measurements
+//! (`semantic:` domain: `SemanticDrift` and its `DRIFTS_*` edges) are refused
+//! for the same reason — they are re-derived deterministically from history
+//! with a pinned embedding model and threshold, and as temporal records a
+//! tombstone would not actually suppress them from the current-state read.
+//! It is also refused for tombstones and for retraction events themselves —
+//! forgetting the audit trail would turn retraction back into a silent hole.
 //!
 //! Retraction is logical and bi-temporally honest: the physical record stays
 //! in the store, so a transaction-time view predating the retraction still
@@ -44,6 +48,10 @@ use crate::{
 /// Stable machine-readable error code for retraction refused on a
 /// deterministic code-graph fact.
 pub const DETERMINISTIC_CODE_FACT_CODE: &str = "deterministic_code_fact";
+
+/// Stable machine-readable error code for retraction refused on a derived
+/// semantic-domain record (`SemanticDrift` and the reserved semantic kinds).
+pub const DERIVED_SEMANTIC_RECORD_CODE: &str = "derived_semantic_record";
 
 /// Request parameters for `eg forget`.
 #[derive(Debug, Clone)]
@@ -122,6 +130,13 @@ pub enum ForgetError {
         /// Node kind name when the target is a node, `edge` for edges.
         kind: String,
     },
+    /// The target is a derived semantic-domain measurement; refused.
+    DerivedSemanticRecord {
+        /// Stable record ID of the refused target.
+        record_id: String,
+        /// Node kind name when the target is a node, `edge` for edges.
+        kind: String,
+    },
     /// The target is a tombstone or a retraction event; refused.
     UnsupportedTarget {
         /// Stable record ID of the refused target.
@@ -141,6 +156,7 @@ impl ForgetError {
             Self::InvalidTransactionTime { .. } => "invalid_transaction_time",
             Self::NotFound { .. } => "not_found",
             Self::DeterministicCodeFact { .. } => DETERMINISTIC_CODE_FACT_CODE,
+            Self::DerivedSemanticRecord { .. } => DERIVED_SEMANTIC_RECORD_CODE,
             Self::UnsupportedTarget { .. } => "unsupported_target",
         }
     }
@@ -183,6 +199,17 @@ impl ForgetError {
                     "'{record_id}' is a deterministic code-graph fact ({kind}); \
                      code facts are reproducible from source and cannot be retracted — \
                      correct them with `eg refresh` or a re-scan"
+                ),
+            }),
+            Self::DerivedSemanticRecord { record_id, kind } => serde_json::json!({
+                "record_id": record_id,
+                "kind": kind,
+                "remedy": "re-scan",
+                "message": format!(
+                    "'{record_id}' is a derived semantic measurement ({kind}); \
+                     semantic-domain records are re-derived deterministically from \
+                     history with a pinned embedding model and threshold and cannot \
+                     be retracted — correct them with a re-scan and re-ingest"
                 ),
             }),
             Self::UnsupportedTarget { record_id, detail } => serde_json::json!({
@@ -249,17 +276,32 @@ fn validate_request(req: &ForgetRequest) -> Result<(), ForgetError> {
 
 /// Refuses target classes that must never be retracted.
 fn refuse_unsupported_target(target: &GraphRecord, handle: &str) -> Result<(), ForgetError> {
+    let kind_name = || match target {
+        GraphRecord::Node { kind, .. } => kind.as_str().to_owned(),
+        GraphRecord::Edge { .. } => "edge".to_owned(),
+        GraphRecord::Tombstone { .. } => "tombstone".to_owned(),
+    };
     // Deterministic code-graph facts are reproducible from source; the
     // correction path is `eg refresh` / a re-scan, never hand deletion.
     if domain_from_record_id(handle).as_deref() == Some("codegraph") {
-        let kind = match target {
-            GraphRecord::Node { kind, .. } => kind.as_str().to_owned(),
-            GraphRecord::Edge { .. } => "edge".to_owned(),
-            GraphRecord::Tombstone { .. } => "tombstone".to_owned(),
-        };
         return Err(ForgetError::DeterministicCodeFact {
             record_id: handle.to_owned(),
-            kind,
+            kind: kind_name(),
+        });
+    }
+    // Derived semantic measurements (`SemanticDrift`, the reserved
+    // `EmbeddingModel`/`EmbeddingVector` kinds, and the `DRIFTS_*` edges) are
+    // reproducible from history with a pinned model and threshold, and the
+    // semantic schema freezes them as immutable at a stable ID
+    // (`docs/schema/semantic-drift.md`). They are also temporal records the
+    // embedded current-state read deliberately re-emits for `--at` views, so
+    // a retraction tombstone would never actually suppress them — accepting
+    // the handle would report success while `eg query drift` kept returning
+    // the record and re-runs falsely no-oped as `already_retracted`.
+    if domain_from_record_id(handle).as_deref() == Some("semantic") {
+        return Err(ForgetError::DerivedSemanticRecord {
+            record_id: handle.to_owned(),
+            kind: kind_name(),
         });
     }
     match target {
@@ -646,6 +688,73 @@ mod tests {
         let err = retract_from_records(&records, &request(&calls_edge_id()))
             .expect_err("code-graph CALLS edges are refused");
         assert_eq!(err.code(), "deterministic_code_fact");
+        assert_eq!(err.to_json()["error"]["detail"]["kind"], "edge");
+    }
+
+    fn drift_id() -> String {
+        crate::ir::semantic_stable_id(&["node", "semantic_drift", "unit-fixture"])
+    }
+
+    fn drift_node() -> GraphRecord {
+        GraphRecord::node(
+            drift_id(),
+            NodeKind::SemanticDrift,
+            Some("src/lib.rs".to_owned()),
+            None,
+            Some("parse".to_owned()),
+            "Semantic drift for parse".to_owned(),
+        )
+        .with_domain("semantic", crate::ir::SEMANTIC_SCHEMA_VERSION)
+    }
+
+    fn drift_edge_id() -> String {
+        crate::ir::semantic_stable_id(&["edge", "DRIFTS_FROM", "unit-fixture"])
+    }
+
+    fn drift_edge() -> GraphRecord {
+        GraphRecord::Edge {
+            id: drift_edge_id(),
+            schema_version: crate::ir::SEMANTIC_SCHEMA_VERSION,
+            label: EdgeLabel::DriftsFrom,
+            source: drift_id(),
+            target: symbol_id(),
+            confidence: None,
+            resolution: None,
+            temporal: None,
+            summary: "Semantic drift measurement target".to_owned(),
+            producer: None,
+        }
+    }
+
+    #[test]
+    fn refuses_derived_semantic_drift_node() {
+        let mut records = seeded();
+        records.push(drift_node());
+        let err = retract_from_records(&records, &request(&drift_id()))
+            .expect_err("derived semantic measurements are refused");
+        assert_eq!(err.code(), "derived_semantic_record");
+        assert_eq!(err.exit_code(), 1);
+        let json = err.to_json();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error"]["code"], "derived_semantic_record");
+        assert_eq!(json["error"]["detail"]["kind"], "SemanticDrift");
+        assert_eq!(json["error"]["detail"]["record_id"], drift_id());
+        let message = json["error"]["detail"]["message"]
+            .as_str()
+            .expect("message");
+        assert!(
+            message.contains("re-scan"),
+            "refusal names the re-derivation path: {message}"
+        );
+    }
+
+    #[test]
+    fn refuses_derived_semantic_edge() {
+        let mut records = seeded();
+        records.push(drift_edge());
+        let err = retract_from_records(&records, &request(&drift_edge_id()))
+            .expect_err("semantic-domain edges are refused");
+        assert_eq!(err.code(), "derived_semantic_record");
         assert_eq!(err.to_json()["error"]["detail"]["kind"], "edge");
     }
 

@@ -22,7 +22,8 @@ mod embedded {
     use std::{fs, path::Path};
 
     use aletheia_egregore::{
-        GraphRecord, NodeKind,
+        GraphRecord, NodeKind, TemporalMetadata,
+        embeddings::{CandidateVector, EmbeddingCandidate, semantic_drift_records},
         ir::{AGENT_MEMORY_SCHEMA_VERSION, EvidenceLink, agent_memory_stable_id, stable_id},
     };
     use assert_cmd::Command;
@@ -91,6 +92,48 @@ mod embedded {
         node
     }
 
+    /// Builds one deterministic `SemanticDrift` node (plus its `DRIFTS_FROM` /
+    /// `DRIFTS_PRIOR` edges) for the seeded symbol, exactly as the embeddings
+    /// pipeline emits them: temporal metadata included, so the record lands in
+    /// the embedded store's per-commit (temporal) lookup.
+    fn drift_records() -> Vec<GraphRecord> {
+        let candidate = |commit: &str, valid_time: &str, values: Vec<f32>| CandidateVector {
+            candidate: EmbeddingCandidate {
+                record_id: symbol_id(),
+                target: "symbol".to_owned(),
+                text: "symbol parse".to_owned(),
+                repo_relative_path: Some("src/lib.rs".to_owned()),
+                name: Some("parse".to_owned()),
+                temporal: Some(TemporalMetadata {
+                    git_commit: commit.to_owned(),
+                    git_parent_commits: Vec::new(),
+                    valid_time: valid_time.to_owned(),
+                    author_time: None,
+                    observed_at: valid_time.to_owned(),
+                    valid_time_source: Some("git_commit_committer_date".to_owned()),
+                }),
+            },
+            vector: values,
+        };
+        semantic_drift_records(
+            &[
+                candidate("aaaaaaaa", "2026-01-01T00:00:00Z", vec![1.0, 0.0]),
+                candidate("bbbbbbbb", "2026-01-02T00:00:00Z", vec![0.0, 1.0]),
+            ],
+            "sentence-transformers/all-MiniLM-L6-v2",
+            0.4,
+        )
+    }
+
+    fn drift_node_id() -> String {
+        drift_records()
+            .iter()
+            .find(|record| matches!(record, GraphRecord::Node { .. }))
+            .expect("drift fixture emits one node")
+            .id()
+            .to_owned()
+    }
+
     fn seed_records() -> Vec<GraphRecord> {
         let symbol = GraphRecord::node(
             symbol_id(),
@@ -110,7 +153,9 @@ mod embedded {
             CITING_TEXT,
             vec![link(&obs_id(), "agent_memory", "RELATES_TO")],
         );
-        vec![symbol, obs, citing]
+        let mut records = vec![symbol, obs, citing];
+        records.extend(drift_records());
+        records
     }
 
     /// Writes the seed fixture to JSONL and ingests it into a fresh embedded
@@ -390,6 +435,50 @@ mod embedded {
         assert!(
             stdout.contains("stale_handle"),
             "stale verdict expected: {stdout}"
+        );
+    }
+
+    /// Derived semantic measurements are refused like code facts: a
+    /// `SemanticDrift` node is a temporal record the embedded current-state
+    /// read deliberately re-emits (for `--at` views), so a retraction
+    /// tombstone would never actually suppress it from `eg query drift` —
+    /// accepting the handle reported success while the record stayed
+    /// queryable and re-runs falsely no-oped as `already_retracted`.
+    #[test]
+    fn forget_refuses_derived_semantic_drift_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = seed_store(temp.path());
+        let drift_id = drift_node_id();
+
+        let (code, stdout, _) = run(&store, &["query", "drift"]);
+        assert_eq!(code, 0, "the seeded drift record is queryable: {stdout}");
+        assert!(stdout.contains(&drift_id), "drift row present: {stdout}");
+
+        let (code, _, stderr) = forget(&store, &drift_id);
+        assert_eq!(code, 1, "derived semantic records are refused: {stderr}");
+        let envelope = stderr_envelope(&stderr);
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], "derived_semantic_record");
+        assert_eq!(envelope["error"]["detail"]["kind"], "SemanticDrift");
+        assert_eq!(envelope["error"]["detail"]["record_id"], drift_id);
+        let message = envelope["error"]["detail"]["message"]
+            .as_str()
+            .expect("message");
+        assert!(
+            message.contains("re-scan"),
+            "refusal names the re-derivation path: {message}"
+        );
+
+        // The refusal writes nothing: the drift record stays queryable and a
+        // re-run is the same refusal, never an `already_retracted` no-op.
+        let (code, stdout, _) = run(&store, &["query", "drift"]);
+        assert_eq!(code, 0);
+        assert!(stdout.contains(&drift_id), "drift row untouched: {stdout}");
+        let (code, _, stderr) = forget(&store, &drift_id);
+        assert_eq!(code, 1, "re-run refuses again, never no-ops: {stderr}");
+        assert_eq!(
+            stderr_envelope(&stderr)["error"]["code"],
+            "derived_semantic_record"
         );
     }
 

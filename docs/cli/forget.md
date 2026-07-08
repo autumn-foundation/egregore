@@ -21,6 +21,9 @@ eg forget agent_memory:v1:<hex> --data-dir .egregore --reason "anything"   # act
 # Deterministic code-graph facts are refused (exit 1).
 eg forget codegraph:v5:<hex> --data-dir .egregore --reason "wrong"         # deterministic_code_fact
 
+# Derived semantic measurements are refused (exit 1).
+eg forget semantic:v1:<hex> --data-dir .egregore --reason "noisy"          # derived_semantic_record
+
 # Unknown handles exit 2.
 eg forget agent_memory:v1:doesnotexist --data-dir .egregore --reason "x"   # not_found
 ```
@@ -86,6 +89,17 @@ naming the correction path:
   "message":"… correct them with `eg refresh` or a re-scan"}}}
 ```
 
+Derived semantic measurements (`semantic:` domain — `SemanticDrift` nodes and
+their `DRIFTS_FROM` / `DRIFTS_PRIOR` edges) are refused for the same reason
+(`derived_semantic_record`, exit 1): they are re-derived deterministically
+from history with a pinned embedding model and threshold, and the semantic
+schema freezes them as immutable at a stable ID
+([`docs/schema/semantic-drift.md`](../schema/semantic-drift.md)). They are
+also temporal records the current-state read deliberately re-emits for
+`--at` views, so a retraction tombstone would never actually suppress them —
+accepting the handle would report success while `eg query drift` kept
+returning the record. Correct them with a re-scan and re-ingest.
+
 Tombstones and retraction events themselves are also refused
 (`unsupported_target`): forgetting the audit trail would turn retraction back
 into a silent hole.
@@ -111,7 +125,7 @@ rewriting.
 | Exit | Meaning |
 |------|---------|
 | 0 | Retracted, or already retracted (idempotent no-op; `action` distinguishes). |
-| 1 | Refused (`deterministic_code_fact`, `unsupported_target`) or malformed (`missing_reason`, `missing_actor`, `invalid_transaction_time`). |
+| 1 | Refused (`deterministic_code_fact`, `derived_semantic_record`, `unsupported_target`) or malformed (`missing_reason`, `missing_actor`, `invalid_transaction_time`). |
 | 2 | `not_found` — the handle resolves to no record. |
 
 Success prints one JSON envelope on stdout:
@@ -131,5 +145,6 @@ Failures print a machine-readable envelope on stderr. With a pinned
 - Bulk/glob retraction, time-window purges, and policy-driven auto-expiry.
 - Physical erasure / cryptographic shredding of bytes at rest.
 - Editing or correcting a record in place (that is supersede/contradict).
-- Retracting deterministic code-graph facts (explicitly refused above).
+- Retracting deterministic code-graph facts or derived semantic measurements
+  (explicitly refused above).
 - Re-deriving or rewriting Git history.
