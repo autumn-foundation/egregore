@@ -1463,6 +1463,9 @@ impl EmbeddedAletheiaSink {
             language,
             symbol_kind,
             disambiguator,
+            visibility,
+            signature,
+            doc,
             temporal,
             semantic_drift,
             evidence_links,
@@ -1569,6 +1572,9 @@ impl EmbeddedAletheiaSink {
         if let Some(disambiguator) = disambiguator {
             builder = builder.insert("disambiguator", disambiguator.to_string().as_str());
         }
+        builder = insert_optional(builder, "visibility", visibility.as_deref());
+        builder = insert_optional(builder, "signature", signature.as_deref());
+        builder = insert_optional(builder, "doc", doc.as_deref());
         builder = insert_temporal(builder, temporal.as_ref());
         builder = insert_semantic_drift(builder, semantic_drift.as_deref());
         builder = insert_optional(builder, "node_valid_time", valid_time.as_deref());
@@ -2216,6 +2222,17 @@ impl EmbeddedAletheiaSink {
             .map(str::parse::<u64>)
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("disambiguator parse error: {e}")))?,
+            visibility: optional_str_property(
+                record_id,
+                "visibility",
+                node.get_property("visibility"),
+            )?,
+            signature: optional_str_property(
+                record_id,
+                "signature",
+                node.get_property("signature"),
+            )?,
+            doc: optional_str_property(record_id, "doc", node.get_property("doc"))?,
             temporal: temporal_from_properties(record_id, |key| node.get_property(key))?,
             semantic_drift: semantic_drift_from_properties(record_id, |key| {
                 node.get_property(key)

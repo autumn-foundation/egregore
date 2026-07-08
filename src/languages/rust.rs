@@ -12,6 +12,7 @@ use crate::{
         SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, node_name,
         path_segments, span,
     },
+    redaction::REDACTION_POLICY_VERSION,
 };
 
 /// Extracts Rust syntax records from one source file.
@@ -299,7 +300,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         ]);
         let node_text = self.node_text(node);
         let normalized = normalize_code(node_text);
-        self.graph.push(GraphRecord::syntax_symbol(
+        let mut record = GraphRecord::syntax_symbol(
             id.clone(),
             symbol_kind,
             self.file.repo_relative_path.clone(),
@@ -308,7 +309,20 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             "rust",
             disambiguator,
             format!("Rust {symbol_kind} {qualified_name}\nSource:\n{normalized}"),
-        ));
+        );
+        if carries_declaration_surface(symbol_kind) {
+            let doc = self.symbol_doc(node);
+            let doc_present = doc.is_some();
+            record = record.with_declaration_surface(
+                Some(self.symbol_visibility(node).to_owned()),
+                Some(self.symbol_signature(node)),
+                doc,
+            );
+            if doc_present {
+                record = record.with_redaction_policy_version(REDACTION_POLICY_VERSION);
+            }
+        }
+        self.graph.push(record);
         self.add_edge(
             EdgeLabel::Defines,
             self.owner_id(),
@@ -316,6 +330,84 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             format!("{} defines {qualified_name}", self.owner_name()),
         );
         id
+    }
+
+    /// Maps the item's `pub` modifier onto the closed visibility set from
+    /// issue #124: `public`, `crate`, `restricted`, or `private`.
+    ///
+    /// `pub(self)` is semantically private; `pub(super)` and `pub(in path)`
+    /// map to `restricted`. Items with no visibility modifier are `private`.
+    fn symbol_visibility(&self, node: Node<'_>) -> &'static str {
+        let Some(modifier) = visibility_modifier(node) else {
+            return "private";
+        };
+        let text: String = self
+            .node_text(modifier)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        match text.as_str() {
+            "pub" => "public",
+            "pub(crate)" => "crate",
+            "pub(self)" => "private",
+            _ => "restricted",
+        }
+    }
+
+    /// Extracts the normalized declaration header: item keyword through the
+    /// end of the parameter list / return type / where-clause for callables,
+    /// or the item header for type-defining items. The visibility modifier is
+    /// excluded (it is carried by the `visibility` field), the body is
+    /// excluded, and interior whitespace is collapsed via [`normalize_code`].
+    fn symbol_signature(&self, node: Node<'_>) -> String {
+        let start = visibility_modifier(node).map_or_else(|| node.start_byte(), |v| v.end_byte());
+        let end = node
+            .child_by_field_name("body")
+            .filter(|body| {
+                matches!(
+                    body.kind(),
+                    "block" | "field_declaration_list" | "enum_variant_list" | "declaration_list"
+                )
+            })
+            .map_or_else(|| node.end_byte(), |body| body.start_byte());
+        normalize_code(self.source.get(start..end).unwrap_or(""))
+    }
+
+    /// Collects the item's doc comment (`///` line docs or a `/** */` block
+    /// doc) from the siblings immediately preceding the item, then applies
+    /// redaction policy v1 to the collected text.
+    ///
+    /// Attribute items between the docs and the item are skipped; any other
+    /// sibling (including plain `//` / `/* */` comments) terminates the doc
+    /// block. Returns `None` when the item has no doc comment or the collected
+    /// text is empty — the `doc` field is omitted, never an empty string.
+    fn symbol_doc(&self, node: Node<'_>) -> Option<String> {
+        let mut doc_parts: Vec<String> = Vec::new();
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            match sibling.kind() {
+                "line_comment" | "block_comment" => {
+                    let Some(text) = doc_comment_text(self.node_text(sibling)) else {
+                        break;
+                    };
+                    doc_parts.push(text);
+                }
+                "attribute_item" => {}
+                _ => break,
+            }
+            current = sibling.prev_sibling();
+        }
+        if doc_parts.is_empty() {
+            return None;
+        }
+        doc_parts.reverse();
+        let joined = doc_parts.join("\n");
+        let trimmed = joined.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(crate::redaction::redact_value(trimmed))
+        }
     }
 
     fn next_symbol_disambiguator(&mut self, symbol_kind: &str, qualified_name: &str) -> u64 {
@@ -392,6 +484,71 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 sibling.kind() == "attribute_item" && self.node_text(sibling).contains("test")
             })
     }
+}
+
+/// Returns `true` when `symbol_kind` belongs to the issue #124 declaration-
+/// surface set: the extracted Rust item kinds that carry `visibility` and
+/// `signature` fields (`impl` blocks are excluded — they have no visibility
+/// modifier and no declaration contract of their own).
+fn carries_declaration_surface(symbol_kind: &str) -> bool {
+    matches!(
+        symbol_kind,
+        "function"
+            | "method"
+            | "test"
+            | "struct"
+            | "enum"
+            | "trait"
+            | "type_alias"
+            | "const"
+            | "static"
+    )
+}
+
+/// Returns the item's `visibility_modifier` child, if any.
+fn visibility_modifier(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find(|child| child.kind() == "visibility_modifier")
+}
+
+/// Extracts doc text from one comment node's source text.
+///
+/// Returns `Some` for rustdoc outer doc comments — `///` line docs (but not
+/// `////`) and `/** */` block docs (but not `/***` or the empty `/**/`) — and
+/// `None` for every other comment shape.
+fn doc_comment_text(text: &str) -> Option<String> {
+    let text = text.trim_end();
+    if let Some(rest) = text.strip_prefix("///") {
+        if rest.starts_with('/') {
+            return None;
+        }
+        return Some(rest.strip_prefix(' ').unwrap_or(rest).to_owned());
+    }
+    if let Some(rest) = text.strip_prefix("/**") {
+        if rest.starts_with('*') || rest == "/" {
+            return None;
+        }
+        let inner = rest.strip_suffix("*/").unwrap_or(rest);
+        return Some(block_doc_text(inner));
+    }
+    None
+}
+
+/// Normalizes the interior of a `/** */` block doc: strips the per-line
+/// leading `*` gutter and one following space, trims line ends, and drops
+/// leading/trailing blank lines.
+fn block_doc_text(inner: &str) -> String {
+    let lines: Vec<&str> = inner
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix('*')
+                .map_or(trimmed, |rest| rest.strip_prefix(' ').unwrap_or(rest))
+        })
+        .collect();
+    lines.join("\n").trim().to_owned()
 }
 
 fn import_name(text: &str) -> String {

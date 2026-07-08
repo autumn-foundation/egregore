@@ -3414,6 +3414,17 @@ struct SymbolResult<'a> {
     kind: &'static str,
     repo_relative_path: Option<&'a str>,
     span: Option<SourceSpan>,
+    /// Declaration visibility class (`public` / `crate` / `restricted` /
+    /// `private`) — present on symbols extracted with issue #124 metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visibility: Option<&'a str>,
+    /// Normalized declaration header (body excluded) — present on symbols
+    /// extracted with issue #124 metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<&'a str>,
+    /// Redacted doc-comment text; omitted when the item has no doc comment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doc: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     git_commit: Option<&'a str>,
     /// Stable `Repository` record ID owning this row; absent when the store
@@ -7021,6 +7032,9 @@ fn symbol_result<'a>(
         name: node_name,
         repo_relative_path,
         span,
+        visibility,
+        signature,
+        doc,
         temporal,
         ..
     } = record
@@ -7043,6 +7057,9 @@ fn symbol_result<'a>(
         kind: "Symbol",
         repo_relative_path: repo_relative_path.as_deref(),
         span: *span,
+        visibility: visibility.as_deref(),
+        signature: signature.as_deref(),
+        doc: doc.as_deref(),
         git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
         repository_id,
         repository: repository_id.and_then(|repo| index.display_of(repo)),
@@ -7604,6 +7621,13 @@ fn query_file(
             kind: "Symbol",
             repo_relative_path: repo_relative_path.as_deref(),
             span: *span,
+            // Declaration-surface fields are a symbol-contract lane: they are
+            // returned by `eg query symbol`, not repeated on every row of the
+            // per-file listing (which would re-serialize much of the file and
+            // regress the `eg audit token-cost` savings gate).
+            visibility: None,
+            signature: None,
+            doc: None,
             git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
             repository_id,
             repository: repository_id.and_then(|repo| index.display_of(repo)),
@@ -9705,6 +9729,7 @@ trait PrintText {
 
 impl PrintText for SymbolResult<'_> {
     fn as_text(&self) -> String {
+        use std::fmt::Write as _;
         let path = self.repo_relative_path.unwrap_or("(unknown)");
         let line = self.span.map_or(0, |s| s.start_line);
         let commit = self.git_commit.map_or(String::new(), |c| format!(" [{c}]"));
@@ -9712,10 +9737,20 @@ impl PrintText for SymbolResult<'_> {
             .freshness
             .map_or(String::new(), |code| format!(" (freshness: {code})"));
         let completeness = format!(" (extraction: {})", self.extraction_completeness);
-        format!(
+        let mut text = format!(
             "{} ({}) @ {path}:{line}{commit}{freshness}{completeness}",
             self.name, self.kind
-        )
+        );
+        if let Some(visibility) = self.visibility {
+            let _ = write!(text, "\n  visibility: {visibility}");
+        }
+        if let Some(signature) = self.signature {
+            let _ = write!(text, "\n  signature: {signature}");
+        }
+        if let Some(doc) = self.doc {
+            let _ = write!(text, "\n  doc: {doc}");
+        }
+        text
     }
 }
 

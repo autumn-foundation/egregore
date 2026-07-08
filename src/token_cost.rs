@@ -348,6 +348,15 @@ struct SymbolAnswerRow<'a> {
     kind: &'static str,
     repo_relative_path: Option<&'a str>,
     span: Option<SourceSpan>,
+    /// Declaration visibility class carried by issue #124 symbol records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visibility: Option<&'a str>,
+    /// Normalized declaration header carried by issue #124 symbol records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<&'a str>,
+    /// Redacted doc-comment text carried by issue #124 symbol records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doc: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     git_commit: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -425,6 +434,7 @@ fn build_symbol_answer(
         index,
         expected_record_id,
         false,
+        true,
         |node_name, _path| node_name == Some(name),
     )
 }
@@ -441,17 +451,24 @@ fn build_file_answer(
         index,
         expected_record_id,
         true,
+        false,
         |_name, node_path| node_path == Some(path),
     )
 }
 
 /// Serializes the symbol nodes matching `include`, sorted and shaped exactly
 /// like `eg query symbol` / `eg query file`, and computes correctness facts.
+///
+/// `include_declaration_surface` mirrors the CLI shape: `eg query symbol` rows
+/// carry `visibility` / `signature` / `doc` (issue #124), while `eg query file`
+/// listing rows omit them.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_lines)]
 fn build_symbol_node_answer<F>(
     records: &[GraphRecord],
     index: &RepositoryIndex,
     expected_record_id: &str,
     include_diagnostics: bool,
+    include_declaration_surface: bool,
     include: F,
 ) -> BuiltAnswer
 where
@@ -514,6 +531,9 @@ where
             name,
             repo_relative_path,
             span,
+            visibility,
+            signature,
+            doc,
             temporal,
             ..
         } = record
@@ -533,6 +553,11 @@ where
                 kind: "Symbol",
                 repo_relative_path: path,
                 span: *span,
+                visibility: visibility
+                    .as_deref()
+                    .filter(|_| include_declaration_surface),
+                signature: signature.as_deref().filter(|_| include_declaration_surface),
+                doc: doc.as_deref().filter(|_| include_declaration_surface),
                 git_commit,
                 repository_id,
                 repository: repository_id.and_then(|repo| index.display_of(repo)),
