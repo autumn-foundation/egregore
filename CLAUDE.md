@@ -91,17 +91,12 @@ cargo run -- query undocumented --graph graph.jsonl               # exit 0 (even
 cargo run -- query undocumented --graph graph.jsonl --limit 20 --format text
 cargo run -- query undocumented --graph graph.jsonl --include-private  # whole-crate doc audit
 
-# Unwrap/expect panic-risk call-site inventory (issue #223)
-cargo run -- query unwrap-expect --graph graph.jsonl                       # exit 0, full inventory
-cargo run -- query unwrap-expect --graph graph.jsonl --path src/adapters   # subsystem-scoped
-cargo run -- query unwrap-expect --graph graph.jsonl --path src/nonexistent  # exit 2 (scope_not_found)
-cargo run -- query unwrap-expect --graph history.graph.jsonl --at <commit>   # pinned valid-time view
-
-# TODO/FIXME/HACK/XXX debt-comment marker inventory (issue #218)
-cargo run -- query debt-markers --graph graph.jsonl                         # exit 0, full inventory
-cargo run -- query debt-markers --graph graph.jsonl --path src/adapters     # subsystem-scoped
-cargo run -- query debt-markers --graph graph.jsonl --path src/nonexistent  # exit 2 (scope_not_found)
-cargo run -- query debt-markers --graph history.graph.jsonl --at <commit>   # pinned valid-time view
+# Per-file ownership shares and bus factor from Git authorship (issue #245)
+cargo run -- query ownership --graph history.graph.jsonl                    # exit 0 (even when surface is empty)
+cargo run -- query ownership src/lib.rs --graph history.graph.jsonl         # one file
+cargo run -- query ownership --graph history.graph.jsonl --at <sha>         # ownership as-of a commit
+cargo run -- query ownership does/not/exist.rs --graph history.graph.jsonl  # exit 2 (unknown_path)
+cargo run -- query ownership --graph history.graph.jsonl --as-of not-a-time # exit 1 (malformed_timestamp)
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -245,6 +240,21 @@ or missing doc capture leave blind spots, `empty_result_with_blind_spots` instea
 certified-clean claim). Output is deterministic and byte-identical across runs.
 See `docs/cli/undocumented.md`.
 
+`eg query ownership [path]` aggregates the issue #116 author-attributed history into a
+per-file ownership and bus-factor map: for every indexed source file present at the resolved
+anchor commit (repository head, `--at <sha>`, or `--as-of <rfc3339>`), a ranked author list
+with distinct in-scope commit counts and ownership shares, a primary owner (max share; ties
+break to the lexicographically smallest `(author_email, author_name)` identity), and the bus
+factor — the minimum number of top authors whose cumulative share reaches `--threshold`
+percent (default 50, integer arithmetic). Rows carry the `File` node's stable record ID and
+are ordered most-concentrated-first; `--limit` (default 100, max 1000) truncates with an
+explicit `truncated` signal. Rows are empirical history-derived leads, never declared
+ownership, review authority, or expertise; CODEOWNERS is never consulted. `author_email` is
+redaction-eligible PII per `docs/schema/redaction.md`: raw at rest in a local store, a stable
+`<REDACTED:email:hash_prefix>` marker in redaction-on exports. Unknown paths, missing/ambiguous
+commits, malformed timestamps, and out-of-range threshold/limit fail with stable
+machine-readable diagnostics (deltas-style exit codes); output is deterministic and
+byte-identical across runs. See `docs/cli/ownership.md`.
 `eg query unwrap-expect` inventories `.unwrap()` / `.expect()` panic-risk method-call sites
 detected over the Tree-sitter AST (never text in comments, strings, or doc comments). Each row
 carries a closed category (`unwrap` / `expect`), a `production` vs `test` context, the stable
