@@ -129,6 +129,7 @@ Each lead row carries:
 | `relation` | Edge label string (`CALLS`, `IMPORTS`, …). |
 | `direction` | `"inbound"` or `"outbound"`. |
 | `edge_record_id` | Stable ID of the connecting edge. |
+| `resolution` | Call resolution status (`"resolved"` / `"ambiguous"` / `"unresolved"`) for `CALLS` edges labeled by the resolution passes (issues #152/#134); omitted when the edge carries none. Filter on `resolution == "resolved"` to act only on uniquely resolved call edges. |
 | `edge_git_commit` | Git commit SHA for the edge record. |
 | `anchor_id` | The anchor record this lead is reached from. |
 | `hop` | BFS hop distance from the anchor (always ≥ 1). |

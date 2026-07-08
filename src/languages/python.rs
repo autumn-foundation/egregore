@@ -10,7 +10,7 @@ use crate::{
     ir::{EdgeLabel, Graph, GraphRecord, NodeKind, stable_id},
     languages::common::{
         SymbolBody, add_graph_edge, collapse_whitespace, emit_reference_edges, identifier_text,
-        next_symbol_ordinal, node_name, path_segments, span,
+        next_symbol_ordinal, node_name, path_segments, reference_text, span,
     },
 };
 
@@ -75,6 +75,12 @@ struct Scope {
     kind: ScopeKind,
     id: String,
 }
+
+/// Tree-sitter node kinds whose text never yields reference edges (issue #134):
+/// comment and string content must not produce `CALLS`/`REFERENCES` matches.
+/// `string_content` (not `string`) is excluded so f-string interpolation
+/// expressions still count as code.
+const REFERENCE_EXCLUDED_KINDS: &[&str] = &["comment", "string_content"];
 
 struct PythonExtractor<'graph, 'source> {
     file: &'source SourceFile,
@@ -199,7 +205,6 @@ impl<'graph, 'source> PythonExtractor<'graph, 'source> {
             self.walk_children(node);
             return;
         };
-        let node_text = self.node_text(node);
         let qualified_name = self.qualify(&local_name);
         let symbol_kind = if self.is_test_function(&local_name) {
             "test"
@@ -215,7 +220,7 @@ impl<'graph, 'source> PythonExtractor<'graph, 'source> {
         self.symbol_bodies.push(SymbolBody {
             id: id.clone(),
             name: qualified_name,
-            text: node_text.to_owned(),
+            text: reference_text(node, self.source, REFERENCE_EXCLUDED_KINDS),
         });
 
         self.scope_stack.push(Scope {

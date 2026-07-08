@@ -15,7 +15,7 @@ use crate::{
     error::{CodegraphError, Result},
     identity,
     ir::{Graph, GraphRecord, ProducerKind, SCHEMA_VERSION, stable_id, versioned_stable_id},
-    languages::cross_file::{FileFacts, cross_file_call_records},
+    languages::cross_file::{FileFacts, cross_file_call_records, label_same_file_call_resolutions},
     repository_record_from_identity, scan_source_file_records,
     schema_version::validate_record_version,
 };
@@ -23,8 +23,11 @@ use crate::{
 /// Incremental cache schema for extractor output stored on disk.
 ///
 /// v5 adds per-file cross-file resolution facts and the previously emitted
-/// cross-file record IDs (issue #152).
-const CACHE_SCHEMA_VERSION: u32 = 5;
+/// cross-file record IDs (issue #152). v6 invalidates caches whose per-file
+/// records still contain phantom comment/string-sourced reference edges
+/// (issue #134); same-file resolution labels are recomputed per scan and are
+/// never cached.
+const CACHE_SCHEMA_VERSION: u32 = 6;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -260,6 +263,10 @@ fn scan_repository_incremental_at_inner(
         graph.push(record.with_valid_time_inferred(transaction_time));
     }
     next_cache.cross_file_record_ids = cross_file_ids.into_iter().collect();
+    // Same-file resolution labeling (issue #134): recomputed over the whole
+    // assembled graph every scan — never cached — so a definition added or
+    // removed in another file re-labels an unchanged file's edges correctly.
+    label_same_file_call_resolutions(graph.records_mut(), &facts_by_file);
 
     let mut tombstoned_files = Vec::new();
     for (removed, cached_file) in &previous_cache.files {

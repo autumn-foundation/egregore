@@ -247,6 +247,9 @@ fn scan_repository_at_with_override_inner(
     for record in languages::cross_file::cross_file_call_records(&repository_id, &facts_by_file) {
         graph.push(record.with_valid_time_inferred(transaction_time));
     }
+    // Same-file resolution labeling (issue #134): stamp per-file CALLS edges
+    // backed by Tree-sitter call sites with the shared resolution status.
+    languages::cross_file::label_same_file_call_resolutions(graph.records_mut(), &facts_by_file);
 
     let languages = languages_in_graph(&graph);
     Ok(graph.stamp_producer(&code_graph_producer(&languages)))

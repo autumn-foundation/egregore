@@ -20,7 +20,10 @@ use crate::{
     },
     freshness::{self, Freshness},
     identity,
-    ir::{EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SnapshotHead, SourceSpan},
+    ir::{
+        CallResolution, EdgeLabel, EvidenceLink, Graph, GraphRecord, NodeKind, SnapshotHead,
+        SourceSpan,
+    },
     link_evidence::{self, LinkOptions},
     local_project, query, scan_repository_history_with_override, scan_repository_with_exclusions,
     schema_version::{RecordVersion, record_version},
@@ -8127,6 +8130,12 @@ struct ImpactLeadJson<'a> {
     direction: &'static str,
     /// Stable edge record ID.
     edge_record_id: &'a str,
+    /// Call resolution status ("resolved" / "ambiguous" / "unresolved") for
+    /// CALLS edges labeled by the resolution passes (issues #152/#134);
+    /// absent when the edge carries none. Lets agents filter to
+    /// resolved-only call edges.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolution: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     edge_git_commit: Option<&'a str>,
     /// Which anchor record ID reached this lead.
@@ -8210,6 +8219,7 @@ fn impact_lead_json<'a>(lead: &'a query::ImpactLead<'a>) -> Option<ImpactLeadJso
         relation: lead.relation,
         direction: lead.direction.as_str(),
         edge_record_id: lead.edge.id(),
+        resolution: lead.edge.resolution().map(CallResolution::as_str),
         edge_git_commit,
         anchor_id: lead.anchor_id,
         hop: lead.hop,

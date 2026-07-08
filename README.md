@@ -172,6 +172,12 @@ See [docs/cli/query.md](docs/cli/query.md) for the full JSON output contract, no
 Structural and semantic queries return a typed, citable handle instead of every
 line a text search would make an agent ingest — no false positives from comments
 or string literals, and no bodies to read just to learn what a file defines.
+That claim is test-enforced: reference matching runs over AST-derived text with
+comment and string content removed, decoy calls in the accuracy corpus
+(`corpus/accuracy/`) must yield zero `CALLS`/`MENTIONS` edges for the
+`eg audit accuracy` gate to pass, and name-collision `CALLS` edges carry an
+explicit `resolution` status (`resolved` / `ambiguous`) instead of being
+asserted as uniquely resolved (issue #134).
 
 That saving is **measured, not asserted**. On the pinned token-cost corpus
 (`corpus/token_cost_corpus/`), counting answer tokens with one deterministic
