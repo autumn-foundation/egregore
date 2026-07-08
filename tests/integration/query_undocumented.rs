@@ -674,3 +674,62 @@ fn query_undocumented_empty_result_with_unresolved_reexports_is_not_certified_cl
         "the unresolved re-export must still be diagnosed, got {diags:?}"
     );
 }
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn embedded_store_round_trips_import_site_docs() {
+    // The `doc` fact on an Import record (a doc comment at a `pub use`
+    // re-export site, issue #257) must survive the embedded-store ingest
+    // round-trip. If a store boundary stripped Import docs, the
+    // site-documented re-export below would fall through to its undocumented
+    // target and be wrongly reported as doc debt.
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::create_dir_all(temp.path().join("src")).expect("src dir");
+    fs::write(
+        temp.path().join("src/lib.rs"),
+        "mod internal;\n\n/// Documented at the re-export site.\npub use internal::SiteDocumented;\n\npub fn bare_fn() {}\n",
+    )
+    .expect("lib.rs");
+    fs::write(
+        temp.path().join("src/internal.rs"),
+        "pub struct SiteDocumented;\n",
+    )
+    .expect("internal.rs");
+    let jsonl = scan_repository_at_with_override(temp.path(), FIXED_TIME, Some("undoc-store"))
+        .expect("scan")
+        .to_jsonl()
+        .expect("serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+    let data_dir = temp.path().join("store");
+
+    egregore()
+        .arg("ingest")
+        .arg(&graph)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let output = egregore()
+        .args(["query", "undocumented", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: Value =
+        serde_json::from_str(std::str::from_utf8(&output).expect("utf8").trim()).expect("json");
+    let paths = item_paths(&parsed);
+    assert!(
+        !paths.iter().any(|p| p == "SiteDocumented"),
+        "the Import record's site doc must survive the store round-trip; \
+         got {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p == "bare_fn"),
+        "the genuinely undocumented symbol proves the store-backed audit ran, \
+         got {paths:?}"
+    );
+}
