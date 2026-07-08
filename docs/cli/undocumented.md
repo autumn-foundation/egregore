@@ -51,6 +51,11 @@ for whole-crate doc audits.
 
 An empty result is a **real, successful, explicit answer**: exit 0 with
 `ok:true`, an empty `items` array, and a `no_undocumented_items` diagnostic.
+`no_undocumented_items` certifies the audit clean, so it is only emitted
+when the audit had **no blind spots**; when unresolved re-exports or missing
+doc capture left symbols unasserted, the empty result instead carries an
+`empty_result_with_blind_spots` diagnostic naming the blind-spot counts —
+still exit 0, but never a certified-clean claim.
 
 ## Capability-absent verdict
 

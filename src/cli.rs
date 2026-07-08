@@ -1256,8 +1256,10 @@ enum QuerySubcommand {
     /// that every symbol is undocumented.
     ///
     /// An empty result is an explicit machine-readable success (`ok:true`,
-    /// empty `items`, a `no_undocumented_items` diagnostic), exit 0 — not an
-    /// error. Exit 1 on malformed input (unknown/ambiguous `--repo`,
+    /// empty `items`, a `no_undocumented_items` diagnostic — or
+    /// `empty_result_with_blind_spots` when unresolved re-exports or missing
+    /// doc capture kept the audit from being certified clean), exit 0 — not
+    /// an error. Exit 1 on malformed input (unknown/ambiguous `--repo`,
     /// unreadable graph). Output is deterministic and byte-stable.
     ///
     /// Documented in `docs/cli/undocumented.md`.

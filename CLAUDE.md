@@ -136,8 +136,10 @@ counts as documentation. `--include-private` widens to a whole-crate doc audit;
 `--limit` truncates deterministically with a diagnostic. The lane asserts doc presence/absence
 only — never doc quality — and a pre-#124 store yields an explicit `doc_facts_unavailable`
 capability verdict instead of treating every symbol as undocumented. Zero undocumented symbols
-is an explicit success (exit 0, `no_undocumented_items` diagnostic). Output is deterministic
-and byte-identical across runs. See `docs/cli/undocumented.md`.
+is an explicit success (exit 0, `no_undocumented_items` diagnostic; when unresolved re-exports
+or missing doc capture leave blind spots, `empty_result_with_blind_spots` instead — never a
+certified-clean claim). Output is deterministic and byte-identical across runs.
+See `docs/cli/undocumented.md`.
 
 Protected raw-artifact commands (issue #60):
 

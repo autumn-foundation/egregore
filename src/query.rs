@@ -14903,14 +14903,33 @@ pub fn undocumented_public_api<'a>(
     }
 
     if report.items.is_empty() {
-        report.diagnostics.push(PublicApiDiagnostic {
-            code: "no_undocumented_items",
-            record_id: None,
-            detail: format!(
-                "every doc-auditable symbol in scope carries a recorded doc \
-                 comment ({} considered)",
-                report.counts.considered
-            ),
+        // `no_undocumented_items` certifies the audit clean, so it requires
+        // an audit with no blind spots. When unresolved re-exports or
+        // missing doc capture left symbols unasserted, the empty result gets
+        // an honest distinct verdict instead — still exit 0, never an error.
+        let blind_spots =
+            report.counts.reexports_unresolved > 0 || report.counts.doc_capture_missing > 0;
+        report.diagnostics.push(if blind_spots {
+            PublicApiDiagnostic {
+                code: "empty_result_with_blind_spots",
+                record_id: None,
+                detail: format!(
+                    "no undocumented symbols found, but the audit has blind spots \
+                     ({} unresolved re-export(s), {} symbol record(s) without doc \
+                     capture); this is not a certified-clean claim",
+                    report.counts.reexports_unresolved, report.counts.doc_capture_missing
+                ),
+            }
+        } else {
+            PublicApiDiagnostic {
+                code: "no_undocumented_items",
+                record_id: None,
+                detail: format!(
+                    "every doc-auditable symbol in scope carries a recorded doc \
+                     comment ({} considered)",
+                    report.counts.considered
+                ),
+            }
         });
     }
 

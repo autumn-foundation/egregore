@@ -633,3 +633,44 @@ fn query_undocumented_doc_macro_expression_counts_as_documented() {
         "the genuinely undocumented sibling must still be reported, got {paths:?}"
     );
 }
+
+#[test]
+fn query_undocumented_empty_result_with_unresolved_reexports_is_not_certified_clean() {
+    // The only public entry is a re-export of an external crate: its doc
+    // presence cannot be asserted. An empty result must not be certified as
+    // "everything documented" while the audit carries that blind spot.
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::create_dir_all(temp.path().join("src")).expect("src dir");
+    fs::write(
+        temp.path().join("src/lib.rs"),
+        "pub use external_dep::Thing;\n",
+    )
+    .expect("lib.rs");
+    let jsonl = scan_repository_at_with_override(temp.path(), FIXED_TIME, Some("undoc-blind"))
+        .expect("scan")
+        .to_jsonl()
+        .expect("serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_undocumented(&graph, &[]); // still exit 0
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["items"].as_array().map(Vec::len), Some(0));
+    let diags = parsed["diagnostics"].as_array().expect("diagnostics");
+    assert!(
+        !diags.iter().any(|d| d["code"] == "no_undocumented_items"),
+        "an audit with unresolved re-exports must not be certified clean, got {diags:?}"
+    );
+    assert!(
+        diags
+            .iter()
+            .any(|d| d["code"] == "empty_result_with_blind_spots"),
+        "the empty result must carry an honest blind-spot verdict, got {diags:?}"
+    );
+    assert!(
+        diags
+            .iter()
+            .any(|d| d["code"] == "reexport_target_unresolved"),
+        "the unresolved re-export must still be diagnosed, got {diags:?}"
+    );
+}

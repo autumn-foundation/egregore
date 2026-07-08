@@ -745,9 +745,9 @@ fn doc_attribute_text(text: &str) -> Option<String> {
 }
 
 /// Decodes a Rust string literal (`"..."`, `r"..."`, `r#"..."#`, ...) into
-/// its text. Plain literals get minimal escape handling (`\"`, `\\`, `\n`,
-/// `\t`); raw literals are taken verbatim. Returns `None` for anything that
-/// is not a single string literal.
+/// its text. Raw literals are taken verbatim; plain literals are unescaped
+/// via [`unescape_string_literal`]. Returns `None` for anything that is not
+/// a single string literal.
 fn string_literal_text(literal: &str) -> Option<String> {
     if let Some(raw) = literal.strip_prefix('r') {
         let hashes = raw.len() - raw.trim_start_matches('#').len();
@@ -755,8 +755,19 @@ fn string_literal_text(literal: &str) -> Option<String> {
         return Some(quoted.strip_prefix('"')?.strip_suffix('"')?.to_owned());
     }
     let inner = literal.strip_prefix('"')?.strip_suffix('"')?;
+    Some(unescape_string_literal(inner))
+}
+
+/// Unescapes the interior of a plain Rust string literal: `\n`, `\t`, `\r`,
+/// `\0`, `\\`, `\'`, `\"`, `\xNN`, `\u{...}`, and the `\`-newline line
+/// continuation (which also swallows the next line's leading whitespace).
+///
+/// Any escape this decoder cannot decode returns the interior **verbatim**
+/// — the recorded text is kept raw rather than partially decoded (a dropped
+/// backslash would corrupt the doc fact).
+fn unescape_string_literal(inner: &str) -> String {
     let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
+    let mut chars = inner.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\\' {
             out.push(c);
@@ -765,11 +776,58 @@ fn string_literal_text(literal: &str) -> Option<String> {
         match chars.next() {
             Some('n') => out.push('\n'),
             Some('t') => out.push('\t'),
-            Some(escaped) => out.push(escaped),
-            None => return None,
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('\\') => out.push('\\'),
+            Some('\'') => out.push('\''),
+            Some('"') => out.push('"'),
+            Some('x') => {
+                let hex: String = (0..2).filter_map(|_| chars.next()).collect();
+                match u8::from_str_radix(&hex, 16) {
+                    Ok(byte) => out.push(char::from(byte)),
+                    Err(_) => return inner.to_owned(),
+                }
+            }
+            Some('u') => {
+                if chars.next() != Some('{') {
+                    return inner.to_owned();
+                }
+                let mut hex = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some(digit) => hex.push(digit),
+                        None => return inner.to_owned(),
+                    }
+                }
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(decoded) => out.push(decoded),
+                    None => return inner.to_owned(),
+                }
+            }
+            // Line continuation: `\` before a newline (or CRLF) removes the
+            // break and the following leading whitespace.
+            Some('\n') => {
+                while chars
+                    .peek()
+                    .is_some_and(|w| matches!(w, ' ' | '\t' | '\n' | '\r'))
+                {
+                    chars.next();
+                }
+            }
+            Some('\r') if chars.peek() == Some(&'\n') => {
+                while chars
+                    .peek()
+                    .is_some_and(|w| matches!(w, ' ' | '\t' | '\n' | '\r'))
+                {
+                    chars.next();
+                }
+            }
+            // Unknown escape or trailing backslash: keep the text raw.
+            _ => return inner.to_owned(),
         }
     }
-    Some(out)
+    out
 }
 
 /// Normalizes the interior of a `/** */` block doc: strips the per-line
@@ -1667,6 +1725,44 @@ mod tests {
         assert_eq!(
             doc_attribute_text(r#"#[doc="escaped \"quote\" and\nnewline"]"#),
             Some("escaped \"quote\" and\nnewline".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_string_literal_text_decodes_all_escape_forms() {
+        assert_eq!(
+            string_literal_text(r#""caf\u{e9}""#),
+            Some("café".to_owned())
+        );
+        assert_eq!(string_literal_text(r#""\x41B""#), Some("AB".to_owned()));
+        assert_eq!(
+            string_literal_text(r#""a\rb\0c\'d\"e""#),
+            Some("a\rb\0c'd\"e".to_owned())
+        );
+        // Line continuation: `\` before a newline swallows the newline and
+        // the next line's leading whitespace.
+        assert_eq!(
+            string_literal_text("\"one \\\n    two\""),
+            Some("one two".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_string_literal_text_keeps_undecodable_escapes_raw() {
+        // Never partially decode: an escape this decoder does not understand
+        // keeps the literal content verbatim instead of dropping backslashes.
+        assert_eq!(string_literal_text(r#""caf\q""#), Some(r"caf\q".to_owned()));
+        assert_eq!(
+            string_literal_text(r#""bad \u{ZZ} escape""#),
+            Some(r"bad \u{ZZ} escape".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_doc_attribute_text_decodes_unicode_escapes() {
+        assert_eq!(
+            doc_attribute_text(r#"#[doc = "caf\u{e9}"]"#),
+            Some("café".to_owned())
         );
     }
 
