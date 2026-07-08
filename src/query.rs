@@ -55,6 +55,58 @@ pub fn symbols_at_commit<'records>(
     matches
 }
 
+/// Returns `true` when a symbol `name` matches a partial-name `pattern`
+/// (issue #102).
+///
+/// Semantics (deterministic, no regex engine):
+///
+/// - A pattern containing `*` is an **anchored glob** over the whole name:
+///   each `*` matches any (possibly empty) run of characters and every other
+///   character is literal. `handle_*` is a prefix match, `*_sink` a suffix
+///   match, and a starless glob would be an exact match.
+/// - A pattern without `*` matches as a **literal substring** anywhere in the
+///   name.
+/// - Matching is case-sensitive unless `case_insensitive` is set, in which
+///   case both sides are Unicode-lowercased first.
+#[must_use]
+pub fn symbol_name_matches(pattern: &str, name: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        return symbol_name_matches(&pattern.to_lowercase(), &name.to_lowercase(), false);
+    }
+    if !pattern.contains('*') {
+        return name.contains(pattern);
+    }
+    glob_matches(pattern, name)
+}
+
+/// Anchored `*`-glob match: `pattern` must cover the whole of `name`.
+///
+/// Standard greedy algorithm: the segment before the first `*` must be a
+/// prefix, the segment after the last `*` must be a non-overlapping suffix,
+/// and the middle segments must appear in order (earliest match) in between.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let segments: Vec<&str> = pattern.split('*').collect();
+    let (first, rest_segments) = segments.split_first().expect("split yields >= 1 segment");
+    if rest_segments.is_empty() {
+        // No `*` in the pattern; anchored means exact.
+        return name == *first;
+    }
+    let Some(core) = name.strip_prefix(first) else {
+        return false;
+    };
+    let (last, middle) = rest_segments.split_last().expect("checked non-empty");
+    let Some(mut core) = core.strip_suffix(last) else {
+        return false;
+    };
+    for segment in middle {
+        match core.find(segment) {
+            Some(idx) => core = &core[idx + segment.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Returns semantic drift nodes ranked by score descending.
 #[must_use]
 pub fn largest_semantic_drifts(records: &[GraphRecord], limit: usize) -> Vec<&GraphRecord> {
