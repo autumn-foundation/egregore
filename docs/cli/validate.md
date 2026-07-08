@@ -56,7 +56,7 @@ same input is byte-identical.
    | Relation | Allowed target kinds |
    |----------|----------------------|
    | `DEFINES` | `Symbol` |
-   | `CONTAINS` | `File`, `Module`, `Commit`, `Change` |
+   | `CONTAINS` | `File`, `Module`, `Commit`, `Change`, `PanicRiskSite` |
    | `CALLS`, `MENTIONS` | `Symbol`, `Diagnostic` (unresolved-call markers) |
    | `IMPORTS` | `Import` |
 

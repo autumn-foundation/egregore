@@ -56,6 +56,9 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
             NodeKind::Commit,
             NodeKind::File,
             NodeKind::Module,
+            // `File CONTAINS PanicRiskSite`: unwrap/expect panic-risk call
+            // sites are contained by their owning file (issue #223).
+            NodeKind::PanicRiskSite,
         ]),
         EdgeLabel::Calls | EdgeLabel::Mentions => Some(&[NodeKind::Diagnostic, NodeKind::Symbol]),
         EdgeLabel::Imports => Some(&[NodeKind::Import]),

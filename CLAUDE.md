@@ -90,6 +90,12 @@ cargo run -- query public-api-deltas <base> <head> --graph history.graph.jsonl -
 cargo run -- query undocumented --graph graph.jsonl               # exit 0 (even when nothing is undocumented)
 cargo run -- query undocumented --graph graph.jsonl --limit 20 --format text
 cargo run -- query undocumented --graph graph.jsonl --include-private  # whole-crate doc audit
+
+# Unwrap/expect panic-risk call-site inventory (issue #223)
+cargo run -- query unwrap-expect --graph graph.jsonl                       # exit 0, full inventory
+cargo run -- query unwrap-expect --graph graph.jsonl --path src/adapters   # subsystem-scoped
+cargo run -- query unwrap-expect --graph graph.jsonl --path src/nonexistent  # exit 2 (scope_not_found)
+cargo run -- query unwrap-expect --graph history.graph.jsonl --at <commit>   # pinned valid-time view
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -206,6 +212,15 @@ is an explicit success (exit 0, `no_undocumented_items` diagnostic; when unresol
 or missing doc capture leave blind spots, `empty_result_with_blind_spots` instead — never a
 certified-clean claim). Output is deterministic and byte-identical across runs.
 See `docs/cli/undocumented.md`.
+
+`eg query unwrap-expect` inventories `.unwrap()` / `.expect()` panic-risk method-call sites
+detected over the Tree-sitter AST (never text in comments, strings, or doc comments). Each row
+carries a closed category (`unwrap` / `expect`), a `production` vs `test` context, the stable
+record ID, the repo-relative file/span handle, and the enclosing symbol handle (explicit `null`
+when top-level). Rows are advisory triage leads from deterministic extractor facts, never
+verdicts. Accepts `--path` (subsystem prefix), `--repo`, and `--at <commit>` (valid-time pin).
+An empty scope reports `no_sites_in_scope`; an out-of-store scope is `scope_not_found` (exit 2).
+The method set is closed for this slice. See `docs/cli/unwrap-expect.md`.
 
 Protected raw-artifact commands (issue #60):
 
