@@ -140,6 +140,11 @@ cargo run -- query manifest-deps --data-dir .egregore --format text # store-back
 cargo run -- query churn --graph history.graph.jsonl               # exit 0, ranked files
 cargo run -- query churn --graph history.graph.jsonl --limit 10    # cap output (default 50, max 500)
 cargo run -- query churn --graph graph.jsonl                       # exit 2 (no_history: not a history store)
+
+# Producer-identity drift audit against the current binary (issue #234)
+cargo run -- query producer-drift --graph graph.jsonl                  # exit 0 (even with drift)
+cargo run -- query producer-drift --data-dir .egregore --repo acme/widget  # scope one repo; bad selector exits 1
+cargo run -- query producer-drift --graph graph.jsonl --format text
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -395,6 +400,19 @@ record ID, the repo-relative path, the integer commit count, and the inclusive c
 used. Ordering is deterministic (ties break on repo-relative path) and byte-identical across
 runs; untracked or ignored paths never appear. The answer states explicitly whether `--limit`
 truncated it. See `docs/cli/churn.md`.
+
+`eg query producer-drift` audits stored producer identity against the running binary
+(issue #234): every code-graph record whose recorded `egregore_version` and/or grammar
+component versions differ from the current extractor is flagged, grouped by the distinct
+producer signature `(producer_kind, egregore_version, component set)`, with per-field
+mismatches and per-record file/span handles. Only code-graph-extraction producers
+(`code_graph_extractor`, `history_replay`, `incremental_cache`) are compared; agent-memory
+and importer producers land in a never-flagged `non_code_producer` bucket and
+`legacy_pre_v1` records keep their own bucket, never merged. A single-binary store yields
+an explicit empty drift result (`no_drift` diagnostic, exit 0) — zero false positives.
+Read-only: reports what re-extraction could change, never re-extracts or mutates the
+store, and drift never changes the exit code. Output (JSON or `--format text`) is
+deterministic and byte-identical across runs. See `docs/cli/producer-drift.md`.
 
 Protected raw-artifact commands (issue #60):
 

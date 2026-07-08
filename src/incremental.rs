@@ -46,7 +46,7 @@ use crate::{
 /// v9 adds per-file `UnsafeSite` records for `unsafe` blocks, `unsafe fn`
 /// declarations, and `unsafe impl` blocks (issue #222); older caches rebuild
 /// so reused per-file records are never missing the new sites.
-const CACHE_SCHEMA_VERSION: u32 = 9;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 9;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

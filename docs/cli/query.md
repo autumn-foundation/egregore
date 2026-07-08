@@ -38,6 +38,7 @@ eg query at       <PATH>:<LINE> --graph <PATH> [--at <COMMIT>] [--repo <SELECTOR
 eg query manifest-deps    --graph <PATH>   [--name <CRATE>] [--repo <SELECTOR>] [--format json|text]
 eg query churn            --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--format json|text]
 eg query churn            --data-dir <DIR>  [--repo <SELECTOR>] [--limit N] [--format json|text]
+eg query producer-drift   --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
 ```
 
 Evidence-backed audit subcommands have their own pages:
@@ -98,6 +99,11 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query churn` — rank Git-tracked files by **change frequency** across the
   commit history captured by `eg scan-history`, for hotspot triage
   ([churn.md](churn.md), issue #128).
+- `eg query producer-drift` — **producer-identity drift** between stored
+  records and the running binary: which records a re-extraction with the
+  installed grammar/extractor versions could change, grouped by producer
+  signature, with legacy and non-code producers bucketed separately
+  ([producer-drift.md](producer-drift.md), issue #234).
 
 - `eg query at` — resolve a **`file:line` location to its smallest enclosing
   code symbol**, with the enclosing chain reported outermost → innermost
