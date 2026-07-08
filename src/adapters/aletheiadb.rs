@@ -655,6 +655,56 @@ impl EmbeddedAletheiaSink {
             .collect())
     }
 
+    /// Maps each actively tombstoned edge's stable record ID to its recorded
+    /// source node record ID.
+    ///
+    /// The current-state read ([`Self::read_all_records`]) suppresses
+    /// tombstoned edge records entirely, so a consumer holding only that
+    /// record slice cannot resolve a tombstone whose `deleted_id` names an
+    /// *edge* to the repository owning the edge's source node (issue #234
+    /// `--repo` scoping). This read-only sweep recovers the attribution from
+    /// the physical edges the append-only store still holds. Every physical
+    /// version of a stable edge ID shares its `source_codegraph_id` (the
+    /// source participates in edge identity), so version collapse is
+    /// unnecessary. Deterministic: `BTreeMap` ordering, property reads only,
+    /// no writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a physical record cannot be read.
+    pub fn tombstoned_edge_sources(&self) -> AdapterResult<BTreeMap<String, String>> {
+        let active_tombstoned = self.active_deleted_ids()?;
+        let mut sources = BTreeMap::new();
+        for node_id in self.db.get_all_node_ids() {
+            for edge_id in self.db.get_outgoing_edges(node_id) {
+                let edge = self.db.get_edge(edge_id).map_err(|error| {
+                    read_back_error("tombstoned_edge_sources", error.to_string())
+                })?;
+                let Some(codegraph_id) = optional_str_property(
+                    "tombstoned_edge_sources",
+                    "codegraph_id",
+                    edge.get_property("codegraph_id"),
+                )?
+                else {
+                    continue;
+                };
+                if !active_tombstoned.contains(codegraph_id.as_str()) {
+                    continue;
+                }
+                let Some(source) = optional_str_property(
+                    "tombstoned_edge_sources",
+                    "source_codegraph_id",
+                    edge.get_property("source_codegraph_id"),
+                )?
+                else {
+                    continue;
+                };
+                sources.insert(codegraph_id, source);
+            }
+        }
+        Ok(sources)
+    }
+
     /// Like [`Self::read_all_records`], but also emits *superseded* non-temporal
     /// physical nodes — older versions of a stable ID that a later re-ingest
     /// replaced in the current-state index. Non-temporal node versions and

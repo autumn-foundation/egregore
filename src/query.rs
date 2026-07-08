@@ -20392,13 +20392,20 @@ fn producer_drift_record_row(record: &GraphRecord) -> ProducerDriftRecord<'_> {
 /// considered (nodes by ID, edges by source node, tombstones by deleted ID —
 /// a deleted *edge* ID resolves through the deleted edge's recorded source
 /// node, since the repository index owns node IDs only);
-/// unattributable records are excluded from a scoped run. Deterministic:
+/// unattributable records are excluded from a scoped run.
+/// `store_edge_sources` supplies edge-ID → source-node-ID attributions for
+/// edges the record slice no longer contains: an embedded store's
+/// current-state view suppresses actively tombstoned edge records, so the
+/// slice-derived map alone would drop every edge tombstone from a scoped
+/// `--data-dir` run. Pass an empty map for JSONL graphs (the superseded edge
+/// record stays in the stream). Deterministic:
 /// output ordering depends only on record content and compile-time constants.
 #[must_use]
 pub fn producer_drift<'a>(
     records: &'a [GraphRecord],
     index: &RepositoryIndex,
     repo_scope: Option<&str>,
+    store_edge_sources: &BTreeMap<String, String>,
     current: &'a CurrentProducerIdentity,
 ) -> ProducerDriftReport<'a> {
     struct GroupAccum<'a> {
@@ -20421,17 +20428,19 @@ pub fn producer_drift<'a>(
     // index owns node IDs only — resolving a deleted edge ID directly always
     // fails and would silently drop every attributable edge tombstone from a
     // scoped run. Resolve deleted edge IDs through the deleted edge's
-    // recorded source node instead; the superseded edge record stays in the
-    // slice of an ingested incremental stream, so the source is available.
-    // Records that still resolve to no repository stay excluded, as
-    // documented.
+    // recorded source node instead. In a JSONL graph the superseded edge
+    // record stays in the slice of an ingested incremental stream; an
+    // embedded store's current-state view suppresses tombstoned edges, so
+    // the caller-supplied `store_edge_sources` fills those gaps. Records
+    // that still resolve to no repository stay excluded, as documented.
     let deleted_edge_sources: BTreeMap<&str, &str> = if repo_scope.is_some() {
-        records
+        store_edge_sources
             .iter()
-            .filter_map(|record| match record {
+            .map(|(id, source)| (id.as_str(), source.as_str()))
+            .chain(records.iter().filter_map(|record| match record {
                 GraphRecord::Edge { id, source, .. } => Some((id.as_str(), source.as_str())),
                 GraphRecord::Node { .. } | GraphRecord::Tombstone { .. } => None,
-            })
+            }))
             .collect()
     } else {
         BTreeMap::new()

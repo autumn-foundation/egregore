@@ -440,15 +440,15 @@ fn repo_selector_scopes_a_multi_repo_store() {
         .stderr(predicate::str::contains("unknown_repository_selector"));
 }
 
-/// A `--repo`-scoped run must keep tombstones whose `deleted_id` names an
-/// *edge* record. `RepositoryIndex` owns node IDs only, so resolving the
-/// deleted edge ID directly always fails; attribution must go through the
-/// deleted edge's recorded source node. An ingested incremental stream keeps
-/// the superseded edge record alongside its cache-invalidation tombstone, so
-/// the source is resolvable — dropping the tombstone silently undercounts the
-/// scoped drift buckets.
-#[test]
-fn repo_scoped_run_keeps_edge_tombstones_attributable_via_edge_source() {
+/// Stable record ID of the drifted edge tombstone written by
+/// [`multi_repo_edge_tombstone_graph`].
+const EDGE_TOMBSTONE_ID: &str =
+    "codegraph:v4:00000000000000000000000000000000000000000000000000000000000000ae";
+
+/// Builds a two-repo graph plus one drifted cache-invalidation tombstone
+/// whose `deleted_id` names one of repo A's *edge* records. Returns the
+/// tempdir and the graph path.
+fn multi_repo_edge_tombstone_graph() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("temp dir");
 
     let repo_a = temp.path().join("a");
@@ -480,7 +480,7 @@ fn repo_scoped_run_keeps_edge_tombstones_attributable_via_edge_source() {
     // incremental-cache binary so it lands in the drifted bucket.
     let tombstone = serde_json::json!({
         "record_type": "tombstone",
-        "id": "codegraph:v4:00000000000000000000000000000000000000000000000000000000000000ae",
+        "id": EDGE_TOMBSTONE_ID,
         "schema_version": 4,
         "deleted_id": deleted_edge_id,
         "summary": "Invalidated stale cached record from src/lib.rs",
@@ -495,6 +495,19 @@ fn repo_scoped_run_keeps_edge_tombstones_attributable_via_edge_source() {
 
     let graph = temp.path().join("multi-tombstone.jsonl");
     fs::write(&graph, format!("{jsonl_a}{jsonl_b}{tombstone}\n")).expect("write graph");
+    (temp, graph)
+}
+
+/// A `--repo`-scoped run must keep tombstones whose `deleted_id` names an
+/// *edge* record. `RepositoryIndex` owns node IDs only, so resolving the
+/// deleted edge ID directly always fails; attribution must go through the
+/// deleted edge's recorded source node. An ingested incremental stream keeps
+/// the superseded edge record alongside its cache-invalidation tombstone, so
+/// the source is resolvable — dropping the tombstone silently undercounts the
+/// scoped drift buckets.
+#[test]
+fn repo_scoped_run_keeps_edge_tombstones_attributable_via_edge_source() {
+    let (_temp, graph) = multi_repo_edge_tombstone_graph();
 
     let run_scoped = |repo: &str| -> Value {
         let output = egregore()
@@ -526,10 +539,7 @@ fn repo_scoped_run_keeps_edge_tombstones_attributable_via_edge_source() {
     assert_eq!(drifted.len(), 1);
     let records = drifted[0]["records"].as_array().expect("records array");
     assert_eq!(records.len(), 1);
-    assert_eq!(
-        records[0]["record_id"],
-        "codegraph:v4:00000000000000000000000000000000000000000000000000000000000000ae"
-    );
+    assert_eq!(records[0]["record_id"], EDGE_TOMBSTONE_ID);
     assert_eq!(records[0]["record_type"], "tombstone");
 
     // Scoped to the sibling repo, the tombstone stays excluded: attribution
@@ -538,6 +548,68 @@ fn repo_scoped_run_keeps_edge_tombstones_attributable_via_edge_source() {
     assert_eq!(
         scoped_b["counts"]["drifted"], 0,
         "another repo's edge tombstone must stay out of a sibling scope"
+    );
+}
+
+/// The embedded store's current-state read suppresses tombstoned edge
+/// records entirely (`read_all_records` skips edges whose ID carries an
+/// active tombstone), so the record slice alone cannot resolve a deleted
+/// *edge* ID to its source node. A `--repo`-scoped `--data-dir` run must
+/// recover that attribution from the store's recorded edge sources —
+/// otherwise edge tombstones silently vanish from scoped drift counts even
+/// though the unscoped run reports them (PR #317 round-4 review).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn repo_scoped_data_dir_run_keeps_edge_tombstones_attributable() {
+    let (temp, graph) = multi_repo_edge_tombstone_graph();
+    let data_dir = temp.path().join("store");
+
+    egregore()
+        .arg("ingest")
+        .arg(&graph)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let run_data_dir = |extra: &[&str]| -> Value {
+        let mut cmd = egregore();
+        cmd.args(["query", "producer-drift"]);
+        cmd.args(extra);
+        cmd.arg("--data-dir").arg(&data_dir);
+        let output = cmd.assert().success().get_output().stdout.clone();
+        serde_json::from_str(std::str::from_utf8(&output).expect("utf8").trim())
+            .expect("stdout must be valid JSON")
+    };
+
+    // Unscoped: the active edge tombstone is in the store view and drifts.
+    let unscoped = run_data_dir(&[]);
+    assert_eq!(
+        unscoped["counts"]["drifted"], 1,
+        "the edge tombstone drifts in the unscoped data-dir run"
+    );
+
+    // Scoped to the owning repo: the store view no longer contains the
+    // deleted edge record, but the tombstone must still attribute through
+    // the store's recorded edge source.
+    let scoped_a = run_data_dir(&["--repo", "drift-repo-a"]);
+    assert_eq!(
+        scoped_a["counts"]["drifted"], 1,
+        "an attributable edge tombstone must not vanish from a scoped --data-dir run"
+    );
+    let drifted = groups_in_bucket(&scoped_a, "drifted");
+    assert_eq!(drifted.len(), 1);
+    let records = drifted[0]["records"].as_array().expect("records array");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["record_id"], EDGE_TOMBSTONE_ID);
+    assert_eq!(records[0]["record_type"], "tombstone");
+
+    // Scoped to the sibling repo, the tombstone stays excluded: attribution
+    // through the stored edge source must not leak another repo's deletions.
+    let scoped_b = run_data_dir(&["--repo", "drift-repo-b"]);
+    assert_eq!(
+        scoped_b["counts"]["drifted"], 0,
+        "another repo's edge tombstone must stay out of a sibling --data-dir scope"
     );
 }
 

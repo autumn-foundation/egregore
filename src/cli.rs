@@ -6219,13 +6219,27 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // Opening the embedded engine in place re-persists its index
             // files; producer-drift documents a read-only guarantee, so an
             // embedded store is read through a throwaway copy. The guard
-            // keeps the copy alive for the read below.
+            // keeps the copy alive for the reads below.
             let store_copy = data_dir.as_deref().map(readonly_audit_store).transpose()?;
             let effective_data_dir = store_copy.as_ref().map(|(path, _guard)| path.as_path());
             let records = load_query_records(graph.as_deref(), effective_data_dir)?;
+            // The embedded current-state view suppresses actively tombstoned
+            // edge records, so a scoped run needs the store's recorded edge
+            // sources to keep edge tombstones attributable; a JSONL graph
+            // keeps the superseded edge in the slice and needs no supplement.
+            let store_edge_sources = effective_data_dir
+                .map(load_tombstoned_edge_sources_from_db)
+                .transpose()?
+                .unwrap_or_default();
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
-            query_producer_drift_cmd(&records, &index, selected.as_deref(), format)
+            query_producer_drift_cmd(
+                &records,
+                &index,
+                selected.as_deref(),
+                &store_edge_sources,
+                format,
+            )
         }
         QuerySubcommand::Orient {
             graph,
@@ -7196,6 +7210,30 @@ fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
         let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
             .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
         sink.read_all_records()
+            .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
+    }
+    #[cfg(not(feature = "embedded-aletheiadb"))]
+    {
+        let _ = data_dir;
+        anyhow::bail!("--data-dir requires the embedded-aletheiadb feature")
+    }
+}
+
+/// Reads the actively-tombstoned-edge → source-node attribution map from an
+/// embedded store (issue #234 `--repo` scoping).
+///
+/// The current-state read suppresses tombstoned edge records, so a scoped
+/// producer-drift run cannot resolve a tombstone whose `deleted_id` names an
+/// edge from the record slice alone; this recovers the edge sources the
+/// append-only store still holds. Callers honouring the read-only guarantee
+/// must pass the same throwaway store copy they load records from.
+fn load_tombstoned_edge_sources_from_db(data_dir: &Path) -> Result<BTreeMap<String, String>> {
+    #[cfg(feature = "embedded-aletheiadb")]
+    {
+        validate_existing_embedded_store(data_dir)?;
+        let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
+            .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
+        sink.tombstoned_edge_sources()
             .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
     }
     #[cfg(not(feature = "embedded-aletheiadb"))]
@@ -13364,10 +13402,11 @@ fn query_producer_drift_cmd(
     records: &[GraphRecord],
     index: &query::RepositoryIndex,
     repo_scope: Option<&str>,
+    store_edge_sources: &BTreeMap<String, String>,
     format: OutputFormat,
 ) -> Result<()> {
     let current = query::CurrentProducerIdentity::of_running_binary();
-    let report = query::producer_drift(records, index, repo_scope, &current);
+    let report = query::producer_drift(records, index, repo_scope, store_edge_sources, &current);
 
     match format {
         OutputFormat::Json => {
