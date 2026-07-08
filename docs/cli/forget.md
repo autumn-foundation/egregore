@@ -70,7 +70,11 @@ record's content: `query symbol`, `file`, `semantic`, `context`, `task`,
 `memory`, `audit`, `failures`, `changes`, `inspect`, and the MCP tools
 (`inspect_store`, `symbol_context`, `task_evidence`) all exclude it, including
 the semantic/vector index — a retracted record is filtered out of similarity
-results even though its embedding bytes remain at rest.
+results even though its embedding bytes remain at rest. The daemon's
+direct-lookup surfaces suppress it too: `GET /v1/records/{id}` and the
+`get_records` query verb resolve a retracted handle to no record, so knowing
+the handle is not enough to fetch the content back. The retraction event and
+the tombstone themselves stay fetchable — they are the audit trail.
 
 `eg query memory <handle>` on a retracted handle reports `stale_handle`
 (exit 2) rather than the content.
@@ -100,6 +104,16 @@ also temporal records the current-state read deliberately re-emits for
 accepting the handle would report success while `eg query drift` kept
 returning the record. Correct them with a re-scan and re-ingest.
 
+Any other commit-anchored (temporal) node — e.g. a manually ingested
+observation or verification record carrying temporal metadata — is refused
+for that same mechanical reason (`temporal_record`, exit 1): the embedded
+current-state read re-emits every per-commit snapshot for `--at` history
+views regardless of tombstones, so a retraction tombstone could never
+actually suppress the record and success would be a silent lie. Correct such
+a record by re-ingesting without it. Commit-anchored **edges** stay
+retractable: evidence-link edges legitimately carry routing-only commit
+anchors, and the edge read path honors tombstones for them.
+
 Tombstones and retraction events themselves are also refused
 (`unsupported_target`): forgetting the audit trail would turn retraction back
 into a silent hole.
@@ -125,7 +139,7 @@ rewriting.
 | Exit | Meaning |
 |------|---------|
 | 0 | Retracted, or already retracted (idempotent no-op; `action` distinguishes). |
-| 1 | Refused (`deterministic_code_fact`, `derived_semantic_record`, `unsupported_target`) or malformed (`missing_reason`, `missing_actor`, `invalid_transaction_time`). |
+| 1 | Refused (`deterministic_code_fact`, `derived_semantic_record`, `temporal_record`, `unsupported_target`) or malformed (`missing_reason`, `missing_actor`, `invalid_transaction_time`). |
 | 2 | `not_found` — the handle resolves to no record. |
 
 Success prints one JSON envelope on stdout:
@@ -145,6 +159,6 @@ Failures print a machine-readable envelope on stderr. With a pinned
 - Bulk/glob retraction, time-window purges, and policy-driven auto-expiry.
 - Physical erasure / cryptographic shredding of bytes at rest.
 - Editing or correcting a record in place (that is supersede/contradict).
-- Retracting deterministic code-graph facts or derived semantic measurements
-  (explicitly refused above).
+- Retracting deterministic code-graph facts, derived semantic measurements,
+  or commit-anchored temporal nodes (explicitly refused above).
 - Re-deriving or rewriting Git history.

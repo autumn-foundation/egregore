@@ -974,6 +974,41 @@ impl EmbeddedAletheiaSink {
         Ok(None)
     }
 
+    /// Like [`Self::read_back_until`], but scoped to the
+    /// transaction-time-current view (issue #231): a record whose stable ID
+    /// is suppressed by an active (non-stale) tombstone resolves to `None`
+    /// instead of its physical latest bytes, matching the exclusion
+    /// [`Self::read_all_records`] applies to current-state slices. Tombstone
+    /// records themselves (and retraction events) resolve normally — active
+    /// tombstones are part of the current view and the audit trail.
+    ///
+    /// Direct-lookup read surfaces (the daemon's `GET /v1/records/{id}` and
+    /// the `get_records` query verb) must use this method so a retracted
+    /// record cannot be fetched by anyone who still knows its handle.
+    /// Write-path verification and internal existence checks keep using
+    /// [`Self::read_back`], which reads physical latest state regardless of
+    /// tombstones.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the embedded store cannot perform read-back or
+    /// the caller-supplied deadline expires.
+    pub(crate) fn read_back_current_until(
+        &self,
+        record_id: &str,
+        deadline: Option<Instant>,
+    ) -> AdapterResult<Option<GraphRecord>> {
+        let Some(record) = self.read_back_until(record_id, deadline)? else {
+            return Ok(None);
+        };
+        if !matches!(record, GraphRecord::Tombstone { .. })
+            && self.active_deleted_ids()?.contains(record_id)
+        {
+            return Ok(None);
+        }
+        Ok(Some(record))
+    }
+
     #[cfg(test)]
     pub(crate) fn node_observation_count_for_test(&self, record_id: &str) -> usize {
         self.node_lookup.candidate_count(record_id)
@@ -4569,6 +4604,64 @@ mod tests {
         assert!(
             !stale_tombstone_emitted,
             "stale tombstone must not appear in read_all_records output"
+        );
+    }
+
+    /// `read_back_current_until` is the direct-lookup analog of
+    /// `read_all_records` (issue #231): an actively tombstoned record
+    /// resolves to `None`, the tombstone itself stays fetchable, and a
+    /// record revived by a later re-ingest (stale tombstone) resolves again.
+    #[test]
+    fn read_back_current_suppresses_actively_tombstoned_record() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("current-read-store");
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "retracted"]);
+        let tombstone_id = stable_id(&["tombstone", &symbol_id, "current-read"]);
+
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&current_symbol_record(&symbol_id, "original", 10))
+            .expect("symbol should write");
+        sink.write_record(&GraphRecord::Tombstone {
+            id: tombstone_id.clone(),
+            schema_version: crate::ir::SCHEMA_VERSION,
+            deleted_id: symbol_id.clone(),
+            summary: "deleted".to_owned(),
+            producer: None,
+        })
+        .expect("tombstone should write");
+
+        // Physical read-back still sees the bytes (write verification lane)…
+        assert!(
+            sink.read_back(&symbol_id)
+                .expect("read_back succeeds")
+                .is_some(),
+            "physical read_back keeps returning the latest bytes"
+        );
+        // …but the current-view lookup suppresses the record.
+        assert!(
+            sink.read_back_current_until(&symbol_id, None)
+                .expect("current read succeeds")
+                .is_none(),
+            "actively tombstoned record must not resolve on the current view"
+        );
+        // The tombstone itself stays fetchable: it is part of the current view.
+        assert!(
+            matches!(
+                sink.read_back_current_until(&tombstone_id, None)
+                    .expect("tombstone read succeeds"),
+                Some(GraphRecord::Tombstone { .. })
+            ),
+            "active tombstone record must stay fetchable"
+        );
+
+        // Reviving the record supersedes the tombstone: current view resolves again.
+        sink.write_record(&current_symbol_record(&symbol_id, "restored", 20))
+            .expect("restored symbol should write");
+        assert!(
+            sink.read_back_current_until(&symbol_id, None)
+                .expect("current read succeeds")
+                .is_some(),
+            "a record revived past a stale tombstone resolves on the current view"
         );
     }
 

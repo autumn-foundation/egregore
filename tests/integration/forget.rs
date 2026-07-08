@@ -482,6 +482,69 @@ mod embedded {
         );
     }
 
+    /// Commit-anchored (temporal) nodes outside the codegraph/semantic
+    /// domains — e.g. a manually ingested observation carrying temporal
+    /// metadata — are refused like semantic drift: the embedded current-state
+    /// read re-emits every per-commit snapshot for `--at` history views
+    /// regardless of tombstones, so a retraction tombstone can never suppress
+    /// them. Accepting the handle would report success while the record
+    /// stayed in the current slice and re-runs falsely no-oped as
+    /// `already_retracted`.
+    #[test]
+    fn forget_refuses_commit_anchored_temporal_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = seed_store(temp.path());
+
+        let temporal_id = agent_memory_stable_id(&["node", "observation", "sess-231", "temporal"]);
+        let record = observation(
+            &temporal_id,
+            "commit-anchored parser claim",
+            vec![link(&symbol_id(), "codegraph", "MENTIONS_SYMBOL")],
+        )
+        .with_temporal(TemporalMetadata {
+            git_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            git_parent_commits: Vec::new(),
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: None,
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: Some("git_commit_committer_date".to_owned()),
+        });
+        let graph = temp.path().join("temporal.jsonl");
+        let line = serde_json::to_string(&record).expect("serializable");
+        fs::write(&graph, format!("{line}\n")).expect("temporal JSONL written");
+        egregore()
+            .args(["ingest"])
+            .arg(&graph)
+            .args(["--adapter", "embedded", "--data-dir"])
+            .arg(&store)
+            .assert()
+            .success();
+
+        let (code, _, stderr) = forget(&store, &temporal_id);
+        assert_eq!(code, 1, "temporal records are refused: {stderr}");
+        let envelope = stderr_envelope(&stderr);
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], "temporal_record");
+        assert_eq!(envelope["error"]["detail"]["kind"], "Observation");
+        assert_eq!(envelope["error"]["detail"]["record_id"], temporal_id);
+
+        // The refusal writes nothing: the record stays in the current-state
+        // slice and a re-run is the same refusal — never a false
+        // `already_retracted` no-op.
+        {
+            let sink = aletheia_egregore::adapters::EmbeddedAletheiaSink::open(&store)
+                .expect("store opens");
+            let records = sink.read_all_records().expect("current view reads");
+            assert!(
+                records.iter().any(|r| r.id() == temporal_id),
+                "the refused record stays untouched in the current slice"
+            );
+        }
+        let (code, _, stderr) = forget(&store, &temporal_id);
+        assert_eq!(code, 1, "re-run refuses again, never no-ops: {stderr}");
+        assert_eq!(stderr_envelope(&stderr)["error"]["code"], "temporal_record");
+    }
+
     /// AC4: deterministic code-graph facts are refused with a machine-readable
     /// error naming the correction path, and the store stays untouched.
     #[test]

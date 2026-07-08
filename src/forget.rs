@@ -23,8 +23,13 @@
 //! for the same reason — they are re-derived deterministically from history
 //! with a pinned embedding model and threshold, and as temporal records a
 //! tombstone would not actually suppress them from the current-state read.
-//! It is also refused for tombstones and for retraction events themselves —
-//! forgetting the audit trail would turn retraction back into a silent hole.
+//! Any other commit-anchored (temporal) node — e.g. a manually ingested
+//! observation carrying temporal metadata — is refused for that same
+//! mechanical reason (`temporal_record`); commit-anchored *edges* stay
+//! retractable because evidence-link edges legitimately carry routing-only
+//! commit anchors and the edge read path honors tombstones. It is also
+//! refused for tombstones and for retraction events themselves — forgetting
+//! the audit trail would turn retraction back into a silent hole.
 //!
 //! Retraction is logical and bi-temporally honest: the physical record stays
 //! in the store, so a transaction-time view predating the retraction still
@@ -52,6 +57,10 @@ pub const DETERMINISTIC_CODE_FACT_CODE: &str = "deterministic_code_fact";
 /// Stable machine-readable error code for retraction refused on a derived
 /// semantic-domain record (`SemanticDrift` and the reserved semantic kinds).
 pub const DERIVED_SEMANTIC_RECORD_CODE: &str = "derived_semantic_record";
+
+/// Stable machine-readable error code for retraction refused on a
+/// commit-anchored (temporal) node outside the codegraph/semantic domains.
+pub const TEMPORAL_RECORD_CODE: &str = "temporal_record";
 
 /// Request parameters for `eg forget`.
 #[derive(Debug, Clone)]
@@ -137,6 +146,14 @@ pub enum ForgetError {
         /// Node kind name when the target is a node, `edge` for edges.
         kind: String,
     },
+    /// The target is a commit-anchored (temporal) node; refused because the
+    /// per-commit read path re-emits it regardless of tombstones.
+    TemporalRecord {
+        /// Stable record ID of the refused target.
+        record_id: String,
+        /// Node kind name of the refused target.
+        kind: String,
+    },
     /// The target is a tombstone or a retraction event; refused.
     UnsupportedTarget {
         /// Stable record ID of the refused target.
@@ -157,6 +174,7 @@ impl ForgetError {
             Self::NotFound { .. } => "not_found",
             Self::DeterministicCodeFact { .. } => DETERMINISTIC_CODE_FACT_CODE,
             Self::DerivedSemanticRecord { .. } => DERIVED_SEMANTIC_RECORD_CODE,
+            Self::TemporalRecord { .. } => TEMPORAL_RECORD_CODE,
             Self::UnsupportedTarget { .. } => "unsupported_target",
         }
     }
@@ -210,6 +228,17 @@ impl ForgetError {
                      semantic-domain records are re-derived deterministically from \
                      history with a pinned embedding model and threshold and cannot \
                      be retracted — correct them with a re-scan and re-ingest"
+                ),
+            }),
+            Self::TemporalRecord { record_id, kind } => serde_json::json!({
+                "record_id": record_id,
+                "kind": kind,
+                "message": format!(
+                    "'{record_id}' is a commit-anchored temporal record ({kind}); \
+                     per-commit snapshots are re-emitted for `--at` history views \
+                     regardless of tombstones, so a retraction tombstone cannot \
+                     suppress it from the current read — correct it by re-ingesting \
+                     without the record"
                 ),
             }),
             Self::UnsupportedTarget { record_id, detail } => serde_json::json!({
@@ -320,6 +349,24 @@ fn refuse_unsupported_target(target: &GraphRecord, handle: &str) -> Result<(), F
                 "'{handle}' is a retraction event; forgetting the audit trail would \
                  turn retraction into a silent hole"
             ),
+        }),
+        // Commit-anchored (temporal) NODES outside the codegraph/semantic
+        // domains — e.g. a manually ingested observation carrying temporal
+        // metadata — are refused for the same mechanical reason as semantic
+        // drift: the embedded current-state read re-emits every per-commit
+        // snapshot for `--at` history views regardless of tombstones, so a
+        // retraction tombstone would never actually suppress the record and
+        // success would be a silent lie. Temporal EDGES stay retractable:
+        // evidence-link edges legitimately carry routing-only commit anchors
+        // (issue #231 must keep them retractable) and the embedded edge read
+        // path honors tombstones for them.
+        GraphRecord::Node {
+            temporal: Some(_),
+            kind,
+            ..
+        } => Err(ForgetError::TemporalRecord {
+            record_id: handle.to_owned(),
+            kind: kind.as_str().to_owned(),
         }),
         GraphRecord::Node { .. } | GraphRecord::Edge { .. } => Ok(()),
     }
@@ -745,6 +792,72 @@ mod tests {
         assert!(
             message.contains("re-scan"),
             "refusal names the re-derivation path: {message}"
+        );
+    }
+
+    fn temporal_metadata() -> crate::ir::TemporalMetadata {
+        crate::ir::TemporalMetadata {
+            git_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            git_parent_commits: Vec::new(),
+            valid_time: "2026-01-01T00:00:00Z".to_owned(),
+            author_time: None,
+            observed_at: "2026-01-01T00:00:00Z".to_owned(),
+            valid_time_source: Some("git_commit_committer_date".to_owned()),
+        }
+    }
+
+    #[test]
+    fn refuses_commit_anchored_temporal_node() {
+        // A commit-anchored node outside the codegraph/semantic domains (e.g.
+        // a manually ingested temporal observation) is re-emitted by the
+        // embedded current-state read for `--at` views regardless of
+        // tombstones, so accepting it would report success while the record
+        // stayed in the current slice.
+        let temporal_id = agent_memory_stable_id(&["node", "observation", "sess-1", "temporal"]);
+        let mut records = seeded();
+        records.push(
+            observation(&temporal_id, "commit-anchored claim").with_temporal(temporal_metadata()),
+        );
+        let err = retract_from_records(&records, &request(&temporal_id))
+            .expect_err("commit-anchored temporal nodes are refused");
+        assert_eq!(err.code(), "temporal_record");
+        assert_eq!(err.exit_code(), 1);
+        let json = err.to_json();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error"]["code"], "temporal_record");
+        assert_eq!(json["error"]["detail"]["kind"], "Observation");
+        assert_eq!(json["error"]["detail"]["record_id"], temporal_id);
+        let message = json["error"]["detail"]["message"]
+            .as_str()
+            .expect("message");
+        assert!(
+            message.contains("history views"),
+            "refusal explains why a tombstone cannot suppress the record: {message}"
+        );
+    }
+
+    #[test]
+    fn temporal_evidence_edge_is_still_retractable() {
+        // Evidence-link edges legitimately carry routing-only commit anchors
+        // (issue #231 must keep them retractable), and the embedded edge read
+        // path honors tombstones for temporal edges — so the temporal-node
+        // refusal must not extend to edges.
+        let edge = GraphRecord::agent_memory_edge(
+            EdgeLabel::MentionsSymbol,
+            obs_id(),
+            symbol_id(),
+            Some("0.9".to_owned()),
+            "obs MENTIONS_SYMBOL symbol".to_owned(),
+        )
+        .with_temporal(temporal_metadata());
+        let edge_id = edge.id().to_owned();
+        let mut records = seeded();
+        records.push(edge);
+        let outcome =
+            retract_from_records(&records, &request(&edge_id)).expect("temporal edges retract");
+        assert!(
+            matches!(outcome, ForgetOutcome::Retracted { .. }),
+            "a commit-anchored agent-memory edge stays retractable"
         );
     }
 

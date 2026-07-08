@@ -177,13 +177,15 @@ cargo run -- forget agent_memory:v1:missing --data-dir .egregore --reason "x"   
 ```
 
 `eg forget` logically retracts one record from every transaction-time-current read surface
-(structural, semantic/vector, context, task, memory, audit, failures, changes, inspect, and
-the MCP tools) by writing a citable `Retraction` event — actor, transaction time, redacted
-reason, prior record handle — plus a tombstone in the target's domain, through the ordinary
+(structural, semantic/vector, context, task, memory, audit, failures, changes, inspect, the
+MCP tools, and the daemon's direct record lookups) by writing a citable `Retraction` event —
+actor, transaction time, redacted reason, prior record handle — plus a tombstone in the
+target's domain, through the ordinary
 adapter boundary. Deterministic code-graph facts are refused with a machine-readable error
 naming `eg refresh`/re-scan; derived semantic measurements (`SemanticDrift` and its edges)
-are refused the same way naming re-scan/re-ingest; tombstones and retraction events are
-also refused. Citing
+are refused the same way naming re-scan/re-ingest, as is any other commit-anchored temporal
+node (`temporal_record`) a tombstone could never suppress; tombstones and retraction events
+are also refused. Citing
 records survive with their link reported as a `stale_evidence_target` diagnostic, historical
 transaction-time views predating the retraction still see the record (bi-temporal honesty),
 and re-running on an already-retracted handle is a no-op success returning the original
