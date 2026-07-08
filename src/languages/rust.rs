@@ -716,11 +716,15 @@ fn doc_comment_text(text: &str) -> Option<String> {
     None
 }
 
-/// Extracts doc text from one `#[doc = "..."]` attribute item's source text.
+/// Extracts doc text from one `#[doc = ...]` attribute item's source text.
 ///
-/// Returns `Some` for outer doc attributes carrying a plain or raw string
-/// literal, and `None` for every other attribute shape — `#[doc(hidden)]`,
-/// `#[doc(alias = "...")]`, and non-`doc` attributes contribute no doc text.
+/// Returns the decoded text for outer doc attributes carrying a plain or raw
+/// string literal. A non-literal value (`#[doc = include_str!(...)]`,
+/// `#[doc = concat!(...)]`) still documents the item for rustdoc, so it
+/// yields a labeled marker citing the unexpanded expression — presence is
+/// recorded, text is never guessed by expanding macros. Returns `None` for
+/// every other attribute shape — `#[doc(hidden)]`, `#[doc(alias = "...")]`,
+/// and non-`doc` attributes contribute no doc text.
 fn doc_attribute_text(text: &str) -> Option<String> {
     let inner = text
         .trim()
@@ -731,7 +735,13 @@ fn doc_attribute_text(text: &str) -> Option<String> {
         .trim_start()
         .strip_prefix('=')?
         .trim();
-    string_literal_text(inner)
+    if let Some(literal) = string_literal_text(inner) {
+        return Some(literal);
+    }
+    if inner.is_empty() {
+        return None;
+    }
+    Some(format!("[unexpanded doc attribute: {inner}]"))
 }
 
 /// Decodes a Rust string literal (`"..."`, `r"..."`, `r#"..."#`, ...) into
@@ -1666,7 +1676,25 @@ mod tests {
         assert_eq!(doc_attribute_text(r#"#[doc(alias = "other")]"#), None);
         assert_eq!(doc_attribute_text("#[derive(Debug)]"), None);
         assert_eq!(doc_attribute_text(r#"#[deprecated = "note"]"#), None);
-        assert_eq!(doc_attribute_text("#[doc = not_a_literal]"), None);
+    }
+
+    #[test]
+    fn test_doc_attribute_text_marks_unexpanded_expressions_as_present() {
+        // Rustdoc documents an item carrying `#[doc = <expr>]` even when the
+        // expression needs macro expansion; the fact recorded is presence
+        // with a labeled unexpanded marker, never guessed doc text.
+        let included = doc_attribute_text(r#"#[doc = include_str!("../README.md")]"#)
+            .expect("include_str! doc attribute must count as documentation");
+        assert!(
+            included.contains(r#"include_str!("../README.md")"#),
+            "marker must cite the unexpanded expression, got {included:?}"
+        );
+        let concatenated = doc_attribute_text(r#"#[doc = concat!("a", "b")]"#)
+            .expect("concat! doc attribute must count as documentation");
+        assert!(
+            concatenated.contains("concat!"),
+            "marker must cite the unexpanded expression, got {concatenated:?}"
+        );
     }
 
     #[test]

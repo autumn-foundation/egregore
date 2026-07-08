@@ -17,7 +17,10 @@ The lane is a graph-native join of two recorded facts:
   visibility-widening `pub use` re-exports, reused verbatim, never re-derived;
 - the **captured doc-comment fact** from issue #124 — a symbol carrying any
   doc form is excluded; a plain `//` comment above a symbol is *not*
-  documentation and the symbol is still reported.
+  documentation and the symbol is still reported. A `#[doc = <expr>]`
+  attribute whose value needs macro expansion (`include_str!`, `concat!`)
+  counts as documentation — presence is recorded with a labeled unexpanded
+  marker; the text is never guessed by expanding macros.
 
 The boring substitute, rustdoc's `missing_docs` lint, needs a compiling crate
 and emits stderr warnings; this lane works on code that does not build and

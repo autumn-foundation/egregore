@@ -596,3 +596,40 @@ fn rust_doc_attribute_is_captured_as_doc_fact() {
         "#[doc = \"...\"] must be captured as the doc fact"
     );
 }
+
+#[test]
+fn query_undocumented_doc_macro_expression_counts_as_documented() {
+    // `#[doc = include_str!(...)]` / `#[doc = concat!(...)]` document the
+    // item for rustdoc and `missing_docs` even though the text needs macro
+    // expansion; the lane asserts presence only, so such items are never
+    // reported as doc debt.
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::create_dir_all(temp.path().join("src")).expect("src dir");
+    fs::write(
+        temp.path().join("src/lib.rs"),
+        "#[doc = include_str!(\"../docs/api.md\")]\npub fn included_fn() {}\n\n\
+         #[doc = concat!(\"joined \", \"doc\")]\npub fn concat_fn() {}\n\n\
+         pub fn bare_fn() {}\n",
+    )
+    .expect("lib.rs");
+    let jsonl = scan_repository_at_with_override(temp.path(), FIXED_TIME, Some("undoc-incl"))
+        .expect("scan")
+        .to_jsonl()
+        .expect("serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_undocumented(&graph, &[]);
+    let paths = item_paths(&parsed);
+    for documented in ["included_fn", "concat_fn"] {
+        assert!(
+            !paths.iter().any(|p| p == documented),
+            "{documented} carries a #[doc = <expr>] attribute and must not be \
+             reported as undocumented, got {paths:?}"
+        );
+    }
+    assert!(
+        paths.iter().any(|p| p == "bare_fn"),
+        "the genuinely undocumented sibling must still be reported, got {paths:?}"
+    );
+}
