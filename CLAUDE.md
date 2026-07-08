@@ -47,6 +47,12 @@ cargo run -- query deltas ffffffffffff <head_sha> --graph history.graph.jsonl # 
 # Externally-reachable public API surface (issue #213)
 cargo run -- query public-api --graph graph.jsonl                 # exit 0 (even when surface is empty)
 cargo run -- query public-api --graph graph.jsonl --repo acme/widget  # scope one repo; bad selector exits 1
+
+# Public-API surface changes across a commit range (issue #157)
+cargo run -- query public-api-deltas <base_sha> <head_sha> --graph history.graph.jsonl  # exit 0 on match
+cargo run -- query public-api-deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
+cargo run -- query public-api-deltas ffffffffffff <head_sha> --graph history.graph.jsonl # exit 2 (missing_commit)
+cargo run -- query public-api-deltas <base> <head> --graph history.graph.jsonl --include-internal --callers
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -80,6 +86,20 @@ repo-relative file/span handle. An empty surface is an explicit machine-readable
 (exit 0 with an `empty_surface` diagnostic), not an error. Output is deterministic and
 byte-identical across runs. Parse-derived, never a build-verified or semver claim.
 See `docs/cli/public-api.md`.
+
+`eg query public-api-deltas <base> <head>` classifies changes to the externally-reachable
+public API surface between two commit handles from a `scan-history` graph or embedded store,
+composing the issue #118 range mechanics with the issue #124 visibility/signature capture.
+Exported-symbol changes land in a closed change-class set (`added`, `removed`,
+`signature_changed`, `visibility_narrowed`, `visibility_widened`); removal, signature change,
+and narrowing carry `potentially_breaking: true` — a review flag, never a semver or breakage
+claim. Non-exported symbol deltas never appear as public-API changes; they are tallied and
+listed only with `--include-internal` in a group labeled `internal_not_public_surface`.
+`--callers` joins base-endpoint caller leads onto removed/signature-changed rows. Rows carry
+stable record IDs, file/span handles (base-side tombstone handles for removals), the
+introducing commit with valid time, and before/after visibility/signature surface text.
+Output (JSON or `--format text`) is deterministic and byte-identical across runs.
+See `docs/cli/public-api-deltas.md`.
 
 Protected raw-artifact commands (issue #60):
 

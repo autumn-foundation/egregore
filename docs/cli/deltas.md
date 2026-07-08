@@ -141,6 +141,11 @@ fail with stable machine-readable diagnostics (`{"ok":false,"error":
 - **`eg query deltas`** — the historical A..B answer: which symbols and files
   structurally changed between two commits, grouped by class, with citable
   record IDs and file/span handles.
+- **`eg query public-api-deltas` (issue #157)** — the public-surface
+  classification layer on top of this query: it joins these range mechanics
+  with recorded visibility/signature to flag exported-contract changes
+  (`removed`, `signature_changed`, `visibility_narrowed`, …). Use it when the
+  question is about the *public* contract, not all structural churn.
 - **`eg query change-impact` (issue #76)** — the *forward*, pre-edit
   blast-radius question: "if I edit this handle now, what nearby code should
   I inspect?" A different job with different input (a symbol/file handle, not
