@@ -16674,10 +16674,30 @@ pub fn ownership_map<'a>(
                     .and_then(|repo_id| snapshot_heads.get(repo_id).copied())
                     .filter(|sha| candidates.contains(sha));
                 head.or_else(|| {
-                    candidates
-                        .iter()
-                        .copied()
-                        .max_by(|a, b| order.rank(a).cmp(&order.rank(b)).then_with(|| a.cmp(b)))
+                    candidates.iter().copied().max_by(|a, b| {
+                        // Under `--as-of`, the documented anchor is the most
+                        // recent commit at or before the cutoff (valid-time
+                        // axis); topological rank and SHA only break ties.
+                        // Merged histories can hold a side-branch commit
+                        // whose committer date is later than a deeper
+                        // mainline commit's, so rank alone picks the wrong
+                        // anchor. Without a cutoff (head absent from the
+                        // recorded commits), rank picks the head-most commit.
+                        let time_cmp = if as_of_dt.is_some() {
+                            let parsed = |sha: &str| {
+                                commits
+                                    .get(sha)
+                                    .and_then(|meta| meta.valid_time)
+                                    .and_then(|vt| DateTime::parse_from_rfc3339(vt).ok())
+                            };
+                            parsed(a).cmp(&parsed(b))
+                        } else {
+                            Ordering::Equal
+                        };
+                        time_cmp
+                            .then_with(|| order.rank(a).cmp(&order.rank(b)))
+                            .then_with(|| a.cmp(b))
+                    })
                 })
             }
         };

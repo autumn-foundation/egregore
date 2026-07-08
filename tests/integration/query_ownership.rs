@@ -499,6 +499,78 @@ fn ownership_as_of_time_matches_at_commit_view() {
     );
 }
 
+#[test]
+fn ownership_as_of_anchors_to_latest_valid_time_not_topological_rank() {
+    // Merged history: the side-branch commit `s1` (T4) has a later committer
+    // date but a shorter ancestor chain than the deeper mainline commit `m3`
+    // (T3). `--as-of` between s1 and the merge must anchor to s1 — the most
+    // recent commit at or before the instant (docs/cli/ownership.md) — never
+    // to the topologically deepest candidate.
+    //
+    //   m1 (T1) ── m2 (T2) ── m3 (T3) ──┐
+    //     └────────── s1 (T4) ──────────┴── m4 (merge, T5)
+    let records = vec![
+        commit("m1sha0000", &[], T1, "Alice Dev", "alice@example.com"),
+        commit(
+            "m2sha0000",
+            &["m1sha0000"],
+            T2,
+            "Alice Dev",
+            "alice@example.com",
+        ),
+        commit(
+            "m3sha0000",
+            &["m2sha0000"],
+            T3,
+            "Alice Dev",
+            "alice@example.com",
+        ),
+        commit(
+            "s1sha0000",
+            &["m1sha0000"],
+            T4,
+            "Bob Dev",
+            "bob@example.com",
+        ),
+        commit(
+            "m4sha0000",
+            &["m3sha0000", "s1sha0000"],
+            T5,
+            "Alice Dev",
+            "alice@example.com",
+        ),
+        // src/lib.rs exists everywhere.
+        file_snapshot("src/lib.rs", "m1sha0000", T1),
+        file_snapshot("src/lib.rs", "m2sha0000", T2),
+        file_snapshot("src/lib.rs", "m3sha0000", T3),
+        file_snapshot("src/lib.rs", "s1sha0000", T4),
+        file_snapshot("src/lib.rs", "m4sha0000", T5),
+        change("src/lib.rs", "A", "m1sha0000", T1),
+        // src/side.rs is born on the side branch and lands at the merge.
+        file_snapshot("src/side.rs", "s1sha0000", T4),
+        file_snapshot("src/side.rs", "m4sha0000", T5),
+        change("src/side.rs", "A", "s1sha0000", T4),
+    ];
+
+    let mut opts = options();
+    opts.as_of = Some("2026-01-04T12:00:00Z"); // after s1 (T4), before the merge (T5)
+    let map = ownership_map(&records, &opts).expect("as-of view should resolve");
+
+    assert_eq!(map.anchors.len(), 1);
+    assert_eq!(
+        map.anchors[0].commit_sha, "s1sha0000",
+        "the anchor must be the most recent commit at or before --as-of, \
+         not the commit with the longest ancestor chain"
+    );
+    // The side-branch file is present at the anchor, so it must get a row.
+    assert!(
+        map.files
+            .iter()
+            .any(|f| f.repo_relative_path == "src/side.rs"),
+        "src/side.rs exists at the latest-by-time anchor and must be reported"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Determinism (byte-identical across repeated runs)
 // ---------------------------------------------------------------------------
