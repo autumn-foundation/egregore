@@ -1204,6 +1204,44 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// Rank Git-tracked files by change frequency across commit history (issue #128).
+    ///
+    /// Over a temporal store produced by `eg scan-history`, returns files
+    /// ranked by descending count of distinct commits that modified them —
+    /// the software-archaeology hotspot signal. Each row carries the stable
+    /// `File` record ID, the repo-relative path handle, the integer commit
+    /// count, and the inclusive commit range the frequency was measured over.
+    /// Only committed, Git-tracked, indexed source files can rank; untracked
+    /// or ignored paths never appear.
+    ///
+    /// Ordering is deterministic and byte-stable: commit count descending,
+    /// then repo-relative path ascending (documented tie-break). The answer
+    /// states explicitly whether `--limit` truncated it.
+    ///
+    /// Exit codes:
+    ///   0 — ranking returned.
+    ///   1 — load error, invalid --limit, unknown/ambiguous --repo selector.
+    ///   2 — no commit history in scope (`no_history`) or no file changes (`no_match`).
+    ///
+    /// Documented in `docs/cli/churn.md`.
+    Churn {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the ranking to one repository (see `eg query symbol --help`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum ranked files returned (default 50, max 500). Values outside
+        /// 1..=500 are rejected with an `invalid_limit` diagnostic.
+        #[arg(long, default_value_t = query::CHURN_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
@@ -4727,6 +4765,35 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_lifeline_cmd(&records, &symbol, selected.as_deref(), format)
+        }
+        QuerySubcommand::Churn {
+            graph,
+            data_dir,
+            repo,
+            limit,
+            format,
+        } => {
+            // Validate the limit before touching the store so a malformed
+            // bound fails fast with a machine-readable diagnostic.
+            if limit == 0 || limit > query::CHURN_MAX_LIMIT {
+                let diag = serde_json::json!({
+                    "code": "invalid_limit",
+                    "limit": limit,
+                    "min": 1,
+                    "max": query::CHURN_MAX_LIMIT,
+                    "message": format!(
+                        "--limit must be between 1 and {} (default {})",
+                        query::CHURN_MAX_LIMIT,
+                        query::CHURN_DEFAULT_LIMIT
+                    ),
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_churn_cmd(&records, selected.as_deref(), limit, format)
         }
     }
 }
@@ -8948,6 +9015,89 @@ fn query_lifeline_cmd(
             std::process::exit(6);
         }
     }
+}
+
+/// Runs `eg query churn` (issue #128): rank files by distinct-commit change
+/// frequency over a `scan-history` temporal store.
+///
+/// The JSON envelope is emitted as a single line so machine consumers keep the
+/// one-JSON-object-per-line contract from `docs/cli/query.md`, and the ranking
+/// is byte-identical across repeated runs on unchanged history.
+fn query_churn_cmd(
+    records: &[GraphRecord],
+    repo_id: Option<&str>,
+    limit: usize,
+    format: OutputFormat,
+) -> Result<()> {
+    match query::file_churn(records, repo_id, limit) {
+        Ok(report) => {
+            match format {
+                OutputFormat::Json => {
+                    let envelope = serde_json::json!({
+                        "ok": true,
+                        "result": report,
+                    });
+                    println!("{}", serde_json::to_string(&envelope)?);
+                }
+                OutputFormat::Text => {
+                    println!(
+                        "File churn ranking: distinct commits that modified each file, highest first"
+                    );
+                    for range in &report.commit_ranges {
+                        let scope = range
+                            .repository
+                            .as_deref()
+                            .or(range.repository_id.as_deref())
+                            .unwrap_or("(unattributed)");
+                        println!(
+                            "range {}..{} ({} commits) [{scope}]",
+                            range.first_commit, range.last_commit, range.commit_count
+                        );
+                    }
+                    for file in &report.files {
+                        println!(
+                            "{}. {} commits={} ({})",
+                            file.rank,
+                            file.repo_relative_path,
+                            file.commit_count,
+                            file.file_record_id
+                        );
+                    }
+                    if report.truncated {
+                        println!(
+                            "truncated: showing {} of {} files (raise --limit, max {})",
+                            report.returned_file_count,
+                            report.total_file_count,
+                            query::CHURN_MAX_LIMIT
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        Err(err @ query::FileChurnError::NoHistory) => churn_error_exit(&err, "no_history", format),
+        Err(err @ query::FileChurnError::NoMatch) => churn_error_exit(&err, "no_match", format),
+    }
+}
+
+/// Prints the stable churn error envelope and exits 2 (nothing to rank).
+fn churn_error_exit(err: &query::FileChurnError, code: &str, format: OutputFormat) -> ! {
+    match format {
+        OutputFormat::Json => {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": code,
+                    "message": err.to_string(),
+                }
+            });
+            println!("{envelope}");
+        }
+        OutputFormat::Text => {
+            eprintln!("Error: {err}");
+        }
+    }
+    std::process::exit(2);
 }
 
 fn print_tree_node_text(node: &query::ModuleTreeNode, indent: usize) {

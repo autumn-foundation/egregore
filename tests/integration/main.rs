@@ -46,6 +46,7 @@ mod producer_version;
 mod protected_artifacts;
 mod python_scan;
 mod query;
+mod query_churn;
 mod query_cli;
 mod query_lifeline;
 mod query_orient;

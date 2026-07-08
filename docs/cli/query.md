@@ -23,6 +23,8 @@ eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>]
 eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N]
 eg query deltas   <BASE> <HEAD> --graph <PATH> [--repo <SELECTOR>]
 eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
+eg query churn            --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--format json|text]
+eg query churn            --data-dir <DIR>  [--repo <SELECTOR>] [--limit N] [--format json|text]
 ```
 
 Evidence-backed audit subcommands have their own pages:
@@ -51,6 +53,9 @@ Evidence-backed audit subcommands have their own pages:
   surface** from recorded visibility and module containment, re-exports
   included, trapped `pub` items excluded
   ([public-api.md](public-api.md), issue #213).
+- `eg query churn` — rank Git-tracked files by **change frequency** across the
+  commit history captured by `eg scan-history`, for hotspot triage
+  ([churn.md](churn.md), issue #128).
 
 Most subcommands accept exactly one input source:
 

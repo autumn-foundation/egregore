@@ -47,6 +47,11 @@ cargo run -- query deltas ffffffffffff <head_sha> --graph history.graph.jsonl # 
 # Externally-reachable public API surface (issue #213)
 cargo run -- query public-api --graph graph.jsonl                 # exit 0 (even when surface is empty)
 cargo run -- query public-api --graph graph.jsonl --repo acme/widget  # scope one repo; bad selector exits 1
+
+# File churn hotspots over a scan-history store (issue #128)
+cargo run -- query churn --graph history.graph.jsonl               # exit 0, ranked files
+cargo run -- query churn --graph history.graph.jsonl --limit 10    # cap output (default 50, max 500)
+cargo run -- query churn --graph graph.jsonl                       # exit 2 (no_history: not a history store)
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -80,6 +85,13 @@ repo-relative file/span handle. An empty surface is an explicit machine-readable
 (exit 0 with an `empty_surface` diagnostic), not an error. Output is deterministic and
 byte-identical across runs. Parse-derived, never a build-verified or semver claim.
 See `docs/cli/public-api.md`.
+
+`eg query churn` ranks Git-tracked files by descending count of distinct commits that
+modified them across a `scan-history` temporal store. Every row carries the stable `File`
+record ID, the repo-relative path, the integer commit count, and the inclusive commit range
+used. Ordering is deterministic (ties break on repo-relative path) and byte-identical across
+runs; untracked or ignored paths never appear. The answer states explicitly whether `--limit`
+truncated it. See `docs/cli/churn.md`.
 
 Protected raw-artifact commands (issue #60):
 
