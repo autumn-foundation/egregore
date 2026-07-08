@@ -83,6 +83,8 @@ pub mod temporal_status;
 pub mod token_cost;
 /// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
 pub mod traj;
+/// Pre-ingest referential-integrity validation for graph JSONL (issue #103).
+pub mod validate;
 /// Transcripts watcher.
 pub mod watch;
 
