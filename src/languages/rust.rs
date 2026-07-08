@@ -7,7 +7,7 @@ use tree_sitter::{Node, Parser};
 use crate::{
     error::{CodegraphError, Result},
     fs::SourceFile,
-    ir::{EdgeLabel, Graph, GraphRecord, NodeKind, stable_id},
+    ir::{EdgeLabel, Graph, GraphRecord, NodeKind, SourceSpan, stable_id},
     languages::{
         common::{
             SymbolBody, add_graph_edge, emit_reference_edges, next_symbol_ordinal, node_name,
@@ -109,6 +109,7 @@ struct RustExtractor<'graph, 'source> {
     symbol_bodies: Vec<SymbolBody>,
     symbol_ordinals: BTreeMap<(String, String), u64>,
     diagnostic_ordinals: BTreeMap<String, u64>,
+    debt_marker_ordinals: BTreeMap<String, u64>,
     facts: FileFacts,
     panic_risk_ordinals: BTreeMap<String, u64>,
     /// Inline-module segments currently enclosing the walk (out-of-line
@@ -146,6 +147,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             symbol_bodies: Vec::new(),
             symbol_ordinals: BTreeMap::new(),
             diagnostic_ordinals: BTreeMap::new(),
+            debt_marker_ordinals: BTreeMap::new(),
             facts: FileFacts::default(),
             panic_risk_ordinals: BTreeMap::new(),
             inline_module_stack: Vec::new(),
@@ -171,6 +173,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             "type_item" => self.extract_named_symbol(node, "type_alias"),
             "macro_invocation" => self.extract_macro_diagnostic(node),
             "call_expression" => self.extract_call_expression(node),
+            "line_comment" | "block_comment" => self.extract_comment_markers(node),
             _ => self.walk_children(node),
         }
     }
@@ -563,6 +566,76 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         self.impl_context = previous;
     }
 
+    /// Visits a Tree-sitter comment node (`line_comment` / `block_comment` —
+    /// rustdoc `///`, `//!`, and `/** */` docs included) and emits one
+    /// deterministic `DebtMarker` record per debt-marker token occurrence
+    /// (issue #218).
+    ///
+    /// Comment ranges come exclusively from the Tree-sitter parse tree, so a
+    /// marker token inside a string or character literal can never match;
+    /// scanning within the identified comment's text enforces word
+    /// boundaries, so identifier substrings (`TODOIST`, `fixmeup`) and longer
+    /// words (`XXXL`) never match either.
+    fn extract_comment_markers(&mut self, node: Node<'_>) {
+        let text = self.node_text(node);
+        let comment_start_byte = node.start_byte();
+        let comment_start_row = node.start_position().row;
+        for marker in comment_debt_markers(text) {
+            let disambiguator = self.next_debt_marker_disambiguator(marker.category);
+            let id = stable_id(&[
+                "node",
+                "debt_marker",
+                self.repository_id,
+                &self.file.repo_relative_path,
+                marker.category,
+                &disambiguator.to_string(),
+            ]);
+            let line = comment_start_row + 1 + marker.line_offset;
+            let marker_span = SourceSpan {
+                start_byte: comment_start_byte + marker.token_start,
+                end_byte: comment_start_byte + marker.note_end,
+                start_line: line,
+                end_line: line,
+            };
+            self.graph.push(
+                GraphRecord::syntax_node(
+                    id.clone(),
+                    NodeKind::DebtMarker,
+                    self.file.repo_relative_path.clone(),
+                    marker_span,
+                    marker.category.to_owned(),
+                    "rust",
+                    format!(
+                        "Rust {} debt-comment marker",
+                        marker.category.to_ascii_uppercase()
+                    ),
+                )
+                .with_note(&crate::redaction::redact_value(&marker.note))
+                .with_redaction_policy_version(REDACTION_POLICY_VERSION),
+            );
+            self.add_edge(
+                EdgeLabel::Contains,
+                self.file_id.to_owned(),
+                id,
+                format!(
+                    "{} contains {} debt-comment marker",
+                    self.file.repo_relative_path,
+                    marker.category.to_ascii_uppercase()
+                ),
+            );
+        }
+    }
+
+    fn next_debt_marker_disambiguator(&mut self, category: &str) -> u64 {
+        let disambiguator = self
+            .debt_marker_ordinals
+            .entry(category.to_owned())
+            .or_default();
+        let current = *disambiguator;
+        *disambiguator += 1;
+        current
+    }
+
     fn extract_macro_diagnostic(&mut self, node: Node<'_>) {
         let invocation = macro_invocation_name(self.node_text(node));
         let disambiguator = self.next_diagnostic_disambiguator(&invocation);
@@ -921,6 +994,86 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                 sibling.kind() == "attribute_item" && self.node_text(sibling).contains("test")
             })
     }
+}
+
+/// The closed debt-marker vocabulary for issue #218, keyed by the lowercase
+/// machine-readable category. Matching is case-insensitive on the marker
+/// token only and is closed for this slice — no user-configurable
+/// vocabularies.
+const DEBT_MARKER_CATEGORIES: [&str; 4] = ["fixme", "hack", "todo", "xxx"];
+
+/// One detected debt-marker occurrence inside a comment node's text.
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct CommentMarker {
+    /// Closed lowercase category: `todo` / `fixme` / `hack` / `xxx`.
+    category: &'static str,
+    /// Trimmed single-line note text following the marker token.
+    note: String,
+    /// Byte offset of the marker token within the comment text.
+    token_start: usize,
+    /// Byte offset just past the trimmed single-line note within the comment
+    /// text (always past the marker token itself).
+    note_end: usize,
+    /// Number of newlines in the comment text before the marker token.
+    line_offset: usize,
+}
+
+/// Scans one comment node's text for debt-marker tokens (issue #218).
+///
+/// The scan is word-boundary conservative: a candidate token is a maximal
+/// ASCII `[A-Za-z0-9_]` run, so `TODOIST`, `fixmeup`, `XXXL`, and `TODO2`
+/// never match. Matching against the closed [`DEBT_MARKER_CATEGORIES`] set is
+/// case-insensitive on the token only. The note is the text following the
+/// marker to the end of its line (or the end of the comment), with a trailing
+/// `*/` block terminator removed, one leading `:` or `-` separator dropped,
+/// and surrounding whitespace trimmed. One marker is returned per token
+/// occurrence, in source order.
+fn comment_debt_markers(text: &str) -> Vec<CommentMarker> {
+    let bytes = text.as_bytes();
+    let mut markers = Vec::new();
+    let mut newlines = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'\n' {
+            newlines += 1;
+            i += 1;
+            continue;
+        }
+        if !byte.is_ascii_alphanumeric() && byte != b'_' {
+            i += 1;
+            continue;
+        }
+        let token_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        let token = &text[token_start..i];
+        let Some(category) = DEBT_MARKER_CATEGORIES
+            .iter()
+            .find(|category| token.eq_ignore_ascii_case(category))
+            .copied()
+        else {
+            continue;
+        };
+        let line_end = text[i..].find('\n').map_or(text.len(), |offset| i + offset);
+        let raw_note = text[i..line_end].trim_end();
+        let without_terminator = raw_note.strip_suffix("*/").unwrap_or(raw_note).trim_end();
+        let note_end = i + without_terminator.len();
+        let cleaned = without_terminator.trim_start();
+        let cleaned = cleaned
+            .strip_prefix(':')
+            .or_else(|| cleaned.strip_prefix('-'))
+            .unwrap_or(cleaned);
+        markers.push(CommentMarker {
+            category,
+            note: cleaned.trim().to_owned(),
+            token_start,
+            note_end,
+            line_offset: newlines,
+        });
+    }
+    markers
 }
 
 /// Returns `true` when `symbol_kind` belongs to the issue #124 declaration-
@@ -2171,5 +2324,124 @@ mod tests {
         let code = "pub const abuse: i32 = 1;";
         let normalized = normalize_file_code(code);
         assert_eq!(normalized, "pub const abuse:i32=1;");
+    }
+
+    // ── Debt-marker comment scanning (issue #218) ─────────────────────────────
+
+    fn categories_and_notes(text: &str) -> Vec<(&'static str, String)> {
+        comment_debt_markers(text)
+            .into_iter()
+            .map(|m| (m.category, m.note))
+            .collect()
+    }
+
+    #[test]
+    fn debt_marker_scan_matches_line_comment_markers() {
+        assert_eq!(
+            categories_and_notes("// TODO: wire retry logic"),
+            vec![("todo", "wire retry logic".to_owned())]
+        );
+        assert_eq!(
+            categories_and_notes("// FIXME - handle empty input"),
+            vec![("fixme", "handle empty input".to_owned())]
+        );
+        assert_eq!(
+            categories_and_notes("// HACK bypasses cache"),
+            vec![("hack", "bypasses cache".to_owned())]
+        );
+    }
+
+    #[test]
+    fn debt_marker_scan_is_case_insensitive_on_the_token_only() {
+        assert_eq!(
+            categories_and_notes("// todo lowercase works"),
+            vec![("todo", "lowercase works".to_owned())]
+        );
+        assert_eq!(
+            categories_and_notes("// xXx MiXeD"),
+            vec![("xxx", "MiXeD".to_owned())],
+            "the note text keeps its original case"
+        );
+    }
+
+    #[test]
+    fn debt_marker_scan_never_matches_identifier_substrings() {
+        assert_eq!(categories_and_notes("// TODOIST integration"), vec![]);
+        assert_eq!(categories_and_notes("// call fixmeup() next"), vec![]);
+        assert_eq!(categories_and_notes("// sizes XXXL and up"), vec![]);
+        assert_eq!(categories_and_notes("// TODO2 is not a marker"), vec![]);
+        assert_eq!(categories_and_notes("// TODO_LIST const"), vec![]);
+        assert_eq!(categories_and_notes("// nothing to see here"), vec![]);
+    }
+
+    #[test]
+    fn debt_marker_scan_strips_block_terminator_and_stays_single_line() {
+        assert_eq!(
+            categories_and_notes("/* FIXME handle empty input */"),
+            vec![("fixme", "handle empty input".to_owned())]
+        );
+        assert_eq!(
+            categories_and_notes("/* first line\n * TODO: second line note\n */"),
+            vec![("todo", "second line note".to_owned())],
+            "a multi-line block note is cut at the end of the marker's line"
+        );
+    }
+
+    #[test]
+    fn debt_marker_scan_captures_raw_note_and_empty_notes() {
+        // Structured metadata is out of scope: the raw text is kept verbatim.
+        assert_eq!(
+            categories_and_notes("// TODO(alice): assign later"),
+            vec![("todo", "(alice): assign later".to_owned())]
+        );
+        assert_eq!(
+            categories_and_notes("// TODO"),
+            vec![("todo", String::new())],
+            "a bare marker keeps an empty note"
+        );
+    }
+
+    #[test]
+    fn debt_marker_scan_returns_one_marker_per_occurrence_in_source_order() {
+        assert_eq!(
+            categories_and_notes("// TODO: fix\n// FIXME: later"),
+            vec![("todo", "fix".to_owned()), ("fixme", "later".to_owned()),]
+        );
+        let markers = comment_debt_markers("/* line one\n TODO: on line two */");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].line_offset, 1, "line offset counts newlines");
+        assert!(markers[0].token_start > 0);
+        assert!(markers[0].note_end > markers[0].token_start);
+    }
+
+    #[test]
+    fn debt_marker_extraction_skips_string_literals_via_tree_sitter() {
+        let source = "pub fn f() -> &'static str {\n    // TODO: real marker\n    \"TODO: not a marker\"\n}\n";
+        let file = SourceFile {
+            path: PathBuf::from("src/lib.rs"),
+            repo_relative_path: "src/lib.rs".to_owned(),
+        };
+        let mut graph = Graph::default();
+        extract_file_source(&file, source, "file-id", "repo-id", &mut graph)
+            .expect("source should parse");
+        let markers: Vec<&GraphRecord> = graph
+            .records()
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    GraphRecord::Node {
+                        kind: NodeKind::DebtMarker,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(
+            markers.len(),
+            1,
+            "only the comment marker may match; the string literal never does"
+        );
+        assert_eq!(markers[0].note(), Some("real marker"));
     }
 }

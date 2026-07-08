@@ -96,6 +96,12 @@ cargo run -- query unwrap-expect --graph graph.jsonl                       # exi
 cargo run -- query unwrap-expect --graph graph.jsonl --path src/adapters   # subsystem-scoped
 cargo run -- query unwrap-expect --graph graph.jsonl --path src/nonexistent  # exit 2 (scope_not_found)
 cargo run -- query unwrap-expect --graph history.graph.jsonl --at <commit>   # pinned valid-time view
+
+# TODO/FIXME/HACK/XXX debt-comment marker inventory (issue #218)
+cargo run -- query debt-markers --graph graph.jsonl                         # exit 0, full inventory
+cargo run -- query debt-markers --graph graph.jsonl --path src/adapters     # subsystem-scoped
+cargo run -- query debt-markers --graph graph.jsonl --path src/nonexistent  # exit 2 (scope_not_found)
+cargo run -- query debt-markers --graph history.graph.jsonl --at <commit>   # pinned valid-time view
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -221,6 +227,16 @@ when top-level). Rows are advisory triage leads from deterministic extractor fac
 verdicts. Accepts `--path` (subsystem prefix), `--repo`, and `--at <commit>` (valid-time pin).
 An empty scope reports `no_sites_in_scope`; an out-of-store scope is `scope_not_found` (exit 2).
 The method set is closed for this slice. See `docs/cli/unwrap-expect.md`.
+
+`eg query debt-markers` inventories human-authored `TODO` / `FIXME` / `HACK` / `XXX`
+debt-comment markers detected inside Tree-sitter comment nodes (never text in string or
+character literals, never identifier substrings). Each row carries a closed lowercase
+category, the trimmed single-line note text, the stable record ID, the repo-relative
+file/span handle, and the enclosing symbol handle (explicit `null` at module top level).
+Rows are advisory triage leads from deterministic extractor facts, never verdicts. Accepts
+`--path` (subsystem prefix), `--repo`, and `--at <commit>` (valid-time pin). An empty scope
+reports `no_markers_in_scope`; an out-of-store scope is `scope_not_found` (exit 2). The
+marker set is closed for this slice. See `docs/cli/debt-markers.md`.
 
 Protected raw-artifact commands (issue #60):
 
