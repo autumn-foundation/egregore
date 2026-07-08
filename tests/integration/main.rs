@@ -32,6 +32,7 @@ mod import_github;
 mod import_github_behaviour;
 mod incremental;
 mod ingest;
+mod inspect_store;
 mod line_ending_determinism;
 mod link_evidence;
 mod local_project;

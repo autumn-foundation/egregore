@@ -18,8 +18,19 @@ cargo run -- scan-history . --out history.graph.jsonl
 cargo run -- inspect graph.jsonl
 cargo run -- ingest graph.jsonl --adapter dry-run
 cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .egregore
+cargo run -- inspect --data-dir .egregore
 cargo run -- query semantic-memory "parser edge case on empty input" --data-dir .egregore
 ```
+
+`eg inspect --data-dir` inspects an embedded store directly — no daemon, no
+network, no embeddings (issue #125, the daemon-free analog of #47). It reports
+totals plus per-domain/per-kind/per-schema-version counts grouped by trust
+class, counts unknown `(domain, kind, schema_version)` tuples distinctly, is
+strictly read-only (the store is read via a throwaway temporary copy), and by
+default emits one deterministic JSON line that is byte-identical across runs on
+an unchanged store (`--format text` matches the JSONL inspect style). A missing
+or empty store fails with a diagnostic naming the path. See
+`docs/cli/inspect.md` for the JSON contract.
 
 Query commands (local JSONL graph, no network):
 
