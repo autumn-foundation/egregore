@@ -451,6 +451,202 @@ fn coupling_threshold_and_limit_bounds_are_validated() {
 // Determinism over synthetic history
 // ---------------------------------------------------------------------------
 
+/// Repository scoping without `--repo` (Codex review on PR #312, P2 #1): in
+/// an unscoped shared store two repositories can carry the same Git commit
+/// SHA (forks, mirrored history). The per-file commit sets count bare SHAs,
+/// so without owner gating a file from the *other* repository would surface
+/// as a co-change partner even though it never changed in the target's
+/// repository. Partners must be restricted to the target file's owning
+/// repository.
+#[test]
+fn coupling_unscoped_multi_repo_store_never_bleeds_partners_across_repos() {
+    let shared_sha = "shax0000";
+
+    let repo_node = |repo_id: &str| {
+        GraphRecord::node(
+            repo_id.to_owned(),
+            NodeKind::Repository,
+            None,
+            None,
+            Some(repo_id.to_owned()),
+            format!("Repository {repo_id}"),
+        )
+    };
+    let commit_in = |repo_id: &str| {
+        GraphRecord::node(
+            stable_id(&["node", "commit", repo_id, shared_sha]),
+            NodeKind::Commit,
+            None,
+            None,
+            Some(shared_sha.to_owned()),
+            format!("Commit {shared_sha} in {repo_id}"),
+        )
+        .with_temporal(temporal(shared_sha, &[], T1))
+    };
+    let file_in = |repo_id: &str, path: &str| {
+        GraphRecord::node(
+            stable_id(&["node", "file", repo_id, path]),
+            NodeKind::File,
+            Some(path.to_owned()),
+            None,
+            Some(path.to_owned()),
+            format!("File {path} in {repo_id}"),
+        )
+        .with_temporal(temporal(shared_sha, &[], T1))
+    };
+    let contains = |source: String, target: String| {
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            source,
+            target,
+            Some("1.0".to_owned()),
+            "containment".to_owned(),
+        )
+    };
+    let changed_in_repo = |repo_id: &str, path: &str| {
+        GraphRecord::edge(
+            EdgeLabel::ChangedIn,
+            stable_id(&["node", "file", repo_id, path]),
+            stable_id(&["node", "commit", repo_id, shared_sha]),
+            Some("1.0".to_owned()),
+            format!("{path} changed in {shared_sha}"),
+        )
+        .with_temporal(temporal(shared_sha, &[], T1))
+    };
+
+    let records = vec![
+        repo_node("repo_a"),
+        repo_node("repo_b"),
+        commit_in("repo_a"),
+        commit_in("repo_b"),
+        contains(
+            "repo_a".to_owned(),
+            stable_id(&["node", "commit", "repo_a", shared_sha]),
+        ),
+        contains(
+            "repo_b".to_owned(),
+            stable_id(&["node", "commit", "repo_b", shared_sha]),
+        ),
+        file_in("repo_a", "src/alpha.rs"),
+        file_in("repo_b", "src/other.rs"),
+        contains(
+            "repo_a".to_owned(),
+            stable_id(&["node", "file", "repo_a", "src/alpha.rs"]),
+        ),
+        contains(
+            "repo_b".to_owned(),
+            stable_id(&["node", "file", "repo_b", "src/other.rs"]),
+        ),
+        changed_in_repo("repo_a", "src/alpha.rs"),
+        changed_in_repo("repo_b", "src/other.rs"),
+    ];
+
+    let mut opts = options();
+    opts.min_support = 1;
+    let report =
+        co_change_coupling(&records, "src/alpha.rs", None, &opts).expect("target should resolve");
+
+    assert_eq!(report.target.change_count, 1);
+    assert!(
+        report.partners.is_empty(),
+        "a file from another repository sharing only a commit SHA must never \
+         appear as a partner, got {:?}",
+        report
+            .partners
+            .iter()
+            .map(|p| p.repo_relative_path)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Chronological last-co-change selection (Codex review on PR #312, P2 #2):
+/// `scan-history` preserves non-UTC committer offsets (`normalize_timestamp`
+/// only rewrites `+00:00` to `Z`), so `2026-01-01T23:30:00-05:00` is
+/// chronologically *later* than `2026-01-02T02:00:00Z` yet sorts *earlier*
+/// as a string. The newest-shared-commit pick must parse valid times the
+/// way the `--as-of` path does, with the SHA tie-break applied on equal
+/// instants.
+#[test]
+fn coupling_last_co_change_commit_compares_valid_times_chronologically() {
+    const EARLY_UTC: &str = "2026-01-02T02:00:00Z"; // lexicographically LATER
+    const LATE_OFFSET: &str = "2026-01-01T23:30:00-05:00"; // = 04:30Z, chronologically LATER
+
+    let records = vec![
+        commit("cearly000", &[], EARLY_UTC),
+        commit("clate0000", &["cearly000"], LATE_OFFSET),
+        file_node("src/alpha.rs", "cearly000", EARLY_UTC),
+        file_node("src/beta.rs", "cearly000", EARLY_UTC),
+        changed_in("src/alpha.rs", "cearly000", EARLY_UTC),
+        changed_in("src/beta.rs", "cearly000", EARLY_UTC),
+        changed_in("src/alpha.rs", "clate0000", LATE_OFFSET),
+        changed_in("src/beta.rs", "clate0000", LATE_OFFSET),
+    ];
+
+    let report = co_change_coupling(&records, "src/alpha.rs", None, &options())
+        .expect("target should resolve");
+    let beta = report
+        .partners
+        .iter()
+        .find(|p| p.repo_relative_path == "src/beta.rs")
+        .expect("beta must be a partner");
+    assert_eq!(beta.co_change_count, 2);
+    assert_eq!(
+        beta.last_co_change_commit, "clate0000",
+        "the chronologically newest shared commit must win even when its \
+         non-UTC valid time sorts earlier as a string"
+    );
+    assert_eq!(beta.last_co_change_valid_time, Some(LATE_OFFSET));
+}
+
+/// End-to-end proof of the offset premise: a fixture repo committed with a
+/// `-05:00` committer date keeps that offset through `scan-history`, and the
+/// coupling answer picks the chronologically newest shared commit.
+#[test]
+fn coupling_fixture_repo_with_offset_committer_dates_picks_chronological_last() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+
+    git(&repo, ["init"]);
+    git(&repo, ["config", "user.email", "codegraph@example.invalid"]);
+    git(&repo, ["config", "user.name", "Codegraph Test"]);
+    git(&repo, ["config", "core.autocrlf", "false"]);
+    git(&repo, ["config", "commit.gpgsign", "false"]);
+
+    write(&repo, "src/alpha.rs", "pub fn alpha() -> u32 { 1 }\n");
+    write(&repo, "src/beta.rs", "pub fn beta() -> u32 { 1 }\n");
+    let _c1 = commit_fixture(&repo, "seed together", "2026-01-02T02:00:00Z");
+
+    write(&repo, "src/alpha.rs", "pub fn alpha() -> u32 { 2 }\n");
+    write(&repo, "src/beta.rs", "pub fn beta() -> u32 { 2 }\n");
+    // Chronologically later (04:30Z), lexicographically earlier.
+    let c2 = commit_fixture(&repo, "change together", "2026-01-01T23:30:00-05:00");
+
+    let jsonl = scan_repository_history(&repo)
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let records: Vec<GraphRecord> = jsonl
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record should parse"))
+        .collect();
+
+    let report = co_change_coupling(&records, "src/alpha.rs", None, &options())
+        .expect("target should resolve");
+    let beta = report
+        .partners
+        .iter()
+        .find(|p| p.repo_relative_path == "src/beta.rs")
+        .expect("beta must be a partner");
+    assert_eq!(beta.co_change_count, 2);
+    assert_eq!(beta.last_co_change_commit, c2);
+    assert_eq!(
+        beta.last_co_change_valid_time,
+        Some("2026-01-01T23:30:00-05:00"),
+        "scan-history must preserve the non-UTC committer offset"
+    );
+}
+
 #[test]
 fn coupling_is_byte_identical_across_repeated_runs() {
     let records = synthetic_records();

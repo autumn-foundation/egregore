@@ -82,7 +82,9 @@ and byte-stable.
 
 Every row also carries the stable `record_id` + `schema_version` of the
 partner's `File` node, the newest shared commit (`last_co_change_commit`,
-chosen by valid time then SHA) with its `valid_time`, and the trust label
+chosen by chronological valid time — parsed offset-aware, never compared as
+strings, since `scan-history` preserves non-UTC committer offsets — with
+ties broken by SHA) plus its recorded `valid_time`, and the trust label
 `historical_co_change_lead`.
 
 ## Noise suppression and completeness
@@ -124,6 +126,11 @@ echoed in the `scope` section of every answer.
 - `--repo <SELECTOR>` gates commit resolution, file resolution, and counting
   to one repository in a shared store; a path present in two repositories
   without a scope fails with `ambiguous_file` listing every candidate.
+- Even without `--repo`, partners are always restricted to the target file's
+  owning repository: in a shared store two repositories can carry the same
+  Git commit SHA (forks, mirrored history), and a file from another
+  repository never surfaces as a partner on the strength of a shared SHA
+  alone.
 - File granularity only: symbol-level co-change is a documented follow-up
   (mirroring how churn deferred symbol granularity).
 - Output is bounded and redaction-safe: record IDs, paths, counts, the

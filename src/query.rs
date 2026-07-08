@@ -15587,7 +15587,8 @@ pub struct CouplingPartner<'a> {
     /// Directional confidence `co / target`: the fraction of the target's
     /// in-scope changes that also touched this partner.
     pub confidence: f64,
-    /// Newest in-scope commit (by valid time, then SHA) where both changed.
+    /// Newest in-scope commit where both changed (by chronological valid
+    /// time — parsed, offset-aware — with ties broken by SHA).
     pub last_co_change_commit: &'a str,
     /// Valid time of `last_co_change_commit`, when recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16015,6 +16016,25 @@ pub fn co_change_coupling<'a>(
         Some(ids) => *ids.iter().next().expect("non-empty id set"),
     };
 
+    // ── repository gating for the unscoped partner universe ─────────────────
+    // In a shared store two repositories can carry the same Git commit SHA
+    // (forks, mirrored history), and the per-file sets count bare SHAs, so
+    // without gating a file from another repository could surface as a
+    // partner of a target it never co-changed with. Partners always live in
+    // the target file's owning repository: `--repo` scoping already
+    // guarantees this through `in_scope`, and unscoped multi-repository
+    // stores are gated here through record ownership.
+    let owner_index: OnceCell<RepositoryIndex> = OnceCell::new();
+    let repository_count = records
+        .iter()
+        .filter(|r| matches!(r.node_kind_name(), Some("Repository")))
+        .count();
+    if repo_scope.is_none() && repository_count > 1 {
+        let index = owner_index.get_or_init(|| RepositoryIndex::build(records));
+        let target_owner = index.owner_of(target_id);
+        files.retain(|id, _| index.owner_of(id) == target_owner);
+    }
+
     // ── per-file distinct in-scope commit sets from CHANGED_IN edges ────────
     let mut commits_by_file: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for r in records {
@@ -16045,10 +16065,9 @@ pub fn co_change_coupling<'a>(
     // co-change, so every `Change` record whose path resolves to a known
     // `File` node contributes its commit to that file's set (a union with
     // the edge-derived sets: add/modify entries are already covered and
-    // deduplicate). In a multi-repository store a colliding path is
-    // attributed through the record's owning repository; an unattributable
+    // deduplicate). In a multi-repository store a Change record is
+    // attributed through its owning repository; an unattributable
     // collision is skipped deterministically rather than guessed.
-    let change_owner_index = OnceCell::new();
     for r in records {
         if let GraphRecord::Node {
             id,
@@ -16065,22 +16084,22 @@ pub fn co_change_coupling<'a>(
             let Some(candidates) = ids_by_path.get(path.as_str()) else {
                 continue; // Non-source / never-indexed paths have no File node.
             };
-            let file_id = if candidates.len() == 1 {
-                *candidates.iter().next().expect("len checked")
-            } else {
-                let index: &RepositoryIndex =
-                    change_owner_index.get_or_init(|| RepositoryIndex::build(records));
-                let change_owner = index.owner_of(id.as_str());
-                let mut owned: Vec<&str> = candidates
-                    .iter()
-                    .copied()
-                    .filter(|candidate| index.owner_of(candidate) == change_owner)
-                    .collect();
-                if owned.len() != 1 {
-                    continue;
-                }
-                owned.pop().expect("len checked")
-            };
+            // The candidate must survive the repository gate above, and in a
+            // multi-repository store its owner must match the Change's owner.
+            let mut viable: Vec<&str> = candidates
+                .iter()
+                .copied()
+                .filter(|candidate| files.contains_key(*candidate))
+                .filter(|candidate| {
+                    owner_index.get().is_none_or(|index| {
+                        index.owner_of(candidate) == index.owner_of(id.as_str())
+                    })
+                })
+                .collect();
+            if viable.len() != 1 {
+                continue;
+            }
+            let file_id = viable.pop().expect("len checked");
             commits_by_file.entry(file_id).or_default().insert(sha);
         }
     }
@@ -16104,10 +16123,21 @@ pub fn co_change_coupling<'a>(
         let partner_change_count = commits.len();
         let union = target_change_count + partner_change_count - co_change_count;
         let info = files.get(file_id).expect("counted files are indexed");
-        // Newest shared commit by (valid time, SHA): the citable handle.
+        // Newest shared commit by chronological valid time, ties (and
+        // unparseable/missing times) broken by SHA: the citable handle.
+        // Valid times are parsed, never string-compared — `scan-history`
+        // preserves non-UTC committer offsets, and a lexicographic compare
+        // would mis-order them across offsets.
         let last = co
             .iter()
-            .max_by_key(|sha| (commit_valid_time.get(*sha), *sha))
+            .max_by_key(|sha| {
+                (
+                    commit_valid_time
+                        .get(*sha)
+                        .and_then(|vt| DateTime::parse_from_rfc3339(vt).ok()),
+                    *sha,
+                )
+            })
             .copied()
             .expect("co_change_count >= min_support >= 1");
         partners.push(CouplingPartner {
