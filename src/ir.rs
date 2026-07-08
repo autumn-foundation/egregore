@@ -170,6 +170,15 @@ impl Graph {
         &self.records
     }
 
+    /// Returns mutable access to all graph records in insertion order.
+    ///
+    /// Used by post-extraction passes that annotate already-pushed records,
+    /// e.g. same-file `CALLS` resolution labeling (issue #134).
+    #[must_use]
+    pub fn records_mut(&mut self) -> &mut [GraphRecord] {
+        &mut self.records
+    }
+
     /// Consumes the graph and returns the records vector.
     #[must_use]
     pub fn into_records(self) -> Vec<GraphRecord> {
@@ -597,6 +606,57 @@ impl UserContextFields {
     }
 }
 
+/// Resolution status carried by labeled `CALLS` edges (issues #152/#134).
+///
+/// Emitted by the deterministic repo-wide cross-file resolution pass (issue
+/// #152) and by the same-file labeling pass over per-file `CALLS` edges
+/// backed by Tree-sitter call sites (issue #134). Both slices label call
+/// edges through one field:
+///
+/// - `resolved` — the call site's name (plus any syntactic path/receiver
+///   narrowing) matched exactly one in-repo definition.
+/// - `ambiguous` — the name matched two or more in-repo definitions; an edge
+///   is emitted to every candidate, each labeled `ambiguous`.
+/// - `unresolved` — no in-repo definition matched; the edge targets a
+///   `Diagnostic` node recording the callee, never an invented symbol.
+///
+/// Adding this optional field is additive per
+/// `docs/schema/schema-versioning.md`; legacy edges simply lack it.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallResolution {
+    /// Exactly one in-repo definition matched the call site.
+    Resolved,
+    /// Two or more in-repo definitions matched; all candidates carry edges.
+    Ambiguous,
+    /// No in-repo definition matched; the target is a `Diagnostic` marker.
+    Unresolved,
+}
+
+impl CallResolution {
+    /// Returns the serialized resolution status.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Ambiguous => "ambiguous",
+            Self::Unresolved => "unresolved",
+        }
+    }
+
+    /// Parses a resolution status from its wire string. Returns `None` for
+    /// unknown values.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "resolved" => Some(Self::Resolved),
+            "ambiguous" => Some(Self::Ambiguous),
+            "unresolved" => Some(Self::Unresolved),
+            _ => None,
+        }
+    }
+}
+
 /// One JSONL graph record.
 // Node carries 10 optional provenance strings for agent-memory nodes.
 // These are None for all code-graph nodes, so the memory cost is only
@@ -935,6 +995,12 @@ pub enum GraphRecord {
         /// Optional extraction confidence.
         #[serde(skip_serializing_if = "Option::is_none")]
         confidence: Option<String>,
+        /// Call resolution status (issues #152/#134); present on `CALLS`
+        /// edges emitted by the repo-wide resolution pass and on same-file
+        /// `CALLS` edges backed by a Tree-sitter call site, absent elsewhere
+        /// (absence means "outside the resolution contract", not "resolved").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolution: Option<CallResolution>,
         /// Git and bitemporal provenance for history-backed records.
         #[serde(skip_serializing_if = "Option::is_none")]
         temporal: Option<TemporalMetadata>,
@@ -1440,6 +1506,7 @@ impl GraphRecord {
             source,
             target,
             confidence,
+            resolution: None,
             temporal: None,
             summary,
             producer: None,
@@ -1464,9 +1531,31 @@ impl GraphRecord {
             source,
             target,
             confidence,
+            resolution: None,
             temporal: None,
             summary,
             producer: None,
+        }
+    }
+
+    /// Attaches a cross-file call resolution status to an edge record (issue #152).
+    ///
+    /// No-op on node and tombstone records.
+    #[must_use]
+    pub const fn with_resolution(mut self, call_resolution: CallResolution) -> Self {
+        if let Self::Edge { resolution, .. } = &mut self {
+            *resolution = Some(call_resolution);
+        }
+        self
+    }
+
+    /// Returns the cross-file call resolution status when this record is an
+    /// edge carrying one; `None` otherwise (issue #152).
+    #[must_use]
+    pub const fn resolution(&self) -> Option<CallResolution> {
+        match self {
+            Self::Edge { resolution, .. } => *resolution,
+            Self::Node { .. } | Self::Tombstone { .. } => None,
         }
     }
 

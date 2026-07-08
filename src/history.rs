@@ -144,6 +144,12 @@ fn scan_repository_history_inner(
             );
         }
 
+        let mut facts_by_file = BTreeMap::new();
+        // Records pushed from here on belong to this commit's replayed tree;
+        // the same-file resolution labeling pass (issue #134) must only see
+        // this commit's slice because the same stable edge ID can recur across
+        // commits with different in-repo definition sets.
+        let commit_records_start = graph.records().len();
         for path in list_indexed_source_files(repo_root, &commit.sha)? {
             let change_id = change_ids_by_path.get(&path);
             let source = git_blob(repo_root, &commit.sha, &path)?;
@@ -151,7 +157,11 @@ fn scan_repository_history_inner(
                 path: repo_root.join(&path),
                 repo_relative_path: path.clone(),
             };
-            for record in scan_source_text_records(&source_file, &source, &repository_id)? {
+            let (records, facts) = scan_source_text_records(&source_file, &source, &repository_id)?;
+            if !facts.is_empty() {
+                facts_by_file.insert(path.clone(), facts);
+            }
+            for record in records {
                 let record = record.with_temporal(commit.temporal());
                 if is_temporal_change_target(&record) {
                     let source_id = record.id().to_owned();
@@ -183,6 +193,20 @@ fn scan_repository_history_inner(
                 }
             }
         }
+
+        // Repo-wide cross-file call resolution for this commit's tree
+        // (issue #152), stamped with the commit's temporal provenance like
+        // every other syntax-backed record replayed at this commit.
+        for record in
+            crate::languages::cross_file::cross_file_call_records(&repository_id, &facts_by_file)
+        {
+            graph.push(record.with_temporal(commit.temporal()));
+        }
+        // Same-file resolution labeling (issue #134) over this commit's slice.
+        crate::languages::cross_file::label_same_file_call_resolutions(
+            &mut graph.records_mut()[commit_records_start..],
+            &facts_by_file,
+        );
     }
 
     let languages = crate::languages_in_graph(&graph);

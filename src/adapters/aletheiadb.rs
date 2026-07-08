@@ -582,31 +582,82 @@ impl EmbeddedAletheiaSink {
             records.push(self.read_tombstone_record(record_id, node_id)?);
         }
 
-        let mut seen_edge_ids = std::collections::BTreeSet::new();
+        for (codegraph_id, edge_id) in self.latest_edge_versions(&active_tombstoned)? {
+            records.push(self.read_edge_record(&codegraph_id, edge_id)?);
+        }
+
+        Ok(records)
+    }
+
+    /// Collapses physical edges to one `AletheiaDB` edge per `codegraph_id`,
+    /// skipping tombstoned IDs and preserving first-encounter emit order.
+    ///
+    /// Edges are append-only: a re-ingest with changed properties (e.g. a
+    /// resolution-only upgrade of a pre-existing CALLS edge, issue #152)
+    /// appends a second physical edge with the same `codegraph_id` and a
+    /// higher `egregore_seq`. Duplicates collapse to the LATEST write —
+    /// highest `egregore_seq` wins; a seq-stamped edge beats a legacy edge
+    /// without the property; ties (and legacy-vs-legacy) fall back to the
+    /// higher `EdgeId`, which the store assigns in write order.
+    fn latest_edge_versions(
+        &self,
+        active_tombstoned: &BTreeSet<String>,
+    ) -> AdapterResult<Vec<(String, ::aletheiadb::EdgeId)>> {
+        let mut latest_edges: BTreeMap<String, (Option<u64>, ::aletheiadb::EdgeId)> =
+            BTreeMap::new();
+        let mut edge_emit_order: Vec<String> = Vec::new();
         for node_id in self.db.get_all_node_ids() {
             for edge_id in self.db.get_outgoing_edges(node_id) {
                 let edge = self
                     .db
                     .get_edge(edge_id)
-                    .map_err(|error| read_back_error("read_all_records", error.to_string()))?;
+                    .map_err(|error| read_back_error("latest_edge_versions", error.to_string()))?;
                 let Some(codegraph_id) = optional_str_property(
-                    "read_all_records",
+                    "latest_edge_versions",
                     "codegraph_id",
                     edge.get_property("codegraph_id"),
                 )?
                 else {
                     continue;
                 };
-                // Deduplicate and skip tombstoned edges.
-                if seen_edge_ids.insert(codegraph_id.clone())
-                    && !active_tombstoned.contains(codegraph_id.as_str())
-                {
-                    records.push(self.read_edge_record(&codegraph_id, edge_id)?);
+                if active_tombstoned.contains(codegraph_id.as_str()) {
+                    continue;
+                }
+                let seq = optional_str_property(
+                    "latest_edge_versions",
+                    "egregore_seq",
+                    edge.get_property("egregore_seq"),
+                )?
+                .and_then(|s| s.parse::<u64>().ok());
+                match latest_edges.entry(codegraph_id.clone()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((seq, edge_id));
+                        edge_emit_order.push(codegraph_id);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        let (current_seq, current_edge_id) = *entry.get();
+                        let candidate_is_later = match (seq, current_seq) {
+                            (Some(new), Some(current)) => {
+                                new > current || (new == current && edge_id > current_edge_id)
+                            }
+                            (Some(_), None) => true,
+                            (None, Some(_)) => false,
+                            (None, None) => edge_id > current_edge_id,
+                        };
+                        if candidate_is_later {
+                            *entry.get_mut() = (seq, edge_id);
+                        }
+                    }
                 }
             }
         }
-
-        Ok(records)
+        Ok(edge_emit_order
+            .into_iter()
+            .map(|codegraph_id| {
+                let (_, edge_id) = latest_edges[&codegraph_id];
+                (codegraph_id, edge_id)
+            })
+            .collect())
     }
 
     /// Like [`Self::read_all_records`], but also emits *superseded* non-temporal
@@ -1970,6 +2021,7 @@ impl EmbeddedAletheiaSink {
             source,
             target,
             confidence,
+            resolution,
             temporal,
             summary,
             producer,
@@ -1988,6 +2040,11 @@ impl EmbeddedAletheiaSink {
             .insert("target_codegraph_id", target.as_str())
             .insert("egregore_seq", seq_str.as_str());
         builder = insert_optional(builder, "confidence", confidence.as_deref());
+        builder = insert_optional(
+            builder,
+            "resolution",
+            resolution.map(crate::ir::CallResolution::as_str),
+        );
         builder = insert_temporal(builder, temporal.as_ref());
         if let Some(p) = producer
             && let Ok(json) = serde_json::to_string(p)
@@ -2813,6 +2870,18 @@ impl EmbeddedAletheiaSink {
                 "confidence",
                 edge.get_property("confidence"),
             )?,
+            resolution: optional_str_property(
+                record_id,
+                "resolution",
+                edge.get_property("resolution"),
+            )?
+            .as_deref()
+            .map(|value| {
+                crate::ir::CallResolution::from_wire(value).ok_or_else(|| {
+                    read_back_error(record_id, format!("resolution invalid: {value}"))
+                })
+            })
+            .transpose()?,
             temporal: temporal_from_properties(record_id, |key| edge.get_property(key))?,
             summary: required_str_property(record_id, "summary", edge.get_property("summary"))?,
             producer: optional_str_property(
@@ -3727,6 +3796,44 @@ mod tests {
     }
 
     #[test]
+    fn edge_resolution_status_round_trips_through_the_embedded_store() {
+        // Issue #152: cross-file CALLS edges carry a `resolution` status; the
+        // embedded adapter must persist it and read it back unchanged.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("resolution-round-trip-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+        let edge = GraphRecord::edge(
+            EdgeLabel::Calls,
+            file_id.clone(),
+            symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "caller calls stable (cross-file, resolved)".to_owned(),
+        )
+        .with_resolution(crate::ir::CallResolution::Resolved);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+        sink.write_record(&file_record(&file_id, "current file"))
+            .expect("file should write");
+        sink.write_record(&current_symbol_record(&symbol_id, "current symbol", 20))
+            .expect("symbol should write");
+        sink.write_record(&edge).expect("edge should write");
+        let StoredRecord::Edge(edge_id) = sink.record_handles[edge.id()] else {
+            panic!("edge handle should point at an edge");
+        };
+        let read_back = sink
+            .read_edge_record(edge.id(), edge_id)
+            .expect("edge should read back");
+
+        assert_eq!(
+            read_back.resolution(),
+            Some(crate::ir::CallResolution::Resolved),
+            "resolution status must survive the embedded round trip"
+        );
+        assert_eq!(read_back, edge, "edge record must round-trip byte-for-byte");
+    }
+
+    #[test]
     fn identical_non_temporal_node_write_is_noop() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let data_dir = temp.path().join("duplicate-exact-node-store");
@@ -4437,6 +4544,82 @@ mod tests {
             !has_edge,
             "tombstoned edge must not appear in read_all_records"
         );
+    }
+
+    #[test]
+    fn read_all_records_returns_latest_edge_after_resolution_only_reingest() {
+        // Issue #152 / PR #290 review: a store created before the `resolution`
+        // field existed holds an unlabeled CALLS edge. Re-ingesting the same
+        // edge with `resolution` set appends a second physical edge with the
+        // same codegraph_id (higher egregore_seq). The read path must return
+        // the latest duplicate, not the stale unlabeled one.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("resolution-upgrade-store");
+        let source_symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "caller"]);
+        let target_symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "callee"]);
+        let unlabeled_edge = GraphRecord::edge(
+            EdgeLabel::Calls,
+            source_symbol_id.clone(),
+            target_symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "caller calls callee".to_owned(),
+        );
+        let edge_id = unlabeled_edge.id().to_owned();
+        let labeled_edge = unlabeled_edge
+            .clone()
+            .with_resolution(crate::ir::CallResolution::Resolved);
+
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+        sink.write_record(&current_symbol_record(
+            &source_symbol_id,
+            "caller symbol",
+            10,
+        ))
+        .expect("caller should write");
+        sink.write_record(&current_symbol_record(
+            &target_symbol_id,
+            "callee symbol",
+            10,
+        ))
+        .expect("callee should write");
+        // Legacy store state: the CALLS edge exists without a resolution property.
+        sink.write_record(&unlabeled_edge)
+            .expect("unlabeled edge should write");
+        // Resolution-only upgrade: expected_record_state reports Mismatched, so a
+        // second physical edge is appended for the same codegraph_id.
+        sink.write_record(&labeled_edge)
+            .expect("labeled edge should write");
+        assert_eq!(
+            sink.edge_observation_count_for_test(&edge_id),
+            2,
+            "resolution-only re-ingest must append a second physical edge"
+        );
+
+        let assert_latest_edge_wins = |sink: &EmbeddedAletheiaSink| {
+            let records = sink
+                .read_all_records()
+                .expect("read_all_records should succeed");
+            let resolution = records
+                .iter()
+                .find_map(|r| match r {
+                    GraphRecord::Edge { id, resolution, .. } if id == &edge_id => Some(*resolution),
+                    _ => None,
+                })
+                .expect("edge must appear in read_all_records");
+            assert_eq!(
+                resolution,
+                Some(crate::ir::CallResolution::Resolved),
+                "read_all_records must return the latest edge write (highest egregore_seq), \
+                 not the stale unlabeled duplicate"
+            );
+        };
+        assert_latest_edge_wins(&sink);
+
+        // Reopen: latest-duplicate selection must survive an index rebuild from
+        // persisted properties.
+        drop(sink);
+        let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+        assert_latest_edge_wins(&sink);
     }
 
     fn temporal_observed(

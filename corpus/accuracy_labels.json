@@ -133,6 +133,14 @@
       "name": "DECOY_STR",
       "symbol_kind": "const",
       "span": { "start_byte": 703, "end_byte": 752, "start_line": 45, "end_line": 45 }
+    },
+    {
+      "id": "sym-decoy-host",
+      "kind": "Symbol",
+      "repo_relative_path": "src/lib.rs",
+      "name": "decoy_host",
+      "symbol_kind": "function",
+      "span": { "start_byte": 754, "end_byte": 888, "start_line": 47, "end_line": 51 }
     }
   ],
   "edges": [
@@ -152,6 +160,7 @@
     { "label": "IMPORTS", "source": "file-lib", "target": "import-aliased" },
     { "label": "IMPORTS", "source": "file-lib", "target": "import-hashmap" },
     { "label": "DEFINES", "source": "file-lib", "target": "sym-decoy-str" },
+    { "label": "DEFINES", "source": "file-lib", "target": "sym-decoy-host" },
     { "label": "CALLS", "source": "sym-impl-mytrait-method", "target": "sym-free-func" }
   ]
 }

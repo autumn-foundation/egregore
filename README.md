@@ -28,6 +28,16 @@ The release binary lands at `target/release/egregore.exe` (and `eg.exe` as a sho
 
 Point `scan` at any repository. It parses every supported source file — `.rs` (Rust), `.py` (Python), `.ts`/`.tsx` (TypeScript), and `.go` (Go) — with Tree-sitter and emits a deterministic JSONL graph of nodes (files, modules, symbols, imports, diagnostics) and edges (DEFINES, CALLS, IMPORTS, MENTIONS, CONTAINS).
 
+For Rust, `CALLS` edges are resolved **across files inside the scanned repository** by a
+deterministic repo-wide resolution pass (issue #152): a call site whose name matches exactly
+one in-repo definition gets a `"resolution":"resolved"` edge, a name matching several in-repo
+definitions gets an edge to every candidate labeled `"ambiguous"`, and a call with no in-repo
+definition is recorded against a `Diagnostic` node labeled `"unresolved"` rather than dropped
+or bound to an invented symbol. The resolution boundary is a documented contract: in-repo
+cross-file resolution **yes**; cross-crate targets, trait dynamic dispatch, macro-expanded
+call sites, and generic monomorphization **no** (see
+[docs/prd/0001-codebase-knowledge-graph.md](docs/prd/0001-codebase-knowledge-graph.md)).
+
 ```powershell
 egregore scan . --out graph.jsonl
 egregore inspect graph.jsonl
@@ -162,6 +172,12 @@ See [docs/cli/query.md](docs/cli/query.md) for the full JSON output contract, no
 Structural and semantic queries return a typed, citable handle instead of every
 line a text search would make an agent ingest — no false positives from comments
 or string literals, and no bodies to read just to learn what a file defines.
+That claim is test-enforced: reference matching runs over AST-derived text with
+comment and string content removed, decoy calls in the accuracy corpus
+(`corpus/accuracy/`) must yield zero `CALLS`/`MENTIONS` edges for the
+`eg audit accuracy` gate to pass, and name-collision `CALLS` edges carry an
+explicit `resolution` status (`resolved` / `ambiguous`) instead of being
+asserted as uniquely resolved (issue #134).
 
 That saving is **measured, not asserted**. On the pinned token-cost corpus
 (`corpus/token_cost_corpus/`), counting answer tokens with one deterministic

@@ -166,6 +166,65 @@ fn incremental_rebuilds_when_cache_record_schema_version_is_unknown() {
 }
 
 #[test]
+fn incremental_tombstones_stale_cross_file_records_when_identity_changes() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    let src = repo.join("src");
+    fs::create_dir_all(&src).expect("fixture src dir should be created");
+    fs::write(src.join("alpha.rs"), "pub fn provide() -> usize { 1 }\n")
+        .expect("fixture should write");
+    fs::write(
+        src.join("beta.rs"),
+        "pub fn consume() -> usize { provide() }\n",
+    )
+    .expect("fixture should write");
+    let cache_path = temp.path().join("codegraph-cache.json");
+
+    // Establish a real cache (with real cross_file_record_ids) via a first scan.
+    scan_repository_incremental(&repo, &cache_path).expect("first scan should work");
+
+    // Simulate a cache persisted under a previous repository identity: rewrite the
+    // cached repository_id and record the cross-file records that identity emitted.
+    // Their IDs embed the old repository_id (e.g. unresolved-call diagnostics), so
+    // the current identity's recomputed pass will never re-emit them.
+    let old_repo_id = stable_id(&[
+        "repository",
+        "local-path",
+        "/old/path/that/no/longer/exists",
+    ]);
+    let stale_cross_file_id = stable_id(&[
+        "node",
+        "diagnostic",
+        "unresolved-call",
+        &old_repo_id,
+        "src/beta.rs",
+        "provide",
+    ]);
+    let mut cache_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cache_path).expect("cache should be readable"))
+            .expect("cache should parse");
+    cache_json["repository_id"] = serde_json::json!(old_repo_id);
+    cache_json["cross_file_record_ids"] = serde_json::json!([stale_cross_file_id]);
+    fs::write(
+        &cache_path,
+        serde_json::to_string_pretty(&cache_json).expect("cache should serialize"),
+    )
+    .expect("fixture should write stale cache");
+
+    let second =
+        scan_repository_incremental(&repo, &cache_path).expect("second scan after id change");
+
+    assert!(
+        second.graph.records().iter().any(|record| matches!(
+            record,
+            GraphRecord::Tombstone { deleted_id, .. } if deleted_id == &stale_cross_file_id
+        )),
+        "cross-file records from a previous repository identity must be tombstoned \
+         even though cache reuse is disabled by the identity mismatch"
+    );
+}
+
+#[test]
 fn incremental_tombstones_stale_repository_when_identity_changes() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let repo = temp.path().join("repo");

@@ -95,10 +95,10 @@ pub use decide::{DecideRequest, decide_candidate};
 pub use error::{CodegraphError, Result};
 pub use history::{scan_repository_history, scan_repository_history_with_override};
 pub use ir::{
-    AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, Domain, EdgeLabel, EgregoreGit,
-    EmbeddingModel, EvidenceLink, Graph, GraphRecord, IdentitySource, MetricKind, NodeKind,
-    NodeProvenance, PRODUCER_ENVELOPE_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION, PatchHandle,
-    Producer, ProducerKind, RepositoryIdentityPayload, SCHEMA_VERSION,
+    AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, CallResolution, Domain, EdgeLabel,
+    EgregoreGit, EmbeddingModel, EvidenceLink, Graph, GraphRecord, IdentitySource, MetricKind,
+    NodeKind, NodeProvenance, PRODUCER_ENVELOPE_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION,
+    PatchHandle, Producer, ProducerKind, RepositoryIdentityPayload, SCHEMA_VERSION,
     SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE, SEMANTIC_SCHEMA_VERSION, SelectionBasis,
     SemanticDriftMetadata, SnapshotHead, SourceSnapshotPayload, SourceSpan, TemporalMetadata,
     USER_CONTEXT_SCHEMA_VERSION, UserContextFields, UserContextScope, VERIFICATION_SCHEMA_VERSION,
@@ -230,11 +230,26 @@ fn scan_repository_at_with_override_inner(
             .with_source_snapshot(snapshot),
     );
 
+    let mut facts_by_file = BTreeMap::new();
     for source_file in fs::discover_source_files(repo_root)? {
-        for record in scan_source_file_records(&source_file, &repository_id)? {
+        let (records, facts) = scan_source_file_records(&source_file, &repository_id)?;
+        for record in records {
             graph.push(record.with_valid_time_inferred(transaction_time));
         }
+        if !facts.is_empty() {
+            facts_by_file.insert(source_file.repo_relative_path.clone(), facts);
+        }
     }
+
+    // Repo-wide cross-file call resolution (issue #152): per-file extraction
+    // only links calls to same-file definitions, so resolve the collected
+    // call sites against every file's definitions before sealing the graph.
+    for record in languages::cross_file::cross_file_call_records(&repository_id, &facts_by_file) {
+        graph.push(record.with_valid_time_inferred(transaction_time));
+    }
+    // Same-file resolution labeling (issue #134): stamp per-file CALLS edges
+    // backed by Tree-sitter call sites with the shared resolution status.
+    languages::cross_file::label_same_file_call_resolutions(graph.records_mut(), &facts_by_file);
 
     let languages = languages_in_graph(&graph);
     Ok(graph.stamp_producer(&code_graph_producer(&languages)))
@@ -343,7 +358,7 @@ fn stable_display_name(payload: &RepositoryIdentityPayload) -> String {
 pub(crate) fn scan_source_file_records(
     source_file: &fs::SourceFile,
     repository_id: &str,
-) -> Result<Vec<GraphRecord>> {
+) -> Result<(Vec<GraphRecord>, languages::cross_file::FileFacts)> {
     let source =
         std::fs::read_to_string(&source_file.path).map_err(|source| CodegraphError::ReadFile {
             path: source_file.path.clone(),
@@ -356,7 +371,7 @@ pub(crate) fn scan_source_text_records(
     source_file: &fs::SourceFile,
     source: &str,
     repository_id: &str,
-) -> Result<Vec<GraphRecord>> {
+) -> Result<(Vec<GraphRecord>, languages::cross_file::FileFacts)> {
     let source_lf = source.replace("\r\n", "\n");
     let source = &source_lf;
     let mut graph = Graph::new();
@@ -383,8 +398,9 @@ pub(crate) fn scan_source_text_records(
         ),
     ));
     parser::add_repository_file_edge(&mut graph, repository_id, &file_id);
-    parser::extract_source_text(source_file, source, &file_id, repository_id, &mut graph)?;
-    Ok(graph.records().to_vec())
+    let facts =
+        parser::extract_source_text(source_file, source, &file_id, repository_id, &mut graph)?;
+    Ok((graph.records().to_vec(), facts))
 }
 
 fn validate_repository(repo_root: &Path) -> Result<()> {

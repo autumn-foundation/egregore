@@ -2040,6 +2040,7 @@ fn emit_task_records(
             source: task_id.clone(),
             target: src_link_id,
             confidence: None,
+            resolution: None,
             temporal: None,
             summary: format!(
                 "Task '{}' has local-file source ExternalLink",
@@ -2127,6 +2128,7 @@ fn emit_ac_record(
         source: ac_id,
         target: parent_task_id.to_owned(),
         confidence: None,
+        resolution: None,
         temporal: None,
         summary: format!("AcceptanceCriterion '{}' owned by task", ac.local_id),
         producer: None,
@@ -2213,6 +2215,7 @@ fn emit_external_link_record(
         source: parent_stable_id.clone(),
         target: link_id,
         confidence: None,
+        resolution: None,
         temporal: None,
         summary: format!("'{}' has ExternalLink", link.parent_local_id),
         producer: None,
