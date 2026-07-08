@@ -1054,3 +1054,107 @@ version = "1.0.0"
     assert_eq!(bar["resolution"], "locked");
     assert_eq!(bar["resolved_version"], "1.4.2");
 }
+
+// ---------------------------------------------------------------------------
+// PR #314 review: a miss is never definitive while manifests were skipped
+// ---------------------------------------------------------------------------
+
+/// Repo with one malformed manifest and one valid one: every answer — hit,
+/// miss, and full listing — must carry a `skipped_manifest` diagnostic citing
+/// the skipped manifest's repo-relative handle, so "do we depend on X?" is
+/// never answered definitively while coverage has holes.
+fn partially_unparseable_graph() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("crates/good/src")).expect("good dir");
+    fs::create_dir_all(repo.join("crates/broken")).expect("broken dir");
+    fs::write(
+        repo.join("crates/good/Cargo.toml"),
+        "[package]\nname = \"good\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("good manifest");
+    fs::write(repo.join("crates/broken/Cargo.toml"), "[package\nbroken =")
+        .expect("broken manifest");
+    fs::write(repo.join("crates/good/src/lib.rs"), "pub fn g() {}\n").expect("lib.rs");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("skipped-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+    (temp, graph)
+}
+
+fn skipped_diagnostics(parsed: &Value) -> Vec<&Value> {
+    parsed["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter(|d| d["code"] == "skipped_manifest")
+        .collect()
+}
+
+#[test]
+fn name_miss_with_skipped_manifest_is_visibly_non_definitive() {
+    let (_temp, graph) = partially_unparseable_graph();
+    let parsed = run_query_deps(&graph, &["--name", "left-pad"]);
+
+    assert_eq!(parsed["ok"], true, "still a machine-readable success");
+    assert_eq!(parsed["count"], 0);
+    let codes: Vec<&str> = parsed["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter_map(|d| d["code"].as_str())
+        .collect();
+    assert!(
+        codes.contains(&"no_match_for_name"),
+        "the miss diagnostic stays, got {codes:?}"
+    );
+    let skipped = skipped_diagnostics(&parsed);
+    assert_eq!(skipped.len(), 1, "the skipped manifest is surfaced");
+    assert_eq!(
+        skipped[0]["detail"], "crates/broken/Cargo.toml",
+        "the diagnostic cites the skipped manifest's repo-relative handle"
+    );
+    assert!(
+        skipped[0]["record_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("codegraph:v")),
+        "the diagnostic cites the Diagnostic record ID"
+    );
+}
+
+#[test]
+fn name_hit_and_full_listing_also_carry_skipped_manifest_diagnostics() {
+    let (_temp, graph) = partially_unparseable_graph();
+
+    let hit = run_query_deps(&graph, &["--name", "serde"]);
+    assert_eq!(hit["count"], 1, "the valid manifest's row is returned");
+    assert_eq!(
+        skipped_diagnostics(&hit).len(),
+        1,
+        "a hit is honestly qualified too"
+    );
+
+    let full = run_query_deps(&graph, &[]);
+    assert_eq!(full["count"], 1);
+    assert_eq!(skipped_diagnostics(&full).len(), 1);
+}
+
+#[test]
+fn clean_repo_carries_no_skipped_manifest_diagnostics() {
+    let (_temp, graph) = fixture_graph();
+    for extra in [
+        &[][..],
+        &["--name", "serde"][..],
+        &["--name", "left-pad"][..],
+    ] {
+        let parsed = run_query_deps(&graph, extra);
+        assert!(
+            skipped_diagnostics(&parsed).is_empty(),
+            "a fully-parsed tree must not report skipped manifests"
+        );
+    }
+}

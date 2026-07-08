@@ -413,8 +413,15 @@ fn dependency_record(
     })
 }
 
+/// Skipped-manifest `symbol_kind` discriminator (PR #314 review).
+///
+/// Stamped on the `Diagnostic` node emitted for an unreadable/unparseable
+/// manifest so query surfaces can recognize skipped-manifest coverage holes
+/// without matching summary text.
+pub const SKIPPED_MANIFEST_DIAGNOSTIC_KIND: &str = "unparseable_cargo_manifest";
+
 fn unparseable_manifest_diagnostic(repository_id: &str, manifest_path: &str) -> GraphRecord {
-    GraphRecord::node(
+    let mut record = GraphRecord::node(
         stable_id(&[
             "node",
             "diagnostic",
@@ -427,7 +434,11 @@ fn unparseable_manifest_diagnostic(repository_id: &str, manifest_path: &str) -> 
         None,
         Some(manifest_path.to_owned()),
         format!("Unparseable Cargo manifest {manifest_path}: dependency declarations skipped"),
-    )
+    );
+    if let GraphRecord::Node { symbol_kind, .. } = &mut record {
+        *symbol_kind = Some(SKIPPED_MANIFEST_DIAGNOSTIC_KIND.to_owned());
+    }
+    record
 }
 
 /// Scans every `Cargo.toml` under `repo_root` into dependency records.

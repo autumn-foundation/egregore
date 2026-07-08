@@ -1378,3 +1378,62 @@ fn audit_toolcall_handles_are_protected() {
         "ToolCall arguments handle not surfaced as protected_payload: {v}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR #314 review: dependency declarations classify as code handles
+// ---------------------------------------------------------------------------
+
+/// An Observation's evidence link to a `DependencyDeclaration` record must
+/// land in `related_code_handles` (the record is a deterministic code-graph
+/// source fact), never in `supporting_evidence`.
+#[test]
+fn dependency_declaration_evidence_lands_in_related_code_handles() {
+    let dep_records = aletheia_egregore::manifest_deps::manifest_dependency_records(
+        "repo-x",
+        "Cargo.toml",
+        "[package]\nname = \"pkg\"\n\n[dependencies]\nserde = \"1\"\n",
+        &aletheia_egregore::manifest_deps::LockfileStatus::Absent,
+    );
+    assert_eq!(dep_records.len(), 1);
+    let dep_id = dep_records[0].id().to_owned();
+
+    let claim_id = agent_memory_stable_id(&["node", "observation", "obs-dep-handle"]);
+    let mut claim = GraphRecord::node(
+        claim_id.clone(),
+        NodeKind::Observation,
+        None,
+        None,
+        None,
+        "Observation about a declared dependency".to_owned(),
+    );
+    if let GraphRecord::Node {
+        schema_version,
+        agent_id,
+        text,
+        evidence_links,
+        ..
+    } = &mut claim
+    {
+        *schema_version = AGENT_MEMORY_SCHEMA_VERSION;
+        *agent_id = Some("agent_1".to_owned());
+        *text = Some("we already depend on serde".to_owned());
+        *evidence_links = Some(vec![link(&dep_id, "codegraph", "MENTIONS_SYMBOL")]);
+    }
+
+    let mut records = dep_records;
+    records.push(claim);
+
+    let ctx = aletheia_egregore::query::memory_audit_context(&records, &claim_id, false);
+    assert!(
+        ctx.related_code_handles
+            .iter()
+            .any(|item| item.record.id() == dep_id),
+        "the dependency record must classify as a related code handle"
+    );
+    assert!(
+        !ctx.supporting_evidence
+            .iter()
+            .any(|item| item.record.id() == dep_id),
+        "the dependency record must not fall through to supporting evidence"
+    );
+}

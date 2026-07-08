@@ -44,6 +44,17 @@ exit 0 with `ok:true`, an empty `declarations` array, and a stable diagnostic
 (`empty_dependency_surface` / `no_match_for_name`) — never a silent empty
 payload, never a synthesized row.
 
+**A definitive answer requires full manifest coverage.** When the scan skipped
+an unreadable or unparseable `Cargo.toml` (its `Diagnostic` record is in the
+store), every response — hit, miss, and empty surface — carries one
+`skipped_manifest` diagnostic per skipped manifest, citing the repo-relative
+manifest handle (`detail`) and the `Diagnostic` record ID (`record_id`) in
+deterministic path order. A `no_match_for_name` accompanied by
+`skipped_manifest` is **not** a definitive "we don't depend on X": the skipped
+manifest's declarations are unknown. Exit codes are unchanged, and these
+diagnostics carry no repository topology, so `--repo` scoping never drops
+them.
+
 ## How the facts are captured
 
 `eg scan` (and `eg scan`'s library entry points) discovers every `Cargo.toml`
@@ -97,7 +108,9 @@ declared entry (manifest key):
   handle-only — the manifest body is never embedded.
 
 A manifest that fails TOML parsing yields one `Diagnostic` node citing the
-manifest handle; the scan never fails and never invents facts. A virtual
+manifest handle (stamped `symbol_kind: unparseable_cargo_manifest` so query
+surfaces can recognize the coverage hole); the scan never fails and never
+invents facts. A virtual
 workspace root (no `[package]`) legitimately declares nothing. The nearest
 `Cargo.lock` that exists is authoritative: when it cannot be read or parsed,
 the upward search stops and the manifest's dependencies are marked

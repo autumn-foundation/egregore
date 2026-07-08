@@ -11292,6 +11292,9 @@ struct ManifestDepsDiagnosticJson<'a> {
     code: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<&'a str>,
+    /// Citing record ID for record-backed diagnostics (`skipped_manifest`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_id: Option<&'a str>,
 }
 
 /// Top-level `query manifest-deps` response envelope.
@@ -11408,11 +11411,45 @@ fn query_manifest_deps_cmd(
         diagnostics.push(ManifestDepsDiagnosticJson {
             code: "empty_dependency_surface",
             detail: None,
+            record_id: None,
         });
     } else if rows.is_empty() {
         diagnostics.push(ManifestDepsDiagnosticJson {
             code: "no_match_for_name",
             detail: name_filter,
+            record_id: None,
+        });
+    }
+    // Skipped-manifest honesty (PR #314 review): an unreadable/unparseable
+    // manifest means dependency coverage has holes, so every answer — hit,
+    // miss, and empty surface — is qualified with one `skipped_manifest`
+    // diagnostic per skipped manifest (repo-relative handle + Diagnostic
+    // record ID, deterministic order). These diagnostics carry no repository
+    // topology, so `--repo` scoping never drops them.
+    let mut skipped: Vec<(&str, &str)> = records
+        .iter()
+        .filter_map(|record| {
+            let GraphRecord::Node {
+                id,
+                kind: NodeKind::Diagnostic,
+                repo_relative_path: Some(path),
+                symbol_kind: Some(symbol_kind),
+                ..
+            } = record
+            else {
+                return None;
+            };
+            (symbol_kind == crate::manifest_deps::SKIPPED_MANIFEST_DIAGNOSTIC_KIND)
+                .then_some((path.as_str(), id.as_str()))
+        })
+        .collect();
+    skipped.sort_unstable();
+    skipped.dedup();
+    for (path, record_id) in skipped {
+        diagnostics.push(ManifestDepsDiagnosticJson {
+            code: "skipped_manifest",
+            detail: Some(path),
+            record_id: Some(record_id),
         });
     }
 
@@ -11455,9 +11492,15 @@ fn query_manifest_deps_cmd(
                 );
             }
             for diagnostic in &diagnostics {
+                let record_id = diagnostic
+                    .record_id
+                    .map(|id| format!(" [{id}]"))
+                    .unwrap_or_default();
                 match diagnostic.detail {
-                    Some(detail) => println!("diagnostic: {} ({detail})", diagnostic.code),
-                    None => println!("diagnostic: {}", diagnostic.code),
+                    Some(detail) => {
+                        println!("diagnostic: {} ({detail}){record_id}", diagnostic.code);
+                    }
+                    None => println!("diagnostic: {}{record_id}", diagnostic.code),
                 }
             }
         }
