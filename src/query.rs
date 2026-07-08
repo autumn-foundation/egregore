@@ -16669,8 +16669,14 @@ pub fn ownership_map<'a>(
             if candidates.is_empty() {
                 None
             } else {
+                // The snapshot-head shortcut only applies without a cutoff:
+                // under `--as-of` the documented anchor is the most recent
+                // commit at or before the instant on the valid-time axis,
+                // and clock skew can place a reachable commit's committer
+                // date after HEAD's while both sit inside the cutoff.
                 let head = owner
                     .as_deref()
+                    .filter(|_| as_of_dt.is_none())
                     .and_then(|repo_id| snapshot_heads.get(repo_id).copied())
                     .filter(|sha| candidates.contains(sha));
                 head.or_else(|| {

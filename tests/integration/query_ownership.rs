@@ -10,7 +10,7 @@ use std::{
 };
 
 use aletheia_egregore::{
-    GraphRecord, NodeKind, TemporalMetadata,
+    EdgeLabel, GraphRecord, NodeKind, TemporalMetadata,
     bundle::scrub_record,
     query::{
         OWNERSHIP_DEFAULT_LIMIT, OWNERSHIP_DEFAULT_THRESHOLD_PERCENT, OWNERSHIP_MAX_LIMIT,
@@ -568,6 +568,129 @@ fn ownership_as_of_anchors_to_latest_valid_time_not_topological_rank() {
             .iter()
             .any(|f| f.repo_relative_path == "src/side.rs"),
         "src/side.rs exists at the latest-by-time anchor and must be reported"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn ownership_as_of_prefers_latest_valid_time_over_snapshot_head() {
+    // Clock skew: the side-branch commit `s1` carries a committer date (T4)
+    // later than the repository HEAD merge commit `m3` (T3). With `--as-of`
+    // after every commit, HEAD itself is within the cutoff — but the
+    // documented anchor (docs/cli/ownership.md) is the most recent commit at
+    // or before the instant on the valid-time axis, which is `s1`, never a
+    // snapshot-head shortcut.
+    //
+    //   m1 (T1) ── m2 (T2) ─────────────┐
+    //     └────── s1 (T4, skewed) ──────┴── m3 (merge, T3, HEAD)
+    let repo_id = stable_id(&["node", "Repository", "repo_test"]);
+    let repo_node = GraphRecord::node(
+        repo_id.clone(),
+        NodeKind::Repository,
+        None,
+        None,
+        Some("repo_test".to_owned()),
+        "Repository repo_test".to_owned(),
+    )
+    .with_source_snapshot(aletheia_egregore::SourceSnapshotPayload {
+        head: aletheia_egregore::SnapshotHead::Commit {
+            sha: "m3sha0000".to_owned(),
+        },
+        dirty: false,
+        repository_id: repo_id.clone(),
+        scanned_at: T5.to_owned(),
+    });
+    let contains = |target: String, what: &str| {
+        GraphRecord::edge(
+            EdgeLabel::Contains,
+            repo_id.clone(),
+            target,
+            None,
+            format!("repo contains {what}"),
+        )
+    };
+    let commit_id = |sha: &str| stable_id(&["node", "commit", "repo_test", sha]);
+    let file_id = |path: &str| stable_id(&["node", "file", "repo_test", path]);
+    let change_id = |commit: &str, status: &str, path: &str| {
+        stable_id(&["node", "change", "repo_test", commit, status, path])
+    };
+
+    let records = vec![
+        repo_node,
+        commit("m1sha0000", &[], T1, "Alice Dev", "alice@example.com"),
+        commit(
+            "m2sha0000",
+            &["m1sha0000"],
+            T2,
+            "Alice Dev",
+            "alice@example.com",
+        ),
+        commit(
+            "s1sha0000",
+            &["m1sha0000"],
+            T4,
+            "Bob Dev",
+            "bob@example.com",
+        ),
+        commit(
+            "m3sha0000",
+            &["m2sha0000", "s1sha0000"],
+            T3,
+            "Alice Dev",
+            "alice@example.com",
+        ),
+        contains(commit_id("m1sha0000"), "m1"),
+        contains(commit_id("m2sha0000"), "m2"),
+        contains(commit_id("s1sha0000"), "s1"),
+        contains(commit_id("m3sha0000"), "m3"),
+        // src/lib.rs exists everywhere.
+        file_snapshot("src/lib.rs", "m1sha0000", T1),
+        file_snapshot("src/lib.rs", "m2sha0000", T2),
+        file_snapshot("src/lib.rs", "s1sha0000", T4),
+        file_snapshot("src/lib.rs", "m3sha0000", T3),
+        change("src/lib.rs", "A", "m1sha0000", T1),
+        contains(file_id("src/lib.rs"), "src/lib.rs"),
+        contains(change_id("m1sha0000", "A", "src/lib.rs"), "lib.rs change"),
+        // src/side.rs is born on the future-dated side branch.
+        file_snapshot("src/side.rs", "s1sha0000", T4),
+        file_snapshot("src/side.rs", "m3sha0000", T3),
+        change("src/side.rs", "A", "s1sha0000", T4),
+        contains(file_id("src/side.rs"), "src/side.rs"),
+        contains(change_id("s1sha0000", "A", "src/side.rs"), "side.rs change"),
+        // src/mainline.rs lands after the branch point: present at HEAD,
+        // absent from the anchor commit's tree.
+        file_snapshot("src/mainline.rs", "m2sha0000", T2),
+        file_snapshot("src/mainline.rs", "m3sha0000", T3),
+        change("src/mainline.rs", "A", "m2sha0000", T2),
+        contains(file_id("src/mainline.rs"), "src/mainline.rs"),
+        contains(
+            change_id("m2sha0000", "A", "src/mainline.rs"),
+            "mainline.rs change",
+        ),
+    ];
+
+    let mut opts = options();
+    opts.as_of = Some(T5); // after every commit, HEAD included
+    let map = ownership_map(&records, &opts).expect("as-of view should resolve");
+
+    assert_eq!(map.anchors.len(), 1);
+    assert_eq!(
+        map.anchors[0].commit_sha, "s1sha0000",
+        "under --as-of the anchor is the most recent commit at or before the \
+         instant on the valid-time axis, even when the snapshot HEAD is also \
+         within the cutoff"
+    );
+    assert!(
+        map.files
+            .iter()
+            .any(|f| f.repo_relative_path == "src/side.rs"),
+        "src/side.rs exists at the latest-by-time anchor and must be reported"
+    );
+    assert!(
+        !map.files
+            .iter()
+            .any(|f| f.repo_relative_path == "src/mainline.rs"),
+        "src/mainline.rs is not in the anchor commit's tree and must not be reported"
     );
 }
 
