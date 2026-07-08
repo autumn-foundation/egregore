@@ -144,6 +144,7 @@ fn scan_repository_history_inner(
             );
         }
 
+        let mut facts_by_file = BTreeMap::new();
         for path in list_indexed_source_files(repo_root, &commit.sha)? {
             let change_id = change_ids_by_path.get(&path);
             let source = git_blob(repo_root, &commit.sha, &path)?;
@@ -151,7 +152,11 @@ fn scan_repository_history_inner(
                 path: repo_root.join(&path),
                 repo_relative_path: path.clone(),
             };
-            for record in scan_source_text_records(&source_file, &source, &repository_id)? {
+            let (records, facts) = scan_source_text_records(&source_file, &source, &repository_id)?;
+            if !facts.is_empty() {
+                facts_by_file.insert(path.clone(), facts);
+            }
+            for record in records {
                 let record = record.with_temporal(commit.temporal());
                 if is_temporal_change_target(&record) {
                     let source_id = record.id().to_owned();
@@ -182,6 +187,15 @@ fn scan_repository_history_inner(
                     graph.push(record);
                 }
             }
+        }
+
+        // Repo-wide cross-file call resolution for this commit's tree
+        // (issue #152), stamped with the commit's temporal provenance like
+        // every other syntax-backed record replayed at this commit.
+        for record in
+            crate::languages::cross_file::cross_file_call_records(&repository_id, &facts_by_file)
+        {
+            graph.push(record.with_temporal(commit.temporal()));
         }
     }
 

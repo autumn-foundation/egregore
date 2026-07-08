@@ -299,6 +299,7 @@ fn make_edge(label: EdgeLabel, source: String, target: String, summary: &str) ->
         source,
         target,
         confidence: None,
+        resolution: None,
         temporal: None,
         summary: summary.to_owned(),
         producer: None,

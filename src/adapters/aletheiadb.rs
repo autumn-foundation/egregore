@@ -1970,6 +1970,7 @@ impl EmbeddedAletheiaSink {
             source,
             target,
             confidence,
+            resolution,
             temporal,
             summary,
             producer,
@@ -1988,6 +1989,11 @@ impl EmbeddedAletheiaSink {
             .insert("target_codegraph_id", target.as_str())
             .insert("egregore_seq", seq_str.as_str());
         builder = insert_optional(builder, "confidence", confidence.as_deref());
+        builder = insert_optional(
+            builder,
+            "resolution",
+            resolution.map(crate::ir::CallResolution::as_str),
+        );
         builder = insert_temporal(builder, temporal.as_ref());
         if let Some(p) = producer
             && let Ok(json) = serde_json::to_string(p)
@@ -2813,6 +2819,18 @@ impl EmbeddedAletheiaSink {
                 "confidence",
                 edge.get_property("confidence"),
             )?,
+            resolution: optional_str_property(
+                record_id,
+                "resolution",
+                edge.get_property("resolution"),
+            )?
+            .as_deref()
+            .map(|value| {
+                crate::ir::CallResolution::from_wire(value).ok_or_else(|| {
+                    read_back_error(record_id, format!("resolution invalid: {value}"))
+                })
+            })
+            .transpose()?,
             temporal: temporal_from_properties(record_id, |key| edge.get_property(key))?,
             summary: required_str_property(record_id, "summary", edge.get_property("summary"))?,
             producer: optional_str_property(
@@ -3724,6 +3742,44 @@ mod tests {
             .expect("edge target should be readable");
 
         assert_eq!(edge_target, updated_symbol_node_id);
+    }
+
+    #[test]
+    fn edge_resolution_status_round_trips_through_the_embedded_store() {
+        // Issue #152: cross-file CALLS edges carry a `resolution` status; the
+        // embedded adapter must persist it and read it back unchanged.
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let data_dir = temp.path().join("resolution-round-trip-store");
+        let file_id = stable_id(&["node", "file", "src/lib.rs"]);
+        let symbol_id = stable_id(&["node", "symbol", "src/lib.rs", "stable"]);
+        let edge = GraphRecord::edge(
+            EdgeLabel::Calls,
+            file_id.clone(),
+            symbol_id.clone(),
+            Some("1.0".to_owned()),
+            "caller calls stable (cross-file, resolved)".to_owned(),
+        )
+        .with_resolution(crate::ir::CallResolution::Resolved);
+        let mut sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+
+        sink.write_record(&file_record(&file_id, "current file"))
+            .expect("file should write");
+        sink.write_record(&current_symbol_record(&symbol_id, "current symbol", 20))
+            .expect("symbol should write");
+        sink.write_record(&edge).expect("edge should write");
+        let StoredRecord::Edge(edge_id) = sink.record_handles[edge.id()] else {
+            panic!("edge handle should point at an edge");
+        };
+        let read_back = sink
+            .read_edge_record(edge.id(), edge_id)
+            .expect("edge should read back");
+
+        assert_eq!(
+            read_back.resolution(),
+            Some(crate::ir::CallResolution::Resolved),
+            "resolution status must survive the embedded round trip"
+        );
+        assert_eq!(read_back, edge, "edge record must round-trip byte-for-byte");
     }
 
     #[test]
