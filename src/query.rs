@@ -9,6 +9,7 @@
     clippy::cast_precision_loss
 )]
 
+use std::cell::OnceCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -16034,6 +16035,53 @@ pub fn co_change_coupling<'a>(
                 .entry(files.get(source.as_str()).expect("checked above").record_id)
                 .or_default()
                 .insert(sha);
+        }
+    }
+
+    // ── fold Change records into the commit sets (deletion coverage) ────────
+    // `scan-history` replays only paths present in a commit's tree, so a
+    // deleted path has a `Change` record for the deletion commit but no
+    // `File` snapshot and no `CHANGED_IN` edge there. Co-deletion is real
+    // co-change, so every `Change` record whose path resolves to a known
+    // `File` node contributes its commit to that file's set (a union with
+    // the edge-derived sets: add/modify entries are already covered and
+    // deduplicate). In a multi-repository store a colliding path is
+    // attributed through the record's owning repository; an unattributable
+    // collision is skipped deterministically rather than guessed.
+    let change_owner_index = OnceCell::new();
+    for r in records {
+        if let GraphRecord::Node {
+            id,
+            kind: NodeKind::Change,
+            repo_relative_path: Some(path),
+            temporal: Some(t),
+            ..
+        } = r
+        {
+            let sha = t.git_commit.as_str();
+            if !in_scope_shas.contains(sha) || !in_scope(id.as_str()) {
+                continue;
+            }
+            let Some(candidates) = ids_by_path.get(path.as_str()) else {
+                continue; // Non-source / never-indexed paths have no File node.
+            };
+            let file_id = if candidates.len() == 1 {
+                *candidates.iter().next().expect("len checked")
+            } else {
+                let index: &RepositoryIndex =
+                    change_owner_index.get_or_init(|| RepositoryIndex::build(records));
+                let change_owner = index.owner_of(id.as_str());
+                let mut owned: Vec<&str> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|candidate| index.owner_of(candidate) == change_owner)
+                    .collect();
+                if owned.len() != 1 {
+                    continue;
+                }
+                owned.pop().expect("len checked")
+            };
+            commits_by_file.entry(file_id).or_default().insert(sha);
         }
     }
 

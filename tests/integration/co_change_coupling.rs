@@ -504,6 +504,131 @@ fn seed_coupling_fixture_repo(repo: &Path) -> [String; 5] {
     [c1, c2, c3, c4, c5]
 }
 
+/// Deletion commits count as changes (Codex review on PR #312): a file
+/// deleted in a commit has a `Change` record for that commit but no `File`
+/// snapshot and no `CHANGED_IN` edge, because `scan-history` only replays
+/// paths present in the commit's tree. Co-deletion is real co-change — a
+/// struct and its fixture removed together is exactly the hidden-coupling
+/// signal this query exists for — so the index must fold deletion `Change`
+/// records into the per-file commit sets.
+#[test]
+fn coupling_counts_co_deletion_commits_from_change_records() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir should be created");
+
+    git(&repo, ["init"]);
+    git(&repo, ["config", "user.email", "codegraph@example.invalid"]);
+    git(&repo, ["config", "user.name", "Codegraph Test"]);
+    git(&repo, ["config", "core.autocrlf", "false"]);
+    git(&repo, ["config", "commit.gpgsign", "false"]);
+
+    // c1: alpha and beta are born together (gamma is control noise).
+    write(&repo, "src/alpha.rs", "pub fn alpha() -> u32 { 1 }\n");
+    write(&repo, "src/beta.rs", "pub fn beta() -> u32 { 1 }\n");
+    write(&repo, "src/gamma.rs", "pub fn gamma() -> u32 { 1 }\n");
+    let _c1 = commit_fixture(&repo, "add alpha and beta together", T1);
+
+    // c2: unrelated churn only.
+    write(&repo, "src/gamma.rs", "pub fn gamma() -> u32 { 2 }\n");
+    let _c2 = commit_fixture(&repo, "gamma alone", T2);
+
+    // c3: alpha and beta die together.
+    fs::remove_file(repo.join("src/alpha.rs")).expect("alpha should be removed");
+    fs::remove_file(repo.join("src/beta.rs")).expect("beta should be removed");
+    let c3 = commit_fixture(&repo, "delete alpha and beta together", T3);
+
+    let jsonl = scan_repository_history(&repo)
+        .expect("history should scan")
+        .to_jsonl()
+        .expect("history graph should serialize");
+    let records: Vec<GraphRecord> = jsonl
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record should parse"))
+        .collect();
+
+    // Evidence for the record-shape claim: the deletion commit carries a
+    // `D`-status Change record for alpha but no File snapshot (and thus no
+    // CHANGED_IN edge) at that commit.
+    let alpha_delete_change = records.iter().any(|r| {
+        matches!(
+            r,
+            GraphRecord::Node {
+                kind: NodeKind::Change,
+                name: Some(name),
+                temporal: Some(t),
+                ..
+            } if name == "D src/alpha.rs" && t.git_commit == c3
+        )
+    });
+    assert!(
+        alpha_delete_change,
+        "scan-history must record the deletion as a Change node"
+    );
+    let alpha_snapshot_at_c3 = records.iter().any(|r| {
+        matches!(
+            r,
+            GraphRecord::Node {
+                kind: NodeKind::File,
+                repo_relative_path: Some(p),
+                temporal: Some(t),
+                ..
+            } if p == "src/alpha.rs" && t.git_commit == c3
+        )
+    });
+    assert!(
+        !alpha_snapshot_at_c3,
+        "a deleted path has no File snapshot at the deletion commit"
+    );
+
+    // The deletion commit counts toward change_count and co-change: alpha
+    // changed in {c1, c3}, beta in {c1, c3}, so at the default min-support
+    // of 2 beta is a partner with co=2 and confidence 1.0, and the newest
+    // shared commit is the co-deletion commit.
+    let report = co_change_coupling(&records, "src/alpha.rs", None, &options())
+        .expect("deleted target should still resolve to its File node");
+    assert_eq!(
+        report.target.change_count, 2,
+        "deletion must count as a change of the target"
+    );
+    let beta = report
+        .partners
+        .iter()
+        .find(|p| p.repo_relative_path == "src/beta.rs")
+        .expect("co-deleted partner must survive the min-support threshold");
+    assert_eq!(beta.co_change_count, 2);
+    assert_eq!(beta.partner_change_count, 2);
+    assert!((beta.coupling - 1.0).abs() < f64::EPSILON);
+    assert!((beta.confidence - 1.0).abs() < f64::EPSILON);
+    assert_eq!(
+        beta.last_co_change_commit, c3,
+        "the co-deletion commit is the newest shared commit"
+    );
+
+    // gamma never co-changed with alpha above the threshold.
+    assert!(
+        report
+            .partners
+            .iter()
+            .all(|p| p.repo_relative_path != "src/gamma.rs"),
+        "control file must stay suppressed"
+    );
+
+    // Determinism holds with Change-record folding in the index.
+    let baseline = serde_json::to_string(&report).expect("report should serialize");
+    for _ in 0..4 {
+        let again = serde_json::to_string(
+            &co_change_coupling(&records, "src/alpha.rs", None, &options())
+                .expect("deleted target should still resolve"),
+        )
+        .expect("report should serialize");
+        assert_eq!(baseline, again, "repeated runs must be byte-equivalent");
+    }
+
+    let status_after = git_output(&repo, ["status", "--porcelain"]);
+    assert!(status_after.is_empty(), "query must not mutate the tree");
+}
+
 #[test]
 fn coupling_fixture_repo_ranks_engineered_partner_first_and_leaves_tree_clean() {
     let temp = tempfile::tempdir().expect("temp dir should be created");

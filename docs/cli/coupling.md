@@ -56,8 +56,13 @@ eg query coupling src/parser.rs --graph history.graph.jsonl --base 4f0c2b1 --hea
 ## The metric (`jaccard_v1`)
 
 Let `A` be the set of distinct in-scope commits that modified the target and
-`B` the set for a candidate partner (both from the `CHANGED_IN` edges
-recorded by `scan-history`).
+`B` the set for a candidate partner. Both sets are built from the
+`CHANGED_IN` edges recorded by `scan-history`, unioned with its per-commit
+`Change` records so that **deletion commits count as changes**: a deleted
+path has no `File` snapshot (and thus no `CHANGED_IN` edge) at the deletion
+commit, but its `D` `Change` record attributes that commit to the file — two
+files removed in the same commit are co-changing, and a deleted file remains
+a queryable target through its recorded `File` node.
 
 | Field | Definition | Meaning |
 |-------|------------|---------|
