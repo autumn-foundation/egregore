@@ -452,3 +452,62 @@ fn query_is_read_only() {
     let after = fs::read(&graph).expect("read graph after");
     assert_eq!(before, after, "producer-drift must never mutate its input");
 }
+
+/// Sorted `(relative path, bytes)` fingerprint of every file under `root`
+/// (mirrors `tests/integration/asof_file_symbols.rs`).
+#[cfg(feature = "embedded-aletheiadb")]
+fn dir_fingerprint(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let ft = entry.file_type().unwrap();
+            let path = entry.path();
+            if ft.is_dir() {
+                walk(&path, base, out);
+            } else if ft.is_file() {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// AC7 for `--data-dir`: opening the embedded engine in place re-persists its
+/// on-disk index files, so the audit must read a throwaway copy and leave the
+/// live store byte-for-byte untouched (mirrors the evidence-freshness,
+/// point-in-time, and citation-audit read-only lanes).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn data_dir_query_is_strictly_read_only() {
+    let (_temp, graph) = mixed_graph();
+    let temp_db = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp_db.path().join("store");
+
+    egregore()
+        .arg("ingest")
+        .arg(&graph)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let before = dir_fingerprint(&data_dir);
+    egregore()
+        .args(["query", "producer-drift", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+    let after = dir_fingerprint(&data_dir);
+    assert_eq!(
+        before, after,
+        "producer-drift must not modify any store file when reading --data-dir"
+    );
+}

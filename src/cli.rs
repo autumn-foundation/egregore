@@ -6216,7 +6216,13 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo,
             format,
         } => {
-            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            // Opening the embedded engine in place re-persists its index
+            // files; producer-drift documents a read-only guarantee, so an
+            // embedded store is read through a throwaway copy. The guard
+            // keeps the copy alive for the read below.
+            let store_copy = data_dir.as_deref().map(readonly_audit_store).transpose()?;
+            let effective_data_dir = store_copy.as_ref().map(|(path, _guard)| path.as_path());
+            let records = load_query_records(graph.as_deref(), effective_data_dir)?;
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_producer_drift_cmd(&records, &index, selected.as_deref(), format)
