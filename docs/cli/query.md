@@ -755,9 +755,12 @@ eg query at <PATH>:<LINE> --data-dir <DIR> [--at <COMMIT>] [--repo <SELECTOR>]
   yields the typed `no_enclosing_symbol` error, never a nearest-neighbor
   guess.
 - **Current state by default.** Without `--at`, tombstoned records are
-  excluded and history graphs resolve each stable ID to its newest version.
-  With `--at`, only records observed at that commit participate, so the same
-  line can resolve to different symbols (or to none) at different commits.
+  excluded, and a history graph is anchored to its stamped HEAD snapshot
+  (issue #82): a path deleted or renamed at HEAD is a `no_match`, never a
+  stale pre-deletion symbol. Legacy stores without a stamped snapshot fall
+  back to each stable ID's newest version. With `--at`, only records observed
+  at that commit participate, so the same line can resolve to different
+  symbols (or to none) at different commits.
 - **Repository boundary stays explicit.** An unscoped location whose path
   exists in more than one repository fails closed with the
   `ambiguous_repository` stderr diagnostic (exit `1`); re-run with `--repo`.

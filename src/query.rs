@@ -18762,8 +18762,30 @@ pub fn location_context<'a>(
     let is_owned =
         |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
 
-    // Select the view: keep-last dedupe by stable ID for the current state,
-    // or the exact per-commit snapshot when a temporal pin is supplied.
+    // HEAD-commit SHA per repository from the stamped source snapshot
+    // (issue #82), later record winning deterministically. Anchors the
+    // default view of a history graph to the HEAD snapshot — matching
+    // `resolve_head_symbols` — because `scan-history` emits no tombstones
+    // for a path deleted or renamed at HEAD: keep-last-per-ID alone would
+    // resurrect the last pre-deletion version as if it were current.
+    let mut repo_heads: BTreeMap<&str, &str> = BTreeMap::new();
+    for record in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Repository,
+            id,
+            source_snapshot: Some(snapshot),
+            ..
+        } = record
+            && let SnapshotHead::Commit { sha } = &snapshot.head
+        {
+            repo_heads.insert(id.as_str(), sha.as_str());
+        }
+    }
+
+    // Select the view: the current state (HEAD snapshot for history-backed
+    // records with a stamped head, newest-version-per-ID otherwise, always
+    // tombstone-excluded), or the exact per-commit snapshot when a temporal
+    // pin is supplied.
     let mut nodes: BTreeMap<&str, &'a GraphRecord> = BTreeMap::new();
     for record in records {
         let GraphRecord::Node {
@@ -18782,16 +18804,23 @@ pub fn location_context<'a>(
         if repo_relative_path.as_deref() != Some(path) || !is_owned(id) {
             continue;
         }
-        match at_commit {
-            Some(commit) => {
-                if temporal.as_ref().map(|t| t.git_commit.as_str()) != Some(commit) {
-                    continue;
-                }
+        if let Some(commit) = at_commit {
+            if temporal.as_ref().map(|t| t.git_commit.as_str()) != Some(commit) {
+                continue;
             }
-            None => {
-                if tombstoned.contains(id.as_str()) {
-                    continue;
-                }
+        } else {
+            if tombstoned.contains(id.as_str()) {
+                continue;
+            }
+            // A history-backed record represents the current state only
+            // at the stamped HEAD commit. Records without a resolvable
+            // owner or without a stamped head (legacy stores) keep the
+            // newest-version-per-ID view.
+            if let Some(t) = temporal
+                && let Some(head) = index.owner_of(id).and_then(|repo| repo_heads.get(repo))
+                && t.git_commit != *head
+            {
+                continue;
             }
         }
         nodes.insert(id.as_str(), record);

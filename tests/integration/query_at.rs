@@ -3,12 +3,12 @@
 //! enclosing chain reported outermost → innermost.
 #![allow(missing_docs)]
 
-use std::{fs, path::Path, path::PathBuf};
+use std::{fs, path::Path, path::PathBuf, process::Stdio};
 
 use aletheia_egregore::{
     GraphRecord, NodeKind, SourceSpan, TemporalMetadata,
     ir::{Graph, stable_id},
-    scan_repository_at_with_override,
+    scan_repository_at_with_override, scan_repository_history_with_override,
 };
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -508,4 +508,131 @@ fn query_at_unknown_repo_selector_exits_1() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("unknown_repository_selector"));
+}
+
+// ---------------------------------------------------------------------------
+// Default view over a scan-history graph is the HEAD snapshot, not
+// latest-record-per-ID: a path deleted at HEAD must be a no_match, never a
+// stale symbol (PR #306 review follow-up)
+// ---------------------------------------------------------------------------
+
+fn git<const N: usize>(repo: &Path, args: [&str; N]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("git should execute");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_commit_all(repo: &Path, message: &str, date: &str) -> String {
+    git(repo, ["add", "--all", "."]);
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "-m", message])
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .stdin(Stdio::null())
+        .output()
+        .expect("git commit should execute");
+    assert!(
+        output.status.success(),
+        "git commit failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sha = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("git rev-parse should execute");
+    String::from_utf8_lossy(&sha.stdout).trim().to_owned()
+}
+
+/// Real Git history where commit 1 adds `src/keep.rs` and `src/gone.rs`, and
+/// commit 2 (HEAD) deletes `src/gone.rs` and moves `keeper` down two lines in
+/// `src/keep.rs`. Returns (`TempDir`, history graph path, c1 SHA, c2 SHA).
+fn deleted_file_history_graph() -> (tempfile::TempDir, PathBuf, String, String) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path();
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "codegraph@example.invalid"]);
+    git(repo, ["config", "user.name", "Codegraph Test"]);
+    git(repo, ["config", "core.autocrlf", "false"]);
+    git(repo, ["config", "commit.gpgsign", "false"]);
+
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(repo.join("src/keep.rs"), "pub fn keeper() -> u32 { 1 }\n").expect("keep.rs");
+    fs::write(repo.join("src/gone.rs"), "pub fn goner() -> u32 { 1 }\n").expect("gone.rs");
+    let c1 = git_commit_all(repo, "add both files", "2026-06-01T00:00:00Z");
+
+    git(repo, ["rm", "src/gone.rs"]);
+    fs::write(
+        repo.join("src/keep.rs"),
+        "// moved\n\npub fn keeper() -> u32 { 2 }\n",
+    )
+    .expect("keep.rs v2");
+    let c2 = git_commit_all(repo, "delete gone.rs, move keeper", "2026-06-02T00:00:00Z");
+
+    let jsonl = scan_repository_history_with_override(repo, Some("at-history-fixture"))
+        .expect("history scan")
+        .to_jsonl()
+        .expect("serialize");
+    let graph = repo.join("history.graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+    (temp, graph, c1, c2)
+}
+
+#[test]
+fn query_at_default_view_is_no_match_for_path_deleted_at_head() {
+    let (_temp, graph, c1, _c2) = deleted_file_history_graph();
+
+    // Default (current-state) view: the path no longer exists at HEAD, so the
+    // answer is a typed no_match — never the stale pre-deletion symbol.
+    let parsed = run_at_err(&graph, "src/gone.rs:1", 2);
+    assert_eq!(
+        parsed["error"]["code"], "no_match",
+        "a HEAD-deleted path must be a no_match in the default view, got {parsed:?}"
+    );
+
+    // The temporal pin still reaches the pre-deletion state.
+    let output = egregore()
+        .args(["query", "at", "src/gone.rs:1", "--at", &c1, "--graph"])
+        .arg(&graph)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: Value =
+        serde_json::from_str(std::str::from_utf8(&output).expect("utf8").trim()).expect("json");
+    assert_eq!(parsed["symbol"]["name"], "gone::goner");
+    assert_eq!(parsed["symbol"]["git_commit"], c1.as_str());
+}
+
+#[test]
+fn query_at_default_view_over_history_graph_resolves_head_spans() {
+    let (_temp, graph, _c1, c2) = deleted_file_history_graph();
+
+    // At HEAD, `keeper` starts on line 3; the default view must answer with
+    // the HEAD version.
+    let parsed = run_at_ok(&graph, "src/keep.rs:3");
+    assert_eq!(parsed["symbol"]["name"], "keep::keeper");
+    assert_eq!(parsed["symbol"]["git_commit"], c2.as_str());
+    assert_eq!(parsed["symbol"]["span"]["start_line"], 3);
+
+    // Line 1 is a comment at HEAD (it was inside `keeper` only at c1): the
+    // default view must not resurrect the superseded span.
+    let parsed = run_at_err(&graph, "src/keep.rs:1", 2);
+    assert_eq!(parsed["error"]["code"], "no_enclosing_symbol");
 }
