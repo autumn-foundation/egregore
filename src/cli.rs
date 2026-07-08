@@ -1287,6 +1287,42 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// List symbols with no recorded inbound reference edges — prune-triage LEADS (issue #113).
+    ///
+    /// Returns the code symbols that nothing in this graph references: zero
+    /// inbound edges of the recorded reference classes (CALLS / IMPORTS /
+    /// MENTIONS, plus the extractor's REFERENCES and IMPLEMENTS usage edges).
+    /// The structural DEFINES/CONTAINS edge from a symbol's own file or
+    /// module never counts — every symbol has one.
+    ///
+    /// Every row is a candidate to INSPECT before removal, never proof the
+    /// symbol is dead: public API consumed outside this repository,
+    /// trait-dispatched methods, macro-generated call sites, FFI /
+    /// `#[no_mangle]` exports, derive-generated use, and crate entry points
+    /// (`main`, `#[test]`) can all be used without a recorded in-graph edge.
+    /// Candidates in a file scope containing extraction `Diagnostic` markers
+    /// carry an advisory extraction-completeness caveat (issue #87).
+    ///
+    /// An empty candidate set (every symbol referenced) is an explicit
+    /// machine-readable success: exit 0, `ok:true`, a `no_candidates`
+    /// diagnostic — distinct from the `no_symbols` diagnostic of a
+    /// symbol-free store and from a store-absent error (exit 1).
+    ///
+    /// Documented in `docs/cli/unreferenced.md`.
+    Unreferenced {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict the candidate set to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Classify public-API surface changes across a commit range (issue #157).
     ///
     /// Composes the issue #118 range-delta mechanics with the issue #124
@@ -5708,6 +5744,17 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 include_private,
                 format,
             )
+        }
+        QuerySubcommand::Unreferenced {
+            graph,
+            data_dir,
+            repo,
+            format: _format,
+        } => {
+            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_unreferenced_cmd(&records, &index, selected.as_deref())
         }
         QuerySubcommand::Orient {
             graph,
@@ -11174,6 +11221,137 @@ fn query_debt_markers_cmd(
 
     let output = serde_json::to_string_pretty(&response)
         .context("failed to serialize debt-marker inventory")?;
+    println!("{output}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// unreferenced-symbol prune candidates (issue #113)
+// ---------------------------------------------------------------------------
+
+/// Extraction-completeness caveat on one unreferenced candidate row.
+#[derive(Serialize)]
+struct UnreferencedCaveatJson<'a> {
+    code: &'a str,
+    diagnostic_count: usize,
+    diagnostic_record_ids: &'a [String],
+    detail: &'a str,
+}
+
+/// One zero-inbound-reference candidate row in the unreferenced response.
+#[derive(Serialize)]
+struct UnreferencedCandidateJson<'a> {
+    record_id: &'a str,
+    schema_version: u32,
+    name: &'a str,
+    kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_relative_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<SourceSpan>,
+    /// Introducing commit for temporal (history-backed) records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_commit: Option<&'a str>,
+    /// The inbound-reference count that selected the row — always 0.
+    inbound_reference_count: usize,
+    /// Present only when the candidate's file scope contains extractor
+    /// `Diagnostic` markers (issue #87): confidence is lower there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extraction_caveat: Option<UnreferencedCaveatJson<'a>>,
+}
+
+/// Deterministic tallies in the unreferenced response.
+#[derive(Serialize)]
+struct UnreferencedCountsJson {
+    symbols_considered: usize,
+    referenced: usize,
+    candidates: usize,
+    files_with_diagnostic_markers: usize,
+}
+
+/// One stable machine-readable diagnostic in the unreferenced response.
+#[derive(Serialize)]
+struct UnreferencedDiagnosticJson<'a> {
+    code: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_id: Option<&'a str>,
+    detail: &'a str,
+}
+
+/// Top-level unreferenced response envelope.
+#[derive(Serialize)]
+struct UnreferencedResponse<'a> {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_scope: Option<&'a str>,
+    /// Per-response disclaimer: leads for pruning triage, never proof.
+    disclaimer: &'static str,
+    /// Edge classes counted as references, sorted.
+    reference_edge_classes: &'static [&'static str],
+    candidates: Vec<UnreferencedCandidateJson<'a>>,
+    counts: UnreferencedCountsJson,
+    diagnostics: Vec<UnreferencedDiagnosticJson<'a>>,
+}
+
+const UNREFERENCED_DISCLAIMER: &str = "Symbols with zero recorded inbound reference edges in this graph. Candidates are leads \
+     for pruning triage, not proof of dead code: public API consumed outside this repository, \
+     trait-dispatched methods, macro-generated call sites, FFI/#[no_mangle] exports, \
+     derive-generated use, and crate entry points (main, #[test]) can all be used without a \
+     recorded in-graph reference.";
+
+fn query_unreferenced_cmd(
+    records: &[GraphRecord],
+    index: &query::RepositoryIndex,
+    repo_scope: Option<&str>,
+) -> Result<()> {
+    let result = query::unreferenced_symbols(records, index, repo_scope);
+
+    let response = UnreferencedResponse {
+        ok: true,
+        repo_scope,
+        disclaimer: UNREFERENCED_DISCLAIMER,
+        reference_edge_classes: query::UNREFERENCED_REFERENCE_CLASS_NAMES,
+        candidates: result
+            .candidates
+            .iter()
+            .map(|candidate| UnreferencedCandidateJson {
+                record_id: candidate.record_id,
+                schema_version: candidate.schema_version,
+                name: candidate.name,
+                kind: candidate.kind,
+                repo_relative_path: candidate.repo_relative_path,
+                span: candidate.span,
+                git_commit: candidate.git_commit,
+                inbound_reference_count: candidate.inbound_reference_count,
+                extraction_caveat: candidate.extraction_caveat.as_ref().map(|caveat| {
+                    UnreferencedCaveatJson {
+                        code: caveat.code,
+                        diagnostic_count: caveat.diagnostic_count,
+                        diagnostic_record_ids: &caveat.diagnostic_record_ids,
+                        detail: &caveat.detail,
+                    }
+                }),
+            })
+            .collect(),
+        counts: UnreferencedCountsJson {
+            symbols_considered: result.counts.symbols_considered,
+            referenced: result.counts.referenced,
+            candidates: result.counts.candidates,
+            files_with_diagnostic_markers: result.counts.files_with_diagnostic_markers,
+        },
+        diagnostics: result
+            .diagnostics
+            .iter()
+            .map(|d| UnreferencedDiagnosticJson {
+                code: d.code,
+                record_id: d.record_id.as_deref(),
+                detail: &d.detail,
+            })
+            .collect(),
+    };
+
+    let output = serde_json::to_string_pretty(&response)
+        .context("failed to serialize unreferenced-symbol candidates")?;
     println!("{output}");
     Ok(())
 }

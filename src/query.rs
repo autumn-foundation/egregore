@@ -17601,4 +17601,341 @@ pub fn ownership_map<'a>(
         files,
         diagnostics,
     })
+
+// unreferenced-symbol prune candidates (issue #113)
+// ---------------------------------------------------------------------------
+
+/// Edge labels counted as recorded references when selecting unreferenced-
+/// symbol candidates (issue #113 AC2).
+///
+/// The issue documents the reference classes `CALLS` / `MENTIONS` / `IMPORTS`;
+/// this repo's extractor additionally records `REFERENCES` (identifier use
+/// that is not call-shaped, e.g. a type named in a body or signature) and
+/// `IMPLEMENTS` (an `impl` block binding to its trait or type). Both are
+/// recorded uses in the existing edge vocabulary, so both count — excluding
+/// them would flatly misreport every used-but-never-called type as
+/// unreferenced, exactly the false-candidate class the issue rules out.
+///
+/// Structural containment (`DEFINES` / `CONTAINS`) is never counted: every
+/// symbol has one from its own file or module, so it carries no usage signal.
+/// Agent-memory `MENTIONS_SYMBOL` edges are never counted either: an
+/// agent-authored observation is not a code fact and must not mark code as
+/// referenced (trust separation).
+pub const UNREFERENCED_REFERENCE_LABELS: &[EdgeLabel] = &[
+    EdgeLabel::Calls,
+    EdgeLabel::Implements,
+    EdgeLabel::Imports,
+    EdgeLabel::Mentions,
+    EdgeLabel::References,
+];
+
+/// Stable wire strings for [`UNREFERENCED_REFERENCE_LABELS`], sorted.
+pub const UNREFERENCED_REFERENCE_CLASS_NAMES: &[&str] =
+    &["CALLS", "IMPLEMENTS", "IMPORTS", "MENTIONS", "REFERENCES"];
+
+/// Extraction-completeness caveat attached to a candidate whose file scope
+/// contains extractor `Diagnostic` markers (issue #87 semantics).
+///
+/// A macro-hidden or unparsed reference may exist in that scope, so the
+/// candidate's confidence is lower. The caveat is advisory: it never rewrites
+/// or hides the code fact it annotates.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct UnreferencedExtractionCaveat {
+    /// Stable caveat code (`diagnostics_in_file_scope`).
+    pub code: &'static str,
+    /// Number of active `Diagnostic` markers in the candidate's file scope.
+    pub diagnostic_count: usize,
+    /// Stable record IDs of those markers, sorted for determinism.
+    pub diagnostic_record_ids: Vec<String>,
+    /// Bounded human-readable detail (paths and counts only — never payload).
+    pub detail: String,
+}
+
+/// One zero-inbound-reference prune candidate.
+///
+/// Every row is a LEAD to inspect before deleting — never proof the symbol is
+/// dead. See [`unreferenced_symbols`] for the false-positive classes the
+/// graph cannot see.
+#[derive(Debug, Clone)]
+pub struct UnreferencedCandidate<'a> {
+    /// Stable record ID of the `Symbol` node.
+    pub record_id: &'a str,
+    /// Record schema version.
+    pub schema_version: u32,
+    /// Symbol name (qualified where the extractor qualifies it).
+    pub name: &'a str,
+    /// Language-specific symbol kind (`function`, `struct`, …); `symbol`
+    /// for records without a recorded kind.
+    pub kind: &'a str,
+    /// Repo-relative file of the declaration.
+    pub repo_relative_path: Option<&'a str>,
+    /// Source span of the declaration.
+    pub span: Option<SourceSpan>,
+    /// Introducing commit for temporal (history-backed) records.
+    pub git_commit: Option<&'a str>,
+    /// The inbound-reference count that selected the candidate — always 0.
+    pub inbound_reference_count: usize,
+    /// Present when the candidate's file scope contains `Diagnostic` markers.
+    pub extraction_caveat: Option<UnreferencedExtractionCaveat>,
+}
+
+/// Deterministic tallies for the unreferenced-symbol result.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct UnreferencedCounts {
+    /// Live, in-scope `Symbol` records considered (impl blocks excluded).
+    pub symbols_considered: usize,
+    /// Considered symbols with at least one recorded inbound reference.
+    pub referenced: usize,
+    /// Considered symbols with zero recorded inbound references.
+    pub candidates: usize,
+    /// Files carrying at least one active extractor `Diagnostic` marker.
+    pub files_with_diagnostic_markers: usize,
+}
+
+/// A stable machine-readable condition attached to the result.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct UnreferencedDiagnostic {
+    /// Stable diagnostic code (`no_candidates`, `no_symbols`,
+    /// `unresolved_call_edges_present`).
+    pub code: &'static str,
+    /// Record the diagnostic is about, when one exists.
+    pub record_id: Option<String>,
+    /// Bounded human-readable detail (counts only — never payload).
+    pub detail: String,
+}
+
+/// The unreferenced-symbol candidate set plus tallies and diagnostics.
+#[derive(Debug, Clone, Default)]
+pub struct UnreferencedSymbols<'a> {
+    /// Candidates sorted by (`repo_relative_path`, `span.start_line`,
+    /// `record_id`) — the documented deterministic ordering.
+    pub candidates: Vec<UnreferencedCandidate<'a>>,
+    /// Deterministic tallies.
+    pub counts: UnreferencedCounts,
+    /// Stable diagnostics, sorted and de-duplicated.
+    pub diagnostics: Vec<UnreferencedDiagnostic>,
+}
+
+/// Selects code symbols with **no recorded inbound reference edges** as
+/// prune-triage candidates (issue #113).
+///
+/// A live `Symbol` record is a candidate when it has zero inbound edges of
+/// the reference classes in [`UNREFERENCED_REFERENCE_LABELS`]. Structural
+/// containment (`DEFINES` / `CONTAINS`) never counts — every symbol has one.
+/// `impl`-block symbols are excluded from the candidate population: they are
+/// unnameable declaration details, so a zero inbound count carries no pruning
+/// signal (their methods are considered individually).
+///
+/// Current-state view: tombstoned symbols are excluded, and when a stable ID
+/// appears more than once (history graphs) the latest record wins
+/// deterministically. Ambiguous call edges count as references — a symbol
+/// that *might* be called is never reported as unreferenced.
+///
+/// Every candidate is a LEAD, never proof of dead code. The graph cannot see:
+/// public API consumed outside this repository, trait-method dynamic
+/// dispatch, macro-generated call sites, FFI / `#[no_mangle]` /
+/// `#[export_name]` consumers, derive-generated use, or crate entry points
+/// (`main`, `#[test]`). Candidates in a file scope containing extractor
+/// `Diagnostic` markers additionally carry an extraction-completeness caveat
+/// (issue #87): a macro-hidden reference may exist there.
+///
+/// Deterministic: output ordering depends only on record content, never on
+/// map iteration or wall-clock time. Strictly read-only.
+#[must_use]
+pub fn unreferenced_symbols<'a>(
+    records: &'a [GraphRecord],
+    index: &RepositoryIndex,
+    repo_scope: Option<&str>,
+) -> UnreferencedSymbols<'a> {
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| {
+            if let GraphRecord::Tombstone { deleted_id, .. } = r {
+                Some(deleted_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let is_owned =
+        |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
+
+    // Candidate population: live, in-scope Symbol nodes, keep-last dedupe by
+    // stable ID so history graphs resolve to their newest version.
+    let mut symbols: BTreeMap<&str, &'a GraphRecord> = BTreeMap::new();
+    // Active extractor Diagnostic markers per file scope. Code-domain only:
+    // trajectory/importer records reuse `NodeKind::Diagnostic` with a `domain`
+    // marker and must not lower confidence in code extraction.
+    let mut file_diagnostics: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for record in records {
+        let GraphRecord::Node {
+            id,
+            kind,
+            repo_relative_path,
+            symbol_kind,
+            domain,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if tombstoned.contains(id.as_str()) || !is_owned(id) {
+            continue;
+        }
+        match kind {
+            NodeKind::Symbol => {
+                // impl blocks are unnameable declaration details, never
+                // prune candidates; their methods are considered directly.
+                if symbol_kind.as_deref() == Some("impl") {
+                    continue;
+                }
+                symbols.insert(id.as_str(), record);
+            }
+            NodeKind::Diagnostic if domain.is_none() => {
+                if let Some(path) = repo_relative_path.as_deref() {
+                    file_diagnostics
+                        .entry(path)
+                        .or_default()
+                        .insert(id.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Inbound reference counting over live edges of the reference classes.
+    let mut referenced_ids: BTreeSet<&str> = BTreeSet::new();
+    let mut unresolved_call_edges = 0usize;
+    for record in records {
+        let GraphRecord::Edge {
+            id,
+            label,
+            target,
+            resolution,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if tombstoned.contains(id.as_str()) {
+            continue;
+        }
+        if !UNREFERENCED_REFERENCE_LABELS.contains(label) {
+            continue;
+        }
+        if *label == EdgeLabel::Calls && *resolution == Some(CallResolution::Unresolved) {
+            // The target is a Diagnostic marker, not a symbol: the callee has
+            // no in-repo definition the graph could see. Tallied for the
+            // honesty diagnostic below.
+            unresolved_call_edges += 1;
+            continue;
+        }
+        referenced_ids.insert(target.as_str());
+    }
+
+    let mut result = UnreferencedSymbols::default();
+    result.counts.symbols_considered = symbols.len();
+    result.counts.files_with_diagnostic_markers = file_diagnostics.len();
+
+    for (id, record) in &symbols {
+        if referenced_ids.contains(id) {
+            result.counts.referenced += 1;
+            continue;
+        }
+        let GraphRecord::Node {
+            schema_version,
+            repo_relative_path,
+            span,
+            name,
+            symbol_kind,
+            temporal,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        let Some(name) = name.as_deref() else {
+            continue;
+        };
+        let extraction_caveat = repo_relative_path
+            .as_deref()
+            .and_then(|path| file_diagnostics.get(path))
+            .map(|marker_ids| {
+                let diagnostic_record_ids: Vec<String> =
+                    marker_ids.iter().map(|m| (*m).to_owned()).collect();
+                UnreferencedExtractionCaveat {
+                    code: "diagnostics_in_file_scope",
+                    diagnostic_count: diagnostic_record_ids.len(),
+                    diagnostic_record_ids,
+                    detail: format!(
+                        "file scope contains {} extraction Diagnostic marker(s); a \
+                         macro-hidden or unparsed reference may exist, so this \
+                         candidate's confidence is lower",
+                        marker_ids.len()
+                    ),
+                }
+            });
+        result.candidates.push(UnreferencedCandidate {
+            record_id: id,
+            schema_version: *schema_version,
+            name,
+            kind: symbol_kind.as_deref().unwrap_or("symbol"),
+            repo_relative_path: repo_relative_path.as_deref(),
+            span: *span,
+            git_commit: temporal.as_ref().map(|t| t.git_commit.as_str()),
+            inbound_reference_count: 0,
+            extraction_caveat,
+        });
+    }
+    result.counts.candidates = result.candidates.len();
+
+    // Documented deterministic ordering (issue #113 AC8).
+    result.candidates.sort_by(|a, b| {
+        a.repo_relative_path
+            .cmp(&b.repo_relative_path)
+            .then_with(|| {
+                a.span
+                    .map(|s| s.start_line)
+                    .cmp(&b.span.map(|s| s.start_line))
+            })
+            .then_with(|| a.record_id.cmp(b.record_id))
+    });
+
+    if result.counts.symbols_considered == 0 {
+        result.diagnostics.push(UnreferencedDiagnostic {
+            code: "no_symbols",
+            record_id: None,
+            detail: "graph contains no live code Symbol records in scope; there is \
+                     nothing to triage (the store may predate code extraction or the \
+                     repository scope excludes every symbol)"
+                .to_owned(),
+        });
+    } else if result.candidates.is_empty() {
+        result.diagnostics.push(UnreferencedDiagnostic {
+            code: "no_candidates",
+            record_id: None,
+            detail: "every considered symbol carries at least one recorded inbound \
+                     reference edge; no prune candidates"
+                .to_owned(),
+        });
+    }
+    if unresolved_call_edges > 0 {
+        result.diagnostics.push(UnreferencedDiagnostic {
+            code: "unresolved_call_edges_present",
+            record_id: None,
+            detail: format!(
+                "{unresolved_call_edges} call edge(s) in this graph have no resolved \
+                 in-repo target; an unrecorded reference to a listed candidate may \
+                 exist, so treat candidates as leads only"
+            ),
+        });
+    }
+    result.diagnostics.sort_by(|a, b| {
+        a.code
+            .cmp(b.code)
+            .then_with(|| a.record_id.cmp(&b.record_id))
+            .then_with(|| a.detail.cmp(&b.detail))
+    });
+    result.diagnostics.dedup();
+    result
 }
