@@ -66,11 +66,16 @@ audit documentation.
 - Default audited kinds: `function`, `struct`, `enum`, `trait`, `type_alias`,
   `const`, `static`, plus `pub use` re-export rows whose target resolves
   in-graph. `--include-private` adds `method` declarations.
+- A re-export is **documented** when either the `pub use` site or the
+  resolved target declaration carries a doc fact — rustdoc exposes a doc
+  comment written above the re-export on the public item, so a
+  site-documented re-export of an undocumented internal item is not doc
+  debt (the bare declaration still shows up under `--include-private`).
 - **Modules** carry no doc-comment fact and are excluded from the audit
   (tallied in `counts.modules_excluded`), never guessed.
-- A re-export whose target does **not** resolve in-graph cannot have its doc
-  presence asserted: it yields a `reexport_target_unresolved` diagnostic and
-  is excluded, never guessed.
+- A re-export whose target does **not** resolve in-graph and whose site
+  carries no doc cannot have its doc presence asserted: it yields a
+  `reexport_target_unresolved` diagnostic and is excluded, never guessed.
 - Surface diagnostics (`glob_reexport_unresolved`,
   `module_visibility_unknown`, `symbol_visibility_missing`) pass through so
   known blind spots stay visible.

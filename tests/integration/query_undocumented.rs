@@ -47,14 +47,21 @@ fn private_undocumented() {}
 
 pub use internal::Hidden;
 pub use internal::Shown;
+
+/// Documented at the re-export site.
+pub use internal::SiteDocumented;
 "#;
 
 /// Private module: `Hidden` has no doc (its re-export must be reported),
-/// `Shown` is documented at the declaration (its re-export must be excluded).
+/// `Shown` is documented at the declaration (its re-export must be excluded),
+/// and `SiteDocumented` has no doc here but its re-export carries one (its
+/// re-export must be excluded — rustdoc exposes the re-export-site docs).
 const INTERNAL_RS: &str = r"pub struct Hidden;
 
 /// Documented at the declaration.
 pub struct Shown;
+
+pub struct SiteDocumented;
 
 pub fn trapped_undocumented() {}
 ";
@@ -254,6 +261,55 @@ fn query_undocumented_reexport_row_is_attributed_to_the_reexport_site() {
     assert!(
         hidden["target_record_id"].as_str().is_some(),
         "resolved re-export target must be cited by record ID"
+    );
+}
+
+#[test]
+fn query_undocumented_reexport_documented_at_the_use_site_is_excluded() {
+    // Rustdoc exposes doc comments written at the `pub use` site on the
+    // public item, so a site-documented re-export is documented even when
+    // the internal declaration carries no doc of its own.
+    let (_temp, graph) = fixture_graph();
+    let parsed = run_undocumented(&graph, &[]);
+    let paths = item_paths(&parsed);
+    assert!(
+        !paths.iter().any(|p| p == "SiteDocumented"),
+        "a re-export documented at the use site must be excluded, got {paths:?}"
+    );
+    // The internal declaration itself is still undocumented and must appear
+    // in a whole-crate audit.
+    let widened = run_undocumented(&graph, &["--include-private"]);
+    let widened_paths = item_paths(&widened);
+    assert!(
+        widened_paths
+            .iter()
+            .any(|p| p == "internal::SiteDocumented"),
+        "the undocumented declaration itself must appear under \
+         --include-private, got {widened_paths:?}"
+    );
+}
+
+#[test]
+fn rust_pub_use_site_doc_is_captured_on_the_import_record() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    write_fixture(temp.path());
+    let jsonl = scan_repository_at_with_override(temp.path(), FIXED_TIME, Some("undoc-sitedoc"))
+        .expect("scan")
+        .to_jsonl()
+        .expect("serialize");
+    let import = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("record"))
+        .find(|r| {
+            r["kind"] == "Import"
+                && r["name"]
+                    .as_str()
+                    .is_some_and(|n| n.contains("SiteDocumented"))
+        })
+        .expect("SiteDocumented import record");
+    assert_eq!(
+        import["doc"], "Documented at the re-export site.",
+        "doc comments above a use declaration must be captured"
     );
 }
 

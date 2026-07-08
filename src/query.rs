@@ -14652,10 +14652,12 @@ fn symbol_doc_facts(record: &GraphRecord) -> (Option<&str>, Option<&str>) {
 /// issue #124 — a graph-native join, never a `pub`-token grep.
 ///
 /// The reachability rule is `public_api_surface`'s, reused verbatim: items
-/// not externally reachable are excluded by default. `include_private`
-/// widens the audit to every doc-auditable symbol (adding `method`
-/// declarations) regardless of visibility, for whole-crate doc audits; such
-/// rows carry their declared visibility class and never claim
+/// not externally reachable are excluded by default. A re-export counts as
+/// documented when either the `pub use` site or the resolved target carries
+/// a doc fact — rustdoc exposes site docs on the public item.
+/// `include_private` widens the audit to every doc-auditable symbol (adding
+/// `method` declarations) regardless of visibility, for whole-crate doc
+/// audits; such rows carry their declared visibility class and never claim
 /// `externally_reachable`.
 ///
 /// Soundness boundary: the lane asserts the **presence or absence of a
@@ -14693,13 +14695,18 @@ pub fn undocumented_public_api<'a>(
     let is_owned =
         |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
     let mut symbols: BTreeMap<&str, &'a GraphRecord> = BTreeMap::new();
+    // Doc facts recorded at `pub use` sites: rustdoc exposes a doc comment
+    // written above the re-export on the public item, so a site doc counts
+    // as documentation for the re-exported symbol.
+    let mut import_docs: BTreeMap<&str, &'a str> = BTreeMap::new();
     for record in records {
         let GraphRecord::Node {
             id,
-            kind: NodeKind::Symbol,
+            kind,
             language,
             repo_relative_path,
             symbol_kind,
+            doc,
             ..
         } = record
         else {
@@ -14714,13 +14721,23 @@ pub fn undocumented_public_api<'a>(
         {
             continue;
         }
-        let auditable = symbol_kind
-            .as_deref()
-            .is_some_and(|k| PUBLIC_API_SYMBOL_KINDS.contains(&k) || k == "method");
-        if !auditable {
-            continue;
+        match kind {
+            NodeKind::Symbol => {
+                let auditable = symbol_kind
+                    .as_deref()
+                    .is_some_and(|k| PUBLIC_API_SYMBOL_KINDS.contains(&k) || k == "method");
+                if !auditable {
+                    continue;
+                }
+                symbols.insert(id.as_str(), record);
+            }
+            NodeKind::Import => {
+                if let Some(doc) = doc.as_deref() {
+                    import_docs.insert(id.as_str(), doc);
+                }
+            }
+            _ => {}
         }
-        symbols.insert(id.as_str(), record);
     }
 
     let mut report = UndocumentedReport::default();
@@ -14772,6 +14789,14 @@ pub fn undocumented_public_api<'a>(
     for item in surface.items {
         if item.kind == "module" {
             report.counts.modules_excluded += 1;
+            continue;
+        }
+        // A doc comment at the `pub use` site documents the re-exported item
+        // (rustdoc attaches it to the public name), regardless of whether the
+        // target declaration carries its own doc.
+        if item.via_reexport && import_docs.contains_key(item.record_id) {
+            report.counts.considered += 1;
+            report.counts.documented += 1;
             continue;
         }
         if item.kind == "reexport" {

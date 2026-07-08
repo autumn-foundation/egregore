@@ -1244,8 +1244,10 @@ enum QuerySubcommand {
     /// carries the concrete evidence asserted plus a citable repo-relative
     /// file/span handle. A symbol carrying any doc comment (`///`, `/** */`,
     /// or `#[doc = "..."]`) is excluded; a plain `//` comment is not
-    /// documentation. `--include-private` widens the audit to all symbols
-    /// (adding methods) for whole-crate doc audits.
+    /// documentation. A re-export counts as documented when either the
+    /// `pub use` site or the resolved target carries a doc fact.
+    /// `--include-private` widens the audit to all symbols (adding methods)
+    /// for whole-crate doc audits.
     ///
     /// Soundness boundary: asserts the presence/absence of a recorded doc
     /// comment — never doc quality, accuracy, or completeness. A store that

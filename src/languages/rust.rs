@@ -211,7 +211,7 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             &self.file.repo_relative_path,
             &name,
         ]);
-        self.graph.push(GraphRecord::syntax_node(
+        let mut record = GraphRecord::syntax_node(
             id.clone(),
             NodeKind::Import,
             self.file.repo_relative_path.clone(),
@@ -219,7 +219,16 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             name.clone(),
             "rust",
             format!("Rust import {name}"),
-        ));
+        );
+        // Doc comments above a `use` declaration attach to the item rustdoc
+        // exposes at the re-export site (issue #257); capture them as the
+        // import's doc fact. Additive, never an identity input.
+        if let Some(doc) = self.symbol_doc(node) {
+            record = record
+                .with_declaration_surface(None, None, Some(doc))
+                .with_redaction_policy_version(REDACTION_POLICY_VERSION);
+        }
+        self.graph.push(record);
         self.add_edge(
             EdgeLabel::Imports,
             self.owner_id(),

@@ -131,7 +131,8 @@ facts — never a `pub` grep and never a rustdoc build. Any doc form (`///`, `/*
 `#[doc = "..."]`) excludes a symbol; a plain `//` comment does not. Each row carries a stable
 record ID, a repo-relative file/span handle, and the concrete evidence asserted
 (`externally_reachable`, `doc_comment_absent`). Re-export rows are attributed to the `pub use`
-site with the checked target cited. `--include-private` widens to a whole-crate doc audit;
+site with the checked target cited; a doc comment at either the re-export site or the target
+counts as documentation. `--include-private` widens to a whole-crate doc audit;
 `--limit` truncates deterministically with a diagnostic. The lane asserts doc presence/absence
 only — never doc quality — and a pre-#124 store yields an explicit `doc_facts_unavailable`
 capability verdict instead of treating every symbol as undocumented. Zero undocumented symbols
