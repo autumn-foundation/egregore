@@ -6,6 +6,7 @@
 
 mod accuracy;
 mod antigravity;
+mod author_attribution_doc;
 mod bundle;
 mod change_impact;
 mod changes_query;
@@ -44,6 +45,7 @@ mod phantom_call_edges;
 mod preference_approval;
 mod producer_version;
 mod protected_artifacts;
+mod public_api_deltas;
 mod python_scan;
 mod query;
 mod query_cli;
@@ -69,6 +71,7 @@ mod temporal_status;
 mod token_cost;
 mod traj;
 mod transaction_time;
+mod transitive_callers;
 mod typescript_scan;
 mod validate;
 mod watch;

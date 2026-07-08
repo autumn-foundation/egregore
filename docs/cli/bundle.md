@@ -11,6 +11,8 @@ The `bundle` command provides utilities to export, verify, and inspect redaction
 
 Importantly, bundles do **not** contain raw sensitive payloads (such as prose transcripts, inline tool inputs/outputs, or patch hunks). These fields are scrubbed (set to `None`), while their BLAKE3 hashes and byte counts are preserved for audit verification.
 
+Git author identity on `Commit` records (issue #116) is treated as redaction-eligible PII on export: the `author_email` field is always replaced with a `<REDACTED:email:hash_prefix>` marker (the prefix is a BLAKE3 hash prefix of the raw address, preserved for audit correlation), and `author_name` passes through the redaction detection policy — an exported bundle contains zero raw author email addresses, while a local store retains them (see [`docs/schema/redaction.md`](../schema/redaction.md)).
+
 ---
 
 ## Commands
