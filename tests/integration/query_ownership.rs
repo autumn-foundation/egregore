@@ -694,6 +694,73 @@ fn ownership_as_of_prefers_latest_valid_time_over_snapshot_head() {
     );
 }
 
+#[test]
+fn ownership_as_of_traverses_past_future_dated_parents() {
+    // Clock skew: the middle commit `p2` carries a committer date (T4) later
+    // than its child `a3` (T3). With `--as-of` at T3 the anchor is `a3`, and
+    // the documented aggregation (docs/cli/ownership.md) runs over commits
+    // reachable from the anchor and then constrained by valid time — two
+    // independent filters. The in-cutoff root `g1` sits behind the
+    // future-dated `p2`, so traversal must pass through `p2` (excluded from
+    // counting) to reach and count `g1`.
+    //
+    //   g1 (T1) ── p2 (T4, skewed) ── a3 (T3, anchor)
+    let records = vec![
+        commit("g1sha0000", &[], T1, "Alice Dev", "alice@example.com"),
+        commit(
+            "p2sha0000",
+            &["g1sha0000"],
+            T4,
+            "Bob Dev",
+            "bob@example.com",
+        ),
+        commit(
+            "a3sha0000",
+            &["p2sha0000"],
+            T3,
+            "Alice Dev",
+            "alice@example.com",
+        ),
+        // src/lib.rs exists everywhere and is changed by every commit.
+        file_snapshot("src/lib.rs", "g1sha0000", T1),
+        file_snapshot("src/lib.rs", "p2sha0000", T4),
+        file_snapshot("src/lib.rs", "a3sha0000", T3),
+        change("src/lib.rs", "A", "g1sha0000", T1),
+        change("src/lib.rs", "M", "p2sha0000", T4),
+        change("src/lib.rs", "M", "a3sha0000", T3),
+    ];
+
+    let mut opts = options();
+    opts.as_of = Some(T3);
+    let map = ownership_map(&records, &opts).expect("as-of view should resolve");
+
+    assert_eq!(map.anchors.len(), 1);
+    assert_eq!(
+        map.anchors[0].commit_sha, "a3sha0000",
+        "the anchor is the most recent commit at or before --as-of"
+    );
+    let lib = map
+        .files
+        .iter()
+        .find(|f| f.repo_relative_path == "src/lib.rs")
+        .expect("src/lib.rs must be reported at the anchor");
+    assert_eq!(
+        lib.total_commits, 2,
+        "the in-cutoff root behind the future-dated parent must still be \
+         counted: reachability and the valid-time cutoff are independent \
+         constraints, so an out-of-cutoff commit never blocks traversal"
+    );
+    assert_eq!(lib.primary_owner.author_email, Some("alice@example.com"));
+    assert_eq!(lib.primary_owner.commits, 2);
+    assert!(
+        !lib.authors
+            .iter()
+            .any(|a| a.author_email == Some("bob@example.com")),
+        "the future-dated commit itself stays outside the cutoff and is \
+         excluded from counting"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Determinism (byte-identical across repeated runs)
 // ---------------------------------------------------------------------------

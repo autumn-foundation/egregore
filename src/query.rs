@@ -16713,17 +16713,25 @@ pub fn ownership_map<'a>(
 
         // Ancestors of the anchor (inclusive), constrained to the recorded
         // group and, under `--as-of`, to commits at or before the cutoff.
+        // Reachability and the cutoff are independent constraints: clock skew
+        // can date a reachable parent after the cutoff while its own
+        // ancestors sit at or before it, so traversal always continues past
+        // an out-of-cutoff commit — only counting excludes it.
         let mut lineage: BTreeSet<&str> = BTreeSet::new();
+        let mut visited: BTreeSet<&str> = BTreeSet::new();
         let mut queue = vec![anchor];
         while let Some(sha) = queue.pop() {
+            if !visited.insert(sha) {
+                continue;
+            }
             let Some(meta) = commits.get(sha) else {
                 continue;
             };
-            if !within_as_of(meta) || !lineage.insert(sha) {
-                continue;
+            if within_as_of(meta) {
+                lineage.insert(sha);
             }
             for parent in &meta.parents {
-                if !lineage.contains(parent) {
+                if !visited.contains(parent) {
                     queue.push(parent);
                 }
             }
