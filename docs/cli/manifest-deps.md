@@ -68,20 +68,22 @@ declared entry (manifest key):
 - **`resolved_version`** / **`resolution`** — the manifest resolves against
   the nearest `Cargo.lock`, walking up from the manifest's directory to the
   repository root (the standard workspace layout keeps one root lockfile).
-  A single locked version of the crate resolves directly. When the lockfile
-  lists several versions (rename pairs), the entry's own declared requirement
-  selects among them with Cargo semantics (`"1"` means `^1`): exactly one
-  satisfying version is `locked`; an absent or unparseable requirement, or
-  one satisfying zero or several locked versions, stays
-  `ambiguous_in_lockfile` — never a guess. The `resolution` marker is drawn
-  from a closed set:
+  A parseable declared requirement gates **every** path with Cargo semantics
+  (`"1"` means `^1`), including a sole locked version that a stale or shared
+  lockfile can leave unsatisfying: exactly one satisfying version is
+  `locked`; none is `requirement_unsatisfied_in_lockfile`; several satisfying
+  (or an absent/unparseable requirement over several versions) stay
+  `ambiguous_in_lockfile`. Without a usable requirement, a sole locked
+  version resolves directly. A resolved version is never guessed. The
+  `resolution` marker is drawn from a closed set:
 
   | Marker | Meaning | `resolved_version` |
   |--------|---------|--------------------|
   | `locked` | exactly one version of the crate is in the lockfile | present |
   | `no_lockfile` | no `Cargo.lock` found for this manifest | absent |
   | `not_in_lockfile` | lockfile exists but does not list the crate | absent |
-  | `ambiguous_in_lockfile` | the lockfile lists two or more versions and the declared requirement cannot select exactly one | absent — never a guess |
+  | `ambiguous_in_lockfile` | several locked versions and the declared requirement (absent, unparseable, or satisfied by two+) cannot select exactly one | absent — never a guess |
+  | `requirement_unsatisfied_in_lockfile` | the lockfile lists the crate but a parseable declared requirement is satisfied by **none** of the locked versions (stale/shared lockfile) | absent — the mismatched version is never presented as resolved |
   | `lockfile_unreadable` | the **nearest** `Cargo.lock` exists but could not be read or parsed | absent — an ancestor lockfile is never consulted in its place |
 
 - **`declaring_package`** — `[package].name` of the owning manifest.

@@ -83,6 +83,12 @@ pub enum LockResolution {
     /// The nearest `Cargo.lock` exists but could not be read or parsed; an
     /// ancestor lockfile is never consulted in its place (PR #314 review).
     LockfileUnreadable,
+    /// The lockfile lists the crate, but a parseable declared requirement is
+    /// satisfied by none of the locked versions (e.g. a stale or shared
+    /// lockfile holding only `foo 1.0.0` while the manifest declares
+    /// `foo = "2"`); the mismatched version is never presented as `locked`
+    /// (PR #314 review).
+    RequirementUnsatisfiedInLockfile,
 }
 
 impl LockResolution {
@@ -95,6 +101,7 @@ impl LockResolution {
             Self::NotInLockfile => "not_in_lockfile",
             Self::AmbiguousInLockfile => "ambiguous_in_lockfile",
             Self::LockfileUnreadable => "lockfile_unreadable",
+            Self::RequirementUnsatisfiedInLockfile => "requirement_unsatisfied_in_lockfile",
         }
     }
 
@@ -157,49 +164,41 @@ impl LockfileIndex {
         Some(Self { versions })
     }
 
-    /// Resolves one crate name against the locked versions, using the
-    /// declared version requirement to select among multiple locked versions
-    /// of the same crate (Cargo `package = "…"` rename pairs; PR #314
-    /// review).
+    /// Resolves one crate name against the locked versions, honoring the
+    /// declared version requirement on every path (PR #314 review).
     ///
-    /// A single locked version resolves directly. With two or more locked
-    /// versions, the declared requirement is matched with Cargo semantics
-    /// (`semver`): exactly one satisfying version resolves as `locked`;
-    /// an absent or unparseable requirement, or one satisfying zero or
-    /// several locked versions, stays `ambiguous_in_lockfile` — never a
-    /// guess.
+    /// A parseable declared requirement is matched with Cargo semantics
+    /// (`semver`, so `"1"` means `^1`) against **all** locked versions of the
+    /// crate — including a sole locked version, which a stale or shared
+    /// lockfile can leave unsatisfying: exactly one satisfying version is
+    /// `locked`; none is `requirement_unsatisfied_in_lockfile`; several stay
+    /// `ambiguous_in_lockfile`. Without a usable requirement (absent or
+    /// unparseable), a sole locked version resolves directly and several stay
+    /// `ambiguous_in_lockfile`. A resolved version is never fabricated.
     #[must_use]
     pub fn resolve(&self, crate_name: &str, declared_requirement: Option<&str>) -> LockResolution {
-        self.versions
-            .get(crate_name)
-            .map_or(LockResolution::NotInLockfile, |versions| {
-                let mut iter = versions.iter();
-                match (iter.next(), iter.next()) {
-                    (Some(version), None) => LockResolution::Locked(version.clone()),
-                    _ => requirement_selects_one(versions, declared_requirement)
-                        .map_or(LockResolution::AmbiguousInLockfile, LockResolution::Locked),
-                }
-            })
+        let Some(versions) = self.versions.get(crate_name) else {
+            return LockResolution::NotInLockfile;
+        };
+        let requirement = declared_requirement.and_then(|req| semver::VersionReq::parse(req).ok());
+        if let Some(requirement) = requirement {
+            // Unparseable locked versions never match (Cargo.lock versions
+            // are generated semver, so this is a defensive boundary).
+            let mut matches = versions.iter().filter(|version| {
+                semver::Version::parse(version).is_ok_and(|parsed| requirement.matches(&parsed))
+            });
+            return match (matches.next(), matches.next()) {
+                (Some(version), None) => LockResolution::Locked(version.clone()),
+                (None, _) => LockResolution::RequirementUnsatisfiedInLockfile,
+                (Some(_), Some(_)) => LockResolution::AmbiguousInLockfile,
+            };
+        }
+        let mut iter = versions.iter();
+        match (iter.next(), iter.next()) {
+            (Some(version), None) => LockResolution::Locked(version.clone()),
+            _ => LockResolution::AmbiguousInLockfile,
+        }
     }
-}
-
-/// Returns the single locked version satisfying the declared requirement,
-/// when exactly one does. Uses Cargo requirement semantics via `semver`
-/// (`"1"` means `^1`, `"0.2"` means `^0.2`). Unparseable requirements and
-/// unparseable locked versions never match.
-fn requirement_selects_one(
-    versions: &BTreeSet<String>,
-    declared_requirement: Option<&str>,
-) -> Option<String> {
-    let requirement = semver::VersionReq::parse(declared_requirement?).ok()?;
-    let mut matches = versions.iter().filter(|version| {
-        semver::Version::parse(version).is_ok_and(|parsed| requirement.matches(&parsed))
-    });
-    let selected = matches.next()?;
-    if matches.next().is_some() {
-        return None;
-    }
-    Some(selected.clone())
 }
 
 /// One directly-declared dependency parsed from a manifest.
@@ -677,8 +676,49 @@ version = "1.0.0"
         );
         assert_eq!(
             index.resolve("embedded-hal", Some("2")),
-            LockResolution::AmbiguousInLockfile,
+            LockResolution::RequirementUnsatisfiedInLockfile,
             "a requirement matching no locked version never guesses"
+        );
+    }
+
+    #[test]
+    fn stale_sole_locked_version_failing_the_requirement_is_unsatisfied() {
+        // PR #314 review: a stale/shared lockfile can hold exactly one version
+        // of a crate that does not satisfy the declaration being scanned; that
+        // version must never be presented as `locked`.
+        let index = LockfileIndex::parse(
+            r#"version = 4
+
+[[package]]
+name = "foo"
+version = "1.0.0"
+"#,
+        )
+        .expect("lockfile parses");
+        assert_eq!(
+            index.resolve("foo", Some("2")),
+            LockResolution::RequirementUnsatisfiedInLockfile,
+            "the sole locked version fails the declared requirement"
+        );
+        assert_eq!(
+            LockResolution::RequirementUnsatisfiedInLockfile.version(),
+            None,
+            "an unsatisfied requirement never yields a resolved version"
+        );
+        // A satisfying requirement, no requirement, or an unparseable
+        // requirement still locks the sole version.
+        assert_eq!(
+            index.resolve("foo", Some("1")),
+            LockResolution::Locked("1.0.0".to_owned())
+        );
+        assert_eq!(
+            index.resolve("foo", None),
+            LockResolution::Locked("1.0.0".to_owned())
+        );
+        assert_eq!(
+            index.resolve("foo", Some("not a requirement")),
+            LockResolution::Locked("1.0.0".to_owned()),
+            "an unparseable requirement cannot gate; the sole version locks"
         );
     }
 

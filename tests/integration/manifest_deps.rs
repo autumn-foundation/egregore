@@ -977,3 +977,80 @@ fn rename_pair_round_trips_through_the_embedded_store() {
         "declared_as and per-alias resolution must survive the embedded store"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR #314 review: a stale lockfile's sole version never masquerades as locked
+// ---------------------------------------------------------------------------
+
+/// A stale (or shared) lockfile can hold exactly one version of a crate that
+/// does not satisfy the declaration being scanned; the mismatch must surface
+/// as `requirement_unsatisfied_in_lockfile` with no resolved version — the
+/// stale version is a fabrication, not a resolution.
+#[test]
+fn stale_lockfile_sole_version_marks_requirement_unsatisfied() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(
+        repo.join("Cargo.toml"),
+        r#"[package]
+name = "stale-user"
+version = "0.1.0"
+
+[dependencies]
+foo = "2"
+bar = "1"
+"#,
+    )
+    .expect("manifest");
+    // The lockfile is stale: `foo` is still locked at 1.0.0 (fails `"2"`),
+    // while `bar` is locked at a satisfying 1.4.2.
+    fs::write(
+        repo.join("Cargo.lock"),
+        r#"version = 4
+
+[[package]]
+name = "bar"
+version = "1.4.2"
+
+[[package]]
+name = "foo"
+version = "1.0.0"
+"#,
+    )
+    .expect("lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn f() {}\n").expect("lib.rs");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("stale-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &[]);
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    assert_eq!(declarations.len(), 2);
+
+    let foo = declarations
+        .iter()
+        .find(|d| d["name"] == "foo")
+        .expect("foo row");
+    assert_eq!(
+        foo["resolution"], "requirement_unsatisfied_in_lockfile",
+        "the stale sole locked version fails the declared requirement"
+    );
+    assert!(
+        foo["resolved_version"].is_null(),
+        "the mismatched stale version is never presented as resolved"
+    );
+    assert_eq!(foo["declared_requirement"], "2");
+
+    // A satisfying sole locked version still resolves.
+    let bar = declarations
+        .iter()
+        .find(|d| d["name"] == "bar")
+        .expect("bar row");
+    assert_eq!(bar["resolution"], "locked");
+    assert_eq!(bar["resolved_version"], "1.4.2");
+}

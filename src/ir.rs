@@ -414,10 +414,13 @@ pub struct DependencyDeclarationPayload {
     /// Lockfile resolution marker, drawn from the closed set `locked`,
     /// `no_lockfile` (no `Cargo.lock` found for this manifest),
     /// `not_in_lockfile` (lockfile exists but does not list the crate),
-    /// `ambiguous_in_lockfile` (the lockfile lists two or more versions of the
-    /// crate; none is chosen), or `lockfile_unreadable` (the nearest
-    /// `Cargo.lock` exists but could not be read or parsed; an ancestor
-    /// lockfile is never consulted in its place).
+    /// `ambiguous_in_lockfile` (several locked versions and the declared
+    /// requirement cannot select exactly one), `requirement_unsatisfied_in_lockfile`
+    /// (a parseable declared requirement is satisfied by none of the locked
+    /// versions; the mismatched version is never presented as resolved), or
+    /// `lockfile_unreadable` (the nearest `Cargo.lock` exists but could not
+    /// be read or parsed; an ancestor lockfile is never consulted in its
+    /// place).
     pub resolution: String,
 }
 
