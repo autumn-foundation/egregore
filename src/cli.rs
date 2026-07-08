@@ -2411,6 +2411,10 @@ fn import_codex_cmd(codex_path: &Path, out: &Path, redaction_report: Option<&Pat
         .to_jsonl()
         .context("failed to serialize agent-memory JSONL")?;
     fs::write(out, jsonl).with_context(|| format!("failed to write JSONL to {}", out.display()))?;
+    // Now that --out exists, aliases invisible to the pre-write guard (e.g.
+    // case-insensitive name folding) are observable; recheck before the
+    // report write. Refusal leaves the records JSONL intact on disk.
+    ensure_report_still_distinct_after_write(out, redaction_report)?;
     let status = format!(
         "imported {} records from {}",
         graph.records().len(),
@@ -2485,6 +2489,17 @@ fn import_antigravity_cmd(antigravity_path: &Path, out: &Path) -> Result<()> {
 /// on Windows, via [`same_file`]) is compared as well, so two pre-existing
 /// hard links to one inode conflict even though their path strings differ.
 ///
+/// One aliasing class is invisible to this pre-write pass by construction:
+/// on a case-insensitive filesystem (Windows NTFS, default APFS) two
+/// spellings differing only by case name one file, but while *neither*
+/// destination exists the resolved paths compare unequal and no metadata
+/// exists to probe for identity. Case folding is not second-guessed
+/// lexically here — on a case-sensitive filesystem those spellings are
+/// genuinely distinct files and must pass. Instead,
+/// [`ensure_report_still_distinct_after_write`] reruns the check after the
+/// records write, when the alias (if any) has become observable on the
+/// actual filesystem; behavior stays deterministic per filesystem.
+///
 /// # Errors
 ///
 /// Returns an error naming both flags when the paths resolve to the same file
@@ -2496,7 +2511,68 @@ fn ensure_report_path_distinct(out: &Path, redaction_report: Option<&Path>) -> R
     if report_path == Path::new("-") {
         return Ok(());
     }
-    let conflict = match (
+    if report_and_out_paths_conflict(out, report_path) {
+        anyhow::bail!(
+            "--redaction-report path {} matches --out; the report would overwrite the \
+             records JSONL — choose distinct paths",
+            report_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Reruns the `--out`/`--redaction-report` collision check after the records
+/// JSONL has been written, immediately before the report write.
+///
+/// The pre-write [`ensure_report_path_distinct`] pass cannot see aliases that
+/// only exist at the filesystem level while neither destination exists —
+/// canonically, case-folded spellings (`Records.JSONL` vs `records.jsonl`)
+/// on a case-insensitive filesystem such as Windows NTFS or default APFS. At
+/// this point `--out` exists, so resolving the report path probes real
+/// metadata: if the two names alias one file, the identity comparison
+/// ([`existing_files_share_identity`]) now detects it and the report write is
+/// refused. This also covers any other OS-level aliasing the pre-write probe
+/// cannot observe. On a case-sensitive filesystem the same spellings remain
+/// distinct files and pass — deterministic per filesystem, never a lexical
+/// case-folding guess.
+///
+/// Refusal here is late but lossless: the records JSONL is already on disk,
+/// untouched and valid; only the report is withheld and the command exits
+/// nonzero. `-` (stdout) never conflicts.
+///
+/// # Errors
+///
+/// Returns an error naming both flags when the report path resolves to the
+/// just-written records file or a symlink chain cannot be resolved.
+fn ensure_report_still_distinct_after_write(
+    out: &Path,
+    redaction_report: Option<&Path>,
+) -> Result<()> {
+    let Some(report_path) = redaction_report else {
+        return Ok(());
+    };
+    if report_path == Path::new("-") {
+        return Ok(());
+    }
+    if report_and_out_paths_conflict(out, report_path) {
+        anyhow::bail!(
+            "--redaction-report path {} resolves to the just-written --out records JSONL \
+             (a filesystem-level alias, e.g. case-insensitive name folding); the records \
+             file was written and remains valid, but the report was not written — choose \
+             distinct paths",
+            report_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Returns `true` when `out` and `report_path` cannot be shown to name
+/// distinct files: their filesystem-order resolutions compare equal, both
+/// resolve but the existing files share on-disk identity, or either path
+/// fails to resolve (unknowable target — the safe side). Shared by the
+/// pre-write guard and the post-records-write recheck.
+fn report_and_out_paths_conflict(out: &Path, report_path: &Path) -> bool {
+    match (
         resolve_output_path_for_collision(out),
         resolve_output_path_for_collision(report_path),
     ) {
@@ -2507,15 +2583,7 @@ fn ensure_report_path_distinct(out: &Path, redaction_report: Option<&Path>) -> R
         // An unresolvable symlink chain means the write target is unknowable;
         // refuse deterministically instead of risking a clobber.
         _ => true,
-    };
-    if conflict {
-        anyhow::bail!(
-            "--redaction-report path {} matches --out; the report would overwrite the \
-             records JSONL — choose distinct paths",
-            report_path.display()
-        );
     }
-    Ok(())
 }
 
 /// Returns `true` when both paths name *existing* files that share on-disk
@@ -2683,6 +2751,10 @@ fn import_traj_cmd(traj_path: &Path, out: &Path, redaction_report: Option<&Path>
         .to_jsonl()
         .context("failed to serialize agent-memory JSONL")?;
     fs::write(out, jsonl).with_context(|| format!("failed to write JSONL to {}", out.display()))?;
+    // Now that --out exists, aliases invisible to the pre-write guard (e.g.
+    // case-insensitive name folding) are observable; recheck before the
+    // report write. Refusal leaves the records JSONL intact on disk.
+    ensure_report_still_distinct_after_write(out, redaction_report)?;
     let status = format!(
         "imported {} records from {}",
         graph.records().len(),
@@ -13066,6 +13138,93 @@ fn watch_cmd(
     )?;
 
     Ok(())
+}
+
+// -----------------------------------------------------------------------------------------------------------
+// Issue #266: post-records-write recheck of the --out/--redaction-report
+// collision guard.
+//
+// On case-insensitive filesystems (Windows NTFS, default APFS) two spellings
+// that differ only by case alias one file, but while NEITHER destination
+// exists the pre-write guard cannot see that: the resolved paths compare
+// unequal and both identity probes miss. The alias becomes observable the
+// moment the records write creates `--out` — so the recheck runs then,
+// before the report write. A hard link created between the two checks stands
+// in for that aliasing here, reproducible on every filesystem (the true
+// casing scenario is exercised by the `#[cfg(any(windows, target_os =
+// "macos"))]` integration tests in tests/integration/redaction_report.rs).
+// -----------------------------------------------------------------------------------------------------------
+#[cfg(test)]
+mod report_collision_recheck {
+    use super::*;
+
+    #[test]
+    fn recheck_refuses_alias_observable_only_after_records_write() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("records.jsonl");
+        let report = temp.path().join("report.json");
+
+        // Pre-write guard passes: neither destination exists yet and the
+        // spellings resolve to distinct paths.
+        ensure_report_path_distinct(&out, Some(&report))
+            .expect("pre-write guard must pass while both destinations are missing");
+
+        // The records write creates --out, and the report spelling turns out
+        // to alias it at the OS level (as differing case does on a
+        // case-insensitive filesystem).
+        fs::write(&out, "records line\n").expect("records write");
+        fs::hard_link(&out, &report).expect("alias report path to out");
+
+        let err = ensure_report_still_distinct_after_write(&out, Some(&report))
+            .expect_err("recheck must refuse once the alias is observable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--redaction-report"),
+            "refusal must name the flag: {msg}"
+        );
+        assert!(
+            msg.contains("report was not written"),
+            "refusal must state the report was withheld: {msg}"
+        );
+        assert_eq!(
+            fs::read_to_string(&out).expect("records file must survive"),
+            "records line\n",
+            "the just-written records JSONL must remain untouched"
+        );
+    }
+
+    #[test]
+    fn recheck_passes_for_distinct_report_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("records.jsonl");
+        let report = temp.path().join("report.json");
+        fs::write(&out, "records line\n").expect("records write");
+
+        ensure_report_still_distinct_after_write(&out, Some(&report))
+            .expect("distinct missing report path must pass");
+
+        fs::write(&report, "stale report\n").expect("pre-existing report");
+        ensure_report_still_distinct_after_write(&out, Some(&report))
+            .expect("distinct existing report file must pass");
+    }
+
+    #[test]
+    fn recheck_exempts_stdout_report() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("records.jsonl");
+        fs::write(&out, "records line\n").expect("records write");
+        ensure_report_still_distinct_after_write(&out, Some(Path::new("-")))
+            .expect("stdout report never conflicts");
+    }
+
+    #[test]
+    fn recheck_is_noop_without_report_flag() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("records.jsonl");
+        fs::write(&out, "records line\n").expect("records write");
+        ensure_report_still_distinct_after_write(&out, None)
+            .expect("no report flag, nothing to recheck");
+    }
 }
 
 // -----------------------------------------------------------------------------------------------------------

@@ -100,7 +100,13 @@ Guarantees:
   never inflates the report.
 - `--redaction-report` pointing at the same path as `--out` is rejected
   before either artifact is written, so the report can never overwrite the
-  records JSONL.
+  records JSONL. Aliases only the filesystem can reveal — e.g. spellings
+  differing solely by case on a case-insensitive filesystem (Windows NTFS,
+  default APFS) while neither file exists yet — are caught by a second check
+  after the records JSONL is written: the records file stays on disk,
+  untouched and valid, the report is not written, and the command exits
+  nonzero. On a case-sensitive filesystem the same spellings are distinct
+  files and both writes proceed; behavior is deterministic per filesystem.
 
 The report covers the two local transcript importers' at-import write
 boundary only — it is not a resting-store leak audit, retraction tool, or

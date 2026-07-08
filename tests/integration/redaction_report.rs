@@ -986,6 +986,98 @@ fn import_codex_cli_rejects_hard_link_report_aliasing_out() {
     );
 }
 
+/// Returns `true` when `dir`'s filesystem folds name casing (two spellings
+/// differing only by case alias one file). Windows NTFS and default APFS do;
+/// a case-sensitive APFS volume or per-directory NTFS case sensitivity does
+/// not, and there the casing spellings are genuinely distinct files.
+#[cfg(any(windows, target_os = "macos"))]
+fn dir_folds_name_case(dir: &Path) -> bool {
+    fs::write(dir.join("case_probe.tmp"), "probe").expect("case probe write");
+    dir.join("CASE_PROBE.TMP").exists()
+}
+
+/// On a case-insensitive filesystem, `--out Records.JSONL --redaction-report
+/// records.jsonl` passes the pre-write guard while neither file exists (the
+/// resolved paths differ and both identity probes miss), but the two
+/// spellings alias one file. The post-records-write recheck must refuse
+/// before the report write: the command exits nonzero, the just-written
+/// records JSONL survives intact, and the report is never written over it.
+/// Skips (trivially passes) on a case-sensitive volume, where the spellings
+/// are genuinely distinct files and no collision exists.
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn import_traj_cli_rejects_case_folded_report_alias_of_out() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    if !dir_folds_name_case(temp.path()) {
+        return; // case-sensitive volume: no aliasing to guard against
+    }
+    let traj_path = write_secret_traj(temp.path());
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .current_dir(temp.path())
+        .arg("import-traj")
+        .arg(&traj_path)
+        .arg("--out")
+        .arg("Records.JSONL")
+        .arg("--redaction-report")
+        .arg("records.jsonl")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--redaction-report"));
+
+    // The alias only became observable after the records write, so the
+    // records JSONL is already on disk — it must remain graph records.
+    let body = fs::read_to_string(temp.path().join("Records.JSONL"))
+        .expect("records JSONL must remain on disk after the refused report write");
+    assert!(
+        body.lines()
+            .next()
+            .is_some_and(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()),
+        "the file at --out must be graph JSONL"
+    );
+    assert!(
+        !body.contains("\"redaction\""),
+        "the file at --out must never be replaced by the redaction report"
+    );
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn import_codex_cli_rejects_case_folded_report_alias_of_out() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    if !dir_folds_name_case(temp.path()) {
+        return; // case-sensitive volume: no aliasing to guard against
+    }
+    let codex_path = write_secret_codex(temp.path());
+
+    Command::cargo_bin("egregore")
+        .expect("binary should run")
+        .current_dir(temp.path())
+        .arg("import-codex")
+        .arg(&codex_path)
+        .arg("--out")
+        .arg("Records.JSONL")
+        .arg("--redaction-report")
+        .arg("records.jsonl")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--redaction-report"));
+
+    let body = fs::read_to_string(temp.path().join("Records.JSONL"))
+        .expect("records JSONL must remain on disk after the refused report write");
+    assert!(
+        body.lines()
+            .next()
+            .is_some_and(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()),
+        "the file at --out must be graph JSONL"
+    );
+    assert!(
+        !body.contains("\"redaction\""),
+        "the file at --out must never be replaced by the redaction report"
+    );
+}
+
 /// Two distinct pre-existing regular files (no link between them) must still
 /// pass the identity check: the import succeeds and overwrites both with the
 /// correct artifact.
