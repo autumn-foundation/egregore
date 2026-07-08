@@ -539,14 +539,16 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         normalize_code(self.source.get(start..end).unwrap_or(""))
     }
 
-    /// Collects the item's doc comment (`///` line docs or a `/** */` block
-    /// doc) from the siblings immediately preceding the item, then applies
-    /// redaction policy v1 to the collected text.
+    /// Collects the item's doc comment (`///` line docs, a `/** */` block
+    /// doc, or `#[doc = "..."]` attributes) from the siblings immediately
+    /// preceding the item, then applies redaction policy v1 to the collected
+    /// text.
     ///
-    /// Attribute items between the docs and the item are skipped; any other
-    /// sibling (including plain `//` / `/* */` comments) terminates the doc
-    /// block. Returns `None` when the item has no doc comment or the collected
-    /// text is empty — the `doc` field is omitted, never an empty string.
+    /// Non-doc attribute items between the docs and the item are skipped; any
+    /// other sibling (including plain `//` / `/* */` comments) terminates the
+    /// doc block. Returns `None` when the item has no doc comment or the
+    /// collected text is empty — the `doc` field is omitted, never an empty
+    /// string.
     fn symbol_doc(&self, node: Node<'_>) -> Option<String> {
         let mut doc_parts: Vec<String> = Vec::new();
         let mut current = node.prev_sibling();
@@ -558,7 +560,11 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
                     };
                     doc_parts.push(text);
                 }
-                "attribute_item" => {}
+                "attribute_item" => {
+                    if let Some(text) = doc_attribute_text(self.node_text(sibling)) {
+                        doc_parts.push(text);
+                    }
+                }
                 _ => break,
             }
             current = sibling.prev_sibling();
@@ -699,6 +705,52 @@ fn doc_comment_text(text: &str) -> Option<String> {
         return Some(block_doc_text(inner));
     }
     None
+}
+
+/// Extracts doc text from one `#[doc = "..."]` attribute item's source text.
+///
+/// Returns `Some` for outer doc attributes carrying a plain or raw string
+/// literal, and `None` for every other attribute shape — `#[doc(hidden)]`,
+/// `#[doc(alias = "...")]`, and non-`doc` attributes contribute no doc text.
+fn doc_attribute_text(text: &str) -> Option<String> {
+    let inner = text
+        .trim()
+        .strip_prefix("#[")?
+        .strip_suffix(']')?
+        .trim()
+        .strip_prefix("doc")?
+        .trim_start()
+        .strip_prefix('=')?
+        .trim();
+    string_literal_text(inner)
+}
+
+/// Decodes a Rust string literal (`"..."`, `r"..."`, `r#"..."#`, ...) into
+/// its text. Plain literals get minimal escape handling (`\"`, `\\`, `\n`,
+/// `\t`); raw literals are taken verbatim. Returns `None` for anything that
+/// is not a single string literal.
+fn string_literal_text(literal: &str) -> Option<String> {
+    if let Some(raw) = literal.strip_prefix('r') {
+        let hashes = raw.len() - raw.trim_start_matches('#').len();
+        let quoted = raw.get(hashes..raw.len().checked_sub(hashes)?)?;
+        return Some(quoted.strip_prefix('"')?.strip_suffix('"')?.to_owned());
+    }
+    let inner = literal.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(escaped) => out.push(escaped),
+            None => return None,
+        }
+    }
+    Some(out)
 }
 
 /// Normalizes the interior of a `/** */` block doc: strips the per-line
@@ -1582,6 +1634,31 @@ pub fn normalize_file_code(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_doc_attribute_text_extracts_string_forms() {
+        assert_eq!(
+            doc_attribute_text(r#"#[doc = "Plain doc."]"#),
+            Some("Plain doc.".to_owned())
+        );
+        assert_eq!(
+            doc_attribute_text(r##"#[doc = r#"Raw doc."#]"##),
+            Some("Raw doc.".to_owned())
+        );
+        assert_eq!(
+            doc_attribute_text(r#"#[doc="escaped \"quote\" and\nnewline"]"#),
+            Some("escaped \"quote\" and\nnewline".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_doc_attribute_text_rejects_non_doc_shapes() {
+        assert_eq!(doc_attribute_text("#[doc(hidden)]"), None);
+        assert_eq!(doc_attribute_text(r#"#[doc(alias = "other")]"#), None);
+        assert_eq!(doc_attribute_text("#[derive(Debug)]"), None);
+        assert_eq!(doc_attribute_text(r#"#[deprecated = "note"]"#), None);
+        assert_eq!(doc_attribute_text("#[doc = not_a_literal]"), None);
+    }
 
     #[test]
     fn test_normalize_raw_strings() {

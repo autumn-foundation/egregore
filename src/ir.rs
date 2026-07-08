@@ -707,9 +707,9 @@ pub enum GraphRecord {
         /// body excluded and interior whitespace collapsed deterministically.
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
-        /// Doc-comment text (`///` or `/** */`) for `Symbol` nodes after
-        /// passing through redaction policy v1. Omitted entirely when the item
-        /// has no doc comment — never an empty string.
+        /// Doc-comment text (`///`, `/** */`, or `#[doc = "..."]`) for
+        /// `Symbol` nodes after passing through redaction policy v1. Omitted
+        /// entirely when the item has no doc comment — never an empty string.
         #[serde(skip_serializing_if = "Option::is_none")]
         doc: Option<String>,
         /// Git and bitemporal provenance for history-backed records.
