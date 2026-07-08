@@ -44,6 +44,7 @@ mod phantom_call_edges;
 mod preference_approval;
 mod producer_version;
 mod protected_artifacts;
+mod public_api_deltas;
 mod python_scan;
 mod query;
 mod query_cli;
