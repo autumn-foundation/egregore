@@ -18703,3 +18703,153 @@ pub fn unreferenced_symbols<'a>(
     result.diagnostics.dedup();
     result
 }
+
+// ── file:line → enclosing symbol resolution (issue #151) ─────────────────────
+
+/// Resolution of one `file:line` location against stored symbol spans.
+///
+/// `chain` holds every `Module` and `Symbol` node whose span contains the
+/// line, ordered outermost → innermost; `primary` is the innermost (smallest
+/// enclosing) `Symbol` node, when one exists. `file_record` is the `File`
+/// node for the path in the selected view, when present. `repo_groups`
+/// carries one entry per repository owner group among the path's records so
+/// callers can fail closed on an unscoped cross-repository collision
+/// (issue #67); unattributed records group under `None`.
+#[derive(Debug, Default)]
+pub struct LocationContext<'a> {
+    /// `File` node for the queried path in the selected view.
+    pub file_record: Option<&'a GraphRecord>,
+    /// Containing `Module`/`Symbol` nodes, outermost → innermost.
+    pub chain: Vec<&'a GraphRecord>,
+    /// Smallest enclosing `Symbol` node (the innermost), when one exists.
+    pub primary: Option<&'a GraphRecord>,
+    /// Repository owner groups among the path's matched records.
+    pub repo_groups: BTreeSet<Option<&'a str>>,
+}
+
+/// Resolves the smallest enclosing `Symbol` for a `path:line` location.
+///
+/// View selection mirrors the other single-answer query verbs:
+///
+/// - Without `at_commit`, the current-state view applies: tombstoned records
+///   are excluded and history graphs resolve each stable ID to its newest
+///   version (keep-last dedupe, as `public_api_surface` does).
+/// - With `at_commit` (a fully resolved SHA), only records whose
+///   `temporal.git_commit` equals that commit participate, so spans resolve
+///   as they existed at that commit.
+///
+/// Containment is by recorded line span (`start_line <= line <= end_line`).
+/// The primary answer is the `Symbol` with the narrowest containing span
+/// (line width, then byte width, then record ID — all ascending), never a
+/// nearest-neighbor guess: a line outside every symbol span yields
+/// `primary: None` even when a `Module` or the file contains it.
+#[must_use]
+pub fn location_context<'a>(
+    records: &'a [GraphRecord],
+    path: &str,
+    line: usize,
+    at_commit: Option<&str>,
+    index: &'a RepositoryIndex,
+    repo_scope: Option<&str>,
+) -> LocationContext<'a> {
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let is_owned =
+        |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
+
+    // Select the view: keep-last dedupe by stable ID for the current state,
+    // or the exact per-commit snapshot when a temporal pin is supplied.
+    let mut nodes: BTreeMap<&str, &'a GraphRecord> = BTreeMap::new();
+    for record in records {
+        let GraphRecord::Node {
+            id,
+            kind,
+            repo_relative_path,
+            temporal,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if !matches!(kind, NodeKind::File | NodeKind::Module | NodeKind::Symbol) {
+            continue;
+        }
+        if repo_relative_path.as_deref() != Some(path) || !is_owned(id) {
+            continue;
+        }
+        match at_commit {
+            Some(commit) => {
+                if temporal.as_ref().map(|t| t.git_commit.as_str()) != Some(commit) {
+                    continue;
+                }
+            }
+            None => {
+                if tombstoned.contains(id.as_str()) {
+                    continue;
+                }
+            }
+        }
+        nodes.insert(id.as_str(), record);
+    }
+
+    let mut ctx = LocationContext {
+        repo_groups: nodes.keys().map(|id| index.owner_of(id)).collect(),
+        ..LocationContext::default()
+    };
+
+    for record in nodes.values() {
+        let GraphRecord::Node { kind, span, .. } = record else {
+            continue;
+        };
+        if matches!(kind, NodeKind::File) {
+            ctx.file_record = Some(record);
+            continue;
+        }
+        let Some(span) = span else { continue };
+        if span.start_line <= line && line <= span.end_line {
+            ctx.chain.push(record);
+        }
+    }
+
+    // Outermost → innermost: wider spans first; ties resolve by earlier
+    // start, then record ID, so the order is total and deterministic.
+    let sort_key = |record: &GraphRecord| {
+        let GraphRecord::Node {
+            id,
+            span: Some(span),
+            ..
+        } = record
+        else {
+            unreachable!("chain entries carry spans by construction");
+        };
+        (
+            usize::MAX - (span.end_line - span.start_line),
+            usize::MAX - (span.end_byte - span.start_byte),
+            span.start_byte,
+            id.clone(),
+        )
+    };
+    ctx.chain.sort_by_key(|record| sort_key(record));
+
+    ctx.primary = ctx
+        .chain
+        .iter()
+        .rev()
+        .find(|record| {
+            matches!(
+                record,
+                GraphRecord::Node {
+                    kind: NodeKind::Symbol,
+                    ..
+                }
+            )
+        })
+        .copied();
+
+    ctx
+}

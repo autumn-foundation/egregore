@@ -119,6 +119,12 @@ cargo run -- query unsafe-sites --graph graph.jsonl                       # exit
 cargo run -- query unsafe-sites --graph graph.jsonl --path src/ffi        # subsystem-scoped
 cargo run -- query unsafe-sites --graph graph.jsonl --path src/nonexistent  # exit 2 (scope_not_found)
 cargo run -- query unsafe-sites --graph history.graph.jsonl --at <commit>   # pinned valid-time view
+
+# file:line location → smallest enclosing symbol (issue #151)
+cargo run -- query at src/lib.rs:42 --graph graph.jsonl           # exit 0 on match
+cargo run -- query at src/lib.rs:2 --graph graph.jsonl            # exit 2 (no_enclosing_symbol)
+cargo run -- query at src/lib.rs:42 --graph history.graph.jsonl --at <sha>  # spans as of that commit
+cargo run -- query at src/lib.rs --graph graph.jsonl              # exit 1 (malformed_location)
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -211,6 +217,15 @@ are out of this slice). Accepts `--path` (subsystem prefix), `--repo`, and `--at
 (valid-time pin). An empty scope reports `no_sites_in_scope`; an out-of-store scope is
 `scope_not_found` (exit 2). The kind set is closed for this slice. See
 `docs/cli/unsafe-sites.md`.
+
+`eg query at <path>:<line>` resolves a raw location (compiler diagnostic, backtrace frame,
+diff hunk, `git blame -L` output) to the smallest enclosing `Symbol` node whose recorded span
+contains that line, plus the enclosing chain of containing modules and symbols ordered
+outermost → innermost. Pure span-containment over already-stored data — no daemon, no
+embeddings. A line outside every symbol span is a typed `no_enclosing_symbol` answer (exit 2),
+never a nearest-neighbor guess; malformed locations exit 1 (`malformed_location`). The `--at
+<commit>` temporal pin resolves spans as they existed at that commit. Output is a
+deterministic JSON envelope, byte-identical across runs. See `docs/cli/query.md`.
 
 Pre-ingest referential-integrity validation (issue #103):
 
