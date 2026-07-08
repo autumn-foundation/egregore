@@ -6,6 +6,7 @@
 
 mod accuracy;
 mod antigravity;
+mod author_attribution_doc;
 mod bundle;
 mod change_impact;
 mod changes_query;

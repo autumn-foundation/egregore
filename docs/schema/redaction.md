@@ -9,6 +9,16 @@ Code-graph records are explicitly out of scope for redaction. Source-derived
 facts such as repository paths, symbol names, spans, commits, and topology edges
 remain plaintext by construction.
 
+One code-graph exception exists for PII (issue #116): `Commit` records carry
+the Git author identity as deterministic VCS-derived facts on the
+`author_name` and `author_email` fields. `author_email` is redaction-eligible:
+a redaction-off local store retains the raw author email address at rest,
+while evidence-bundle export (`eg bundle export`,
+[`docs/cli/bundle.md`](../cli/bundle.md)) always replaces it with a
+`<REDACTED:email:hash_prefix>` marker and passes `author_name` through the
+detection policy, so an exported bundle contains
+zero raw author email addresses.
+
 Coordination: [`docs/schema/project-graph.md`](project-graph.md) reserves the
 project fields that must pass through this policy:
 `Task.title`, `Task.body_handle.inline`, `Task.labels`, `Task.assignees`,
@@ -36,6 +46,7 @@ The default policy must redact at least these named classes before persistence:
 | `webhook_secret` | Webhook signing secrets and shared callback tokens. |
 | `session_cookie` | Auth/session cookies. |
 | `env_secret` | `.env`-style `KEY=VALUE` assignments whose key matches the documented secret-name allowlist. |
+| `email` | Email addresses (PII), including the Git author email on exported `Commit` records. |
 
 The initial secret-name allowlist includes keys containing:
 

@@ -1,6 +1,6 @@
 # eg query
 
-Query an existing graph JSONL for symbols, files, semantic drift records, or by natural-language similarity.
+Query an existing graph JSONL for symbols, files, who last changed a symbol, semantic drift records, or by natural-language similarity.
 
 ## Synopsis
 
@@ -11,6 +11,8 @@ eg query symbols  <PATTERN> --graph <PATH>  [--case-insensitive] [--repo <SELECT
 eg query symbols  <PATTERN> --data-dir <DIR> [--case-insensitive] [--repo <SELECTOR>] [--format json|text]
 eg query file     <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query file     <PATH>  --data-dir <DIR>  [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query who      <NAME>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query who      <NAME>  --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query drift            --graph <PATH>    [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query drift            --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
@@ -367,6 +369,82 @@ eg query file <PATH> --graph <PATH> [--format json|text]
 ### JSON output fields
 
 Same fields as `eg query symbol` (see above), except the declaration-surface fields `visibility`, `signature`, and `doc`, which are omitted from file listing rows to keep the per-file answer lean — use `eg query symbol <NAME>` for a symbol's contract. Results are sorted by `span.start_line` ascending, then `record_id`.
+
+---
+
+## eg query who
+
+Find who last changed a symbol (issue #116).
+
+```text
+eg query who <NAME> --graph <PATH> [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--format json|text]
+```
+
+Answers "who last changed `<NAME>`" by returning the Git author of the most
+recent commit at or before the queried point in history that actually changed
+the symbol (following file renames), together with the commit SHA and the
+symbol's repo-relative file handle. Requires a history graph produced by
+`eg scan-history`: a plain `eg scan` graph carries no `Commit` records and
+yields a no-match exit `2`.
+
+Authorship is a **deterministic VCS-derived fact**, not an agent-authored
+observation: `eg scan-history` records the normalized Git author identity
+(`author_name` + `author_email`, from the commit's `%an` / `%ae` author
+metadata) on every `Commit` record, on its own fields distinct from the
+`author_time` timestamp in the temporal metadata. It states who empirically
+made a change; it is **not an ownership claim** — it asserts nothing about
+declared ownership, responsibility, or review authority (CODEOWNERS-style
+declarations answer a different question). Repeated `eg scan-history` runs of
+an unchanged repository reproduce the author fields byte-for-byte.
+
+`author_email` is **redaction-eligible** PII: a local store retains the raw
+address at rest, while evidence-bundle export always scrubs it to a
+`<REDACTED:email:hash_prefix>` marker
+(see [`docs/schema/redaction.md`](../schema/redaction.md) and
+[`bundle.md`](bundle.md)).
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `<NAME>` | yes | Exact symbol name to look up. |
+| `--graph <PATH>` | one of | History graph JSONL produced by `eg scan-history`. Mutually exclusive with `--data-dir`. |
+| `--data-dir <DIR>` | one of | Embedded `AletheiaDB` store populated from a history graph. Mutually exclusive with `--graph`. |
+| `--at <COMMIT>` | no | Report authorship as of this commit SHA or unique prefix (valid-time axis). Exit `1` on an ambiguous prefix. Mutually exclusive with `--as-of`. |
+| `--as-of <RFC3339>` | no | Report authorship at the most recent commit at or before this instant (valid-time axis). Mutually exclusive with `--at`. |
+| `--tx-as-of <RFC3339>` | no | Reserved for `eg query who`; exits `1` with an error rather than silently ignoring the flag. |
+| `--repo <SELECTOR>` | no | Restrict results to one repository (see [Repository scope](#repository-scope---repo-issue-67)). |
+| `--repo-path <DIR>` | no | Working-tree path for the non-fatal `freshness` code (see [Store freshness](#store-freshness---repo-path-issue-82)). |
+| `--format` | no | `json` (default) or `text`. |
+
+Without a temporal selector the answer is computed at HEAD. With `--at` /
+`--as-of` authorship is reported **as-of the queried point in history**, scoped
+to the HEAD lineage — the same valid-time semantics as `eg query symbol`
+([`docs/schema/temporal-selectors.md`](../schema/temporal-selectors.md)).
+
+### JSON output fields
+
+| Field | Type | Always present | Description |
+|-------|------|----------------|-------------|
+| `symbol_name` | string | yes | The queried symbol name. |
+| `commit_sha` | string | yes | Full SHA of the most recent commit at or before the queried point that changed the symbol — the citable commit handle. |
+| `author_name` | string | when recorded | Git author display name from that commit. |
+| `author_email` | string | when recorded | Git author email address from that commit. Redaction-eligible PII (see above). |
+| `valid_time` | string | yes | Committer timestamp of that commit (valid-time axis). |
+| `repo_relative_path` | string or null | yes | Repository-relative file path of the symbol — the citable file handle. |
+| `freshness` | string | with `--repo-path` | Non-fatal store-freshness code (`fresh` / `stale_head` / `stale_dirty` / `unknown`). |
+
+### Example
+
+```sh
+eg scan-history . --out history.graph.jsonl
+eg query who scan_repository --graph history.graph.jsonl
+eg query who scan_repository --graph history.graph.jsonl --as-of 2026-01-02T00:00:00Z
+```
+
+```json
+{"symbol_name":"scan_repository","commit_sha":"83fa99...","author_name":"Jane Dev","author_email":"jane@example.com","valid_time":"2026-01-01T12:00:00Z","repo_relative_path":"src/lib.rs"}
+```
 
 ---
 
