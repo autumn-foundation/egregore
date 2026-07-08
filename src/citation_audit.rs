@@ -1126,6 +1126,29 @@ fn drive_file(records: &[GraphRecord]) -> WorkflowBuilder {
     builder
 }
 
+/// `eg query manifest-deps` (issue #180 / PR #314 review): every live
+/// `DependencyDeclaration` row the default invocation returns must carry its
+/// stable record ID plus the repo-relative manifest handle (the path-cited
+/// spanless source-fact rule).
+fn drive_manifest_deps(records: &[GraphRecord]) -> WorkflowBuilder {
+    let mut builder = WorkflowBuilder::new("manifest-deps", "source_fact");
+    let tombstoned = tombstoned_ids(records);
+    for record in records {
+        let GraphRecord::Node {
+            id, kind, temporal, ..
+        } = record
+        else {
+            continue;
+        };
+        if kind.as_str() == "DependencyDeclaration"
+            && node_visible(id, temporal.is_some(), &tombstoned)
+        {
+            builder.push_record(record);
+        }
+    }
+    builder
+}
+
 fn drive_drift(records: &[GraphRecord]) -> WorkflowBuilder {
     let mut builder = WorkflowBuilder::new("drift", "source_fact");
     // Measure the DEFAULT `eg query drift` output, which returns the top
@@ -1716,6 +1739,7 @@ pub fn run_citation_audit(records: &[GraphRecord], config: &AuditConfig) -> Cita
         drive_evidence_freshness(freshness_records),
         drive_failures(records, &repo_index),
         drive_file(records),
+        drive_manifest_deps(records),
         drive_memory(records),
         drive_policy(records),
         drive_semantic(config),

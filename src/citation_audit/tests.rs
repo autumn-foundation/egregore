@@ -293,6 +293,58 @@ fn gate_fails_below_threshold_passes_when_cited() {
     assert!(!report.ok);
 }
 
+// PR #314 review: `manifest-deps` is a registered citation-audit workflow —
+// dependency rows must carry record_id + manifest handle, and a handle-less
+// row must fail the gate.
+#[test]
+fn manifest_deps_workflow_gates_dependency_rows() {
+    // Real extractor output: a plain entry plus a `package = "…"` rename pair
+    // (spanless facts cited by the manifest path).
+    let records = crate::manifest_deps::manifest_dependency_records(
+        "repo-id",
+        "Cargo.toml",
+        "[package]\nname = \"pkg\"\n\n[dependencies]\nembedded-hal = \"0.2\"\nembedded-hal-1 = { package = \"embedded-hal\", version = \"1\" }\n",
+        &crate::manifest_deps::LockfileStatus::Absent,
+    );
+    assert_eq!(records.len(), 2, "both rename-pair entries seed the audit");
+
+    let report = run_citation_audit(&records, &AuditConfig::default());
+    let workflow = report
+        .workflows
+        .iter()
+        .find(|w| w.workflow == "manifest-deps")
+        .expect("manifest-deps must be a registered audit workflow");
+    assert!(workflow.enabled);
+    assert_eq!(workflow.trust_class, "source_fact");
+    assert_eq!(workflow.rows.len(), 2, "one row per declared entry");
+    for row in &workflow.rows {
+        assert_eq!(row.trust_class, "source_fact");
+        assert_eq!(row.status, CitationStatus::Cited);
+        assert_eq!(
+            row.primary_handle.as_deref(),
+            Some("Cargo.toml"),
+            "rows are cited by their repo-relative manifest handle"
+        );
+        assert!(row.record_id.starts_with("codegraph:v"));
+    }
+    assert!(report.gate.code_gate_pass);
+
+    // A dependency row missing its manifest handle is a real code-answer miss
+    // and must fail the gate.
+    let bad = node(
+        "codegraph:v5:dep-without-handle",
+        NodeKind::DependencyDeclaration,
+    );
+    let mut with_bad = records;
+    with_bad.push(bad);
+    let report = run_citation_audit(&with_bad, &AuditConfig::default());
+    assert!(
+        !report.gate.code_gate_pass,
+        "a handle-less dependency row must fail the citation gate"
+    );
+    assert!(!report.ok);
+}
+
 // AC2/AC3: the semantic workflow reports a stable disabled reason over --graph.
 #[test]
 fn semantic_disabled_reason_stable_over_graph() {

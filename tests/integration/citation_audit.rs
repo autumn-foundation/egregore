@@ -196,6 +196,21 @@ fn seed() -> Fixture {
         "file defines foo".to_owned(),
     );
 
+    // ── Manifest-declared dependency facts (issue #180 / PR #314 review) ────
+    // Real extractor output: a plain entry plus a `package = "…"` rename pair,
+    // spanless facts cited by their repo-relative manifest handle.
+    let dependency_records = aletheia_egregore::manifest_deps::manifest_dependency_records(
+        "repo-fixture",
+        "Cargo.toml",
+        "[package]\nname = \"pkg\"\n\n[dependencies]\nembedded-hal = \"0.2\"\nembedded-hal-1 = { package = \"embedded-hal\", version = \"1\" }\n",
+        &aletheia_egregore::manifest_deps::LockfileStatus::Absent,
+    );
+    assert_eq!(
+        dependency_records.len(),
+        2,
+        "fixture seeds both rename-pair entries"
+    );
+
     // ── Semantic drift result ───────────────────────────────────────────────
     let drift_id = semantic_stable_id(&["drift", "foo"]);
     let mut drift = GraphRecord::node(
@@ -661,6 +676,9 @@ fn seed() -> Fixture {
     for record in promo_obs {
         graph.push(record);
     }
+    for record in dependency_records {
+        graph.push(record);
+    }
 
     let jsonl = graph.to_jsonl().expect("serialize");
     fs::write(&path, jsonl).expect("write");
@@ -749,6 +767,7 @@ fn covers_all_public_query_workflows() {
         "file",
         "drift",
         "semantic",
+        "manifest-deps",
         "context",
         "subsystem",
         "task",
@@ -777,6 +796,11 @@ fn covers_all_public_query_workflows() {
     assert!(rows_for("symbol") >= 1);
     assert!(rows_for("file") >= 1);
     assert!(rows_for("drift") >= 1);
+    // PR #314 review: the manifest-deps lane is seeded and gated too.
+    assert!(
+        rows_for("manifest-deps") >= 2,
+        "manifest-deps lane should surface the seeded dependency declarations"
+    );
     assert!(
         rows_for("policy") >= 1,
         "policy lane should surface the durable preference"
