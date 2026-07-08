@@ -70,6 +70,8 @@ pub mod protected;
 pub mod query;
 /// Redaction policy engine (`docs/schema/redaction.md` v1).
 pub mod redaction;
+/// At-import redaction report (issue #266).
+pub mod redaction_report;
 /// Offline repair workflow for Egregore stores (issue #49).
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod repair;
