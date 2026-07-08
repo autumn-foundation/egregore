@@ -747,6 +747,20 @@ enum QuerySubcommand {
         #[cfg(feature = "embedded-aletheiadb")]
         #[arg(long, requires = "data_dir", conflicts_with = "graph")]
         daemon: bool,
+        /// Pin the listing to the file's recorded state at this commit SHA or
+        /// unique prefix (issue #158). Requires a `scan-history` store.
+        /// Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Pin the listing to the file's recorded state at the most recent
+        /// commit at or before this RFC 3339 instant (valid-time axis).
+        /// Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Transaction-time selector (reserved for query file, not implemented).
+        /// Returns a `not_implemented` error envelope rather than silently ignoring the flag.
+        #[arg(long)]
+        tx_as_of: Option<String>,
         /// Restrict results to one repository (see `eg query symbol --help`).
         /// A colliding path in another repository is excluded and reported via
         /// a stderr diagnostic, never mixed into the result set.
@@ -4670,10 +4684,71 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             data_dir,
             #[cfg(feature = "embedded-aletheiadb")]
             daemon,
+            at,
+            as_of,
+            tx_as_of,
             repo,
             repo_path,
             format,
         } => {
+            // Transaction-time file views are reserved: reject with the
+            // documented machine-readable envelope, never silently ignore.
+            if tx_as_of.is_some() {
+                print_tx_error(
+                    "not_implemented",
+                    "--tx-as-of is not implemented for query file; the transaction-time \
+                     axis currently covers query symbol only (see \
+                     docs/schema/temporal-selectors.md)",
+                )?;
+                std::process::exit(1);
+            }
+            if at.is_some() || as_of.is_some() {
+                #[cfg(feature = "embedded-aletheiadb")]
+                if daemon {
+                    eprintln!(
+                        "error: --daemon is not supported with --at/--as-of for query file; \
+                         run without --daemon against the same store"
+                    );
+                    std::process::exit(1);
+                }
+                if repo_path.is_some() {
+                    // Freshness stamps a current-tree answer; a point-in-time
+                    // snapshot has no current-tree freshness to report.
+                    eprintln!(
+                        "error: --repo-path cannot be used with --at/--as-of; \
+                         freshness stamping applies to current-state answers only"
+                    );
+                    std::process::exit(1);
+                }
+                // Strictly read-only lane (issue #158): opening the embedded
+                // engine in place re-persists its on-disk index files, so
+                // `--data-dir` reads from a throwaway copy, never the live
+                // store. The copy uses the *current-state* read — the same
+                // view `query deltas` and `query symbol --at` resolve
+                // against: it still includes every commit snapshot, but
+                // collapses a re-ingested snapshot of the same
+                // `(record_id, commit)` pair to its current version.
+                // Superseded prior versions are a transaction-time concern
+                // (issue #66), not part of a plain valid-time point query.
+                let records = match (graph.as_deref(), data_dir.as_deref()) {
+                    (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                    (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                    (Some(_), Some(_)) => {
+                        anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                    }
+                    (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+                };
+                let index = query::RepositoryIndex::build(&records);
+                let selected = resolve_repo_scope(&index, repo.as_deref());
+                return query_file_at_point(
+                    &records,
+                    &path,
+                    at.as_deref(),
+                    as_of.as_deref(),
+                    selected.as_deref(),
+                    format,
+                );
+            }
             #[cfg(feature = "embedded-aletheiadb")]
             if daemon {
                 if repo_path.is_some() {
@@ -8218,6 +8293,94 @@ fn query_file(
         print_result(result, format)?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// query file --at / --as-of (issue #158)
+// ---------------------------------------------------------------------------
+
+/// Prints a file's defined-symbol set reconstructed at a past commit or
+/// instant, as a single deterministic JSON envelope (issue #158).
+///
+/// Exit codes follow the documented temporal contract: `0` for a resolved
+/// point (including an explicit empty-but-found result), `2` for
+/// no-match/invalid input (unknown path, path absent at the point, missing
+/// commit, empty history, malformed or out-of-range instant), and `1` for an
+/// ambiguous commit prefix or an ambiguous unscoped repository collision.
+fn query_file_at_point(
+    records: &[GraphRecord],
+    path: &str,
+    at: Option<&str>,
+    as_of: Option<&str>,
+    selected_repo: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let selector = match (at, as_of) {
+        (Some(prefix), None) => query::FileAtPointSelector::At(prefix),
+        (None, Some(instant)) => query::FileAtPointSelector::AsOf(instant),
+        // clap's `conflicts_with` forbids both; the caller guards against neither.
+        _ => unreachable!("exactly one of --at / --as-of must be set"),
+    };
+    match query::file_symbols_at_point(records, path, selector, selected_repo) {
+        Ok(result) => {
+            match format {
+                OutputFormat::Json => {
+                    #[derive(serde::Serialize)]
+                    struct FileAtPointResponse<'a> {
+                        ok: bool,
+                        #[serde(flatten)]
+                        result: query::FileSymbolsAtPoint<'a>,
+                    }
+                    let response = FileAtPointResponse { ok: true, result };
+                    let output = serde_json::to_string_pretty(&response)
+                        .context("failed to serialize file-at-point result")?;
+                    println!("{output}");
+                }
+                OutputFormat::Text => {
+                    for row in &result.symbols {
+                        let line = row.span.map_or(0, |s| s.start_line);
+                        println!(
+                            "{} (Symbol) @ {}:{line} [{}]",
+                            row.name, row.repo_relative_path, row.commit
+                        );
+                    }
+                    for diag in &result.diagnostics {
+                        println!("# {}: {}", diag.code, diag.detail);
+                    }
+                    println!(
+                        "# resolved_commit: {}{}",
+                        result.resolved_commit,
+                        result
+                            .resolved_valid_time
+                            .map_or(String::new(), |vt| format!(" ({vt})"))
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(err) => {
+            #[derive(serde::Serialize)]
+            struct FileAtPointErrorResponse {
+                ok: bool,
+                error: query::FileAtPointError,
+            }
+            let envelope = FileAtPointErrorResponse {
+                ok: false,
+                error: err.clone(),
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&envelope)
+                    .context("failed to serialize file-at-point error")?
+            );
+            let exit_code = match err {
+                query::FileAtPointError::AmbiguousCommitPrefix { .. }
+                | query::FileAtPointError::AmbiguousRepository { .. } => 1,
+                _ => 2,
+            };
+            std::process::exit(exit_code);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

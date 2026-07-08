@@ -63,6 +63,12 @@ cargo run -- query deltas <base_sha> <head_sha> --graph history.graph.jsonl  # e
 cargo run -- query deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
 cargo run -- query deltas ffffffffffff <head_sha> --graph history.graph.jsonl # exit 2 (missing_commit)
 
+# A file's defined-symbol set at a past commit or instant (issue #158)
+cargo run -- query file src/lib.rs --graph history.graph.jsonl --at <commit_sha>             # exit 0 on match
+cargo run -- query file src/lib.rs --graph history.graph.jsonl --as-of 2026-01-02T00:00:00Z  # exit 0 on match
+cargo run -- query file src/nope.rs --graph history.graph.jsonl --at <commit_sha>            # exit 2 (unknown_path)
+cargo run -- query file src/lib.rs --graph history.graph.jsonl --tx-as-of <instant>          # exit 1 (not_implemented)
+
 # Externally-reachable public API surface (issue #213)
 cargo run -- query public-api --graph graph.jsonl                 # exit 0 (even when surface is empty)
 cargo run -- query public-api --graph graph.jsonl --repo acme/widget  # scope one repo; bad selector exits 1
@@ -107,6 +113,17 @@ available, and the introducing commit with its valid time. Semantic drift inside
 folded in where drift records exist and marked unavailable otherwise. Rows are observed
 deltas, never proof of behavior change; the response is deterministic and byte-identical
 across runs. See `docs/cli/deltas.md`.
+
+`eg query file <path> --at <commit>` / `--as-of <instant>` reconstructs the deterministic
+set of symbols a file defined at a chosen commit or valid-time instant (issue #158) from a
+`scan-history` graph or embedded store. A symbol tombstoned at or before the point never
+appears; spans and names are the recorded state as-of the point, not the current tree. Each
+row carries a stable record ID plus a repo-relative file/span handle, and the envelope
+records the resolved commit/instant. A file that existed but defined zero symbols is an
+explicit `empty_symbol_set` success (exit 0); an unknown path or a path absent at the point
+is a machine-readable error (exit 2); `--tx-as-of` on `query file` is reserved and returns
+`not_implemented` (exit 1). Code-facts only, read-only, and byte-identical across runs.
+See the `eg query file` section of `docs/cli/query.md`.
 
 `eg query public-api` enumerates the Rust library crate's externally-reachable public API
 surface from recorded per-symbol visibility (issue #124) and module containment — never a
