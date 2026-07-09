@@ -18,6 +18,8 @@ eg query drift            --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--f
 eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query semantic-context <QUERY> --data-dir <DIR> [--limit N] [--min-score F] [--repo <SELECTOR>]
 eg query semantic-memory <QUERY> --data-dir <DIR> [--limit N] [--repo <SELECTOR>] [--verified-only] [--format json|text]
+eg query implementors <TRAIT> --graph <PATH>   [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
+eg query implementors <TRAIT> --data-dir <DIR> [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
 eg query context  <NAME>  --graph <PATH>    [--repo-path <DIR>]
 eg query task     <HANDLE> --graph <PATH>
 eg query memory   <HANDLE> --graph <PATH>   [--verified-only]
@@ -857,3 +859,189 @@ The returned `record_id` is a stable handle: feed it directly to
 `eg query change-impact`, `eg query failures`, or `eg query context` to pivot
 from a raw location into callers, prior failures, and evidence without ever
 scanning the file's full symbol list.
+
+---
+
+## eg query implementors
+
+List the recorded implementors of a locally-defined trait by walking the
+inbound `IMPLEMENTS` edges of the resolved trait symbol (issue #133).
+
+```text
+eg query implementors <TRAIT> --graph <PATH> [--at <COMMIT>] [--as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
+```
+
+Strictly read-only and deterministic: no records, indexes, or runtime files
+are created, modified, or deleted, and an identical query against an
+unchanged source produces byte-identical rows, ordering, and handles across
+runs (rows are sorted by `trait_record_id`, then impl `record_id`, then
+`edge_record_id`). Because opening the embedded engine re-persists its index
+files, the `--data-dir` path reads a throwaway copy of the store; the live
+store stays byte-for-byte untouched. Both handle forms — trait name and
+canonical record ID — work with and without the temporal selectors.
+Implementing-type resolution never crosses the repository boundary: a
+same-named type in another repository is never cited, and the row falls back
+to `parsed_only` instead.
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `<TRAIT>` | yes | Exact trait symbol name (qualified when module-nested, e.g. `mymod::Renderable`) or the trait's canonical Symbol record ID. |
+| `--graph <PATH>` | one of | Graph JSONL produced by `eg scan` or `eg scan-history`. |
+| `--data-dir <DIR>` | one of | Embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. |
+| `--at <COMMIT>` | no | Return the implementor set at this commit SHA or unique prefix (valid-time axis keyed by commit). Exit `1` on an ambiguous prefix. Requires a history graph. Mutually exclusive with `--as-of`. |
+| `--as-of <INSTANT>` | no | Return the implementor set at the most recent record at or before this RFC 3339 instant. Mutually exclusive with `--at`. Same temporal-selector contract as `eg query symbol`. |
+| `--repo <SELECTOR>` | no | Restrict resolution to one repository (see [Repository scope](#repository-scope---repo-issue-67)). |
+| `--format` | no | `json` (default, newline-delimited) or `text`. |
+
+### Completeness contract (`local_traits_only`)
+
+The extractor records an `IMPLEMENTS` edge only when the trait definition was
+resolvable in the extraction scope — that is, for **locally-defined traits**,
+where "locally" means **the same source file as the impl**. `impl Display
+for Foo` (an external/std trait) produces **no** edge in this slice, and
+neither does an impl whose trait lives in another file of the same repo
+(the out-of-line module layout: `lib.rs` defines the trait, `m.rs` holds
+`impl crate::T for Foo`) — cross-file trait resolution needs a repo-wide
+type-symbol index, which is extraction-deepening reserved for a follow-up. The same bound covers generic impl headers: a generic impl
+(`impl<T> Trait for Type<T>`) and a generic-trait instantiation
+(`impl Trait<Args> for Type`) are not trait-edge-backed by the current
+extractor and never appear as implementor rows — resolving them is
+extraction-deepening, explicitly out of scope for this slice per issue #133.
+The query surfaces this bound instead of hiding it:
+
+- Every implementor row and every zero-implementors signal carries
+  `completeness: "local_traits_only"`.
+- A trait that resolves to a live record but has zero recorded `IMPLEMENTS`
+  edges emits an explicit `zero_implementors_recorded` signal row (exit `0`)
+  with a `note` explaining the bound — never a bare empty answer presented as
+  authoritative.
+- A name that resolves to **no** live record (typical for external/std
+  traits, which have no local Symbol record at all) is a `no_match` (exit
+  `2`), with the same explanation in `error.message`.
+
+Absence of a row is therefore never proof that no implementation exists.
+
+### Ambiguity rule
+
+A trait name that resolves to multiple distinct live symbols (same name in
+different modules/files) returns the implementors of **every** candidate,
+each row labeled by its `trait_record_id` and `trait_name`; a candidate is
+never picked implicitly. Ordering is deterministic (candidates by record ID).
+This holds across repositories too: the unscoped current view is a list
+query per the [repository-scope contract](#when-repository-scope-is-required)
+— colliding same-named traits from different repositories are returned side
+by side, each row carrying its own `repository_id`/`repository`, never
+merged; use `--repo` to narrow. Only the single-answer temporal views fail
+closed on an unscoped multi-repository collision.
+Pass the qualified name or the trait's record ID to narrow to one candidate.
+Name resolution considers only symbols whose kind can be an `IMPLEMENTS`
+target (trait, class, interface, struct/enum/union, type aliases; legacy
+records without a recorded kind are included): a `fn` sharing a trait's name
+lives in a different namespace and never adds a spurious zero signal. A name
+resolving only to non-target kinds is a `no_match` whose `error` names the
+kinds (`non_target_symbol_kinds`); an explicit record-ID handle always
+answers for exactly that record.
+The rule is uniform across time views: `--at` and `--as-of` also return
+every same-named candidate at the pinned point (per candidate, the newest
+record at or before the instant), labeled the same way. An unscoped
+multi-repository collision fails closed with the `ambiguous_repository`
+diagnostic.
+
+Scan-history stores replay full per-commit snapshots and emit no tombstone
+when a symbol or relationship disappears (removal is visible as absence from
+later snapshots). Consistent with the sibling verbs (`eg query symbol` lists
+every snapshot version; `transitive-callers` walks deduplicated history
+edges), an **unpinned** query over such a store answers with the union
+across recorded history — every row labeled with its provenance
+`git_commit`, never silently frontier-trimmed. Pin `--at <tip>` for the
+frontier/current answer; current-tree stores (`eg scan` / incremental)
+carry real tombstones and are frontier-accurate unpinned. `--as-of` is
+timestamp-based at parity with `eg query symbol --as-of`: a trait that
+stopped appearing without a tombstone resolves at its newest snapshot at or
+before the instant, and the implementor rows are pinned to — and labeled
+with — that snapshot's commit. When two commits share one committer
+timestamp, the tie resolves from stored facts, independent of store read
+order: the tied commit that no other tied candidate records as a parent
+wins (recorded parent links recover chains); between unrelated equal-time
+commits — where true topological order is not recoverable from stored
+facts — the largest commit SHA wins as a documented deterministic
+fallback.
+
+Over an embedded store (`--data-dir`), a temporal selector reads the
+history-inclusive store view (through the same throwaway read-only copy).
+The embedded store keeps every per-commit node snapshot but only the latest
+physical version of each edge, so a pinned view additionally accepts an
+`IMPLEMENTS` edge whose source is an `impl`-block symbol with a snapshot at
+the pinned commit — sound because the impl block's identity encodes the
+implemented trait. Type-source edges (Python/TS classes, Go embedding) get
+no such fallback: heritage can change without the class identity changing,
+and a fabricated pinned relationship would be a guess.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Implementor rows returned, or the trait resolved with zero recorded implementors (explicit `zero_implementors_recorded` signal row). |
+| `1` | Invalid selector: malformed `--as-of` timestamp, ambiguous `--at` commit prefix, unknown/ambiguous repository selector, or ambiguous unscoped repository collision. Message on stderr. |
+| `2` | The trait could not be resolved. Stdout carries `{"ok":false,"error":{"code":"no_match",...}}`, or `{"ok":false,"error":{"code":"stale_handle",...}}` when the handle resolves only to tombstoned record(s), or `{"ok":false,"error":{"code":"no_commit_anchor",...}}` when a temporal selector resolves a snapshot without a commit anchor (current-tree/refresh records) — a pinned implementor set requires scan-history commit snapshots, and answering with the unpinned view would leak later changes into the past. |
+
+### JSON output — implementor rows
+
+One JSON object per line (JSONL), one line per recorded implementor.
+
+| Field | Type | Always present | Description |
+|-------|------|----------------|-------------|
+| `record_id` | string | yes | Stable record ID of the `impl` Symbol — the citable handle for the impl block. |
+| `schema_version` | number | yes | Record schema version of the impl Symbol. |
+| `kind` | string | yes | Always `"Symbol"`. |
+| `symbol_kind` | string | when recorded | Symbol kind of the impl record (typically `"impl"`; absent on legacy graphs without symbol-kind metadata). |
+| `name` | string | yes | Impl display name, e.g. `"impl Renderable for Circle"`. |
+| `implementing_type` | string | yes | Qualified name of the implementing type, resolved from the impl against the graph's Symbol records when possible. |
+| `implementing_type_record_id` | string | when resolved | Stable record ID of the implementing type's Symbol record. |
+| `implementing_type_resolution` | string | yes | `"resolved"` when the type maps to a live Symbol record, `"parsed_only"` when only the impl display name could be parsed (e.g. the type is defined outside the store). |
+| `trait_record_id` | string | yes | Stable record ID of the resolved trait this row belongs to. |
+| `trait_name` | string | yes | Resolved trait's (qualified) name. |
+| `repo_relative_path` | string | when recorded | Repo-relative file of the impl block. |
+| `span` | object or null | yes | Source span of the impl block (`start_byte`, `end_byte`, `start_line`, `end_line`). |
+| `edge_record_id` | string | yes | Stable record ID of the connecting `IMPLEMENTS` edge. |
+| `git_commit` | string | history graphs / pinned views | Commit SHA the edge (or impl record) was recorded at. |
+| `repository_id` | string | when attributable | Stable `Repository` record ID owning the impl row. |
+| `repository` | string | when attributable | Human-usable repository identity handle. |
+| `completeness` | string | yes | Always `"local_traits_only"`. |
+
+### JSON output — zero-implementors signal
+
+Emitted (exit `0`) once per resolved trait candidate that has no recorded
+`IMPLEMENTS` edge:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ok` | bool | `true` — the trait resolved; the answer is the explicit zero signal. |
+| `code` | string | Always `"zero_implementors_recorded"`. |
+| `trait_record_id` / `trait_name` | string | The resolved trait's handle. |
+| `repo_relative_path` / `span` | string / object | The trait definition's citable handle. |
+| `repository_id` / `repository` | string | Owning repository, when attributable. |
+| `implementors_recorded` | number | Always `0`. |
+| `completeness` | string | Always `"local_traits_only"`. |
+| `note` | string | Human-readable statement of the locally-defined-traits-only bound. |
+
+### Example
+
+```sh
+eg scan . --out g.jsonl
+eg query implementors Renderable --graph g.jsonl
+```
+
+```json
+{"record_id":"codegraph:v4:1f0a…","schema_version":4,"kind":"Symbol","symbol_kind":"impl","name":"impl Renderable for Circle","implementing_type":"Circle","implementing_type_record_id":"codegraph:v4:77aa…","implementing_type_resolution":"resolved","trait_record_id":"codegraph:v4:0be1…","trait_name":"Renderable","repo_relative_path":"src/shapes.rs","span":{"start_byte":120,"end_byte":420,"start_line":7,"end_line":15},"edge_record_id":"codegraph:v4:9c3d…","completeness":"local_traits_only"}
+```
+
+`--format text` prints one human-readable line per row (e.g.
+`Circle (impl Renderable for Circle) implements Renderable @ src/shapes.rs:7 (completeness: local_traits_only)`);
+the text format is not stable and must not be parsed.
+
+Out of scope for this verb: emitting edges for external/std traits, resolving
+generic/blanket impls (`impl<T> Trait for T`), method-level breakage analysis,
+and the outbound direction ("what does this type implement").
