@@ -964,3 +964,55 @@ fn repo_scope_excludes_other_repositories_unresolved_call_diagnostic() {
         "the owning repository keeps its unresolved-call diagnostic"
     );
 }
+
+/// Unscoped runs over a merged store must not blur the repository boundary
+/// either: with both repositories recording `src/lib.rs` and a Diagnostic in
+/// only one of them, the clean repository's candidate carries no caveat, the
+/// owning repository's candidate keeps its caveat, and the marked-file tally
+/// counts per (repository, path).
+#[test]
+fn unscoped_merged_store_keys_caveats_by_repository_and_path() {
+    let temp_clean = tempfile::tempdir().expect("temp dir clean");
+    fs::create_dir_all(temp_clean.path().join("src")).expect("src dir");
+    fs::write(
+        temp_clean.path().join("src/lib.rs"),
+        "fn clean_orphan() {}\n",
+    )
+    .expect("clean lib.rs");
+    let temp_dirty = tempfile::tempdir().expect("temp dir dirty");
+    fs::create_dir_all(temp_dirty.path().join("src")).expect("src dir");
+    fs::write(
+        temp_dirty.path().join("src/lib.rs"),
+        "fn dirty_orphan() {}\n\ntotally_unknown_macro!(marker);\n",
+    )
+    .expect("dirty lib.rs");
+
+    let jsonl_clean =
+        scan_repository_at_with_override(temp_clean.path(), FIXED_TIME, Some("repo-clean"))
+            .expect("scan clean")
+            .to_jsonl()
+            .expect("serialize clean");
+    let jsonl_dirty =
+        scan_repository_at_with_override(temp_dirty.path(), FIXED_TIME, Some("repo-dirty"))
+            .expect("scan dirty")
+            .to_jsonl()
+            .expect("serialize dirty");
+    let graph = temp_clean.path().join("merged.graph.jsonl");
+    fs::write(&graph, format!("{jsonl_clean}{jsonl_dirty}")).expect("write merged graph");
+
+    let parsed = run_unreferenced(&graph);
+    assert!(
+        candidate(&parsed, "clean_orphan")["extraction_caveat"].is_null(),
+        "an unscoped run must not caveat the clean repository's candidate off \
+         another repository's marker at the same repo-relative path"
+    );
+    assert_eq!(
+        candidate(&parsed, "dirty_orphan")["extraction_caveat"]["code"],
+        "diagnostics_in_file_scope",
+        "the owning repository's candidate keeps its caveat"
+    );
+    assert_eq!(
+        parsed["counts"]["files_with_diagnostic_markers"], 1,
+        "the marked-file tally counts per (repository, path)"
+    );
+}

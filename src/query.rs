@@ -17864,7 +17864,18 @@ pub fn unreferenced_symbols<'a>(
     // lanes — kept when its path is recorded by the selected repository —
     // because the caveat is advisory and dropping a real marker would hide
     // lower extraction confidence.
-    let mut file_diagnostics: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    //
+    // The map is keyed by (attributed repository, path) so an unscoped run
+    // over a merged store never blurs the repository boundary: two
+    // repositories recording the same repo-relative path keep separate
+    // marker sets, and each candidate matches only its own repository's
+    // markers (plus unattributable `None`-keyed markers, kept conservatively
+    // for every path-matching candidate). Repository keys are canonical ID
+    // suffixes so a schema-version bump never splits one repository.
+    let canonical_repo = |repo: &str| -> String {
+        parse_codegraph_id(repo).map_or_else(|| repo.to_owned(), |(_, suffix)| suffix.to_owned())
+    };
+    let mut file_diagnostics: BTreeMap<(Option<String>, &str), BTreeSet<&str>> = BTreeMap::new();
     if !diagnostic_rows.is_empty() {
         let repository_ids = index.repository_ids();
         // Macro-scheme disambiguators are per-(path, invocation) ordinals, so
@@ -17931,7 +17942,10 @@ pub fn unreferenced_symbols<'a>(
                 },
             );
             if current {
-                file_diagnostics.entry(path).or_default().insert(id);
+                file_diagnostics
+                    .entry((attributed.map(&canonical_repo), path))
+                    .or_default()
+                    .insert(id);
             }
         }
     }
@@ -18007,24 +18021,44 @@ pub fn unreferenced_symbols<'a>(
         let Some(name) = name.as_deref() else {
             continue;
         };
-        let extraction_caveat = repo_relative_path
-            .as_deref()
-            .and_then(|path| file_diagnostics.get(path))
-            .map(|marker_ids| {
-                let diagnostic_record_ids: Vec<String> =
-                    marker_ids.iter().map(|m| (*m).to_owned()).collect();
-                UnreferencedExtractionCaveat {
-                    code: "diagnostics_in_file_scope",
-                    diagnostic_count: diagnostic_record_ids.len(),
-                    diagnostic_record_ids,
-                    detail: format!(
-                        "file scope contains {} extraction Diagnostic marker(s); a \
-                         macro-hidden or unparsed reference may exist, so this \
-                         candidate's confidence is lower",
-                        marker_ids.len()
-                    ),
+        // Markers matched through the candidate's own repository: its repo's
+        // key plus the unattributable `None` key. A candidate the topology
+        // cannot attribute (legacy graphs) conservatively matches every
+        // marker at its path.
+        let mut marker_ids: BTreeSet<&str> = BTreeSet::new();
+        if let Some(path) = repo_relative_path.as_deref() {
+            match index.owner_of(id).map(&canonical_repo) {
+                Some(candidate_repo) => {
+                    for key in [Some(candidate_repo), None] {
+                        if let Some(ids) = file_diagnostics.get(&(key, path)) {
+                            marker_ids.extend(ids.iter().copied());
+                        }
+                    }
                 }
-            });
+                None => {
+                    for ((_, marker_path), ids) in &file_diagnostics {
+                        if *marker_path == path {
+                            marker_ids.extend(ids.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+        let extraction_caveat = (!marker_ids.is_empty()).then(|| {
+            let diagnostic_record_ids: Vec<String> =
+                marker_ids.iter().map(|m| (*m).to_owned()).collect();
+            UnreferencedExtractionCaveat {
+                code: "diagnostics_in_file_scope",
+                diagnostic_count: diagnostic_record_ids.len(),
+                diagnostic_record_ids,
+                detail: format!(
+                    "file scope contains {} extraction Diagnostic marker(s); a \
+                     macro-hidden or unparsed reference may exist, so this \
+                     candidate's confidence is lower",
+                    marker_ids.len()
+                ),
+            }
+        });
         result.candidates.push(UnreferencedCandidate {
             record_id: id,
             schema_version: *schema_version,
