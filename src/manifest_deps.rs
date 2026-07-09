@@ -320,19 +320,47 @@ pub fn parse_manifest_dependencies(
     })
 }
 
+/// Where a dependency table sits, for the context-dependent key rules
+/// Cargo enforces (each verified against `cargo metadata`, PR #314 review).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DependencyTableContext {
+    /// A member manifest's dependency table entry. `optional = true` is
+    /// legal only where the table kind allows it (normal and build tables;
+    /// dev dependencies cannot be optional).
+    Member { optional_true_allowed: bool },
+    /// A `[workspace.dependencies]` template entry. `optional = true` is
+    /// rejected (workspace dependencies cannot be optional); the
+    /// `workspace` key is IGNORED by Cargo entirely — any value, even a
+    /// wrong-typed one, is tolerated like an unknown key (verified).
+    Template,
+}
+
+impl DependencyTableContext {
+    /// Context for one member dependency table by its kind.
+    const fn member(kind: DependencyKind) -> Self {
+        Self::Member {
+            optional_true_allowed: !matches!(kind, DependencyKind::Dev),
+        }
+    }
+}
+
 /// Validates the KNOWN dependency-table keys' types and allowed values per
 /// Cargo's rejection behavior (PR #314 review): the string sources and
 /// refinements (`version`/`path`/`git`/`registry`/`branch`/`tag`/`rev`/
 /// `package`) must be strings, `optional`/`default-features` (and the
 /// deprecated `default_features` spelling) must be booleans, `features`
-/// must be an array of strings, and `workspace` may only be the literal
-/// `true` — `workspace = false` is Cargo-invalid. `optional` is only legal
-/// where the containing table allows it: normal and build dependencies may
-/// be optional, dev dependencies may not (Cargo rejects an optional
-/// dev-dependency), and `[workspace.dependencies]` templates reject it
-/// separately as a member-only key. Unknown keys are tolerated: Cargo
-/// warns but loads the manifest.
-fn dependency_table_is_well_typed(spec: &dyn toml_edit::TableLike, optional_allowed: bool) -> bool {
+/// must be an array of strings, and — in member tables — `workspace` may
+/// only be the literal `true` (`workspace = false` is Cargo-invalid there),
+/// while a template's `workspace` key is ignored by Cargo entirely. Cargo
+/// rejects only the VALUE `optional = true` where optionality is
+/// disallowed (dev dependencies and workspace templates); `optional =
+/// false` is accepted everywhere the key is bool-typed (verified — PR #314
+/// review). Unknown keys are tolerated: Cargo warns but loads the
+/// manifest.
+fn dependency_table_is_well_typed(
+    spec: &dyn toml_edit::TableLike,
+    context: DependencyTableContext,
+) -> bool {
     // Cross-field source rules Cargo enforces (each verified against
     // `cargo metadata`, PR #314 review): `path` and `git` are mutually
     // exclusive, `git` and `registry` are mutually exclusive, and
@@ -355,8 +383,20 @@ fn dependency_table_is_well_typed(spec: &dyn toml_edit::TableLike, optional_allo
         "version" | "path" | "git" | "registry" | "branch" | "tag" | "rev" | "package" => {
             item.as_str().is_some()
         }
-        "workspace" => item.as_bool() == Some(true),
-        "optional" => optional_allowed && item.as_bool().is_some(),
+        "workspace" => match context {
+            DependencyTableContext::Member { .. } => item.as_bool() == Some(true),
+            DependencyTableContext::Template => true,
+        },
+        "optional" => match item.as_bool() {
+            Some(false) => true,
+            Some(true) => matches!(
+                context,
+                DependencyTableContext::Member {
+                    optional_true_allowed: true
+                }
+            ),
+            None => false,
+        },
         "default-features" | "default_features" => item.as_bool().is_some(),
         "features" => item
             .as_array()
@@ -404,7 +444,7 @@ fn package_name_is_valid(name: &str) -> bool {
 /// usable source — a `version`/`path`/`git` string or `workspace = true` —
 /// and a table whose KNOWN keys are wrong-typed or carry disallowed values
 /// (`version = 1` even beside a valid `path`, `workspace = false`, an
-/// `optional` dev-dependency, or an unparseable requirement string like
+/// `optional = true` dev-dependency, or an unparseable requirement string like
 /// `"not a req"`) are manifests Cargo rejects: `None`, no row is
 /// fabricated, and the caller reports the coverage hole (PR #314 review).
 fn declared_dependency(
@@ -422,8 +462,9 @@ fn declared_dependency(
         // Any known key with a wrong type or disallowed value poisons the
         // whole entry — Cargo rejects the manifest even when another
         // source field is valid (PR #314 review). Dev dependencies cannot
-        // be optional; normal and build dependencies can.
-        if !dependency_table_is_well_typed(spec, !matches!(kind, DependencyKind::Dev)) {
+        // be optional (`optional = true`); normal and build dependencies
+        // can, and `optional = false` is legal everywhere.
+        if !dependency_table_is_well_typed(spec, DependencyTableContext::member(kind)) {
             return None;
         }
         if let Some(package) = spec.get("package").and_then(|v| v.as_str()) {
@@ -1370,18 +1411,20 @@ fn parse_workspace_facts(text: &str, repo_root: &Path, dir_key: &str) -> Workspa
                                         entry.get(name).and_then(|v| v.as_str()).map(str::to_owned)
                                     };
                                     let version = field("version");
-                                    // A template additionally rejects the
-                                    // member-only keys Cargo disallows in
-                                    // `[workspace.dependencies]`: `optional`
-                                    // and `workspace` itself; known keys
-                                    // must be well-typed like member
-                                    // entries, and a declared version must
-                                    // be a requirement Cargo can parse
-                                    // (PR #314 review).
-                                    let usable = dependency_table_is_well_typed(entry, true)
-                                        && entry.get("optional").is_none()
-                                        && entry.get("workspace").is_none()
-                                        && version.as_deref().is_none_or(requirement_is_parseable)
+                                    // Template known keys must be
+                                    // well-typed with the template-context
+                                    // rules — `optional = true` rejected
+                                    // (`false` accepted), the `workspace`
+                                    // key ignored by Cargo entirely — and
+                                    // a declared version must be a
+                                    // requirement Cargo can parse
+                                    // (PR #314 review, each verified).
+                                    let usable = dependency_table_is_well_typed(
+                                        entry,
+                                        DependencyTableContext::Template,
+                                    ) && version
+                                        .as_deref()
+                                        .is_none_or(requirement_is_parseable)
                                         && (version.is_some()
                                             || field("path").is_some()
                                             || field("git").is_some());
@@ -1727,7 +1770,7 @@ fn manifest_path_dependency_dirs(doc: &toml_edit::DocumentMut) -> ManifestPathDe
             let Some(spec) = item.as_table_like() else {
                 continue;
             };
-            if !dependency_table_is_well_typed(spec, !matches!(kind, DependencyKind::Dev)) {
+            if !dependency_table_is_well_typed(spec, DependencyTableContext::member(kind)) {
                 continue;
             }
             if let Some(path) = spec.get("path").and_then(|value| value.as_str()) {
@@ -1773,9 +1816,11 @@ fn manifest_path_dependency_dirs(doc: &toml_edit::DocumentMut) -> ManifestPathDe
 /// membership, and a path entry no member (nor the root package) ever
 /// inherits is only a template — never enqueued from here; inheritance
 /// drives membership (PR #314 review, Cargo semantics). A Cargo-invalid
-/// template (ill-typed known keys, a cross-field source conflict, or the
-/// member-only keys `optional`/`workspace`) never feeds membership either
-/// (PR #314 review).
+/// template (ill-typed known keys, a cross-field source conflict, or
+/// `optional = true` — workspace dependencies cannot be optional) never
+/// feeds membership either; the `workspace` key in a template is ignored
+/// by Cargo entirely and never disqualifies one (PR #314 review, both
+/// verified).
 fn workspace_dependency_paths(root_doc: &toml_edit::DocumentMut) -> BTreeMap<String, String> {
     root_doc
         .get("workspace")
@@ -1787,9 +1832,7 @@ fn workspace_dependency_paths(root_doc: &toml_edit::DocumentMut) -> BTreeMap<Str
                 .iter()
                 .filter_map(|(key, item)| {
                     let spec = item.as_table_like()?;
-                    if !dependency_table_is_well_typed(spec, false)
-                        || spec.get("workspace").is_some()
-                    {
+                    if !dependency_table_is_well_typed(spec, DependencyTableContext::Template) {
                         return None;
                     }
                     spec.get("path")

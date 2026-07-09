@@ -3381,10 +3381,14 @@ fn ill_typed_member_dependency_tables_are_uninterpretable() {
     assert_eq!(skipped_diagnostics(&miss).len(), 1);
 }
 
-/// PR #314 review: Cargo rejects `[workspace.dependencies]` templates
-/// carrying member-only keys — `optional` (and `workspace` itself). Such a
-/// template is unusable: inheriting members take the
-/// `uninterpretable_cargo_dependency` path instead of fabricating a row.
+/// PR #314 review: Cargo rejects only the VALUE `optional = true` in a
+/// `[workspace.dependencies]` template — such a template is unusable and
+/// inheriting members take the `uninterpretable_cargo_dependency` path
+/// instead of fabricating a row. `optional = false` in a template is a
+/// manifest Cargo accepts (verified) and still inherits, and the
+/// `workspace` key in a template is IGNORED by Cargo entirely — any value,
+/// even a wrong-typed one (verified) — so such templates inherit and a
+/// path template carrying the stray key still feeds automatic membership.
 /// A template with `features`/`default-features` (allowed there) still
 /// inherits.
 #[test]
@@ -3392,6 +3396,7 @@ fn disallowed_template_keys_make_workspace_specs_unusable() {
     let temp = tempfile::tempdir().expect("temp dir");
     let repo = temp.path().join("repo");
     fs::create_dir_all(repo.join("m1/src")).expect("dirs");
+    fs::create_dir_all(repo.join("helper/src")).expect("dirs");
     fs::write(
         repo.join("Cargo.toml"),
         concat!(
@@ -3399,12 +3404,22 @@ fn disallowed_template_keys_make_workspace_specs_unusable() {
             "[workspace.dependencies]\n",
             "serde = { version = \"1\", optional = true }\n",
             "itoa = { version = \"1\", features = [\"std\"], default-features = false }\n",
+            "opt2 = { version = \"1\", optional = false }\n",
+            "wskey = { version = \"1\", workspace = \"stray\" }\n",
+            "helper = { path = \"helper\", workspace = true }\n",
         ),
     )
     .expect("root manifest");
     fs::write(
         repo.join("Cargo.lock"),
-        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\n[[package]]\nname = \"itoa\"\nversion = \"1.0.11\"\n",
+        concat!(
+            "version = 4\n\n",
+            "[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\n",
+            "[[package]]\nname = \"itoa\"\nversion = \"1.0.11\"\n\n",
+            "[[package]]\nname = \"opt2\"\nversion = \"1.9.0\"\n\n",
+            "[[package]]\nname = \"wskey\"\nversion = \"1.3.0\"\n\n",
+            "[[package]]\nname = \"ryu\"\nversion = \"1.0.5\"\n",
+        ),
     )
     .expect("root lockfile");
     fs::write(
@@ -3414,10 +3429,22 @@ fn disallowed_template_keys_make_workspace_specs_unusable() {
             "[dependencies]\n",
             "serde = { workspace = true }\n",
             "itoa = { workspace = true }\n",
+            "opt2 = { workspace = true }\n",
+            "wskey = { workspace = true }\n",
+            "helper = { workspace = true }\n",
         ),
     )
     .expect("member manifest");
     fs::write(repo.join("m1/src/lib.rs"), "pub fn m() {}\n").expect("lib");
+    // `helper` is reachable only through the path template carrying the
+    // stray `workspace` key: its own dependency resolves `locked` from the
+    // root lockfile only if that template still feeds automatic membership.
+    fs::write(
+        repo.join("helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n\n[dependencies]\nryu = \"1\"\n",
+    )
+    .expect("helper manifest");
+    fs::write(repo.join("helper/src/lib.rs"), "pub fn h() {}\n").expect("lib");
 
     let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("bad-template-fixture"))
         .expect("fixture should scan")
@@ -3438,6 +3465,25 @@ fn disallowed_template_keys_make_workspace_specs_unusable() {
         .expect("features/default-features are allowed in workspace templates");
     assert_eq!(itoa["resolution"], "locked");
     assert_eq!(itoa["resolved_version"], "1.0.11");
+    let opt2 = rows
+        .iter()
+        .find(|d| d["name"] == "opt2")
+        .expect("optional = false in a template is a manifest Cargo accepts");
+    assert_eq!(opt2["resolution"], "locked");
+    assert_eq!(opt2["resolved_version"], "1.9.0");
+    let wskey = rows
+        .iter()
+        .find(|d| d["name"] == "wskey")
+        .expect("the workspace key in a template is ignored by Cargo entirely");
+    assert_eq!(wskey["resolution"], "locked");
+    assert_eq!(wskey["resolved_version"], "1.3.0");
+    let ryu = rows
+        .iter()
+        .find(|d| d["name"] == "ryu")
+        .expect("a path template with a stray workspace key still feeds membership");
+    assert_eq!(ryu["declaring_package"], "helper");
+    assert_eq!(ryu["resolution"], "locked");
+    assert_eq!(ryu["resolved_version"], "1.0.5");
     assert_eq!(
         skipped_diagnostics(&full).len(),
         1,
@@ -3527,10 +3573,12 @@ fn unparseable_version_requirements_are_uninterpretable() {
     assert!(!skipped_diagnostics(&miss).is_empty());
 }
 
-/// PR #314 review: Cargo rejects `optional = true` in `[dev-dependencies]`
-/// (dev deps cannot be optional) — such an entry takes the
-/// `uninterpretable_cargo_dependency` path. Optional normal and build
-/// dependencies stay legal per Cargo and still extract (pinned).
+/// PR #314 review: Cargo rejects only the VALUE `optional = true` in
+/// `[dev-dependencies]` (dev deps cannot be optional) — such an entry takes
+/// the `uninterpretable_cargo_dependency` path, while `optional = false`
+/// in a dev table is a manifest Cargo accepts (verified) and still
+/// extracts. Optional normal and build dependencies stay legal per Cargo
+/// and still extract (pinned).
 #[test]
 fn optional_dev_dependencies_are_uninterpretable() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -3541,7 +3589,8 @@ fn optional_dev_dependencies_are_uninterpretable() {
         concat!(
             "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\n\n",
             "[dependencies]\nd1 = { version = \"1\", optional = true }\n\n",
-            "[dev-dependencies]\nserde = { version = \"1\", optional = true }\n\n",
+            "[dev-dependencies]\nserde = { version = \"1\", optional = true }\n",
+            "d2 = { version = \"1\", optional = false }\n\n",
             "[build-dependencies]\nb1 = { version = \"1\", optional = true }\n",
         ),
     )
@@ -3550,7 +3599,11 @@ fn optional_dev_dependencies_are_uninterpretable() {
     // become a row, let alone a `locked` one.
     fs::write(
         repo.join("Cargo.lock"),
-        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+        concat!(
+            "version = 4\n\n",
+            "[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\n",
+            "[[package]]\nname = \"d2\"\nversion = \"1.4.0\"\n",
+        ),
     )
     .expect("root lockfile");
     fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
@@ -3578,6 +3631,13 @@ fn optional_dev_dependencies_are_uninterpretable() {
         .find(|d| d["name"] == "b1")
         .expect("optional build dependencies are legal");
     assert_eq!(b1["dependency_kind"], "build");
+    let d2 = rows
+        .iter()
+        .find(|d| d["name"] == "d2")
+        .expect("optional = false in a dev table is a manifest Cargo accepts");
+    assert_eq!(d2["dependency_kind"], "dev");
+    assert_eq!(d2["resolution"], "locked");
+    assert_eq!(d2["resolved_version"], "1.4.0");
     assert_eq!(
         skipped_diagnostics(&full).len(),
         1,

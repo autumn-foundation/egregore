@@ -75,8 +75,10 @@ source: `version`/`path`/`git`/`registry`/`branch`/`tag`/`rev`/`package`
 must be strings, `optional`/`default-features` (and the deprecated
 `default_features`) booleans, `features` an array of strings,
 `workspace` only the literal `true` (`workspace = false` is
-Cargo-invalid), and `optional` is illegal in `[dev-dependencies]` (dev
-deps cannot be optional; normal and build deps can) — unknown keys stay
+Cargo-invalid), and the VALUE `optional = true` is illegal in
+`[dev-dependencies]` (dev deps cannot be optional; normal and build deps
+can, and `optional = false` is accepted everywhere the key is bool-typed —
+verified) — unknown keys stay
 tolerated, since Cargo warns but loads. Cross-field source rules Cargo
 enforces are checked too (each verified against `cargo metadata`):
 `path` and `git` are mutually exclusive, `git` and `registry` are
@@ -94,8 +96,10 @@ alike). The same class covers a
 `{ workspace = true }` entry whose
 `[workspace.dependencies]` root spec exists but is itself invalid: no
 usable string `version`/`path`/`git`, an unparseable template `version`,
-ill-typed known keys, or the
-member-only keys Cargo disallows in templates (`optional`, `workspace`) —
+ill-typed known keys, or `optional = true` (workspace dependencies cannot
+be optional; `optional = false` templates inherit, and the `workspace`
+key in a template is ignored by Cargo entirely — any value — so it never
+disqualifies one; both verified) —
 stamped `symbol_kind: uninterpretable_cargo_dependency`,
 the invalid entry skipped — never a key-named row with no requirement —
 while valid sibling entries, including git-only declarations, still
@@ -148,12 +152,12 @@ declared entry (manifest key):
   fabrication — plus a `skipped_manifest` qualification
   (`uninheritable_cargo_dependency`); a root spec that exists but is itself
   Cargo-invalid (no usable string `version`/`path`/`git`, e.g. `serde = {}`
-  or wrong-typed `version = 1`, ill-typed known keys, or the member-only
-  keys Cargo disallows in `[workspace.dependencies]` — `optional` and
-  `workspace` itself) also yields no row, qualified as
-  `uninterpretable_cargo_dependency`, while a valid path-only root spec —
-  or one carrying `features`/`default-features`, which are allowed
-  there — still inherits.
+  or wrong-typed `version = 1`, ill-typed known keys, or `optional = true` —
+  workspace dependencies cannot be optional) also yields no row, qualified
+  as `uninterpretable_cargo_dependency`, while a valid path-only root
+  spec — or one carrying `features`/`default-features` (allowed there),
+  `optional = false`, or a stray `workspace` key of any value, which Cargo
+  ignores in templates entirely (verified) — still inherits.
 - **`resolved_version`** / **`resolution`** — the manifest resolves against
   the `Cargo.lock` Cargo would actually use: the lockfile of the crate's
   **workspace root** for a member, or its own directory's lockfile for a
