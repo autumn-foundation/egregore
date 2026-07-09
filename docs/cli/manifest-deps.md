@@ -46,7 +46,8 @@ payload, never a synthesized row.
 
 **A definitive answer requires full manifest coverage.** When the scan skipped
 an unreadable or unparseable `Cargo.toml`, a parseable one whose dependency
-tables carry no usable `[package].name` (a name-less package table, or a
+tables carry no usable `[package].name` (a name-less package table, an
+empty or whitespace-only name — which Cargo rejects — or a
 virtual manifest wrongly declaring top-level dependencies — stamped
 `symbol_kind: unattributable_cargo_manifest`; its declarations cannot be
 attributed to a declaring package), or `{ workspace = true }` entries with no
@@ -217,7 +218,11 @@ lockfile.
   rebuild the store — ingest the fresh scan into a **new** `--data-dir` — or
   query the fresh `graph.jsonl` directly, which always reflects the current
   tree. Tombstoning absent dependency IDs on ingest/refresh is a follow-on
-  slice.
+  slice. When a tombstone **is** present (an append-style graph or a store
+  where the record was retracted), the query honors it: a tombstoned
+  dependency row is never returned as live, and a tombstoned
+  skipped-manifest diagnostic stops qualifying answers — the current-state
+  contract every other query path follows.
 
 ## Output
 

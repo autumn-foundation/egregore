@@ -11344,6 +11344,7 @@ fn collect_manifest_deps_rows<'a>(
     records: &'a [GraphRecord],
     index: &'a query::RepositoryIndex,
     repo_scope: Option<&str>,
+    deleted: &std::collections::BTreeSet<&str>,
 ) -> Vec<ManifestDepsDeclarationJson<'a>> {
     let mut rows: Vec<ManifestDepsDeclarationJson<'_>> = records
         .iter()
@@ -11360,6 +11361,11 @@ fn collect_manifest_deps_rows<'a>(
             else {
                 return None;
             };
+            // Current-state query: a tombstoned declaration is not live
+            // (PR #314 review), mirroring the other query paths.
+            if deleted.contains(id.as_str()) {
+                return None;
+            }
             // Repository attribution via the CONTAINS topology (PR #314
             // review); scoping drops rows owned by other repositories.
             let owner = index.owner_of(id);
@@ -11418,6 +11424,7 @@ fn collect_skipped_manifest_diagnostics<'a>(
     records: &'a [GraphRecord],
     index: &'a query::RepositoryIndex,
     repo_scope: Option<&str>,
+    deleted: &std::collections::BTreeSet<&str>,
 ) -> Vec<ManifestDepsDiagnosticJson<'a>> {
     let mut skipped: Vec<(&str, &str, Option<&str>)> = records
         .iter()
@@ -11432,6 +11439,11 @@ fn collect_skipped_manifest_diagnostics<'a>(
             else {
                 return None;
             };
+            // A tombstoned diagnostic no longer qualifies current-state
+            // answers (PR #314 review).
+            if deleted.contains(id.as_str()) {
+                return None;
+            }
             // Every skipped-manifest class qualifies answers: unparseable
             // manifests, parseable ones whose dependency tables carry no
             // usable [package].name, and manifests whose `workspace = true`
@@ -11479,7 +11491,10 @@ fn query_manifest_deps_cmd(
     name_filter: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
-    let mut rows = collect_manifest_deps_rows(records, index, repo_scope);
+    // Current-state view: tombstoned records (rows and diagnostics alike)
+    // are excluded, mirroring the other query paths (PR #314 review).
+    let deleted = current_deleted_ids(records);
+    let mut rows = collect_manifest_deps_rows(records, index, repo_scope, &deleted);
     let surface_is_empty = rows.is_empty();
     if let Some(filter) = name_filter {
         rows.retain(|row| row.name == filter);
@@ -11502,7 +11517,7 @@ fn query_manifest_deps_cmd(
         });
     }
     diagnostics.extend(collect_skipped_manifest_diagnostics(
-        records, index, repo_scope,
+        records, index, repo_scope, &deleted,
     ));
 
     match format {

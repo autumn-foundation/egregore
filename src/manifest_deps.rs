@@ -235,7 +235,9 @@ pub struct WorkspaceDepSpec {
 /// Parsed dependency surface of one manifest.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ManifestDependencies {
-    /// `[package].name`; `None` for a virtual workspace manifest.
+    /// `[package].name`; `None` for a virtual workspace manifest or when
+    /// the declared name is empty/whitespace-only (Cargo-invalid, PR #314
+    /// review) — such names never attribute declarations.
     pub package_name: Option<String>,
     /// Declarations in documented order: table order (`normal`, `dev`,
     /// `build`), then crate name, then the declared-as manifest key.
@@ -258,6 +260,11 @@ pub fn parse_manifest_dependencies(
         .and_then(toml_edit::Item::as_table_like)
         .and_then(|package| package.get("name"))
         .and_then(|name| name.as_str())
+        // An empty or whitespace-only name (which Cargo rejects) is no
+        // usable name: a row with `declaring_package: ""` would be a
+        // fabricated fact, so such manifests take the existing
+        // unattributable-manifest diagnostic path (PR #314 review).
+        .filter(|name| !name.trim().is_empty())
         .map(str::to_owned);
 
     let mut declarations = Vec::new();

@@ -2714,3 +2714,169 @@ fn out_of_root_member_globs_seed_the_closure() {
         "a glob member outside the root seeds the closure transitively"
     );
 }
+
+/// PR #314 review: `[package] name = ""` (or whitespace-only) with dependency
+/// tables cannot honestly attribute its declarations — Cargo rejects empty
+/// package names, and a row with `declaring_package: ""` would be a
+/// fabricated fact. Such manifests follow the existing no-usable-name path:
+/// an `unattributable_cargo_manifest` skipped-manifest diagnostic, no rows.
+#[test]
+fn empty_package_names_surface_as_skipped_manifest() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    fs::create_dir_all(repo.join("empty")).expect("dirs");
+    fs::create_dir_all(repo.join("blank")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"root-pkg\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+    // Valid TOML, declares dependencies, but the name Cargo would reject.
+    fs::write(
+        repo.join("empty/Cargo.toml"),
+        "[package]\nname = \"\"\nversion = \"0.1.0\"\n\n[dependencies]\ntokio = \"1\"\n",
+    )
+    .expect("empty-name manifest");
+    fs::write(
+        repo.join("blank/Cargo.toml"),
+        "[package]\nname = \"   \"\nversion = \"0.1.0\"\n\n[dependencies]\ntokio = \"1\"\n",
+    )
+    .expect("whitespace-name manifest");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("empty-name-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let full = run_query_deps(&graph, &[]);
+    let rows = full["declarations"].as_array().expect("declarations");
+    assert!(
+        rows.iter().all(|d| d["name"] != "tokio"),
+        "an unattributable manifest must produce no rows"
+    );
+    assert!(
+        rows.iter().all(|d| d["declaring_package"]
+            .as_str()
+            .is_some_and(|p| !p.trim().is_empty())),
+        "no row may carry an empty declaring_package"
+    );
+    let diagnostics = skipped_diagnostics(&full);
+    let details: Vec<&str> = diagnostics
+        .iter()
+        .filter_map(|d| d["detail"].as_str())
+        .collect();
+    assert!(
+        details.contains(&"empty/Cargo.toml") && details.contains(&"blank/Cargo.toml"),
+        "empty and whitespace-only names are both coverage holes, got {details:?}"
+    );
+
+    // A --name miss for the crate hidden behind the empty-name manifest is
+    // qualified, never a silently definitive "no".
+    let miss = run_query_deps(&graph, &["--name", "tokio"]);
+    assert_eq!(miss["count"], 0);
+    assert_eq!(skipped_diagnostics(&miss).len(), 2);
+}
+
+/// PR #314 review: `eg query manifest-deps` reads current state, so a
+/// dependency record tombstoned later in an append-style graph must not be
+/// returned as live — mirroring the other current-state query paths. A
+/// tombstoned skipped-manifest Diagnostic stops qualifying answers too.
+#[test]
+fn tombstoned_dependency_records_are_excluded_from_current_state() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    fs::create_dir_all(repo.join("noname")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\ntokio = \"1\"\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\n[[package]]\nname = \"tokio\"\nversion = \"1.47.1\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+    // A nameless manifest yields a skipped-manifest Diagnostic we can
+    // tombstone alongside the dependency row.
+    fs::write(
+        repo.join("noname/Cargo.toml"),
+        "[package]\nversion = \"0.1.0\"\n\n[dependencies]\nleft-pad = \"1\"\n",
+    )
+    .expect("nameless manifest");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("tombstone-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+
+    // Find the tokio dependency record and the Diagnostic record, then
+    // append tombstones for both (append-style graph evolution).
+    let mut tokio_id = None;
+    let mut diagnostic_id = None;
+    for line in jsonl.lines() {
+        let value: Value = serde_json::from_str(line).expect("graph line json");
+        if value["record_type"] != "node" {
+            continue;
+        }
+        if value["kind"] == "DependencyDeclaration" && value["name"] == "tokio" {
+            tokio_id = Some(value["id"].as_str().expect("id").to_owned());
+        }
+        if value["kind"] == "Diagnostic" && value["repo_relative_path"] == "noname/Cargo.toml" {
+            diagnostic_id = Some(value["id"].as_str().expect("id").to_owned());
+        }
+    }
+    let tokio_id = tokio_id.expect("tokio dependency record");
+    let diagnostic_id = diagnostic_id.expect("skipped-manifest diagnostic record");
+    let tombstone = |n: u32, deleted_id: &str| {
+        serde_json::json!({
+            "record_type": "tombstone",
+            "id": format!("codegraph:v5:tombstone-{n}"),
+            "schema_version": 5,
+            "deleted_id": deleted_id,
+            "summary": "declaration removed",
+        })
+        .to_string()
+    };
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(
+        &graph,
+        format!(
+            "{jsonl}{}\n{}\n",
+            tombstone(1, &tokio_id),
+            tombstone(2, &diagnostic_id)
+        ),
+    )
+    .expect("write graph");
+
+    let full = run_query_deps(&graph, &[]);
+    let rows = full["declarations"].as_array().expect("declarations");
+    assert!(
+        rows.iter().any(|d| d["name"] == "serde"),
+        "the untombstoned sibling stays listed"
+    );
+    assert!(
+        rows.iter().all(|d| d["name"] != "tokio"),
+        "a tombstoned dependency record must not be returned as live"
+    );
+    assert!(
+        skipped_diagnostics(&full).is_empty(),
+        "a tombstoned skipped-manifest diagnostic stops qualifying answers"
+    );
+
+    // The direct lookup is a miss per the existing no-match contract
+    // (machine-readable success, count 0).
+    let miss = run_query_deps(&graph, &["--name", "tokio"]);
+    assert_eq!(miss["ok"], true);
+    assert_eq!(miss["count"], 0);
+}
