@@ -69,6 +69,7 @@ pub fn extract_file_source(
 
     let mut extractor = RustExtractor::new(file, file_id, repository_id, graph, source);
     extractor.walk(tree.root_node());
+    extractor.resolve_pending_impl_edges();
     extractor.emit_reference_edges();
     Ok(extractor.facts)
 }
@@ -102,6 +103,16 @@ struct ImplContext {
     id: String,
 }
 
+/// An impl whose trait lookup is deferred until the whole file is indexed:
+/// Rust item order is insignificant, so a trait defined after its impl must
+/// edge-back all the same. Captures the module scope the impl was walked in.
+#[derive(Debug, Clone)]
+struct PendingImplEdge {
+    source_id: String,
+    display: String,
+    module_names: Vec<String>,
+}
+
 struct RustExtractor<'graph, 'source> {
     file: &'source SourceFile,
     file_id: &'source str,
@@ -112,6 +123,20 @@ struct RustExtractor<'graph, 'source> {
     owner_ids: Vec<String>,
     impl_context: Option<ImplContext>,
     definitions: BTreeMap<String, String>,
+    /// Module-qualified names only (`m::T`; root items bare), restricted to
+    /// symbols that can be IMPLEMENTS targets — never the bare-name aliases
+    /// `definitions` also carries and never value-namespace items.
+    /// Path-qualified impl trait lookups (`crate::T`, `self::T`, `super::T`)
+    /// resolve here so a nested symbol's bare alias can never shadow a root
+    /// item.
+    qualified_definitions: BTreeMap<String, String>,
+    /// Bare-name aliases restricted to symbols that can be IMPLEMENTS
+    /// targets. The unqualified impl trait fallback (use-imported traits
+    /// from another module) consults this instead of `definitions`, so a
+    /// later value-namespace item (`fn T()`) can never capture an impl edge.
+    type_definitions: BTreeMap<String, String>,
+    /// Impl trait lookups deferred to after the walk (source order).
+    pending_impl_edges: Vec<PendingImplEdge>,
     symbol_bodies: Vec<SymbolBody>,
     symbol_ordinals: BTreeMap<(String, String), u64>,
     diagnostic_ordinals: BTreeMap<String, u64>,
@@ -151,6 +176,9 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
             owner_ids: vec![file_id.to_owned()],
             impl_context: None,
             definitions: BTreeMap::new(),
+            qualified_definitions: BTreeMap::new(),
+            type_definitions: BTreeMap::new(),
+            pending_impl_edges: Vec::new(),
             symbol_bodies: Vec::new(),
             symbol_ordinals: BTreeMap::new(),
             diagnostic_ordinals: BTreeMap::new(),
@@ -373,8 +401,16 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         };
         let qualified_name = self.qualify(&local_name);
         let id = self.add_symbol(node, symbol_kind, &qualified_name);
-        self.definitions.insert(local_name, id.clone());
-        self.definitions.insert(qualified_name.clone(), id);
+        self.definitions.insert(local_name.clone(), id.clone());
+        self.definitions.insert(qualified_name.clone(), id.clone());
+        // Only symbols that can be IMPLEMENTS targets enter the impl-lookup
+        // key spaces: value-namespace items (`const`, `static`, functions)
+        // must never shadow a trait or type in impl trait resolution.
+        if is_impl_target_kind(symbol_kind) {
+            self.qualified_definitions
+                .insert(qualified_name, id.clone());
+            self.type_definitions.insert(local_name, id);
+        }
         self.walk_children(node);
     }
 
@@ -564,14 +600,14 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         let id = self.add_symbol(node, "impl", &qualified_name);
         self.definitions.insert(qualified_name, id.clone());
 
-        if let Some(target) = self.impl_target_id(&display) {
-            self.add_edge(
-                EdgeLabel::Implements,
-                id.clone(),
-                target,
-                format!("{display} implementation relationship"),
-            );
-        }
+        // The trait lookup is deferred until the whole file is indexed
+        // (`resolve_pending_impl_edges`): Rust item order is insignificant,
+        // so a trait defined after this impl must edge-back all the same.
+        self.pending_impl_edges.push(PendingImplEdge {
+            source_id: id.clone(),
+            display: display.clone(),
+            module_names: self.module_names.clone(),
+        });
 
         let previous = self.impl_context.replace(ImplContext {
             method_owner: method_owner(&display),
@@ -1025,13 +1061,127 @@ impl<'graph, 'source> RustExtractor<'graph, 'source> {
         emit_reference_edges(self.graph, &self.definitions, &self.symbol_bodies);
     }
 
-    fn impl_target_id(&self, display: &str) -> Option<String> {
-        let target = display
+    /// Resolves every deferred impl trait lookup after the whole file has
+    /// been indexed, so a trait defined after its impl edge-backs all the
+    /// same (Rust item order is insignificant). Emission follows source
+    /// order, keeping the output deterministic.
+    fn resolve_pending_impl_edges(&mut self) {
+        let pending = std::mem::take(&mut self.pending_impl_edges);
+        for entry in pending {
+            if let Some(target) = self.impl_target_id(&entry.display, &entry.module_names) {
+                self.add_edge(
+                    EdgeLabel::Implements,
+                    entry.source_id,
+                    target,
+                    format!("{} implementation relationship", entry.display),
+                );
+            }
+        }
+    }
+
+    fn impl_target_id(&self, display: &str, module_names: &[String]) -> Option<String> {
+        // `unsafe impl Trait for Type` is an ordinary non-generic impl behind
+        // a keyword prefix; strip it so the trait lookup matches the plain
+        // `impl Trait for Type` path.
+        let header = display.strip_prefix("unsafe ").unwrap_or(display);
+        let Some(target) = header
             .strip_prefix("impl ")
-            .and_then(|rest| rest.split(" for ").next())
-            .unwrap_or(display)
-            .trim();
-        self.definitions.get(target).cloned()
+            .map(|rest| rest.split(" for ").next().unwrap_or(rest).trim())
+        else {
+            // A generic header (`impl<T> ...`) is not parsed in this slice.
+            // The legacy verbatim lookup stays: it can only match another
+            // impl display (space-containing keys never collide with
+            // identifier names), preserving the recorded self-referential
+            // edge for generic inherent impls.
+            return self.definitions.get(display.trim()).cloned();
+        };
+        if target.contains("::") {
+            // An absolute `crate::`/`self::`/`super::` path resolves against
+            // the module-qualified key space only: a nested symbol's
+            // bare-name alias in `definitions` must never shadow the root
+            // item the path denotes.
+            if let Some(normalized) = Self::normalize_local_trait_path(target, module_names) {
+                return self.qualified_definitions.get(&normalized).cloned();
+            }
+            // A relative qualified path (`sibling::T`) resolves in the
+            // impl's module scope first, walking outward to the crate root
+            // (`m::sibling::T`, then `sibling::T`) — mirroring the
+            // unqualified scope walk. Cross-crate paths (`std::fmt::Debug`)
+            // match nothing and stay unresolved.
+            for depth in (0..=module_names.len()).rev() {
+                let candidate = if depth == 0 {
+                    target.to_owned()
+                } else {
+                    format!("{}::{target}", module_names[..depth].join("::"))
+                };
+                if let Some(id) = self.qualified_definitions.get(&candidate) {
+                    return Some(id.clone());
+                }
+            }
+            // No general `definitions` fallback here: beyond the qualified
+            // impl-target keys the scope walk already checked, that map
+            // holds only value-namespace and callable names, which must
+            // never capture an IMPLEMENTS edge.
+            return None;
+        }
+        // An unqualified trait name resolves in the impl's module scope
+        // first, walking outward to the crate root through the
+        // qualified-only key space, so a same-named trait in an unrelated
+        // nested module can never shadow the in-scope one via its bare
+        // alias.
+        for depth in (0..=module_names.len()).rev() {
+            let candidate = if depth == 0 {
+                target.to_owned()
+            } else {
+                format!("{}::{target}", module_names[..depth].join("::"))
+            };
+            if let Some(id) = self.qualified_definitions.get(&candidate) {
+                return Some(id.clone());
+            }
+        }
+        // Final fallback: the bare alias still covers names the scope walk
+        // cannot see, such as use-imported traits from another module — but
+        // only through the type-namespace view, so a later value-namespace
+        // item (`fn T()`) can never capture the edge.
+        self.type_definitions.get(target).cloned()
+    }
+
+    /// Resolves a `crate::` / `self::` / `super::` qualifier on an impl's
+    /// trait path to the module-qualified name `qualify` records in
+    /// `definitions`, so `impl crate::T for X` edge-backs exactly like
+    /// `impl T for X` when the trait is defined in this file.
+    ///
+    /// `crate::` paths are taken as written from the crate root;
+    /// `self::` / `super::` resolve against the impl's enclosing module
+    /// path. Returns `None` for unqualified paths (already looked up
+    /// verbatim) and for `super::` chains that walk above this file's
+    /// module scope.
+    fn normalize_local_trait_path(target: &str, module_names: &[String]) -> Option<String> {
+        if let Some(rest) = target.strip_prefix("crate::") {
+            return Some(rest.to_owned());
+        }
+        if let Some(rest) = target.strip_prefix("self::") {
+            return Some(if module_names.is_empty() {
+                rest.to_owned()
+            } else {
+                format!("{}::{rest}", module_names.join("::"))
+            });
+        }
+        if !target.starts_with("super::") {
+            return None;
+        }
+        let mut remaining = target;
+        let mut modules: &[String] = module_names;
+        while let Some(rest) = remaining.strip_prefix("super::") {
+            let (_, init) = modules.split_last()?;
+            modules = init;
+            remaining = rest;
+        }
+        Some(if modules.is_empty() {
+            remaining.to_owned()
+        } else {
+            format!("{}::{remaining}", modules.join("::"))
+        })
     }
 
     fn owner_id(&self) -> String {
@@ -1369,6 +1519,13 @@ fn import_name(text: &str) -> String {
         .trim_end_matches(';')
         .trim()
         .to_owned()
+}
+
+/// Returns `true` when a symbol of this kind can be the target of an
+/// `IMPLEMENTS` edge: traits and type-defining items. Value-namespace items
+/// (`const`, `static`) and callables never qualify.
+fn is_impl_target_kind(symbol_kind: &str) -> bool {
+    matches!(symbol_kind, "trait" | "struct" | "enum" | "type_alias")
 }
 
 fn impl_display(text: &str) -> String {
