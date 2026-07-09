@@ -655,33 +655,39 @@ impl EmbeddedAletheiaSink {
             .collect())
     }
 
-    /// Maps each actively tombstoned edge's stable record ID to its recorded
-    /// source node record ID.
+    /// Maps each actively tombstoned record's stable ID to its attribution
+    /// parent: a tombstoned edge to its recorded source node, and a
+    /// tombstoned containment-edge target to that same source.
     ///
     /// The current-state read ([`Self::read_all_records`]) suppresses
-    /// tombstoned edge records entirely, so a consumer holding only that
-    /// record slice cannot resolve a tombstone whose `deleted_id` names an
-    /// *edge* to the repository owning the edge's source node (issue #234
-    /// `--repo` scoping). This read-only sweep recovers the attribution from
-    /// the physical edges the append-only store still holds. Every physical
-    /// version of a stable edge ID shares its `source_codegraph_id` (the
-    /// source participates in edge identity), so version collapse is
-    /// unnecessary. Deterministic: `BTreeMap` ordering, property reads only,
-    /// no writes.
+    /// tombstoned edge records entirely — and tombstoned non-temporal nodes
+    /// with them — so a consumer holding only that record slice cannot
+    /// resolve a tombstone's `deleted_id` to the repository owning it
+    /// (issue #234 `--repo` scoping): a deleted *edge* ID needs the edge's
+    /// source node, and a deleted *node* ID needs the containment topology
+    /// (`CONTAINS`/`DEFINES`/`IMPORTS`) that was tombstoned along with it.
+    /// This read-only sweep recovers both from the physical edges the
+    /// append-only store still holds: every actively tombstoned edge maps to
+    /// its recorded source node, and every tombstoned containment edge
+    /// additionally maps its target node to that source, so a consumer can
+    /// chase `deleted node → parent → … → repository`. Every physical
+    /// version of a stable edge ID shares its endpoints (they participate in
+    /// edge identity), so version collapse is unnecessary. Deterministic:
+    /// `BTreeMap` ordering, property reads only, no writes.
     ///
     /// # Errors
     ///
     /// Returns an error if a physical record cannot be read.
-    pub fn tombstoned_edge_sources(&self) -> AdapterResult<BTreeMap<String, String>> {
+    pub fn tombstoned_record_parents(&self) -> AdapterResult<BTreeMap<String, String>> {
         let active_tombstoned = self.active_deleted_ids()?;
-        let mut sources = BTreeMap::new();
+        let mut parents = BTreeMap::new();
         for node_id in self.db.get_all_node_ids() {
             for edge_id in self.db.get_outgoing_edges(node_id) {
                 let edge = self.db.get_edge(edge_id).map_err(|error| {
-                    read_back_error("tombstoned_edge_sources", error.to_string())
+                    read_back_error("tombstoned_record_parents", error.to_string())
                 })?;
                 let Some(codegraph_id) = optional_str_property(
-                    "tombstoned_edge_sources",
+                    "tombstoned_record_parents",
                     "codegraph_id",
                     edge.get_property("codegraph_id"),
                 )?
@@ -692,17 +698,35 @@ impl EmbeddedAletheiaSink {
                     continue;
                 }
                 let Some(source) = optional_str_property(
-                    "tombstoned_edge_sources",
+                    "tombstoned_record_parents",
                     "source_codegraph_id",
                     edge.get_property("source_codegraph_id"),
                 )?
                 else {
                     continue;
                 };
-                sources.insert(codegraph_id, source);
+                // The ownership topology mirrors `RepositoryIndex::build`'s
+                // containment adjacency: a tombstoned containment edge is
+                // exactly the link the current-state view withheld from the
+                // index, so its target's attribution parent is its source.
+                let label = optional_str_property(
+                    "tombstoned_record_parents",
+                    "label",
+                    edge.get_property("label"),
+                )?;
+                if matches!(label.as_deref(), Some("CONTAINS" | "DEFINES" | "IMPORTS"))
+                    && let Some(target) = optional_str_property(
+                        "tombstoned_record_parents",
+                        "target_codegraph_id",
+                        edge.get_property("target_codegraph_id"),
+                    )?
+                {
+                    parents.insert(target, source.clone());
+                }
+                parents.insert(codegraph_id, source);
             }
         }
-        Ok(sources)
+        Ok(parents)
     }
 
     /// Like [`Self::read_all_records`], but also emits *superseded* non-temporal

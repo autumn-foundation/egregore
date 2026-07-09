@@ -6227,8 +6227,8 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             // edge records, so a scoped run needs the store's recorded edge
             // sources to keep edge tombstones attributable; a JSONL graph
             // keeps the superseded edge in the slice and needs no supplement.
-            let store_edge_sources = effective_data_dir
-                .map(load_tombstoned_edge_sources_from_db)
+            let store_record_parents = effective_data_dir
+                .map(load_tombstoned_record_parents_from_db)
                 .transpose()?
                 .unwrap_or_default();
             let index = query::RepositoryIndex::build(&records);
@@ -6237,7 +6237,7 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 &records,
                 &index,
                 selected.as_deref(),
-                &store_edge_sources,
+                &store_record_parents,
                 format,
             )
         }
@@ -7219,21 +7219,22 @@ fn load_records_from_db(data_dir: &Path) -> Result<Vec<GraphRecord>> {
     }
 }
 
-/// Reads the actively-tombstoned-edge → source-node attribution map from an
-/// embedded store (issue #234 `--repo` scoping).
+/// Reads the tombstoned-record → attribution-parent map from an embedded
+/// store (issue #234 `--repo` scoping).
 ///
-/// The current-state read suppresses tombstoned edge records, so a scoped
-/// producer-drift run cannot resolve a tombstone whose `deleted_id` names an
-/// edge from the record slice alone; this recovers the edge sources the
-/// append-only store still holds. Callers honouring the read-only guarantee
-/// must pass the same throwaway store copy they load records from.
-fn load_tombstoned_edge_sources_from_db(data_dir: &Path) -> Result<BTreeMap<String, String>> {
+/// The current-state read suppresses tombstoned edge and node records, so a
+/// scoped producer-drift run cannot resolve a deletion tombstone's
+/// `deleted_id` from the record slice alone; this recovers the edge sources
+/// and containment parents the append-only store still holds. Callers
+/// honouring the read-only guarantee must pass the same throwaway store copy
+/// they load records from.
+fn load_tombstoned_record_parents_from_db(data_dir: &Path) -> Result<BTreeMap<String, String>> {
     #[cfg(feature = "embedded-aletheiadb")]
     {
         validate_existing_embedded_store(data_dir)?;
         let sink = EmbeddedAletheiaSink::open_unleased(data_dir)
             .with_context(|| format!("failed to open embedded store {}", data_dir.display()))?;
-        sink.tombstoned_edge_sources()
+        sink.tombstoned_record_parents()
             .map_err(|e| anyhow::anyhow!("failed to read from embedded store: {e}"))
     }
     #[cfg(not(feature = "embedded-aletheiadb"))]
@@ -13402,11 +13403,11 @@ fn query_producer_drift_cmd(
     records: &[GraphRecord],
     index: &query::RepositoryIndex,
     repo_scope: Option<&str>,
-    store_edge_sources: &BTreeMap<String, String>,
+    store_record_parents: &BTreeMap<String, String>,
     format: OutputFormat,
 ) -> Result<()> {
     let current = query::CurrentProducerIdentity::of_running_binary();
-    let report = query::producer_drift(records, index, repo_scope, store_edge_sources, &current);
+    let report = query::producer_drift(records, index, repo_scope, store_record_parents, &current);
 
     match format {
         OutputFormat::Json => {

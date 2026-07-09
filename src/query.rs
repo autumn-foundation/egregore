@@ -20391,21 +20391,25 @@ fn producer_drift_record_row(record: &GraphRecord) -> ProducerDriftRecord<'_> {
 /// With `repo_scope`, only records attributable to the scoped repository are
 /// considered (nodes by ID, edges by source node, tombstones by deleted ID —
 /// a deleted *edge* ID resolves through the deleted edge's recorded source
-/// node, since the repository index owns node IDs only);
+/// node, and a deleted *node* ID through its recorded containment parents,
+/// since the repository index owns only IDs reachable in the live topology);
 /// unattributable records are excluded from a scoped run.
-/// `store_edge_sources` supplies edge-ID → source-node-ID attributions for
-/// edges the record slice no longer contains: an embedded store's
-/// current-state view suppresses actively tombstoned edge records, so the
-/// slice-derived map alone would drop every edge tombstone from a scoped
-/// `--data-dir` run. Pass an empty map for JSONL graphs (the superseded edge
-/// record stays in the stream). Deterministic:
+/// `store_record_parents` supplies record-ID → attribution-parent links for
+/// records the slice no longer contains: an embedded store's current-state
+/// view suppresses actively tombstoned edges *and* nodes, so the
+/// slice-derived map alone would drop every deletion tombstone from a scoped
+/// `--data-dir` run. Each tombstoned edge maps to its source node, and each
+/// tombstoned containment edge's target maps to that source, so ownership
+/// resolves by chasing `deleted record → parent → … → live topology`. Pass
+/// an empty map for JSONL graphs (superseded records stay in the stream).
+/// Deterministic:
 /// output ordering depends only on record content and compile-time constants.
 #[must_use]
 pub fn producer_drift<'a>(
     records: &'a [GraphRecord],
     index: &RepositoryIndex,
     repo_scope: Option<&str>,
-    store_edge_sources: &BTreeMap<String, String>,
+    store_record_parents: &BTreeMap<String, String>,
     current: &'a CurrentProducerIdentity,
 ) -> ProducerDriftReport<'a> {
     struct GroupAccum<'a> {
@@ -20424,19 +20428,23 @@ pub fn producer_drift<'a>(
     let mut counts = ProducerDriftCounts::default();
 
     // A tombstone's `deleted_id` may name an *edge* record (the incremental
-    // cache tombstones stale DEFINES/CALLS/... edges), but the repository
-    // index owns node IDs only — resolving a deleted edge ID directly always
-    // fails and would silently drop every attributable edge tombstone from a
-    // scoped run. Resolve deleted edge IDs through the deleted edge's
-    // recorded source node instead. In a JSONL graph the superseded edge
-    // record stays in the slice of an ingested incremental stream; an
-    // embedded store's current-state view suppresses tombstoned edges, so
-    // the caller-supplied `store_edge_sources` fills those gaps. Records
-    // that still resolve to no repository stay excluded, as documented.
-    let deleted_edge_sources: BTreeMap<&str, &str> = if repo_scope.is_some() {
-        store_edge_sources
+    // cache tombstones stale DEFINES/CALLS/... edges) or a *node* whose
+    // containment topology was deleted along with it (a whole-file
+    // invalidation tombstones the File node, its Symbols, and their edges).
+    // The repository index owns only IDs reachable in the live topology, so
+    // resolving such a deleted ID directly always fails and would silently
+    // drop every attributable deletion tombstone from a scoped run. Resolve
+    // instead by chasing recorded attribution parents — an edge's source
+    // node, a deleted node's containment parent — until a live owner is
+    // found. In a JSONL graph the superseded records stay in the slice of an
+    // ingested incremental stream; an embedded store's current-state view
+    // suppresses them, so the caller-supplied `store_record_parents` fills
+    // those gaps. Records that still resolve to no repository stay excluded,
+    // as documented.
+    let deleted_record_parents: BTreeMap<&str, &str> = if repo_scope.is_some() {
+        store_record_parents
             .iter()
-            .map(|(id, source)| (id.as_str(), source.as_str()))
+            .map(|(id, parent)| (id.as_str(), parent.as_str()))
             .chain(records.iter().filter_map(|record| match record {
                 GraphRecord::Edge { id, source, .. } => Some((id.as_str(), source.as_str())),
                 GraphRecord::Node { .. } | GraphRecord::Tombstone { .. } => None,
@@ -20445,18 +20453,29 @@ pub fn producer_drift<'a>(
     } else {
         BTreeMap::new()
     };
+    let owner_of_deleted = |deleted_id: &str| -> Option<&str> {
+        // Chase bound: parent chains are containment paths (symbol → file →
+        // module → repository), so any genuine chain is short; the bound
+        // only guards against a malformed store's cyclic parent links.
+        const MAX_PARENT_HOPS: usize = 64;
+        let mut anchor = deleted_id;
+        for _ in 0..=MAX_PARENT_HOPS {
+            if let Some(owner) = index.owner_of(anchor) {
+                return Some(owner);
+            }
+            anchor = deleted_record_parents.get(anchor)?;
+        }
+        None
+    };
 
     for record in records {
         if let Some(scope) = repo_scope {
-            let anchor = match record {
-                GraphRecord::Node { id, .. } => id.as_str(),
-                GraphRecord::Edge { source, .. } => source.as_str(),
-                GraphRecord::Tombstone { deleted_id, .. } => deleted_edge_sources
-                    .get(deleted_id.as_str())
-                    .copied()
-                    .unwrap_or(deleted_id.as_str()),
+            let owner = match record {
+                GraphRecord::Node { id, .. } => index.owner_of(id),
+                GraphRecord::Edge { source, .. } => index.owner_of(source),
+                GraphRecord::Tombstone { deleted_id, .. } => owner_of_deleted(deleted_id),
             };
-            if index.owner_of(anchor) != Some(scope) {
+            if owner != Some(scope) {
                 continue;
             }
         }

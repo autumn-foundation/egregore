@@ -31,12 +31,15 @@ Reads from either a JSONL file (`--graph`) or an embedded AletheiaDB store
 (`--data-dir`). `--repo <SELECTOR>` scopes a shared multi-repo store to one
 repository (nodes attribute by ID, edges by source node, tombstones by
 deleted ID — a deleted *edge* ID resolves through the deleted edge's recorded
-source node, so cache-invalidation tombstones for stale edges stay in their
-repo's scoped run; for `--data-dir`, whose current-state view suppresses
-tombstoned edge records, that source is recovered from the physical edges
-the append-only store still holds. Records unattributable to any repository
-are excluded from a scoped run). An unknown or ambiguous selector is rejected
-with a machine-readable stderr diagnostic (exit 1), never resolved implicitly.
+source node and a deleted *node* ID through its recorded containment parents,
+so cache-invalidation tombstones for stale edges and whole-file deletions
+stay in their repo's scoped run; for `--data-dir`, whose current-state view
+suppresses tombstoned records, those attribution links are recovered from
+the physical edges the append-only store still holds and chased
+`deleted record → parent → … → repository`. Records unattributable to any
+repository are excluded from a scoped run). An unknown or ambiguous selector
+is rejected with a machine-readable stderr diagnostic (exit 1), never
+resolved implicitly.
 
 | Condition | Exit | Output |
 |-----------|------|--------|

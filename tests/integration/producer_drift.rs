@@ -613,6 +613,148 @@ fn repo_scoped_data_dir_run_keeps_edge_tombstones_attributable() {
     );
 }
 
+/// An incremental file deletion tombstones the `File` node, its `Symbol`
+/// nodes, and every containment edge between them. The embedded store's
+/// current-state read suppresses all of those records while still returning
+/// their tombstones, so `RepositoryIndex` (built from the surviving slice)
+/// owns neither the deleted node IDs nor the deleted edges' source nodes. A
+/// `--repo`-scoped `--data-dir` run must recover the attribution chain from
+/// the tombstoned topology the append-only store still holds — node → parent
+/// via the deleted `CONTAINS`/`DEFINES` edges — or file/symbol deletion
+/// tombstones vanish from scoped drift counts that the unscoped run reports
+/// (PR #317 round-5 review).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn repo_scoped_data_dir_run_keeps_deleted_node_tombstones_attributable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+
+    let repo_a = temp.path().join("a");
+    write_current_fixture(&repo_a);
+    let jsonl_a = scan_repository_at_with_override(&repo_a, FIXED_TIME, Some("drift-repo-a"))
+        .expect("scan a")
+        .to_jsonl()
+        .expect("serialize a");
+
+    let repo_b = temp.path().join("b");
+    fs::create_dir_all(repo_b.join("src")).expect("src dir");
+    fs::write(repo_b.join("src/lib.rs"), "pub fn other_fn() {}\n").expect("lib.rs");
+    let jsonl_b = scan_repository_at_with_override(&repo_b, FIXED_TIME, Some("drift-repo-b"))
+        .expect("scan b")
+        .to_jsonl()
+        .expect("serialize b");
+
+    // Reconstruct one whole-file deletion from repo A's records: the File
+    // node, one Symbol it defines, the DEFINES edge between them, and the
+    // containment edge that anchors the File to the repository topology.
+    let records_a: Vec<Value> = jsonl_a
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let file_id = records_a
+        .iter()
+        .find(|v| v["record_type"] == "node" && v["kind"] == "File")
+        .expect("repo A scan must emit a File node")["id"]
+        .as_str()
+        .expect("file id")
+        .to_owned();
+    let defines_edge = records_a
+        .iter()
+        .find(|v| v["record_type"] == "edge" && v["label"] == "DEFINES" && v["source"] == *file_id)
+        .expect("repo A scan must emit a DEFINES edge from the File node");
+    let symbol_id = defines_edge["target"]
+        .as_str()
+        .expect("symbol id")
+        .to_owned();
+    let defines_edge_id = defines_edge["id"].as_str().expect("edge id").to_owned();
+    let containment_edge_id = records_a
+        .iter()
+        .find(|v| v["record_type"] == "edge" && v["target"] == *file_id)
+        .expect("repo A scan must anchor the File node in the repository topology")["id"]
+        .as_str()
+        .expect("edge id")
+        .to_owned();
+
+    // Cache-invalidation tombstones for the whole deleted file, stamped by an
+    // older incremental-cache binary so they land in the drifted bucket.
+    let mut graph_text = format!("{jsonl_a}{jsonl_b}");
+    let deleted: [(&str, &str); 4] = [
+        (&file_id, "b0"),
+        (&symbol_id, "b1"),
+        (&defines_edge_id, "b2"),
+        (&containment_edge_id, "b3"),
+    ];
+    for (deleted_id, suffix) in deleted {
+        let tombstone = serde_json::json!({
+            "record_type": "tombstone",
+            "id": format!(
+                "codegraph:v4:00000000000000000000000000000000000000000000000000000000000000{suffix}"
+            ),
+            "schema_version": 4,
+            "deleted_id": deleted_id,
+            "summary": "Invalidated stale cached record from src/lib.rs",
+            "producer": {
+                "egregore_version": "0.0.1",
+                "producer_kind": "incremental_cache",
+                "producer_components": {"tree_sitter": "0.1.0", "tree_sitter_rust": "0.1.0"},
+                "producer_started_at": "2025-01-01T00:00:00Z"
+            }
+        });
+        graph_text.push_str(&tombstone.to_string());
+        graph_text.push('\n');
+    }
+    let graph = temp.path().join("deleted-file.jsonl");
+    fs::write(&graph, graph_text).expect("write graph");
+
+    let data_dir = temp.path().join("store");
+    egregore()
+        .arg("ingest")
+        .arg(&graph)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let run_data_dir = |extra: &[&str]| -> Value {
+        let mut cmd = egregore();
+        cmd.args(["query", "producer-drift"]);
+        cmd.args(extra);
+        cmd.arg("--data-dir").arg(&data_dir);
+        let output = cmd.assert().success().get_output().stdout.clone();
+        serde_json::from_str(std::str::from_utf8(&output).expect("utf8").trim())
+            .expect("stdout must be valid JSON")
+    };
+
+    // Unscoped: all four deletion tombstones are in the store view and drift.
+    let unscoped = run_data_dir(&[]);
+    assert_eq!(
+        unscoped["counts"]["drifted"], 4,
+        "all four deletion tombstones drift in the unscoped data-dir run"
+    );
+
+    // Scoped to the owning repo: the deleted node records and their topology
+    // edges are all suppressed from the store view, so attribution must chase
+    // the tombstoned containment chain (symbol → file → repository) recovered
+    // from the store.
+    let scoped_a = run_data_dir(&["--repo", "drift-repo-a"]);
+    assert_eq!(
+        scoped_a["counts"]["drifted"], 4,
+        "file/symbol deletion tombstones must not vanish from a scoped --data-dir run"
+    );
+    let drifted = groups_in_bucket(&scoped_a, "drifted");
+    assert_eq!(drifted.len(), 1, "one old-binary signature group");
+    let records = drifted[0]["records"].as_array().expect("records array");
+    assert_eq!(records.len(), 4);
+    assert!(records.iter().all(|r| r["record_type"] == "tombstone"));
+
+    // Scoped to the sibling repo, the deletions stay excluded.
+    let scoped_b = run_data_dir(&["--repo", "drift-repo-b"]);
+    assert_eq!(
+        scoped_b["counts"]["drifted"], 0,
+        "another repo's deletion tombstones must stay out of a sibling --data-dir scope"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AC7: the verb is read-only — the graph input is never modified.
 // ---------------------------------------------------------------------------
