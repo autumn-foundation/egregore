@@ -2354,3 +2354,101 @@ fn orphan_workspace_inheritance_is_qualified_not_fabricated() {
     );
     assert_eq!(diagnostics[0]["detail"], "Cargo.toml");
 }
+
+/// PR #314 review: a `package.workspace` pointer names the owning workspace
+/// root explicitly — a member OUTSIDE the root's directory tree
+/// (`pkgs/a` pointing at `ws/`, with ws declaring `members = ["../pkgs/a"]`)
+/// resolves through `ws/Cargo.lock` and inherits from ws's
+/// `[workspace.dependencies]`, never standalone.
+#[test]
+fn package_workspace_pointer_resolves_through_the_named_root() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("ws")).expect("dirs");
+    fs::create_dir_all(repo.join("pkgs/a/src")).expect("dirs");
+    fs::write(
+        repo.join("ws/Cargo.toml"),
+        "[workspace]\nmembers = [\"../pkgs/a\"]\n\n[workspace.dependencies]\ntokio = \"1\"\n",
+    )
+    .expect("ws manifest");
+    fs::write(
+        repo.join("ws/Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\n[[package]]\nname = \"tokio\"\nversion = \"1.40.0\"\n",
+    )
+    .expect("ws lockfile");
+    fs::write(
+        repo.join("pkgs/a/Cargo.toml"),
+        "[package]\nname = \"pkg-a\"\nversion = \"0.1.0\"\nworkspace = \"../../ws\"\n\n[dependencies]\nserde = \"1\"\ntokio = { workspace = true }\n",
+    )
+    .expect("member manifest");
+    fs::write(repo.join("pkgs/a/src/lib.rs"), "pub fn a() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("pointer-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let serde = run_query_deps(&graph, &["--name", "serde"]);
+    let rows = serde["declarations"].as_array().expect("declarations");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["resolution"], "locked",
+        "a package.workspace pointer resolves through the named root's lockfile"
+    );
+    assert_eq!(rows[0]["resolved_version"], "1.0.228");
+
+    // Inheritance flows through the pointer too.
+    let tokio = run_query_deps(&graph, &["--name", "tokio"]);
+    let rows = tokio["declarations"].as_array().expect("declarations");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["declared_requirement"], "1");
+    assert_eq!(rows[0]["resolution"], "locked");
+    assert_eq!(rows[0]["resolved_version"], "1.40.0");
+    assert!(
+        skipped_diagnostics(&tokio).is_empty(),
+        "pointer-resolved inheritance is not a coverage hole"
+    );
+}
+
+/// A broken `package.workspace` pointer (target missing or not a workspace
+/// root) keeps honest standalone behavior — own-directory lockfile state,
+/// never a guessed root (pinned).
+#[test]
+fn broken_package_workspace_pointer_stays_standalone() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("pkgs/b/src")).expect("dirs");
+    fs::create_dir_all(repo.join("plain")).expect("dirs");
+    // The pointer target exists but is a plain package, not a workspace root.
+    fs::write(
+        repo.join("plain/Cargo.toml"),
+        "[package]\nname = \"plain\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("plain manifest");
+    fs::write(
+        repo.join("pkgs/b/Cargo.toml"),
+        "[package]\nname = \"pkg-b\"\nversion = \"0.1.0\"\nworkspace = \"../../plain\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("member manifest");
+    fs::write(repo.join("pkgs/b/src/lib.rs"), "pub fn b() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("broken-pointer-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let rows = parsed["declarations"].as_array().expect("declarations");
+    let pkg_b = rows
+        .iter()
+        .find(|d| d["declaring_package"] == "pkg-b")
+        .expect("pkg-b row");
+    assert_eq!(
+        pkg_b["resolution"], "no_lockfile",
+        "a broken pointer never resolves through a guessed root"
+    );
+}

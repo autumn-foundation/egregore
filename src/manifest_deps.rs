@@ -730,6 +730,8 @@ enum WorkspaceFacts {
 struct LockfileWalkCache {
     lockfiles: BTreeMap<String, LockfileStatus>,
     workspaces: BTreeMap<String, WorkspaceFacts>,
+    /// Per-directory `[package].workspace` pointer strings (PR #314 review).
+    pointers: BTreeMap<String, Option<String>>,
 }
 
 /// Finds and parses the `Cargo.lock` Cargo would actually use for a manifest,
@@ -803,6 +805,27 @@ fn owning_workspace_dir(
     ) {
         return Some(manifest_dir.join("/"));
     }
+    // `package.workspace` explicit pointer (PR #314 review): the manifest
+    // names its workspace root directly — Cargo resolves through it even
+    // when the member lives OUTSIDE the root's directory tree (the root's
+    // `members` can be `../`-relative). A pointer, when present, replaces
+    // ancestor discovery entirely; a broken pointer (target missing or not
+    // a `[workspace]` root), an out-of-repo pointer, or an excluded member
+    // means honest standalone behavior.
+    if let Some(pointer) = package_workspace_pointer(repo_root, &manifest_dir, cache) {
+        let target_key = resolve_pointer_dir(&manifest_dir, &pointer)?;
+        let target_segments: Vec<&str> = target_key.split('/').filter(|s| !s.is_empty()).collect();
+        let WorkspaceFacts::Workspace { exclude, .. } =
+            workspace_facts_in_dir(repo_root, &target_segments, cache)
+        else {
+            return None;
+        };
+        let rel = rel_between(&target_segments, &manifest_dir);
+        if exclude.iter().any(|glob| member_glob_match(glob, &rel)) {
+            return None;
+        }
+        return Some(target_key);
+    }
     loop {
         segments.pop()?;
         match workspace_facts_in_dir(repo_root, &segments, cache) {
@@ -828,6 +851,71 @@ fn owning_workspace_dir(
             WorkspaceFacts::NoManifest | WorkspaceFacts::PackageOnly => {}
         }
     }
+}
+
+/// Reads (and caches) one directory's `[package].workspace` pointer string
+/// (PR #314 review). `None` when the manifest is missing, unparseable, or
+/// carries no pointer.
+fn package_workspace_pointer(
+    repo_root: &Path,
+    segments: &[&str],
+    cache: &mut LockfileWalkCache,
+) -> Option<String> {
+    let dir_key = segments.join("/");
+    if let Some(cached) = cache.pointers.get(&dir_key) {
+        return cached.clone();
+    }
+    let mut candidate = repo_root.to_path_buf();
+    for segment in segments {
+        candidate.push(segment);
+    }
+    candidate.push("Cargo.toml");
+    let pointer = std::fs::read_to_string(&candidate)
+        .ok()
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|doc| {
+            doc.get("package")
+                .and_then(toml_edit::Item::as_table_like)
+                .and_then(|package| package.get("workspace"))
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        });
+    cache.pointers.insert(dir_key, pointer.clone());
+    pointer
+}
+
+/// Resolves a `package.workspace` pointer against the manifest's directory
+/// with lexical `.`/`..` handling. Returns the target directory as a
+/// repo-root-relative `/`-joined key (`""` = the repository root itself);
+/// `None` when the pointer escapes the repository — such a root is outside
+/// this slice and the manifest stays standalone (documented skip).
+fn resolve_pointer_dir(manifest_dir: &[&str], pointer: &str) -> Option<String> {
+    let mut stack: Vec<&str> = manifest_dir.to_vec();
+    let normalized = pointer.replace('\\', "/");
+    for segment in normalized.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                stack.pop()?;
+            }
+            other => stack.push(other),
+        }
+    }
+    Some(stack.join("/"))
+}
+
+/// Lexical relative path from `root` to `dir` (`..` climbs when `dir` lives
+/// outside `root`'s tree), used to run a pointer-named root's `exclude`
+/// globs against the member's directory.
+fn rel_between(root: &[&str], dir: &[&str]) -> String {
+    let common = root
+        .iter()
+        .zip(dir.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut parts: Vec<&str> = vec![".."; root.len() - common];
+    parts.extend(&dir[common..]);
+    parts.join("/")
 }
 
 /// The `[workspace.dependencies]` inheritance surface of the workspace root

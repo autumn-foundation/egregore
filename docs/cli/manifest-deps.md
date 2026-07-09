@@ -131,9 +131,17 @@ declared entry (manifest key):
   ancestor. Plain package manifests and stray lockfiles without a manifest
   are walked past, mirroring Cargo's workspace discovery; an unreadable
   ancestor manifest stops the walk without accepting the ancestor.
-  (`..`-escaping and absolute out-of-tree path dependencies, and
-  `package.workspace` explicit-pointer keys, are not interpreted in this
-  slice.)
+  A `package.workspace` explicit pointer names the owning workspace root
+  directly and replaces ancestor discovery entirely: the pointer resolves
+  lexically against the manifest's directory (staying inside the repository;
+  an out-of-repo pointer is a documented skip), the target must declare
+  `[workspace]`, and its lockfile state, `[workspace.dependencies]`
+  inheritance, and `exclude` globs all apply — so a member OUTSIDE the
+  root's directory tree (root `members = ["../pkgs/a"]`) still resolves
+  through the root's lockfile. A broken pointer (target missing or not a
+  workspace root) means honest standalone behavior.
+  (`..`-escaping and absolute out-of-tree path dependencies are not
+  interpreted in this slice.)
   A parseable declared requirement gates **every** path with Cargo semantics
   (`"1"` means `^1`), including a sole locked version that a stale or shared
   lockfile can leave unsatisfying: exactly one satisfying version is
