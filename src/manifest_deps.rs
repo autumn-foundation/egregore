@@ -809,22 +809,26 @@ fn owning_workspace_dir(
     // names its workspace root directly — Cargo resolves through it even
     // when the member lives OUTSIDE the root's directory tree (the root's
     // `members` can be `../`-relative). A pointer, when present, replaces
-    // ancestor discovery entirely; a broken pointer (target missing or not
-    // a `[workspace]` root), an out-of-repo pointer, or an excluded member
+    // ancestor discovery entirely. Cargo requires MUTUAL consent: the
+    // pointed root's own membership rules must cover the pointing package,
+    // else Cargo errors ("believes it's in a workspace when it's not") —
+    // a broken pointer (target missing or not a `[workspace]` root), an
+    // out-of-repo pointer, or a target that does not include the member
     // means honest standalone behavior.
     if let Some(pointer) = package_workspace_pointer(repo_root, &manifest_dir, cache) {
-        let target_key = resolve_pointer_dir(&manifest_dir, &pointer)?;
+        let target_key = resolve_pointer_dir(repo_root, &manifest_dir, &pointer)?;
         let target_segments: Vec<&str> = target_key.split('/').filter(|s| !s.is_empty()).collect();
-        let WorkspaceFacts::Workspace { exclude, .. } =
-            workspace_facts_in_dir(repo_root, &target_segments, cache)
+        let WorkspaceFacts::Workspace {
+            members,
+            exclude,
+            path_members,
+            ..
+        } = workspace_facts_in_dir(repo_root, &target_segments, cache)
         else {
             return None;
         };
         let rel = rel_between(&target_segments, &manifest_dir);
-        if exclude.iter().any(|glob| member_glob_match(glob, &rel)) {
-            return None;
-        }
-        return Some(target_key);
+        return workspace_includes(&members, &exclude, &path_members, &rel).then_some(target_key);
     }
     loop {
         segments.pop()?;
@@ -838,10 +842,8 @@ fn owning_workspace_dir(
                 ..
             } => {
                 let rel = manifest_dir[segments.len()..].join("/");
-                let is_member = (members.iter().any(|glob| member_glob_match(glob, &rel))
-                    || path_members.iter().any(|member| member == &rel))
-                    && !exclude.iter().any(|glob| member_glob_match(glob, &rel));
-                return is_member.then(|| segments.join("/"));
+                return workspace_includes(&members, &exclude, &path_members, &rel)
+                    .then(|| segments.join("/"));
             }
             // Membership cannot be verified: never claim ownership.
             WorkspaceFacts::Unverifiable => return None,
@@ -851,6 +853,21 @@ fn owning_workspace_dir(
             WorkspaceFacts::NoManifest | WorkspaceFacts::PackageOnly => {}
         }
     }
+}
+
+/// Membership predicate shared by ancestor discovery and pointer targets:
+/// `members` globs (including `../`-relative patterns for out-of-tree
+/// pointer members) or automatic path-dependency members admit the
+/// directory, and `exclude` globs veto it (PR #314 review).
+fn workspace_includes(
+    members: &[String],
+    exclude: &[String],
+    path_members: &[String],
+    rel: &str,
+) -> bool {
+    (members.iter().any(|glob| member_glob_match(glob, rel))
+        || path_members.iter().any(|member| member == rel))
+        && !exclude.iter().any(|glob| member_glob_match(glob, rel))
 }
 
 /// Reads (and caches) one directory's `[package].workspace` pointer string
@@ -885,13 +902,30 @@ fn package_workspace_pointer(
 }
 
 /// Resolves a `package.workspace` pointer against the manifest's directory
-/// with lexical `.`/`..` handling. Returns the target directory as a
-/// repo-root-relative `/`-joined key (`""` = the repository root itself);
-/// `None` when the pointer escapes the repository — such a root is outside
-/// this slice and the manifest stays standalone (documented skip).
-fn resolve_pointer_dir(manifest_dir: &[&str], pointer: &str) -> Option<String> {
-    let mut stack: Vec<&str> = manifest_dir.to_vec();
+/// with lexical `.`/`..` handling. An **absolute** pointer is normalized
+/// like absolute path dependencies: the repo root is lexically absolutized
+/// (relative scan roots covered) and stripped as a prefix. Returns the
+/// target directory as a repo-root-relative `/`-joined key (`""` = the
+/// repository root itself); `None` when the pointer escapes the
+/// repository — such a root is outside this slice and the manifest stays
+/// standalone (documented skip).
+fn resolve_pointer_dir(repo_root: &Path, manifest_dir: &[&str], pointer: &str) -> Option<String> {
     let normalized = pointer.replace('\\', "/");
+    if Path::new(&normalized).is_absolute() {
+        let abs_root = absolutize_lexical(repo_root);
+        let target = absolutize_lexical(Path::new(&normalized));
+        let rel = target.strip_prefix(&abs_root).ok()?;
+        let mut parts: Vec<&str> = Vec::new();
+        for component in rel.components() {
+            match component {
+                std::path::Component::Normal(part) => parts.push(part.to_str()?),
+                std::path::Component::CurDir => {}
+                _ => return None,
+            }
+        }
+        return Some(parts.join("/"));
+    }
+    let mut stack: Vec<&str> = manifest_dir.to_vec();
     for segment in normalized.split('/') {
         match segment {
             "" | "." => {}

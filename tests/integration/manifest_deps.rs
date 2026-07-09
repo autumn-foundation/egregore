@@ -2452,3 +2452,138 @@ fn broken_package_workspace_pointer_stays_standalone() {
         "a broken pointer never resolves through a guessed root"
     );
 }
+
+/// PR #314 review: an ABSOLUTE in-repo `package.workspace` pointer is
+/// normalized like absolute path dependencies — lexically stripped of the
+/// repo root — and resolves through the pointed root; an absolute pointer
+/// outside the repository is a documented skip (standalone).
+#[test]
+fn absolute_package_workspace_pointers_resolve_in_repo() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("ws")).expect("dirs");
+    fs::create_dir_all(repo.join("pkgs/a/src")).expect("dirs");
+    fs::create_dir_all(repo.join("pkgs/c/src")).expect("dirs");
+    // An out-of-repo workspace root the absolute pointer must never adopt.
+    fs::create_dir_all(temp.path().join("outside-ws")).expect("dirs");
+    fs::write(
+        temp.path().join("outside-ws/Cargo.toml"),
+        "[workspace]\nmembers = [\"*\"]\n",
+    )
+    .expect("outside ws manifest");
+    fs::write(
+        temp.path().join("outside-ws/Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"9.9.9\"\n",
+    )
+    .expect("outside ws lockfile");
+
+    fs::write(
+        repo.join("ws/Cargo.toml"),
+        "[workspace]\nmembers = [\"../pkgs/a\"]\n\n[workspace.dependencies]\ntokio = \"1\"\n",
+    )
+    .expect("ws manifest");
+    fs::write(
+        repo.join("ws/Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\n[[package]]\nname = \"tokio\"\nversion = \"1.40.0\"\n",
+    )
+    .expect("ws lockfile");
+    let abs_ws = repo.join("ws");
+    fs::write(
+        repo.join("pkgs/a/Cargo.toml"),
+        format!(
+            "[package]\nname = \"pkg-a\"\nversion = \"0.1.0\"\nworkspace = \"{}\"\n\n[dependencies]\nserde = \"1\"\ntokio = {{ workspace = true }}\n",
+            abs_ws.display()
+        ),
+    )
+    .expect("member manifest");
+    fs::write(repo.join("pkgs/a/src/lib.rs"), "pub fn a() {}\n").expect("lib");
+    let abs_outside = temp.path().join("outside-ws");
+    fs::write(
+        repo.join("pkgs/c/Cargo.toml"),
+        format!(
+            "[package]\nname = \"pkg-c\"\nversion = \"0.1.0\"\nworkspace = \"{}\"\n\n[dependencies]\nserde = \"1\"\n",
+            abs_outside.display()
+        ),
+    )
+    .expect("member manifest");
+    fs::write(repo.join("pkgs/c/src/lib.rs"), "pub fn c() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("abs-pointer-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let serde = run_query_deps(&graph, &["--name", "serde"]);
+    let rows = serde["declarations"].as_array().expect("declarations");
+    let by_pkg = |pkg: &str| {
+        rows.iter()
+            .find(|d| d["declaring_package"] == pkg)
+            .unwrap_or_else(|| panic!("row for {pkg}"))
+    };
+    assert_eq!(
+        by_pkg("pkg-a")["resolution"],
+        "locked",
+        "an absolute in-repo pointer resolves through the pointed root"
+    );
+    assert_eq!(by_pkg("pkg-a")["resolved_version"], "1.0.228");
+    assert_eq!(
+        by_pkg("pkg-c")["resolution"],
+        "no_lockfile",
+        "an out-of-repo absolute pointer is a documented skip — never a foreign lockfile"
+    );
+    // Inheritance flows through the absolute in-repo pointer too.
+    let tokio = run_query_deps(&graph, &["--name", "tokio"]);
+    let rows = tokio["declarations"].as_array().expect("declarations");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["declared_requirement"], "1");
+    assert_eq!(rows[0]["resolved_version"], "1.40.0");
+}
+
+/// Cargo requires mutual consent: the pointed root's membership rules must
+/// actually cover the pointing package. A pointer at a workspace whose
+/// members/closure do NOT include the package keeps honest standalone
+/// behavior — never a fabricated locked version.
+#[test]
+fn pointer_without_mutual_membership_stays_standalone() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("ws2")).expect("dirs");
+    fs::create_dir_all(repo.join("pkgs/b/src")).expect("dirs");
+    // ws2 is a workspace root, but its members never include ../pkgs/b.
+    fs::write(
+        repo.join("ws2/Cargo.toml"),
+        "[workspace]\nmembers = [\"../pkgs/other\"]\n",
+    )
+    .expect("ws2 manifest");
+    fs::write(
+        repo.join("ws2/Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("ws2 lockfile");
+    fs::write(
+        repo.join("pkgs/b/Cargo.toml"),
+        "[package]\nname = \"pkg-b\"\nversion = \"0.1.0\"\nworkspace = \"../../ws2\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("member manifest");
+    fs::write(repo.join("pkgs/b/src/lib.rs"), "pub fn b() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("nonmutual-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let rows = parsed["declarations"].as_array().expect("declarations");
+    let pkg_b = rows
+        .iter()
+        .find(|d| d["declaring_package"] == "pkg-b")
+        .expect("pkg-b row");
+    assert_eq!(
+        pkg_b["resolution"], "no_lockfile",
+        "a pointer without mutual membership never adopts the root's lockfile"
+    );
+}
