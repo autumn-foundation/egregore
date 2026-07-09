@@ -20665,6 +20665,11 @@ pub struct DependencyCycleCounts {
     pub imports_ambiguous_excluded: usize,
     /// Import items with no in-repo defining file (external crates/packages).
     pub imports_external: usize,
+    /// Non-Rust `Import` declarations, excluded from cycle detection: import
+    /// name resolution is Rust-only in this slice, and a raw Python /
+    /// TypeScript / Go import statement must be tallied — never silently
+    /// treated as external or reported as a bare "acyclic".
+    pub imports_non_rust_excluded: usize,
 }
 
 /// A stable machine-readable condition attached to the cycle result.
@@ -20672,7 +20677,7 @@ pub struct DependencyCycleCounts {
 pub struct DependencyCycleDiagnostic {
     /// Stable diagnostic code (`acyclic`, `ambiguous_dependencies_excluded`,
     /// `unresolved_calls_excluded`, `unlabeled_calls_excluded`,
-    /// `cycles_truncated`).
+    /// `non_rust_imports_excluded`, `cycles_truncated`).
     pub code: &'static str,
     /// Record the diagnostic is about, when one exists.
     pub record_id: Option<String>,
@@ -20807,6 +20812,11 @@ fn enumerate_elementary_cycles(adj: &[Vec<usize>], cap: usize) -> (Vec<Vec<usize
 ///   symbol definitions in the same repository. Exactly one defining file →
 ///   an `importing-file → defining-file` dependency; two or more candidate
 ///   files → ambiguous, excluded and tallied; none → external, tallied.
+///   Import name resolution is **Rust-only** in this slice: non-Rust
+///   `Import` nodes (Python / TypeScript / Go raw statement text) are
+///   excluded and tallied with a diagnostic — an unparseable import is never
+///   silently treated as external, and their absence from the cycle set is
+///   never a bare acyclicity claim.
 ///
 /// Same-file dependencies never form an edge, so self-loops are excluded by
 /// construction. When `repo_scope` is set, only that repository's files and
@@ -20985,19 +20995,28 @@ pub fn dependency_cycles<'a>(
     // IMPORTS declarations: each imported item resolves by name against
     // same-repository symbol definitions. Exactly one defining file is a
     // dependency; several candidate files are ambiguous and excluded; no
-    // candidate is an external import.
+    // candidate is an external import. Import name resolution is Rust-only
+    // in this slice: non-Rust `Import` nodes carry raw statement text
+    // (`from a import X`, `import { X } from "./b"`, `"pkg/path"`) that Rust
+    // path parsing cannot resolve, so they are excluded and tallied — never
+    // silently folded into the external tally.
     for r in records {
         let GraphRecord::Node {
             id,
             kind: NodeKind::Import,
             name: Some(name),
             repo_relative_path: Some(path),
+            language,
             ..
         } = r
         else {
             continue;
         };
         if deleted(id.as_str()) || !in_scope(id.as_str()) {
+            continue;
+        }
+        if language.as_deref() != Some("rust") {
+            result.counts.imports_non_rust_excluded += 1;
             continue;
         }
         let repo = owner(id.as_str());
@@ -21173,6 +21192,19 @@ pub fn dependency_cycles<'a>(
                  cycle detection; absence never means resolved — re-scan to \
                  label them",
                 result.counts.calls_unlabeled_excluded
+            ),
+        });
+    }
+    if result.counts.imports_non_rust_excluded > 0 {
+        result.diagnostics.push(DependencyCycleDiagnostic {
+            code: "non_rust_imports_excluded",
+            record_id: None,
+            detail: format!(
+                "{} non-Rust import declaration(s) are outside this slice's \
+                 Rust-only import name resolution and were excluded from \
+                 cycle detection; their absence from the cycle set is not \
+                 proof of acyclicity",
+                result.counts.imports_non_rust_excluded
             ),
         });
     }

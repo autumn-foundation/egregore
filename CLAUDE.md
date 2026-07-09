@@ -425,6 +425,8 @@ edges: resolved cross-file `CALLS` edges (issues #152/#134) and import declarati
 name-resolve to exactly one in-repo defining file. `ambiguous`/`unresolved`/unlabeled
 cross-file CALLS edges and ambiguous imports are excluded from cycle detection and tallied —
 ambiguity never fabricates a cycle and an unlabeled edge is never treated as resolved.
+Import name resolution is Rust-only in this slice; non-Rust imports are excluded and tallied
+with a diagnostic, never silently reported acyclic.
 Each cycle lists the ordered member files closing the loop, with stable record IDs,
 repo-relative handles, and the citable records behind every closing edge. Cycles are
 canonical (rotated to the lexicographically smallest member, reported once, sorted by a

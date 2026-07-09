@@ -62,6 +62,12 @@ new extraction in this slice:
   more candidate files → ambiguous, excluded and tallied; no in-repo
   candidate → external (e.g. `std::`), tallied. Name-based, so this mirrors
   the leads-not-proof contract of the import join in `change-impact`.
+  **Import name resolution is Rust-only in this slice**: Python / TypeScript
+  / Go `Import` nodes carry raw statement text that Rust path parsing cannot
+  resolve, so they are excluded and tallied in
+  `counts.imports_non_rust_excluded` with a `non_rust_imports_excluded`
+  diagnostic — never silently treated as external, and their absence from
+  the cycle set is never a bare acyclicity claim.
 
 Same-file dependencies never form an edge, so self-loops are excluded by
 construction. `--repo <SELECTOR>` restricts the whole dependency graph to one
@@ -122,7 +128,8 @@ Output is byte-identical across repeated runs on an unchanged graph:
     "calls_unlabeled_excluded": 0,
     "imports_resolved": 0,
     "imports_ambiguous_excluded": 0,
-    "imports_external": 0
+    "imports_external": 0,
+    "imports_non_rust_excluded": 0
   },
   "diagnostics": []
 }
@@ -138,7 +145,7 @@ Output is byte-identical across repeated runs on an unchanged graph:
   distinguishable from "graph is acyclic".
 - Diagnostic codes: `acyclic`, `ambiguous_dependencies_excluded`,
   `unresolved_calls_excluded`, `unlabeled_calls_excluded`,
-  `cycles_truncated`.
+  `non_rust_imports_excluded`, `cycles_truncated`.
 
 `--format text` prints one human-readable line per cycle (`cycle 1 (length
 3): src/alpha.rs -> src/beta.rs -> src/gamma.rs -> src/alpha.rs`) or

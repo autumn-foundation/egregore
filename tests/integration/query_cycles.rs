@@ -619,3 +619,106 @@ fn query_cycles_repo_scoping_restricts_the_graph() {
     let scoped_cyclic = run_cycles(&graph, &["--repo", "repo-cyclic"]);
     assert_eq!(scoped_cyclic["cycles"].as_array().map(Vec::len), Some(1));
 }
+
+// ---------------------------------------------------------------------------
+// Resolution policy: non-Rust imports are excluded and tallied, never
+// silently reported as an acyclic graph
+// ---------------------------------------------------------------------------
+
+/// A Python import-only loop. Import name resolution is Rust-only in this
+/// slice: these must be excluded and tallied with a diagnostic — never
+/// silently folded into the external tally, and never a bare "acyclic" claim.
+const PYTHON_IMPORT_CYCLE: &[(&str, &str)] = &[
+    (
+        "pkg/alpha.py",
+        "from pkg.beta import beta_fn\n\n\ndef alpha_fn():\n    return 1\n",
+    ),
+    (
+        "pkg/beta.py",
+        "from pkg.alpha import alpha_fn\n\n\ndef beta_fn():\n    return 2\n",
+    ),
+];
+
+#[test]
+fn query_cycles_non_rust_imports_are_excluded_and_tallied() {
+    let (_temp, graph) = fixture_graph("cycles-python", PYTHON_IMPORT_CYCLE);
+    let parsed = run_cycles(&graph, &[]);
+
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(
+        parsed["cycles"].as_array().map(Vec::len),
+        Some(0),
+        "non-Rust imports must not fabricate cycles: {:?}",
+        parsed["cycles"]
+    );
+    assert!(
+        parsed["counts"]["imports_non_rust_excluded"]
+            .as_u64()
+            .is_some_and(|n| n >= 2),
+        "non-Rust imports are tallied as excluded, not mislabeled external, got {:?}",
+        parsed["counts"]
+    );
+    let diags = parsed["diagnostics"].as_array().expect("diagnostics");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d["code"] == "non_rust_imports_excluded"),
+        "the Rust-only import-resolution scope must be surfaced, got {diags:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// --data-dir reads must leave the live embedded store byte-for-byte untouched
+// ---------------------------------------------------------------------------
+
+/// Recursive path -> content map for byte-exact store comparisons.
+#[cfg(feature = "embedded-aletheiadb")]
+fn dir_contents(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut contents = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("dir should read") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let bytes = fs::read(&path).expect("file should read");
+                contents.insert(path.display().to_string(), bytes);
+            }
+        }
+    }
+    contents
+}
+
+/// Opening the embedded engine in place re-persists index files, so the
+/// `--data-dir` path must read through a throwaway copy (same contract as the
+/// other strictly read-only lanes).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn cycles_query_is_read_only_for_embedded_store() {
+    let (temp, graph) = fixture_graph("cycles-readonly", ONE_CYCLE);
+    let data_dir = temp.path().join("store");
+
+    egregore()
+        .arg("ingest")
+        .arg(&graph)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let bytes_before = dir_contents(&data_dir);
+
+    egregore()
+        .args(["query", "cycles", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    assert_eq!(
+        dir_contents(&data_dir),
+        bytes_before,
+        "querying must leave the live embedded store byte-for-byte untouched"
+    );
+}

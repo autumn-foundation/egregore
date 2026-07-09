@@ -6294,7 +6294,18 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             repo,
             format,
         } => {
-            let records = load_query_records(graph.as_deref(), data_dir.as_deref())?;
+            // Strictly read-only lane (issue #138): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_cycles_cmd(
@@ -13642,6 +13653,7 @@ struct CycleCountsJson {
     imports_resolved: usize,
     imports_ambiguous_excluded: usize,
     imports_external: usize,
+    imports_non_rust_excluded: usize,
 }
 
 /// One stable machine-readable diagnostic in the cycles response.
@@ -13671,7 +13683,8 @@ struct CyclesResponse<'a> {
 
 const CYCLES_EDGE_POLICY: &str = "resolved CALLS edges and imports name-resolving to exactly one in-repo defining file \
      form dependency edges; ambiguous, unresolved, and unlabeled cross-file CALLS edges and \
-     ambiguous imports are excluded from cycle detection and tallied in counts.";
+     ambiguous imports are excluded from cycle detection and tallied in counts. Import name \
+     resolution is Rust-only in this slice: non-Rust imports are excluded and tallied.";
 
 const CYCLES_DISCLAIMER: &str = "Cycles are derived from extracted, resolution-labeled graph edges. Absence of a \
      reported cycle is not proof the modules are acyclic at runtime (excluded ambiguous \
@@ -13816,6 +13829,7 @@ fn query_cycles_cmd(
                     imports_resolved: ctx.counts.imports_resolved,
                     imports_ambiguous_excluded: ctx.counts.imports_ambiguous_excluded,
                     imports_external: ctx.counts.imports_external,
+                    imports_non_rust_excluded: ctx.counts.imports_non_rust_excluded,
                 },
                 diagnostics: ctx
                     .diagnostics
