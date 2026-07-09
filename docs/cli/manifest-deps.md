@@ -61,12 +61,18 @@ never stand alone), or a table whose KNOWN keys are wrong-typed or carry
 disallowed values, which poisons the whole entry even beside a valid
 source: `version`/`path`/`git`/`registry`/`branch`/`tag`/`rev`/`package`
 must be strings, `optional`/`default-features` (and the deprecated
-`default_features`) booleans, `features` an array of strings, and
+`default_features`) booleans, `features` an array of strings,
 `workspace` only the literal `true` (`workspace = false` is
-Cargo-invalid) — unknown keys stay tolerated, since Cargo warns but
-loads. The same class covers a `{ workspace = true }` entry whose
+Cargo-invalid), and `optional` is illegal in `[dev-dependencies]` (dev
+deps cannot be optional; normal and build deps can) — unknown keys stay
+tolerated, since Cargo warns but loads. A version requirement string
+Cargo cannot parse (`serde = "not a req"`, plain-string or table
+`version`) is the same class: rejected at declaration time, never
+resolved against a lockfile. The same class covers a
+`{ workspace = true }` entry whose
 `[workspace.dependencies]` root spec exists but is itself invalid: no
-usable string `version`/`path`/`git`, ill-typed known keys, or the
+usable string `version`/`path`/`git`, an unparseable template `version`,
+ill-typed known keys, or the
 member-only keys Cargo disallows in templates (`optional`, `workspace`) —
 stamped `symbol_kind: uninterpretable_cargo_dependency`,
 the invalid entry skipped — never a key-named row with no requirement —
@@ -189,13 +195,16 @@ declared entry (manifest key):
   back over the repository tree (or back inside the root's own tree) and
   stay a member; only paths escaping the *repository* — relative or
   absolute — are not interpreted in this slice.
-  A parseable declared requirement gates **every** path with Cargo semantics
+  The declared requirement gates **every** path with Cargo semantics
   (`"1"` means `^1`), including a sole locked version that a stale or shared
   lockfile can leave unsatisfying: exactly one satisfying version is
   `locked`; none is `requirement_unsatisfied_in_lockfile`; several satisfying
-  (or an absent/unparseable requirement over several versions) stay
-  `ambiguous_in_lockfile`. Without a usable requirement, a sole locked
-  version resolves directly. A resolved version is never guessed. The
+  (or an absent requirement over several versions) stay
+  `ambiguous_in_lockfile`. Without a requirement (a pure `path`/`git`
+  declaration), a sole locked version resolves directly. A requirement
+  string Cargo cannot parse never reaches resolution at all: the entry is
+  rejected at declaration time as `uninterpretable_cargo_dependency` (see
+  above). A resolved version is never guessed. The
   `resolution` marker is drawn from a closed set:
 
   | Marker | Meaning | `resolved_version` |
@@ -203,7 +212,7 @@ declared entry (manifest key):
   | `locked` | exactly one version of the crate is in the lockfile | present |
   | `no_lockfile` | no `Cargo.lock` found for this manifest | absent |
   | `not_in_lockfile` | lockfile exists but does not list the crate | absent |
-  | `ambiguous_in_lockfile` | several locked versions and the declared requirement (absent, unparseable, or satisfied by two+) cannot select exactly one | absent — never a guess |
+  | `ambiguous_in_lockfile` | several locked versions and the declared requirement (absent, or satisfied by two+) cannot select exactly one | absent — never a guess |
   | `requirement_unsatisfied_in_lockfile` | the lockfile lists the crate but a parseable declared requirement is satisfied by **none** of the locked versions (stale/shared lockfile) | absent — the mismatched version is never presented as resolved |
   | `lockfile_unreadable` | the **nearest** `Cargo.lock` exists but could not be read or parsed | absent — an ancestor lockfile is never consulted in its place |
 

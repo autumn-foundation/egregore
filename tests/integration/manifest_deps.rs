@@ -3448,3 +3448,143 @@ fn disallowed_template_keys_make_workspace_specs_unusable() {
     assert_eq!(miss["count"], 0);
     assert_eq!(skipped_diagnostics(&miss).len(), 1);
 }
+
+/// PR #314 review: a version requirement string Cargo cannot parse
+/// (`serde = "not a req"`, a table's `version`, or a workspace template's
+/// `version`) is a rejected manifest — the entry takes the
+/// `uninterpretable_cargo_dependency` path (no row, even when the crate
+/// sits in the lockfile), while valid requirement forms (`"1"`, `"^0.2"`,
+/// `">=1, <2"`, `"*"`) still extract.
+#[test]
+fn unparseable_version_requirements_are_uninterpretable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    fs::create_dir_all(repo.join("m1/src")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        concat!(
+            "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\n\n",
+            "[workspace]\nmembers = [\"m1\"]\n\n",
+            "[workspace.dependencies]\n",
+            "ryu = { version = \"also not a req\" }\n\n",
+            "[dependencies]\n",
+            "serde = \"not a req\"\n",
+            "itoa = { version = \"still not a req\" }\n",
+            "a1 = \"1\"\n",
+            "a2 = \"^0.2\"\n",
+            "a3 = \">=1, <2\"\n",
+            "a4 = \"*\"\n",
+        ),
+    )
+    .expect("root manifest");
+    // serde sits in the lockfile: an unparseable requirement must never
+    // resolve, let alone as `locked`.
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\n[[package]]\nname = \"a1\"\nversion = \"1.2.3\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+    fs::write(
+        repo.join("m1/Cargo.toml"),
+        "[package]\nname = \"m1\"\nversion = \"0.1.0\"\n\n[dependencies]\nryu = { workspace = true }\n",
+    )
+    .expect("member manifest");
+    fs::write(repo.join("m1/src/lib.rs"), "pub fn m() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("bad-req-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let full = run_query_deps(&graph, &[]);
+    let rows = full["declarations"].as_array().expect("declarations");
+    for invalid in ["serde", "itoa", "ryu"] {
+        assert!(
+            rows.iter().all(|d| d["name"] != invalid),
+            "an unparseable requirement must make the {invalid} entry uninterpretable"
+        );
+    }
+    for valid in ["a1", "a2", "a3", "a4"] {
+        assert!(
+            rows.iter().any(|d| d["name"] == valid),
+            "a valid requirement form ({valid}) still extracts"
+        );
+    }
+    let a1 = rows.iter().find(|d| d["name"] == "a1").expect("a1 row");
+    assert_eq!(a1["resolution"], "locked");
+    assert_eq!(
+        skipped_diagnostics(&full).len(),
+        2,
+        "the root manifest and the inheriting member each carry a qualification"
+    );
+
+    let miss = run_query_deps(&graph, &["--name", "serde"]);
+    assert_eq!(miss["count"], 0);
+    assert!(!skipped_diagnostics(&miss).is_empty());
+}
+
+/// PR #314 review: Cargo rejects `optional = true` in `[dev-dependencies]`
+/// (dev deps cannot be optional) — such an entry takes the
+/// `uninterpretable_cargo_dependency` path. Optional normal and build
+/// dependencies stay legal per Cargo and still extract (pinned).
+#[test]
+fn optional_dev_dependencies_are_uninterpretable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        concat!(
+            "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\n\n",
+            "[dependencies]\nd1 = { version = \"1\", optional = true }\n\n",
+            "[dev-dependencies]\nserde = { version = \"1\", optional = true }\n\n",
+            "[build-dependencies]\nb1 = { version = \"1\", optional = true }\n",
+        ),
+    )
+    .expect("root manifest");
+    // serde sits in the lockfile: an optional dev-dependency must never
+    // become a row, let alone a `locked` one.
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("optional-dev-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let full = run_query_deps(&graph, &[]);
+    let rows = full["declarations"].as_array().expect("declarations");
+    assert!(
+        rows.iter().all(|d| d["name"] != "serde"),
+        "an optional dev-dependency is a manifest Cargo rejects"
+    );
+    let d1 = rows
+        .iter()
+        .find(|d| d["name"] == "d1")
+        .expect("optional normal dependencies are legal");
+    assert_eq!(d1["dependency_kind"], "normal");
+    let b1 = rows
+        .iter()
+        .find(|d| d["name"] == "b1")
+        .expect("optional build dependencies are legal");
+    assert_eq!(b1["dependency_kind"], "build");
+    assert_eq!(
+        skipped_diagnostics(&full).len(),
+        1,
+        "the skipped optional dev-dependency must qualify the answer"
+    );
+
+    let miss = run_query_deps(&graph, &["--name", "serde"]);
+    assert_eq!(miss["count"], 0);
+    assert_eq!(skipped_diagnostics(&miss).len(), 1);
+}

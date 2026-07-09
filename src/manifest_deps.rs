@@ -172,9 +172,13 @@ impl LockfileIndex {
     /// crate — including a sole locked version, which a stale or shared
     /// lockfile can leave unsatisfying: exactly one satisfying version is
     /// `locked`; none is `requirement_unsatisfied_in_lockfile`; several stay
-    /// `ambiguous_in_lockfile`. Without a usable requirement (absent or
-    /// unparseable), a sole locked version resolves directly and several stay
-    /// `ambiguous_in_lockfile`. A resolved version is never fabricated.
+    /// `ambiguous_in_lockfile`. Without a requirement (a pure `path`/`git`
+    /// declaration), a sole locked version resolves directly and several
+    /// stay `ambiguous_in_lockfile`. Extraction rejects unparseable
+    /// requirement strings at declaration time (PR #314 review), so the
+    /// unparseable arm of this fallback is a defensive boundary for direct
+    /// callers, not a path extracted rows can reach. A resolved version is
+    /// never fabricated.
     #[must_use]
     pub fn resolve(&self, crate_name: &str, declared_requirement: Option<&str>) -> LockResolution {
         let Some(versions) = self.versions.get(crate_name) else {
@@ -322,20 +326,35 @@ pub fn parse_manifest_dependencies(
 /// `package`) must be strings, `optional`/`default-features` (and the
 /// deprecated `default_features` spelling) must be booleans, `features`
 /// must be an array of strings, and `workspace` may only be the literal
-/// `true` — `workspace = false` is Cargo-invalid. Unknown keys are
-/// tolerated: Cargo warns but loads the manifest.
-fn dependency_table_is_well_typed(spec: &dyn toml_edit::TableLike) -> bool {
+/// `true` — `workspace = false` is Cargo-invalid. `optional` is only legal
+/// where the containing table allows it: normal and build dependencies may
+/// be optional, dev dependencies may not (Cargo rejects an optional
+/// dev-dependency), and `[workspace.dependencies]` templates reject it
+/// separately as a member-only key. Unknown keys are tolerated: Cargo
+/// warns but loads the manifest.
+fn dependency_table_is_well_typed(spec: &dyn toml_edit::TableLike, optional_allowed: bool) -> bool {
     spec.iter().all(|(key, item)| match key {
         "version" | "path" | "git" | "registry" | "branch" | "tag" | "rev" | "package" => {
             item.as_str().is_some()
         }
         "workspace" => item.as_bool() == Some(true),
-        "optional" | "default-features" | "default_features" => item.as_bool().is_some(),
+        "optional" => optional_allowed && item.as_bool().is_some(),
+        "default-features" | "default_features" => item.as_bool().is_some(),
         "features" => item
             .as_array()
             .is_some_and(|array| array.iter().all(|value| value.as_str().is_some())),
         _ => true,
     })
+}
+
+/// Returns whether a declared version requirement string is one Cargo
+/// accepts (the `semver::VersionReq` grammar — `"1"`, `"^0.2"`,
+/// `">=1, <2"`, `"*"`). An unparseable requirement (`"not a req"`) is a
+/// manifest Cargo rejects: the declaring entry takes the uninterpretable
+/// diagnostic path instead of being recorded, and never resolves against a
+/// lockfile (PR #314 review).
+fn requirement_is_parseable(requirement: &str) -> bool {
+    semver::VersionReq::parse(requirement).is_ok()
 }
 
 /// Interprets one dependency table entry.
@@ -348,9 +367,10 @@ fn dependency_table_is_well_typed(spec: &dyn toml_edit::TableLike) -> bool {
 /// string nor a dependency table (`serde = true`), a table without a
 /// usable source — a `version`/`path`/`git` string or `workspace = true` —
 /// and a table whose KNOWN keys are wrong-typed or carry disallowed values
-/// (`version = 1` even beside a valid `path`, `workspace = false`) are
-/// manifests Cargo rejects: `None`, no row is fabricated, and the caller
-/// reports the coverage hole (PR #314 review).
+/// (`version = 1` even beside a valid `path`, `workspace = false`, an
+/// `optional` dev-dependency, or an unparseable requirement string like
+/// `"not a req"`) are manifests Cargo rejects: `None`, no row is
+/// fabricated, and the caller reports the coverage hole (PR #314 review).
 fn declared_dependency(
     key: &str,
     item: &toml_edit::Item,
@@ -365,8 +385,9 @@ fn declared_dependency(
     } else if let Some(spec) = item.as_table_like() {
         // Any known key with a wrong type or disallowed value poisons the
         // whole entry — Cargo rejects the manifest even when another
-        // source field is valid (PR #314 review).
-        if !dependency_table_is_well_typed(spec) {
+        // source field is valid (PR #314 review). Dev dependencies cannot
+        // be optional; normal and build dependencies can.
+        if !dependency_table_is_well_typed(spec, !matches!(kind, DependencyKind::Dev)) {
             return None;
         }
         if let Some(package) = spec.get("package").and_then(|v| v.as_str()) {
@@ -393,6 +414,14 @@ fn declared_dependency(
             return None;
         }
     } else {
+        return None;
+    }
+    // A requirement string Cargo cannot parse is a rejected manifest —
+    // never a recorded declaration and never a lockfile resolution
+    // (PR #314 review). Covers plain-string entries and table `version`s.
+    if let Some(requirement) = declared_requirement.as_deref()
+        && !requirement_is_parseable(requirement)
+    {
         return None;
     }
     Some(DeclaredDependency {
@@ -1214,10 +1243,13 @@ fn parse_workspace_facts(text: &str, repo_root: &Path, dir_key: &str) -> Workspa
                                     // `[workspace.dependencies]`: `optional`
                                     // and `workspace` itself; known keys
                                     // must be well-typed like member
-                                    // entries (PR #314 review).
-                                    let usable = dependency_table_is_well_typed(entry)
+                                    // entries, and a declared version must
+                                    // be a requirement Cargo can parse
+                                    // (PR #314 review).
+                                    let usable = dependency_table_is_well_typed(entry, true)
                                         && entry.get("optional").is_none()
                                         && entry.get("workspace").is_none()
+                                        && version.as_deref().is_none_or(requirement_is_parseable)
                                         && (version.is_some()
                                             || field("path").is_some()
                                             || field("git").is_some());
@@ -1231,7 +1263,10 @@ fn parse_workspace_facts(text: &str, repo_root: &Path, dir_key: &str) -> Workspa
                         |version| WorkspaceDepSpec {
                             package: None,
                             version: Some(version.to_owned()),
-                            usable: true,
+                            // A plain-string template is its own version
+                            // requirement — usable only when Cargo could
+                            // parse it (PR #314 review).
+                            usable: requirement_is_parseable(version),
                         },
                     );
                     (key.to_owned(), spec)
