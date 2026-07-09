@@ -1598,8 +1598,10 @@ enum QuerySubcommand {
     /// derived from already-extracted records: resolved cross-file `CALLS`
     /// edges (issues #152/#134) and import declarations that name-resolve to
     /// exactly one in-repo defining file. `ambiguous` / `unresolved` CALLS
-    /// edges and ambiguous imports are excluded from cycle detection and
-    /// tallied — ambiguity never fabricates a cycle.
+    /// edges, cross-file CALLS edges carrying no resolution label (stores
+    /// predating the resolution field), and ambiguous imports are excluded
+    /// from cycle detection and tallied — ambiguity never fabricates a
+    /// cycle, and an unlabeled edge is never treated as resolved.
     ///
     /// Each cycle lists the ordered member files that close the loop, with
     /// stable record IDs and repo-relative handles, plus the citable records
@@ -13578,8 +13580,9 @@ struct CycleEvidenceJson<'a> {
     /// Stable record ID of the contributing CALLS edge or Import node.
     record_id: &'a str,
     /// Call resolution status ("resolved") on CALLS-derived evidence; absent
-    /// on import-derived evidence. Ambiguous/unresolved edges never appear
-    /// here — they are excluded from cycle detection and tallied in `counts`.
+    /// on import-derived evidence. Ambiguous, unresolved, and unlabeled
+    /// cross-file edges never appear here — they are excluded from cycle
+    /// detection and tallied in `counts`.
     #[serde(skip_serializing_if = "Option::is_none")]
     resolution: Option<&'static str>,
 }
@@ -13635,6 +13638,7 @@ struct CycleCountsJson {
     calls_resolved: usize,
     calls_ambiguous_excluded: usize,
     calls_unresolved_excluded: usize,
+    calls_unlabeled_excluded: usize,
     imports_resolved: usize,
     imports_ambiguous_excluded: usize,
     imports_external: usize,
@@ -13666,8 +13670,8 @@ struct CyclesResponse<'a> {
 }
 
 const CYCLES_EDGE_POLICY: &str = "resolved CALLS edges and imports name-resolving to exactly one in-repo defining file \
-     form dependency edges; ambiguous and unresolved CALLS edges and ambiguous imports are \
-     excluded from cycle detection and tallied in counts.";
+     form dependency edges; ambiguous, unresolved, and unlabeled cross-file CALLS edges and \
+     ambiguous imports are excluded from cycle detection and tallied in counts.";
 
 const CYCLES_DISCLAIMER: &str = "Cycles are derived from extracted, resolution-labeled graph edges. Absence of a \
      reported cycle is not proof the modules are acyclic at runtime (excluded ambiguous \
@@ -13808,6 +13812,7 @@ fn query_cycles_cmd(
                     calls_resolved: ctx.counts.calls_resolved,
                     calls_ambiguous_excluded: ctx.counts.calls_ambiguous_excluded,
                     calls_unresolved_excluded: ctx.counts.calls_unresolved_excluded,
+                    calls_unlabeled_excluded: ctx.counts.calls_unlabeled_excluded,
                     imports_resolved: ctx.counts.imports_resolved,
                     imports_ambiguous_excluded: ctx.counts.imports_ambiguous_excluded,
                     imports_external: ctx.counts.imports_external,

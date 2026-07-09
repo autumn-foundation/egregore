@@ -316,6 +316,119 @@ fn query_cycles_excludes_ambiguous_calls_edges_and_reports_the_exclusion() {
     );
 }
 
+#[test]
+fn query_cycles_repo_scope_excludes_other_repos_excluded_call_tallies() {
+    // repo-noisy carries ambiguous CALLS edges; repo-clean is acyclic and
+    // unambiguous. A --repo repo-clean response must not leak repo-noisy's
+    // excluded-edge tallies or the ambiguity diagnostic.
+    let noisy = {
+        let inner = tempfile::tempdir().expect("temp dir");
+        write_fixture(inner.path(), AMBIGUOUS_ONLY);
+        scan_repository_at_with_override(inner.path(), FIXED_TIME, Some("repo-noisy"))
+            .expect("scan")
+            .to_jsonl()
+            .expect("serialize")
+    };
+    let clean = {
+        let inner = tempfile::tempdir().expect("temp dir");
+        write_fixture(inner.path(), ACYCLIC);
+        scan_repository_at_with_override(inner.path(), FIXED_TIME, Some("repo-clean"))
+            .expect("scan")
+            .to_jsonl()
+            .expect("serialize")
+    };
+    let temp = tempfile::tempdir().expect("temp dir");
+    let graph = temp.path().join("multi.jsonl");
+    fs::write(&graph, format!("{noisy}{clean}")).expect("write multi-repo graph");
+
+    let scoped = run_cycles(&graph, &["--repo", "repo-clean"]);
+    assert_eq!(
+        scoped["counts"]["calls_ambiguous_excluded"].as_u64(),
+        Some(0),
+        "another repo's ambiguous edges must not be tallied in a scoped \
+         response, got {:?}",
+        scoped["counts"]
+    );
+    assert_eq!(
+        scoped["counts"]["calls_unresolved_excluded"].as_u64(),
+        Some(0),
+        "another repo's unresolved edges must not be tallied in a scoped \
+         response, got {:?}",
+        scoped["counts"]
+    );
+    let diags = scoped["diagnostics"].as_array().expect("diagnostics");
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d["code"] == "ambiguous_dependencies_excluded"),
+        "another repo's ambiguity diagnostic must not leak into a scoped \
+         response, got {diags:?}"
+    );
+
+    // The noisy repo, scoped to itself, still reports its own exclusions.
+    let noisy_scoped = run_cycles(&graph, &["--repo", "repo-noisy"]);
+    assert!(
+        noisy_scoped["counts"]["calls_ambiguous_excluded"]
+            .as_u64()
+            .is_some_and(|n| n >= 2),
+        "the owning repo's scoped response keeps its tallies, got {:?}",
+        noisy_scoped["counts"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Resolution policy: unlabeled CALLS edges never close a cycle
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_cycles_excludes_unlabeled_cross_file_calls_edges() {
+    // Simulate an older or third-party store whose cross-file CALLS edges
+    // predate the resolution field (issues #152/#134): strip `resolution`
+    // from every edge record. Absence means "outside the resolution
+    // contract", not "resolved" — such edges must not close cycles.
+    let (_temp, graph) = fixture_graph("cycles-unlabeled", ONE_CYCLE);
+    let stripped: String = fs::read_to_string(&graph)
+        .expect("read graph")
+        .lines()
+        .map(|line| {
+            let mut record: Value = serde_json::from_str(line).expect("valid record");
+            if record["record_type"] == "edge" {
+                record
+                    .as_object_mut()
+                    .expect("edge object")
+                    .remove("resolution");
+            }
+            let mut serialized = serde_json::to_string(&record).expect("serialize record");
+            serialized.push('\n');
+            serialized
+        })
+        .collect();
+    fs::write(&graph, stripped).expect("write stripped graph");
+
+    let parsed = run_cycles(&graph, &[]);
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(
+        parsed["cycles"].as_array().map(Vec::len),
+        Some(0),
+        "an unlabeled cross-file CALLS edge must not close a cycle: {:?}",
+        parsed["cycles"]
+    );
+    assert!(
+        parsed["counts"]["calls_unlabeled_excluded"]
+            .as_u64()
+            .is_some_and(|n| n >= 3),
+        "excluded unlabeled cross-file edges are tallied, got {:?}",
+        parsed["counts"]
+    );
+    let diags = parsed["diagnostics"].as_array().expect("diagnostics");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d["code"] == "unlabeled_calls_excluded"),
+        "the exclusion must be surfaced, got {diags:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AC: scoped form reports only cycles through the given node
 // ---------------------------------------------------------------------------

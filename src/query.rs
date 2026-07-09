@@ -20653,6 +20653,12 @@ pub struct DependencyCycleCounts {
     pub calls_ambiguous_excluded: usize,
     /// `CALLS` edges labeled `unresolved`, excluded from cycle detection.
     pub calls_unresolved_excluded: usize,
+    /// Cross-file `CALLS` edges carrying no resolution label (older or
+    /// third-party stores predating issues #152/#134), excluded from cycle
+    /// detection: absence means "outside the resolution contract", never
+    /// "resolved". Same-file unlabeled edges are not tallied — they can
+    /// never contribute a file-level dependency edge.
+    pub calls_unlabeled_excluded: usize,
     /// Import items that resolved to exactly one in-repo defining file.
     pub imports_resolved: usize,
     /// Import items matching two or more in-repo defining files, excluded.
@@ -20665,7 +20671,8 @@ pub struct DependencyCycleCounts {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DependencyCycleDiagnostic {
     /// Stable diagnostic code (`acyclic`, `ambiguous_dependencies_excluded`,
-    /// `unresolved_calls_excluded`, `cycles_truncated`).
+    /// `unresolved_calls_excluded`, `unlabeled_calls_excluded`,
+    /// `cycles_truncated`).
     pub code: &'static str,
     /// Record the diagnostic is about, when one exists.
     pub record_id: Option<String>,
@@ -20789,9 +20796,12 @@ fn enumerate_elementary_cycles(adj: &[Vec<usize>], cap: usize) -> (Vec<Vec<usize
 ///   `caller-file → callee-file` dependency **only when labeled `resolved`**
 ///   by the resolution passes (issues #152/#134). Edges labeled `ambiguous`
 ///   or `unresolved` are excluded from cycle detection and tallied — an
-///   ambiguous edge must never fabricate a cycle. Edges carrying no
-///   resolution label are outside the resolution contract (same-file
-///   Tree-sitter edges under current extractors) and cannot cross files.
+///   ambiguous edge must never fabricate a cycle. A cross-file edge carrying
+///   **no** resolution label (an older or third-party store predating the
+///   resolution field) is likewise excluded and tallied: absence means
+///   "outside the resolution contract", never "resolved". Excluded-edge
+///   tallies are scoped to the calling symbol's repository, so a
+///   `--repo`-scoped response never reports another repository's edges.
 /// - **`IMPORTS` declarations** (`File/Module → Import` nodes): each imported
 ///   item (grouped and aliased imports expanded) is name-matched against
 ///   symbol definitions in the same repository. Exactly one defining file →
@@ -20918,8 +20928,9 @@ pub fn dependency_cycles<'a>(
             .insert((relation, record_id), resolution);
     };
 
-    // CALLS edges: resolved edges drive cycle detection; ambiguous and
-    // unresolved edges are excluded and tallied, never silently dropped.
+    // CALLS edges: resolved edges drive cycle detection; ambiguous,
+    // unresolved, and unlabeled cross-file edges are excluded and tallied,
+    // never silently dropped.
     for r in records {
         let GraphRecord::Edge {
             id,
@@ -20935,6 +20946,13 @@ pub fn dependency_cycles<'a>(
         if deleted(id.as_str()) {
             continue;
         }
+        // An edge belongs to its calling symbol's repository: resolve the
+        // caller first so a `--repo`-scoped response never tallies (or
+        // traverses) another repository's edges. `symbol_file` holds only
+        // in-scope symbols.
+        let Some(&from) = symbol_file.get(source.as_str()) else {
+            continue;
+        };
         match resolution {
             Some(CallResolution::Ambiguous) => {
                 result.counts.calls_ambiguous_excluded += 1;
@@ -20946,13 +20964,18 @@ pub fn dependency_cycles<'a>(
             }
             Some(CallResolution::Resolved) | None => {}
         }
-        let (Some(&from), Some(&to)) = (
-            symbol_file.get(source.as_str()),
-            symbol_file.get(target.as_str()),
-        ) else {
+        let Some(&to) = symbol_file.get(target.as_str()) else {
             continue;
         };
         if from == to || !files.contains_key(&from) || !files.contains_key(&to) {
+            continue;
+        }
+        // A cross-file edge with no resolution label is outside the
+        // resolution contract (older or third-party store predating issues
+        // #152/#134): absence never means "resolved", so it must not close
+        // a cycle. Excluded and tallied.
+        if resolution.is_none() {
+            result.counts.calls_unlabeled_excluded += 1;
             continue;
         }
         result.counts.calls_resolved += 1;
@@ -21137,6 +21160,19 @@ pub fn dependency_cycles<'a>(
                 "{} unresolved CALLS edge(s) have no in-repo target and were \
                  excluded from cycle detection",
                 result.counts.calls_unresolved_excluded
+            ),
+        });
+    }
+    if result.counts.calls_unlabeled_excluded > 0 {
+        result.diagnostics.push(DependencyCycleDiagnostic {
+            code: "unlabeled_calls_excluded",
+            record_id: None,
+            detail: format!(
+                "{} cross-file CALLS edge(s) carry no resolution label \
+                 (store predates issues #152/#134?) and were excluded from \
+                 cycle detection; absence never means resolved — re-scan to \
+                 label them",
+                result.counts.calls_unlabeled_excluded
             ),
         });
     }

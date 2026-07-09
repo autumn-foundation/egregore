@@ -48,9 +48,13 @@ new extraction in this slice:
   contributes a `caller-file → callee-file` dependency **only when labeled
   `resolved`**. Edges labeled `ambiguous` or `unresolved` are excluded from
   cycle detection and tallied in `counts` — an ambiguous edge must never
-  fabricate a cycle. Edges carrying no resolution label are outside the
-  resolution contract (same-file Tree-sitter edges under current extractors)
-  and cannot cross files.
+  fabricate a cycle. A cross-file edge carrying **no** resolution label (an
+  older or third-party store predating the resolution field) is likewise
+  excluded and tallied in `counts.calls_unlabeled_excluded` with an
+  `unlabeled_calls_excluded` diagnostic: absence means "outside the
+  resolution contract", never "resolved" — re-scan to label such edges.
+  Excluded-edge tallies are scoped to the calling symbol's repository, so a
+  `--repo`-scoped response never reports another repository's edges.
 - **Import declarations** (`IMPORTS` edges to `Import` nodes). Each imported
   item — grouped (`a::{X, Y}`) and aliased (`X as Y`) imports expanded — is
   name-matched against symbol definitions in the **same repository**. Exactly
@@ -115,6 +119,7 @@ Output is byte-identical across repeated runs on an unchanged graph:
     "calls_resolved": 3,
     "calls_ambiguous_excluded": 0,
     "calls_unresolved_excluded": 0,
+    "calls_unlabeled_excluded": 0,
     "imports_resolved": 0,
     "imports_ambiguous_excluded": 0,
     "imports_external": 0
@@ -132,7 +137,8 @@ Output is byte-identical across repeated runs on an unchanged graph:
   still reports the unfiltered count so "filtered to zero" is
   distinguishable from "graph is acyclic".
 - Diagnostic codes: `acyclic`, `ambiguous_dependencies_excluded`,
-  `unresolved_calls_excluded`, `cycles_truncated`.
+  `unresolved_calls_excluded`, `unlabeled_calls_excluded`,
+  `cycles_truncated`.
 
 `--format text` prints one human-readable line per cycle (`cycle 1 (length
 3): src/alpha.rs -> src/beta.rs -> src/gamma.rs -> src/alpha.rs`) or

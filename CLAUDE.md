@@ -422,9 +422,10 @@ deterministic and byte-identical across runs. See `docs/cli/producer-drift.md`.
 
 `eg query cycles [scope]` enumerates dependency cycles among files over the already-extracted
 edges: resolved cross-file `CALLS` edges (issues #152/#134) and import declarations that
-name-resolve to exactly one in-repo defining file. `ambiguous`/`unresolved` CALLS edges and
-ambiguous imports are excluded from cycle detection and tallied — ambiguity never fabricates
-a cycle. Each cycle lists the ordered member files closing the loop, with stable record IDs,
+name-resolve to exactly one in-repo defining file. `ambiguous`/`unresolved`/unlabeled
+cross-file CALLS edges and ambiguous imports are excluded from cycle detection and tallied —
+ambiguity never fabricates a cycle and an unlabeled edge is never treated as resolved.
+Each cycle lists the ordered member files closing the loop, with stable record IDs,
 repo-relative handles, and the citable records behind every closing edge. Cycles are
 canonical (rotated to the lexicographically smallest member, reported once, sorted by a
 stable key) and byte-identical across runs. The optional scope handle (symbol name/record ID
