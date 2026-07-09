@@ -1672,3 +1672,64 @@ fn absolute_path_dependencies_resolve_under_a_relative_scan_root() {
     );
     assert_eq!(helper["resolved_version"], "1.0.228");
 }
+
+/// PR #314 review: Cargo's `members`/`exclude` globs support character
+/// classes (the `glob` crate — `[ab]`, ranges, `[!…]`). A class in `members`
+/// must admit the member and a class in `exclude` must be honored.
+#[test]
+fn workspace_glob_character_classes_are_honored() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    for member in ["a", "b"] {
+        fs::create_dir_all(repo.join(format!("crates/{member}/src"))).expect("dirs");
+        fs::write(
+            repo.join(format!("crates/{member}/Cargo.toml")),
+            format!(
+                "[package]\nname = \"pkg-{member}\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n"
+            ),
+        )
+        .expect("member manifest");
+        fs::write(
+            repo.join(format!("crates/{member}/src/lib.rs")),
+            "pub fn f() {}\n",
+        )
+        .expect("lib");
+    }
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/[ab]\"]\nexclude = [\"crates/[b]\"]\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("class-glob-fixture"))
+        .expect("scan must not fail on class globs")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    let pkg_a = declarations
+        .iter()
+        .find(|d| d["declaring_package"] == "pkg-a")
+        .expect("pkg-a row");
+    assert_eq!(
+        pkg_a["resolution"], "locked",
+        "a member admitted by a class glob resolves from the root lockfile"
+    );
+    assert_eq!(pkg_a["resolved_version"], "1.0.228");
+    let pkg_b = declarations
+        .iter()
+        .find(|d| d["declaring_package"] == "pkg-b")
+        .expect("pkg-b row");
+    assert_eq!(
+        pkg_b["resolution"], "no_lockfile",
+        "an exclude entry written as a class glob is honored"
+    );
+}

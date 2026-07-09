@@ -959,9 +959,59 @@ fn string_array(item: Option<&toml_edit::Item>) -> Vec<String> {
 
 /// Minimal deterministic glob match for Cargo workspace `members` / `exclude`
 /// entries over a `/`-separated relative directory path: `*` matches any
-/// sequence within one path segment, `?` one non-separator character, and a
-/// `**` segment spans zero or more whole segments. No external glob crate.
+/// sequence within one path segment, `?` one non-separator character, a
+/// `**` segment spans zero or more whole segments, and `[…]` character
+/// classes match one character — singles, `a-z` ranges, `[!…]` negation, and
+/// a literal `]` as the first member, per the `glob` crate Cargo uses
+/// (PR #314 review). An unclosed or empty class (where the `glob` crate
+/// errors and Cargo would reject the manifest) degrades to a literal `[` —
+/// it never silently matches everything or nothing. No external glob crate.
 fn member_glob_match(pattern: &str, path: &str) -> bool {
+    /// One parsed `[…]` character class.
+    struct CharClass {
+        negated: bool,
+        singles: Vec<char>,
+        ranges: Vec<(char, char)>,
+    }
+    impl CharClass {
+        /// Parses the class body following `[`, returning the class and the
+        /// rest of the pattern after `]`; `None` when the class never closes
+        /// (including the empty `[]`, whose first `]` is a literal member).
+        fn parse(rest: &[char]) -> Option<(Self, &[char])> {
+            let mut i = usize::from(rest.first() == Some(&'!'));
+            let negated = i == 1;
+            let mut singles = Vec::new();
+            let mut ranges = Vec::new();
+            let mut first = true;
+            loop {
+                let ch = *rest.get(i)?;
+                if ch == ']' && !first {
+                    let class = Self {
+                        negated,
+                        singles,
+                        ranges,
+                    };
+                    return Some((class, &rest[i + 1..]));
+                }
+                first = false;
+                // `a-z` is a range unless the `-` sits at a class edge
+                // (then both characters are literal members).
+                if rest.get(i + 1) == Some(&'-') && rest.get(i + 2).is_some_and(|c| *c != ']') {
+                    ranges.push((ch, *rest.get(i + 2)?));
+                    i += 3;
+                } else {
+                    singles.push(ch);
+                    i += 1;
+                }
+            }
+        }
+
+        fn matches(&self, ch: char) -> bool {
+            let inside = self.singles.contains(&ch)
+                || self.ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(&ch));
+            inside != self.negated
+        }
+    }
     fn segments_match(pattern: &[&str], path: &[&str]) -> bool {
         match pattern.split_first() {
             None => path.is_empty(),
@@ -982,6 +1032,15 @@ fn member_glob_match(pattern: &str, path: &str) -> bool {
                 Some(('?', rest)) => s
                     .split_first()
                     .is_some_and(|(_, s_rest)| inner(rest, s_rest)),
+                Some(('[', rest)) => match CharClass::parse(rest) {
+                    Some((class, after)) => s
+                        .split_first()
+                        .is_some_and(|(sc, s_rest)| class.matches(*sc) && inner(after, s_rest)),
+                    // Unclosed class: the `[` is a literal (documented).
+                    None => s
+                        .split_first()
+                        .is_some_and(|(sc, s_rest)| *sc == '[' && inner(rest, s_rest)),
+                },
                 Some((ch, rest)) => s
                     .split_first()
                     .is_some_and(|(sc, s_rest)| sc == ch && inner(rest, s_rest)),
@@ -1290,6 +1349,44 @@ version = "2.0.0"
         // Trailing-slash normalization happens in `string_array`; the matcher
         // itself ignores empty segments.
         assert!(member_glob_match("crates//member", "crates/member"));
+    }
+
+    #[test]
+    fn member_globs_support_character_classes() {
+        // Plain classes (PR #314 review): `[ab]` matches exactly one of the
+        // listed characters, per the `glob` crate Cargo uses.
+        assert!(member_glob_match("crates/[ab]", "crates/a"));
+        assert!(member_glob_match("crates/[ab]", "crates/b"));
+        assert!(!member_glob_match("crates/[ab]", "crates/c"));
+        assert!(!member_glob_match("crates/[ab]", "crates/ab"));
+        // Ranges.
+        assert!(member_glob_match("crates/pkg-[a-c]", "crates/pkg-b"));
+        assert!(!member_glob_match("crates/pkg-[a-c]", "crates/pkg-d"));
+        // `-` at a class edge is a literal member, not a range.
+        assert!(member_glob_match("crates/[-a]", "crates/-"));
+        assert!(member_glob_match("crates/[a-]", "crates/-"));
+        // Negation uses the glob crate's `[!…]` form.
+        assert!(member_glob_match("crates/[!ab]", "crates/c"));
+        assert!(!member_glob_match("crates/[!ab]", "crates/a"));
+        assert!(member_glob_match("crates/pkg-[!x-z]", "crates/pkg-a"));
+        // A `]` as the first class member is a literal.
+        assert!(member_glob_match("crates/[]x]", "crates/]"));
+        assert!(member_glob_match("crates/[]x]", "crates/x"));
+        assert!(!member_glob_match("crates/[]x]", "crates/y"));
+        // Classes compose with the other metacharacters.
+        assert!(member_glob_match("crates/[ab]*", "crates/alpha"));
+        assert!(member_glob_match("**/[ab]", "x/y/a"));
+    }
+
+    #[test]
+    fn unclosed_character_class_is_a_literal_bracket() {
+        // An unclosed (or empty — `[]` never closes a class) bracket falls
+        // back to a literal `[` character; it never silently matches
+        // everything or nothing (PR #314 review, documented behavior).
+        assert!(member_glob_match("crates/[ab", "crates/[ab"));
+        assert!(!member_glob_match("crates/[ab", "crates/a"));
+        assert!(member_glob_match("crates/[]", "crates/[]"));
+        assert!(!member_glob_match("crates/[]", "crates/a"));
     }
 
     #[test]

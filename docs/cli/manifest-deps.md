@@ -86,7 +86,10 @@ declared entry (manifest key):
   ancestor's — whether or not a lockfile sits beside it: a lockfile-less
   workspace root means `no_lockfile`, never an outer lockfile even when an
   outer workspace's globs would match. Membership at an ancestor root means
-  the `members` globs include the crate (and `exclude` does not) **or** the
+  the `members` globs include the crate (and `exclude` does not; glob syntax
+  covers `*`, `?`, spanning `**`, and `[…]` character classes with ranges and
+  `[!…]` negation, per the `glob` crate Cargo uses — an unclosed class, which
+  Cargo would reject, degrades to a literal `[`) **or** the
   workspace reaches it through in-tree `path = "…"` dependencies
   (transitively — Cargo's automatic members; the closure grows from the root
   package and from every glob member, so a virtual root's members contribute
