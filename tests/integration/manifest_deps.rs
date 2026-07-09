@@ -3794,3 +3794,131 @@ fn cross_field_source_conflicts_are_uninterpretable() {
     assert_eq!(miss["count"], 0);
     assert_eq!(skipped_diagnostics(&miss).len(), 1);
 }
+
+/// PR #314 review: the membership closure must not trust `path` entries in
+/// Cargo-invalid dependency tables — `dep = { path = "dep", git = "..." }`
+/// is a manifest Cargo rejects, so `dep` never seeds the closure and never
+/// resolves through the root lockfile; a valid path entry still seeds.
+#[test]
+fn invalid_path_entries_do_not_seed_the_closure() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    for dir in ["src", "dep/src", "helper/src"] {
+        fs::create_dir_all(repo.join(dir)).expect("dirs");
+    }
+    fs::write(
+        repo.join("Cargo.toml"),
+        concat!(
+            "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\n\n",
+            "[workspace]\nmembers = []\n\n",
+            "[dependencies]\n",
+            "dep = { path = \"dep\", git = \"https://example.com/d.git\" }\n",
+            "helper = { path = \"helper\" }\n",
+        ),
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+    for member in ["dep", "helper"] {
+        fs::write(
+            repo.join(member).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n"
+            ),
+        )
+        .expect("member manifest");
+        fs::write(repo.join(member).join("src/lib.rs"), "pub fn f() {}\n").expect("lib");
+    }
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("invalid-seed-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let rows = parsed["declarations"].as_array().expect("declarations");
+    let by_pkg = |pkg: &str| {
+        rows.iter()
+            .find(|d| d["declaring_package"] == pkg)
+            .unwrap_or_else(|| panic!("row for {pkg}"))
+    };
+    assert_eq!(
+        by_pkg("dep")["resolution"],
+        "no_lockfile",
+        "a Cargo-invalid path entry must not seed the membership closure"
+    );
+    assert_eq!(
+        by_pkg("helper")["resolution"],
+        "locked",
+        "a valid path entry still seeds the closure"
+    );
+    assert_eq!(by_pkg("helper")["resolved_version"], "1.0.228");
+}
+
+/// PR #314 review: an empty or whitespace-only dependency NAME — a quoted
+/// empty table key (`"" = "1"`) or a blank `package` value — is a manifest
+/// Cargo rejects: no row (even when a lockfile could resolve something),
+/// with the `uninterpretable_cargo_dependency` qualification; the trimming
+/// boundary matches the finding-35 package-name check.
+#[test]
+fn empty_dependency_names_are_uninterpretable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        concat!(
+            "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\n\n",
+            "[dependencies]\n",
+            "\"\" = \"1\"\n",
+            "blank = { package = \"  \", version = \"1\" }\n",
+            "tokio = \"1\"\n",
+        ),
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"tokio\"\nversion = \"1.47.1\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("empty-dep-name-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let full = run_query_deps(&graph, &[]);
+    let rows = full["declarations"].as_array().expect("declarations");
+    assert!(
+        rows.iter()
+            .all(|d| d["name"].as_str().is_some_and(|n| !n.trim().is_empty())),
+        "no row may carry an empty or whitespace-only name"
+    );
+    assert!(
+        rows.iter().all(|d| d["declared_as"] != "blank"),
+        "a blank package value must not fabricate a renamed row"
+    );
+    let tokio = rows
+        .iter()
+        .find(|d| d["name"] == "tokio")
+        .expect("valid sibling entry still extracts");
+    assert_eq!(tokio["resolution"], "locked");
+    assert_eq!(
+        skipped_diagnostics(&full).len(),
+        1,
+        "the skipped blank-named entries must qualify the answer"
+    );
+
+    let miss = run_query_deps(&graph, &["--name", "left-pad"]);
+    assert_eq!(miss["count"], 0);
+    assert_eq!(skipped_diagnostics(&miss).len(), 1);
+}

@@ -442,6 +442,13 @@ fn declared_dependency(
     {
         return None;
     }
+    // An empty or whitespace-only dependency NAME — a quoted empty table
+    // key (`"" = "1"`) or a blank `package` value — is a manifest Cargo
+    // rejects: a blank-named row would be a fabricated fact. The trimming
+    // boundary matches the package-name check (PR #314 review).
+    if name.trim().is_empty() {
+        return None;
+    }
     Some(DeclaredDependency {
         name,
         declared_as,
@@ -1607,13 +1614,25 @@ struct ManifestPathDeps {
 /// Cargo treats target-specific and workspace-inherited path dependencies as
 /// automatic workspace members too (PR #314 review). This feeds membership
 /// only; target-specific dependency ROWS stay out of extraction scope as
-/// documented.
+/// documented. A Cargo-invalid entry (ill-typed known keys or a cross-field
+/// source conflict like `{ path = "…", git = "…" }`) never seeds membership:
+/// Cargo rejects the manifest, so trusting its `path` would fabricate a
+/// member (PR #314 review). Whether an invalid ROOT manifest should
+/// invalidate the entire workspace it declares is a broader open question —
+/// this slice only refuses to seed from the invalid entries themselves.
 fn manifest_path_dependency_dirs(doc: &toml_edit::DocumentMut) -> ManifestPathDeps {
-    fn collect_paths(table: &dyn toml_edit::TableLike, deps: &mut ManifestPathDeps) {
+    fn collect_paths(
+        table: &dyn toml_edit::TableLike,
+        kind: DependencyKind,
+        deps: &mut ManifestPathDeps,
+    ) {
         for (key, item) in table.iter() {
             let Some(spec) = item.as_table_like() else {
                 continue;
             };
+            if !dependency_table_is_well_typed(spec, !matches!(kind, DependencyKind::Dev)) {
+                continue;
+            }
             if let Some(path) = spec.get("path").and_then(|value| value.as_str()) {
                 deps.literal.push(path.to_owned());
             } else if spec
@@ -1631,7 +1650,7 @@ fn manifest_path_dependency_dirs(doc: &toml_edit::DocumentMut) -> ManifestPathDe
             .get(kind.table())
             .and_then(toml_edit::Item::as_table_like)
         {
-            collect_paths(table, &mut deps);
+            collect_paths(table, kind, &mut deps);
         }
     }
     if let Some(targets) = doc.get("target").and_then(toml_edit::Item::as_table_like) {
@@ -1644,7 +1663,7 @@ fn manifest_path_dependency_dirs(doc: &toml_edit::DocumentMut) -> ManifestPathDe
                     .get(kind.table())
                     .and_then(toml_edit::Item::as_table_like)
                 {
-                    collect_paths(table, &mut deps);
+                    collect_paths(table, kind, &mut deps);
                 }
             }
         }
@@ -1656,7 +1675,10 @@ fn manifest_path_dependency_dirs(doc: &toml_edit::DocumentMut) -> ManifestPathDe
 /// (relative to the workspace root). Entries without a `path` never feed
 /// membership, and a path entry no member (nor the root package) ever
 /// inherits is only a template — never enqueued from here; inheritance
-/// drives membership (PR #314 review, Cargo semantics).
+/// drives membership (PR #314 review, Cargo semantics). A Cargo-invalid
+/// template (ill-typed known keys, a cross-field source conflict, or the
+/// member-only keys `optional`/`workspace`) never feeds membership either
+/// (PR #314 review).
 fn workspace_dependency_paths(root_doc: &toml_edit::DocumentMut) -> BTreeMap<String, String> {
     root_doc
         .get("workspace")
@@ -1667,8 +1689,13 @@ fn workspace_dependency_paths(root_doc: &toml_edit::DocumentMut) -> BTreeMap<Str
             table
                 .iter()
                 .filter_map(|(key, item)| {
-                    item.as_table_like()
-                        .and_then(|spec| spec.get("path"))
+                    let spec = item.as_table_like()?;
+                    if !dependency_table_is_well_typed(spec, false)
+                        || spec.get("workspace").is_some()
+                    {
+                        return None;
+                    }
+                    spec.get("path")
                         .and_then(|value| value.as_str())
                         .map(|path| (key.to_owned(), path.to_owned()))
                 })

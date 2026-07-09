@@ -74,7 +74,10 @@ accepted, since Cargo only checks registry *configuration* later. A
 version requirement string
 Cargo cannot parse (`serde = "not a req"`, plain-string or table
 `version`) is the same class: rejected at declaration time, never
-resolved against a lockfile. The same class covers a
+resolved against a lockfile — as is an empty or whitespace-only
+dependency NAME (a quoted empty table key `"" = "1"`, or a blank
+`package` value; the trimming boundary matches the package-name
+check). The same class covers a
 `{ workspace = true }` entry whose
 `[workspace.dependencies]` root spec exists but is itself invalid: no
 usable string `version`/`path`/`git`, an unparseable template `version`,
@@ -165,6 +168,12 @@ declared entry (manifest key):
   package and from every glob member, so a virtual root's members contribute
   their path dependencies too, while an excluded directory is pruned at
   traversal time — neither it nor packages reachable only through it join).
+  A Cargo-invalid dependency entry (ill-typed known keys, or a cross-field
+  source conflict like `{ path = "…", git = "…" }`) never seeds
+  membership — its `path` is not trusted, in member tables or workspace
+  templates alike. Whether an invalid ROOT manifest should invalidate the
+  entire workspace it declares is an open question beyond this slice; only
+  the invalid entries themselves are refused.
   Explicit `members` patterns resolve against the root's own directory, so a
   `../`-relative member outside the root's tree — literal
   (`members = ["../pkgs/app"]`) or glob (`../pkgs/*`, enumerated under the
