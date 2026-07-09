@@ -96,9 +96,12 @@ agent-authored claim is never counted as evidence for itself (AC6).
 
 ### Covered workflows
 
-`symbol`, `file`, `drift`, and `semantic` (code-oriented) plus the cross-domain
-lanes `context`, `subsystem`, `task`, `memory`, `failures`, `change-impact`,
-`policy`, `candidates`, `changes`, and `evidence-freshness`. A workflow with
+`symbol`, `file`, `drift`, `semantic`, and `manifest-deps` (code-oriented) plus
+the cross-domain lanes `context`, `subsystem`, `task`, `memory`, `failures`,
+`change-impact`, `policy`, `candidates`, `changes`, and `evidence-freshness`.
+The `manifest-deps` lane gates every returned `DependencyDeclaration` row on
+its stable record ID plus the repo-relative `Cargo.toml` handle (a spanless
+path-cited source fact). A workflow with
 nothing to return in the fixture reports zero rows rather than disappearing; one
 that needs inputs the fixture lacks (e.g. `semantic` without an embedded vector
 index, or `changes` without a commit range) is reported `enabled: false` with a

@@ -7432,6 +7432,11 @@ const fn is_codegraph_kind(kind: NodeKind) -> bool {
             | NodeKind::Commit
             | NodeKind::Change
             | NodeKind::Repository
+            // Manifest-declared dependency facts are deterministic code-graph
+            // source facts (issue #180 / PR #314 review): memory-audit evidence
+            // links classify them as code handles, and failure queries may
+            // anchor on their canonical record IDs.
+            | NodeKind::DependencyDeclaration
     )
 }
 

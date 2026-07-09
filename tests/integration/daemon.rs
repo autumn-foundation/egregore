@@ -4220,7 +4220,8 @@ fn first_record_id(graph_path: &Path) -> String {
 #[test]
 fn all_node_kinds_have_documented_schema() {
     let _ = |k: NodeKind| match k {
-        // Documented in docs/prd/0001-codebase-knowledge-graph.md
+        // Documented in docs/prd/0001-codebase-knowledge-graph.md;
+        // DependencyDeclaration documented in docs/cli/manifest-deps.md (issue #180)
         NodeKind::Repository
         | NodeKind::File
         | NodeKind::Module
@@ -4237,7 +4238,10 @@ fn all_node_kinds_have_documented_schema() {
         | NodeKind::DebtMarker
         // Unsafe-surface sites (issue #222), documented in
         // docs/cli/unsafe-sites.md.
-        | NodeKind::UnsafeSite => "code-graph-documented",
+        | NodeKind::UnsafeSite
+        // Declared Cargo dependencies (issue #180), documented in
+        // docs/cli/manifest-deps.md.
+        | NodeKind::DependencyDeclaration => "code-graph-documented",
         // Documented in docs/schema/semantic-drift.md
         NodeKind::SemanticDrift | NodeKind::EmbeddingModel | NodeKind::EmbeddingVector => {
             "semantic-domain-documented"
