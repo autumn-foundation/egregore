@@ -18704,6 +18704,213 @@ pub fn unreferenced_symbols<'a>(
     result
 }
 
+// ── file:line → enclosing symbol resolution (issue #151) ─────────────────────
+
+/// Resolution of one `file:line` location against stored symbol spans.
+///
+/// `chain` holds every `Module` and `Symbol` node whose span contains the
+/// line, ordered outermost → innermost; `primary` is the innermost (smallest
+/// enclosing) `Symbol` node, when one exists. `file_record` is the `File`
+/// node for the path in the selected view, when present. `repo_groups`
+/// carries one entry per repository owner group among the path's records so
+/// callers can fail closed on an unscoped cross-repository collision
+/// (issue #67); unattributed records group under `None`.
+#[derive(Debug, Default)]
+pub struct LocationContext<'a> {
+    /// `File` node for the queried path in the selected view.
+    pub file_record: Option<&'a GraphRecord>,
+    /// Containing `Module`/`Symbol` nodes, outermost → innermost.
+    pub chain: Vec<&'a GraphRecord>,
+    /// Smallest enclosing `Symbol` node (the innermost), when one exists.
+    pub primary: Option<&'a GraphRecord>,
+    /// Repository owner groups among the path's matched records.
+    pub repo_groups: BTreeSet<Option<&'a str>>,
+}
+
+/// Recency ordering for two versions of one stable record ID in the
+/// current-state view. A non-temporal (current-scan) record outranks every
+/// history-backed snapshot; history-backed snapshots order by parsed valid
+/// time (unparseable valid times sort oldest), with the commit SHA as a
+/// deterministic tiebreak for equal-time commits (e.g. rebases).
+fn version_recency_key(record: &GraphRecord) -> (u8, Option<DateTime<chrono::FixedOffset>>, &str) {
+    let GraphRecord::Node { temporal, .. } = record else {
+        return (0, None, "");
+    };
+    temporal.as_ref().map_or((1, None, ""), |t| {
+        (
+            0,
+            DateTime::parse_from_rfc3339(&t.valid_time).ok(),
+            t.git_commit.as_str(),
+        )
+    })
+}
+
+/// Resolves the smallest enclosing `Symbol` for a `path:line` location.
+///
+/// View selection mirrors the other single-answer query verbs:
+///
+/// - Without `at_commit`, the current-state view applies: tombstoned records
+///   are excluded and history graphs resolve each stable ID to its newest
+///   version (keep-last dedupe, as `public_api_surface` does).
+/// - With `at_commit` (a fully resolved SHA), only records whose
+///   `temporal.git_commit` equals that commit participate, so spans resolve
+///   as they existed at that commit.
+///
+/// Containment is by recorded line span (`start_line <= line <= end_line`).
+/// The primary answer is the `Symbol` with the narrowest containing span
+/// (line width, then byte width, then record ID — all ascending), never a
+/// nearest-neighbor guess: a line outside every symbol span yields
+/// `primary: None` even when a `Module` or the file contains it.
+#[must_use]
+pub fn location_context<'a>(
+    records: &'a [GraphRecord],
+    path: &str,
+    line: usize,
+    at_commit: Option<&str>,
+    index: &'a RepositoryIndex,
+    repo_scope: Option<&str>,
+) -> LocationContext<'a> {
+    let tombstoned: BTreeSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            GraphRecord::Tombstone { deleted_id, .. } => Some(deleted_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let is_owned =
+        |id: &str| -> bool { repo_scope.is_none_or(|scope| index.owner_of(id) == Some(scope)) };
+
+    // HEAD-commit SHA per repository from the stamped source snapshot
+    // (issue #82), later record winning deterministically. Anchors the
+    // default view of a history graph to the HEAD snapshot — matching
+    // `resolve_head_symbols` — because `scan-history` emits no tombstones
+    // for a path deleted or renamed at HEAD: keep-last-per-ID alone would
+    // resurrect the last pre-deletion version as if it were current.
+    let mut repo_heads: BTreeMap<&str, &str> = BTreeMap::new();
+    for record in records {
+        if let GraphRecord::Node {
+            kind: NodeKind::Repository,
+            id,
+            source_snapshot: Some(snapshot),
+            ..
+        } = record
+            && let SnapshotHead::Commit { sha } = &snapshot.head
+        {
+            repo_heads.insert(id.as_str(), sha.as_str());
+        }
+    }
+
+    // Select the view: the current state (HEAD snapshot for history-backed
+    // records with a stamped head, newest-version-per-ID otherwise, always
+    // tombstone-excluded), or the exact per-commit snapshot when a temporal
+    // pin is supplied.
+    let mut nodes: BTreeMap<&str, &'a GraphRecord> = BTreeMap::new();
+    for record in records {
+        let GraphRecord::Node {
+            id,
+            kind,
+            repo_relative_path,
+            temporal,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if !matches!(kind, NodeKind::File | NodeKind::Module | NodeKind::Symbol) {
+            continue;
+        }
+        if repo_relative_path.as_deref() != Some(path) || !is_owned(id) {
+            continue;
+        }
+        if let Some(commit) = at_commit {
+            if temporal.as_ref().map(|t| t.git_commit.as_str()) != Some(commit) {
+                continue;
+            }
+        } else {
+            if tombstoned.contains(id.as_str()) {
+                continue;
+            }
+            // A history-backed record represents the current state only
+            // at the stamped HEAD commit. Records without a resolvable
+            // owner or without a stamped head (legacy stores) keep the
+            // newest-version-per-ID view.
+            if let Some(t) = temporal
+                && let Some(head) = index.owner_of(id).and_then(|repo| repo_heads.get(repo))
+                && t.git_commit != *head
+            {
+                continue;
+            }
+        }
+        // Newest-version-per-ID must not depend on record emission order:
+        // the embedded store emits temporal snapshots in commit-SHA lexical
+        // order (`read_all_records`), not commit time, so a newer commit
+        // whose SHA sorts first would lose a plain last-write-wins insert.
+        // Replace only when the incoming record is at least as recent.
+        let replace = nodes
+            .get(id.as_str())
+            .is_none_or(|existing| version_recency_key(record) >= version_recency_key(existing));
+        if replace {
+            nodes.insert(id.as_str(), record);
+        }
+    }
+
+    let mut ctx = LocationContext {
+        repo_groups: nodes.keys().map(|id| index.owner_of(id)).collect(),
+        ..LocationContext::default()
+    };
+
+    for record in nodes.values() {
+        let GraphRecord::Node { kind, span, .. } = record else {
+            continue;
+        };
+        if matches!(kind, NodeKind::File) {
+            ctx.file_record = Some(record);
+            continue;
+        }
+        let Some(span) = span else { continue };
+        if span.start_line <= line && line <= span.end_line {
+            ctx.chain.push(record);
+        }
+    }
+
+    // Outermost → innermost: wider spans first; ties resolve by earlier
+    // start, then record ID, so the order is total and deterministic.
+    let sort_key = |record: &GraphRecord| {
+        let GraphRecord::Node {
+            id,
+            span: Some(span),
+            ..
+        } = record
+        else {
+            unreachable!("chain entries carry spans by construction");
+        };
+        (
+            usize::MAX - (span.end_line - span.start_line),
+            usize::MAX - (span.end_byte - span.start_byte),
+            span.start_byte,
+            id.clone(),
+        )
+    };
+    ctx.chain.sort_by_key(|record| sort_key(record));
+
+    ctx.primary = ctx
+        .chain
+        .iter()
+        .rev()
+        .find(|record| {
+            matches!(
+                record,
+                GraphRecord::Node {
+                    kind: NodeKind::Symbol,
+                    ..
+                }
+            )
+        })
+        .copied();
+
+    ctx
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // File churn ranking (issue #128)
 // ─────────────────────────────────────────────────────────────────────────────

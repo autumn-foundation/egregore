@@ -31,6 +31,7 @@ eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
 eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--include-private] [--format json|text]
 eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--threshold <PERCENT>] [--limit N] [--format json|text]
 eg query unreferenced     --graph <PATH>   [--repo <SELECTOR>]
+eg query at       <PATH>:<LINE> --graph <PATH> [--at <COMMIT>] [--repo <SELECTOR>]
 eg query churn            --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--format json|text]
 eg query churn            --data-dir <DIR>  [--repo <SELECTOR>] [--limit N] [--format json|text]
 ```
@@ -89,6 +90,10 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query churn` — rank Git-tracked files by **change frequency** across the
   commit history captured by `eg scan-history`, for hotspot triage
   ([churn.md](churn.md), issue #128).
+
+- `eg query at` — resolve a **`file:line` location to its smallest enclosing
+  code symbol**, with the enclosing chain reported outermost → innermost
+  ([below](#eg-query-at), issue #151).
 
 Most subcommands accept exactly one input source:
 
@@ -714,3 +719,129 @@ eg query semantic "write nodes to database storage" --data-dir .egregore-semanti
 ```
 
 The `record_id` is stable across re-scans of the same commit and can be cited in agent-memory records. The `repo_relative_path` and `span` together give a file and line-range handle that agents can pass directly to editor tools or other `eg` commands.
+
+---
+
+## eg query at
+
+Resolve a `file:line` location — a compiler diagnostic (`src/daemon.rs:412`),
+a panic backtrace frame, a PR diff hunk, or `git blame -L` output — to the
+**smallest enclosing `Symbol` node** whose recorded span contains that line
+(issue #151). Purely a span-containment lookup over already-stored
+`SourceSpan` data: no daemon, no embeddings, no `--embed` store required.
+Strictly read-only: a `--data-dir` embedded store is read through a throwaway
+temporary copy (opening the live engine re-persists its index files), so the
+original store stays byte-for-byte untouched.
+
+```text
+eg query at <PATH>:<LINE> --graph <PATH>   [--at <COMMIT>] [--repo <SELECTOR>]
+eg query at <PATH>:<LINE> --data-dir <DIR> [--at <COMMIT>] [--repo <SELECTOR>]
+```
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `<PATH>:<LINE>` | yes | Repo-relative path and 1-based line, e.g. `src/lib.rs:42`. The line is taken after the **last** `:`. |
+| `--graph <PATH>` | one of | Graph JSONL produced by `eg scan` or `eg scan-history`. |
+| `--data-dir <DIR>` | one of | Embedded `AletheiaDB` store. Structural records only — the store does **not** need `--embed`. |
+| `--at <COMMIT>` | no | Temporal pin: resolve the location against symbol spans **as they existed at this commit** (full SHA or unique prefix). Requires a history-bearing store. |
+| `--repo <SELECTOR>` | no | Restrict resolution to one repository (see [Repository scope](#repository-scope---repo-issue-67)). |
+| `--format` | no | Accepted for CLI-surface consistency; the envelope is JSON. |
+
+### Resolution semantics
+
+- **Innermost wins.** When nested symbols contain the line (a method inside an
+  `impl` inside a module), the primary `symbol` is the one with the narrowest
+  containing span (line width, then byte width, then record ID — all
+  ascending). The full enclosing chain of containing `Module` and `Symbol`
+  nodes is also reported, ordered **outermost → innermost**; the last chain
+  entry is always the primary symbol.
+- **Absence is the answer.** A line outside every symbol span (blank line,
+  file-level `use`/attribute, inter-item whitespace — even inside a module)
+  yields the typed `no_enclosing_symbol` error, never a nearest-neighbor
+  guess.
+- **Current state by default.** Without `--at`, tombstoned records are
+  excluded, and a history graph is anchored to its stamped HEAD snapshot
+  (issue #82): a path deleted or renamed at HEAD is a `no_match`, never a
+  stale pre-deletion symbol. Legacy stores without a stamped snapshot fall
+  back to each stable ID's newest recorded version (by valid time,
+  independent of record emission order). With `--at`, only records observed
+  at that commit participate, so the same line can resolve to different
+  symbols (or to none) at different commits.
+- **Repository boundary stays explicit.** An unscoped location whose path
+  exists in more than one repository fails closed with the
+  `ambiguous_repository` stderr diagnostic (exit `1`); re-run with `--repo`.
+
+### JSON output fields
+
+A single deterministic JSON envelope on stdout, byte-identical across runs
+for identical inputs and store state:
+
+| Field | Type | Always present | Description |
+|-------|------|----------------|-------------|
+| `ok` | boolean | yes | `true` on success. |
+| `path` | string | yes | Queried repo-relative path, echoed back. |
+| `line` | number | yes | Queried 1-based line, echoed back. |
+| `symbol` | object | yes | The smallest enclosing `Symbol` node. |
+| `enclosing_chain` | array | yes | Containing `Module`/`Symbol` nodes, outermost → innermost. The innermost entry is the primary `symbol`. |
+| `repository_id` | string | when attributable | Stable `Repository` record ID owning the answer. |
+| `repository` | string | when attributable | Human-usable repository identity handle. |
+
+`symbol` and each `enclosing_chain` entry carry: `record_id`,
+`kind` (`"Symbol"` or `"Module"` for chain entries), `schema_version`, `name`,
+`symbol_kind` (e.g. `function` / `method` / `struct` / `impl`; absent on
+modules), `repo_relative_path`, `span` (`start_byte`, `end_byte`,
+`start_line`, `end_line`), and — when recorded — `language`, `visibility`,
+`signature`, `git_commit` (history-backed records), and `valid_time`.
+
+### Exit codes and error envelopes
+
+Errors are one-line `{"ok":false,"error":{...}}` envelopes on stdout:
+
+| Code | Error `code` | Meaning |
+|------|--------------|---------|
+| `0` | — | An enclosing symbol was found and printed. |
+| `1` | `malformed_location` | Input is not `<path>:<line>` with a positive 1-based line. |
+| `1` | `ambiguous_commit_prefix` | `--at` prefix matches more than one commit; `candidates` lists them. |
+| `1` | `ambiguous_repository` / `unknown_repository_selector` / `ambiguous_repository_selector` | Repository selection failed (stderr diagnostic, as elsewhere). |
+| `2` | `no_match` | No record carries the path in the selected view (unknown file, or file absent at `--at <COMMIT>`). |
+| `2` | `missing_commit` | `--at` commit is absent from the store's history. |
+| `2` | `no_enclosing_symbol` | The path is known but no symbol span contains the line. Carries `file_record_id` when the `File` node resolved. |
+
+### Example
+
+```sh
+eg scan . --out g.jsonl
+eg query at src/lib.rs:412 --graph g.jsonl
+```
+
+```json
+{
+  "ok": true,
+  "path": "src/lib.rs",
+  "line": 412,
+  "symbol": {
+    "record_id": "codegraph:v4:abc...",
+    "kind": "Symbol",
+    "schema_version": 4,
+    "name": "outer::Gadget::method_one",
+    "symbol_kind": "method",
+    "repo_relative_path": "src/lib.rs",
+    "span": {"start_byte": 4096, "end_byte": 5200, "start_line": 409, "end_line": 431},
+    "language": "rust",
+    "visibility": "public",
+    "signature": "pub fn method_one(&self) -> usize"
+  },
+  "enclosing_chain": [
+    {"record_id": "codegraph:v4:m01...", "kind": "Module", "schema_version": 4, "name": "outer", "repo_relative_path": "src/lib.rs", "span": {"start_byte": 100, "end_byte": 6000, "start_line": 3, "end_line": 480}, "language": "rust"},
+    {"record_id": "codegraph:v4:i01...", "kind": "Symbol", "schema_version": 4, "name": "outer::impl Gadget", "symbol_kind": "impl", "repo_relative_path": "src/lib.rs", "span": {"start_byte": 3900, "end_byte": 5300, "start_line": 405, "end_line": 433}, "language": "rust"},
+    {"record_id": "codegraph:v4:abc...", "kind": "Symbol", "schema_version": 4, "name": "outer::Gadget::method_one", "symbol_kind": "method", "repo_relative_path": "src/lib.rs", "span": {"start_byte": 4096, "end_byte": 5200, "start_line": 409, "end_line": 431}, "language": "rust"}
+  ]
+}
+```
+
+The returned `record_id` is a stable handle: feed it directly to
+`eg query change-impact`, `eg query failures`, or `eg query context` to pivot
+from a raw location into callers, prior failures, and evidence without ever
+scanning the file's full symbol list.

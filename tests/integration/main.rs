@@ -53,6 +53,7 @@ mod protected_artifacts;
 mod public_api_deltas;
 mod python_scan;
 mod query;
+mod query_at;
 mod query_churn;
 mod query_cli;
 mod query_debt_markers;
