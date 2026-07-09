@@ -53,11 +53,15 @@ virtual manifest wrongly declaring top-level dependencies — stamped
 attributed to a declaring package), `{ workspace = true }` entries with no
 resolvable workspace root (stamped `symbol_kind:
 uninheritable_cargo_dependency`; the manifest's other declarations still
-extract), or dependency entries that are neither a version string nor a
-dependency table (`serde = true` — a manifest Cargo rejects; stamped
-`symbol_kind: uninterpretable_cargo_dependency`, the invalid entry is
-skipped — never a key-named row with no requirement — while valid sibling
-entries still extract), every response — hit, miss, and empty
+extract), or dependency entries Cargo rejects — neither a version string
+nor a dependency table (`serde = true`), or a table without a usable
+source (a string `version`/`path`/`git` or `workspace = true`; empty
+tables and wrong-typed fields like `version = 1` or `workspace = "yes"`
+count too — `registry`/`rev`/`branch`/`tag` only refine a source and never
+stand alone) — stamped `symbol_kind: uninterpretable_cargo_dependency`,
+the invalid entry skipped — never a key-named row with no requirement —
+while valid sibling entries, including git-only declarations, still
+extract — every response — hit, miss, and empty
 surface — carries one
 `skipped_manifest` diagnostic per skipped manifest, citing the repo-relative
 manifest handle (`detail`) and the `Diagnostic` record ID (`record_id`) in
@@ -114,7 +118,11 @@ declared entry (manifest key):
   the `members` globs include the crate (and `exclude` does not; glob syntax
   covers `*`, `?`, spanning `**`, and `[…]` character classes with ranges and
   `[!…]` negation, per the `glob` crate Cargo uses — an unclosed class, which
-  Cargo would reject, degrades to a literal `[`) **or** the
+  Cargo would reject, degrades to a literal `[`; an absolute in-repo
+  `members`/`exclude` pattern is normalized like absolute path deps — repo
+  root lexically absolutized and stripped, then re-expressed
+  workspace-root-relative — so it matches, excludes, and seeds the closure,
+  while an out-of-repo absolute pattern is a documented skip) **or** the
   workspace reaches it through in-tree `path = "…"` dependencies
   (transitively — Cargo's automatic members; the closure grows from the root
   package and from every glob member, so a virtual root's members contribute

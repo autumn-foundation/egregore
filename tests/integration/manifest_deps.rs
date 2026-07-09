@@ -3014,3 +3014,153 @@ fn uninterpretable_dependency_entries_are_skipped_with_a_diagnostic() {
     assert_eq!(miss["count"], 0);
     assert_eq!(skipped_diagnostics(&miss).len(), 1);
 }
+
+/// PR #314 review: a dependency table entry must carry a usable source —
+/// `version`/`path`/`git` string or `workspace = true` — to be a
+/// declaration Cargo accepts. An empty table (`serde = {}`) or wrong-typed
+/// fields (`version = 1`, `workspace = "yes"`) are rejected manifests: the
+/// entry is skipped with the `uninterpretable_cargo_dependency` diagnostic
+/// (never a requirement-less row that could even resolve `locked` from a
+/// sole lockfile entry), while valid siblings — including git-only
+/// declarations — still extract.
+#[test]
+fn invalid_dependency_tables_are_skipped_with_a_diagnostic() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        concat!(
+            "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\n\n",
+            "[dependencies]\n",
+            "serde = {}\n",
+            "itoa = { version = 1 }\n",
+            "ryu = { workspace = \"yes\" }\n",
+            "gitdep = { git = \"https://example.com/gitdep.git\" }\n",
+            "tokio = \"1\"\n",
+        ),
+    )
+    .expect("root manifest");
+    // serde sits in the lockfile: an empty-table entry must still never
+    // become a row, let alone a `locked` one.
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\n[[package]]\nname = \"tokio\"\nversion = \"1.47.1\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("invalid-table-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let full = run_query_deps(&graph, &[]);
+    let rows = full["declarations"].as_array().expect("declarations");
+    for invalid in ["serde", "itoa", "ryu"] {
+        assert!(
+            rows.iter().all(|d| d["name"] != invalid),
+            "invalid table entry {invalid} must not become a row"
+        );
+    }
+    assert!(
+        rows.iter().any(|d| d["name"] == "gitdep"),
+        "a git-only declaration is valid and still extracts"
+    );
+    let tokio = rows
+        .iter()
+        .find(|d| d["name"] == "tokio")
+        .expect("valid sibling entry still extracts");
+    assert_eq!(tokio["resolution"], "locked");
+    assert_eq!(
+        skipped_diagnostics(&full).len(),
+        1,
+        "the skipped invalid entries must qualify the answer"
+    );
+
+    let miss = run_query_deps(&graph, &["--name", "serde"]);
+    assert_eq!(miss["count"], 0);
+    assert_eq!(skipped_diagnostics(&miss).len(), 1);
+}
+
+/// PR #314 review: absolute `members`/`exclude` patterns are normalized
+/// like absolute path deps and pointers — the repo root lexically
+/// absolutized and stripped, then re-expressed workspace-root-relative —
+/// so an absolute in-repo member matches, is excluded, and seeds the
+/// path-dependency closure; an out-of-repo absolute pattern is a pinned
+/// skip.
+#[test]
+fn absolute_member_and_exclude_patterns_are_normalized() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    for dir in ["crates/a/src", "crates/b/src", "helper/src", "solo/src"] {
+        fs::create_dir_all(repo.join(dir)).expect("dirs");
+    }
+    let repo_display = repo.display();
+    fs::write(
+        repo.join("Cargo.toml"),
+        format!(
+            "[workspace]\nmembers = [\"{repo_display}/crates/*\", \"/definitely/not/in/repo/*\"]\nexclude = [\"{repo_display}/crates/b\"]\n",
+        ),
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    for (member, dep_extra) in [
+        ("crates/a", "helper = { path = \"../../helper\" }\n"),
+        ("crates/b", ""),
+        ("helper", ""),
+        ("solo", ""),
+    ] {
+        let name = member.rsplit('/').next().expect("name");
+        fs::write(
+            repo.join(member).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n{dep_extra}"
+            ),
+        )
+        .expect("member manifest");
+        fs::write(repo.join(member).join("src/lib.rs"), "pub fn f() {}\n").expect("lib");
+    }
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("abs-member-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let rows = parsed["declarations"].as_array().expect("declarations");
+    let by_pkg = |pkg: &str| {
+        rows.iter()
+            .find(|d| d["declaring_package"] == pkg)
+            .unwrap_or_else(|| panic!("row for {pkg}"))
+    };
+    assert_eq!(
+        by_pkg("a")["resolution"],
+        "locked",
+        "an absolute in-repo member pattern admits the member"
+    );
+    assert_eq!(by_pkg("a")["resolved_version"], "1.0.228");
+    assert_eq!(
+        by_pkg("helper")["resolution"],
+        "locked",
+        "an absolute member pattern seeds the path-dependency closure"
+    );
+    assert_eq!(
+        by_pkg("b")["resolution"],
+        "no_lockfile",
+        "an absolute in-repo exclude pattern is honored"
+    );
+    assert_eq!(
+        by_pkg("solo")["resolution"],
+        "no_lockfile",
+        "an out-of-repo absolute member pattern is a pinned skip, never a match"
+    );
+}

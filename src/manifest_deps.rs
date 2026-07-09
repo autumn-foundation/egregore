@@ -317,9 +317,11 @@ pub fn parse_manifest_dependencies(
 /// entry, so the *crate* name is the `package` value. A declaration without a
 /// `version` key (pure `path`/`git`/`workspace = true`) carries no
 /// requirement — nothing is fabricated. An entry that is neither a version
-/// string nor a dependency table (`serde = true` — a manifest Cargo rejects)
-/// is `None`: no row is fabricated for it, and the caller reports the
-/// coverage hole (PR #314 review).
+/// string nor a dependency table (`serde = true`), and a table without a
+/// usable source — a `version`/`path`/`git` string or `workspace = true`
+/// (an empty table, or wrong-typed fields like `version = 1` /
+/// `workspace = "yes"`) — are manifests Cargo rejects: `None`, no row is
+/// fabricated, and the caller reports the coverage hole (PR #314 review).
 fn declared_dependency(
     key: &str,
     item: &toml_edit::Item,
@@ -343,6 +345,18 @@ fn declared_dependency(
             .get("workspace")
             .and_then(toml_edit::Item::as_bool)
             .unwrap_or(false);
+        // A dependency table must name a usable source (Cargo's acceptance
+        // boundary): a string `version`, `path`, or `git`, or
+        // `workspace = true`. `registry`/`rev`/`branch`/`tag` only refine a
+        // `git`/`version` source and never stand alone.
+        let has_source = |field: &str| spec.get(field).and_then(|v| v.as_str()).is_some();
+        if declared_requirement.is_none()
+            && !inherits_workspace
+            && !has_source("path")
+            && !has_source("git")
+        {
+            return None;
+        }
     } else {
         return None;
     }
@@ -1109,8 +1123,19 @@ fn parse_workspace_facts(text: &str, repo_root: &Path, dir_key: &str) -> Workspa
     else {
         return WorkspaceFacts::PackageOnly;
     };
-    let members = string_array(workspace.get("members"));
-    let exclude = string_array(workspace.get("exclude"));
+    let root_segments: Vec<&str> = dir_key.split('/').filter(|s| !s.is_empty()).collect();
+    // Absolute `members`/`exclude` patterns are normalized to the
+    // workspace-root-relative form every matcher and seed expects — the
+    // same absolutize-and-strip idiom as absolute path deps and pointers;
+    // out-of-repo absolute patterns are a documented skip (PR #314 review).
+    let normalize = |patterns: Vec<String>| -> Vec<String> {
+        patterns
+            .into_iter()
+            .filter_map(|pattern| normalize_member_pattern(repo_root, &root_segments, pattern))
+            .collect()
+    };
+    let members = normalize(string_array(workspace.get("members")));
+    let exclude = normalize(string_array(workspace.get("exclude")));
     let path_members = path_dependency_closure(&doc, repo_root, dir_key, &members, &exclude);
     // `[workspace.dependencies]` inheritance surface: a plain string entry
     // is its own version requirement; a table entry contributes its
@@ -1550,6 +1575,37 @@ fn normalize_in_tree_path(root_segments: &[&str], base: &str, path: &str) -> Opt
         return None;
     }
     Some(rel_between(root_segments, &stack))
+}
+
+/// Normalizes one `members`/`exclude` pattern to the workspace-root-relative
+/// form used for matching and seeding (PR #314 review): relative patterns
+/// pass through unchanged; an absolute in-repo pattern is normalized like
+/// absolute path dependencies and pointers — the repo root lexically
+/// absolutized and stripped as a prefix (relative scan roots covered), then
+/// re-expressed relative to the workspace root via [`rel_between`] (glob
+/// segments carried through literally). An out-of-repo absolute pattern is
+/// `None` — a documented skip, never a match.
+fn normalize_member_pattern(
+    repo_root: &Path,
+    root_segments: &[&str],
+    pattern: String,
+) -> Option<String> {
+    let normalized = pattern.replace('\\', "/");
+    if !Path::new(&normalized).is_absolute() {
+        return Some(pattern);
+    }
+    let abs_repo = absolutize_lexical(repo_root);
+    let abs_pattern = absolutize_lexical(Path::new(&normalized));
+    let rel = abs_pattern.strip_prefix(&abs_repo).ok()?;
+    let mut segments: Vec<&str> = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(part) => segments.push(part.to_str()?),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(rel_between(root_segments, &segments))
 }
 
 /// Extracts a TOML string array (`members` / `exclude`) as owned strings with
