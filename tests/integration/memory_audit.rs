@@ -1393,6 +1393,7 @@ fn dependency_declaration_evidence_lands_in_related_code_handles() {
         "Cargo.toml",
         "[package]\nname = \"pkg\"\n\n[dependencies]\nserde = \"1\"\n",
         &aletheia_egregore::manifest_deps::LockfileStatus::Absent,
+        None,
     );
     assert_eq!(dep_records.len(), 1);
     let dep_id = dep_records[0].id().to_owned();

@@ -204,6 +204,7 @@ fn seed() -> Fixture {
         "Cargo.toml",
         "[package]\nname = \"pkg\"\n\n[dependencies]\nembedded-hal = \"0.2\"\nembedded-hal-1 = { package = \"embedded-hal\", version = \"1\" }\n",
         &aletheia_egregore::manifest_deps::LockfileStatus::Absent,
+        None,
     );
     assert_eq!(
         dependency_records.len(),

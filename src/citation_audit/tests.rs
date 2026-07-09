@@ -305,6 +305,7 @@ fn manifest_deps_workflow_gates_dependency_rows() {
         "Cargo.toml",
         "[package]\nname = \"pkg\"\n\n[dependencies]\nembedded-hal = \"0.2\"\nembedded-hal-1 = { package = \"embedded-hal\", version = \"1\" }\n",
         &crate::manifest_deps::LockfileStatus::Absent,
+        None,
     );
     assert_eq!(records.len(), 2, "both rename-pair entries seed the audit");
 

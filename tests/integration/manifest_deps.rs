@@ -2229,3 +2229,128 @@ fn dot_prefixed_member_and_exclude_globs_are_honored() {
         "a ./-prefixed exclude entry is honored"
     );
 }
+
+/// PR #314 review: extraction rows for `{ workspace = true }` entries must
+/// resolve through the workspace root's `[workspace.dependencies]` table —
+/// real package name from the root entry's `package` (else the key), the
+/// root's version requirement, and `declared_as` when the member key
+/// differs. A member-local `version` beside `workspace = true` (which Cargo
+/// rejects) is ignored in favor of the root's requirement (pinned).
+#[test]
+fn workspace_inherited_rows_resolve_through_the_root_table() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("app/src")).expect("dirs");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    // Root is both workspace root and package; the root package itself
+    // inherits `serde` from its own [workspace.dependencies].
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"root-pkg\"\nversion = \"0.1.0\"\n\n[workspace]\nmembers = [\"app\"]\n\n[workspace.dependencies]\nserde = \"1\"\nalias = { package = \"itoa\", version = \"1\" }\nextra = \"2\"\n\n[dependencies]\nserde = { workspace = true }\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\n[[package]]\nname = \"itoa\"\nversion = \"1.0.15\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+    fs::write(
+        repo.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nalias = { workspace = true }\nserde = { workspace = true, features = [\"derive\"] }\nextra = { workspace = true, version = \"9\" }\n",
+    )
+    .expect("app manifest");
+    fs::write(repo.join("app/src/lib.rs"), "pub fn a() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("inherit-rows-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    // Alias inheritance: `--name itoa` finds the REAL direct dependency.
+    let itoa = run_query_deps(&graph, &["--name", "itoa"]);
+    let rows = itoa["declarations"].as_array().expect("declarations");
+    assert_eq!(rows.len(), 1, "alias-inherited row carries the real name");
+    assert_eq!(rows[0]["declaring_package"], "app");
+    assert_eq!(rows[0]["declared_as"], "alias");
+    assert_eq!(rows[0]["declared_requirement"], "1");
+    assert_eq!(rows[0]["resolution"], "locked");
+    assert_eq!(rows[0]["resolved_version"], "1.0.15");
+
+    let serde = run_query_deps(&graph, &["--name", "serde"]);
+    let rows = serde["declarations"].as_array().expect("declarations");
+    let by_pkg = |pkg: &str| {
+        rows.iter()
+            .find(|d| d["declaring_package"] == pkg)
+            .unwrap_or_else(|| panic!("row for {pkg}"))
+    };
+    // Plain inheritance in the member.
+    assert_eq!(by_pkg("app")["declared_requirement"], "1");
+    assert_eq!(by_pkg("app")["resolution"], "locked");
+    assert_eq!(by_pkg("app")["resolved_version"], "1.0.228");
+    // The root package's own inherited entry.
+    assert_eq!(by_pkg("root-pkg")["declared_requirement"], "1");
+    assert_eq!(by_pkg("root-pkg")["resolution"], "locked");
+
+    // A member-local `version` beside `workspace = true` never overrides the
+    // root's requirement.
+    let extra = run_query_deps(&graph, &["--name", "extra"]);
+    let rows = extra["declarations"].as_array().expect("declarations");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["declared_requirement"], "2",
+        "the root's requirement wins; the illegal local version is ignored"
+    );
+    // No misleading `alias` row survives anywhere.
+    let alias = run_query_deps(&graph, &["--name", "alias"]);
+    assert_eq!(alias["count"], 0, "the alias key is not a crate name");
+}
+
+/// A `{ workspace = true }` entry with NO findable workspace root (standalone
+/// package) can resolve against nothing: the honest fallback is no row plus
+/// a skipped-manifest qualification — never a misleading key-named row.
+#[test]
+fn orphan_workspace_inheritance_is_qualified_not_fabricated() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"loner\"\nversion = \"0.1.0\"\n\n[dependencies]\nghost = { workspace = true }\nserde = \"1\"\n",
+    )
+    .expect("manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn f() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("orphan-inherit-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &[]);
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    assert!(
+        declarations.iter().all(|d| d["name"] != "ghost"),
+        "an unresolvable inherited entry never yields a key-named row"
+    );
+    let serde = declarations
+        .iter()
+        .find(|d| d["name"] == "serde")
+        .expect("the attributable declaration still extracts");
+    assert_eq!(serde["resolution"], "locked");
+    let diagnostics = skipped_diagnostics(&parsed);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "the unresolvable inheritance must qualify the answer"
+    );
+    assert_eq!(diagnostics[0]["detail"], "Cargo.toml");
+}

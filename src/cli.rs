@@ -11432,11 +11432,13 @@ fn collect_skipped_manifest_diagnostics<'a>(
             else {
                 return None;
             };
-            // Both skipped-manifest classes qualify answers: unparseable
-            // manifests and parseable ones whose dependency tables carry no
-            // usable [package].name (PR #314 review).
+            // Every skipped-manifest class qualifies answers: unparseable
+            // manifests, parseable ones whose dependency tables carry no
+            // usable [package].name, and manifests whose `workspace = true`
+            // entries have no resolvable workspace root (PR #314 review).
             if symbol_kind != crate::manifest_deps::SKIPPED_MANIFEST_DIAGNOSTIC_KIND
                 && symbol_kind != crate::manifest_deps::UNATTRIBUTABLE_MANIFEST_DIAGNOSTIC_KIND
+                && symbol_kind != crate::manifest_deps::UNINHERITABLE_MANIFEST_DIAGNOSTIC_KIND
             {
                 return None;
             }

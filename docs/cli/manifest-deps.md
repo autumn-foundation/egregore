@@ -45,11 +45,14 @@ exit 0 with `ok:true`, an empty `declarations` array, and a stable diagnostic
 payload, never a synthesized row.
 
 **A definitive answer requires full manifest coverage.** When the scan skipped
-an unreadable or unparseable `Cargo.toml`, or a parseable one whose dependency
+an unreadable or unparseable `Cargo.toml`, a parseable one whose dependency
 tables carry no usable `[package].name` (a name-less package table, or a
 virtual manifest wrongly declaring top-level dependencies — stamped
 `symbol_kind: unattributable_cargo_manifest`; its declarations cannot be
-attributed to a declaring package), every response — hit, miss, and empty
+attributed to a declaring package), or `{ workspace = true }` entries with no
+resolvable workspace root (stamped `symbol_kind:
+uninheritable_cargo_dependency`; the manifest's other declarations still
+extract), every response — hit, miss, and empty
 surface — carries one
 `skipped_manifest` diagnostic per skipped manifest, citing the repo-relative
 manifest handle (`detail`) and the `Diagnostic` record ID (`record_id`) in
@@ -82,7 +85,16 @@ declared entry (manifest key):
   declaration was written in.
 - **`declared_requirement`** — the `version` string exactly as written
   (`"1.0.228"`, `"1"`). Absent when the declaration carries no `version` key
-  (pure `path`/`git`/`workspace = true` dependencies) — never fabricated.
+  (pure `path`/`git` dependencies) — never fabricated. A
+  `{ workspace = true }` entry resolves through the owning workspace root's
+  `[workspace.dependencies]` table: the real crate name is the root entry's
+  `package` (else the shared key, with `declared_as` recording the member key
+  when it differs), the requirement is the root entry's `version` (absent for
+  a path/git-only template), and a member-local `version` beside
+  `workspace = true` — which Cargo rejects — never overrides the root's. An
+  inherited entry with no resolvable workspace root (or a key missing from
+  the root table) yields **no row** — a key-named row would be a
+  fabrication — plus a `skipped_manifest` qualification.
 - **`resolved_version`** / **`resolution`** — the manifest resolves against
   the `Cargo.lock` Cargo would actually use: the lockfile of the crate's
   **workspace root** for a member, or its own directory's lockfile for a

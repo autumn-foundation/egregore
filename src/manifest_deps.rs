@@ -215,6 +215,21 @@ pub struct DeclaredDependency {
     /// Version requirement string exactly as written; `None` when the
     /// declaration has no `version` key.
     pub declared_requirement: Option<String>,
+    /// `true` for a `{ workspace = true }` entry: the real crate name and
+    /// requirement live in the workspace root's `[workspace.dependencies]`
+    /// table and are resolved at record-building time (PR #314 review).
+    pub inherits_workspace: bool,
+}
+
+/// One `[workspace.dependencies]` entry's inheritance-relevant surface:
+/// the optional `package = "…"` rename and the declared `version`
+/// requirement (a plain string entry is its own version requirement).
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct WorkspaceDepSpec {
+    /// Real crate name when the entry renames (`package = "…"`).
+    pub package: Option<String>,
+    /// Declared version requirement; `None` for path/git-only templates.
+    pub version: Option<String>,
 }
 
 /// Parsed dependency surface of one manifest.
@@ -288,6 +303,7 @@ fn declared_dependency(
     let mut name = key.to_owned();
     let mut declared_as = None;
     let mut declared_requirement = None;
+    let mut inherits_workspace = false;
     if let Some(requirement) = item.as_str() {
         declared_requirement = Some(requirement.to_owned());
     } else if let Some(spec) = item.as_table_like() {
@@ -298,12 +314,17 @@ fn declared_dependency(
         if let Some(version) = spec.get("version").and_then(|v| v.as_str()) {
             declared_requirement = Some(version.to_owned());
         }
+        inherits_workspace = spec
+            .get("workspace")
+            .and_then(toml_edit::Item::as_bool)
+            .unwrap_or(false);
     }
     DeclaredDependency {
         name,
         declared_as,
         kind,
         declared_requirement,
+        inherits_workspace,
     }
 }
 
@@ -320,6 +341,7 @@ pub fn manifest_dependency_records(
     manifest_path: &str,
     manifest_text: &str,
     lockfile: &LockfileStatus,
+    workspace_deps: Option<&BTreeMap<String, WorkspaceDepSpec>>,
 ) -> Vec<GraphRecord> {
     let Ok(parsed) = parse_manifest_dependencies(manifest_text) else {
         return vec![unparseable_manifest_diagnostic(
@@ -342,19 +364,71 @@ pub fn manifest_dependency_records(
             manifest_path,
         )];
     };
-    parsed
-        .declarations
-        .into_iter()
+    let (declarations, uninheritable) =
+        resolve_workspace_inheritance(parsed.declarations, workspace_deps);
+    let mut records: Vec<GraphRecord> = declarations
+        .iter()
         .map(|declaration| {
             dependency_record(
                 repository_id,
                 manifest_path,
                 &declaring_package,
-                &declaration,
+                declaration,
                 lockfile,
             )
         })
-        .collect()
+        .collect();
+    if uninheritable {
+        records.push(uninheritable_dependency_diagnostic(
+            repository_id,
+            manifest_path,
+        ));
+    }
+    records
+}
+
+/// Resolves `{ workspace = true }` entries through the workspace root's
+/// `[workspace.dependencies]` table (PR #314 review): the real crate name is
+/// the root entry's `package` (else the shared key), the requirement is the
+/// root entry's `version` (a path/git-only template has none — the existing
+/// no-requirement semantics apply), and `declared_as` records the member key
+/// when it differs from the real name. A member-local `version` beside
+/// `workspace = true` (which Cargo rejects) never overrides the root's.
+/// Entries with no resolvable root context (standalone manifest, or a key
+/// missing from the root table) are dropped — a key-named row would be a
+/// fabrication — and reported via the returned flag.
+fn resolve_workspace_inheritance(
+    declarations: Vec<DeclaredDependency>,
+    workspace_deps: Option<&BTreeMap<String, WorkspaceDepSpec>>,
+) -> (Vec<DeclaredDependency>, bool) {
+    let mut resolved = Vec::with_capacity(declarations.len());
+    let mut uninheritable = false;
+    for mut declaration in declarations {
+        if !declaration.inherits_workspace {
+            resolved.push(declaration);
+            continue;
+        }
+        let key = declaration.name.clone();
+        let Some(spec) = workspace_deps.and_then(|deps| deps.get(&key)) else {
+            uninheritable = true;
+            continue;
+        };
+        let real_name = spec.package.clone().unwrap_or_else(|| key.clone());
+        declaration.declared_as = (real_name != key).then_some(key);
+        declaration.name = real_name;
+        declaration.declared_requirement.clone_from(&spec.version);
+        resolved.push(declaration);
+    }
+    // Restore the documented per-kind (name, declared_as) order — an
+    // inherited rename can change the sort key computed at parse time.
+    resolved.sort_by(|left, right| {
+        left.kind.cmp(&right.kind).then_with(|| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.declared_as.cmp(&right.declared_as))
+        })
+    });
+    (resolved, uninheritable)
 }
 
 fn dependency_record(
@@ -431,6 +505,16 @@ fn dependency_record(
 /// without matching summary text.
 pub const SKIPPED_MANIFEST_DIAGNOSTIC_KIND: &str = "unparseable_cargo_manifest";
 
+/// Skipped-manifest `symbol_kind` for unresolvable `{ workspace = true }`
+/// entries (PR #314 review).
+///
+/// Stamped when a manifest inherits workspace dependencies but no owning
+/// workspace root (or no matching `[workspace.dependencies]` key) exists to
+/// resolve them: the affected declarations are skipped — a key-named row
+/// would be a fabrication — and the answer stays qualified. Other
+/// declarations in the same manifest still extract normally.
+pub const UNINHERITABLE_MANIFEST_DIAGNOSTIC_KIND: &str = "uninheritable_cargo_dependency";
+
 /// Skipped-manifest `symbol_kind` for an unattributable manifest (PR #314
 /// review).
 ///
@@ -500,6 +584,33 @@ fn unattributable_manifest_diagnostic(repository_id: &str, manifest_path: &str) 
     record
 }
 
+/// Diagnostic for `{ workspace = true }` entries with no resolvable
+/// workspace context (PR #314 review): the affected declarations are
+/// skipped — never rendered as key-named rows — and the coverage hole is
+/// reported so answers stay qualified.
+fn uninheritable_dependency_diagnostic(repository_id: &str, manifest_path: &str) -> GraphRecord {
+    let mut record = GraphRecord::node(
+        stable_id(&[
+            "node",
+            "diagnostic",
+            "uninheritable-cargo-dependency",
+            repository_id,
+            manifest_path,
+        ]),
+        NodeKind::Diagnostic,
+        Some(manifest_path.to_owned()),
+        None,
+        Some(manifest_path.to_owned()),
+        format!(
+            "Cargo manifest {manifest_path} inherits workspace dependencies with no resolvable workspace root: those declarations skipped"
+        ),
+    );
+    if let GraphRecord::Node { symbol_kind, .. } = &mut record {
+        *symbol_kind = Some(UNINHERITABLE_MANIFEST_DIAGNOSTIC_KIND.to_owned());
+    }
+    record
+}
+
 /// Scans every `Cargo.toml` under `repo_root` into dependency records.
 ///
 /// Manifests are visited in deterministic repo-relative path order. Each
@@ -525,11 +636,14 @@ pub fn scan_dependency_records(repo_root: &Path, repository_id: &str) -> Result<
         };
         let lockfile =
             nearest_lockfile(repo_root, &manifest.repo_relative_path, &mut lockfile_cache);
+        let workspace_deps =
+            workspace_dep_specs_for(repo_root, &manifest.repo_relative_path, &mut lockfile_cache);
         let manifest_records = manifest_dependency_records(
             repository_id,
             &manifest.repo_relative_path,
             &manifest_text,
             &lockfile,
+            workspace_deps.as_ref(),
         );
         // Repository attribution topology (PR #314 review): a manifest that
         // declares dependencies gets a `File` node plus the exact
@@ -599,11 +713,14 @@ enum WorkspaceFacts {
     PackageOnly,
     /// A workspace root: `members` / `exclude` globs plus the root package's
     /// in-tree `path = "…"` dependencies (transitively — Cargo treats them as
-    /// automatic members) decide coverage.
+    /// automatic members) decide coverage, and `dep_specs` carries the
+    /// `[workspace.dependencies]` inheritance surface members resolve
+    /// `{ workspace = true }` entries against (PR #314 review).
     Workspace {
         members: Vec<String>,
         exclude: Vec<String>,
         path_members: Vec<String>,
+        dep_specs: BTreeMap<String, WorkspaceDepSpec>,
     },
 }
 
@@ -646,26 +763,48 @@ fn nearest_lockfile(
     manifest_repo_relative_path: &str,
     cache: &mut LockfileWalkCache,
 ) -> LockfileStatus {
-    let mut segments: Vec<&str> = manifest_repo_relative_path.split('/').collect();
+    let mut manifest_dir: Vec<&str> = manifest_repo_relative_path.split('/').collect();
     // Drop the `Cargo.toml` file name, keeping the containing directory.
+    manifest_dir.pop();
+    match owning_workspace_dir(repo_root, manifest_repo_relative_path, cache) {
+        // The owning workspace root's lockfile state is authoritative —
+        // Cargo ignores a stale/corrupt local Cargo.lock beside a member
+        // manifest (PR #314 review).
+        Some(root_key) => {
+            let segments: Vec<&str> = root_key.split('/').filter(|s| !s.is_empty()).collect();
+            lockfile_in_dir(repo_root, &segments, cache)
+        }
+        // Standalone (no owning workspace, excluded / non-member, or
+        // unverifiable ancestry): the manifest's own-directory lockfile
+        // state is its own.
+        None => lockfile_in_dir(repo_root, &manifest_dir, cache),
+    }
+}
+
+/// Directory of the workspace root OWNING this manifest, as a `/`-joined
+/// repo-relative key (`""` = the repository root): the manifest's own
+/// directory when it declares `[workspace]`, else the first
+/// `[workspace]`-declaring ancestor whose membership (members/exclude globs
+/// plus automatic path-dependency members) includes it. `None` for
+/// standalone, excluded / non-member, or unverifiable-ancestry manifests.
+fn owning_workspace_dir(
+    repo_root: &Path,
+    manifest_repo_relative_path: &str,
+    cache: &mut LockfileWalkCache,
+) -> Option<String> {
+    let mut segments: Vec<&str> = manifest_repo_relative_path.split('/').collect();
     segments.pop();
     let manifest_dir: Vec<&str> = segments.clone();
 
-    // A manifest that itself declares `[workspace]` IS a workspace root —
-    // its own directory's lockfile state is authoritative (PR #314 review).
+    // A manifest that itself declares `[workspace]` IS a workspace root.
     if matches!(
         workspace_facts_in_dir(repo_root, &manifest_dir, cache),
         WorkspaceFacts::Workspace { .. }
     ) {
-        return lockfile_in_dir(repo_root, &manifest_dir, cache);
+        return Some(manifest_dir.join("/"));
     }
-
     loop {
-        if segments.pop().is_none() {
-            // No owning workspace anywhere above: a standalone package's
-            // own-directory lockfile (or its absence) is its own.
-            return lockfile_in_dir(repo_root, &manifest_dir, cache);
-        }
+        segments.pop()?;
         match workspace_facts_in_dir(repo_root, &segments, cache) {
             // The first `[workspace]`-declaring ancestor is the candidate
             // workspace root, whether or not a lockfile sits beside it.
@@ -673,31 +812,39 @@ fn nearest_lockfile(
                 members,
                 exclude,
                 path_members,
+                ..
             } => {
                 let rel = manifest_dir[segments.len()..].join("/");
                 let is_member = (members.iter().any(|glob| member_glob_match(glob, &rel))
                     || path_members.iter().any(|member| member == &rel))
                     && !exclude.iter().any(|glob| member_glob_match(glob, &rel));
-                if is_member {
-                    // A member ALWAYS resolves through the root's lockfile
-                    // state — Cargo ignores a stale/corrupt local Cargo.lock
-                    // beside a member manifest (PR #314 review).
-                    return lockfile_in_dir(repo_root, &segments, cache);
-                }
-                // Excluded or non-member nested crate: standalone — its own
-                // lockfile state applies, never an unrelated ancestor's.
-                return lockfile_in_dir(repo_root, &manifest_dir, cache);
+                return is_member.then(|| segments.join("/"));
             }
-            // Membership cannot be verified: never take the ancestor's
-            // lockfile; the manifest's own state is all that is safe.
-            WorkspaceFacts::Unverifiable => {
-                return lockfile_in_dir(repo_root, &manifest_dir, cache);
-            }
+            // Membership cannot be verified: never claim ownership.
+            WorkspaceFacts::Unverifiable => return None,
             // Not a workspace root (plain package, or a stray lockfile with
             // no manifest): Cargo's discovery walks past it — and past any
             // lockfile it holds.
             WorkspaceFacts::NoManifest | WorkspaceFacts::PackageOnly => {}
         }
+    }
+}
+
+/// The `[workspace.dependencies]` inheritance surface of the workspace root
+/// owning this manifest, when one exists (PR #314 review): what a member's
+/// `{ workspace = true }` entries resolve against. `None` for standalone /
+/// excluded / unverifiable manifests — their inherited entries are
+/// unresolvable and reported as a coverage hole.
+fn workspace_dep_specs_for(
+    repo_root: &Path,
+    manifest_repo_relative_path: &str,
+    cache: &mut LockfileWalkCache,
+) -> Option<BTreeMap<String, WorkspaceDepSpec>> {
+    let root_key = owning_workspace_dir(repo_root, manifest_repo_relative_path, cache)?;
+    let segments: Vec<&str> = root_key.split('/').filter(|s| !s.is_empty()).collect();
+    match workspace_facts_in_dir(repo_root, &segments, cache) {
+        WorkspaceFacts::Workspace { dep_specs, .. } => Some(dep_specs),
+        _ => None,
     }
 }
 
@@ -775,10 +922,45 @@ fn parse_workspace_facts(text: &str, root_dir: &Path) -> WorkspaceFacts {
     let members = string_array(workspace.get("members"));
     let exclude = string_array(workspace.get("exclude"));
     let path_members = path_dependency_closure(&doc, root_dir, &members, &exclude);
+    // `[workspace.dependencies]` inheritance surface: a plain string entry
+    // is its own version requirement; a table entry contributes its
+    // `package` rename and `version` keys (PR #314 review).
+    let dep_specs = workspace
+        .get("dependencies")
+        .and_then(toml_edit::Item::as_table_like)
+        .map(|table| {
+            table
+                .iter()
+                .map(|(key, item)| {
+                    let spec = item.as_str().map_or_else(
+                        || {
+                            item.as_table_like()
+                                .map_or_else(WorkspaceDepSpec::default, |entry| WorkspaceDepSpec {
+                                    package: entry
+                                        .get("package")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_owned),
+                                    version: entry
+                                        .get("version")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_owned),
+                                })
+                        },
+                        |version| WorkspaceDepSpec {
+                            package: None,
+                            version: Some(version.to_owned()),
+                        },
+                    );
+                    (key.to_owned(), spec)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     WorkspaceFacts::Workspace {
         members,
         exclude,
         path_members,
+        dep_specs,
     }
 }
 
@@ -1232,12 +1414,14 @@ clap = { version = "4.6.1", features = ["derive"] }
                     declared_as: None,
                     kind: DependencyKind::Normal,
                     declared_requirement: Some("4.6.1".to_owned()),
+                    inherits_workspace: false,
                 },
                 DeclaredDependency {
                     name: "serde".to_owned(),
                     declared_as: None,
                     kind: DependencyKind::Normal,
                     declared_requirement: Some("1.0.228".to_owned()),
+                    inherits_workspace: false,
                 },
             ]
         );
@@ -1390,6 +1574,7 @@ embedded-hal = "0.2"
 embedded-hal-1 = { package = "embedded-hal", version = "1" }
 "#,
             &LockfileStatus::Absent,
+            None,
         );
         assert_eq!(records.len(), 2, "both declared entries become facts");
         assert_ne!(
@@ -1635,6 +1820,7 @@ tokio = { version = "1", features = ["full"] }
             "Cargo.toml",
             "[package]\nname = \"pkg\"\n\n[dependencies]\nserde = \"1\"\n",
             &LockfileStatus::Invalid,
+            None,
         );
         assert_eq!(records.len(), 1);
         let payload = records[0].dependency().expect("dependency payload");
@@ -1657,6 +1843,7 @@ tokio = { version = "1", features = ["full"] }
             "Cargo.toml",
             "[package\nbroken",
             &LockfileStatus::Absent,
+            None,
         );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_kind_name(), Some("Diagnostic"));
@@ -1673,6 +1860,7 @@ tokio = { version = "1", features = ["full"] }
             "Cargo.toml",
             "[package]\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
             &LockfileStatus::Absent,
+            None,
         );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_kind_name(), Some("Diagnostic"));
@@ -1694,6 +1882,7 @@ tokio = { version = "1", features = ["full"] }
             "Cargo.toml",
             "[workspace]\nmembers = [\"app\"]\n\n[dependencies]\nserde = \"1\"\n",
             &LockfileStatus::Absent,
+            None,
         );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_kind_name(), Some("Diagnostic"));
@@ -1706,6 +1895,7 @@ tokio = { version = "1", features = ["full"] }
             "Cargo.toml",
             "[workspace]\nmembers = [\"a\"]\n",
             &LockfileStatus::Absent,
+            None,
         );
         assert!(records.is_empty());
     }
