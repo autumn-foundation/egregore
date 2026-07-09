@@ -80,12 +80,16 @@ declared entry (manifest key):
   (`"1.0.228"`, `"1"`). Absent when the declaration carries no `version` key
   (pure `path`/`git`/`workspace = true` dependencies) — never fabricated.
 - **`resolved_version`** / **`resolution`** — the manifest resolves against
-  the `Cargo.lock` Cargo would actually use: its own directory's lockfile, or
-  the lockfile of the crate's **workspace root**. The walk stops at the first
-  `[workspace]`-declaring manifest — the manifest's own, or the first
-  ancestor's — whether or not a lockfile sits beside it: a lockfile-less
-  workspace root means `no_lockfile`, never an outer lockfile even when an
-  outer workspace's globs would match. Membership at an ancestor root means
+  the `Cargo.lock` Cargo would actually use: the lockfile of the crate's
+  **workspace root** for a member, or its own directory's lockfile for a
+  standalone package or a manifest that itself declares `[workspace]`. The
+  walk stops at the first `[workspace]`-declaring manifest — the manifest's
+  own, or the first ancestor's — whether or not a lockfile sits beside it: a
+  lockfile-less workspace root means `no_lockfile`, never an outer lockfile
+  even when an outer workspace's globs would match. A **member** always
+  resolves through the root's lockfile state — a stale or corrupt
+  `Cargo.lock` beside a member's own manifest is dead state Cargo never
+  reads and is ignored. Membership at an ancestor root means
   the `members` globs include the crate (and `exclude` does not; glob syntax
   covers `*`, `?`, spanning `**`, and `[…]` character classes with ranges and
   `[!…]` negation, per the `glob` crate Cargo uses — an unclosed class, which
@@ -93,14 +97,17 @@ declared entry (manifest key):
   workspace reaches it through in-tree `path = "…"` dependencies
   (transitively — Cargo's automatic members; the closure grows from the root
   package and from every glob member, so a virtual root's members contribute
-  their path dependencies too). Absolute `path` values pointing inside the
+  their path dependencies too, while an excluded directory is pruned at
+  traversal time — neither it nor packages reachable only through it join).
+  Absolute `path` values pointing inside the
   workspace root are normalized to root-relative member paths (the root is
   lexically absolutized first, so `eg scan .` with a relative repo path
   recognizes them too; symlinks are never resolved). Non-members and excluded
-  members get `no_lockfile` — never a fabricated `locked` from an unrelated
+  members are standalone: their own directory's lockfile state applies —
+  never a fabricated `locked` from an unrelated
   ancestor. Plain package manifests and stray lockfiles without a manifest
   are walked past, mirroring Cargo's workspace discovery; an unreadable
-  ancestor manifest stops the walk without accepting anything.
+  ancestor manifest stops the walk without accepting the ancestor.
   (`..`-escaping and absolute out-of-tree path dependencies, and
   `package.workspace` explicit-pointer keys, are not interpreted in this
   slice.)

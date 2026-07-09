@@ -577,23 +577,30 @@ fn dependency_records_pass_referential_validation() {
 }
 
 // ---------------------------------------------------------------------------
-// PR #314 review: an invalid nearest lockfile must stop the upward search
+// PR #314 review: a workspace member always resolves through the root
+// lockfile; the authoritative lockfile's corruption is never skipped
 // ---------------------------------------------------------------------------
 
-/// A corrupt `Cargo.lock` sitting next to a member manifest must never be
-/// skipped in favor of a valid ancestor lockfile: the nearest lockfile is the
-/// authority, and when it cannot be read or parsed the dependencies are
-/// marked `lockfile_unreadable` — a version from an unrelated parent lockfile
-/// is a fabricated resolution.
+/// Cargo resolves a workspace member through the workspace ROOT's lockfile
+/// even when a stale or corrupt local `Cargo.lock` sits beside the member's
+/// manifest — the member-local file is dead state Cargo never reads. Only
+/// standalone packages and workspace roots own their own-directory lockfile.
 #[test]
-fn corrupt_nearest_lockfile_stops_the_search_never_resolving_from_ancestor() {
+fn member_local_lockfiles_are_ignored_in_favor_of_the_workspace_root() {
     let temp = tempfile::tempdir().expect("temp dir");
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
     write_fixture(&repo);
-    // Nearest lockfile for pkg-a: exists but is not valid TOML.
+    // A corrupt local lockfile beside member pkg-a, and a stale local
+    // lockfile beside member local-b (serde locked at a version the root
+    // lockfile does not hold). Cargo reads neither.
     fs::write(repo.join("crates/pkg-a/Cargo.lock"), "not [ valid toml")
         .expect("corrupt nested lockfile");
+    fs::write(
+        repo.join("crates/local-b/Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.100\"\n",
+    )
+    .expect("stale nested lockfile");
 
     let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("deps-fixture"))
         .expect("fixture should scan")
@@ -603,29 +610,56 @@ fn corrupt_nearest_lockfile_stops_the_search_never_resolving_from_ancestor() {
     fs::write(&graph, jsonl).expect("write graph");
 
     let nodes = dependency_nodes(&graph);
-    for node in nodes
+    let serde_a = nodes
         .iter()
-        .filter(|n| n["dependency"]["declaring_package"] == "pkg-a")
-    {
-        assert_eq!(
-            node["dependency"]["resolution"], "lockfile_unreadable",
-            "pkg-a dependency {} must carry the invalid-nearest-lockfile marker",
-            node["name"]
-        );
-        assert!(
-            node["dependency"]["resolved_version"].is_null(),
-            "pkg-a dependency {} must never resolve from the ancestor lockfile",
-            node["name"]
-        );
-    }
-    // The sibling crate has no nested lockfile: it still resolves from the
-    // valid root lockfile.
+        .find(|n| n["dependency"]["declaring_package"] == "pkg-a" && n["name"] == "serde")
+        .expect("pkg-a serde fact");
+    assert_eq!(
+        serde_a["dependency"]["resolution"], "locked",
+        "a member with a corrupt local lockfile still resolves from the workspace root"
+    );
+    assert_eq!(serde_a["dependency"]["resolved_version"], "1.0.228");
     let serde_b = nodes
         .iter()
         .find(|n| n["dependency"]["declaring_package"] == "local-b" && n["name"] == "serde")
         .expect("local-b serde fact");
-    assert_eq!(serde_b["dependency"]["resolution"], "locked");
-    assert_eq!(serde_b["dependency"]["resolved_version"], "1.0.228");
+    assert_eq!(
+        serde_b["dependency"]["resolution"], "locked",
+        "a member with a stale local lockfile resolves from the root, never the local file"
+    );
+    assert_eq!(
+        serde_b["dependency"]["resolved_version"], "1.0.228",
+        "the stale member-local version must never surface"
+    );
+}
+
+/// For a standalone package (no owning workspace) the own-directory lockfile
+/// IS the authority: when it exists but cannot be parsed the dependencies are
+/// `lockfile_unreadable` — never a guess, never an unrelated ancestor.
+#[test]
+fn standalone_corrupt_lockfile_marks_facts_lockfile_unreadable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"loner\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("manifest");
+    fs::write(repo.join("Cargo.lock"), "not [ valid toml").expect("corrupt lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn f() {}\n").expect("lib.rs");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("loner-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let row = &parsed["declarations"].as_array().expect("declarations")[0];
+    assert_eq!(row["resolution"], "lockfile_unreadable");
+    assert!(row["resolved_version"].is_null());
 }
 
 // ---------------------------------------------------------------------------
@@ -1788,5 +1822,109 @@ fn workspace_glob_character_classes_are_honored() {
     assert_eq!(
         pkg_b["resolution"], "no_lockfile",
         "an exclude entry written as a class glob is honored"
+    );
+}
+
+/// Builds a workspace-root package that path-depends on an excluded package,
+/// which in turn path-depends on `crates/helper`. When `root_also_depends_on_helper`
+/// is set, the root additionally depends on the helper directly, making it
+/// independently reachable outside the excluded chain.
+fn excluded_chain_graph(root_also_depends_on_helper: bool) -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("crates/excluded/src")).expect("dirs");
+    fs::create_dir_all(repo.join("crates/helper/src")).expect("dirs");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    let helper_dep = if root_also_depends_on_helper {
+        "helper = { path = \"crates/helper\" }\n"
+    } else {
+        ""
+    };
+    fs::write(
+        repo.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"root-pkg\"\nversion = \"0.1.0\"\n\n[workspace]\nexclude = [\"crates/excluded\"]\n\n[dependencies]\nexcluded = {{ path = \"crates/excluded\" }}\n{helper_dep}serde = \"1\"\n"
+        ),
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+    fs::write(
+        repo.join("crates/excluded/Cargo.toml"),
+        "[package]\nname = \"excluded\"\nversion = \"0.1.0\"\n\n[dependencies]\nhelper = { path = \"../helper\" }\nserde = \"1\"\n",
+    )
+    .expect("excluded manifest");
+    fs::write(repo.join("crates/excluded/src/lib.rs"), "pub fn e() {}\n").expect("lib");
+    fs::write(
+        repo.join("crates/helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("helper manifest");
+    fs::write(repo.join("crates/helper/src/lib.rs"), "pub fn h() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("excluded-chain"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+    (temp, graph)
+}
+
+/// PR #314 review: `exclude` removes the package AND everything reachable
+/// only through it — Cargo makes neither the excluded package nor its
+/// transitive path dependencies workspace members. The closure must not
+/// traverse an excluded directory's manifest.
+#[test]
+fn excluded_packages_never_extend_the_membership_closure() {
+    let (_temp, graph) = excluded_chain_graph(false);
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    let by_pkg = |pkg: &str| {
+        declarations
+            .iter()
+            .find(|d| d["declaring_package"] == pkg)
+            .unwrap_or_else(|| panic!("row for {pkg}"))
+    };
+    assert_eq!(by_pkg("root-pkg")["resolution"], "locked");
+    assert_eq!(
+        by_pkg("excluded")["resolution"],
+        "no_lockfile",
+        "an excluded path dependency is standalone, never a member"
+    );
+    assert_eq!(
+        by_pkg("helper")["resolution"],
+        "no_lockfile",
+        "a package reachable only through an excluded one is not a member either"
+    );
+}
+
+/// A transitive dependency of an excluded package that is ALSO reachable
+/// from a non-excluded seed keeps its membership through that other path.
+#[test]
+fn independently_reachable_deps_survive_an_excluded_sibling_chain() {
+    let (_temp, graph) = excluded_chain_graph(true);
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    let by_pkg = |pkg: &str| {
+        declarations
+            .iter()
+            .find(|d| d["declaring_package"] == pkg)
+            .unwrap_or_else(|| panic!("row for {pkg}"))
+    };
+    assert_eq!(
+        by_pkg("helper")["resolution"],
+        "locked",
+        "the root's own direct path dependency stays a member"
+    );
+    assert_eq!(by_pkg("helper")["resolved_version"], "1.0.228");
+    assert_eq!(
+        by_pkg("excluded")["resolution"],
+        "no_lockfile",
+        "the excluded package itself stays out"
     );
 }

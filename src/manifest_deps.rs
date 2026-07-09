@@ -575,19 +575,25 @@ struct LockfileWalkCache {
 ///
 /// Boundary rules (PR #314 review):
 ///
-/// - The manifest's **own** directory's lockfile is always its own.
-/// - An **ancestor** directory's lockfile is accepted only when that
-///   directory's `Cargo.toml` declares a `[workspace]` whose `members` globs
-///   include the manifest's directory and whose `exclude` globs do not — an
-///   independent nested crate or an excluded member never resolves from an
-///   unrelated ancestor lockfile (`no_lockfile` instead).
+/// - A manifest that itself declares `[workspace]` IS a workspace root: its
+///   own directory's lockfile state (found / invalid / absent) is
+///   authoritative — the walk never proceeds to an outer workspace.
+/// - A **workspace member** — the first `[workspace]`-declaring ancestor's
+///   `members` globs (or automatic path-dependency members) include its
+///   directory and `exclude` does not — always resolves through the ROOT's
+///   lockfile state. A stale or corrupt `Cargo.lock` beside the member's own
+///   manifest is dead state Cargo never reads and is ignored entirely.
+/// - Only a **standalone** package — no `[workspace]`-declaring ancestor, or
+///   a nested crate the first such ancestor does not own (excluded /
+///   non-member) — owns its own-directory lockfile.
 /// - A plain package manifest (no `[workspace]`) or a stray lockfile with no
 ///   manifest beside it is walked past, mirroring Cargo's workspace
 ///   discovery; an unreadable/unparseable ancestor manifest stops the walk
-///   without accepting anything (membership cannot be verified).
-/// - A candidate lockfile that exists but cannot be read or parsed stops the
-///   walk with [`LockfileStatus::Invalid`] — never a fallback to a higher
-///   ancestor.
+///   without accepting the ancestor (membership cannot be verified; the
+///   manifest's own lockfile state is all that is safe).
+/// - Wherever the authoritative lockfile lives, one that exists but cannot
+///   be read or parsed is [`LockfileStatus::Invalid`] — never a fallback to
+///   a different lockfile.
 fn nearest_lockfile(
     repo_root: &Path,
     manifest_repo_relative_path: &str,
@@ -598,30 +604,24 @@ fn nearest_lockfile(
     segments.pop();
     let manifest_dir: Vec<&str> = segments.clone();
 
-    // The manifest's own directory: its lockfile is unconditionally its own,
-    // and a manifest that itself declares `[workspace]` IS a workspace root —
-    // lockfile or not — so the walk never proceeds to an outer workspace
-    // (PR #314 review).
-    let own = lockfile_in_dir(repo_root, &segments, cache);
-    if !matches!(own, LockfileStatus::Absent) {
-        return own;
-    }
+    // A manifest that itself declares `[workspace]` IS a workspace root —
+    // its own directory's lockfile state is authoritative (PR #314 review).
     if matches!(
-        workspace_facts_in_dir(repo_root, &segments, cache),
+        workspace_facts_in_dir(repo_root, &manifest_dir, cache),
         WorkspaceFacts::Workspace { .. }
     ) {
-        return LockfileStatus::Absent;
+        return lockfile_in_dir(repo_root, &manifest_dir, cache);
     }
 
     loop {
         if segments.pop().is_none() {
-            return LockfileStatus::Absent;
+            // No owning workspace anywhere above: a standalone package's
+            // own-directory lockfile (or its absence) is its own.
+            return lockfile_in_dir(repo_root, &manifest_dir, cache);
         }
         match workspace_facts_in_dir(repo_root, &segments, cache) {
-            // The first `[workspace]`-declaring ancestor is the crate's
-            // workspace root, whether or not a lockfile sits beside it:
-            // membership decides between that root's own lockfile state and
-            // a standalone `no_lockfile` — never an outer lockfile.
+            // The first `[workspace]`-declaring ancestor is the candidate
+            // workspace root, whether or not a lockfile sits beside it.
             WorkspaceFacts::Workspace {
                 members,
                 exclude,
@@ -632,12 +632,20 @@ fn nearest_lockfile(
                     || path_members.iter().any(|member| member == &rel))
                     && !exclude.iter().any(|glob| member_glob_match(glob, &rel));
                 if is_member {
+                    // A member ALWAYS resolves through the root's lockfile
+                    // state — Cargo ignores a stale/corrupt local Cargo.lock
+                    // beside a member manifest (PR #314 review).
                     return lockfile_in_dir(repo_root, &segments, cache);
                 }
-                return LockfileStatus::Absent;
+                // Excluded or non-member nested crate: standalone — its own
+                // lockfile state applies, never an unrelated ancestor's.
+                return lockfile_in_dir(repo_root, &manifest_dir, cache);
             }
-            // Membership cannot be verified: never fabricate a resolution.
-            WorkspaceFacts::Unverifiable => return LockfileStatus::Absent,
+            // Membership cannot be verified: never take the ancestor's
+            // lockfile; the manifest's own state is all that is safe.
+            WorkspaceFacts::Unverifiable => {
+                return lockfile_in_dir(repo_root, &manifest_dir, cache);
+            }
             // Not a workspace root (plain package, or a stray lockfile with
             // no manifest): Cargo's discovery walks past it — and past any
             // lockfile it holds.
@@ -732,10 +740,13 @@ fn parse_workspace_facts(text: &str, root_dir: &Path) -> WorkspaceFacts {
 /// workspace members even when `members` does not list them; the closure
 /// grows from the root package (when the root manifest is one) AND from
 /// every explicit members-glob member — so a virtual root's members
-/// contribute their path dependencies too (PR #314 review). Paths escaping
-/// the root directory (`..` or an absolute path beyond it) are outside this
-/// slice and are skipped; each manifest is parsed with `toml_edit` — never
-/// `cargo metadata`.
+/// contribute their path dependencies too (PR #314 review). Directories
+/// matching an `exclude` glob are pruned at traversal time: they never join
+/// and never contribute their own path dependencies, though a dependency
+/// independently reachable from a non-excluded seed still joins. Paths
+/// escaping the root directory (`..` or an absolute path beyond it) are
+/// outside this slice and are skipped; each manifest is parsed with
+/// `toml_edit` — never `cargo metadata`.
 fn path_dependency_closure(
     root_doc: &toml_edit::DocumentMut,
     root_dir: &Path,
@@ -765,6 +776,14 @@ fn path_dependency_closure(
         }
     }
     while let Some(rel) = queue.pop() {
+        // `exclude` removes the package AND everything reachable only
+        // through it: an excluded directory never joins the closure and
+        // never contributes its own path dependencies (PR #314 review).
+        // A dependency that is independently reachable from a non-excluded
+        // seed still joins through that other path.
+        if exclude.iter().any(|glob| member_glob_match(glob, &rel)) {
+            continue;
+        }
         if !closure.insert(rel.clone()) {
             continue;
         }
