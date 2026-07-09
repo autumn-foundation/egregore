@@ -58,6 +58,12 @@ cargo run -- query transitive-callers does_not_exist --graph graph.jsonl      # 
 cargo run -- query transitive-callers <symbol_name> --graph graph.jsonl --max-depth 3
 cargo run -- query transitive-callers <symbol_name> --graph history.graph.jsonl --at <sha>  # commit view
 
+# Direct outbound dependencies of a symbol (issue #123)
+cargo run -- query deps <symbol_name> --graph graph.jsonl          # exit 0 (even when empty)
+cargo run -- query deps <ambiguous_name> --graph graph.jsonl       # exit 1 (candidates listed)
+cargo run -- query deps does_not_exist --graph graph.jsonl         # exit 2 (no_match)
+cargo run -- query deps <symbol_name> --graph history.graph.jsonl --at <sha>  # commit view
+
 # Symbol- and file-level deltas across a commit range (issue #118)
 cargo run -- query deltas <base_sha> <head_sha> --graph history.graph.jsonl  # exit 0 on match
 cargo run -- query deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
@@ -138,6 +144,17 @@ candidate record IDs; `--at`/`--as-of` walk a single-commit history view. Output
 newline-delimited JSON (summary envelope line, then one row per line), byte-identical across
 runs. Rows are reachability leads, never proof of breakage. See
 `docs/cli/transitive-callers.md`.
+
+`eg query deps <handle>` returns the direct outbound dependencies of a symbol (record ID or
+exact name) — its `CALLS`/`IMPLEMENTS`/`IMPORTS`/`REFERENCES` neighbors — each labeled with
+the edge type that produced it and carrying a stable record ID, repo-relative file/span
+handle, and any `CALLS` resolution status (issues #152/#134). Unresolved targets (a call
+with no in-repo definition, or a missing target record) are an explicit `unresolved`
+category with a stable reason, never silently dropped. Ambiguous names exit 1 listing all
+candidate record IDs; `--at`/`--as-of` return the dependency set at a single-commit history
+view. Output is newline-delimited JSON (summary envelope line, then one row per line),
+byte-identical across runs, with a `--format text` mode. Rows are dependency leads, never
+proof of runtime behavior. See `docs/cli/deps.md`.
 
 `eg query deltas <base> <head>` returns the observed structural deltas between two commit
 handles (full SHA or unique prefix) from a `scan-history` graph or embedded store, grouped by

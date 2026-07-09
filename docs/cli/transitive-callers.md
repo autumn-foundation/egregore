@@ -31,7 +31,7 @@ callers are outside the extraction contract).
 | `<HANDLE>` | yes | Stable symbol record ID (`codegraph:vN:<hex>`) or exact symbol name. File paths and task/source handles are rejected (exit `1`). |
 | `--graph <PATH>` | one of | Graph JSONL produced by `eg scan` or `eg scan-history`. |
 | `--data-dir <DIR>` | one of | Embedded `AletheiaDB` store populated by `eg ingest --adapter embedded`. |
-| `--repo <SELECTOR>` | no | Restrict symbol resolution to one repository (see [query.md](query.md#repository-scope---repo-issue-67)). |
+| `--repo <SELECTOR>` | no | Restrict symbol resolution — and `--at`/`--as-of` commit resolution — to one repository (see [query.md](query.md#repository-scope---repo-issue-67)). |
 | `--max-depth N` | no | Inbound walk bound in hops. Default `5`; must be ≥ 1. |
 | `--at <COMMIT>` | no | Walk the graph state at this commit SHA or unique prefix (requires a history store). Mutually exclusive with `--as-of`. |
 | `--as-of <RFC3339>` | no | Walk the graph state at the most recent commit at or before this instant. Mutually exclusive with `--at`. |
@@ -136,7 +136,11 @@ Over a `scan-history` graph or an ingested history store, the walk runs
 against the single-commit snapshot the selector names, reusing recorded
 history output without touching Git state or the working tree. `--as-of`
 resolves to the most recent commit whose valid time is at or before the
-instant; the envelope's `at_commit` reports which commit answered.
+instant; the envelope's `at_commit` reports which commit answered. When
+`--repo` is set, commit resolution happens within the selected repository
+(matching `eg query deltas`): a shared multi-repository store never answers
+from another repository's commits, and an `--at` prefix is never ambiguous
+because of commits outside the selected repository.
 
 ## Example
 

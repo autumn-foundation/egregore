@@ -24,6 +24,7 @@ eg query memory   <HANDLE> --graph <PATH>   [--verified-only]
 eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>]
 eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N]
 eg query transitive-callers <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
+eg query deps     <HANDLE> --graph <PATH>   [--repo <SELECTOR>] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query deltas   <BASE> <HEAD> --graph <PATH> [--repo <SELECTOR>]
 eg query coupling <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--base <COMMIT> --head <COMMIT> | --at <COMMIT> | --as-of <RFC3339>] [--min-support N] [--limit N] [--format json|text]
 eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
@@ -56,6 +57,10 @@ Evidence-backed audit subcommands have their own pages:
   `--max-depth`, deterministic under cycles, honoring `--at`/`--as-of`
   temporal views, with `CALLS` resolution labels propagated along each path
   ([transitive-callers.md](transitive-callers.md), issue #139).
+- `eg query deps` — the **direct outbound dependencies** of a symbol — what it
+  calls, implements, imports, and references — labeled by edge type, with
+  unresolved targets as an explicit category, honoring `--at`/`--as-of`
+  temporal views ([deps.md](deps.md), issue #123).
 - `eg query deltas` — **symbol- and file-level changes between two commits**,
   grouped by stable change class with citable handles
   ([deltas.md](deltas.md), issue #118).
