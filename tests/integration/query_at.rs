@@ -726,3 +726,70 @@ fn query_at_legacy_fallback_prefers_newest_valid_time_over_emission_order() {
     let parsed = run_at_err(&graph, "src/lib.rs:2", 2);
     assert_eq!(parsed["error"]["code"], "no_enclosing_symbol");
 }
+
+// ---------------------------------------------------------------------------
+// --data-dir reads must leave the live embedded store byte-for-byte untouched
+// (PR #306 review follow-up, round 3): opening the embedded engine in place
+// re-persists its on-disk index files, so the query must read a throwaway
+// copy (same contract as the other read-only query lanes)
+// ---------------------------------------------------------------------------
+
+/// Sorted `(relative path, bytes)` fingerprint of every file under `root`
+/// (mirrors `tests/integration/evidence_freshness.rs`).
+#[cfg(feature = "embedded-aletheiadb")]
+fn dir_fingerprint(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let ft = entry.file_type().unwrap();
+            let path = entry.path();
+            if ft.is_dir() {
+                walk(&path, base, out);
+            } else if ft.is_file() {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_at_data_dir_is_strictly_read_only() {
+    let (temp, graph) = fixture_graph();
+    let data_dir = temp.path().join("store");
+    egregore()
+        .arg("ingest")
+        .arg(&graph)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let before = dir_fingerprint(&data_dir);
+    let output = egregore()
+        .args(["query", "at", "src/lib.rs:17", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: Value =
+        serde_json::from_str(std::str::from_utf8(&output).expect("utf8").trim()).expect("json");
+    assert_eq!(parsed["symbol"]["name"], "free_standing");
+
+    let after = dir_fingerprint(&data_dir);
+    assert_eq!(
+        before, after,
+        "query at must leave the live embedded store byte-for-byte untouched"
+    );
+}

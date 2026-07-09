@@ -725,6 +725,9 @@ a panic backtrace frame, a PR diff hunk, or `git blame -L` output — to the
 **smallest enclosing `Symbol` node** whose recorded span contains that line
 (issue #151). Purely a span-containment lookup over already-stored
 `SourceSpan` data: no daemon, no embeddings, no `--embed` store required.
+Strictly read-only: a `--data-dir` embedded store is read through a throwaway
+temporary copy (opening the live engine re-persists its index files), so the
+original store stays byte-for-byte untouched.
 
 ```text
 eg query at <PATH>:<LINE> --graph <PATH>   [--at <COMMIT>] [--repo <SELECTOR>]
