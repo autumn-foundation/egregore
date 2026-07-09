@@ -230,6 +230,12 @@ pub struct WorkspaceDepSpec {
     pub package: Option<String>,
     /// Declared version requirement; `None` for path/git-only templates.
     pub version: Option<String>,
+    /// `false` when the root entry is present but Cargo-invalid — no usable
+    /// string `version`/`path`/`git` source (`serde = {}`, wrong-typed
+    /// `version = 1`, or a non-string non-table value). Inheriting members
+    /// take the uninterpretable diagnostic path instead of fabricating a
+    /// row (PR #314 review); the derived `Default` is deliberately unusable.
+    pub usable: bool,
 }
 
 /// Parsed dependency surface of one manifest.
@@ -405,7 +411,7 @@ pub fn manifest_dependency_records(
             manifest_path,
         )];
     };
-    let (declarations, uninheritable) =
+    let (declarations, uninheritable, inherited_uninterpretable) =
         resolve_workspace_inheritance(parsed.declarations, workspace_deps);
     let mut records: Vec<GraphRecord> = declarations
         .iter()
@@ -425,7 +431,11 @@ pub fn manifest_dependency_records(
             manifest_path,
         ));
     }
-    if parsed.uninterpretable {
+    // Own invalid entries and inherited entries whose root spec exists but
+    // is Cargo-invalid share the uninterpretable discriminator (PR #314
+    // review): both are declarations that cannot be interpreted, distinct
+    // from a root entry that is missing entirely (uninheritable above).
+    if parsed.uninterpretable || inherited_uninterpretable {
         records.push(uninterpretable_dependency_diagnostic(
             repository_id,
             manifest_path,
@@ -443,13 +453,18 @@ pub fn manifest_dependency_records(
 /// `workspace = true` (which Cargo rejects) never overrides the root's.
 /// Entries with no resolvable root context (standalone manifest, or a key
 /// missing from the root table) are dropped — a key-named row would be a
-/// fabrication — and reported via the returned flag.
+/// fabrication — and reported via the first returned flag (uninheritable).
+/// A root entry that EXISTS but is Cargo-invalid (no usable string
+/// `version`/`path`/`git` source) is dropped the same way and reported via
+/// the second flag: an unusable spec is an uninterpretable declaration,
+/// distinct from a missing one (PR #314 review).
 fn resolve_workspace_inheritance(
     declarations: Vec<DeclaredDependency>,
     workspace_deps: Option<&BTreeMap<String, WorkspaceDepSpec>>,
-) -> (Vec<DeclaredDependency>, bool) {
+) -> (Vec<DeclaredDependency>, bool, bool) {
     let mut resolved = Vec::with_capacity(declarations.len());
     let mut uninheritable = false;
+    let mut uninterpretable = false;
     for mut declaration in declarations {
         if !declaration.inherits_workspace {
             resolved.push(declaration);
@@ -460,6 +475,10 @@ fn resolve_workspace_inheritance(
             uninheritable = true;
             continue;
         };
+        if !spec.usable {
+            uninterpretable = true;
+            continue;
+        }
         let real_name = spec.package.clone().unwrap_or_else(|| key.clone());
         declaration.declared_as = (real_name != key).then_some(key);
         declaration.name = real_name;
@@ -475,7 +494,7 @@ fn resolve_workspace_inheritance(
                 .then_with(|| left.declared_as.cmp(&right.declared_as))
         })
     });
-    (resolved, uninheritable)
+    (resolved, uninheritable, uninterpretable)
 }
 
 fn dependency_record(
@@ -1147,23 +1166,34 @@ fn parse_workspace_facts(text: &str, repo_root: &Path, dir_key: &str) -> Workspa
             table
                 .iter()
                 .map(|(key, item)| {
+                    // A table entry needs a usable source — a string
+                    // `version`/`path`/`git` — to be inheritable; Cargo
+                    // rejects `serde = {}` and wrong-typed fields like
+                    // `version = 1`, so an invalid entry stays recorded as
+                    // unusable and inheriting members take the
+                    // uninterpretable diagnostic path (PR #314 review).
                     let spec = item.as_str().map_or_else(
                         || {
                             item.as_table_like()
-                                .map_or_else(WorkspaceDepSpec::default, |entry| WorkspaceDepSpec {
-                                    package: entry
-                                        .get("package")
-                                        .and_then(|v| v.as_str())
-                                        .map(str::to_owned),
-                                    version: entry
-                                        .get("version")
-                                        .and_then(|v| v.as_str())
-                                        .map(str::to_owned),
+                                .map_or_else(WorkspaceDepSpec::default, |entry| {
+                                    let field = |name: &str| {
+                                        entry.get(name).and_then(|v| v.as_str()).map(str::to_owned)
+                                    };
+                                    let version = field("version");
+                                    let usable = version.is_some()
+                                        || field("path").is_some()
+                                        || field("git").is_some();
+                                    WorkspaceDepSpec {
+                                        package: field("package"),
+                                        version,
+                                        usable,
+                                    }
                                 })
                         },
                         |version| WorkspaceDepSpec {
                             package: None,
                             version: Some(version.to_owned()),
+                            usable: true,
                         },
                     );
                     (key.to_owned(), spec)

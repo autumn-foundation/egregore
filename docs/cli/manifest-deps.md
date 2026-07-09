@@ -58,7 +58,10 @@ nor a dependency table (`serde = true`), or a table without a usable
 source (a string `version`/`path`/`git` or `workspace = true`; empty
 tables and wrong-typed fields like `version = 1` or `workspace = "yes"`
 count too — `registry`/`rev`/`branch`/`tag` only refine a source and never
-stand alone) — stamped `symbol_kind: uninterpretable_cargo_dependency`,
+stand alone), including a `{ workspace = true }` entry whose
+`[workspace.dependencies]` root spec exists but is itself invalid (no
+usable string `version`/`path`/`git`) — stamped
+`symbol_kind: uninterpretable_cargo_dependency`,
 the invalid entry skipped — never a key-named row with no requirement —
 while valid sibling entries, including git-only declarations, still
 extract — every response — hit, miss, and empty
@@ -103,7 +106,12 @@ declared entry (manifest key):
   `workspace = true` — which Cargo rejects — never overrides the root's. An
   inherited entry with no resolvable workspace root (or a key missing from
   the root table) yields **no row** — a key-named row would be a
-  fabrication — plus a `skipped_manifest` qualification.
+  fabrication — plus a `skipped_manifest` qualification
+  (`uninheritable_cargo_dependency`); a root spec that exists but is itself
+  Cargo-invalid (no usable string `version`/`path`/`git`, e.g. `serde = {}`
+  or wrong-typed `version = 1`) also yields no row, qualified as
+  `uninterpretable_cargo_dependency`, while a valid path-only root spec
+  still inherits.
 - **`resolved_version`** / **`resolution`** — the manifest resolves against
   the `Cargo.lock` Cargo would actually use: the lockfile of the crate's
   **workspace root** for a member, or its own directory's lockfile for a

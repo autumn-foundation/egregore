@@ -3232,3 +3232,78 @@ fn absolute_in_repo_path_deps_outside_the_workspace_dir_join_the_closure() {
     );
     assert_eq!(by_pkg("helper")["resolved_version"], "1.0.228");
 }
+
+/// PR #314 review: a `[workspace.dependencies]` entry needs a usable source
+/// (a string `version`/`path`/`git`, or the plain-string shorthand) to be
+/// inheritable — Cargo rejects `serde = {}` and wrong-typed fields like
+/// `version = 1`. A member inheriting such an invalid root entry gets no
+/// fabricated row (even when the crate sits in the lockfile) and the
+/// `uninterpretable_cargo_dependency` qualification; a valid path-only
+/// root spec still inherits (pinned).
+#[test]
+fn invalid_workspace_dependency_specs_are_not_inheritable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("m1/src")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        concat!(
+            "[workspace]\nmembers = [\"m1\"]\n\n",
+            "[workspace.dependencies]\n",
+            "serde = {}\n",
+            "itoa = { version = 1 }\n",
+            "ryu = { path = \"ryu-local\" }\n",
+        ),
+    )
+    .expect("root manifest");
+    // serde sits in the lockfile: an invalid inherited entry must never
+    // become a row, let alone a `locked` one.
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\n[[package]]\nname = \"ryu\"\nversion = \"1.0.5\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(
+        repo.join("m1/Cargo.toml"),
+        concat!(
+            "[package]\nname = \"m1\"\nversion = \"0.1.0\"\n\n",
+            "[dependencies]\n",
+            "serde = { workspace = true }\n",
+            "itoa = { workspace = true }\n",
+            "ryu = { workspace = true }\n",
+        ),
+    )
+    .expect("member manifest");
+    fs::write(repo.join("m1/src/lib.rs"), "pub fn m() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("invalid-ws-dep-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let full = run_query_deps(&graph, &[]);
+    let rows = full["declarations"].as_array().expect("declarations");
+    for invalid in ["serde", "itoa"] {
+        assert!(
+            rows.iter().all(|d| d["name"] != invalid),
+            "inheriting an invalid root entry ({invalid}) must not fabricate a row"
+        );
+    }
+    let ryu = rows
+        .iter()
+        .find(|d| d["name"] == "ryu")
+        .expect("a valid path-only root spec still inherits");
+    assert_eq!(ryu["resolution"], "locked");
+    assert_eq!(ryu["resolved_version"], "1.0.5");
+    assert_eq!(
+        skipped_diagnostics(&full).len(),
+        1,
+        "the skipped invalid inherited entries must qualify the answer"
+    );
+
+    let miss = run_query_deps(&graph, &["--name", "serde"]);
+    assert_eq!(miss["count"], 0);
+    assert_eq!(skipped_diagnostics(&miss).len(), 1);
+}
