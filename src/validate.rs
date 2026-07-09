@@ -39,11 +39,16 @@ pub const TOMBSTONE_STRANDS_LIVE_EDGE: &str = "tombstone_strands_live_edge";
 /// stand alone (extractor warnings carry no edges); `Commit`/`Change` records
 /// are always edge-attached by the history producer, and non-code-graph kinds
 /// are out of scope for code-graph reference closure.
-const ORPHANABLE_KINDS: [NodeKind; 4] = [
+/// `DependencyDeclaration` facts are always emitted with their manifest
+/// `File —CONTAINS→ DependencyDeclaration` attribution edge — the ownership
+/// chain `--repo` scoping walks — so an unattached one is a defect
+/// (PR #314 review).
+const ORPHANABLE_KINDS: [NodeKind; 5] = [
     NodeKind::File,
     NodeKind::Module,
     NodeKind::Symbol,
     NodeKind::Import,
+    NodeKind::DependencyDeclaration,
 ];
 
 /// Allowed target node kinds for the typed code-graph relations checked by
@@ -403,8 +408,9 @@ fn check_orphans(
 ///    ID with no surviving node record (`edge_to_tombstoned_record`);
 /// 4. no record is named by a tombstone yet still referenced by a live edge
 ///    (`tombstone_strands_live_edge`);
-/// 5. no topology node (`File`, `Module`, `Symbol`, `Import`) is orphaned
-///    with zero incident edges (`orphan_node`).
+/// 5. no topology node (`File`, `Module`, `Symbol`, `Import`,
+///    `DependencyDeclaration`) is orphaned with zero incident edges
+///    (`orphan_node`).
 ///
 /// The output is deterministic: diagnostics are deduplicated and sorted in
 /// canonical order, so repeated validation of the same input is identical.
@@ -494,6 +500,18 @@ mod tests {
         ];
         let report = validate_records(&records);
         assert!(report.is_clean(), "got {:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn unattached_dependency_declaration_is_an_orphan() {
+        // PR #314 review: a standalone `DependencyDeclaration` without its
+        // `File —CONTAINS→ DependencyDeclaration` attribution edge breaks
+        // the repository-ownership chain `--repo` scoping relies on.
+        let records = vec![node("n:dep", NodeKind::DependencyDeclaration)];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![ORPHAN_NODE]);
+        assert_eq!(report.diagnostics[0].kind, Some("DependencyDeclaration"));
     }
 
     #[test]

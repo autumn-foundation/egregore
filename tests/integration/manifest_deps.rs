@@ -707,6 +707,63 @@ fn query_deps_round_trips_through_the_embedded_store() {
     );
 }
 
+/// Sorted `(relative path, bytes)` fingerprint of every file under `root`
+/// (mirrors `tests/integration/asof_file_symbols.rs`).
+#[cfg(feature = "embedded-aletheiadb")]
+fn dir_fingerprint(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let ft = entry.file_type().unwrap();
+            let path = entry.path();
+            if ft.is_dir() {
+                walk(&path, base, out);
+            } else if ft.is_file() {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// PR #314 review: the store-backed query is strictly read-only. Opening the
+/// embedded engine in place re-persists its on-disk index files, so
+/// `--data-dir` must read from a throwaway copy and leave the live store
+/// byte-for-byte untouched (same contract as the other read-only lanes).
+#[cfg(feature = "embedded-aletheiadb")]
+#[test]
+fn query_manifest_deps_data_dir_is_strictly_read_only() {
+    let (temp, graph) = fixture_graph();
+    let data_dir = temp.path().join("store");
+    egregore()
+        .arg("ingest")
+        .arg(&graph)
+        .args(["--adapter", "embedded", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let before = dir_fingerprint(&data_dir);
+    egregore()
+        .args(["query", "manifest-deps", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+    let after = dir_fingerprint(&data_dir);
+    assert_eq!(
+        before, after,
+        "query manifest-deps must not modify any store file when reading --data-dir"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // PR #314 review: dependency facts must be attributable to their repository
 // ---------------------------------------------------------------------------

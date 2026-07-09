@@ -69,11 +69,13 @@ same input is byte-identical.
 4. **Tombstones stranding live edges** — no record is named by a tombstone yet
    still referenced by a live edge as source or target
    (`tombstone_strands_live_edge`).
-5. **Orphan nodes** — no topology node (`File`, `Module`, `Symbol`, `Import`)
-   has zero incident edges (`orphan_node`). An orphaned symbol is invisible to
-   edge-walking queries such as `eg query file`. `Repository` (the containment
-   root) and `Diagnostic` markers legitimately stand alone and are exempt, as
-   are non-code-graph node kinds.
+5. **Orphan nodes** — no topology node (`File`, `Module`, `Symbol`, `Import`,
+   `DependencyDeclaration`) has zero incident edges (`orphan_node`). An
+   orphaned symbol is invisible to edge-walking queries such as
+   `eg query file`; an unattached dependency declaration has lost the
+   `File —CONTAINS→ DependencyDeclaration` chain repository scoping walks.
+   `Repository` (the containment root) and `Diagnostic` markers legitimately
+   stand alone and are exempt, as are non-code-graph node kinds.
 
 Clean `eg scan` and `eg scan-history` outputs pass all checks.
 
