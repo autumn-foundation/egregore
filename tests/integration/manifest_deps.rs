@@ -2587,3 +2587,130 @@ fn pointer_without_mutual_membership_stays_standalone() {
         "a pointer without mutual membership never adopts the root's lockfile"
     );
 }
+
+/// PR #314 review: explicit OUT-OF-ROOT members (`members = ["../pkgs/app"]`)
+/// must seed the path-dependency closure too — their own path deps join
+/// `path_members`, so a pointer-carrying transitive dep like `pkgs/helper`
+/// passes the pointed root's membership check and resolves from
+/// `ws/Cargo.lock`. An out-of-repo member pattern is skipped (pinned).
+#[test]
+fn out_of_root_members_seed_the_path_dependency_closure() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("ws")).expect("dirs");
+    for dir in ["pkgs/app/src", "pkgs/helper/src", "pkgs/x/src"] {
+        fs::create_dir_all(repo.join(dir)).expect("dirs");
+    }
+    // The escaping member pattern must be skipped, never enumerated.
+    fs::write(
+        repo.join("ws/Cargo.toml"),
+        "[workspace]\nmembers = [\"../pkgs/app\", \"../../evil/*\"]\n",
+    )
+    .expect("ws manifest");
+    fs::write(
+        repo.join("ws/Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("ws lockfile");
+    fs::write(
+        repo.join("pkgs/app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nworkspace = \"../../ws\"\n\n[dependencies]\nhelper = { path = \"../helper\" }\nserde = \"1\"\n",
+    )
+    .expect("app manifest");
+    fs::write(repo.join("pkgs/app/src/lib.rs"), "pub fn a() {}\n").expect("lib");
+    fs::write(
+        repo.join("pkgs/helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nworkspace = \"../../ws\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("helper manifest");
+    fs::write(repo.join("pkgs/helper/src/lib.rs"), "pub fn h() {}\n").expect("lib");
+    // Uncovered pointer-carrying package: honest standalone.
+    fs::write(
+        repo.join("pkgs/x/Cargo.toml"),
+        "[package]\nname = \"pkg-x\"\nversion = \"0.1.0\"\nworkspace = \"../../ws\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("x manifest");
+    fs::write(repo.join("pkgs/x/src/lib.rs"), "pub fn x() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("oor-member-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let rows = parsed["declarations"].as_array().expect("declarations");
+    let by_pkg = |pkg: &str| {
+        rows.iter()
+            .find(|d| d["declaring_package"] == pkg)
+            .unwrap_or_else(|| panic!("row for {pkg}"))
+    };
+    assert_eq!(by_pkg("app")["resolution"], "locked");
+    assert_eq!(
+        by_pkg("helper")["resolution"],
+        "locked",
+        "an out-of-root member's path dependency joins the closure"
+    );
+    assert_eq!(by_pkg("helper")["resolved_version"], "1.0.228");
+    assert_eq!(
+        by_pkg("pkg-x")["resolution"],
+        "no_lockfile",
+        "an uncovered pointer package stays standalone; the escaping pattern admits nothing"
+    );
+}
+
+/// An out-of-root member GLOB (`members = ["../pkgs/*"]`) enumerates the
+/// resolved parent directory, so glob members outside the root's tree seed
+/// the closure and their transitive path deps join too.
+#[test]
+fn out_of_root_member_globs_seed_the_closure() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("ws")).expect("dirs");
+    fs::create_dir_all(repo.join("pkgs/app/src")).expect("dirs");
+    fs::create_dir_all(repo.join("other/lib2/src")).expect("dirs");
+    fs::write(
+        repo.join("ws/Cargo.toml"),
+        "[workspace]\nmembers = [\"../pkgs/*\"]\n",
+    )
+    .expect("ws manifest");
+    fs::write(
+        repo.join("ws/Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("ws lockfile");
+    fs::write(
+        repo.join("pkgs/app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nworkspace = \"../../ws\"\n\n[dependencies]\nlib2 = { path = \"../../other/lib2\" }\nserde = \"1\"\n",
+    )
+    .expect("app manifest");
+    fs::write(repo.join("pkgs/app/src/lib.rs"), "pub fn a() {}\n").expect("lib");
+    fs::write(
+        repo.join("other/lib2/Cargo.toml"),
+        "[package]\nname = \"lib2\"\nversion = \"0.1.0\"\nworkspace = \"../../ws\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("lib2 manifest");
+    fs::write(repo.join("other/lib2/src/lib.rs"), "pub fn l() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("oor-glob-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let rows = parsed["declarations"].as_array().expect("declarations");
+    let by_pkg = |pkg: &str| {
+        rows.iter()
+            .find(|d| d["declaring_package"] == pkg)
+            .unwrap_or_else(|| panic!("row for {pkg}"))
+    };
+    assert_eq!(by_pkg("app")["resolution"], "locked");
+    assert_eq!(
+        by_pkg("lib2")["resolution"],
+        "locked",
+        "a glob member outside the root seeds the closure transitively"
+    );
+}

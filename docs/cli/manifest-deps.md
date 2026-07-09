@@ -115,6 +115,12 @@ declared entry (manifest key):
   package and from every glob member, so a virtual root's members contribute
   their path dependencies too, while an excluded directory is pruned at
   traversal time — neither it nor packages reachable only through it join).
+  Explicit `members` patterns resolve against the root's own directory, so a
+  `../`-relative member outside the root's tree — literal
+  (`members = ["../pkgs/app"]`) or glob (`../pkgs/*`, enumerated under the
+  resolved parent directory) — seeds the closure and contributes its own
+  path dependencies like any other member; a pattern escaping the
+  repository is skipped.
   Target-specific tables (`[target.<cfg>.dependencies]` and the
   `dev-`/`build-` variants) feed this membership closure too, even though
   target-specific dependency rows stay out of extraction scope; so do

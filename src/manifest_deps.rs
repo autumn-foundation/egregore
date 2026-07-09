@@ -1014,14 +1014,10 @@ fn workspace_facts_in_dir(
         candidate.push(segment);
     }
     candidate.push("Cargo.toml");
-    let mut root_dir = repo_root.to_path_buf();
-    for segment in segments {
-        root_dir.push(segment);
-    }
     let facts = match std::fs::read_to_string(&candidate) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => WorkspaceFacts::NoManifest,
         Err(_) => WorkspaceFacts::Unverifiable,
-        Ok(text) => parse_workspace_facts(&text, &root_dir),
+        Ok(text) => parse_workspace_facts(&text, repo_root, &dir_key),
     };
     cache.workspaces.insert(dir_key, facts.clone());
     facts
@@ -1030,8 +1026,10 @@ fn workspace_facts_in_dir(
 /// Classifies one manifest body as a workspace root, a plain package, or
 /// unverifiable. For a workspace root that is also a package, the in-tree
 /// `path = "…"` dependency closure is collected as automatic members
-/// (Cargo semantics; PR #314 review).
-fn parse_workspace_facts(text: &str, root_dir: &Path) -> WorkspaceFacts {
+/// (Cargo semantics; PR #314 review). `dir_key` is the root's repo-relative
+/// `/`-joined directory (`""` = the repository root itself), needed so
+/// `../`-relative member patterns can resolve without escaping the repo.
+fn parse_workspace_facts(text: &str, repo_root: &Path, dir_key: &str) -> WorkspaceFacts {
     let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
         return WorkspaceFacts::Unverifiable;
     };
@@ -1043,7 +1041,7 @@ fn parse_workspace_facts(text: &str, root_dir: &Path) -> WorkspaceFacts {
     };
     let members = string_array(workspace.get("members"));
     let exclude = string_array(workspace.get("exclude"));
-    let path_members = path_dependency_closure(&doc, root_dir, &members, &exclude);
+    let path_members = path_dependency_closure(&doc, repo_root, dir_key, &members, &exclude);
     // `[workspace.dependencies]` inheritance surface: a plain string entry
     // is its own version requirement; a table entry contributes its
     // `package` rename and `version` keys (PR #314 review).
@@ -1100,15 +1098,21 @@ fn parse_workspace_facts(text: &str, root_dir: &Path) -> WorkspaceFacts {
 /// `toml_edit` — never `cargo metadata`.
 fn path_dependency_closure(
     root_doc: &toml_edit::DocumentMut,
-    root_dir: &Path,
+    repo_root: &Path,
+    dir_key: &str,
     members: &[String],
     exclude: &[String],
 ) -> Vec<String> {
+    let root_segments: Vec<&str> = dir_key.split('/').filter(|s| !s.is_empty()).collect();
+    let mut root_dir = repo_root.to_path_buf();
+    for segment in &root_segments {
+        root_dir.push(segment);
+    }
     let mut closure: BTreeSet<String> = BTreeSet::new();
     // The scan root may be relative (`eg scan .`); the absolute-path branch
     // of `normalize_path_dep` compares against the lexically absolutized
     // form, computed once per workspace root (PR #314 review).
-    let abs_root = absolutize_lexical(root_dir);
+    let abs_root = absolutize_lexical(&root_dir);
     // `[workspace.dependencies]` path templates: a member (or the root
     // package) inheriting one via `{ workspace = true }` makes its target
     // an automatic member; the paths are relative to the ROOT (PR #314
@@ -1132,14 +1136,16 @@ fn path_dependency_closure(
     if root_doc.get("package").is_some() {
         enqueue(&manifest_path_dependency_dirs(root_doc), "", &mut queue);
     }
-    if !members.is_empty() {
-        for rel in manifest_dirs_under(root_dir) {
-            if members.iter().any(|glob| member_glob_match(glob, &rel))
-                && !exclude.iter().any(|glob| member_glob_match(glob, &rel))
-            {
-                queue.push(rel);
-            }
-        }
+    // Explicit member seeds (PR #314 review): each pattern is resolved
+    // against the root's directory, so `../`-relative members OUTSIDE the
+    // root's tree seed the closure too. The pattern's leading literal
+    // segments anchor the enumeration directory; `..` resolves against the
+    // root's repo-relative position and a pattern escaping the repository
+    // is skipped (documented). Candidates keep the pattern's own
+    // root-relative form so exclusion checks and membership comparisons
+    // stay consistent.
+    for pattern in members {
+        seed_member_pattern(repo_root, &root_segments, pattern, exclude, &mut queue);
     }
     while let Some(rel) = queue.pop() {
         // `exclude` removes the package AND everything reachable only
@@ -1153,7 +1159,7 @@ fn path_dependency_closure(
         if !closure.insert(rel.clone()) {
             continue;
         }
-        let mut manifest = root_dir.to_path_buf();
+        let mut manifest = root_dir.clone();
         for segment in rel.split('/') {
             manifest.push(segment);
         }
@@ -1167,6 +1173,74 @@ fn path_dependency_closure(
         enqueue(&manifest_path_dependency_dirs(&doc), &rel, &mut queue);
     }
     closure.into_iter().collect()
+}
+
+/// Seeds the closure queue from one `members` pattern (PR #314 review):
+/// the pattern's leading literal segments anchor the enumeration
+/// directory, `..` resolving against the root's repo-relative position —
+/// so `../`-relative members outside the root's tree seed too, while a
+/// pattern escaping the repository is skipped (documented).
+fn seed_member_pattern(
+    repo_root: &Path,
+    root_segments: &[&str],
+    pattern: &str,
+    exclude: &[String],
+    queue: &mut Vec<String>,
+) {
+    fn is_glob_segment(segment: &str) -> bool {
+        segment.contains(['*', '?', '['])
+    }
+    let segments: Vec<&str> = pattern
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    let split = segments
+        .iter()
+        .position(|segment| is_glob_segment(segment))
+        .unwrap_or(segments.len());
+    let (prefix, rest) = segments.split_at(split);
+    let mut anchor_repo: Vec<&str> = root_segments.to_vec();
+    for segment in prefix {
+        if *segment == ".." {
+            if anchor_repo.pop().is_none() {
+                // The pattern escapes the repository: documented skip.
+                return;
+            }
+        } else {
+            anchor_repo.push(segment);
+        }
+    }
+    let prefix_rel = prefix.join("/");
+    let mut anchor_path = repo_root.to_path_buf();
+    for segment in &anchor_repo {
+        anchor_path.push(segment);
+    }
+    if rest.is_empty() {
+        if !prefix_rel.is_empty() && anchor_path.join("Cargo.toml").is_file() {
+            push_candidate(&prefix_rel, pattern, exclude, queue);
+        }
+        return;
+    }
+    for sub in manifest_dirs_under(&anchor_path) {
+        let candidate = if prefix_rel.is_empty() {
+            sub
+        } else {
+            format!("{prefix_rel}/{sub}")
+        };
+        push_candidate(&candidate, pattern, exclude, queue);
+    }
+}
+
+/// Queues one concrete member candidate after the full pattern match and
+/// the exclusion veto — both run on the candidate's root-relative form.
+fn push_candidate(candidate: &str, pattern: &str, exclude: &[String], queue: &mut Vec<String>) {
+    if member_glob_match(pattern, candidate)
+        && !exclude
+            .iter()
+            .any(|glob| member_glob_match(glob, candidate))
+    {
+        queue.push(candidate.to_owned());
+    }
 }
 
 /// Enumerates every directory under `root_dir` (relative, `/`-separated,
@@ -1371,17 +1445,23 @@ fn workspace_dependency_paths(root_doc: &toml_edit::DocumentMut) -> BTreeMap<Str
 
 /// Joins a `/`-separated base (relative to the workspace root; `""` for the
 /// root itself) with a manifest-declared relative path, resolving `.` and
-/// `..` segments. Returns `None` when the result escapes the root — such a
-/// path dependency is outside this slice's membership check.
+/// `..` segments. The base itself may carry leading `..` segments (an
+/// out-of-root member, PR #314 review); a `..` in the path never cancels
+/// one of those and never climbs past them. Returns `None` when the result
+/// escapes the root — such a path dependency is outside this slice's
+/// membership check.
 fn normalize_in_tree_path(base: &str, path: &str) -> Option<String> {
     let mut stack: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
     let normalized = path.replace('\\', "/");
     for segment in normalized.split('/') {
         match segment {
             "" | "." => {}
-            ".." => {
-                stack.pop()?;
-            }
+            ".." => match stack.last() {
+                Some(segment) if *segment != ".." => {
+                    stack.pop();
+                }
+                _ => return None,
+            },
             other => stack.push(other),
         }
     }
