@@ -623,3 +623,89 @@ fn churn_text_format_lists_ranking() {
         "rows past the limit must not leak into text output"
     );
 }
+
+/// A `CHANGED_IN` edge without temporal provenance (the retractable class per
+/// `eg forget`: commit-anchored edges stay retractable and the edge read path
+/// must honor tombstones).
+fn changed_in_untemporal(source: &str, target: &str) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::ChangedIn,
+        source.to_owned(),
+        target.to_owned(),
+        None,
+        String::new(),
+    )
+}
+
+fn tombstone_of(record: &GraphRecord, tombstone_id: &str) -> GraphRecord {
+    GraphRecord::Tombstone {
+        id: tombstone_id.to_owned(),
+        schema_version: 4,
+        deleted_id: record.id().to_owned(),
+        summary: format!("retracted {}", record.id()),
+        producer: None,
+    }
+}
+
+#[test]
+fn churn_excludes_retracted_change_edges_but_keeps_historical_provenance() {
+    // file:a's only change marker is a retracted (tombstoned, non-temporal)
+    // edge: it must not rank at all.
+    let retracted_only = changed_in_untemporal("file:a", "commit:1");
+    let retracted_only_tombstone = tombstone_of(&retracted_only, "tombstone:edge-a");
+    // file:b has one live temporal edge and one retracted non-temporal edge:
+    // the retracted edge must not inflate the count.
+    let b_live = changed_in("file:b", "commit:1", "c1", "2026-01-01T00:00:00Z");
+    let b_retracted = changed_in_untemporal("file:b", "commit:2");
+    let b_retracted_tombstone = tombstone_of(&b_retracted, "tombstone:edge-b");
+    // file:c's change edge carries temporal provenance; a current-state
+    // tombstone on its stable ID does not erase the historical fact
+    // (convention shared with `eg query changes` / `eg query subsystem`).
+    let c_temporal = changed_in("file:c", "commit:1", "c1", "2026-01-01T00:00:00Z");
+    let c_tombstone = tombstone_of(&c_temporal, "tombstone:edge-c");
+
+    let records = vec![
+        repo_node("repo:main", "main-repo"),
+        commit_node("commit:1", "c1", &[], "2026-01-01T00:00:00Z"),
+        commit_node("commit:2", "c2", &["c1"], "2026-01-02T00:00:00Z"),
+        contains("repo:main", "commit:1"),
+        contains("repo:main", "commit:2"),
+        file_node("file:a", "src/a.rs", "c1", "2026-01-01T00:00:00Z"),
+        file_node("file:b", "src/b.rs", "c1", "2026-01-01T00:00:00Z"),
+        file_node("file:c", "src/c.rs", "c1", "2026-01-01T00:00:00Z"),
+        contains("repo:main", "file:a"),
+        contains("repo:main", "file:b"),
+        contains("repo:main", "file:c"),
+        retracted_only,
+        retracted_only_tombstone,
+        b_live,
+        b_retracted,
+        b_retracted_tombstone,
+        c_temporal,
+        c_tombstone,
+    ];
+    let (_temp, graph) = write_graph(&records);
+
+    let parsed = run_churn_json(&graph, &[]);
+    let files = parsed["result"]["files"].as_array().expect("files array");
+    assert_eq!(
+        files.len(),
+        2,
+        "a file whose only change marker was retracted must not rank"
+    );
+    assert_eq!(files[0]["file_record_id"], "file:b");
+    assert_eq!(
+        files[0]["commit_count"], 1,
+        "a retracted change edge must not inflate the commit count"
+    );
+    assert_eq!(files[1]["file_record_id"], "file:c");
+    assert_eq!(
+        files[1]["commit_count"], 1,
+        "a temporal change edge keeps its historical provenance despite a tombstone"
+    );
+    let rendered = serde_json::to_string(&parsed).expect("serialize");
+    assert!(
+        !rendered.contains("src/a.rs"),
+        "fully retracted file must not appear anywhere in the answer"
+    );
+}

@@ -45,6 +45,12 @@ eg query churn --graph history.graph.jsonl --limit 10 --format text
   #99), and non-source files (e.g. `README.md`) do not rank.
 - A source file deleted mid-history still ranks on the commits that touched it
   while it existed: its temporal `File` records remain citable.
+- Retraction tombstones on the change edge itself are honored: a retracted
+  (tombstoned, non-temporal) `CHANGED_IN` edge never counts, and a file whose
+  only change marker was retracted does not rank. An edge carrying commit
+  provenance (temporal metadata) is a historical fact exempt from
+  current-state tombstone suppression — the same convention as
+  `eg query changes` and the `eg forget` retraction contract.
 - This reads committed history only — live working-tree edits and uncommitted
   churn are invisible to the ranking.
 

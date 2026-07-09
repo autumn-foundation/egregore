@@ -18886,14 +18886,24 @@ pub fn file_churn(
     let mut changed_commits: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for record in records {
         let GraphRecord::Edge {
+            id,
             label: EdgeLabel::ChangedIn,
             source,
             target,
+            temporal,
             ..
         } = record
         else {
             continue;
         };
+        // Honor retraction tombstones on the change edge itself: a retracted
+        // relationship must not count toward churn. Temporal guard shared with
+        // `changes_context` / subsystem seeding — an edge carrying commit
+        // provenance is a historical fact exempt from current-state tombstone
+        // suppression (`eg forget` refuses such targets for the same reason).
+        if temporal.is_none() && tombstoned.contains(id.as_str()) {
+            continue;
+        }
         if !files.contains_key(source.as_str()) {
             continue;
         }
