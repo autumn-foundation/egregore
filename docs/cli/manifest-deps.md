@@ -51,9 +51,12 @@ store), every response — hit, miss, and empty surface — carries one
 manifest handle (`detail`) and the `Diagnostic` record ID (`record_id`) in
 deterministic path order. A `no_match_for_name` accompanied by
 `skipped_manifest` is **not** a definitive "we don't depend on X": the skipped
-manifest's declarations are unknown. Exit codes are unchanged, and these
-diagnostics carry no repository topology, so `--repo` scoping never drops
-them.
+manifest's declarations are unknown. Exit codes are unchanged. Each diagnostic
+is attributed to its repository (`Repository —CONTAINS→ Diagnostic` topology)
+and carries the owning repository label; under `--repo`, coverage holes owned
+by **other** repositories are dropped, while unattributable legacy diagnostics
+are always included — their absent `repository` field is the marker — because
+hiding a possible coverage hole would be worse than over-reporting one.
 
 ## How the facts are captured
 
@@ -78,16 +81,20 @@ declared entry (manifest key):
   (pure `path`/`git`/`workspace = true` dependencies) — never fabricated.
 - **`resolved_version`** / **`resolution`** — the manifest resolves against
   the `Cargo.lock` Cargo would actually use: its own directory's lockfile, or
-  an ancestor directory's lockfile **only when that ancestor's `Cargo.toml`
-  declares a `[workspace]` whose `members` globs include the crate and whose
-  `exclude` globs do not** (the standard workspace layout keeps one root
-  lockfile). An independent nested crate outside the members globs, or an
-  excluded member, gets `no_lockfile` — never a fabricated `locked` from an
-  unrelated ancestor. Plain package manifests and stray lockfiles without a
-  manifest are walked past, mirroring Cargo's workspace discovery; an
-  unreadable ancestor manifest stops the walk without accepting anything.
-  (`package.workspace` explicit-pointer keys are not interpreted in this
-  slice.)
+  the lockfile of the crate's **workspace root**. The walk stops at the first
+  `[workspace]`-declaring manifest — the manifest's own, or the first
+  ancestor's — whether or not a lockfile sits beside it: a lockfile-less
+  workspace root means `no_lockfile`, never an outer lockfile even when an
+  outer workspace's globs would match. Membership at an ancestor root means
+  the `members` globs include the crate (and `exclude` does not) **or** the
+  root package reaches it through in-tree `path = "…"` dependencies
+  (transitively — Cargo's automatic members). Non-members and excluded
+  members get `no_lockfile` — never a fabricated `locked` from an unrelated
+  ancestor. Plain package manifests and stray lockfiles without a manifest
+  are walked past, mirroring Cargo's workspace discovery; an unreadable
+  ancestor manifest stops the walk without accepting anything. (`.."-escaping
+  path dependencies and `package.workspace` explicit-pointer keys are not
+  interpreted in this slice.)
   A parseable declared requirement gates **every** path with Cargo semantics
   (`"1"` means `^1`), including a sole locked version that a stale or shared
   lockfile can leave unsatisfying: exactly one satisfying version is

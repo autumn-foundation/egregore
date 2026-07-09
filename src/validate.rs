@@ -54,6 +54,9 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
         EdgeLabel::Contains => Some(&[
             NodeKind::Change,
             NodeKind::Commit,
+            // Repository —CONTAINS→ Diagnostic attributes skipped-manifest
+            // coverage holes to their repository (issue #180).
+            NodeKind::Diagnostic,
             // `File CONTAINS DebtMarker` attributes debt-comment markers
             // (issue #218) to their owning file.
             NodeKind::DebtMarker,

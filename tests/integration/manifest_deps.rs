@@ -1250,3 +1250,197 @@ fn ancestor_lockfile_only_resolves_genuine_workspace_members() {
     );
     assert!(independent["resolved_version"].is_null());
 }
+
+// ---------------------------------------------------------------------------
+// PR #314 review: a [workspace]-declaring manifest is a root, lockfile or not
+// ---------------------------------------------------------------------------
+
+/// A nested directory whose `Cargo.toml` declares `[workspace]` is a
+/// workspace ROOT: Cargo would create/use the lockfile there, never an outer
+/// one — even when an outer workspace's member globs would match. Without its
+/// own lockfile the answer is `no_lockfile`, never the outer resolution.
+#[test]
+fn nested_workspace_root_without_lockfile_never_uses_outer_lockfile() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("crates/innerws/pkgs/leaf/src")).expect("dirs");
+    fs::create_dir_all(repo.join("crates/innerws/src")).expect("dirs");
+    // Outer workspace with a lockfile and a deep glob that would match.
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/**\"]\n",
+    )
+    .expect("outer manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("outer lockfile");
+    // Inner workspace ROOT (package + [workspace]), no lockfile of its own.
+    fs::write(
+        repo.join("crates/innerws/Cargo.toml"),
+        "[package]\nname = \"innerws\"\nversion = \"0.1.0\"\n\n[workspace]\nmembers = [\"pkgs/*\"]\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("inner root manifest");
+    fs::write(repo.join("crates/innerws/src/lib.rs"), "pub fn i() {}\n").expect("lib");
+    // A member of the INNER workspace.
+    fs::write(
+        repo.join("crates/innerws/pkgs/leaf/Cargo.toml"),
+        "[package]\nname = \"leaf\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("leaf manifest");
+    fs::write(
+        repo.join("crates/innerws/pkgs/leaf/src/lib.rs"),
+        "pub fn l() {}\n",
+    )
+    .expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("innerws-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    assert_eq!(declarations.len(), 2);
+    for declaration in declarations {
+        assert_eq!(
+            declaration["resolution"], "no_lockfile",
+            "{}: the inner workspace root has no lockfile; the outer one is never consulted",
+            declaration["declaring_package"]
+        );
+        assert!(declaration["resolved_version"].is_null());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR #314 review: in-tree path dependencies join the workspace automatically
+// ---------------------------------------------------------------------------
+
+/// Cargo treats a workspace-root package's in-tree `path = "…"` dependencies
+/// (transitively) as workspace members even when `members` does not list
+/// them; they resolve from the root lockfile.
+#[test]
+fn path_dependencies_join_the_workspace_for_lockfile_resolution() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("crates/helper/sub/src")).expect("dirs");
+    fs::create_dir_all(repo.join("crates/helper/src")).expect("dirs");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    // Root package + empty [workspace]: helper is a member only via the
+    // path dependency; sub joins transitively through helper.
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"root-pkg\"\nversion = \"0.1.0\"\n\n[workspace]\n\n[dependencies]\nhelper = { path = \"crates/helper\" }\nserde = \"1\"\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+    fs::write(
+        repo.join("crates/helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n\n[dependencies]\nsub = { path = \"sub\" }\nserde = \"1\"\n",
+    )
+    .expect("helper manifest");
+    fs::write(repo.join("crates/helper/src/lib.rs"), "pub fn h() {}\n").expect("lib");
+    fs::write(
+        repo.join("crates/helper/sub/Cargo.toml"),
+        "[package]\nname = \"sub\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("sub manifest");
+    fs::write(repo.join("crates/helper/sub/src/lib.rs"), "pub fn s() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("pathdep-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    assert_eq!(
+        declarations.len(),
+        3,
+        "root, helper, and sub all declare serde"
+    );
+    for declaration in declarations {
+        assert_eq!(
+            declaration["resolution"], "locked",
+            "{}: path-dependency members resolve from the root lockfile",
+            declaration["declaring_package"]
+        );
+        assert_eq!(declaration["resolved_version"], "1.0.228");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR #314 review: --repo scoping applies to skipped-manifest diagnostics
+// ---------------------------------------------------------------------------
+
+/// Two merged repos where only repo B has a malformed manifest: a query
+/// scoped to repo A must not be qualified by B's coverage hole, a query
+/// scoped to B must be, and an unscoped query reports it (with its owning
+/// repository label).
+fn two_repo_one_broken_graph() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    for (dir, broken) in [("repo-a", false), ("repo-b", true)] {
+        let root = temp.path().join(dir);
+        fs::create_dir_all(root.join("src")).expect("dirs");
+        fs::write(
+            root.join("Cargo.toml"),
+            format!("[package]\nname = \"{dir}-pkg\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n"),
+        )
+        .expect("manifest");
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").expect("lib");
+        if broken {
+            fs::create_dir_all(root.join("crates/broken")).expect("dirs");
+            fs::write(root.join("crates/broken/Cargo.toml"), "[package\nbroken =")
+                .expect("broken manifest");
+        }
+    }
+    let mut merged = String::new();
+    for dir in ["repo-a", "repo-b"] {
+        merged.push_str(
+            &scan_repository_at_with_override(temp.path().join(dir), FIXED_TIME, Some(dir))
+                .expect("fixture should scan")
+                .to_jsonl()
+                .expect("graph should serialize"),
+        );
+    }
+    let graph = temp.path().join("merged.jsonl");
+    fs::write(&graph, merged).expect("write merged graph");
+    (temp, graph)
+}
+
+#[test]
+fn repo_scoped_queries_drop_foreign_skipped_manifest_diagnostics() {
+    let (_temp, graph) = two_repo_one_broken_graph();
+
+    // Scoped to the clean repo: no foreign coverage-hole qualification.
+    let scoped_a = run_query_deps(&graph, &["--repo", "repo-a"]);
+    assert!(
+        skipped_diagnostics(&scoped_a).is_empty(),
+        "repo A's answer must not be qualified by repo B's malformed manifest"
+    );
+
+    // Scoped to the broken repo: its own hole is surfaced.
+    let scoped_b = run_query_deps(&graph, &["--repo", "repo-b"]);
+    let b_skipped = skipped_diagnostics(&scoped_b);
+    assert_eq!(b_skipped.len(), 1);
+    assert_eq!(b_skipped[0]["detail"], "crates/broken/Cargo.toml");
+
+    // Unscoped: the hole is reported and attributed.
+    let unscoped = run_query_deps(&graph, &[]);
+    let all_skipped = skipped_diagnostics(&unscoped);
+    assert_eq!(all_skipped.len(), 1);
+    assert_eq!(
+        all_skipped[0]["repository"], "repo-b",
+        "unscoped diagnostics carry their owning repository label"
+    );
+}

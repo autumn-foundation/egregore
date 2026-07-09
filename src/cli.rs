@@ -11295,6 +11295,10 @@ struct ManifestDepsDiagnosticJson<'a> {
     /// Citing record ID for record-backed diagnostics (`skipped_manifest`).
     #[serde(skip_serializing_if = "Option::is_none")]
     record_id: Option<&'a str>,
+    /// Owning repository display label for record-backed diagnostics; absent
+    /// when the record cannot be attributed (legacy graphs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
 }
 
 /// Top-level `query manifest-deps` response envelope.
@@ -11389,6 +11393,63 @@ fn collect_manifest_deps_rows<'a>(
     rows
 }
 
+/// Skipped-manifest honesty (PR #314 review): an unreadable/unparseable
+/// manifest means dependency coverage has holes, so every answer — hit,
+/// miss, and empty surface — is qualified with one `skipped_manifest`
+/// diagnostic per skipped manifest (repo-relative handle + Diagnostic record
+/// ID + owning repository label, deterministic order). Diagnostics are
+/// attributed via the Repository —CONTAINS→ Diagnostic topology; under
+/// `--repo`, holes owned by OTHER repositories are dropped, while
+/// unattributable legacy diagnostics are always included (their absent
+/// `repository` field is the marker) — hiding a possible coverage hole would
+/// be worse than over-reporting one.
+fn collect_skipped_manifest_diagnostics<'a>(
+    records: &'a [GraphRecord],
+    index: &'a query::RepositoryIndex,
+    repo_scope: Option<&str>,
+) -> Vec<ManifestDepsDiagnosticJson<'a>> {
+    let mut skipped: Vec<(&str, &str, Option<&str>)> = records
+        .iter()
+        .filter_map(|record| {
+            let GraphRecord::Node {
+                id,
+                kind: NodeKind::Diagnostic,
+                repo_relative_path: Some(path),
+                symbol_kind: Some(symbol_kind),
+                ..
+            } = record
+            else {
+                return None;
+            };
+            if symbol_kind != crate::manifest_deps::SKIPPED_MANIFEST_DIAGNOSTIC_KIND {
+                return None;
+            }
+            let owner = index.owner_of(id);
+            if let Some(scope) = repo_scope
+                && owner.is_some_and(|owner| owner != scope)
+            {
+                return None;
+            }
+            Some((
+                path.as_str(),
+                id.as_str(),
+                owner.and_then(|repo_id| index.display_of(repo_id)),
+            ))
+        })
+        .collect();
+    skipped.sort_unstable();
+    skipped.dedup();
+    skipped
+        .into_iter()
+        .map(|(path, record_id, repository)| ManifestDepsDiagnosticJson {
+            code: "skipped_manifest",
+            detail: Some(path),
+            record_id: Some(record_id),
+            repository,
+        })
+        .collect()
+}
+
 /// `eg query manifest-deps` (issue #180): list declared Cargo dependencies
 /// with their lockfile resolution and repository attribution, or answer a
 /// direct `--name` lookup. Deterministic, byte-identical output; an empty
@@ -11412,46 +11473,19 @@ fn query_manifest_deps_cmd(
             code: "empty_dependency_surface",
             detail: None,
             record_id: None,
+            repository: None,
         });
     } else if rows.is_empty() {
         diagnostics.push(ManifestDepsDiagnosticJson {
             code: "no_match_for_name",
             detail: name_filter,
             record_id: None,
+            repository: None,
         });
     }
-    // Skipped-manifest honesty (PR #314 review): an unreadable/unparseable
-    // manifest means dependency coverage has holes, so every answer — hit,
-    // miss, and empty surface — is qualified with one `skipped_manifest`
-    // diagnostic per skipped manifest (repo-relative handle + Diagnostic
-    // record ID, deterministic order). These diagnostics carry no repository
-    // topology, so `--repo` scoping never drops them.
-    let mut skipped: Vec<(&str, &str)> = records
-        .iter()
-        .filter_map(|record| {
-            let GraphRecord::Node {
-                id,
-                kind: NodeKind::Diagnostic,
-                repo_relative_path: Some(path),
-                symbol_kind: Some(symbol_kind),
-                ..
-            } = record
-            else {
-                return None;
-            };
-            (symbol_kind == crate::manifest_deps::SKIPPED_MANIFEST_DIAGNOSTIC_KIND)
-                .then_some((path.as_str(), id.as_str()))
-        })
-        .collect();
-    skipped.sort_unstable();
-    skipped.dedup();
-    for (path, record_id) in skipped {
-        diagnostics.push(ManifestDepsDiagnosticJson {
-            code: "skipped_manifest",
-            detail: Some(path),
-            record_id: Some(record_id),
-        });
-    }
+    diagnostics.extend(collect_skipped_manifest_diagnostics(
+        records, index, repo_scope,
+    ));
 
     match format {
         OutputFormat::Json => {

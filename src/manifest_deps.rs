@@ -420,6 +420,18 @@ fn dependency_record(
 /// without matching summary text.
 pub const SKIPPED_MANIFEST_DIAGNOSTIC_KIND: &str = "unparseable_cargo_manifest";
 
+/// Attaches a skipped-manifest `Diagnostic` to its repository so a shared
+/// multi-repo store can scope and label the coverage hole (PR #314 review).
+fn diagnostic_repo_edge(repository_id: &str, diagnostic_id: &str) -> GraphRecord {
+    GraphRecord::edge(
+        EdgeLabel::Contains,
+        repository_id.to_owned(),
+        diagnostic_id.to_owned(),
+        Some("1.0".to_owned()),
+        "Repository contains skipped-manifest diagnostic".to_owned(),
+    )
+}
+
 fn unparseable_manifest_diagnostic(repository_id: &str, manifest_path: &str) -> GraphRecord {
     let mut record = GraphRecord::node(
         stable_id(&[
@@ -458,10 +470,10 @@ pub fn scan_dependency_records(repo_root: &Path, repository_id: &str) -> Result<
         let Ok(manifest_text) = std::fs::read_to_string(&manifest.path) else {
             // An unreadable manifest is reported like an unparseable one:
             // a diagnostic fact, never a failed scan.
-            records.push(unparseable_manifest_diagnostic(
-                repository_id,
-                &manifest.repo_relative_path,
-            ));
+            let diagnostic =
+                unparseable_manifest_diagnostic(repository_id, &manifest.repo_relative_path);
+            records.push(diagnostic_repo_edge(repository_id, diagnostic.id()));
+            records.push(diagnostic);
             continue;
         };
         let lockfile =
@@ -482,6 +494,14 @@ pub fn scan_dependency_records(repo_root: &Path, repository_id: &str) -> Result<
             .filter(|record| record.node_kind_name() == Some("DependencyDeclaration"))
             .map(|record| record.id().to_owned())
             .collect();
+        // Skipped-manifest Diagnostic records join the repository topology
+        // (Repository —CONTAINS→ Diagnostic) so `RepositoryIndex` can own
+        // them and `--repo` scoping applies (PR #314 review).
+        for record in &manifest_records {
+            if record.node_kind_name() == Some("Diagnostic") {
+                records.push(diagnostic_repo_edge(repository_id, record.id()));
+            }
+        }
         if dependency_ids.is_empty() {
             records.extend(manifest_records);
         } else {
@@ -530,10 +550,13 @@ enum WorkspaceFacts {
     /// A plain package manifest (no `[workspace]` table): its lockfile covers
     /// only itself; Cargo's workspace discovery walks past it.
     PackageOnly,
-    /// A workspace root: `members` / `exclude` globs decide coverage.
+    /// A workspace root: `members` / `exclude` globs plus the root package's
+    /// in-tree `path = "…"` dependencies (transitively — Cargo treats them as
+    /// automatic members) decide coverage.
     Workspace {
         members: Vec<String>,
         exclude: Vec<String>,
+        path_members: Vec<String>,
     },
 }
 
@@ -574,35 +597,51 @@ fn nearest_lockfile(
     // Drop the `Cargo.toml` file name, keeping the containing directory.
     segments.pop();
     let manifest_dir: Vec<&str> = segments.clone();
+
+    // The manifest's own directory: its lockfile is unconditionally its own,
+    // and a manifest that itself declares `[workspace]` IS a workspace root —
+    // lockfile or not — so the walk never proceeds to an outer workspace
+    // (PR #314 review).
+    let own = lockfile_in_dir(repo_root, &segments, cache);
+    if !matches!(own, LockfileStatus::Absent) {
+        return own;
+    }
+    if matches!(
+        workspace_facts_in_dir(repo_root, &segments, cache),
+        WorkspaceFacts::Workspace { .. }
+    ) {
+        return LockfileStatus::Absent;
+    }
+
     loop {
-        let status = lockfile_in_dir(repo_root, &segments, cache);
-        let is_own_dir = segments.len() == manifest_dir.len();
-        if !matches!(status, LockfileStatus::Absent) {
-            if is_own_dir {
-                // A package's own directory's lockfile is its own.
-                return status;
-            }
-            match workspace_facts_in_dir(repo_root, &segments, cache) {
-                WorkspaceFacts::Workspace { members, exclude } => {
-                    let rel = manifest_dir[segments.len()..].join("/");
-                    let is_member = members.iter().any(|glob| member_glob_match(glob, &rel))
-                        && !exclude.iter().any(|glob| member_glob_match(glob, &rel));
-                    if is_member {
-                        return status;
-                    }
-                    // Cargo stops at the first workspace root: a non-member or
-                    // excluded crate is standalone and never resolves from
-                    // this (or any higher) ancestor lockfile.
-                    return LockfileStatus::Absent;
-                }
-                // Membership cannot be verified: never fabricate a resolution.
-                WorkspaceFacts::Unverifiable => return LockfileStatus::Absent,
-                // Not a workspace root: Cargo's discovery walks past it.
-                WorkspaceFacts::NoManifest | WorkspaceFacts::PackageOnly => {}
-            }
-        }
         if segments.pop().is_none() {
             return LockfileStatus::Absent;
+        }
+        match workspace_facts_in_dir(repo_root, &segments, cache) {
+            // The first `[workspace]`-declaring ancestor is the crate's
+            // workspace root, whether or not a lockfile sits beside it:
+            // membership decides between that root's own lockfile state and
+            // a standalone `no_lockfile` — never an outer lockfile.
+            WorkspaceFacts::Workspace {
+                members,
+                exclude,
+                path_members,
+            } => {
+                let rel = manifest_dir[segments.len()..].join("/");
+                let is_member = (members.iter().any(|glob| member_glob_match(glob, &rel))
+                    || path_members.iter().any(|member| member == &rel))
+                    && !exclude.iter().any(|glob| member_glob_match(glob, &rel));
+                if is_member {
+                    return lockfile_in_dir(repo_root, &segments, cache);
+                }
+                return LockfileStatus::Absent;
+            }
+            // Membership cannot be verified: never fabricate a resolution.
+            WorkspaceFacts::Unverifiable => return LockfileStatus::Absent,
+            // Not a workspace root (plain package, or a stray lockfile with
+            // no manifest): Cargo's discovery walks past it — and past any
+            // lockfile it holds.
+            WorkspaceFacts::NoManifest | WorkspaceFacts::PackageOnly => {}
         }
     }
 }
@@ -651,18 +690,24 @@ fn workspace_facts_in_dir(
         candidate.push(segment);
     }
     candidate.push("Cargo.toml");
+    let mut root_dir = repo_root.to_path_buf();
+    for segment in segments {
+        root_dir.push(segment);
+    }
     let facts = match std::fs::read_to_string(&candidate) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => WorkspaceFacts::NoManifest,
         Err(_) => WorkspaceFacts::Unverifiable,
-        Ok(text) => parse_workspace_facts(&text),
+        Ok(text) => parse_workspace_facts(&text, &root_dir),
     };
     cache.workspaces.insert(dir_key, facts.clone());
     facts
 }
 
 /// Classifies one manifest body as a workspace root, a plain package, or
-/// unverifiable.
-fn parse_workspace_facts(text: &str) -> WorkspaceFacts {
+/// unverifiable. For a workspace root that is also a package, the in-tree
+/// `path = "…"` dependency closure is collected as automatic members
+/// (Cargo semantics; PR #314 review).
+fn parse_workspace_facts(text: &str, root_dir: &Path) -> WorkspaceFacts {
     let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
         return WorkspaceFacts::Unverifiable;
     };
@@ -672,10 +717,96 @@ fn parse_workspace_facts(text: &str) -> WorkspaceFacts {
     else {
         return WorkspaceFacts::PackageOnly;
     };
+    let path_members = if doc.get("package").is_some() {
+        path_dependency_closure(&doc, root_dir)
+    } else {
+        Vec::new()
+    };
     WorkspaceFacts::Workspace {
         members: string_array(workspace.get("members")),
         exclude: string_array(workspace.get("exclude")),
+        path_members,
     }
+}
+
+/// Collects the transitive in-tree `path = "…"` dependency directories of a
+/// workspace-root package, relative to the root. Cargo treats these as
+/// automatic workspace members even when `members` does not list them.
+/// Paths escaping the root directory (`..` beyond it) are outside this
+/// slice and are skipped; each manifest is parsed with `toml_edit` — never
+/// `cargo metadata`.
+fn path_dependency_closure(root_doc: &toml_edit::DocumentMut, root_dir: &Path) -> Vec<String> {
+    let mut closure: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<String> = manifest_path_dependency_dirs(root_doc)
+        .into_iter()
+        .filter_map(|path| normalize_in_tree_path("", &path))
+        .collect();
+    while let Some(rel) = queue.pop() {
+        if !closure.insert(rel.clone()) {
+            continue;
+        }
+        let mut manifest = root_dir.to_path_buf();
+        for segment in rel.split('/') {
+            manifest.push(segment);
+        }
+        manifest.push("Cargo.toml");
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            continue;
+        };
+        let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+            continue;
+        };
+        for path in manifest_path_dependency_dirs(&doc) {
+            if let Some(next) = normalize_in_tree_path(&rel, &path) {
+                queue.push(next);
+            }
+        }
+    }
+    closure.into_iter().collect()
+}
+
+/// Extracts the `path = "…"` values from a manifest's three captured
+/// dependency tables.
+fn manifest_path_dependency_dirs(doc: &toml_edit::DocumentMut) -> Vec<String> {
+    let mut dirs = Vec::new();
+    for kind in DEPENDENCY_KINDS {
+        let Some(table) = doc
+            .get(kind.table())
+            .and_then(toml_edit::Item::as_table_like)
+        else {
+            continue;
+        };
+        for (_, item) in table.iter() {
+            if let Some(spec) = item.as_table_like()
+                && let Some(path) = spec.get("path").and_then(|value| value.as_str())
+            {
+                dirs.push(path.to_owned());
+            }
+        }
+    }
+    dirs
+}
+
+/// Joins a `/`-separated base (relative to the workspace root; `""` for the
+/// root itself) with a manifest-declared relative path, resolving `.` and
+/// `..` segments. Returns `None` when the result escapes the root — such a
+/// path dependency is outside this slice's membership check.
+fn normalize_in_tree_path(base: &str, path: &str) -> Option<String> {
+    let mut stack: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
+    let normalized = path.replace('\\', "/");
+    for segment in normalized.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                stack.pop()?;
+            }
+            other => stack.push(other),
+        }
+    }
+    if stack.is_empty() {
+        return None;
+    }
+    Some(stack.join("/"))
 }
 
 /// Extracts a TOML string array (`members` / `exclude`) as owned strings with
