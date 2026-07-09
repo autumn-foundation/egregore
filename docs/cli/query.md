@@ -32,10 +32,10 @@ eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
 eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--include-private] [--format json|text]
 eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--threshold <PERCENT>] [--limit N] [--format json|text]
 eg query unreferenced     --graph <PATH>   [--repo <SELECTOR>]
-
 eg query at       <PATH>:<LINE> --graph <PATH> [--at <COMMIT>] [--repo <SELECTOR>]
-
 eg query manifest-deps    --graph <PATH>   [--name <CRATE>] [--repo <SELECTOR>] [--format json|text]
+eg query churn            --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--format json|text]
+eg query churn            --data-dir <DIR>  [--repo <SELECTOR>] [--limit N] [--format json|text]
 ```
 
 Evidence-backed audit subcommands have their own pages:
@@ -93,6 +93,9 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query unreferenced` — symbols with **no recorded inbound reference
   edges**, as prune-triage leads with citable handles — never proof of dead
   code ([unreferenced.md](unreferenced.md), issue #113).
+- `eg query churn` — rank Git-tracked files by **change frequency** across the
+  commit history captured by `eg scan-history`, for hotspot triage
+  ([churn.md](churn.md), issue #128).
 
 - `eg query at` — resolve a **`file:line` location to its smallest enclosing
   code symbol**, with the enclosing chain reported outermost → innermost
