@@ -49,6 +49,7 @@ mod memory_recall;
 mod memory_recall_corpus;
 mod phantom_call_edges;
 mod preference_approval;
+mod producer_drift;
 mod producer_version;
 mod protected_artifacts;
 mod public_api_deltas;

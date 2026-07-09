@@ -46,7 +46,11 @@ use crate::{
 /// v9 adds per-file `UnsafeSite` records for `unsafe` blocks, `unsafe fn`
 /// declarations, and `unsafe impl` blocks (issue #222); older caches rebuild
 /// so reused per-file records are never missing the new sites.
-const CACHE_SCHEMA_VERSION: u32 = 9;
+///
+/// Independent of this version, the cache records the writing binary's
+/// producer signature (issue #234): a signature mismatch invalidates reuse
+/// without a schema bump, and caches missing the signature always rebuild.
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 9;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -128,8 +132,18 @@ fn scan_repository_incremental_at_inner(
     let repo_identity = identity::compute_repository_identity(repo_root, None);
     let (repository_id, repository) = repository_record_from_identity(&repo_identity);
     let previous_cache = CacheFile::load(cache_path.as_ref())?;
+    // Cache reuse also keys on the producer signature of the binary that
+    // wrote the cache (issue #234 / PR #317 review). The assembled graph is
+    // re-stamped with the running binary's producer envelope, so reusing
+    // records extracted by a different binary/grammar would launder them
+    // into `current` and turn the grammar-upgrade partial-refresh scenario
+    // into a producer-drift false negative. A signature mismatch (or a cache
+    // written before signatures existed) degrades to a full rebuild.
+    let current_producer_identity = crate::query::CurrentProducerIdentity::of_running_binary();
     let mut can_reuse_cache_records = previous_cache.schema_version == CACHE_SCHEMA_VERSION
-        && previous_cache.repository_id == repository_id;
+        && previous_cache.repository_id == repository_id
+        && previous_cache.producer_egregore_version == current_producer_identity.egregore_version
+        && previous_cache.producer_components == current_producer_identity.producer_components;
     if can_reuse_cache_records && previous_cache.validate_record_versions().is_err() {
         can_reuse_cache_records = false;
     }
@@ -309,6 +323,8 @@ fn scan_repository_incremental_at_inner(
     }
 
     next_cache.repository_id.clone_from(&repository_id);
+    next_cache.producer_egregore_version = current_producer_identity.egregore_version;
+    next_cache.producer_components = current_producer_identity.producer_components;
     next_cache.save(cache_path.as_ref())?;
     let languages = crate::languages_in_graph(&graph);
     let mut producer = code_graph_producer(&languages);
@@ -335,6 +351,16 @@ struct CacheFile {
     /// kept so a later scan can tombstone the ones that disappear.
     #[serde(default)]
     cross_file_record_ids: Vec<String>,
+    /// `CARGO_PKG_VERSION` of the binary that wrote this cache (issue #234).
+    /// Empty for caches written before producer signatures were recorded;
+    /// those always rebuild because their extractor identity is unknown.
+    #[serde(default)]
+    producer_egregore_version: String,
+    /// Every producer-component version the writing binary would stamp
+    /// (issue #234). Any difference from the running binary invalidates
+    /// reuse so re-stamped records never misreport their producer.
+    #[serde(default)]
+    producer_components: BTreeMap<String, String>,
 }
 
 impl Default for CacheFile {
@@ -344,6 +370,8 @@ impl Default for CacheFile {
             repository_id: String::new(),
             files: BTreeMap::new(),
             cross_file_record_ids: Vec::new(),
+            producer_egregore_version: String::new(),
+            producer_components: BTreeMap::new(),
         }
     }
 }
