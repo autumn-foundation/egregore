@@ -33,11 +33,14 @@ pub const ORPHAN_NODE: &str = "orphan_node";
 /// referenced by at least one live edge.
 pub const TOMBSTONE_STRANDS_LIVE_EDGE: &str = "tombstone_strands_live_edge";
 /// Stable defect category: a `DependencyDeclaration` with edges but no
-/// `File —CONTAINS→` attribution edge (PR #314 review).
+/// `File —CONTAINS→` attribution edge from its declaring manifest
+/// (PR #314 review).
 ///
-/// The containment chain is what repository scoping walks; zero-edge nodes
-/// are `orphan_node`, so this category covers nodes whose only edges are
-/// unrelated ones.
+/// The containment chain is what repository scoping walks; the containing
+/// `File`'s repo-relative path must equal the dependency node's declared
+/// manifest handle — containment by a source file or a different manifest
+/// is the same missing chain. Zero-edge nodes are `orphan_node`, so this
+/// category covers nodes whose edges never include that containment.
 pub const MISSING_CONTAINMENT_EDGE: &str = "missing_containment_edge";
 
 /// Node kinds that must be reachable through at least one edge.
@@ -405,16 +408,27 @@ fn check_orphans(
 
 /// Kind-specific containment rule (PR #314 review): every
 /// `DependencyDeclaration` must be the target of a `CONTAINS` edge whose
-/// source is a `File` node — the manifest attribution chain `--repo` scoping
-/// walks. Zero-edge nodes are already flagged as `orphan_node`; this check
-/// catches nodes whose only edges are unrelated ones, which would otherwise
-/// validate clean while repository scoping silently drops them.
+/// source is a `File` node at the SAME repo-relative path as the dependency
+/// node's declared manifest handle — the attribution chain `--repo` scoping
+/// walks. Any other `File` (a source file, or a different manifest) is the
+/// same missing chain. Zero-edge nodes are already flagged as `orphan_node`;
+/// this check catches nodes whose edges never include the declaring
+/// manifest's containment, which would otherwise validate clean while
+/// repository scoping silently drops them.
 fn check_dependency_containment(
     records: &[GraphRecord],
     index: &GraphIndex<'_>,
     incident: &BTreeSet<&str>,
     diagnostics: &mut BTreeSet<ValidationDiagnostic>,
 ) {
+    fn node_path<'a>(index: &'a GraphIndex<'_>, id: &str) -> Option<&'a str> {
+        match index.node_first.get(id) {
+            Some(GraphRecord::Node {
+                repo_relative_path, ..
+            }) => repo_relative_path.as_deref(),
+            _ => None,
+        }
+    }
     let mut contained: BTreeSet<&str> = BTreeSet::new();
     for record in records {
         let GraphRecord::Edge {
@@ -426,11 +440,17 @@ fn check_dependency_containment(
         else {
             continue;
         };
-        if index
+        if !index
             .node_kinds
             .get(source.as_str())
             .is_some_and(|kinds| kinds.contains(&NodeKind::File))
         {
+            continue;
+        }
+        // The containing file must BE the declaring manifest: its path must
+        // equal the dependency node's declared manifest handle.
+        let source_path = node_path(index, source);
+        if source_path.is_some() && source_path == node_path(index, target) {
             contained.insert(target);
         }
     }
@@ -465,7 +485,9 @@ fn check_dependency_containment(
 ///    `DependencyDeclaration`) is orphaned with zero incident edges
 ///    (`orphan_node`);
 /// 6. every `DependencyDeclaration` with incident edges is the target of a
-///    `File —CONTAINS→` attribution edge (`missing_containment_edge`).
+///    `File —CONTAINS→` attribution edge from its declaring manifest — the
+///    containing file's path equals the dependency node's manifest handle
+///    (`missing_containment_edge`).
 ///
 /// The output is deterministic: diagnostics are deduplicated and sorted in
 /// canonical order, so repeated validation of the same input is identical.
@@ -494,10 +516,14 @@ mod tests {
     use crate::ir::SCHEMA_VERSION;
 
     fn node(id: &str, kind: NodeKind) -> GraphRecord {
+        node_at(id, kind, "src/lib.rs")
+    }
+
+    fn node_at(id: &str, kind: NodeKind, path: &str) -> GraphRecord {
         GraphRecord::node(
             id.to_owned(),
             kind,
-            Some("src/lib.rs".to_owned()),
+            Some(path.to_owned()),
             Some(SourceSpan {
                 start_byte: 0,
                 end_byte: 1,
@@ -548,14 +574,53 @@ mod tests {
 
     #[test]
     fn contains_edge_to_dependency_declaration_is_allowed() {
-        // Issue #180 topology: File(Cargo.toml) —CONTAINS→ DependencyDeclaration.
+        // Issue #180 topology: File(Cargo.toml) —CONTAINS→ DependencyDeclaration,
+        // with the containing file AT the dependency's declared manifest path.
         let records = vec![
-            node("n:manifest", NodeKind::File),
-            node("n:dep", NodeKind::DependencyDeclaration),
+            node_at("n:manifest", NodeKind::File, "crates/a/Cargo.toml"),
+            node_at(
+                "n:dep",
+                NodeKind::DependencyDeclaration,
+                "crates/a/Cargo.toml",
+            ),
             edge("e:contains", EdgeLabel::Contains, "n:manifest", "n:dep"),
         ];
         let report = validate_records(&records);
         assert!(report.is_clean(), "got {:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn dependency_containment_by_a_non_manifest_file_is_a_defect() {
+        // PR #314 review: any `File` source is not enough — containment by
+        // `src/lib.rs` is not the declaring manifest's attribution chain.
+        let records = vec![
+            node_at("n:dep", NodeKind::DependencyDeclaration, "Cargo.toml"),
+            node_at("n:lib", NodeKind::File, "src/lib.rs"),
+            edge("e:contains", EdgeLabel::Contains, "n:lib", "n:dep"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![MISSING_CONTAINMENT_EDGE]);
+        assert_eq!(report.diagnostics[0].record_id.as_deref(), Some("n:dep"));
+    }
+
+    #[test]
+    fn dependency_containment_by_a_foreign_manifest_is_a_defect() {
+        // Containment by a DIFFERENT manifest (e.g. another crate's or
+        // repo's Cargo.toml) is the same missing attribution chain.
+        let records = vec![
+            node_at(
+                "n:dep",
+                NodeKind::DependencyDeclaration,
+                "crates/a/Cargo.toml",
+            ),
+            node_at("n:foreign", NodeKind::File, "Cargo.toml"),
+            edge("e:contains", EdgeLabel::Contains, "n:foreign", "n:dep"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![MISSING_CONTAINMENT_EDGE]);
+        assert_eq!(report.diagnostics[0].record_id.as_deref(), Some("n:dep"));
     }
 
     #[test]

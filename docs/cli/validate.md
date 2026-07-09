@@ -77,11 +77,13 @@ same input is byte-identical.
    `Repository` (the containment root) and `Diagnostic` markers legitimately
    stand alone and are exempt, as are non-code-graph node kinds.
 6. **Dependency containment** — every `DependencyDeclaration` with incident
-   edges is the target of a `CONTAINS` edge from a `File` node
-   (`missing_containment_edge`). Any other edge alone is not enough: without
-   the `File —CONTAINS→ DependencyDeclaration` attribution chain, repository
-   scoping silently drops the fact while the graph would otherwise validate
-   clean.
+   edges is the target of a `CONTAINS` edge from a `File` node whose
+   repo-relative path equals the dependency's declared manifest handle
+   (`missing_containment_edge`). Any other edge — or containment by a source
+   file or a different manifest — is not enough: without the declaring
+   manifest's `File —CONTAINS→ DependencyDeclaration` attribution chain,
+   repository scoping silently drops the fact while the graph would
+   otherwise validate clean.
 
 Clean `eg scan` and `eg scan-history` outputs pass all checks.
 

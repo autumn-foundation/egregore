@@ -1193,8 +1193,17 @@ fn member_glob_match(pattern: &str, path: &str) -> bool {
         let (p, s): (Vec<char>, Vec<char>) = (pattern.chars().collect(), segment.chars().collect());
         inner(&p, &s)
     }
-    let pattern_segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
-    let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // Cargo accepts `./`-prefixed members/exclude entries; `.` segments are
+    // dropped on both sides so `./crates/a` compares equal to the
+    // repo-relative directory `crates/a` (PR #314 review).
+    let pattern_segments: Vec<&str> = pattern
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    let path_segments: Vec<&str> = path
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
     segments_match(&pattern_segments, &path_segments)
 }
 
@@ -1531,6 +1540,18 @@ version = "2.0.0"
         assert!(!member_glob_match("crates/[ab", "crates/a"));
         assert!(member_glob_match("crates/[]", "crates/[]"));
         assert!(!member_glob_match("crates/[]", "crates/a"));
+    }
+
+    #[test]
+    fn leading_dot_glob_segments_are_normalized() {
+        // Cargo accepts `./`-prefixed members/exclude entries; `.` segments
+        // are dropped before matching so `./crates/a` compares equal to the
+        // repo-relative directory `crates/a` (PR #314 review).
+        assert!(member_glob_match("./crates/*", "crates/member"));
+        assert!(member_glob_match("./crates/a", "crates/a"));
+        // Interior `.` segments resolve the same lexical way (pinned).
+        assert!(member_glob_match("crates/./a", "crates/a"));
+        assert!(!member_glob_match("./crates/*", "vendor/independent"));
     }
 
     #[test]

@@ -2168,3 +2168,64 @@ fn nameless_manifest_dependencies_surface_as_skipped_manifest() {
     let full = run_query_deps(&graph, &[]);
     assert_eq!(skipped_diagnostics(&full).len(), 1);
 }
+
+/// PR #314 review: Cargo accepts `./`-prefixed `members`/`exclude` entries
+/// (`members = ["./crates/*"]`); the matcher must normalize `.` segments so
+/// such members resolve from the root lockfile and `./` excludes are honored.
+#[test]
+fn dot_prefixed_member_and_exclude_globs_are_honored() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    for member in ["a", "b"] {
+        fs::create_dir_all(repo.join(format!("crates/{member}/src"))).expect("dirs");
+        fs::write(
+            repo.join(format!("crates/{member}/Cargo.toml")),
+            format!(
+                "[package]\nname = \"pkg-{member}\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n"
+            ),
+        )
+        .expect("member manifest");
+        fs::write(
+            repo.join(format!("crates/{member}/src/lib.rs")),
+            "pub fn f() {}\n",
+        )
+        .expect("lib");
+    }
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"./crates/*\"]\nexclude = [\"./crates/b\"]\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("dot-glob-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    let by_pkg = |pkg: &str| {
+        declarations
+            .iter()
+            .find(|d| d["declaring_package"] == pkg)
+            .unwrap_or_else(|| panic!("row for {pkg}"))
+    };
+    assert_eq!(
+        by_pkg("pkg-a")["resolution"],
+        "locked",
+        "a ./-prefixed members glob admits the member"
+    );
+    assert_eq!(by_pkg("pkg-a")["resolved_version"], "1.0.228");
+    assert_eq!(
+        by_pkg("pkg-b")["resolution"],
+        "no_lockfile",
+        "a ./-prefixed exclude entry is honored"
+    );
+}
