@@ -91,7 +91,9 @@ declared entry (manifest key):
   (transitively — Cargo's automatic members; the closure grows from the root
   package and from every glob member, so a virtual root's members contribute
   their path dependencies too). Absolute `path` values pointing inside the
-  workspace root are normalized to root-relative member paths. Non-members and excluded
+  workspace root are normalized to root-relative member paths (the root is
+  lexically absolutized first, so `eg scan .` with a relative repo path
+  recognizes them too; symlinks are never resolved). Non-members and excluded
   members get `no_lockfile` — never a fabricated `locked` from an unrelated
   ancestor. Plain package manifests and stray lockfiles without a manifest
   are walked past, mirroring Cargo's workspace discovery; an unreadable

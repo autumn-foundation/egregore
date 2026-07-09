@@ -1580,3 +1580,95 @@ fn absolute_in_tree_path_dependencies_are_members() {
     );
     assert_eq!(helper["resolved_version"], "1.0.228");
 }
+
+/// Builds a path to `target` that is relative to the test's current working
+/// directory: a direct `strip_prefix` when `target` lives under it, else a
+/// lexical `..`-climb to the filesystem root. Used to invoke the scanner the
+/// way `eg scan .` does — with a relative repo root.
+fn relative_path_from_cwd(target: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().expect("cwd");
+    if let Ok(stripped) = target.strip_prefix(&cwd) {
+        return stripped.to_path_buf();
+    }
+    let mut rel = PathBuf::new();
+    for component in cwd.components() {
+        if matches!(component, std::path::Component::Normal(_)) {
+            rel.push("..");
+        }
+    }
+    for component in target.components() {
+        if let std::path::Component::Normal(part) = component {
+            rel.push(part);
+        }
+    }
+    rel
+}
+
+/// PR #314 review: `eg scan .` passes a *relative* repo root, while an
+/// in-tree `path = "…"` dependency may be declared absolute. Membership
+/// normalization must absolutize the workspace root before stripping the
+/// prefix; otherwise the member silently drops to `no_lockfile`.
+#[test]
+fn absolute_path_dependencies_resolve_under_a_relative_scan_root() {
+    // The fixture lives under the crate's target tmpdir so a relative path
+    // from the test's working directory (the package root) reaches it
+    // without crossing filesystem roots.
+    let temp = tempfile::Builder::new()
+        .prefix("issue180-relative-root-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("temp dir under target");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("crates/helper/src")).expect("dirs");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+
+    let in_tree = repo.join("crates/helper");
+    fs::write(
+        repo.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"root-pkg\"\nversion = \"0.1.0\"\n\n[workspace]\n\n[dependencies]\nhelper = {{ path = \"{}\" }}\nserde = \"1\"\n",
+            in_tree.display(),
+        ),
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+    fs::write(
+        repo.join("crates/helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("helper manifest");
+    fs::write(repo.join("crates/helper/src/lib.rs"), "pub fn h() {}\n").expect("lib");
+
+    let rel_repo = relative_path_from_cwd(&repo);
+    assert!(
+        rel_repo.is_relative(),
+        "fixture must exercise a relative scan root"
+    );
+    assert!(
+        rel_repo.join("Cargo.toml").is_file(),
+        "relative repo path must resolve from the test working directory"
+    );
+
+    let jsonl = scan_repository_at_with_override(&rel_repo, FIXED_TIME, Some("rel-root-fixture"))
+        .expect("scan must not fail on a relative repo root")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    let helper = declarations
+        .iter()
+        .find(|d| d["declaring_package"] == "helper")
+        .expect("helper row");
+    assert_eq!(
+        helper["resolution"], "locked",
+        "an absolute in-tree path dependency is a member even under a relative scan root"
+    );
+    assert_eq!(helper["resolved_version"], "1.0.228");
+}

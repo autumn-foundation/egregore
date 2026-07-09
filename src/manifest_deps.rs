@@ -21,7 +21,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::{
@@ -743,12 +743,16 @@ fn path_dependency_closure(
     exclude: &[String],
 ) -> Vec<String> {
     let mut closure: BTreeSet<String> = BTreeSet::new();
+    // The scan root may be relative (`eg scan .`); the absolute-path branch
+    // of `normalize_path_dep` compares against the lexically absolutized
+    // form, computed once per workspace root (PR #314 review).
+    let abs_root = absolutize_lexical(root_dir);
     let mut queue: Vec<String> = Vec::new();
     if root_doc.get("package").is_some() {
         queue.extend(
             manifest_path_dependency_dirs(root_doc)
                 .into_iter()
-                .filter_map(|path| normalize_path_dep(root_dir, "", &path)),
+                .filter_map(|path| normalize_path_dep(&abs_root, "", &path)),
         );
     }
     if !members.is_empty() {
@@ -776,7 +780,7 @@ fn path_dependency_closure(
             continue;
         };
         for path in manifest_path_dependency_dirs(&doc) {
-            if let Some(next) = normalize_path_dep(root_dir, &rel, &path) {
+            if let Some(next) = normalize_path_dep(&abs_root, &rel, &path) {
                 queue.push(next);
             }
         }
@@ -827,18 +831,58 @@ fn manifest_dirs_under(root_dir: &Path) -> Vec<String> {
     dirs
 }
 
+/// Lexically absolutizes a workspace-root path against the process working
+/// directory: a relative root (`eg scan .`) joins the cwd, then `.`/`..`
+/// components resolve in place. Symlinks are deliberately not followed —
+/// `fs::canonicalize` would rewrite a symlinked checkout into a physical
+/// path the manifest author never wrote — keeping the absolute-path-dep
+/// prefix comparison deterministic (PR #314 review).
+fn absolutize_lexical(dir: &Path) -> PathBuf {
+    let joined = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        // Without a resolvable working directory the relative root cannot
+        // be absolutized; keeping it as-is preserves prior behavior
+        // (absolute path deps are skipped, never invented).
+        std::env::current_dir().map_or_else(|_| dir.to_path_buf(), |cwd| cwd.join(dir))
+    };
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if matches!(
+                    out.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) {
+                    out.pop();
+                } else if !out.has_root() {
+                    // A leading `..` on a still-relative path is preserved;
+                    // `..` at an absolute root resolves to the root itself.
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Normalizes one `path = "…"` dependency value against the workspace root.
 ///
 /// Relative paths join `base` (the declaring manifest's root-relative
 /// directory) with `.`/`..` resolution; an **absolute** path is accepted
-/// only when it points inside the workspace root (lexical prefix match) and
-/// converts to the root-relative member path. Absolute out-of-tree targets
-/// and paths escaping the root are skipped — documented out of scope, never
-/// an error (PR #314 review).
-fn normalize_path_dep(root_dir: &Path, base: &str, raw: &str) -> Option<String> {
+/// only when it points inside the workspace root (lexical prefix match
+/// against `abs_root`, the [`absolutize_lexical`] form of the root, so a
+/// relative scan root still recognizes in-tree targets) and converts to the
+/// root-relative member path. Absolute out-of-tree targets and paths
+/// escaping the root are skipped — documented out of scope, never an error
+/// (PR #314 review).
+fn normalize_path_dep(abs_root: &Path, base: &str, raw: &str) -> Option<String> {
     let normalized = raw.replace('\\', "/");
     if Path::new(&normalized).is_absolute() {
-        let rel = Path::new(&normalized).strip_prefix(root_dir).ok()?;
+        let rel = absolutize_lexical(Path::new(&normalized));
+        let rel = rel.strip_prefix(abs_root).ok()?;
         let mut parts: Vec<&str> = Vec::new();
         for component in rel.components() {
             match component {
@@ -1251,6 +1295,23 @@ version = "2.0.0"
     #[test]
     fn corrupt_lockfile_fails_parse() {
         assert!(LockfileIndex::parse("not [ valid toml").is_none());
+    }
+
+    #[test]
+    fn absolutize_lexical_resolves_relative_roots_against_the_cwd() {
+        let cwd = std::env::current_dir().expect("cwd");
+        assert_eq!(absolutize_lexical(Path::new(".")), cwd);
+        assert_eq!(
+            absolutize_lexical(Path::new("./sub/../sub")),
+            cwd.join("sub"),
+            "`.`/`..` components resolve lexically after the cwd join"
+        );
+        let absolute = cwd.join("a").join(".").join("b").join("..").join("c");
+        assert_eq!(
+            absolutize_lexical(&absolute),
+            cwd.join("a").join("c"),
+            "an already-absolute path is normalized in place"
+        );
     }
 
     #[test]
