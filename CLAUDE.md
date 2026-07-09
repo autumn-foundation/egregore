@@ -145,6 +145,12 @@ cargo run -- query churn --graph graph.jsonl                       # exit 2 (no_
 cargo run -- query producer-drift --graph graph.jsonl                  # exit 0 (even with drift)
 cargo run -- query producer-drift --data-dir .egregore --repo acme/widget  # scope one repo; bad selector exits 1
 cargo run -- query producer-drift --graph graph.jsonl --format text
+
+# Dependency cycles among files over IMPORTS/CALLS edges (issue #138)
+cargo run -- query cycles --graph graph.jsonl                     # exit 0 (even when acyclic)
+cargo run -- query cycles src/lib.rs --graph graph.jsonl          # only cycles through this node
+cargo run -- query cycles does_not_exist --graph graph.jsonl      # exit 2 (no_match)
+cargo run -- query cycles codegraph:v1:zzz --graph graph.jsonl    # exit 1 (Unsupported)
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -413,6 +419,18 @@ an explicit empty drift result (`no_drift` diagnostic, exit 0) — zero false po
 Read-only: reports what re-extraction could change, never re-extracts or mutates the
 store, and drift never changes the exit code. Output (JSON or `--format text`) is
 deterministic and byte-identical across runs. See `docs/cli/producer-drift.md`.
+
+`eg query cycles [scope]` enumerates dependency cycles among files over the already-extracted
+edges: resolved cross-file `CALLS` edges (issues #152/#134) and import declarations that
+name-resolve to exactly one in-repo defining file. `ambiguous`/`unresolved` CALLS edges and
+ambiguous imports are excluded from cycle detection and tallied — ambiguity never fabricates
+a cycle. Each cycle lists the ordered member files closing the loop, with stable record IDs,
+repo-relative handles, and the citable records behind every closing edge. Cycles are
+canonical (rotated to the lexicographically smallest member, reported once, sorted by a
+stable key) and byte-identical across runs. The optional scope handle (symbol name/record ID
+or file path) filters to cycles through that node — the pre-refactor check. An acyclic graph
+is an explicit success (exit 0 with an `acyclic` diagnostic), not an error.
+See `docs/cli/cycles.md`.
 
 Protected raw-artifact commands (issue #60):
 

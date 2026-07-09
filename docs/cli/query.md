@@ -34,6 +34,8 @@ eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
 eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--include-private] [--format json|text]
 eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--threshold <PERCENT>] [--limit N] [--format json|text]
 eg query unreferenced     --graph <PATH>   [--repo <SELECTOR>]
+eg query cycles   [SCOPE] --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
+
 eg query at       <PATH>:<LINE> --graph <PATH> [--at <COMMIT>] [--repo <SELECTOR>]
 eg query manifest-deps    --graph <PATH>   [--name <CRATE>] [--repo <SELECTOR>] [--format json|text]
 eg query churn            --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--format json|text]
@@ -104,6 +106,10 @@ Evidence-backed audit subcommands have their own pages:
   installed grammar/extractor versions could change, grouped by producer
   signature, with legacy and non-code producers bucketed separately
   ([producer-drift.md](producer-drift.md), issue #234).
+- `eg query cycles` — **dependency cycles among files** over resolved
+  `CALLS` edges and unambiguous imports, each with its ordered closing path
+  and citable evidence, optionally scoped to one node for the pre-refactor
+  check ([cycles.md](cycles.md), issue #138).
 
 - `eg query at` — resolve a **`file:line` location to its smallest enclosing
   code symbol**, with the enclosing chain reported outermost → innermost
