@@ -87,14 +87,18 @@ declared entry (manifest key):
   workspace root means `no_lockfile`, never an outer lockfile even when an
   outer workspace's globs would match. Membership at an ancestor root means
   the `members` globs include the crate (and `exclude` does not) **or** the
-  root package reaches it through in-tree `path = "…"` dependencies
-  (transitively — Cargo's automatic members). Non-members and excluded
+  workspace reaches it through in-tree `path = "…"` dependencies
+  (transitively — Cargo's automatic members; the closure grows from the root
+  package and from every glob member, so a virtual root's members contribute
+  their path dependencies too). Absolute `path` values pointing inside the
+  workspace root are normalized to root-relative member paths. Non-members and excluded
   members get `no_lockfile` — never a fabricated `locked` from an unrelated
   ancestor. Plain package manifests and stray lockfiles without a manifest
   are walked past, mirroring Cargo's workspace discovery; an unreadable
-  ancestor manifest stops the walk without accepting anything. (`.."-escaping
-  path dependencies and `package.workspace` explicit-pointer keys are not
-  interpreted in this slice.)
+  ancestor manifest stops the walk without accepting anything.
+  (`..`-escaping and absolute out-of-tree path dependencies, and
+  `package.workspace` explicit-pointer keys, are not interpreted in this
+  slice.)
   A parseable declared requirement gates **every** path with Cargo semantics
   (`"1"` means `^1`), including a sole locked version that a stale or shared
   lockfile can leave unsatisfying: exactly one satisfying version is

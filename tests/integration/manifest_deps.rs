@@ -1444,3 +1444,139 @@ fn repo_scoped_queries_drop_foreign_skipped_manifest_diagnostics() {
         "unscoped diagnostics carry their owning repository label"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR #314 review: member manifests seed the automatic path-dep closure too
+// ---------------------------------------------------------------------------
+
+/// Cargo's automatic path-dependency membership grows from the root package
+/// AND every explicit member: `crates/app` (a glob member) depending on
+/// `../helper` makes helper a member even though no glob matches it — for
+/// both a package root and a virtual root.
+fn member_seeded_path_dep_graph(virtual_root: bool) -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("crates/app/src")).expect("dirs");
+    fs::create_dir_all(repo.join("crates/helper/src")).expect("dirs");
+    let root_manifest = if virtual_root {
+        "[workspace]\nmembers = [\"crates/app\"]\n".to_owned()
+    } else {
+        fs::create_dir_all(repo.join("src")).expect("dirs");
+        fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+        "[package]\nname = \"root-pkg\"\nversion = \"0.1.0\"\n\n[workspace]\nmembers = [\"crates/app\"]\n\n[dependencies]\nserde = \"1\"\n".to_owned()
+    };
+    fs::write(repo.join("Cargo.toml"), root_manifest).expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(
+        repo.join("crates/app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nhelper = { path = \"../helper\" }\nserde = \"1\"\n",
+    )
+    .expect("app manifest");
+    fs::write(repo.join("crates/app/src/lib.rs"), "pub fn a() {}\n").expect("lib");
+    fs::write(
+        repo.join("crates/helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("helper manifest");
+    fs::write(repo.join("crates/helper/src/lib.rs"), "pub fn h() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("memberseed-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+    (temp, graph)
+}
+
+#[test]
+fn member_path_dependencies_join_the_workspace() {
+    for virtual_root in [false, true] {
+        let (_temp, graph) = member_seeded_path_dep_graph(virtual_root);
+        let parsed = run_query_deps(&graph, &["--name", "serde"]);
+        let declarations = parsed["declarations"].as_array().expect("declarations");
+        let helper = declarations
+            .iter()
+            .find(|d| d["declaring_package"] == "helper")
+            .expect("helper row");
+        assert_eq!(
+            helper["resolution"], "locked",
+            "virtual_root={virtual_root}: a glob member's path dependency joins the workspace"
+        );
+        assert_eq!(helper["resolved_version"], "1.0.228");
+        let app = declarations
+            .iter()
+            .find(|d| d["declaring_package"] == "app")
+            .expect("app row");
+        assert_eq!(app["resolution"], "locked");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR #314 review: absolute in-tree path dependencies are normalized
+// ---------------------------------------------------------------------------
+
+/// An absolute `path = "/…/repo/crates/helper"` pointing inside the
+/// workspace root converts to the correct root-relative member path; an
+/// absolute path pointing outside the tree is skipped without error.
+#[test]
+fn absolute_in_tree_path_dependencies_are_members() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("crates/helper/src")).expect("dirs");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    // An out-of-tree absolute target (exists, but outside the repo root).
+    fs::create_dir_all(temp.path().join("outside")).expect("dirs");
+    fs::write(
+        temp.path().join("outside/Cargo.toml"),
+        "[package]\nname = \"outside\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("outside manifest");
+
+    let in_tree = repo.join("crates/helper");
+    let out_of_tree = temp.path().join("outside");
+    fs::write(
+        repo.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"root-pkg\"\nversion = \"0.1.0\"\n\n[workspace]\n\n[dependencies]\nhelper = {{ path = \"{}\" }}\noutside = {{ path = \"{}\" }}\nserde = \"1\"\n",
+            in_tree.display(),
+            out_of_tree.display(),
+        ),
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+    fs::write(
+        repo.join("crates/helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("helper manifest");
+    fs::write(repo.join("crates/helper/src/lib.rs"), "pub fn h() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("abs-path-fixture"))
+        .expect("scan must not fail on absolute path dependencies")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    let helper = declarations
+        .iter()
+        .find(|d| d["declaring_package"] == "helper")
+        .expect("helper row");
+    assert_eq!(
+        helper["resolution"], "locked",
+        "an absolute in-tree path dependency is a workspace member"
+    );
+    assert_eq!(helper["resolved_version"], "1.0.228");
+}

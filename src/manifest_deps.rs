@@ -717,30 +717,49 @@ fn parse_workspace_facts(text: &str, root_dir: &Path) -> WorkspaceFacts {
     else {
         return WorkspaceFacts::PackageOnly;
     };
-    let path_members = if doc.get("package").is_some() {
-        path_dependency_closure(&doc, root_dir)
-    } else {
-        Vec::new()
-    };
+    let members = string_array(workspace.get("members"));
+    let exclude = string_array(workspace.get("exclude"));
+    let path_members = path_dependency_closure(&doc, root_dir, &members, &exclude);
     WorkspaceFacts::Workspace {
-        members: string_array(workspace.get("members")),
-        exclude: string_array(workspace.get("exclude")),
+        members,
+        exclude,
         path_members,
     }
 }
 
 /// Collects the transitive in-tree `path = "…"` dependency directories of a
-/// workspace-root package, relative to the root. Cargo treats these as
-/// automatic workspace members even when `members` does not list them.
-/// Paths escaping the root directory (`..` beyond it) are outside this
+/// workspace, relative to the root. Cargo treats these as automatic
+/// workspace members even when `members` does not list them; the closure
+/// grows from the root package (when the root manifest is one) AND from
+/// every explicit members-glob member — so a virtual root's members
+/// contribute their path dependencies too (PR #314 review). Paths escaping
+/// the root directory (`..` or an absolute path beyond it) are outside this
 /// slice and are skipped; each manifest is parsed with `toml_edit` — never
 /// `cargo metadata`.
-fn path_dependency_closure(root_doc: &toml_edit::DocumentMut, root_dir: &Path) -> Vec<String> {
+fn path_dependency_closure(
+    root_doc: &toml_edit::DocumentMut,
+    root_dir: &Path,
+    members: &[String],
+    exclude: &[String],
+) -> Vec<String> {
     let mut closure: BTreeSet<String> = BTreeSet::new();
-    let mut queue: Vec<String> = manifest_path_dependency_dirs(root_doc)
-        .into_iter()
-        .filter_map(|path| normalize_in_tree_path("", &path))
-        .collect();
+    let mut queue: Vec<String> = Vec::new();
+    if root_doc.get("package").is_some() {
+        queue.extend(
+            manifest_path_dependency_dirs(root_doc)
+                .into_iter()
+                .filter_map(|path| normalize_path_dep(root_dir, "", &path)),
+        );
+    }
+    if !members.is_empty() {
+        for rel in manifest_dirs_under(root_dir) {
+            if members.iter().any(|glob| member_glob_match(glob, &rel))
+                && !exclude.iter().any(|glob| member_glob_match(glob, &rel))
+            {
+                queue.push(rel);
+            }
+        }
+    }
     while let Some(rel) = queue.pop() {
         if !closure.insert(rel.clone()) {
             continue;
@@ -757,12 +776,83 @@ fn path_dependency_closure(root_doc: &toml_edit::DocumentMut, root_dir: &Path) -
             continue;
         };
         for path in manifest_path_dependency_dirs(&doc) {
-            if let Some(next) = normalize_in_tree_path(&rel, &path) {
+            if let Some(next) = normalize_path_dep(root_dir, &rel, &path) {
                 queue.push(next);
             }
         }
     }
     closure.into_iter().collect()
+}
+
+/// Enumerates every directory under `root_dir` (relative, `/`-separated,
+/// sorted) that holds a `Cargo.toml`, skipping `.git` and `target`. Used to
+/// expand members globs into concrete seed manifests for the automatic
+/// path-dependency closure.
+fn manifest_dirs_under(root_dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name == ".git" || name == "target" {
+                continue;
+            }
+            let child_rel = if rel.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let child = entry.path();
+            if child.join("Cargo.toml").is_file() {
+                out.push(child_rel.clone());
+            }
+            walk(&child, &child_rel, out);
+        }
+    }
+    let mut dirs = Vec::new();
+    walk(root_dir, "", &mut dirs);
+    dirs.sort();
+    dirs
+}
+
+/// Normalizes one `path = "…"` dependency value against the workspace root.
+///
+/// Relative paths join `base` (the declaring manifest's root-relative
+/// directory) with `.`/`..` resolution; an **absolute** path is accepted
+/// only when it points inside the workspace root (lexical prefix match) and
+/// converts to the root-relative member path. Absolute out-of-tree targets
+/// and paths escaping the root are skipped — documented out of scope, never
+/// an error (PR #314 review).
+fn normalize_path_dep(root_dir: &Path, base: &str, raw: &str) -> Option<String> {
+    let normalized = raw.replace('\\', "/");
+    if Path::new(&normalized).is_absolute() {
+        let rel = Path::new(&normalized).strip_prefix(root_dir).ok()?;
+        let mut parts: Vec<&str> = Vec::new();
+        for component in rel.components() {
+            match component {
+                std::path::Component::Normal(part) => parts.push(part.to_str()?),
+                std::path::Component::CurDir => {}
+                _ => return None,
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        return Some(parts.join("/"));
+    }
+    normalize_in_tree_path(base, &normalized)
 }
 
 /// Extracts the `path = "…"` values from a manifest's three captured
