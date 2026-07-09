@@ -58,6 +58,7 @@ mod query;
 mod query_at;
 mod query_churn;
 mod query_cli;
+mod query_cycles;
 mod query_debt_markers;
 mod query_implementors;
 mod query_lifeline;
