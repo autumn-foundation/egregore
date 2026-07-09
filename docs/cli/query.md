@@ -29,6 +29,7 @@ eg query coupling <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--base <COMMIT>
 eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
 eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--include-private] [--format json|text]
 eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--threshold <PERCENT>] [--limit N] [--format json|text]
+eg query unreferenced     --graph <PATH>   [--repo <SELECTOR>]
 ```
 
 Evidence-backed audit subcommands have their own pages:
@@ -75,6 +76,9 @@ Evidence-backed audit subcommands have their own pages:
   shares, deterministic tie-breaks, `--at`/`--as-of` time travel, and an
   explicit empirical-not-declared boundary
   ([ownership.md](ownership.md), issue #245).
+- `eg query unreferenced` — symbols with **no recorded inbound reference
+  edges**, as prune-triage leads with citable handles — never proof of dead
+  code ([unreferenced.md](unreferenced.md), issue #113).
 
 Most subcommands accept exactly one input source:
 

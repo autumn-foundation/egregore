@@ -97,6 +97,10 @@ cargo run -- query ownership src/lib.rs --graph history.graph.jsonl         # on
 cargo run -- query ownership --graph history.graph.jsonl --at <sha>         # ownership as-of a commit
 cargo run -- query ownership does/not/exist.rs --graph history.graph.jsonl  # exit 2 (unknown_path)
 cargo run -- query ownership --graph history.graph.jsonl --as-of not-a-time # exit 1 (malformed_timestamp)
+
+# Zero-inbound-reference prune-triage leads (issue #113)
+cargo run -- query unreferenced --graph graph.jsonl               # exit 0 (even when no candidates)
+cargo run -- query unreferenced --graph graph.jsonl --repo acme/widget  # scope one repo; bad selector exits 1
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -273,6 +277,17 @@ Rows are advisory triage leads from deterministic extractor facts, never verdict
 `--path` (subsystem prefix), `--repo`, and `--at <commit>` (valid-time pin). An empty scope
 reports `no_markers_in_scope`; an out-of-store scope is `scope_not_found` (exit 2). The
 marker set is closed for this slice. See `docs/cli/debt-markers.md`.
+
+`eg query unreferenced` lists code symbols with zero recorded inbound reference edges
+(`CALLS`/`IMPORTS`/`MENTIONS`, plus the extractor's `REFERENCES` and `IMPLEMENTS` usage
+edges) as prune-triage candidates. The structural `DEFINES`/`CONTAINS` edge from a symbol's
+own file or module never counts. Rows are leads, never proof of dead code — public API
+consumed elsewhere, trait dispatch, macro-generated call sites, FFI, derives, and entry
+points are documented false-positive classes. Candidates in `Diagnostic`-marked file scopes
+carry an advisory extraction-completeness caveat (issue #87). Tombstoned symbols are
+excluded; an empty candidate set is an explicit success (exit 0 with a `no_candidates`
+diagnostic, distinct from `no_symbols`). Output is deterministic, byte-identical across
+runs, and sorted by path, start line, then record ID. See `docs/cli/unreferenced.md`.
 
 Protected raw-artifact commands (issue #60):
 
