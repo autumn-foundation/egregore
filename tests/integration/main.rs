@@ -4,6 +4,8 @@
 //! test binary. Compiling them as modules of a single test target keeps
 //! link time and on-disk debug artifacts down without changing behavior.
 
+// The module list below is alphabetized (one `mod` line per file); keep it
+// that way so parallel PRs adding test files merge without conflicts.
 mod accuracy;
 mod antigravity;
 mod asof_file_symbols;
