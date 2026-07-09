@@ -7432,6 +7432,11 @@ const fn is_codegraph_kind(kind: NodeKind) -> bool {
             | NodeKind::Commit
             | NodeKind::Change
             | NodeKind::Repository
+            // Manifest-declared dependency facts are deterministic code-graph
+            // source facts (issue #180 / PR #314 review): memory-audit evidence
+            // links classify them as code handles, and failure queries may
+            // anchor on their canonical record IDs.
+            | NodeKind::DependencyDeclaration
     )
 }
 
@@ -13431,6 +13436,8 @@ pub struct LifelineEvent {
     pub record_id: String,
     /// The Git commit SHA.
     pub commit: String,
+    /// The valid time (commit time) of the event's commit.
+    pub valid_time: String,
     /// The repository-relative path (absent for removal events).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_relative_path: Option<String>,
@@ -13546,6 +13553,7 @@ pub fn symbol_lifeline(
 
     // Filter commits, symbol snapshots, and drift records in a single consolidated loop
     let mut repo_commits = Vec::new();
+    let mut commit_valid_times: BTreeMap<&str, &str> = BTreeMap::new();
     let mut parent_map: BTreeMap<&str, &[String]> = BTreeMap::new();
     let mut symbol_snapshots: BTreeMap<&str, &GraphRecord> = BTreeMap::new();
     let mut symbol_snapshot_bodies: BTreeMap<&str, &str> = BTreeMap::new();
@@ -13565,6 +13573,7 @@ pub fn symbol_lifeline(
                 );
                 if in_repo {
                     repo_commits.push((sha.as_str(), r));
+                    commit_valid_times.insert(sha.as_str(), t.valid_time.as_str());
                     parent_map.insert(sha.as_str(), &t.git_parent_commits);
                 }
             }
@@ -13614,6 +13623,15 @@ pub fn symbol_lifeline(
             }
         }
         !saw_parent_snapshot
+    };
+
+    // Helper: the valid time of a repository commit. Every commit gathered
+    // into `repo_commits` carries temporal metadata, so this is always
+    // present for event commits.
+    let valid_time_of = |sha: &str| -> String {
+        commit_valid_times
+            .get(sha)
+            .map_or_else(String::new, |vt| (*vt).to_owned())
     };
 
     let mut events = Vec::new();
@@ -13667,6 +13685,7 @@ pub fn symbol_lifeline(
                         event_type: LifelineEventKind::Modified,
                         record_id: target_symbol_id.to_string(),
                         commit: (*commit_sha).to_owned(),
+                        valid_time: valid_time_of(commit_sha),
                         repo_relative_path: repo_relative_path.clone(),
                         span: *span,
                         absent_span_reason,
@@ -13699,6 +13718,7 @@ pub fn symbol_lifeline(
                     event_type,
                     record_id: target_symbol_id.to_string(),
                     commit: (*commit_sha).to_owned(),
+                    valid_time: valid_time_of(commit_sha),
                     repo_relative_path: repo_relative_path.clone(),
                     span: *span,
                     absent_span_reason,
@@ -13726,6 +13746,7 @@ pub fn symbol_lifeline(
                     event_type: LifelineEventKind::Removed,
                     record_id: tombstone_record_id,
                     commit: (*commit_sha).to_owned(),
+                    valid_time: valid_time_of(commit_sha),
                     repo_relative_path: None,
                     span: None,
                     absent_span_reason: Some("tombstone".to_owned()),

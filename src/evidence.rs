@@ -357,6 +357,7 @@ fn evidence_producer() -> Producer {
 /// Agent nodes carry a stable ID based on `agent_id` and `agent_kind`; the same
 /// agent registered with different kinds produces distinct records, preventing
 /// mismatched-payload conflicts in the embedded sink.
+#[allow(clippy::too_many_lines)]
 fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
     let id = agent_memory_stable_id(&["node", "agent", agent_id, agent_kind]);
     GraphRecord::Node {
@@ -455,6 +456,7 @@ fn build_agent_node(agent_id: &str, agent_kind: &str) -> GraphRecord {
         author: None,
         diff_hunk_handle: None,
         review_side: None,
+        dependency: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,
     }
@@ -571,6 +573,7 @@ fn build_agent_session_node(prov: &EvidenceProvenance, agent_kind: &str) -> Grap
         author: None,
         diff_hunk_handle: None,
         review_side: None,
+        dependency: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: None,
     }
@@ -889,6 +892,7 @@ pub fn build_observation_records(
         author: None,
         diff_hunk_handle: None,
         review_side: None,
+        dependency: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };
@@ -1120,6 +1124,7 @@ pub fn build_command_evidence_records(
         author: None,
         diff_hunk_handle: None,
         review_side: None,
+        dependency: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };
@@ -1358,6 +1363,7 @@ pub fn build_artifact_records(
         author: None,
         diff_hunk_handle: None,
         review_side: None,
+        dependency: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };
@@ -1574,6 +1580,7 @@ pub fn build_verification_records(
         author: None,
         diff_hunk_handle: None,
         review_side: None,
+        dependency: None,
         user_context: crate::ir::UserContextFields::empty(),
         producer: Some(evidence_producer()),
     };

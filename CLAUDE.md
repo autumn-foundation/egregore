@@ -82,6 +82,11 @@ cargo run -- query coupling src/lib.rs --graph history.graph.jsonl --base <sha> 
 cargo run -- query coupling src/lib.rs --graph history.graph.jsonl --at <sha>   # history as of one commit
 cargo run -- query coupling src/nope.rs --graph history.graph.jsonl            # exit 2 (unknown_file)
 
+# One symbol's full evolution timeline across commit history (issues #96, #215)
+cargo run -- query lifeline <symbol_name> --graph history.graph.jsonl     # exit 0, NDJSON events
+cargo run -- query lifeline does_not_exist --graph history.graph.jsonl    # exit 2 (unknown_symbol)
+cargo run -- query lifeline <symbol_name> --graph history.graph.jsonl --format text  # timeline view
+
 # Externally-reachable public API surface (issue #213)
 cargo run -- query public-api --graph graph.jsonl                 # exit 0 (even when surface is empty)
 cargo run -- query public-api --graph graph.jsonl --repo acme/widget  # scope one repo; bad selector exits 1
@@ -125,6 +130,11 @@ cargo run -- query at src/lib.rs:42 --graph graph.jsonl           # exit 0 on ma
 cargo run -- query at src/lib.rs:2 --graph graph.jsonl            # exit 2 (no_enclosing_symbol)
 cargo run -- query at src/lib.rs:42 --graph history.graph.jsonl --at <sha>  # spans as of that commit
 cargo run -- query at src/lib.rs --graph graph.jsonl              # exit 1 (malformed_location)
+
+# Declared Cargo dependencies with lockfile resolution (issue #180)
+cargo run -- query manifest-deps --graph graph.jsonl                # exit 0 (even when surface is empty)
+cargo run -- query manifest-deps --graph graph.jsonl --name serde   # direct "do we depend on X?" lookup
+cargo run -- query manifest-deps --data-dir .egregore --format text # store-backed, human-readable
 
 # File churn hotspots over a scan-history store (issue #128)
 cargo run -- query churn --graph history.graph.jsonl               # exit 0, ranked files
@@ -200,6 +210,18 @@ follows the existing selector contract: full history, `--base`+`--head` range, `
 non-source paths never appear. Rows are historical co-change leads — never proof of
 dependency, and absence of coupling is not proof of independence. Output is deterministic
 and byte-identical across runs. See `docs/cli/coupling.md`.
+
+`eg query lifeline <symbol>` returns one symbol's chronologically ordered lifecycle events
+(`introduced`, `modified`, `removed`, `reintroduced`) from a `scan-history` graph or embedded
+store, keyed on the stable symbol-identity contract (ADR-0004) so same-name symbols never
+bleed into the answer. Each event carries the commit SHA, its valid time, a stable record ID,
+a repo-relative file/span handle (or documented absent-span reason), and the `SemanticDrift`
+record ID + score for a modifying step when a drift record exists (drift-absent otherwise,
+never a fabricated 0). Output is newline-delimited JSON by default — one event per line,
+byte-identical across runs; `--format text` prints a human-readable timeline. Unknown symbols
+and symbols with no commit-linked history exit 2; ambiguous names list all candidate record
+IDs and exit 6. Events are advisory temporal facts, never a risk or behavior claim.
+See `docs/cli/lifeline.md`.
 
 `eg query public-api` enumerates the Rust library crate's externally-reachable public API
 surface from recorded per-symbol visibility (issue #124) and module containment — never a
@@ -349,6 +371,23 @@ carry an advisory extraction-completeness caveat (issue #87). Tombstoned symbols
 excluded; an empty candidate set is an explicit success (exit 0 with a `no_candidates`
 diagnostic, distinct from `no_symbols`). Output is deterministic, byte-identical across
 runs, and sorted by path, start line, then record ID. See `docs/cli/unreferenced.md`.
+
+`eg query manifest-deps` lists every directly-declared Cargo dependency captured at scan time from
+`[dependencies]`, `[dev-dependencies]`, and `[build-dependencies]` as citable
+`DependencyDeclaration` facts: crate name (plus the `declared_as` manifest key for
+`package = "…"` rename pairs, which are never collapsed), kind (`normal`/`dev`/`build`), the
+declared version requirement as written, the resolved version from the nearest `Cargo.lock`
+(a parseable declared requirement gates every path, including a stale sole locked version;
+markers `locked` / `no_lockfile` / `not_in_lockfile` / `ambiguous_in_lockfile` /
+`requirement_unsatisfied_in_lockfile` / `lockfile_unreadable` — never a guessed version, and
+never a fallback past an invalid nearest lockfile), the
+declaring package, and the repo-relative manifest handle. `--name <crate>` answers the direct
+"do we depend on X?" lookup; rows carry their owning repository label and `--repo <selector>`
+scopes a shared multi-repo store. Manifests are parsed with a real TOML parser; `cargo metadata`
+is never invoked and the scan stays read-only. An empty surface or a name miss is a machine-
+readable success (exit 0 with a stable diagnostic). Output (JSON or `--format text`) is
+deterministic and byte-identical across runs. Rows are declaration facts, never usage or build
+proof. See `docs/cli/manifest-deps.md`.
 
 `eg query churn` ranks Git-tracked files by descending count of distinct commits that
 modified them across a `scan-history` temporal store. Every row carries the stable `File`

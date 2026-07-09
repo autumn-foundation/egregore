@@ -1377,6 +1377,41 @@ enum QuerySubcommand {
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
+    /// List declared Cargo dependencies as citable graph facts (issue #180).
+    ///
+    /// Reports every directly-declared Cargo dependency captured at scan
+    /// time from `[dependencies]`, `[dev-dependencies]`, and
+    /// `[build-dependencies]`: crate name, dependency kind, the declared
+    /// version requirement as written, the resolved version from the nearest
+    /// `Cargo.lock` (or a documented unresolved marker — never a guess), the
+    /// declaring package, and the repo-relative manifest handle. `--name`
+    /// answers the direct "do we depend on X?" lookup, returning only
+    /// matching declarations.
+    ///
+    /// Rows are parse-derived declaration facts — never proof the dependency
+    /// is used in code, builds, or resolves. Output is deterministic and
+    /// byte-identical across runs; an empty surface or a name miss is a
+    /// machine-readable success (exit 0 with a stable diagnostic), not an
+    /// error.
+    ///
+    /// Documented in `docs/cli/manifest-deps.md`.
+    ManifestDeps {
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Return only declarations of this exact crate name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Restrict the surface to one repository in a multi-repo store.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Classify public-API surface changes across a commit range (issue #157).
     ///
     /// Composes the issue #118 range-delta mechanics with the issue #124
@@ -1732,6 +1767,22 @@ enum QuerySubcommand {
         format: OutputFormat,
     },
     /// Trace a single symbol's lifecycle across Git history.
+    ///
+    /// Resolves one symbol (stable record ID or exact name) against a
+    /// `scan-history` graph or embedded store and returns its chronologically
+    /// ordered lifecycle events: `introduced`, each `modified` commit with
+    /// its semantic-drift record where one exists, `removed` if the symbol
+    /// was tombstoned, and `reintroduced` if it came back. Every event
+    /// carries the commit SHA, its valid time, a stable record ID, and a
+    /// repo-relative file/span handle (or a documented absent-span reason).
+    /// Output is newline-delimited JSON by default — one event object per
+    /// line — and byte-identical across runs; `--format text` prints a
+    /// human-readable timeline. Events are advisory temporal facts, never a
+    /// risk or behavior claim. An unknown symbol or a symbol with no
+    /// commit-linked history exits 2; an ambiguous name reports all
+    /// candidate record IDs and exits 6.
+    ///
+    /// Documented in `docs/cli/lifeline.md`.
     Lifeline {
         /// Graph JSONL path (mutually exclusive with --data-dir).
         #[arg(long)]
@@ -6079,6 +6130,35 @@ fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
                 limit,
             };
             query_coupling_cmd(&records, &path, selected.as_deref(), &options, format)
+        }
+        QuerySubcommand::ManifestDeps {
+            graph,
+            data_dir,
+            name,
+            repo,
+            format,
+        } => {
+            // Strictly read-only lane (PR #314 review): opening the embedded
+            // engine in place re-persists its on-disk index files, so
+            // `--data-dir` reads from a throwaway copy, never the live store
+            // (same contract as the other read-only lanes).
+            let records = match (graph.as_deref(), data_dir.as_deref()) {
+                (Some(graph_path), None) => load_records_from_jsonl(graph_path)?,
+                (None, Some(dir)) => load_records_from_data_dir_readonly(dir)?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide only one of --graph or --data-dir, not both")
+                }
+                (None, None) => anyhow::bail!("provide --graph <path> or --data-dir <path>"),
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_manifest_deps_cmd(
+                &records,
+                &index,
+                selected.as_deref(),
+                name.as_deref(),
+                format,
+            )
         }
         QuerySubcommand::PublicApiDeltas {
             base,
@@ -11268,6 +11348,321 @@ struct PublicApiResponse<'a> {
 const PUBLIC_API_DISCLAIMER: &str = "Parse-derived enumeration of the externally-reachable public API surface from recorded \
      visibility and module containment. Not a build-verified or semver claim.";
 
+// ---------------------------------------------------------------------------
+// manifest-declared dependency query (issue #180)
+// ---------------------------------------------------------------------------
+
+/// Standing disclaimer on every `query manifest-deps` response: rows are declaration
+/// facts parsed from manifests, never usage, build, or resolvability proof.
+const MANIFEST_DEPS_DISCLAIMER: &str = "Declared-dependency facts parsed from Cargo manifests and the nearest Cargo.lock; never proof the dependency is used in code, builds, or resolves.";
+
+/// One declared-dependency row in the `query manifest-deps` response.
+#[derive(serde::Serialize)]
+struct ManifestDepsDeclarationJson<'a> {
+    record_id: &'a str,
+    /// Owning repository display label; absent when the record cannot be
+    /// attributed (e.g. a legacy graph without a `Repository` node).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
+    name: &'a str,
+    /// Manifest key when the entry was declared under a `package = "…"`
+    /// rename; absent for plain declarations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declared_as: Option<&'a str>,
+    dependency_kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declared_requirement: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_version: Option<&'a str>,
+    resolution: &'a str,
+    declaring_package: &'a str,
+    manifest_path: &'a str,
+    schema_version: u32,
+}
+
+/// One stable machine-readable diagnostic in the `query manifest-deps` response.
+#[derive(serde::Serialize)]
+struct ManifestDepsDiagnosticJson<'a> {
+    code: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
+    /// Citing record ID for record-backed diagnostics (`skipped_manifest`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_id: Option<&'a str>,
+    /// Owning repository display label for record-backed diagnostics; absent
+    /// when the record cannot be attributed (legacy graphs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<&'a str>,
+}
+
+/// Top-level `query manifest-deps` response envelope.
+#[derive(serde::Serialize)]
+struct ManifestDepsResponse<'a> {
+    ok: bool,
+    query: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_scope: Option<&'a str>,
+    count: usize,
+    disclaimer: &'a str,
+    declarations: Vec<ManifestDepsDeclarationJson<'a>>,
+    diagnostics: Vec<ManifestDepsDiagnosticJson<'a>>,
+}
+
+/// Sort rank keeping the documented dependency-kind order stable:
+/// `normal` < `dev` < `build` < anything unknown.
+const fn dependency_kind_rank(kind: &str) -> u8 {
+    match kind.as_bytes() {
+        b"normal" => 0,
+        b"dev" => 1,
+        b"build" => 2,
+        _ => 3,
+    }
+}
+
+/// Collects, attributes, scopes, and canonically orders the declaration rows
+/// for `eg query manifest-deps`.
+fn collect_manifest_deps_rows<'a>(
+    records: &'a [GraphRecord],
+    index: &'a query::RepositoryIndex,
+    repo_scope: Option<&str>,
+    deleted: &std::collections::BTreeSet<&str>,
+) -> Vec<ManifestDepsDeclarationJson<'a>> {
+    let mut rows: Vec<ManifestDepsDeclarationJson<'_>> = records
+        .iter()
+        .filter_map(|record| {
+            let GraphRecord::Node {
+                id,
+                kind: NodeKind::DependencyDeclaration,
+                schema_version,
+                repo_relative_path: Some(manifest_path),
+                name: Some(name),
+                dependency: Some(payload),
+                ..
+            } = record
+            else {
+                return None;
+            };
+            // Current-state query: a tombstoned declaration is not live
+            // (PR #314 review), mirroring the other query paths.
+            if deleted.contains(id.as_str()) {
+                return None;
+            }
+            // Repository attribution via the CONTAINS topology (PR #314
+            // review); scoping drops rows owned by other repositories.
+            let owner = index.owner_of(id);
+            if let Some(scope) = repo_scope
+                && owner != Some(scope)
+            {
+                return None;
+            }
+            Some(ManifestDepsDeclarationJson {
+                record_id: id,
+                repository: owner.and_then(|repo_id| index.display_of(repo_id)),
+                name,
+                declared_as: payload.declared_as.as_deref(),
+                dependency_kind: &payload.dependency_kind,
+                declared_requirement: payload.declared_requirement.as_deref(),
+                resolved_version: payload.resolved_version.as_deref(),
+                resolution: &payload.resolution,
+                declaring_package: &payload.declaring_package,
+                manifest_path,
+                schema_version: *schema_version,
+            })
+        })
+        .collect();
+    rows.sort_by(|left, right| {
+        left.repository
+            .unwrap_or("")
+            .cmp(right.repository.unwrap_or(""))
+            .then_with(|| left.manifest_path.cmp(right.manifest_path))
+            .then_with(|| left.declaring_package.cmp(right.declaring_package))
+            .then_with(|| {
+                dependency_kind_rank(left.dependency_kind)
+                    .cmp(&dependency_kind_rank(right.dependency_kind))
+            })
+            .then_with(|| left.name.cmp(right.name))
+            .then_with(|| {
+                left.declared_as
+                    .unwrap_or("")
+                    .cmp(right.declared_as.unwrap_or(""))
+            })
+            .then_with(|| left.record_id.cmp(right.record_id))
+    });
+    rows
+}
+
+/// Skipped-manifest honesty (PR #314 review): an unreadable/unparseable
+/// manifest means dependency coverage has holes, so every answer — hit,
+/// miss, and empty surface — is qualified with one `skipped_manifest`
+/// diagnostic per skipped manifest (repo-relative handle + Diagnostic record
+/// ID + owning repository label, deterministic order). Diagnostics are
+/// attributed via the Repository —CONTAINS→ Diagnostic topology; under
+/// `--repo`, holes owned by OTHER repositories are dropped, while
+/// unattributable legacy diagnostics are always included (their absent
+/// `repository` field is the marker) — hiding a possible coverage hole would
+/// be worse than over-reporting one.
+fn collect_skipped_manifest_diagnostics<'a>(
+    records: &'a [GraphRecord],
+    index: &'a query::RepositoryIndex,
+    repo_scope: Option<&str>,
+    deleted: &std::collections::BTreeSet<&str>,
+) -> Vec<ManifestDepsDiagnosticJson<'a>> {
+    let mut skipped: Vec<(&str, &str, Option<&str>)> = records
+        .iter()
+        .filter_map(|record| {
+            let GraphRecord::Node {
+                id,
+                kind: NodeKind::Diagnostic,
+                repo_relative_path: Some(path),
+                symbol_kind: Some(symbol_kind),
+                ..
+            } = record
+            else {
+                return None;
+            };
+            // A tombstoned diagnostic no longer qualifies current-state
+            // answers (PR #314 review).
+            if deleted.contains(id.as_str()) {
+                return None;
+            }
+            // Every skipped-manifest class qualifies answers: unparseable
+            // manifests, parseable ones whose dependency tables carry no
+            // usable [package].name, manifests whose `workspace = true`
+            // entries have no resolvable workspace root, dependency
+            // entries Cargo would reject — neither version string nor
+            // table — and workspace roots whose member resolution Cargo
+            // rejects outright (PR #314 review).
+            if symbol_kind != crate::manifest_deps::SKIPPED_MANIFEST_DIAGNOSTIC_KIND
+                && symbol_kind != crate::manifest_deps::UNATTRIBUTABLE_MANIFEST_DIAGNOSTIC_KIND
+                && symbol_kind != crate::manifest_deps::UNINHERITABLE_MANIFEST_DIAGNOSTIC_KIND
+                && symbol_kind != crate::manifest_deps::UNINTERPRETABLE_DEPENDENCY_DIAGNOSTIC_KIND
+                && symbol_kind != crate::manifest_deps::UNLOADABLE_WORKSPACE_DIAGNOSTIC_KIND
+            {
+                return None;
+            }
+            let owner = index.owner_of(id);
+            if let Some(scope) = repo_scope
+                && owner.is_some_and(|owner| owner != scope)
+            {
+                return None;
+            }
+            Some((
+                path.as_str(),
+                id.as_str(),
+                owner.and_then(|repo_id| index.display_of(repo_id)),
+            ))
+        })
+        .collect();
+    skipped.sort_unstable();
+    skipped.dedup();
+    skipped
+        .into_iter()
+        .map(|(path, record_id, repository)| ManifestDepsDiagnosticJson {
+            code: "skipped_manifest",
+            detail: Some(path),
+            record_id: Some(record_id),
+            repository,
+        })
+        .collect()
+}
+
+/// `eg query manifest-deps` (issue #180): list declared Cargo dependencies
+/// with their lockfile resolution and repository attribution, or answer a
+/// direct `--name` lookup. Deterministic, byte-identical output; an empty
+/// surface or a miss is a machine-readable success, never an error.
+fn query_manifest_deps_cmd(
+    records: &[GraphRecord],
+    index: &query::RepositoryIndex,
+    repo_scope: Option<&str>,
+    name_filter: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    // Current-state view: tombstoned records (rows and diagnostics alike)
+    // are excluded, mirroring the other query paths (PR #314 review).
+    let deleted = current_deleted_ids(records);
+    let mut rows = collect_manifest_deps_rows(records, index, repo_scope, &deleted);
+    let surface_is_empty = rows.is_empty();
+    if let Some(filter) = name_filter {
+        rows.retain(|row| row.name == filter);
+    }
+
+    let mut diagnostics = Vec::new();
+    if surface_is_empty {
+        diagnostics.push(ManifestDepsDiagnosticJson {
+            code: "empty_dependency_surface",
+            detail: None,
+            record_id: None,
+            repository: None,
+        });
+    } else if rows.is_empty() {
+        diagnostics.push(ManifestDepsDiagnosticJson {
+            code: "no_match_for_name",
+            detail: name_filter,
+            record_id: None,
+            repository: None,
+        });
+    }
+    diagnostics.extend(collect_skipped_manifest_diagnostics(
+        records, index, repo_scope, &deleted,
+    ));
+
+    match format {
+        OutputFormat::Json => {
+            let response = ManifestDepsResponse {
+                ok: true,
+                query: "manifest-deps",
+                name: name_filter,
+                repo_scope: repo_scope.and_then(|repo_id| index.display_of(repo_id)),
+                count: rows.len(),
+                disclaimer: MANIFEST_DEPS_DISCLAIMER,
+                declarations: rows,
+                diagnostics,
+            };
+            let output = serde_json::to_string_pretty(&response)
+                .context("failed to serialize dependency declarations")?;
+            println!("{output}");
+        }
+        OutputFormat::Text => {
+            println!("{} dependency declaration(s)", rows.len());
+            for row in &rows {
+                let requirement = row.declared_requirement.unwrap_or("(none)");
+                let resolved = row.resolved_version.unwrap_or(row.resolution);
+                let repository = row
+                    .repository
+                    .map(|label| format!(" repo={label}"))
+                    .unwrap_or_default();
+                let declared_as = row
+                    .declared_as
+                    .map(|key| format!(" declared-as={key}"))
+                    .unwrap_or_default();
+                println!(
+                    "{package} {kind} {name}{declared_as} requirement={requirement} resolved={resolved} manifest={manifest}{repository} ({record_id})",
+                    package = row.declaring_package,
+                    kind = row.dependency_kind,
+                    name = row.name,
+                    manifest = row.manifest_path,
+                    record_id = row.record_id,
+                );
+            }
+            for diagnostic in &diagnostics {
+                let record_id = diagnostic
+                    .record_id
+                    .map(|id| format!(" [{id}]"))
+                    .unwrap_or_default();
+                match diagnostic.detail {
+                    Some(detail) => {
+                        println!("diagnostic: {} ({detail}){record_id}", diagnostic.code);
+                    }
+                    None => println!("diagnostic: {}{record_id}", diagnostic.code),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn query_public_api_cmd(
     records: &[GraphRecord],
     index: &query::RepositoryIndex,
@@ -12573,15 +12968,55 @@ fn query_lifeline_cmd(
     repo_id: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
+    /// Prints a stable machine-readable lifeline diagnostic and exits.
+    fn fail(
+        code: &str,
+        msg: &str,
+        candidates: Option<&[String]>,
+        format: OutputFormat,
+        exit_code: i32,
+    ) -> ! {
+        match format {
+            OutputFormat::Json => {
+                let mut error = serde_json::json!({
+                    "code": code,
+                    "message": msg
+                });
+                if let Some(candidates) = candidates {
+                    error["candidates"] = serde_json::json!(candidates);
+                }
+                let envelope = serde_json::json!({
+                    "ok": false,
+                    "error": error
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string(&envelope).expect("diagnostic envelope must serialize")
+                );
+            }
+            OutputFormat::Text => match candidates {
+                Some(candidates) => {
+                    eprintln!("Error: {msg}. Candidates: {}", candidates.join(", "));
+                }
+                None => eprintln!("Error: {msg}"),
+            },
+        }
+        std::process::exit(exit_code);
+    }
+
     match query::symbol_lifeline(records, symbol, repo_id) {
         Ok(events) => {
+            if events.is_empty() {
+                let msg = format!("symbol matched but has no commit-linked history: {symbol}");
+                fail("no_history", &msg, None, format, 2);
+            }
             match format {
                 OutputFormat::Json => {
-                    let envelope = serde_json::json!({
-                        "ok": true,
-                        "result": events,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                    // Newline-delimited JSON: one standalone event object per
+                    // line, chronologically ordered (issue #215).
+                    for ev in &events {
+                        println!("{}", serde_json::to_string(ev)?);
+                    }
                 }
                 OutputFormat::Text => {
                     println!("Advisory temporal facts: where and when this symbol changed");
@@ -12607,8 +13042,8 @@ fn query_lifeline_cmd(
                             _ => " drift=absent".to_string(),
                         };
                         println!(
-                            "[{}] commit={} record_id={}{}{}",
-                            ev.event_type, ev.commit, ev.record_id, citation, drift
+                            "[{}] commit={} valid_time={} record_id={}{}{}",
+                            ev.event_type, ev.commit, ev.valid_time, ev.record_id, citation, drift
                         );
                     }
                 }
@@ -12616,45 +13051,12 @@ fn query_lifeline_cmd(
             Ok(())
         }
         Err(query::LifelineError::UnknownSymbol { query }) => {
-            let code = "unknown_symbol";
             let msg = format!("symbol not found in the graph: {query}");
-            match format {
-                OutputFormat::Json => {
-                    let envelope = serde_json::json!({
-                        "ok": false,
-                        "error": {
-                            "code": code,
-                            "message": msg
-                        }
-                    });
-                    println!("{}", serde_json::to_string(&envelope)?);
-                }
-                OutputFormat::Text => {
-                    eprintln!("Error: {msg}");
-                }
-            }
-            std::process::exit(5);
+            fail("unknown_symbol", &msg, None, format, 2);
         }
         Err(query::LifelineError::AmbiguousSymbol { query, candidates }) => {
-            let code = "ambiguous_symbol";
             let msg = format!("ambiguous symbol name '{query}' matches multiple symbols");
-            match format {
-                OutputFormat::Json => {
-                    let envelope = serde_json::json!({
-                        "ok": false,
-                        "error": {
-                            "code": code,
-                            "message": msg,
-                            "candidates": candidates
-                        }
-                    });
-                    println!("{}", serde_json::to_string(&envelope)?);
-                }
-                OutputFormat::Text => {
-                    eprintln!("Error: {msg}. Candidates: {}", candidates.join(", "));
-                }
-            }
-            std::process::exit(6);
+            fail("ambiguous_symbol", &msg, Some(&candidates), format, 6);
         }
     }
 }
@@ -12952,8 +13354,17 @@ pub(crate) fn trust_class_for(record: &GraphRecord) -> &'static str {
         "Observation" | "Decision" | "Failure" | "Lesson" => "agent_authored",
         "Verification" | "CommandEvidence" | "CommandRun" | "TestRun" | "CIStatus"
         | "BenchmarkRun" | "CoverageReport" | "ProofResult" => "verification_evidence",
-        "File" | "Symbol" | "Module" | "Import" | "Commit" | "Change" | "Repository"
-        | "PanicRiskSite" | "DebtMarker" | "UnsafeSite" => "source_fact",
+        "File"
+        | "Symbol"
+        | "Module"
+        | "Import"
+        | "Commit"
+        | "Change"
+        | "Repository"
+        | "PanicRiskSite"
+        | "DebtMarker"
+        | "UnsafeSite"
+        | "DependencyDeclaration" => "source_fact",
         "Task"
         | "AcceptanceCriterion"
         | "LocalTask"

@@ -380,6 +380,50 @@ pub struct SourceSnapshotPayload {
     pub scanned_at: String,
 }
 
+/// Declared-dependency payload stamped on `DependencyDeclaration` nodes.
+///
+/// Captures one directly-declared Cargo dependency exactly as written in a
+/// `Cargo.toml` manifest, joined with the single resolved version from the
+/// nearest `Cargo.lock` when one exists (issue #180). Parse-derived and
+/// strictly local: never the output of `cargo metadata`, a network lookup, or
+/// a build. All fields are additive per `docs/schema/schema-versioning.md §2`
+/// and are never identity inputs beyond those hashed into the record ID.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DependencyDeclarationPayload {
+    /// `[package].name` of the manifest declaring this dependency.
+    pub declaring_package: String,
+    /// Dependency table the declaration was written in, drawn from the closed
+    /// set `normal` (`[dependencies]`), `dev` (`[dev-dependencies]`), or
+    /// `build` (`[build-dependencies]`).
+    pub dependency_kind: String,
+    /// Manifest key the entry was declared under when it differs from the
+    /// crate name (Cargo `package = "…"` rename syntax, which legitimately
+    /// declares several versions of one crate). Absent for plain
+    /// declarations. Additive per `docs/schema/schema-versioning.md §2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_as: Option<String>,
+    /// Declared version requirement string exactly as written (`"1.0.228"`).
+    /// Absent when the declaration carries no `version` key (e.g. a pure
+    /// `path`/`git`/`workspace = true` dependency) — never fabricated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_requirement: Option<String>,
+    /// The single resolved version from the nearest `Cargo.lock`. Present only
+    /// when `resolution` is `locked`; never a guessed or fabricated version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_version: Option<String>,
+    /// Lockfile resolution marker, drawn from the closed set `locked`,
+    /// `no_lockfile` (no `Cargo.lock` found for this manifest),
+    /// `not_in_lockfile` (lockfile exists but does not list the crate),
+    /// `ambiguous_in_lockfile` (several locked versions and the declared
+    /// requirement cannot select exactly one), `requirement_unsatisfied_in_lockfile`
+    /// (a parseable declared requirement is satisfied by none of the locked
+    /// versions; the mismatched version is never presented as resolved), or
+    /// `lockfile_unreadable` (the nearest `Cargo.lock` exists but could not
+    /// be read or parsed; an ancestor lockfile is never consulted in its
+    /// place).
+    pub resolution: String,
+}
+
 /// A typed citation from an agent-memory node to another graph record.
 ///
 /// Evidence links are stored both on the source node (for fast read) and as
@@ -745,6 +789,10 @@ pub enum GraphRecord {
         /// all other kinds and on stores produced before snapshot stamping.
         #[serde(skip_serializing_if = "Option::is_none")]
         source_snapshot: Option<Box<SourceSnapshotPayload>>,
+        /// Declared-dependency payload for `DependencyDeclaration` nodes
+        /// (issue #180); absent on all other kinds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dependency: Option<Box<DependencyDeclarationPayload>>,
         // ── Agent-memory provenance fields (absent for code-graph nodes) ─────
         /// Observation body text (Observation nodes).
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1169,6 +1217,7 @@ impl GraphRecord {
             author: None,
             diff_hunk_handle: None,
             review_side: None,
+            dependency: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1281,6 +1330,7 @@ impl GraphRecord {
             author: None,
             diff_hunk_handle: None,
             review_side: None,
+            dependency: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1392,6 +1442,7 @@ impl GraphRecord {
             author: None,
             diff_hunk_handle: None,
             review_side: None,
+            dependency: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1509,6 +1560,7 @@ impl GraphRecord {
             author: None,
             diff_hunk_handle: None,
             review_side: None,
+            dependency: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1734,6 +1786,26 @@ impl GraphRecord {
             *source_snapshot = Some(Box::new(snapshot));
         }
         self
+    }
+
+    /// Stamps a [`DependencyDeclarationPayload`] on a `DependencyDeclaration`
+    /// node (issue #180). No-op on non-node records.
+    #[must_use]
+    pub fn with_dependency(mut self, payload: DependencyDeclarationPayload) -> Self {
+        if let Self::Node { dependency, .. } = &mut self {
+            *dependency = Some(Box::new(payload));
+        }
+        self
+    }
+
+    /// Returns the declared-dependency payload when this record is a
+    /// `DependencyDeclaration` node carrying one; `None` otherwise (issue #180).
+    #[must_use]
+    pub fn dependency(&self) -> Option<&DependencyDeclarationPayload> {
+        match self {
+            Self::Node { dependency, .. } => dependency.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
     }
 
     /// Returns the source-snapshot payload when this record is a `Repository` node
@@ -2060,6 +2132,8 @@ pub enum NodeKind {
     /// block. The `name` field carries the closed site kind
     /// (`block` / `fn` / `impl`).
     UnsafeSite,
+    /// Directly-declared Cargo manifest dependency (issue #180).
+    DependencyDeclaration,
     /// Git commit observed during history replay.
     Commit,
     /// File-level change observed in a commit.
@@ -2169,6 +2243,7 @@ impl NodeKind {
             Self::PanicRiskSite => "PanicRiskSite",
             Self::DebtMarker => "DebtMarker",
             Self::UnsafeSite => "UnsafeSite",
+            Self::DependencyDeclaration => "DependencyDeclaration",
             Self::Commit => "Commit",
             Self::Change => "Change",
             Self::SemanticDrift => "SemanticDrift",

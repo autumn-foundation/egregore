@@ -89,6 +89,43 @@ fn classifies_spanless_module_as_absent_handle_documented() {
     assert!(result.diagnostic.is_none());
 }
 
+// Issue #180 (PR #314 review): a manifest-declared dependency fact is a
+// deterministic source fact, cited by its repo-relative Cargo.toml path —
+// span absence is legitimate for a whole-manifest handle, mirroring `File`.
+#[test]
+fn classifies_dependency_declaration_as_path_cited_source_fact() {
+    let mut dep = node("codegraph:v5:dep1", NodeKind::DependencyDeclaration);
+    if let GraphRecord::Node {
+        repo_relative_path,
+        name,
+        ..
+    } = &mut dep
+    {
+        repo_relative_path.replace("crates/pkg-a/Cargo.toml".to_owned());
+        name.replace("serde".to_owned());
+    }
+    assert_eq!(citation_trust_class(&dep), "source_fact");
+    let result = classify_record(&dep);
+    assert_eq!(result.row.trust_class, "source_fact");
+    assert_eq!(result.row.status, CitationStatus::Cited);
+    assert_eq!(
+        result.row.primary_handle.as_deref(),
+        Some("crates/pkg-a/Cargo.toml"),
+        "the manifest path is the citation handle"
+    );
+    assert!(result.diagnostic.is_none());
+}
+
+// Issue #180 fail path: a dependency fact without its manifest path carries no
+// usable handle and must fail the gate rather than pass as documented-absent.
+#[test]
+fn dependency_declaration_without_manifest_path_is_missing_required() {
+    let dep = node("codegraph:v5:dep2", NodeKind::DependencyDeclaration);
+    let result = classify_record(&dep);
+    assert_eq!(result.row.trust_class, "source_fact");
+    assert_eq!(result.row.status, CitationStatus::MissingRequiredHandle);
+}
+
 // AC4 fail path: a code fact with neither path nor span is missing + diagnosed.
 #[test]
 fn code_fact_without_path_or_span_is_missing_required() {
@@ -216,6 +253,7 @@ fn trust_class_strings_match_existing_vocab() {
         NodeKind::Preference,
         NodeKind::Agent,
         NodeKind::EmbeddingModel,
+        NodeKind::DependencyDeclaration,
     ] {
         let rec = node("id", kind);
         assert!(
@@ -252,6 +290,59 @@ fn gate_fails_below_threshold_passes_when_cited() {
     }
     let report = run_citation_audit(&[sym, bad], &AuditConfig::default());
     assert!(!report.gate.code_gate_pass);
+    assert!(!report.ok);
+}
+
+// PR #314 review: `manifest-deps` is a registered citation-audit workflow —
+// dependency rows must carry record_id + manifest handle, and a handle-less
+// row must fail the gate.
+#[test]
+fn manifest_deps_workflow_gates_dependency_rows() {
+    // Real extractor output: a plain entry plus a `package = "…"` rename pair
+    // (spanless facts cited by the manifest path).
+    let records = crate::manifest_deps::manifest_dependency_records(
+        "repo-id",
+        "Cargo.toml",
+        "[package]\nname = \"pkg\"\n\n[dependencies]\nembedded-hal = \"0.2\"\nembedded-hal-1 = { package = \"embedded-hal\", version = \"1\" }\n",
+        &crate::manifest_deps::LockfileStatus::Absent,
+        None,
+    );
+    assert_eq!(records.len(), 2, "both rename-pair entries seed the audit");
+
+    let report = run_citation_audit(&records, &AuditConfig::default());
+    let workflow = report
+        .workflows
+        .iter()
+        .find(|w| w.workflow == "manifest-deps")
+        .expect("manifest-deps must be a registered audit workflow");
+    assert!(workflow.enabled);
+    assert_eq!(workflow.trust_class, "source_fact");
+    assert_eq!(workflow.rows.len(), 2, "one row per declared entry");
+    for row in &workflow.rows {
+        assert_eq!(row.trust_class, "source_fact");
+        assert_eq!(row.status, CitationStatus::Cited);
+        assert_eq!(
+            row.primary_handle.as_deref(),
+            Some("Cargo.toml"),
+            "rows are cited by their repo-relative manifest handle"
+        );
+        assert!(row.record_id.starts_with("codegraph:v"));
+    }
+    assert!(report.gate.code_gate_pass);
+
+    // A dependency row missing its manifest handle is a real code-answer miss
+    // and must fail the gate.
+    let bad = node(
+        "codegraph:v5:dep-without-handle",
+        NodeKind::DependencyDeclaration,
+    );
+    let mut with_bad = records;
+    with_bad.push(bad);
+    let report = run_citation_audit(&with_bad, &AuditConfig::default());
+    assert!(
+        !report.gate.code_gate_pass,
+        "a handle-less dependency row must fail the citation gate"
+    );
     assert!(!report.ok);
 }
 
