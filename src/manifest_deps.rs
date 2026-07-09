@@ -1205,9 +1205,10 @@ fn path_dependency_closure(
     }
     let mut closure: BTreeSet<String> = BTreeSet::new();
     // The scan root may be relative (`eg scan .`); the absolute-path branch
-    // of `normalize_path_dep` compares against the lexically absolutized
-    // form, computed once per workspace root (PR #314 review).
-    let abs_root = absolutize_lexical(&root_dir);
+    // of `normalize_path_dep` strips against the lexically absolutized REPO
+    // root — an absolute in-repo target may live anywhere in the
+    // repository, not just inside the workspace directory (PR #314 review).
+    let abs_repo = absolutize_lexical(repo_root);
     // `[workspace.dependencies]` path templates: a member (or the root
     // package) inheriting one via `{ workspace = true }` makes its target
     // an automatic member; the paths are relative to the ROOT (PR #314
@@ -1215,13 +1216,13 @@ fn path_dependency_closure(
     let workspace_paths = workspace_dependency_paths(root_doc);
     let enqueue = |deps: &ManifestPathDeps, base: &str, queue: &mut Vec<String>| {
         for path in &deps.literal {
-            if let Some(next) = normalize_path_dep(&abs_root, &root_segments, base, path) {
+            if let Some(next) = normalize_path_dep(&abs_repo, &root_segments, base, path) {
                 queue.push(next);
             }
         }
         for key in &deps.inherited {
             if let Some(path) = workspace_paths.get(key)
-                && let Some(next) = normalize_path_dep(&abs_root, &root_segments, "", path)
+                && let Some(next) = normalize_path_dep(&abs_repo, &root_segments, "", path)
             {
                 queue.push(next);
             }
@@ -1418,19 +1419,22 @@ fn absolutize_lexical(dir: &Path) -> PathBuf {
     out
 }
 
-/// Normalizes one `path = "…"` dependency value against the workspace root.
+/// Normalizes one `path = "…"` dependency value to the workspace-root-
+/// relative member form.
 ///
 /// Relative paths join `base` (the declaring manifest's root-relative
-/// directory) with `.`/`..` resolution; an **absolute** path is accepted
-/// only when it points inside the workspace root (lexical prefix match
-/// against `abs_root`, the [`absolutize_lexical`] form of the root, so a
-/// relative scan root still recognizes in-tree targets) and converts to the
-/// root-relative member path. Absolute out-of-tree targets and relative
-/// paths escaping the repository are skipped — documented out of scope,
-/// never an error; a relative path climbing back over the repo tree stays
-/// a member (PR #314 review).
+/// directory) with `.`/`..` resolution in the repo-relative canonical
+/// space; an **absolute** path is accepted when it points anywhere inside
+/// the REPOSITORY (lexical prefix match against `abs_repo`, the
+/// [`absolutize_lexical`] form of the repo root, so a relative scan root
+/// still recognizes in-repo targets — including targets outside the
+/// workspace directory) and is re-expressed root-relative via
+/// [`rel_between`]. Absolute out-of-repo targets and relative paths
+/// escaping the repository are skipped — documented out of scope, never an
+/// error; a path climbing back over the repo tree stays a member
+/// (PR #314 review).
 fn normalize_path_dep(
-    abs_root: &Path,
+    abs_repo: &Path,
     root_segments: &[&str],
     base: &str,
     raw: &str,
@@ -1438,7 +1442,7 @@ fn normalize_path_dep(
     let normalized = raw.replace('\\', "/");
     if Path::new(&normalized).is_absolute() {
         let rel = absolutize_lexical(Path::new(&normalized));
-        let rel = rel.strip_prefix(abs_root).ok()?;
+        let rel = rel.strip_prefix(abs_repo).ok()?;
         let mut parts: Vec<&str> = Vec::new();
         for component in rel.components() {
             match component {
@@ -1447,10 +1451,11 @@ fn normalize_path_dep(
                 _ => return None,
             }
         }
-        if parts.is_empty() {
+        if parts == root_segments {
+            // The workspace root is never its own member.
             return None;
         }
-        return Some(parts.join("/"));
+        return Some(rel_between(root_segments, &parts));
     }
     normalize_in_tree_path(root_segments, base, &normalized)
 }

@@ -3164,3 +3164,71 @@ fn absolute_member_and_exclude_patterns_are_normalized() {
         "an out-of-repo absolute member pattern is a pinned skip, never a match"
     );
 }
+
+/// PR #314 review: an absolute in-repo path dependency may target a
+/// directory anywhere in the repository — not just inside the workspace
+/// root's own tree. It is stripped against the REPO root and re-expressed
+/// workspace-root-relative, so it joins `path_members` and resolves
+/// `locked` through the root's lockfile; an out-of-repo absolute target
+/// stays a pinned skip.
+#[test]
+fn absolute_in_repo_path_deps_outside_the_workspace_dir_join_the_closure() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    for dir in ["ws", "pkgs/app/src", "pkgs/helper/src"] {
+        fs::create_dir_all(repo.join(dir)).expect("dirs");
+    }
+    fs::write(
+        repo.join("ws/Cargo.toml"),
+        "[workspace]\nmembers = [\"../pkgs/app\"]\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("ws/Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    let helper_abs = repo.join("pkgs/helper");
+    fs::write(
+        repo.join("pkgs/app/Cargo.toml"),
+        format!(
+            concat!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nworkspace = \"../../ws\"\n\n",
+                "[dependencies]\nserde = \"1\"\n",
+                "helper = {{ path = \"{}\" }}\n",
+                "esc = {{ path = \"/definitely/not/in/repo/esc\" }}\n",
+            ),
+            helper_abs.display()
+        ),
+    )
+    .expect("app manifest");
+    fs::write(repo.join("pkgs/app/src/lib.rs"), "pub fn a() {}\n").expect("lib");
+    fs::write(
+        repo.join("pkgs/helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nworkspace = \"../../ws\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("helper manifest");
+    fs::write(repo.join("pkgs/helper/src/lib.rs"), "pub fn h() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("abs-dep-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let rows = parsed["declarations"].as_array().expect("declarations");
+    let by_pkg = |pkg: &str| {
+        rows.iter()
+            .find(|d| d["declaring_package"] == pkg)
+            .unwrap_or_else(|| panic!("row for {pkg}"))
+    };
+    assert_eq!(by_pkg("app")["resolution"], "locked");
+    assert_eq!(
+        by_pkg("helper")["resolution"],
+        "locked",
+        "an absolute in-repo path dep outside the workspace dir is a member"
+    );
+    assert_eq!(by_pkg("helper")["resolved_version"], "1.0.228");
+}

@@ -141,10 +141,11 @@ declared entry (manifest key):
   resolves against the root's `[workspace.dependencies]` `path` (relative
   to the root), while a template no member ever inherits never becomes a
   member.
-  Absolute `path` values pointing inside the
-  workspace root are normalized to root-relative member paths (the root is
-  lexically absolutized first, so `eg scan .` with a relative repo path
-  recognizes them too; symlinks are never resolved). Non-members and excluded
+  Absolute `path` values pointing anywhere inside the
+  REPOSITORY — including outside the workspace directory — are normalized
+  to root-relative member paths (the repo root is lexically absolutized and
+  stripped, so `eg scan .` with a relative repo path recognizes them too;
+  symlinks are never resolved). Non-members and excluded
   members are standalone: their own directory's lockfile state applies —
   never a fabricated `locked` from an unrelated
   ancestor. Plain package manifests and stray lockfiles without a manifest
@@ -168,9 +169,8 @@ declared entry (manifest key):
   Relative path dependencies resolve against the declaring manifest's
   REPO-relative position, so an out-of-root member's dependency may climb
   back over the repository tree (or back inside the root's own tree) and
-  stay a member; only a relative path escaping the *repository* — and
-  absolute out-of-tree path dependencies — are not interpreted in this
-  slice.
+  stay a member; only paths escaping the *repository* — relative or
+  absolute — are not interpreted in this slice.
   A parseable declared requirement gates **every** path with Cargo semantics
   (`"1"` means `^1`), including a sole locked version that a stale or shared
   lockfile can leave unsatisfying: exactly one satisfying version is
