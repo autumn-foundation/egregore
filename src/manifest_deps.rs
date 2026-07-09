@@ -316,6 +316,28 @@ pub fn parse_manifest_dependencies(
     })
 }
 
+/// Validates the KNOWN dependency-table keys' types and allowed values per
+/// Cargo's rejection behavior (PR #314 review): the string sources and
+/// refinements (`version`/`path`/`git`/`registry`/`branch`/`tag`/`rev`/
+/// `package`) must be strings, `optional`/`default-features` (and the
+/// deprecated `default_features` spelling) must be booleans, `features`
+/// must be an array of strings, and `workspace` may only be the literal
+/// `true` — `workspace = false` is Cargo-invalid. Unknown keys are
+/// tolerated: Cargo warns but loads the manifest.
+fn dependency_table_is_well_typed(spec: &dyn toml_edit::TableLike) -> bool {
+    spec.iter().all(|(key, item)| match key {
+        "version" | "path" | "git" | "registry" | "branch" | "tag" | "rev" | "package" => {
+            item.as_str().is_some()
+        }
+        "workspace" => item.as_bool() == Some(true),
+        "optional" | "default-features" | "default_features" => item.as_bool().is_some(),
+        "features" => item
+            .as_array()
+            .is_some_and(|array| array.iter().all(|value| value.as_str().is_some())),
+        _ => true,
+    })
+}
+
 /// Interprets one dependency table entry.
 ///
 /// `serde = "1"` declares requirement `"1"`; `serde = { version = "1", .. }`
@@ -323,11 +345,12 @@ pub fn parse_manifest_dependencies(
 /// entry, so the *crate* name is the `package` value. A declaration without a
 /// `version` key (pure `path`/`git`/`workspace = true`) carries no
 /// requirement — nothing is fabricated. An entry that is neither a version
-/// string nor a dependency table (`serde = true`), and a table without a
-/// usable source — a `version`/`path`/`git` string or `workspace = true`
-/// (an empty table, or wrong-typed fields like `version = 1` /
-/// `workspace = "yes"`) — are manifests Cargo rejects: `None`, no row is
-/// fabricated, and the caller reports the coverage hole (PR #314 review).
+/// string nor a dependency table (`serde = true`), a table without a
+/// usable source — a `version`/`path`/`git` string or `workspace = true` —
+/// and a table whose KNOWN keys are wrong-typed or carry disallowed values
+/// (`version = 1` even beside a valid `path`, `workspace = false`) are
+/// manifests Cargo rejects: `None`, no row is fabricated, and the caller
+/// reports the coverage hole (PR #314 review).
 fn declared_dependency(
     key: &str,
     item: &toml_edit::Item,
@@ -340,6 +363,12 @@ fn declared_dependency(
     if let Some(requirement) = item.as_str() {
         declared_requirement = Some(requirement.to_owned());
     } else if let Some(spec) = item.as_table_like() {
+        // Any known key with a wrong type or disallowed value poisons the
+        // whole entry — Cargo rejects the manifest even when another
+        // source field is valid (PR #314 review).
+        if !dependency_table_is_well_typed(spec) {
+            return None;
+        }
         if let Some(package) = spec.get("package").and_then(|v| v.as_str()) {
             package.clone_into(&mut name);
             declared_as = Some(key.to_owned());
@@ -1180,9 +1209,18 @@ fn parse_workspace_facts(text: &str, repo_root: &Path, dir_key: &str) -> Workspa
                                         entry.get(name).and_then(|v| v.as_str()).map(str::to_owned)
                                     };
                                     let version = field("version");
-                                    let usable = version.is_some()
-                                        || field("path").is_some()
-                                        || field("git").is_some();
+                                    // A template additionally rejects the
+                                    // member-only keys Cargo disallows in
+                                    // `[workspace.dependencies]`: `optional`
+                                    // and `workspace` itself; known keys
+                                    // must be well-typed like member
+                                    // entries (PR #314 review).
+                                    let usable = dependency_table_is_well_typed(entry)
+                                        && entry.get("optional").is_none()
+                                        && entry.get("workspace").is_none()
+                                        && (version.is_some()
+                                            || field("path").is_some()
+                                            || field("git").is_some());
                                     WorkspaceDepSpec {
                                         package: field("package"),
                                         version,

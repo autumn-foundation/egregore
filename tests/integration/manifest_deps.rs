@@ -3307,3 +3307,144 @@ fn invalid_workspace_dependency_specs_are_not_inheritable() {
     assert_eq!(miss["count"], 0);
     assert_eq!(skipped_diagnostics(&miss).len(), 1);
 }
+
+/// PR #314 review: known dependency-table keys must carry the types Cargo
+/// accepts — a wrong-typed known key (`version = 1` beside a valid `path`)
+/// or a disallowed value (`workspace = false`) makes the whole entry a
+/// manifest Cargo rejects: no row, `uninterpretable_cargo_dependency`
+/// qualification. Unknown keys stay tolerated (Cargo warns but loads), and
+/// member-manifest-only keys like `optional = true` remain valid there.
+#[test]
+fn ill_typed_member_dependency_tables_are_uninterpretable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        concat!(
+            "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\n\n",
+            "[dependencies]\n",
+            "dep1 = { path = \"dep1\", version = 1 }\n",
+            "serde = { version = \"1\", workspace = false }\n",
+            "tokio = { version = \"1\", optional = true }\n",
+            "ryu = { version = \"1\", some-unknown-key = 5 }\n",
+        ),
+    )
+    .expect("root manifest");
+    // serde sits in the lockfile: an ill-typed entry must still never
+    // become a row, let alone a `locked` one.
+    fs::write(
+        repo.join("Cargo.lock"),
+        concat!(
+            "version = 4\n\n",
+            "[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\n",
+            "[[package]]\nname = \"tokio\"\nversion = \"1.47.1\"\n\n",
+            "[[package]]\nname = \"ryu\"\nversion = \"1.0.5\"\n",
+        ),
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("ill-typed-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let full = run_query_deps(&graph, &[]);
+    let rows = full["declarations"].as_array().expect("declarations");
+    for invalid in ["dep1", "serde"] {
+        assert!(
+            rows.iter().all(|d| d["name"] != invalid),
+            "an ill-typed known key must make the {invalid} entry uninterpretable"
+        );
+    }
+    let tokio = rows
+        .iter()
+        .find(|d| d["name"] == "tokio")
+        .expect("optional = true is valid in a member manifest");
+    assert_eq!(tokio["resolution"], "locked");
+    let ryu = rows
+        .iter()
+        .find(|d| d["name"] == "ryu")
+        .expect("unknown keys are tolerated (Cargo warns but loads)");
+    assert_eq!(ryu["resolution"], "locked");
+    assert_eq!(
+        skipped_diagnostics(&full).len(),
+        1,
+        "the skipped ill-typed entries must qualify the answer"
+    );
+
+    let miss = run_query_deps(&graph, &["--name", "serde"]);
+    assert_eq!(miss["count"], 0);
+    assert_eq!(skipped_diagnostics(&miss).len(), 1);
+}
+
+/// PR #314 review: Cargo rejects `[workspace.dependencies]` templates
+/// carrying member-only keys — `optional` (and `workspace` itself). Such a
+/// template is unusable: inheriting members take the
+/// `uninterpretable_cargo_dependency` path instead of fabricating a row.
+/// A template with `features`/`default-features` (allowed there) still
+/// inherits.
+#[test]
+fn disallowed_template_keys_make_workspace_specs_unusable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("m1/src")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        concat!(
+            "[workspace]\nmembers = [\"m1\"]\n\n",
+            "[workspace.dependencies]\n",
+            "serde = { version = \"1\", optional = true }\n",
+            "itoa = { version = \"1\", features = [\"std\"], default-features = false }\n",
+        ),
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\n[[package]]\nname = \"itoa\"\nversion = \"1.0.11\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(
+        repo.join("m1/Cargo.toml"),
+        concat!(
+            "[package]\nname = \"m1\"\nversion = \"0.1.0\"\n\n",
+            "[dependencies]\n",
+            "serde = { workspace = true }\n",
+            "itoa = { workspace = true }\n",
+        ),
+    )
+    .expect("member manifest");
+    fs::write(repo.join("m1/src/lib.rs"), "pub fn m() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("bad-template-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let full = run_query_deps(&graph, &[]);
+    let rows = full["declarations"].as_array().expect("declarations");
+    assert!(
+        rows.iter().all(|d| d["name"] != "serde"),
+        "a template with a member-only key must not be inheritable"
+    );
+    let itoa = rows
+        .iter()
+        .find(|d| d["name"] == "itoa")
+        .expect("features/default-features are allowed in workspace templates");
+    assert_eq!(itoa["resolution"], "locked");
+    assert_eq!(itoa["resolved_version"], "1.0.11");
+    assert_eq!(
+        skipped_diagnostics(&full).len(),
+        1,
+        "the unusable template must qualify the answer"
+    );
+
+    let miss = run_query_deps(&graph, &["--name", "serde"]);
+    assert_eq!(miss["count"], 0);
+    assert_eq!(skipped_diagnostics(&miss).len(), 1);
+}

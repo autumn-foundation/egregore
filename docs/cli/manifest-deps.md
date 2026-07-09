@@ -54,14 +54,21 @@ attributed to a declaring package), `{ workspace = true }` entries with no
 resolvable workspace root (stamped `symbol_kind:
 uninheritable_cargo_dependency`; the manifest's other declarations still
 extract), or dependency entries Cargo rejects — neither a version string
-nor a dependency table (`serde = true`), or a table without a usable
+nor a dependency table (`serde = true`), a table without a usable
 source (a string `version`/`path`/`git` or `workspace = true`; empty
-tables and wrong-typed fields like `version = 1` or `workspace = "yes"`
-count too — `registry`/`rev`/`branch`/`tag` only refine a source and never
-stand alone), including a `{ workspace = true }` entry whose
-`[workspace.dependencies]` root spec exists but is itself invalid (no
-usable string `version`/`path`/`git`) — stamped
-`symbol_kind: uninterpretable_cargo_dependency`,
+tables count — `registry`/`rev`/`branch`/`tag` only refine a source and
+never stand alone), or a table whose KNOWN keys are wrong-typed or carry
+disallowed values, which poisons the whole entry even beside a valid
+source: `version`/`path`/`git`/`registry`/`branch`/`tag`/`rev`/`package`
+must be strings, `optional`/`default-features` (and the deprecated
+`default_features`) booleans, `features` an array of strings, and
+`workspace` only the literal `true` (`workspace = false` is
+Cargo-invalid) — unknown keys stay tolerated, since Cargo warns but
+loads. The same class covers a `{ workspace = true }` entry whose
+`[workspace.dependencies]` root spec exists but is itself invalid: no
+usable string `version`/`path`/`git`, ill-typed known keys, or the
+member-only keys Cargo disallows in templates (`optional`, `workspace`) —
+stamped `symbol_kind: uninterpretable_cargo_dependency`,
 the invalid entry skipped — never a key-named row with no requirement —
 while valid sibling entries, including git-only declarations, still
 extract — every response — hit, miss, and empty
@@ -109,9 +116,12 @@ declared entry (manifest key):
   fabrication — plus a `skipped_manifest` qualification
   (`uninheritable_cargo_dependency`); a root spec that exists but is itself
   Cargo-invalid (no usable string `version`/`path`/`git`, e.g. `serde = {}`
-  or wrong-typed `version = 1`) also yields no row, qualified as
-  `uninterpretable_cargo_dependency`, while a valid path-only root spec
-  still inherits.
+  or wrong-typed `version = 1`, ill-typed known keys, or the member-only
+  keys Cargo disallows in `[workspace.dependencies]` — `optional` and
+  `workspace` itself) also yields no row, qualified as
+  `uninterpretable_cargo_dependency`, while a valid path-only root spec —
+  or one carrying `features`/`default-features`, which are allowed
+  there — still inherits.
 - **`resolved_version`** / **`resolution`** — the manifest resolves against
   the `Cargo.lock` Cargo would actually use: the lockfile of the crate's
   **workspace root** for a member, or its own directory's lockfile for a
