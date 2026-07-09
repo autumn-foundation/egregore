@@ -82,6 +82,11 @@ cargo run -- query coupling src/lib.rs --graph history.graph.jsonl --base <sha> 
 cargo run -- query coupling src/lib.rs --graph history.graph.jsonl --at <sha>   # history as of one commit
 cargo run -- query coupling src/nope.rs --graph history.graph.jsonl            # exit 2 (unknown_file)
 
+# One symbol's full evolution timeline across commit history (issues #96, #215)
+cargo run -- query lifeline <symbol_name> --graph history.graph.jsonl     # exit 0, NDJSON events
+cargo run -- query lifeline does_not_exist --graph history.graph.jsonl    # exit 2 (unknown_symbol)
+cargo run -- query lifeline <symbol_name> --graph history.graph.jsonl --format text  # timeline view
+
 # Externally-reachable public API surface (issue #213)
 cargo run -- query public-api --graph graph.jsonl                 # exit 0 (even when surface is empty)
 cargo run -- query public-api --graph graph.jsonl --repo acme/widget  # scope one repo; bad selector exits 1
@@ -195,6 +200,18 @@ follows the existing selector contract: full history, `--base`+`--head` range, `
 non-source paths never appear. Rows are historical co-change leads — never proof of
 dependency, and absence of coupling is not proof of independence. Output is deterministic
 and byte-identical across runs. See `docs/cli/coupling.md`.
+
+`eg query lifeline <symbol>` returns one symbol's chronologically ordered lifecycle events
+(`introduced`, `modified`, `removed`, `reintroduced`) from a `scan-history` graph or embedded
+store, keyed on the stable symbol-identity contract (ADR-0004) so same-name symbols never
+bleed into the answer. Each event carries the commit SHA, its valid time, a stable record ID,
+a repo-relative file/span handle (or documented absent-span reason), and the `SemanticDrift`
+record ID + score for a modifying step when a drift record exists (drift-absent otherwise,
+never a fabricated 0). Output is newline-delimited JSON by default — one event per line,
+byte-identical across runs; `--format text` prints a human-readable timeline. Unknown symbols
+and symbols with no commit-linked history exit 2; ambiguous names list all candidate record
+IDs and exit 6. Events are advisory temporal facts, never a risk or behavior claim.
+See `docs/cli/lifeline.md`.
 
 `eg query public-api` enumerates the Rust library crate's externally-reachable public API
 surface from recorded per-symbol visibility (issue #124) and module containment — never a
