@@ -4234,7 +4234,10 @@ fn all_node_kinds_have_documented_schema() {
         | NodeKind::PanicRiskSite
         // Human-authored debt-comment markers (issue #218), documented in
         // docs/cli/debt-markers.md.
-        | NodeKind::DebtMarker => "code-graph-documented",
+        | NodeKind::DebtMarker
+        // Unsafe-surface sites (issue #222), documented in
+        // docs/cli/unsafe-sites.md.
+        | NodeKind::UnsafeSite => "code-graph-documented",
         // Documented in docs/schema/semantic-drift.md
         NodeKind::SemanticDrift | NodeKind::EmbeddingModel | NodeKind::EmbeddingVector => {
             "semantic-domain-documented"

@@ -35,10 +35,18 @@ use crate::{
 /// (issue #134); same-file resolution labels are recomputed per scan and are
 /// never cached.
 ///
+/// v7 adds per-file `PanicRiskSite` unwrap/expect call-site records
+/// (issue #223); older caches rebuild so reused per-file records are never
+/// missing the new sites.
+///
 /// v8: cached per-file records include `DebtMarker` debt-comment marker
 /// nodes with their `note` field and `CONTAINS` edges (issue #218); older
 /// caches rebuild so reused records are never missing the markers.
-const CACHE_SCHEMA_VERSION: u32 = 8;
+///
+/// v9 adds per-file `UnsafeSite` records for `unsafe` blocks, `unsafe fn`
+/// declarations, and `unsafe impl` blocks (issue #222); older caches rebuild
+/// so reused per-file records are never missing the new sites.
+const CACHE_SCHEMA_VERSION: u32 = 9;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]

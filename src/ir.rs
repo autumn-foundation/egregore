@@ -2055,6 +2055,11 @@ pub enum NodeKind {
     /// node. The `name` field carries the closed lowercase category and
     /// `note` carries the trimmed single-line note text.
     DebtMarker,
+    /// Deterministic `unsafe`-surface site (issue #222): an `unsafe { .. }`
+    /// block expression, an `unsafe fn` declaration, or an `unsafe impl`
+    /// block. The `name` field carries the closed site kind
+    /// (`block` / `fn` / `impl`).
+    UnsafeSite,
     /// Git commit observed during history replay.
     Commit,
     /// File-level change observed in a commit.
@@ -2163,6 +2168,7 @@ impl NodeKind {
             Self::Diagnostic => "Diagnostic",
             Self::PanicRiskSite => "PanicRiskSite",
             Self::DebtMarker => "DebtMarker",
+            Self::UnsafeSite => "UnsafeSite",
             Self::Commit => "Commit",
             Self::Change => "Change",
             Self::SemanticDrift => "SemanticDrift",

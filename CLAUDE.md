@@ -101,6 +101,18 @@ cargo run -- query ownership --graph history.graph.jsonl --as-of not-a-time # ex
 # Zero-inbound-reference prune-triage leads (issue #113)
 cargo run -- query unreferenced --graph graph.jsonl               # exit 0 (even when no candidates)
 cargo run -- query unreferenced --graph graph.jsonl --repo acme/widget  # scope one repo; bad selector exits 1
+
+# TODO/FIXME/HACK/XXX debt-comment marker inventory (issue #218)
+cargo run -- query debt-markers --graph graph.jsonl                         # exit 0, full inventory
+cargo run -- query debt-markers --graph graph.jsonl --path src/adapters     # subsystem-scoped
+cargo run -- query debt-markers --graph graph.jsonl --path src/nonexistent  # exit 2 (scope_not_found)
+cargo run -- query debt-markers --graph history.graph.jsonl --at <commit>   # pinned valid-time view
+
+# Unsafe-code surface inventory (issue #222)
+cargo run -- query unsafe-sites --graph graph.jsonl                       # exit 0, full inventory + count
+cargo run -- query unsafe-sites --graph graph.jsonl --path src/ffi        # subsystem-scoped
+cargo run -- query unsafe-sites --graph graph.jsonl --path src/nonexistent  # exit 2 (scope_not_found)
+cargo run -- query unsafe-sites --graph history.graph.jsonl --at <commit>   # pinned valid-time view
 ```
 
 `eg query subsystem <prefix>` returns code facts, agent observations, project state, artifacts,
@@ -170,6 +182,18 @@ repo-relative file/span handle. An empty surface is an explicit machine-readable
 (exit 0 with an `empty_surface` diagnostic), not an error. Output is deterministic and
 byte-identical across runs. Parse-derived, never a build-verified or semver claim.
 See `docs/cli/public-api.md`.
+
+`eg query unsafe-sites` inventories the scanned repo's own `unsafe`-code surface detected
+over the Tree-sitter AST (never the word `unsafe` in comments, strings, doc comments, or
+identifiers). Each row carries a closed site kind (`block` / `fn` / `impl`), the stable record
+ID, the repo-relative file/span handle, and the enclosing symbol handle (explicit `null` when
+top-level); the envelope reports an aggregate count equal to the number of returned sites.
+Rows are an advisory inventory from deterministic extractor facts, never a soundness verdict —
+a zero count is not a safety guarantee (macro-generated, build-script, and dependency `unsafe`
+are out of this slice). Accepts `--path` (subsystem prefix), `--repo`, and `--at <commit>`
+(valid-time pin). An empty scope reports `no_sites_in_scope`; an out-of-store scope is
+`scope_not_found` (exit 2). The kind set is closed for this slice. See
+`docs/cli/unsafe-sites.md`.
 
 Pre-ingest referential-integrity validation (issue #103):
 

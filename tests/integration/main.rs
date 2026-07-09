@@ -62,6 +62,7 @@ mod query_subsystem;
 mod query_symbols;
 mod query_undocumented;
 mod query_unreferenced;
+mod query_unsafe_sites;
 mod query_unwrap_expect;
 mod query_who;
 mod range_deltas;
