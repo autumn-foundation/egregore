@@ -83,7 +83,16 @@ same input is byte-identical.
    file or a different manifest — is not enough: without the declaring
    manifest's `File —CONTAINS→ DependencyDeclaration` attribution chain,
    repository scoping silently drops the fact while the graph would
-   otherwise validate clean.
+   otherwise validate clean. The containing Files must additionally belong
+   to ONE repository (direct `Repository —CONTAINS→ File` ownership):
+   same-path manifests exist across repos in a merged store, so a
+   dependency whose containing Files span two owners has ambiguous
+   attribution and is the same defect. A dependency contained only by a
+   single (possibly foreign) repo's manifest is topologically
+   indistinguishable from a legitimate row of that repo — record IDs are
+   opaque — and graphs without `Repository`-owned Files keep the
+   path-equality-only behavior, so legacy/partial graphs are never
+   mass-flagged.
 
 Clean `eg scan` and `eg scan-history` outputs pass all checks.
 

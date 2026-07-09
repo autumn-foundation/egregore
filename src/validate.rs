@@ -411,10 +411,17 @@ fn check_orphans(
 /// source is a `File` node at the SAME repo-relative path as the dependency
 /// node's declared manifest handle — the attribution chain `--repo` scoping
 /// walks. Any other `File` (a source file, or a different manifest) is the
-/// same missing chain. Zero-edge nodes are already flagged as `orphan_node`;
-/// this check catches nodes whose edges never include the declaring
-/// manifest's containment, which would otherwise validate clean while
-/// repository scoping silently drops them.
+/// same missing chain. In addition, the containing Files must all belong to
+/// ONE repository: same-path manifests exist across repos in a merged
+/// store, so a dependency whose containing Files span two `Repository`
+/// owners has ambiguous attribution and repository scoping could show the
+/// row under the wrong repo. A dependency whose only containment is a
+/// single (possibly foreign) repo's manifest is topologically
+/// indistinguishable from a legitimate row of that repo — record IDs are
+/// opaque — and graphs without `Repository`-owned Files keep the
+/// path-equality-only behavior so legacy/partial graphs are not
+/// mass-flagged (documented softening). Zero-edge nodes are already flagged
+/// as `orphan_node`.
 fn check_dependency_containment(
     records: &[GraphRecord],
     index: &GraphIndex<'_>,
@@ -429,7 +436,14 @@ fn check_dependency_containment(
             _ => None,
         }
     }
-    let mut contained: BTreeSet<&str> = BTreeSet::new();
+    fn source_has_kind(index: &GraphIndex<'_>, id: &str, kind: NodeKind) -> bool {
+        index
+            .node_kinds
+            .get(id)
+            .is_some_and(|kinds| kinds.contains(&kind))
+    }
+    // Direct `Repository —CONTAINS→ File` ownership, as the scanner emits it.
+    let mut file_owners: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for record in records {
         let GraphRecord::Edge {
             label: EdgeLabel::Contains,
@@ -440,12 +454,35 @@ fn check_dependency_containment(
         else {
             continue;
         };
-        if !index
-            .node_kinds
-            .get(source.as_str())
-            .is_some_and(|kinds| kinds.contains(&NodeKind::File))
+        if source_has_kind(index, source, NodeKind::Repository)
+            && source_has_kind(index, target, NodeKind::File)
+        {
+            file_owners.entry(target).or_default().insert(source);
+        }
+    }
+    let mut contained: BTreeSet<&str> = BTreeSet::new();
+    let mut dep_owner_repos: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for record in records {
+        let GraphRecord::Edge {
+            label: EdgeLabel::Contains,
+            source,
+            target,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if !source_has_kind(index, source, NodeKind::File)
+            || !source_has_kind(index, target, NodeKind::DependencyDeclaration)
         {
             continue;
+        }
+        // Every containing File's owners count toward the consistency set.
+        if let Some(owners) = file_owners.get(source.as_str()) {
+            dep_owner_repos
+                .entry(target)
+                .or_default()
+                .extend(owners.iter().copied());
         }
         // The containing file must BE the declaring manifest: its path must
         // equal the dependency node's declared manifest handle.
@@ -455,10 +492,13 @@ fn check_dependency_containment(
         }
     }
     for (id, kinds) in &index.node_kinds {
-        if !kinds.contains(&NodeKind::DependencyDeclaration)
-            || !incident.contains(id)
-            || contained.contains(id)
-        {
+        if !kinds.contains(&NodeKind::DependencyDeclaration) || !incident.contains(id) {
+            continue;
+        }
+        let spans_repos = dep_owner_repos
+            .get(id)
+            .is_some_and(|owners| owners.len() > 1);
+        if contained.contains(id) && !spans_repos {
             continue;
         }
         let mut diagnostic = ValidationDiagnostic::new(MISSING_CONTAINMENT_EDGE);
@@ -621,6 +661,53 @@ mod tests {
         let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
         assert_eq!(codes, vec![MISSING_CONTAINMENT_EDGE]);
         assert_eq!(report.diagnostics[0].record_id.as_deref(), Some("n:dep"));
+    }
+
+    #[test]
+    fn dependency_containment_spanning_repositories_is_a_defect() {
+        // PR #314 review: path equality alone lets a repo-A dependency be
+        // contained by repo-B's same-path manifest File. When containing
+        // Files tie the dependency to MORE than one Repository, the
+        // attribution is ambiguous and repository scoping can show the row
+        // under the wrong repo — a defect.
+        let records = vec![
+            node_at("n:repo-a", NodeKind::Repository, "."),
+            node_at("n:repo-b", NodeKind::Repository, "."),
+            node_at("n:manifest-a", NodeKind::File, "Cargo.toml"),
+            node_at("n:manifest-b", NodeKind::File, "Cargo.toml"),
+            node_at("n:dep-a", NodeKind::DependencyDeclaration, "Cargo.toml"),
+            node_at("n:dep-b", NodeKind::DependencyDeclaration, "Cargo.toml"),
+            edge("e:ra-fa", EdgeLabel::Contains, "n:repo-a", "n:manifest-a"),
+            edge("e:rb-fb", EdgeLabel::Contains, "n:repo-b", "n:manifest-b"),
+            edge("e:fa-da", EdgeLabel::Contains, "n:manifest-a", "n:dep-a"),
+            edge("e:fb-db", EdgeLabel::Contains, "n:manifest-b", "n:dep-b"),
+            // The malformed edge: repo B's manifest also claims repo A's dep.
+            edge("e:fb-da", EdgeLabel::Contains, "n:manifest-b", "n:dep-a"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![MISSING_CONTAINMENT_EDGE]);
+        assert_eq!(report.diagnostics[0].record_id.as_deref(), Some("n:dep-a"));
+    }
+
+    #[test]
+    fn dependency_containment_within_one_repository_is_clean() {
+        // The well-formed merged two-repo graph: each dep contained only by
+        // its own repo's manifest File — same paths across repos are fine.
+        let records = vec![
+            node_at("n:repo-a", NodeKind::Repository, "."),
+            node_at("n:repo-b", NodeKind::Repository, "."),
+            node_at("n:manifest-a", NodeKind::File, "Cargo.toml"),
+            node_at("n:manifest-b", NodeKind::File, "Cargo.toml"),
+            node_at("n:dep-a", NodeKind::DependencyDeclaration, "Cargo.toml"),
+            node_at("n:dep-b", NodeKind::DependencyDeclaration, "Cargo.toml"),
+            edge("e:ra-fa", EdgeLabel::Contains, "n:repo-a", "n:manifest-a"),
+            edge("e:rb-fb", EdgeLabel::Contains, "n:repo-b", "n:manifest-b"),
+            edge("e:fa-da", EdgeLabel::Contains, "n:manifest-a", "n:dep-a"),
+            edge("e:fb-db", EdgeLabel::Contains, "n:manifest-b", "n:dep-b"),
+        ];
+        let report = validate_records(&records);
+        assert!(report.is_clean(), "got {:?}", report.diagnostics);
     }
 
     #[test]
