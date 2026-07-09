@@ -33,6 +33,8 @@ pub mod error;
 pub mod evidence;
 /// Evidence-link freshness verdicts for agent observations (issue #85).
 pub mod evidence_freshness;
+/// Operator-facing logical retraction of persisted records (issue #231).
+pub mod forget;
 /// Read-only store freshness classification (issue #82).
 pub mod freshness;
 /// Filesystem discovery.
@@ -70,6 +72,8 @@ pub mod protected;
 pub mod query;
 /// Redaction policy engine (`docs/schema/redaction.md` v1).
 pub mod redaction;
+/// At-import redaction report (issue #266).
+pub mod redaction_report;
 /// Offline repair workflow for Egregore stores (issue #49).
 #[cfg(feature = "embedded-aletheiadb")]
 pub mod repair;
@@ -83,6 +87,8 @@ pub mod temporal_status;
 pub mod token_cost;
 /// `rust-swe-agent` `.traj` importer (M2 agent-memory source).
 pub mod traj;
+/// Pre-ingest referential-integrity validation for graph JSONL (issue #103).
+pub mod validate;
 /// Transcripts watcher.
 pub mod watch;
 
@@ -107,10 +113,11 @@ pub use ir::{
 };
 pub use local_project::import_local_tasks;
 pub use query::{
-    ChangesContext, ChangesError, RangeDeltas, RangeDeltasError, RepositoryIndex,
-    RepositorySelectorError, SubsystemContext, SubsystemPrefixError, SymbolContext, UnresolvedRef,
-    active_policy, audit_trail, changes_context, is_candidate_suppressed, path_is_under_prefix,
-    pending_candidates, range_deltas, subsystem_context, symbol_context,
+    ChangesContext, ChangesError, PublicApiDeltas, PublicApiDeltasOptions, RangeDeltas,
+    RangeDeltasError, RepositoryIndex, RepositorySelectorError, SubsystemContext,
+    SubsystemPrefixError, SymbolContext, UnresolvedRef, active_policy, audit_trail,
+    changes_context, is_candidate_suppressed, path_is_under_prefix, pending_candidates,
+    public_api_deltas, range_deltas, subsystem_context, symbol_context,
 };
 pub use schema_version::{
     RecordLineRead, RecordReadError, RecordVersion, UNKNOWN_SCHEMA_VERSION_CODE,
@@ -250,6 +257,10 @@ fn scan_repository_at_with_override_inner(
     // Same-file resolution labeling (issue #134): stamp per-file CALLS edges
     // backed by Tree-sitter call sites with the shared resolution status.
     languages::cross_file::label_same_file_call_resolutions(graph.records_mut(), &facts_by_file);
+    // Out-of-line `#[cfg(test)] mod x;` test-scope marking (issue #223): the
+    // module file is extracted with no view of the gating attribute, so the
+    // repo-wide pass rewrites its panic-risk sites to test context.
+    languages::cross_file::apply_out_of_line_test_scope(graph.records_mut(), &facts_by_file);
 
     let languages = languages_in_graph(&graph);
     Ok(graph.stamp_producer(&code_graph_producer(&languages)))

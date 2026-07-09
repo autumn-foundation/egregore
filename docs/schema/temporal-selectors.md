@@ -84,6 +84,13 @@ The `egregore query symbol` subcommand exposes the following temporal flags:
 `--at` (the latter pins the valid axis to a commit; combining them is an
 `unsupported_combination` error).
 
+`egregore query file` accepts the same mutually exclusive valid-time flags
+(`--at <commit>` / `--as-of <RFC3339>`) to reconstruct a file's defined-symbol
+set at a point (issue #158; see `docs/cli/query.md`). Its `--tx-as-of` flag is
+**reserved**: it always returns a `not_implemented` error envelope (exit `1`)
+rather than silently ignoring the flag — the transaction-time axis currently
+covers `query symbol` only.
+
 ### Exit Codes
 
 | Exit code | Meaning |

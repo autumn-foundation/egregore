@@ -18,8 +18,20 @@ cargo run -- scan-history . --out history.graph.jsonl
 cargo run -- inspect graph.jsonl
 cargo run -- ingest graph.jsonl --adapter dry-run
 cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .egregore
+cargo run -- inspect --data-dir .egregore
 cargo run -- query semantic-memory "parser edge case on empty input" --data-dir .egregore
 ```
+
+`eg inspect --data-dir` inspects an embedded store directly — no daemon, no
+network, no embeddings (issue #125, the daemon-free analog of #47). It reports
+totals plus per-domain/per-kind/per-schema-version counts grouped by trust
+class, counts unknown `(domain, kind, schema_version)` tuples distinctly, is
+strictly read-only (the store is read via a throwaway temporary copy), and by
+default emits one deterministic JSON line that is byte-identical across runs on
+an unchanged store (`--format text` matches the JSONL inspect style). A missing
+store, an empty directory, or an initialized store holding zero Egregore
+records fails with a diagnostic naming the path — never successful zero
+counts. See `docs/cli/inspect.md` for the JSON contract.
 
 Query commands (local JSONL graph, no network):
 
@@ -39,14 +51,74 @@ cargo run -- query change-impact codegraph:v1:zzz --graph graph.jsonl     # exit
 cargo run -- query change-impact does_not_exist --graph graph.jsonl        # exit 2 (no_match)
 cargo run -- query change-impact <symbol_name> --graph graph.jsonl --depth 2  # wider neighborhood
 
+# Transitive inbound callers with call paths (issue #139)
+cargo run -- query transitive-callers <symbol_name> --graph graph.jsonl       # exit 0 (even when empty)
+cargo run -- query transitive-callers <ambiguous_name> --graph graph.jsonl    # exit 1 (candidates listed)
+cargo run -- query transitive-callers does_not_exist --graph graph.jsonl      # exit 2 (no_match)
+cargo run -- query transitive-callers <symbol_name> --graph graph.jsonl --max-depth 3
+cargo run -- query transitive-callers <symbol_name> --graph history.graph.jsonl --at <sha>  # commit view
+
+# Direct outbound dependencies of a symbol (issue #123)
+cargo run -- query deps <symbol_name> --graph graph.jsonl          # exit 0 (even when empty)
+cargo run -- query deps <ambiguous_name> --graph graph.jsonl       # exit 1 (candidates listed)
+cargo run -- query deps does_not_exist --graph graph.jsonl         # exit 2 (no_match)
+cargo run -- query deps <symbol_name> --graph history.graph.jsonl --at <sha>  # commit view
+
 # Symbol- and file-level deltas across a commit range (issue #118)
 cargo run -- query deltas <base_sha> <head_sha> --graph history.graph.jsonl  # exit 0 on match
 cargo run -- query deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
 cargo run -- query deltas ffffffffffff <head_sha> --graph history.graph.jsonl # exit 2 (missing_commit)
 
+# A file's defined-symbol set at a past commit or instant (issue #158)
+cargo run -- query file src/lib.rs --graph history.graph.jsonl --at <commit_sha>             # exit 0 on match
+cargo run -- query file src/lib.rs --graph history.graph.jsonl --as-of 2026-01-02T00:00:00Z  # exit 0 on match
+cargo run -- query file src/nope.rs --graph history.graph.jsonl --at <commit_sha>            # exit 2 (unknown_path)
+cargo run -- query file src/lib.rs --graph history.graph.jsonl --tx-as-of <instant>          # exit 1 (not_implemented)
+
+# Ranked historical co-change partners for a file (issue #153)
+cargo run -- query coupling src/lib.rs --graph history.graph.jsonl            # exit 0 (even when empty)
+cargo run -- query coupling src/lib.rs --graph history.graph.jsonl --min-support 5 --limit 10
+cargo run -- query coupling src/lib.rs --graph history.graph.jsonl --base <sha> --head <sha>
+cargo run -- query coupling src/lib.rs --graph history.graph.jsonl --at <sha>   # history as of one commit
+cargo run -- query coupling src/nope.rs --graph history.graph.jsonl            # exit 2 (unknown_file)
+
 # Externally-reachable public API surface (issue #213)
 cargo run -- query public-api --graph graph.jsonl                 # exit 0 (even when surface is empty)
 cargo run -- query public-api --graph graph.jsonl --repo acme/widget  # scope one repo; bad selector exits 1
+
+# Public-API surface changes across a commit range (issue #157)
+cargo run -- query public-api-deltas <base_sha> <head_sha> --graph history.graph.jsonl  # exit 0 on match
+cargo run -- query public-api-deltas <sha> <sha> --graph history.graph.jsonl            # exit 1 (identical_endpoints)
+cargo run -- query public-api-deltas ffffffffffff <head_sha> --graph history.graph.jsonl # exit 2 (missing_commit)
+cargo run -- query public-api-deltas <base> <head> --graph history.graph.jsonl --include-internal --callers
+
+# Undocumented public API symbols — doc-debt triage (issue #257)
+cargo run -- query undocumented --graph graph.jsonl               # exit 0 (even when nothing is undocumented)
+cargo run -- query undocumented --graph graph.jsonl --limit 20 --format text
+cargo run -- query undocumented --graph graph.jsonl --include-private  # whole-crate doc audit
+
+# Per-file ownership shares and bus factor from Git authorship (issue #245)
+cargo run -- query ownership --graph history.graph.jsonl                    # exit 0 (even when surface is empty)
+cargo run -- query ownership src/lib.rs --graph history.graph.jsonl         # one file
+cargo run -- query ownership --graph history.graph.jsonl --at <sha>         # ownership as-of a commit
+cargo run -- query ownership does/not/exist.rs --graph history.graph.jsonl  # exit 2 (unknown_path)
+cargo run -- query ownership --graph history.graph.jsonl --as-of not-a-time # exit 1 (malformed_timestamp)
+
+# Zero-inbound-reference prune-triage leads (issue #113)
+cargo run -- query unreferenced --graph graph.jsonl               # exit 0 (even when no candidates)
+cargo run -- query unreferenced --graph graph.jsonl --repo acme/widget  # scope one repo; bad selector exits 1
+
+# TODO/FIXME/HACK/XXX debt-comment marker inventory (issue #218)
+cargo run -- query debt-markers --graph graph.jsonl                         # exit 0, full inventory
+cargo run -- query debt-markers --graph graph.jsonl --path src/adapters     # subsystem-scoped
+cargo run -- query debt-markers --graph graph.jsonl --path src/nonexistent  # exit 2 (scope_not_found)
+cargo run -- query debt-markers --graph history.graph.jsonl --at <commit>   # pinned valid-time view
+
+# Unsafe-code surface inventory (issue #222)
+cargo run -- query unsafe-sites --graph graph.jsonl                       # exit 0, full inventory + count
+cargo run -- query unsafe-sites --graph graph.jsonl --path src/ffi        # subsystem-scoped
+cargo run -- query unsafe-sites --graph graph.jsonl --path src/nonexistent  # exit 2 (scope_not_found)
+cargo run -- query unsafe-sites --graph history.graph.jsonl --at <commit>   # pinned valid-time view
 
 # File churn hotspots over a scan-history store (issue #128)
 cargo run -- query churn --graph history.graph.jsonl               # exit 0, ranked files
@@ -66,6 +138,29 @@ Rows are leads to inspect before editing, not proof of breakage. The response is
 and byte-identical across runs. Default depth is 1 (direct neighbors only); use `--depth 2`
 for a wider BFS neighborhood. Output is a JSON envelope with an always-present disclaimer.
 
+`eg query transitive-callers <handle>` walks the transitive inbound `CALLS`/`REFERENCES`
+closure of a symbol (record ID or exact name) up to `--max-depth` (default 5) and returns
+every reachable symbol with its hop distance and one concrete shortest connecting call path
+of record-ID/edge-label handles. Cycles terminate deterministically (each symbol reported
+once, shortest path); reaching the bound emits a truncation diagnostic counting dropped
+frontier nodes per depth. Call-resolution labels (issues #152/#134) propagate along paths:
+each row carries the weakest resolution on its chain. Ambiguous names exit 1 listing all
+candidate record IDs; `--at`/`--as-of` walk a single-commit history view. Output is
+newline-delimited JSON (summary envelope line, then one row per line), byte-identical across
+runs. Rows are reachability leads, never proof of breakage. See
+`docs/cli/transitive-callers.md`.
+
+`eg query deps <handle>` returns the direct outbound dependencies of a symbol (record ID or
+exact name) — its `CALLS`/`IMPLEMENTS`/`IMPORTS`/`REFERENCES` neighbors — each labeled with
+the edge type that produced it and carrying a stable record ID, repo-relative file/span
+handle, and any `CALLS` resolution status (issues #152/#134). Unresolved targets (a call
+with no in-repo definition, or a missing target record) are an explicit `unresolved`
+category with a stable reason, never silently dropped. Ambiguous names exit 1 listing all
+candidate record IDs; `--at`/`--as-of` return the dependency set at a single-commit history
+view. Output is newline-delimited JSON (summary envelope line, then one row per line),
+byte-identical across runs, with a `--format text` mode. Rows are dependency leads, never
+proof of runtime behavior. See `docs/cli/deps.md`.
+
 `eg query deltas <base> <head>` returns the observed structural deltas between two commit
 handles (full SHA or unique prefix) from a `scan-history` graph or embedded store, grouped by
 stable change class (`added_symbols`, `removed_symbols`, `modified_symbols`, `added_files`,
@@ -76,6 +171,30 @@ folded in where drift records exist and marked unavailable otherwise. Rows are o
 deltas, never proof of behavior change; the response is deterministic and byte-identical
 across runs. See `docs/cli/deltas.md`.
 
+`eg query file <path> --at <commit>` / `--as-of <instant>` reconstructs the deterministic
+set of symbols a file defined at a chosen commit or valid-time instant (issue #158) from a
+`scan-history` graph or embedded store. A symbol tombstoned at or before the point never
+appears; spans and names are the recorded state as-of the point, not the current tree. Each
+row carries a stable record ID plus a repo-relative file/span handle, and the envelope
+records the resolved commit/instant. A file that existed but defined zero symbols is an
+explicit `empty_symbol_set` success (exit 0); an unknown path or a path absent at the point
+is a machine-readable error (exit 2); `--tx-as-of` on `query file` is reserved and returns
+`not_implemented` (exit 1). Code-facts only, read-only, and byte-identical across runs.
+See the `eg query file` section of `docs/cli/query.md`.
+
+`eg query coupling <path>` ranks the files that historically changed in the same commits as
+a target file over a `scan-history` store, using the distinct-commit co-change count and a
+documented normalized strength (`jaccard_v1`: shared commits over the union of both files'
+change sets) plus a directional confidence (shared commits over the target's changes), so
+high-churn files cannot dominate purely by volume. A minimum-support threshold
+(`--min-support`, default 2, max 100) suppresses noise pairs and is echoed in the answer;
+`--limit` (default 20, max 500) caps rows with an explicit truncation signal. Temporal scope
+follows the existing selector contract: full history, `--base`+`--head` range, `--at`, or
+`--as-of`. Both target and partners must resolve to `File` nodes, so untracked, ignored, and
+non-source paths never appear. Rows are historical co-change leads — never proof of
+dependency, and absence of coupling is not proof of independence. Output is deterministic
+and byte-identical across runs. See `docs/cli/coupling.md`.
+
 `eg query public-api` enumerates the Rust library crate's externally-reachable public API
 surface from recorded per-symbol visibility (issue #124) and module containment — never a
 `pub` token grep. `pub` items trapped in non-`pub` modules are excluded; `pub use` re-exports
@@ -85,6 +204,136 @@ repo-relative file/span handle. An empty surface is an explicit machine-readable
 (exit 0 with an `empty_surface` diagnostic), not an error. Output is deterministic and
 byte-identical across runs. Parse-derived, never a build-verified or semver claim.
 See `docs/cli/public-api.md`.
+
+`eg query unsafe-sites` inventories the scanned repo's own `unsafe`-code surface detected
+over the Tree-sitter AST (never the word `unsafe` in comments, strings, doc comments, or
+identifiers). Each row carries a closed site kind (`block` / `fn` / `impl`), the stable record
+ID, the repo-relative file/span handle, and the enclosing symbol handle (explicit `null` when
+top-level); the envelope reports an aggregate count equal to the number of returned sites.
+Rows are an advisory inventory from deterministic extractor facts, never a soundness verdict —
+a zero count is not a safety guarantee (macro-generated, build-script, and dependency `unsafe`
+are out of this slice). Accepts `--path` (subsystem prefix), `--repo`, and `--at <commit>`
+(valid-time pin). An empty scope reports `no_sites_in_scope`; an out-of-store scope is
+`scope_not_found` (exit 2). The kind set is closed for this slice. See
+`docs/cli/unsafe-sites.md`.
+
+Pre-ingest referential-integrity validation (issue #103):
+
+```powershell
+# Gate a graph JSONL between scan and ingest
+cargo run -- validate graph.jsonl                 # exit 0 clean, 1 defects, 2 load error
+cargo run -- validate graph.jsonl --format text   # human-readable one-line-per-defect form
+```
+
+`eg validate` runs one read-only, offline pass asserting a graph JSONL (from `scan` or
+`scan-history`) is referentially closed: every edge endpoint resolves to a present node,
+every `DEFINES`/`CONTAINS`/`CALLS`/`IMPORTS`/`MENTIONS` edge targets an allowed node kind,
+no tombstoned-and-unsuperseded record is still referenced by a live edge, and no topology
+node is orphaned. Zero defects exit 0; any defect exits 1 with one machine-readable JSONL
+diagnostic per defect in deterministic canonical order (byte-identical across runs). Output
+is redaction-safe — record IDs, categories, relation labels, paths, spans, and counts only.
+Structural reference closure only: never parse correctness, semantic accuracy, schema-version
+compatibility, or extraction completeness. See `docs/cli/validate.md`.
+`eg query public-api-deltas <base> <head>` classifies changes to the externally-reachable
+public API surface between two commit handles from a `scan-history` graph or embedded store,
+composing the issue #118 range mechanics with the issue #124 visibility/signature capture.
+Exported-symbol changes land in a closed change-class set (`added`, `removed`,
+`signature_changed`, `visibility_narrowed`, `visibility_widened`); removal, signature change,
+and narrowing carry `potentially_breaking: true` — a review flag, never a semver or breakage
+claim. Non-exported symbol deltas never appear as public-API changes; they are tallied and
+listed only with `--include-internal` in a group labeled `internal_not_public_surface`.
+`--callers` joins base-endpoint caller leads onto removed/signature-changed rows. Rows carry
+stable record IDs, file/span handles (base-side tombstone handles for removals), the
+introducing commit with valid time, and before/after visibility/signature surface text.
+Output (JSON or `--format text`) is deterministic and byte-identical across runs.
+See `docs/cli/public-api-deltas.md`.
+
+Record retraction (issue #231):
+
+```powershell
+# Retract one persisted agent-authored or sensitive record by stable handle
+cargo run -- forget agent_memory:v1:<hex> --data-dir .egregore --reason "leaked customer name"   # exit 0
+cargo run -- forget agent_memory:v1:<hex> --data-dir .egregore --reason "anything"               # exit 0 (already_retracted no-op)
+cargo run -- forget codegraph:v5:<hex> --data-dir .egregore --reason "wrong"    # exit 1 (deterministic_code_fact)
+cargo run -- forget agent_memory:v1:missing --data-dir .egregore --reason "x"   # exit 2 (not_found)
+```
+
+`eg forget` logically retracts one record from every transaction-time-current read surface
+(structural, semantic/vector, context, task, memory, audit, failures, changes, inspect, the
+MCP tools, and the daemon's record lookups — direct `GET /v1/records/{id}` and the bulk
+`GET /v1/records` serving view) by writing a citable `Retraction` event —
+actor, transaction time, redacted reason, prior record handle — plus a tombstone in the
+target's domain, through the ordinary
+adapter boundary. Deterministic code-graph facts are refused with a machine-readable error
+naming `eg refresh`/re-scan; derived semantic measurements (`SemanticDrift` and its edges)
+are refused the same way naming re-scan/re-ingest, as is any other commit-anchored temporal
+node (`temporal_record`) a tombstone could never suppress; tombstones and retraction events
+are also refused. Citing
+records survive with their link reported as a `stale_evidence_target` diagnostic, historical
+transaction-time views predating the retraction still see the record (bi-temporal honesty),
+and re-running on an already-retracted handle is a no-op success returning the original
+event. With a pinned `--transaction-time` the envelope is deterministic and byte-identical
+across runs. See `docs/cli/forget.md`.
+`eg query undocumented` lists externally-reachable public symbols whose captured doc-comment
+fact (issue #124) is absent, by joining the issue #213 public surface with the recorded doc
+facts — never a `pub` grep and never a rustdoc build. Any doc form (`///`, `/** */`,
+`#[doc = "..."]`) excludes a symbol; a plain `//` comment does not. Each row carries a stable
+record ID, a repo-relative file/span handle, and the concrete evidence asserted
+(`externally_reachable`, `doc_comment_absent`). Re-export rows are attributed to the `pub use`
+site with the checked target cited; a doc comment at either the re-export site or the target
+counts as documentation. `--include-private` widens to a whole-crate doc audit;
+`--limit` truncates deterministically with a diagnostic. The lane asserts doc presence/absence
+only — never doc quality — and a pre-#124 store yields an explicit `doc_facts_unavailable`
+capability verdict instead of treating every symbol as undocumented. Zero undocumented symbols
+is an explicit success (exit 0, `no_undocumented_items` diagnostic; when unresolved re-exports
+or missing doc capture leave blind spots, `empty_result_with_blind_spots` instead — never a
+certified-clean claim). Output is deterministic and byte-identical across runs.
+See `docs/cli/undocumented.md`.
+
+`eg query ownership [path]` aggregates the issue #116 author-attributed history into a
+per-file ownership and bus-factor map: for every indexed source file present at the resolved
+anchor commit (repository head, `--at <sha>`, or `--as-of <rfc3339>`), a ranked author list
+with distinct in-scope commit counts and ownership shares, a primary owner (max share; ties
+break to the lexicographically smallest `(author_email, author_name)` identity), and the bus
+factor — the minimum number of top authors whose cumulative share reaches `--threshold`
+percent (default 50, integer arithmetic). Rows carry the `File` node's stable record ID and
+are ordered most-concentrated-first; `--limit` (default 100, max 1000) truncates with an
+explicit `truncated` signal. Rows are empirical history-derived leads, never declared
+ownership, review authority, or expertise; CODEOWNERS is never consulted. `author_email` is
+redaction-eligible PII per `docs/schema/redaction.md`: raw at rest in a local store, a stable
+`<REDACTED:email:hash_prefix>` marker in redaction-on exports. Unknown paths, missing/ambiguous
+commits, malformed timestamps, and out-of-range threshold/limit fail with stable
+machine-readable diagnostics (deltas-style exit codes); output is deterministic and
+byte-identical across runs. See `docs/cli/ownership.md`.
+`eg query unwrap-expect` inventories `.unwrap()` / `.expect()` panic-risk method-call sites
+detected over the Tree-sitter AST (never text in comments, strings, or doc comments). Each row
+carries a closed category (`unwrap` / `expect`), a `production` vs `test` context, the stable
+record ID, the repo-relative file/span handle, and the enclosing symbol handle (explicit `null`
+when top-level). Rows are advisory triage leads from deterministic extractor facts, never
+verdicts. Accepts `--path` (subsystem prefix), `--repo`, and `--at <commit>` (valid-time pin).
+An empty scope reports `no_sites_in_scope`; an out-of-store scope is `scope_not_found` (exit 2).
+The method set is closed for this slice. See `docs/cli/unwrap-expect.md`.
+
+`eg query debt-markers` inventories human-authored `TODO` / `FIXME` / `HACK` / `XXX`
+debt-comment markers detected inside Tree-sitter comment nodes (never text in string or
+character literals, never identifier substrings). Each row carries a closed lowercase
+category, the trimmed single-line note text, the stable record ID, the repo-relative
+file/span handle, and the enclosing symbol handle (explicit `null` at module top level).
+Rows are advisory triage leads from deterministic extractor facts, never verdicts. Accepts
+`--path` (subsystem prefix), `--repo`, and `--at <commit>` (valid-time pin). An empty scope
+reports `no_markers_in_scope`; an out-of-store scope is `scope_not_found` (exit 2). The
+marker set is closed for this slice. See `docs/cli/debt-markers.md`.
+
+`eg query unreferenced` lists code symbols with zero recorded inbound reference edges
+(`CALLS`/`IMPORTS`/`MENTIONS`, plus the extractor's `REFERENCES` and `IMPLEMENTS` usage
+edges) as prune-triage candidates. The structural `DEFINES`/`CONTAINS` edge from a symbol's
+own file or module never counts. Rows are leads, never proof of dead code — public API
+consumed elsewhere, trait dispatch, macro-generated call sites, FFI, derives, and entry
+points are documented false-positive classes. Candidates in `Diagnostic`-marked file scopes
+carry an advisory extraction-completeness caveat (issue #87). Tombstoned symbols are
+excluded; an empty candidate set is an explicit success (exit 0 with a `no_candidates`
+diagnostic, distinct from `no_symbols`). Output is deterministic, byte-identical across
+runs, and sorted by path, start line, then record ID. See `docs/cli/unreferenced.md`.
 
 `eg query churn` ranks Git-tracked files by descending count of distinct commits that
 modified them across a `scan-history` temporal store. Every row carries the stable `File`
@@ -149,6 +398,18 @@ constant: an answer counts only if it carries the expected record ID plus a repo
 file/span or commit handle; an uncited answer is a miss, not a win. A class below threshold
 yields a distinct exit code and a `below_token_savings_threshold` diagnostic naming the class
 and ratio. Output is deterministic and redaction-safe. See `docs/cli/token-cost.md`.
+
+Embedded store write locking (issue #200):
+
+Every embedded write open takes the OS-level exclusive store lease (`egregored.lock`),
+shared with the daemon, so one data dir has exactly one live writer at a time. A second
+concurrent writer — embedded peer or live daemon — is refused before any write with the
+structured `store_contended` error naming the remedy (route concurrent writers through
+`eg daemon start` + `--adapter daemon`, or retry after the current writer releases the
+store). `eg ingest --adapter embedded` additionally prints the machine-readable
+`{"ok": false, "error": {...}}` envelope on stdout. Read-only commands never take the
+write lease; strictly read-only audits read a throwaway snapshot copy. See
+`docs/cli/embedded-concurrency.md`.
 
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
 

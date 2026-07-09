@@ -1310,7 +1310,10 @@ fn embedded_cli_ingest_refuses_while_daemon_owns_data_dir() {
         .arg(&data_dir)
         .assert()
         .failure()
-        .stderr(predicate::str::contains("embedded store is already leased"));
+        .stdout(predicate::str::contains(r#""code":"store_contended""#))
+        .stderr(predicate::str::contains("store_contended"))
+        .stderr(predicate::str::contains("egregored daemon"))
+        .stderr(predicate::str::contains("--adapter daemon"));
 
     daemon.stop();
 }
@@ -1349,7 +1352,9 @@ fn embedded_cli_ingest_refuses_when_daemon_lock_exists_without_metadata() {
         .arg(&data_dir)
         .assert()
         .failure()
-        .stderr(predicate::str::contains("embedded store is already leased"));
+        .stdout(predicate::str::contains(r#""code":"store_contended""#))
+        .stderr(predicate::str::contains("store_contended"))
+        .stderr(predicate::str::contains("retry"));
 
     fs::write(metadata_path, metadata).expect("metadata should be restored for shutdown");
     daemon.stop();
@@ -4223,13 +4228,24 @@ fn all_node_kinds_have_documented_schema() {
         | NodeKind::Import
         | NodeKind::Diagnostic
         | NodeKind::Commit
-        | NodeKind::Change => "code-graph-documented",
+        | NodeKind::Change
+        // Unwrap/expect panic-risk call sites (issue #223), documented in
+        // docs/cli/unwrap-expect.md.
+        | NodeKind::PanicRiskSite
+        // Human-authored debt-comment markers (issue #218), documented in
+        // docs/cli/debt-markers.md.
+        | NodeKind::DebtMarker
+        // Unsafe-surface sites (issue #222), documented in
+        // docs/cli/unsafe-sites.md.
+        | NodeKind::UnsafeSite => "code-graph-documented",
         // Documented in docs/schema/semantic-drift.md
         NodeKind::SemanticDrift | NodeKind::EmbeddingModel | NodeKind::EmbeddingVector => {
             "semantic-domain-documented"
         }
-        // Documented in docs/schema/agent-memory.md (full schema)
-        NodeKind::Agent | NodeKind::AgentSession | NodeKind::Observation => {
+        // Documented in docs/schema/agent-memory.md (full schema).
+        // Retraction is the operator retraction event (issue #231):
+        // docs/schema/agent-memory.md §4a and docs/cli/forget.md.
+        NodeKind::Agent | NodeKind::AgentSession | NodeKind::Observation | NodeKind::Retraction => {
             "agent-memory-documented"
         }
         // Project-domain day-one shapes documented in docs/schema/project-graph.md

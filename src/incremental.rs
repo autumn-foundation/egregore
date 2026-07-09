@@ -15,7 +15,10 @@ use crate::{
     error::{CodegraphError, Result},
     identity,
     ir::{Graph, GraphRecord, ProducerKind, SCHEMA_VERSION, stable_id, versioned_stable_id},
-    languages::cross_file::{FileFacts, cross_file_call_records, label_same_file_call_resolutions},
+    languages::cross_file::{
+        FileFacts, apply_out_of_line_test_scope, cross_file_call_records,
+        label_same_file_call_resolutions,
+    },
     repository_record_from_identity, scan_source_file_records,
     schema_version::validate_record_version,
 };
@@ -31,7 +34,19 @@ use crate::{
 /// records still contain phantom comment/string-sourced reference edges
 /// (issue #134); same-file resolution labels are recomputed per scan and are
 /// never cached.
-const CACHE_SCHEMA_VERSION: u32 = 6;
+///
+/// v7 adds per-file `PanicRiskSite` unwrap/expect call-site records
+/// (issue #223); older caches rebuild so reused per-file records are never
+/// missing the new sites.
+///
+/// v8: cached per-file records include `DebtMarker` debt-comment marker
+/// nodes with their `note` field and `CONTAINS` edges (issue #218); older
+/// caches rebuild so reused records are never missing the markers.
+///
+/// v9 adds per-file `UnsafeSite` records for `unsafe` blocks, `unsafe fn`
+/// declarations, and `unsafe impl` blocks (issue #222); older caches rebuild
+/// so reused per-file records are never missing the new sites.
+const CACHE_SCHEMA_VERSION: u32 = 9;
 
 /// Result of an incremental repository scan.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -273,6 +288,11 @@ fn scan_repository_incremental_at_inner(
     // assembled graph every scan — never cached — so a definition added or
     // removed in another file re-labels an unchanged file's edges correctly.
     label_same_file_call_resolutions(graph.records_mut(), &facts_by_file);
+    // Out-of-line `#[cfg(test)] mod x;` test-scope marking (issue #223):
+    // recomputed over the whole assembled graph every scan — never cached —
+    // so a gating change in a parent file re-contexts an unchanged module
+    // file's cached panic-risk sites correctly.
+    apply_out_of_line_test_scope(graph.records_mut(), &facts_by_file);
 
     let mut tombstoned_files = Vec::new();
     for (removed, cached_file) in &previous_cache.files {

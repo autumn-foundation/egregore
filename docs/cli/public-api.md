@@ -6,9 +6,10 @@ per-symbol visibility (issue #124) and module containment. Local-first, no
 network, no build.
 
 > **Parse-derived enumeration, not a build-verified or semver claim.** The
-> surface is computed from what the code graph recorded at scan time. Breaking
-> -change classification across a commit range is issue #157, which consumes
-> this snapshot.
+> surface is computed from what the code graph recorded at scan time.
+> Breaking-change classification across a commit range is
+> `eg query public-api-deltas` (issue #157), which consumes this snapshot —
+> see `docs/cli/public-api-deltas.md`.
 
 A `pub` token grep is wrong, not just noisy: a `pub fn` inside a private `mod`
 is **not** externally reachable, and a `pub use private::Foo;` re-export
@@ -137,5 +138,6 @@ eg query public-api --graph graph.jsonl --repo acme/widget
 - **`cargo public-api` / `cargo-semver-checks`** — build-backed and precise,
   but require a successful build per revision. This query is parse-only and
   works on code that does not currently compile.
-- **Issue #157 (breaking-change classification)** — consumes this surface
-  snapshot; not implemented here.
+- **`eg query public-api-deltas` (issue #157)** — the breaking-change
+  classification layer across a commit range; consumes this surface rule.
+  See `docs/cli/public-api-deltas.md`.

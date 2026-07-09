@@ -1,6 +1,6 @@
 # eg query
 
-Query an existing graph JSONL for symbols, files, semantic drift records, or by natural-language similarity.
+Query an existing graph JSONL for symbols, files, who last changed a symbol, semantic drift records, or by natural-language similarity.
 
 ## Synopsis
 
@@ -9,8 +9,10 @@ eg query symbol   <NAME>  --graph <PATH>    [--at <COMMIT>] [--repo <SELECTOR>] 
 eg query symbol   <NAME>  --data-dir <DIR>  [--at <COMMIT>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query symbols  <PATTERN> --graph <PATH>  [--case-insensitive] [--repo <SELECTOR>] [--format json|text]
 eg query symbols  <PATTERN> --data-dir <DIR> [--case-insensitive] [--repo <SELECTOR>] [--format json|text]
-eg query file     <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
-eg query file     <PATH>  --data-dir <DIR>  [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query file     <PATH>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query file     <PATH>  --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query who      <NAME>  --graph <PATH>    [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
+eg query who      <NAME>  --data-dir <DIR>  [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--repo-path <DIR>] [--format json|text]
 eg query drift            --graph <PATH>    [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query drift            --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
 eg query semantic <QUERY> --data-dir <DIR>  [--limit N] [--repo <SELECTOR>] [--format json|text]
@@ -21,8 +23,14 @@ eg query task     <HANDLE> --graph <PATH>
 eg query memory   <HANDLE> --graph <PATH>   [--verified-only]
 eg query failures <HANDLE> --graph <PATH>   [--repo <SELECTOR>]
 eg query change-impact <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--depth N]
+eg query transitive-callers <HANDLE> --graph <PATH> [--repo <SELECTOR>] [--max-depth N] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
+eg query deps     <HANDLE> --graph <PATH>   [--repo <SELECTOR>] [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 eg query deltas   <BASE> <HEAD> --graph <PATH> [--repo <SELECTOR>]
+eg query coupling <PATH>  --graph <PATH>    [--repo <SELECTOR>] [--base <COMMIT> --head <COMMIT> | --at <COMMIT> | --as-of <RFC3339>] [--min-support N] [--limit N] [--format json|text]
 eg query public-api       --graph <PATH>   [--repo <SELECTOR>]
+eg query undocumented     --graph <PATH>   [--repo <SELECTOR>] [--limit N] [--include-private] [--format json|text]
+eg query ownership [PATH] --graph <PATH>   [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--threshold <PERCENT>] [--limit N] [--format json|text]
+eg query unreferenced     --graph <PATH>   [--repo <SELECTOR>]
 eg query churn            --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--format json|text]
 eg query churn            --data-dir <DIR>  [--repo <SELECTOR>] [--limit N] [--format json|text]
 ```
@@ -46,13 +54,38 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query change-impact` — **graph-derived impact leads** grouped by relation
   for a symbol or file handle, for blast-radius triage before editing
   ([change-impact.md](change-impact.md), issue #76).
+- `eg query transitive-callers` — the **transitive inbound-reachable set** of a
+  symbol with one concrete connecting call path per row, bounded by
+  `--max-depth`, deterministic under cycles, honoring `--at`/`--as-of`
+  temporal views, with `CALLS` resolution labels propagated along each path
+  ([transitive-callers.md](transitive-callers.md), issue #139).
+- `eg query deps` — the **direct outbound dependencies** of a symbol — what it
+  calls, implements, imports, and references — labeled by edge type, with
+  unresolved targets as an explicit category, honoring `--at`/`--as-of`
+  temporal views ([deps.md](deps.md), issue #123).
 - `eg query deltas` — **symbol- and file-level changes between two commits**,
   grouped by stable change class with citable handles
   ([deltas.md](deltas.md), issue #118).
+- `eg query coupling` — the files that **historically changed in the same
+  commits** as a target file, ranked by a documented normalized coupling
+  strength with a minimum-support threshold; historical co-change leads,
+  never dependency proof ([coupling.md](coupling.md), issue #153).
 - `eg query public-api` — the crate's **externally-reachable public API
   surface** from recorded visibility and module containment, re-exports
   included, trapped `pub` items excluded
   ([public-api.md](public-api.md), issue #213).
+- `eg query undocumented` — **externally-reachable public symbols with no
+  recorded doc comment**, each row carrying citable evidence;
+  presence/absence only, never doc quality
+  ([undocumented.md](undocumented.md), issue #257).
+- `eg query ownership` — **per-file authorship aggregates with a primary
+  owner and bus-factor signal** from a history store: ranked ownership
+  shares, deterministic tie-breaks, `--at`/`--as-of` time travel, and an
+  explicit empirical-not-declared boundary
+  ([ownership.md](ownership.md), issue #245).
+- `eg query unreferenced` — symbols with **no recorded inbound reference
+  edges**, as prune-triage leads with citable handles — never proof of dead
+  code ([unreferenced.md](unreferenced.md), issue #113).
 - `eg query churn` — rank Git-tracked files by **change frequency** across the
   commit history captured by `eg scan-history`, for hotspot triage
   ([churn.md](churn.md), issue #128).
@@ -357,7 +390,7 @@ routing.
 List all `Symbol` nodes defined in a file, resolved through `DEFINES` edges.
 
 ```text
-eg query file <PATH> --graph <PATH> [--format json|text]
+eg query file <PATH> --graph <PATH> [--at <COMMIT> | --as-of <RFC3339>] [--format json|text]
 ```
 
 ### Arguments
@@ -366,12 +399,200 @@ eg query file <PATH> --graph <PATH> [--format json|text]
 |----------|----------|-------------|
 | `<PATH>` | yes | Repository-relative file path, e.g. `src/lib.rs`. |
 | `--graph <PATH>` | yes | Graph JSONL to query. |
+| `--at <COMMIT>` | no | Pin the listing to the file's recorded state at this commit SHA or unique prefix (issue #158). Requires a `scan-history` store. Mutually exclusive with `--as-of`. |
+| `--as-of <RFC3339>` | no | Pin the listing to the file's recorded state at the most recent commit at or before this instant (valid-time axis). Mutually exclusive with `--at`. |
+| `--tx-as-of <RFC3339>` | no | Reserved for `query file`: always returns a `not_implemented` error envelope and exit `1`, never a silently coerced result. Transaction time currently covers `query symbol` only (issue #66). |
 | `--repo <SELECTOR>` | no | Restrict results to one repository. A matching path in another repository is excluded and reported only through the `excluded_other_repositories` stderr diagnostic. |
 | `--format` | no | `json` (default) or `text`. |
 
 ### JSON output fields
 
 Same fields as `eg query symbol` (see above), except the declaration-surface fields `visibility`, `signature`, and `doc`, which are omitted from file listing rows to keep the per-file answer lean — use `eg query symbol <NAME>` for a symbol's contract. Results are sorted by `span.start_line` ascending, then `record_id`.
+
+### File snapshot at a point in time (`--at` / `--as-of`, issue #158)
+
+`--at <COMMIT>` / `--as-of <RFC3339>` reconstruct the deterministic set of
+symbols the file defined **at that point**, from a `scan-history` graph or an
+embedded store — no network, no re-parsing of `git show` output, no working-tree
+reads. `scan-history` records a full snapshot at every commit, so a symbol
+tombstoned at or before the selected point simply has no snapshot there and can
+never leak into the result; spans and names are the recorded state as-of the
+point, not the current tree. The answer is code-facts only (`File`/`Symbol`/
+`Commit` history records) — agent observations, project/task, artifact, and
+verification records are never mixed in.
+
+```sh
+# Replay history first (reads Git objects only, never mutates the checkout)
+eg scan-history . --out history.graph.jsonl
+
+# What symbols did src/parser.rs define at commit 4f0c2b1?
+eg query file src/parser.rs --graph history.graph.jsonl --at 4f0c2b1
+
+# ... and as of an instant (most recent commit at or before it)?
+eg query file src/parser.rs --graph history.graph.jsonl --as-of 2026-01-02T00:00:00Z
+```
+
+Unlike the current-state listing, the point-in-time answer is a **single JSON
+envelope** (not JSONL rows), byte-identical across repeated runs:
+
+```json
+{
+  "ok": true,
+  "path": "src/parser.rs",
+  "at": "4f0c2b1",
+  "as_of": null,
+  "resolved_commit": "<full SHA the answer was computed against>",
+  "resolved_valid_time": "2026-01-01T00:00:00Z",
+  "file_record_id": "codegraph:v5:...",
+  "file_schema_version": 5,
+  "symbols": [
+    {
+      "record_id": "codegraph:v5:...",
+      "schema_version": 5,
+      "name": "parse",
+      "kind": "Symbol",
+      "symbol_kind": "function",
+      "repo_relative_path": "src/parser.rs",
+      "span": { "start_byte": 0, "end_byte": 30, "start_line": 1, "end_line": 1 },
+      "commit": "<resolved full SHA>",
+      "valid_time": "2026-01-01T00:00:00Z"
+    }
+  ],
+  "returned": 1,
+  "diagnostics": []
+}
+```
+
+Every row carries a stable record ID plus a repo-relative file/span handle
+resolved as-of the point (module-level symbols without a span carry a
+documented `absent_span_reason`), and the envelope records the resolved
+commit/instant it was computed against. Output is bounded and redaction-safe:
+record IDs, commit handles, paths, spans, and counts only — never raw source
+text, patch hunks, or commit-message bodies.
+
+Not-found is never conflated with empty: a file that existed at the point but
+defined zero symbols returns `ok: true` with an explicit `empty_symbol_set`
+diagnostic (exit `0`), while an unknown path or a path that did not exist at
+the point fails with a machine-readable error and exit `2`.
+
+In a shared multi-repository store, `--as-of` resolves the instant on the
+queried path's **own repository timeline**: an unrelated repository's newer
+commit never wins the at-or-before race, so it cannot make the file look
+absent at a commit its repository never had. When more than one repository
+records the same path, an unscoped `--as-of` query fails closed with
+`ambiguous_repository` (rerun with `--repo <SELECTOR>`), matching the
+issue #67 contract for single-answer time views.
+
+#### Exit codes for `--at` / `--as-of`
+
+Failures print `{"ok":false,"error":{"error_type":...}}` to stdout — never a
+fabricated symbol, never an empty success:
+
+| Condition | `error_type` | Exit |
+|-----------|--------------|------|
+| Resolved point (including an `empty_symbol_set` result) | — | `0` |
+| Path matches nothing at any recorded commit | `unknown_path` | `2` |
+| Path known to history but absent at the resolved point | `file_absent_at_point` | `2` |
+| Commit prefix matches nothing | `missing_commit` | `2` |
+| Store has no commit history (plain `scan` graph) | `empty_history` | `2` |
+| `--as-of` instant is not valid RFC 3339 | `invalid_instant` | `2` |
+| No commit at or before the `--as-of` instant | `no_commit_at_or_before_instant` | `2` |
+| `--at` combined with `--as-of` | — (flag conflict, clap) | `2` |
+| Commit prefix matches multiple commits | `ambiguous_commit_prefix` | `1` |
+| Unscoped path+commit collision across repositories | `ambiguous_repository` | `1` |
+| `--tx-as-of` supplied | `not_implemented` (as `error.code`) | `1` |
+
+#### When to use which temporal tool
+
+- **`eg query file <PATH> --at/--as-of`** — you have a *path* and want its
+  past symbol set; you do not yet know the symbol names.
+- **`eg query symbol <NAME> --at/--as-of`** — you already know the *name* and
+  want that one symbol's state at a point.
+- **`eg query lifeline` (issue #96)** — one symbol's full lifecycle across all
+  history, not a per-file snapshot.
+- **`eg query deltas <BASE> <HEAD>` (issue #118)** — what changed *between* two
+  commits, not what existed *at* one.
+- **`eg query symbol --tx-as-of` (issue #66)** — what the *store* knew at a
+  transaction instant; the file listing has no transaction-time view yet.
+- **`git show <COMMIT>:<PATH>`** — raw file bytes at a commit; you must
+  re-parse them and re-filter same-name/comment/string noise yourself, with no
+  stable record IDs to join against the graph.
+
+---
+
+## eg query who
+
+Find who last changed a symbol (issue #116).
+
+```text
+eg query who <NAME> --graph <PATH> [--at <COMMIT> | --as-of <RFC3339>] [--repo <SELECTOR>] [--format json|text]
+```
+
+Answers "who last changed `<NAME>`" by returning the Git author of the most
+recent commit at or before the queried point in history that actually changed
+the symbol (following file renames), together with the commit SHA and the
+symbol's repo-relative file handle. Requires a history graph produced by
+`eg scan-history`: a plain `eg scan` graph carries no `Commit` records and
+yields a no-match exit `2`.
+
+Authorship is a **deterministic VCS-derived fact**, not an agent-authored
+observation: `eg scan-history` records the normalized Git author identity
+(`author_name` + `author_email`, from the commit's `%an` / `%ae` author
+metadata) on every `Commit` record, on its own fields distinct from the
+`author_time` timestamp in the temporal metadata. It states who empirically
+made a change; it is **not an ownership claim** — it asserts nothing about
+declared ownership, responsibility, or review authority (CODEOWNERS-style
+declarations answer a different question). Repeated `eg scan-history` runs of
+an unchanged repository reproduce the author fields byte-for-byte.
+
+`author_email` is **redaction-eligible** PII: a local store retains the raw
+address at rest, while evidence-bundle export always scrubs it to a
+`<REDACTED:email:hash_prefix>` marker
+(see [`docs/schema/redaction.md`](../schema/redaction.md) and
+[`bundle.md`](bundle.md)).
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `<NAME>` | yes | Exact symbol name to look up. |
+| `--graph <PATH>` | one of | History graph JSONL produced by `eg scan-history`. Mutually exclusive with `--data-dir`. |
+| `--data-dir <DIR>` | one of | Embedded `AletheiaDB` store populated from a history graph. Mutually exclusive with `--graph`. |
+| `--at <COMMIT>` | no | Report authorship as of this commit SHA or unique prefix (valid-time axis). Exit `1` on an ambiguous prefix. Mutually exclusive with `--as-of`. |
+| `--as-of <RFC3339>` | no | Report authorship at the most recent commit at or before this instant (valid-time axis). Mutually exclusive with `--at`. |
+| `--tx-as-of <RFC3339>` | no | Reserved for `eg query who`; exits `1` with an error rather than silently ignoring the flag. |
+| `--repo <SELECTOR>` | no | Restrict results to one repository (see [Repository scope](#repository-scope---repo-issue-67)). |
+| `--repo-path <DIR>` | no | Working-tree path for the non-fatal `freshness` code (see [Store freshness](#store-freshness---repo-path-issue-82)). |
+| `--format` | no | `json` (default) or `text`. |
+
+Without a temporal selector the answer is computed at HEAD. With `--at` /
+`--as-of` authorship is reported **as-of the queried point in history**, scoped
+to the HEAD lineage — the same valid-time semantics as `eg query symbol`
+([`docs/schema/temporal-selectors.md`](../schema/temporal-selectors.md)).
+
+### JSON output fields
+
+| Field | Type | Always present | Description |
+|-------|------|----------------|-------------|
+| `symbol_name` | string | yes | The queried symbol name. |
+| `commit_sha` | string | yes | Full SHA of the most recent commit at or before the queried point that changed the symbol — the citable commit handle. |
+| `author_name` | string | when recorded | Git author display name from that commit. |
+| `author_email` | string | when recorded | Git author email address from that commit. Redaction-eligible PII (see above). |
+| `valid_time` | string | yes | Committer timestamp of that commit (valid-time axis). |
+| `repo_relative_path` | string or null | yes | Repository-relative file path of the symbol — the citable file handle. |
+| `freshness` | string | with `--repo-path` | Non-fatal store-freshness code (`fresh` / `stale_head` / `stale_dirty` / `unknown`). |
+
+### Example
+
+```sh
+eg scan-history . --out history.graph.jsonl
+eg query who scan_repository --graph history.graph.jsonl
+eg query who scan_repository --graph history.graph.jsonl --as-of 2026-01-02T00:00:00Z
+```
+
+```json
+{"symbol_name":"scan_repository","commit_sha":"83fa99...","author_name":"Jane Dev","author_email":"jane@example.com","valid_time":"2026-01-01T12:00:00Z","repo_relative_path":"src/lib.rs"}
+```
 
 ---
 

@@ -44,6 +44,13 @@ The v1 runtime directory file set is closed:
 Any future file, such as structured logs, is an additive contract update in
 this document.
 
+Additive note (issue #200): the embedded adapter acquires the same
+`egregored.lock` exclusive advisory lock for the lifetime of every embedded
+write, so a data directory has exactly one live writer — daemon or embedded —
+at any moment. A writer that loses the race is refused with the structured
+`store_contended` error documented in
+[`docs/cli/embedded-concurrency.md`](../cli/embedded-concurrency.md).
+
 ## 3. `egregored.json` Schema
 
 Required fields:
