@@ -46,11 +46,23 @@ payload, never a synthesized row.
 
 **A definitive answer requires full manifest coverage.** When the scan skipped
 an unreadable or unparseable `Cargo.toml`, a parseable one whose dependency
-tables carry no usable `[package].name` (a name-less package table, an
-empty or whitespace-only name — which Cargo rejects — or a
+tables carry no usable `[package].name` (a name-less package table, a name
+violating Cargo's package-name rule — verified against `cargo metadata`:
+the first character must be a Unicode XID start character or `_`, never a
+digit or `-`, and the rest XID continue characters or `-`, so `"bad name"`,
+`"1foo"`, and the empty name are rejected while hyphens, underscores, and
+non-ASCII letters are valid — or a
 virtual manifest wrongly declaring top-level dependencies — stamped
 `symbol_kind: unattributable_cargo_manifest`; its declarations cannot be
-attributed to a declaring package), `{ workspace = true }` entries with no
+attributed to a declaring package), a `[workspace]` root whose member
+resolution Cargo rejects outright (a glob or literal member resolving to a
+directory without `Cargo.toml`, a missing literal member, or a glob
+matching nothing — "failed to load manifest for workspace member",
+verified; hidden directories count, loose files never match, excluded
+matches are exempt — stamped `symbol_kind: unloadable_cargo_workspace` on
+the ROOT manifest: the whole workspace is unloadable, its lockfile and
+`[workspace.dependencies]` are never used, and every member falls back to
+honest standalone behavior), `{ workspace = true }` entries with no
 resolvable workspace root (stamped `symbol_kind:
 uninheritable_cargo_dependency`; the manifest's other declarations still
 extract), or dependency entries Cargo rejects — neither a version string
@@ -74,10 +86,11 @@ accepted, since Cargo only checks registry *configuration* later. A
 version requirement string
 Cargo cannot parse (`serde = "not a req"`, plain-string or table
 `version`) is the same class: rejected at declaration time, never
-resolved against a lockfile — as is an empty or whitespace-only
-dependency NAME (a quoted empty table key `"" = "1"`, or a blank
-`package` value; the trimming boundary matches the package-name
-check). The same class covers a
+resolved against a lockfile — as is a dependency NAME violating the same
+package-name rule (a quoted empty or invalid table key like `"" = "1"` or
+`"1foo" = "1"`, or an invalid `package` value like `"foo.bar"` — Cargo
+applies one rule to `[package].name`, dependency keys, and rename values
+alike). The same class covers a
 `{ workspace = true }` entry whose
 `[workspace.dependencies]` root spec exists but is itself invalid: no
 usable string `version`/`path`/`git`, an unparseable template `version`,
@@ -171,9 +184,12 @@ declared entry (manifest key):
   A Cargo-invalid dependency entry (ill-typed known keys, or a cross-field
   source conflict like `{ path = "…", git = "…" }`) never seeds
   membership — its `path` is not trusted, in member tables or workspace
-  templates alike. Whether an invalid ROOT manifest should invalidate the
-  entire workspace it declares is an open question beyond this slice; only
-  the invalid entries themselves are refused.
+  templates alike. One workspace-invalidating class IS mirrored: member
+  resolution failures make the whole workspace unloadable
+  (`unloadable_cargo_workspace` above). Whether OTHER root-manifest
+  invalidities (e.g. an invalid root dependency entry) should also
+  invalidate the workspace remains an open question beyond this slice;
+  only the invalid entries themselves are refused there.
   Explicit `members` patterns resolve against the root's own directory, so a
   `../`-relative member outside the root's tree — literal
   (`members = ["../pkgs/app"]`) or glob (`../pkgs/*`, enumerated under the

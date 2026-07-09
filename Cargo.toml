@@ -61,6 +61,10 @@ toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 # `package = "…"` rename pairs (issue #180 / PR #314 review). Already present
 # transitively in Cargo.lock, so this pins no new crate version.
 semver = "1.0.28"
+# Unicode XID tables for Cargo's package-name validity rule (PR #314 review).
+# Already present transitively in Cargo.lock (via proc-macro2), so this pins
+# no new crate version.
+unicode-ident = "1.0.24"
 rmcp = { version = "1.7.0", features = ["macros", "server", "transport-io"], optional = true }
 schemars = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }

@@ -275,11 +275,11 @@ pub fn parse_manifest_dependencies(
         .and_then(toml_edit::Item::as_table_like)
         .and_then(|package| package.get("name"))
         .and_then(|name| name.as_str())
-        // An empty or whitespace-only name (which Cargo rejects) is no
-        // usable name: a row with `declaring_package: ""` would be a
-        // fabricated fact, so such manifests take the existing
+        // A name Cargo rejects — empty, or violating the package-name
+        // rule (`"bad name"`) — is no usable name: a row attributed to it
+        // would be a fabricated fact, so such manifests take the existing
         // unattributable-manifest diagnostic path (PR #314 review).
-        .filter(|name| !name.trim().is_empty())
+        .filter(|name| package_name_is_valid(name))
         .map(str::to_owned);
 
     let mut declarations = Vec::new();
@@ -375,6 +375,24 @@ fn requirement_is_parseable(requirement: &str) -> bool {
     semver::VersionReq::parse(requirement).is_ok()
 }
 
+/// Cargo's package-name validity rule at manifest load, verified against
+/// `cargo metadata` (PR #314 review): the first character must be a Unicode
+/// XID start character or `_` (never a digit or `-`), and every following
+/// character a Unicode XID continue character or `-`. Non-ASCII letters and
+/// uppercase are valid; spaces, `.`, `!`, a leading digit, or a leading `-`
+/// are rejection-level errors. Applies to `[package].name`, dependency
+/// table keys, and `package = "…"` rename values alike — Cargo rejects all
+/// three the same way. Rejection-level rules only; crates.io publish-time
+/// restrictions and Cargo warnings are out of scope.
+fn package_name_is_valid(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (unicode_ident::is_xid_start(first) || first == '_')
+        && chars.all(|c| unicode_ident::is_xid_continue(c) || c == '-')
+}
+
 /// Interprets one dependency table entry.
 ///
 /// `serde = "1"` declares requirement `"1"`; `serde = { version = "1", .. }`
@@ -442,11 +460,12 @@ fn declared_dependency(
     {
         return None;
     }
-    // An empty or whitespace-only dependency NAME — a quoted empty table
-    // key (`"" = "1"`) or a blank `package` value — is a manifest Cargo
-    // rejects: a blank-named row would be a fabricated fact. The trimming
-    // boundary matches the package-name check (PR #314 review).
-    if name.trim().is_empty() {
+    // A dependency NAME Cargo rejects — empty (a quoted empty table key,
+    // `"" = "1"`), blank, or violating the package-name rule (`"1foo"`,
+    // `package = "foo.bar"`) — never becomes a row: Cargo applies the same
+    // validity rule to dependency keys and rename values as to
+    // `[package].name` (verified, PR #314 review).
+    if !package_name_is_valid(&name) {
         return None;
     }
     Some(DeclaredDependency {
@@ -573,6 +592,12 @@ fn resolve_workspace_inheritance(
             continue;
         }
         let real_name = spec.package.clone().unwrap_or_else(|| key.clone());
+        // The root template's rename must itself be a Cargo-valid name
+        // (PR #314 review) — an invalid one never fabricates a row.
+        if !package_name_is_valid(&real_name) {
+            uninterpretable = true;
+            continue;
+        }
         declaration.declared_as = (real_name != key).then_some(key);
         declaration.name = real_name;
         declaration.declared_requirement.clone_from(&spec.version);
@@ -683,6 +708,17 @@ pub const UNINHERITABLE_MANIFEST_DIAGNOSTIC_KIND: &str = "uninheritable_cargo_de
 /// fabrication — and the answer stays qualified. Valid sibling entries in
 /// the same manifest still extract normally.
 pub const UNINTERPRETABLE_DEPENDENCY_DIAGNOSTIC_KIND: &str = "uninterpretable_cargo_dependency";
+
+/// Skipped-manifest `symbol_kind` for an unloadable workspace root
+/// (PR #314 review).
+///
+/// Stamped on the ROOT manifest whose member resolution Cargo rejects
+/// outright — a member directory without `Cargo.toml`, a missing literal
+/// member, or a glob matching nothing ("failed to load manifest for
+/// workspace member", verified). No member uses the root's lockfile or
+/// `[workspace.dependencies]`; all fall back to honest standalone behavior
+/// and every answer stays qualified.
+pub const UNLOADABLE_WORKSPACE_DIAGNOSTIC_KIND: &str = "unloadable_cargo_workspace";
 
 /// Skipped-manifest `symbol_kind` for an unattributable manifest (PR #314
 /// review).
@@ -807,6 +843,33 @@ fn uninterpretable_dependency_diagnostic(repository_id: &str, manifest_path: &st
     record
 }
 
+/// Diagnostic for a `[workspace]` root whose member resolution Cargo
+/// rejects (PR #314 review): the whole workspace is unloadable, so no
+/// member resolves through it — a coverage hole reported on the root
+/// manifest, never a silent skip.
+fn unloadable_workspace_diagnostic(repository_id: &str, manifest_path: &str) -> GraphRecord {
+    let mut record = GraphRecord::node(
+        stable_id(&[
+            "node",
+            "diagnostic",
+            "unloadable-cargo-workspace",
+            repository_id,
+            manifest_path,
+        ]),
+        NodeKind::Diagnostic,
+        Some(manifest_path.to_owned()),
+        None,
+        Some(manifest_path.to_owned()),
+        format!(
+            "Cargo workspace at {manifest_path} is unloadable (a member fails to resolve): no member uses its lockfile or workspace dependencies"
+        ),
+    );
+    if let GraphRecord::Node { symbol_kind, .. } = &mut record {
+        *symbol_kind = Some(UNLOADABLE_WORKSPACE_DIAGNOSTIC_KIND.to_owned());
+    }
+    record
+}
+
 /// Scans every `Cargo.toml` under `repo_root` into dependency records.
 ///
 /// Manifests are visited in deterministic repo-relative path order. Each
@@ -834,6 +897,20 @@ pub fn scan_dependency_records(repo_root: &Path, repository_id: &str) -> Result<
             nearest_lockfile(repo_root, &manifest.repo_relative_path, &mut lockfile_cache);
         let workspace_deps =
             workspace_dep_specs_for(repo_root, &manifest.repo_relative_path, &mut lockfile_cache);
+        // An unloadable workspace is a coverage hole reported on its ROOT
+        // manifest (PR #314 review): Cargo rejects the whole workspace, so
+        // no member resolves through it and every answer stays qualified.
+        let mut manifest_dir: Vec<&str> = manifest.repo_relative_path.split('/').collect();
+        manifest_dir.pop();
+        if matches!(
+            workspace_facts_in_dir(repo_root, &manifest_dir, &mut lockfile_cache),
+            WorkspaceFacts::UnloadableWorkspace
+        ) {
+            let diagnostic =
+                unloadable_workspace_diagnostic(repository_id, &manifest.repo_relative_path);
+            records.push(diagnostic_repo_edge(repository_id, diagnostic.id()));
+            records.push(diagnostic);
+        }
         let manifest_records = manifest_dependency_records(
             repository_id,
             &manifest.repo_relative_path,
@@ -907,6 +984,15 @@ enum WorkspaceFacts {
     /// A plain package manifest (no `[workspace]` table): its lockfile covers
     /// only itself; Cargo's workspace discovery walks past it.
     PackageOnly,
+    /// A `[workspace]` root whose member resolution Cargo rejects outright
+    /// ("failed to load manifest for workspace member", verified): a glob or
+    /// literal member resolving to a directory without `Cargo.toml`, a
+    /// missing literal member, or a glob matching nothing at all. The whole
+    /// workspace is unloadable — its lockfile and `[workspace.dependencies]`
+    /// are never used by ANY member, which fall back to honest standalone
+    /// behavior, and the walk still stops at this `[workspace]` boundary
+    /// (PR #314 review).
+    UnloadableWorkspace,
     /// A workspace root: `members` / `exclude` globs plus the root package's
     /// in-tree `path = "…"` dependencies (transitively — Cargo treats them as
     /// automatic members) decide coverage, and `dep_specs` carries the
@@ -1041,8 +1127,11 @@ fn owning_workspace_dir(
                 return workspace_includes(&members, &exclude, &path_members, &rel)
                     .then(|| segments.join("/"));
             }
-            // Membership cannot be verified: never claim ownership.
-            WorkspaceFacts::Unverifiable => return None,
+            // Membership cannot be verified: never claim ownership. An
+            // unloadable workspace grants no membership either — Cargo
+            // rejects it whole — but its `[workspace]` boundary still stops
+            // the walk (PR #314 review).
+            WorkspaceFacts::Unverifiable | WorkspaceFacts::UnloadableWorkspace => return None,
             // Not a workspace root (plain package, or a stray lockfile with
             // no manifest): Cargo's discovery walks past it — and past any
             // lockfile it holds.
@@ -1248,6 +1337,14 @@ fn parse_workspace_facts(text: &str, repo_root: &Path, dir_key: &str) -> Workspa
     };
     let members = normalize(string_array(workspace.get("members")));
     let exclude = normalize(string_array(workspace.get("exclude")));
+    // Member resolution hitting a non-package directory, a missing literal
+    // member, or a glob matching nothing makes Cargo reject the WHOLE
+    // workspace (verified — "failed to load manifest for workspace
+    // member"): no member may use its lockfile or inheritance surface
+    // (PR #314 review).
+    if !members_are_loadable(repo_root, &root_segments, &members, &exclude) {
+        return WorkspaceFacts::UnloadableWorkspace;
+    }
     let path_members = path_dependency_closure(&doc, repo_root, dir_key, &members, &exclude);
     // `[workspace.dependencies]` inheritance surface: a plain string entry
     // is its own version requirement; a table entry contributes its
@@ -1740,6 +1837,131 @@ fn normalize_in_tree_path(root_segments: &[&str], base: &str, path: &str) -> Opt
 /// Returns whether one `/`-separated pattern segment carries glob syntax.
 fn is_glob_segment(segment: &str) -> bool {
     segment.contains(['*', '?', '['])
+}
+
+/// Enumerates every directory under `root_dir` (relative, `/`-separated,
+/// sorted), hidden directories included and nothing skipped: Cargo's member
+/// globs match hidden directories too (verified against `cargo metadata`),
+/// and a matched directory without a manifest is fatal wherever it sits.
+fn all_dirs_under(root_dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let child_rel = if rel.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let child = dir.join(name);
+            out.push(child_rel.clone());
+            walk(&child, &child_rel, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(root_dir, "", &mut out);
+    out
+}
+
+/// Verifies Cargo would load every explicit member (PR #314 review, each
+/// rule verified against `cargo metadata`): a literal member must be a
+/// directory holding `Cargo.toml`; a glob must match at least one directory
+/// (an empty match set falls back to a literal path Cargo then fails to
+/// load), and every matched, non-excluded directory must hold `Cargo.toml`.
+/// Hidden directories count, loose files never match, and excluded matches
+/// are exempt. Out-of-repo patterns were already dropped by normalization
+/// (documented out of scope).
+fn members_are_loadable(
+    repo_root: &Path,
+    root_segments: &[&str],
+    members: &[String],
+    exclude: &[String],
+) -> bool {
+    let excluded = |candidate: &str| {
+        exclude
+            .iter()
+            .any(|glob| member_glob_match(glob, candidate))
+    };
+    for pattern in members {
+        let segments: Vec<&str> = pattern
+            .split('/')
+            .filter(|s| !s.is_empty() && *s != ".")
+            .collect();
+        let split = segments
+            .iter()
+            .position(|segment| is_glob_segment(segment))
+            .unwrap_or(segments.len());
+        let (prefix, rest) = segments.split_at(split);
+        let mut anchor_repo: Vec<&str> = root_segments.to_vec();
+        let mut escaped = false;
+        for segment in prefix {
+            if *segment == ".." {
+                if anchor_repo.pop().is_none() {
+                    escaped = true;
+                    break;
+                }
+            } else {
+                anchor_repo.push(segment);
+            }
+        }
+        if escaped {
+            // Out-of-repo: documented out of scope, never checked here.
+            continue;
+        }
+        let mut anchor_path = repo_root.to_path_buf();
+        for segment in &anchor_repo {
+            anchor_path.push(segment);
+        }
+        let prefix_rel = prefix.join("/");
+        if rest.is_empty() {
+            if excluded(&prefix_rel) {
+                continue;
+            }
+            if !anchor_path.join("Cargo.toml").is_file() {
+                return false;
+            }
+            continue;
+        }
+        let mut matched_any = false;
+        for sub in all_dirs_under(&anchor_path) {
+            let candidate = if prefix_rel.is_empty() {
+                sub.clone()
+            } else {
+                format!("{prefix_rel}/{sub}")
+            };
+            if !member_glob_match(pattern, &candidate) {
+                continue;
+            }
+            matched_any = true;
+            if excluded(&candidate) {
+                continue;
+            }
+            let mut member_dir = anchor_path.clone();
+            for segment in sub.split('/') {
+                member_dir.push(segment);
+            }
+            if !member_dir.join("Cargo.toml").is_file() {
+                return false;
+            }
+        }
+        if !matched_any {
+            return false;
+        }
+    }
+    true
 }
 
 /// Normalizes one `members`/`exclude` pattern to the workspace-root-relative

@@ -3922,3 +3922,184 @@ fn empty_dependency_names_are_uninterpretable() {
     assert_eq!(miss["count"], 0);
     assert_eq!(skipped_diagnostics(&miss).len(), 1);
 }
+
+/// PR #314 review: Cargo's package-name rule (verified against `cargo
+/// metadata`): the first character must be a Unicode XID start character
+/// or `_` (never a digit or `-`), the rest XID continue characters or `-`.
+/// An invalid `[package].name` routes to the unattributable path (no
+/// rows); an invalid dependency key or `package` value routes to the
+/// uninterpretable path. Hyphens, underscores, and non-ASCII letters stay
+/// valid.
+#[test]
+fn cargo_invalid_names_are_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    fs::create_dir_all(repo.join("badname")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        concat!(
+            "[package]\nname = \"root_pkg-1\"\nversion = \"0.1.0\"\n\n",
+            "[dependencies]\n",
+            "\"1foo\" = \"1\"\n",
+            "alias = { package = \"foo.bar\", version = \"1\" }\n",
+            "foo-bar = \"1\"\n",
+            "foo_bar = \"1\"\n",
+        ),
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\n[[package]]\nname = \"foo-bar\"\nversion = \"1.2.3\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+    // Cargo rejects the space in the package name (invalid XID character).
+    fs::write(
+        repo.join("badname/Cargo.toml"),
+        "[package]\nname = \"bad name\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("bad-name manifest");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("bad-name-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let full = run_query_deps(&graph, &[]);
+    let rows = full["declarations"].as_array().expect("declarations");
+    assert!(
+        rows.iter().all(|d| d["declaring_package"] != "bad name"),
+        "a Cargo-invalid package name must not attribute rows"
+    );
+    for invalid in ["1foo", "foo.bar", "serde"] {
+        assert!(
+            rows.iter().all(|d| d["name"] != invalid),
+            "a Cargo-invalid dependency name ({invalid}) must not become a row"
+        );
+    }
+    for valid in ["foo-bar", "foo_bar"] {
+        assert!(
+            rows.iter().any(|d| d["name"] == valid),
+            "hyphens and underscores stay valid ({valid})"
+        );
+    }
+    let diagnostics = skipped_diagnostics(&full);
+    let details: Vec<&str> = diagnostics
+        .iter()
+        .filter_map(|d| d["detail"].as_str())
+        .collect();
+    assert!(
+        details.contains(&"badname/Cargo.toml"),
+        "the invalid package name is an unattributable coverage hole, got {details:?}"
+    );
+    assert!(
+        details.contains(&"Cargo.toml"),
+        "the invalid dependency names qualify the root manifest, got {details:?}"
+    );
+
+    let miss = run_query_deps(&graph, &["--name", "serde"]);
+    assert_eq!(miss["count"], 0);
+    assert!(!skipped_diagnostics(&miss).is_empty());
+}
+
+/// PR #314 review (verified against `cargo metadata`): workspace member
+/// resolution hitting a directory without `Cargo.toml` — via a glob, a
+/// literal member with a missing directory or manifest, or a glob matching
+/// nothing at all — makes Cargo reject the WHOLE workspace ("failed to
+/// load manifest for workspace member"). Such a workspace grants no
+/// membership: its lockfile and `[workspace.dependencies]` are never used,
+/// members fall back to honest standalone behavior, and the root manifest
+/// carries an `unloadable_cargo_workspace` qualification. Loose files and
+/// excluded matches never trip the check (also verified).
+#[test]
+fn unloadable_workspaces_grant_no_membership() {
+    // (a) glob matching a directory without a manifest.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("crates/app/src")).expect("dirs");
+    fs::create_dir_all(repo.join("crates/notpkg")).expect("dirs");
+    fs::write(repo.join("crates/notpkg/readme.txt"), "not a package\n").expect("file");
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(
+        repo.join("crates/app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("app manifest");
+    fs::write(repo.join("crates/app/src/lib.rs"), "pub fn a() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("unloadable-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let rows = parsed["declarations"].as_array().expect("declarations");
+    let app = rows
+        .iter()
+        .find(|d| d["declaring_package"] == "app")
+        .expect("app row");
+    assert_eq!(
+        app["resolution"], "no_lockfile",
+        "an unloadable workspace grants no membership — members are standalone"
+    );
+    let diagnostics = skipped_diagnostics(&parsed);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "the unloadable workspace root must qualify the answer"
+    );
+    assert_eq!(diagnostics[0]["detail"], "Cargo.toml");
+
+    // (b) literal member with a missing directory: same fatal class.
+    let repo2 = temp.path().join("repo2");
+    fs::create_dir_all(repo2.join("app/src")).expect("dirs");
+    fs::write(
+        repo2.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"missing\"]\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo2.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(
+        repo2.join("app/Cargo.toml"),
+        "[package]\nname = \"app2\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("app manifest");
+    fs::write(repo2.join("app/src/lib.rs"), "pub fn a() {}\n").expect("lib");
+
+    let jsonl2 = scan_repository_at_with_override(&repo2, FIXED_TIME, Some("unloadable-fixture-2"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph2 = temp.path().join("graph2.jsonl");
+    fs::write(&graph2, jsonl2).expect("write graph");
+
+    let parsed2 = run_query_deps(&graph2, &["--name", "serde"]);
+    let rows2 = parsed2["declarations"].as_array().expect("declarations");
+    let app2 = rows2
+        .iter()
+        .find(|d| d["declaring_package"] == "app2")
+        .expect("app2 row");
+    assert_eq!(
+        app2["resolution"], "no_lockfile",
+        "a literal member with a missing directory makes the workspace unloadable"
+    );
+    assert_eq!(skipped_diagnostics(&parsed2).len(), 1);
+}
