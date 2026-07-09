@@ -346,6 +346,18 @@ file/span or commit handle; an uncited answer is a miss, not a win. A class belo
 yields a distinct exit code and a `below_token_savings_threshold` diagnostic naming the class
 and ratio. Output is deterministic and redaction-safe. See `docs/cli/token-cost.md`.
 
+Embedded store write locking (issue #200):
+
+Every embedded write open takes the OS-level exclusive store lease (`egregored.lock`),
+shared with the daemon, so one data dir has exactly one live writer at a time. A second
+concurrent writer — embedded peer or live daemon — is refused before any write with the
+structured `store_contended` error naming the remedy (route concurrent writers through
+`eg daemon start` + `--adapter daemon`, or retry after the current writer releases the
+store). `eg ingest --adapter embedded` additionally prints the machine-readable
+`{"ok": false, "error": {...}}` envelope on stdout. Read-only commands never take the
+write lease; strictly read-only audits read a throwaway snapshot copy. See
+`docs/cli/embedded-concurrency.md`.
+
 The primary binary is `egregore`; `eg` is also built as a short CLI alias.
 
 ## Working Rules

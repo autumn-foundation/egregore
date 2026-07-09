@@ -321,7 +321,14 @@ impl StoreLease {
         })
     }
 
-    fn try_acquire(data_dir: &Path) -> Result<Option<Self>> {
+    /// Attempts to acquire the embedded-store lease without treating a held
+    /// lease as an error.
+    ///
+    /// Returns `Ok(None)` when another live process holds the lease (lock
+    /// contention) and `Err` only for real I/O or permission failures. The
+    /// embedded adapter uses this distinction to raise the structured
+    /// `store_contended` error (issue #200).
+    pub(crate) fn try_acquire(data_dir: &Path) -> Result<Option<Self>> {
         let path = lock_path(data_dir)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
@@ -1421,6 +1428,25 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<()> {
     let _ = write_metadata(&config.data_dir, &stopped_metadata);
     let _ = lease.write_metadata(&stopped_metadata);
     Ok(())
+}
+
+/// Names the live lease holder for embedded-contention diagnostics when the
+/// runtime metadata identifies a running daemon (issue #200).
+///
+/// Callers invoke this only after a lease acquisition failed, so non-stopped
+/// `running` metadata plus a held lock identifies the daemon as the holder.
+/// Returns `None` when no metadata exists, the metadata is unreadable, or the
+/// recorded state is not `running` — the holder is then an unidentified
+/// embedded peer.
+pub(crate) fn live_daemon_holder_hint(data_dir: &Path) -> Option<String> {
+    let metadata = try_read_raw_metadata(data_dir).ok().flatten()?;
+    if metadata.state != DaemonState::Running {
+        return None;
+    }
+    Some(format!(
+        "a live egregored daemon (pid {}, address {})",
+        metadata.pid, metadata.address
+    ))
 }
 
 /// Returns active daemon metadata for a data directory if the daemon responds.
