@@ -50,10 +50,14 @@ tables carry no usable `[package].name` (a name-less package table, an
 empty or whitespace-only name — which Cargo rejects — or a
 virtual manifest wrongly declaring top-level dependencies — stamped
 `symbol_kind: unattributable_cargo_manifest`; its declarations cannot be
-attributed to a declaring package), or `{ workspace = true }` entries with no
+attributed to a declaring package), `{ workspace = true }` entries with no
 resolvable workspace root (stamped `symbol_kind:
 uninheritable_cargo_dependency`; the manifest's other declarations still
-extract), every response — hit, miss, and empty
+extract), or dependency entries that are neither a version string nor a
+dependency table (`serde = true` — a manifest Cargo rejects; stamped
+`symbol_kind: uninterpretable_cargo_dependency`, the invalid entry is
+skipped — never a key-named row with no requirement — while valid sibling
+entries still extract), every response — hit, miss, and empty
 surface — carries one
 `skipped_manifest` diagnostic per skipped manifest, citing the repo-relative
 manifest handle (`detail`) and the `Diagnostic` record ID (`record_id`) in
@@ -153,8 +157,12 @@ declared entry (manifest key):
   through the root's lockfile. A broken pointer (target missing or not a
   workspace root) or a non-covering target means honest standalone
   behavior.
-  (`..`-escaping and absolute out-of-tree path dependencies are not
-  interpreted in this slice.)
+  Relative path dependencies resolve against the declaring manifest's
+  REPO-relative position, so an out-of-root member's dependency may climb
+  back over the repository tree (or back inside the root's own tree) and
+  stay a member; only a relative path escaping the *repository* — and
+  absolute out-of-tree path dependencies — are not interpreted in this
+  slice.
   A parseable declared requirement gates **every** path with Cargo semantics
   (`"1"` means `^1`), including a sole locked version that a stale or shared
   lockfile can leave unsatisfying: exactly one satisfying version is

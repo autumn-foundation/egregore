@@ -242,6 +242,11 @@ pub struct ManifestDependencies {
     /// Declarations in documented order: table order (`normal`, `dev`,
     /// `build`), then crate name, then the declared-as manifest key.
     pub declarations: Vec<DeclaredDependency>,
+    /// `true` when at least one dependency table entry was neither a
+    /// version string nor a dependency table (`serde = true` — a manifest
+    /// Cargo rejects). The entry is skipped, never rendered as a row, and
+    /// reported as a coverage hole (PR #314 review).
+    pub uninterpretable: bool,
 }
 
 /// Parses the three captured dependency tables from a manifest body.
@@ -268,6 +273,7 @@ pub fn parse_manifest_dependencies(
         .map(str::to_owned);
 
     let mut declarations = Vec::new();
+    let mut uninterpretable = false;
     for kind in DEPENDENCY_KINDS {
         let Some(table) = doc
             .get(kind.table())
@@ -277,7 +283,15 @@ pub fn parse_manifest_dependencies(
         };
         let mut entries: Vec<DeclaredDependency> = table
             .iter()
-            .map(|(key, item)| declared_dependency(key, item, kind))
+            .filter_map(|(key, item)| {
+                let entry = declared_dependency(key, item, kind);
+                if entry.is_none() {
+                    // Invalid entry (neither version string nor table):
+                    // skipped, reported, never fabricated (PR #314 review).
+                    uninterpretable = true;
+                }
+                entry
+            })
             .collect();
         // One fact per declared entry: TOML keys are unique per table, and a
         // `package = "…"` rename legitimately declares a second version of
@@ -292,6 +306,7 @@ pub fn parse_manifest_dependencies(
     Ok(ManifestDependencies {
         package_name,
         declarations,
+        uninterpretable,
     })
 }
 
@@ -301,12 +316,15 @@ pub fn parse_manifest_dependencies(
 /// declares the `version` key; a `package = "real-name"` key renames the
 /// entry, so the *crate* name is the `package` value. A declaration without a
 /// `version` key (pure `path`/`git`/`workspace = true`) carries no
-/// requirement — nothing is fabricated.
+/// requirement — nothing is fabricated. An entry that is neither a version
+/// string nor a dependency table (`serde = true` — a manifest Cargo rejects)
+/// is `None`: no row is fabricated for it, and the caller reports the
+/// coverage hole (PR #314 review).
 fn declared_dependency(
     key: &str,
     item: &toml_edit::Item,
     kind: DependencyKind,
-) -> DeclaredDependency {
+) -> Option<DeclaredDependency> {
     let mut name = key.to_owned();
     let mut declared_as = None;
     let mut declared_requirement = None;
@@ -325,14 +343,16 @@ fn declared_dependency(
             .get("workspace")
             .and_then(toml_edit::Item::as_bool)
             .unwrap_or(false);
+    } else {
+        return None;
     }
-    DeclaredDependency {
+    Some(DeclaredDependency {
         name,
         declared_as,
         kind,
         declared_requirement,
         inherits_workspace,
-    }
+    })
 }
 
 /// Builds the `DependencyDeclaration` (and manifest `Diagnostic`) records for
@@ -357,7 +377,7 @@ pub fn manifest_dependency_records(
         )];
     };
     let Some(declaring_package) = parsed.package_name else {
-        if parsed.declarations.is_empty() {
+        if parsed.declarations.is_empty() && !parsed.uninterpretable {
             // A true virtual workspace manifest declares nothing: no rows,
             // no diagnostic.
             return Vec::new();
@@ -387,6 +407,12 @@ pub fn manifest_dependency_records(
         .collect();
     if uninheritable {
         records.push(uninheritable_dependency_diagnostic(
+            repository_id,
+            manifest_path,
+        ));
+    }
+    if parsed.uninterpretable {
+        records.push(uninterpretable_dependency_diagnostic(
             repository_id,
             manifest_path,
         ));
@@ -522,6 +548,16 @@ pub const SKIPPED_MANIFEST_DIAGNOSTIC_KIND: &str = "unparseable_cargo_manifest";
 /// declarations in the same manifest still extract normally.
 pub const UNINHERITABLE_MANIFEST_DIAGNOSTIC_KIND: &str = "uninheritable_cargo_dependency";
 
+/// Skipped-manifest `symbol_kind` for invalid dependency table entries
+/// (PR #314 review).
+///
+/// Stamped when a dependency table entry is neither a version string nor a
+/// dependency table (`serde = true` — a manifest Cargo rejects): the entry
+/// is skipped — a key-named row with no requirement would be a
+/// fabrication — and the answer stays qualified. Valid sibling entries in
+/// the same manifest still extract normally.
+pub const UNINTERPRETABLE_DEPENDENCY_DIAGNOSTIC_KIND: &str = "uninterpretable_cargo_dependency";
+
 /// Skipped-manifest `symbol_kind` for an unattributable manifest (PR #314
 /// review).
 ///
@@ -614,6 +650,33 @@ fn uninheritable_dependency_diagnostic(repository_id: &str, manifest_path: &str)
     );
     if let GraphRecord::Node { symbol_kind, .. } = &mut record {
         *symbol_kind = Some(UNINHERITABLE_MANIFEST_DIAGNOSTIC_KIND.to_owned());
+    }
+    record
+}
+
+/// Diagnostic for dependency table entries that are neither a version
+/// string nor a dependency table (PR #314 review): Cargo rejects such
+/// manifests, so the entry is skipped — never rendered as a row — and the
+/// coverage hole is reported so answers stay qualified.
+fn uninterpretable_dependency_diagnostic(repository_id: &str, manifest_path: &str) -> GraphRecord {
+    let mut record = GraphRecord::node(
+        stable_id(&[
+            "node",
+            "diagnostic",
+            "uninterpretable-cargo-dependency",
+            repository_id,
+            manifest_path,
+        ]),
+        NodeKind::Diagnostic,
+        Some(manifest_path.to_owned()),
+        None,
+        Some(manifest_path.to_owned()),
+        format!(
+            "Cargo manifest {manifest_path} declares dependency entries that are neither a version string nor a dependency table: those declarations skipped"
+        ),
+    );
+    if let GraphRecord::Node { symbol_kind, .. } = &mut record {
+        *symbol_kind = Some(UNINTERPRETABLE_DEPENDENCY_DIAGNOSTIC_KIND.to_owned());
     }
     record
 }
@@ -1127,13 +1190,13 @@ fn path_dependency_closure(
     let workspace_paths = workspace_dependency_paths(root_doc);
     let enqueue = |deps: &ManifestPathDeps, base: &str, queue: &mut Vec<String>| {
         for path in &deps.literal {
-            if let Some(next) = normalize_path_dep(&abs_root, base, path) {
+            if let Some(next) = normalize_path_dep(&abs_root, &root_segments, base, path) {
                 queue.push(next);
             }
         }
         for key in &deps.inherited {
             if let Some(path) = workspace_paths.get(key)
-                && let Some(next) = normalize_path_dep(&abs_root, "", path)
+                && let Some(next) = normalize_path_dep(&abs_root, &root_segments, "", path)
             {
                 queue.push(next);
             }
@@ -1337,10 +1400,16 @@ fn absolutize_lexical(dir: &Path) -> PathBuf {
 /// only when it points inside the workspace root (lexical prefix match
 /// against `abs_root`, the [`absolutize_lexical`] form of the root, so a
 /// relative scan root still recognizes in-tree targets) and converts to the
-/// root-relative member path. Absolute out-of-tree targets and paths
-/// escaping the root are skipped — documented out of scope, never an error
-/// (PR #314 review).
-fn normalize_path_dep(abs_root: &Path, base: &str, raw: &str) -> Option<String> {
+/// root-relative member path. Absolute out-of-tree targets and relative
+/// paths escaping the repository are skipped — documented out of scope,
+/// never an error; a relative path climbing back over the repo tree stays
+/// a member (PR #314 review).
+fn normalize_path_dep(
+    abs_root: &Path,
+    root_segments: &[&str],
+    base: &str,
+    raw: &str,
+) -> Option<String> {
     let normalized = raw.replace('\\', "/");
     if Path::new(&normalized).is_absolute() {
         let rel = absolutize_lexical(Path::new(&normalized));
@@ -1358,7 +1427,7 @@ fn normalize_path_dep(abs_root: &Path, base: &str, raw: &str) -> Option<String> 
         }
         return Some(parts.join("/"));
     }
-    normalize_in_tree_path(base, &normalized)
+    normalize_in_tree_path(root_segments, base, &normalized)
 }
 
 /// Path-dependency references collected from one manifest for the
@@ -1451,31 +1520,36 @@ fn workspace_dependency_paths(root_doc: &toml_edit::DocumentMut) -> BTreeMap<Str
 }
 
 /// Joins a `/`-separated base (relative to the workspace root; `""` for the
-/// root itself) with a manifest-declared relative path, resolving `.` and
-/// `..` segments. The base itself may carry leading `..` segments (an
-/// out-of-root member, PR #314 review); a `..` in the path never cancels
-/// one of those and never climbs past them. Returns `None` when the result
-/// escapes the root — such a path dependency is outside this slice's
-/// membership check.
-fn normalize_in_tree_path(base: &str, path: &str) -> Option<String> {
-    let mut stack: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
-    let normalized = path.replace('\\', "/");
+/// root itself) with a manifest-declared relative path by resolving both
+/// against the root's REPO-relative position (PR #314 review): an
+/// out-of-root member's dependency may legitimately climb back over the
+/// repository tree — base `../pkgs/app` + `../../other` is the repo-root
+/// sibling `other` — or back inside the root's own tree, and both are
+/// members per Cargo. The result is re-expressed root-relative via
+/// `rel_between`, so it compares canonically against membership `rel`
+/// strings. Returns `None` only when the path escapes the REPOSITORY
+/// (documented out of scope) or lands on the root's own directory.
+fn normalize_in_tree_path(root_segments: &[&str], base: &str, path: &str) -> Option<String> {
+    // Repo-relative position of the declaring manifest's directory: the
+    // root's position plus the root-relative base (whose leading `..`
+    // segments climb over the root, never past the repository).
+    let mut stack: Vec<&str> = root_segments.to_vec();
+    let normalized = format!("{base}/{}", path.replace('\\', "/"));
     for segment in normalized.split('/') {
         match segment {
             "" | "." => {}
-            ".." => match stack.last() {
-                Some(segment) if *segment != ".." => {
-                    stack.pop();
-                }
-                _ => return None,
-            },
+            ".." => {
+                // Escaping the repository is a documented skip.
+                stack.pop()?;
+            }
             other => stack.push(other),
         }
     }
-    if stack.is_empty() {
+    if stack == root_segments {
+        // The root is never its own member.
         return None;
     }
-    Some(stack.join("/"))
+    Some(rel_between(root_segments, &stack))
 }
 
 /// Extracts a TOML string array (`members` / `exclude`) as owned strings with

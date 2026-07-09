@@ -2880,3 +2880,137 @@ fn tombstoned_dependency_records_are_excluded_from_current_state() {
     assert_eq!(miss["ok"], true);
     assert_eq!(miss["count"], 0);
 }
+
+/// PR #314 review: an out-of-root member's path dependency may legitimately
+/// climb back over the repository tree (Cargo accepts it and reports both
+/// packages as workspace members) — `pkgs/app` depending on `../../other`
+/// resolves to the repo-root sibling `other`, which must join `path_members`
+/// and resolve through `ws/Cargo.lock`. Only a dependency escaping the
+/// REPOSITORY stays skipped (pinned).
+#[test]
+fn upward_path_deps_from_out_of_root_members_join_the_closure() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    for dir in ["ws", "pkgs/app/src", "other/src", "ws/inner/src"] {
+        fs::create_dir_all(repo.join(dir)).expect("dirs");
+    }
+    fs::write(
+        repo.join("ws/Cargo.toml"),
+        "[workspace]\nmembers = [\"../pkgs/app\"]\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("ws/Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    // Out-of-root member with an upward path dep back over the repo tree,
+    // one pointing back INSIDE the root's own tree, and one escaping the
+    // repository entirely (pinned skip).
+    fs::write(
+        repo.join("pkgs/app/Cargo.toml"),
+        concat!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nworkspace = \"../../ws\"\n\n",
+            "[dependencies]\nserde = \"1\"\n",
+            "other = { path = \"../../other\" }\n",
+            "inner = { path = \"../../ws/inner\" }\n",
+            "esc = { path = \"../../../nowhere\" }\n",
+        ),
+    )
+    .expect("app manifest");
+    fs::write(repo.join("pkgs/app/src/lib.rs"), "pub fn a() {}\n").expect("lib");
+    fs::write(
+        repo.join("other/Cargo.toml"),
+        "[package]\nname = \"other\"\nversion = \"0.1.0\"\nworkspace = \"../ws\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("other manifest");
+    fs::write(repo.join("other/src/lib.rs"), "pub fn o() {}\n").expect("lib");
+    fs::write(
+        repo.join("ws/inner/Cargo.toml"),
+        "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("inner manifest");
+    fs::write(repo.join("ws/inner/src/lib.rs"), "pub fn i() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("upward-dep-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let rows = parsed["declarations"].as_array().expect("declarations");
+    let by_pkg = |pkg: &str| {
+        rows.iter()
+            .find(|d| d["declaring_package"] == pkg)
+            .unwrap_or_else(|| panic!("row for {pkg}"))
+    };
+    assert_eq!(by_pkg("app")["resolution"], "locked");
+    assert_eq!(
+        by_pkg("other")["resolution"],
+        "locked",
+        "an upward path dep from an out-of-root member is a valid member"
+    );
+    assert_eq!(by_pkg("other")["resolved_version"], "1.0.228");
+    assert_eq!(
+        by_pkg("inner")["resolution"],
+        "locked",
+        "an out-of-root member's dep pointing back inside the root tree is a member"
+    );
+}
+
+/// PR #314 review: a dependency table entry that is neither a version string
+/// nor a dependency table (`serde = true`) is a manifest Cargo rejects — no
+/// row is fabricated for it. The entry is skipped with an
+/// `uninterpretable_cargo_dependency` coverage-hole diagnostic; valid
+/// sibling entries still extract.
+#[test]
+fn uninterpretable_dependency_entries_are_skipped_with_a_diagnostic() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = true\ntokio = \"1\"\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"tokio\"\nversion = \"1.47.1\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("invalid-entry-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let full = run_query_deps(&graph, &[]);
+    let rows = full["declarations"].as_array().expect("declarations");
+    assert!(
+        rows.iter().all(|d| d["name"] != "serde"),
+        "an invalid entry Cargo rejects must not become a row"
+    );
+    let tokio = rows
+        .iter()
+        .find(|d| d["name"] == "tokio")
+        .expect("valid sibling entry still extracts");
+    assert_eq!(tokio["resolution"], "locked");
+    let diagnostics = skipped_diagnostics(&full);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "the skipped invalid entry must qualify the answer"
+    );
+    assert_eq!(diagnostics[0]["detail"], "Cargo.toml");
+
+    // The direct lookup for the invalid entry is a qualified miss, never a
+    // definitive row or a definitive "no".
+    let miss = run_query_deps(&graph, &["--name", "serde"]);
+    assert_eq!(miss["count"], 0);
+    assert_eq!(skipped_diagnostics(&miss).len(), 1);
+}
