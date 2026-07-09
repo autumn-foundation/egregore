@@ -328,8 +328,19 @@ pub fn manifest_dependency_records(
         )];
     };
     let Some(declaring_package) = parsed.package_name else {
-        // Virtual workspace manifests cannot declare package dependencies.
-        return Vec::new();
+        if parsed.declarations.is_empty() {
+            // A true virtual workspace manifest declares nothing: no rows,
+            // no diagnostic.
+            return Vec::new();
+        }
+        // Dependency tables without a usable `[package].name` cannot be
+        // attributed to a declaring package: a silent skip would be a
+        // coverage hole, so the manifest is reported like the unparseable
+        // case, under its own discriminator (PR #314 review).
+        return vec![unattributable_manifest_diagnostic(
+            repository_id,
+            manifest_path,
+        )];
     };
     parsed
         .declarations
@@ -420,6 +431,15 @@ fn dependency_record(
 /// without matching summary text.
 pub const SKIPPED_MANIFEST_DIAGNOSTIC_KIND: &str = "unparseable_cargo_manifest";
 
+/// Skipped-manifest `symbol_kind` for an unattributable manifest (PR #314
+/// review).
+///
+/// Stamped when dependency tables exist but no usable `[package].name` does
+/// (a name-less package table, or a virtual manifest wrongly carrying
+/// top-level dependencies). Reported like the unparseable case so answers
+/// stay qualified, under its own discriminator.
+pub const UNATTRIBUTABLE_MANIFEST_DIAGNOSTIC_KIND: &str = "unattributable_cargo_manifest";
+
 /// Attaches a skipped-manifest `Diagnostic` to its repository so a shared
 /// multi-repo store can scope and label the coverage hole (PR #314 review).
 fn diagnostic_repo_edge(repository_id: &str, diagnostic_id: &str) -> GraphRecord {
@@ -449,6 +469,33 @@ fn unparseable_manifest_diagnostic(repository_id: &str, manifest_path: &str) -> 
     );
     if let GraphRecord::Node { symbol_kind, .. } = &mut record {
         *symbol_kind = Some(SKIPPED_MANIFEST_DIAGNOSTIC_KIND.to_owned());
+    }
+    record
+}
+
+/// Diagnostic for a parseable manifest with dependency tables but no usable
+/// `[package].name` (PR #314 review): the declarations cannot be attributed
+/// to a declaring package, so the manifest is reported as a coverage hole —
+/// never a silent skip and never an invented package name.
+fn unattributable_manifest_diagnostic(repository_id: &str, manifest_path: &str) -> GraphRecord {
+    let mut record = GraphRecord::node(
+        stable_id(&[
+            "node",
+            "diagnostic",
+            "unattributable-cargo-manifest",
+            repository_id,
+            manifest_path,
+        ]),
+        NodeKind::Diagnostic,
+        Some(manifest_path.to_owned()),
+        None,
+        Some(manifest_path.to_owned()),
+        format!(
+            "Cargo manifest {manifest_path} declares dependencies without a usable [package].name: declarations skipped"
+        ),
+    );
+    if let GraphRecord::Node { symbol_kind, .. } = &mut record {
+        *symbol_kind = Some(UNATTRIBUTABLE_MANIFEST_DIAGNOSTIC_KIND.to_owned());
     }
     record
 }
@@ -1588,6 +1635,43 @@ tokio = { version = "1", features = ["full"] }
             "repo-id",
             "Cargo.toml",
             "[package\nbroken",
+            &LockfileStatus::Absent,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_kind_name(), Some("Diagnostic"));
+    }
+
+    #[test]
+    fn nameless_manifest_with_dependencies_yields_a_diagnostic() {
+        // PR #314 review: dependency tables without a usable [package].name
+        // cannot be attributed to a declaring package — a silent skip would
+        // be a coverage hole, so a distinct skipped-manifest Diagnostic is
+        // emitted instead of nothing.
+        let records = manifest_dependency_records(
+            "repo-id",
+            "Cargo.toml",
+            "[package]\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+            &LockfileStatus::Absent,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_kind_name(), Some("Diagnostic"));
+        let GraphRecord::Node { symbol_kind, .. } = &records[0] else {
+            panic!("diagnostic must be a node");
+        };
+        assert_eq!(
+            symbol_kind.as_deref(),
+            Some(UNATTRIBUTABLE_MANIFEST_DIAGNOSTIC_KIND)
+        );
+    }
+
+    #[test]
+    fn nameless_virtual_manifest_with_dependencies_yields_a_diagnostic() {
+        // A virtual manifest wrongly carrying top-level dependency tables is
+        // the same unattributable coverage hole.
+        let records = manifest_dependency_records(
+            "repo-id",
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"app\"]\n\n[dependencies]\nserde = \"1\"\n",
             &LockfileStatus::Absent,
         );
         assert_eq!(records.len(), 1);

@@ -45,8 +45,12 @@ exit 0 with `ok:true`, an empty `declarations` array, and a stable diagnostic
 payload, never a synthesized row.
 
 **A definitive answer requires full manifest coverage.** When the scan skipped
-an unreadable or unparseable `Cargo.toml` (its `Diagnostic` record is in the
-store), every response — hit, miss, and empty surface — carries one
+an unreadable or unparseable `Cargo.toml`, or a parseable one whose dependency
+tables carry no usable `[package].name` (a name-less package table, or a
+virtual manifest wrongly declaring top-level dependencies — stamped
+`symbol_kind: unattributable_cargo_manifest`; its declarations cannot be
+attributed to a declaring package), every response — hit, miss, and empty
+surface — carries one
 `skipped_manifest` diagnostic per skipped manifest, citing the repo-relative
 manifest handle (`detail`) and the `Diagnostic` record ID (`record_id`) in
 deterministic path order. A `no_match_for_name` accompanied by

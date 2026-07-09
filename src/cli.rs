@@ -11432,7 +11432,12 @@ fn collect_skipped_manifest_diagnostics<'a>(
             else {
                 return None;
             };
-            if symbol_kind != crate::manifest_deps::SKIPPED_MANIFEST_DIAGNOSTIC_KIND {
+            // Both skipped-manifest classes qualify answers: unparseable
+            // manifests and parseable ones whose dependency tables carry no
+            // usable [package].name (PR #314 review).
+            if symbol_kind != crate::manifest_deps::SKIPPED_MANIFEST_DIAGNOSTIC_KIND
+                && symbol_kind != crate::manifest_deps::UNATTRIBUTABLE_MANIFEST_DIAGNOSTIC_KIND
+            {
                 return None;
             }
             let owner = index.owner_of(id);

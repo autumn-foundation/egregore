@@ -32,6 +32,13 @@ pub const ORPHAN_NODE: &str = "orphan_node";
 /// Stable defect category: a tombstone whose deleted record is still
 /// referenced by at least one live edge.
 pub const TOMBSTONE_STRANDS_LIVE_EDGE: &str = "tombstone_strands_live_edge";
+/// Stable defect category: a `DependencyDeclaration` with edges but no
+/// `File —CONTAINS→` attribution edge (PR #314 review).
+///
+/// The containment chain is what repository scoping walks; zero-edge nodes
+/// are `orphan_node`, so this category covers nodes whose only edges are
+/// unrelated ones.
+pub const MISSING_CONTAINMENT_EDGE: &str = "missing_containment_edge";
 
 /// Node kinds that must be reachable through at least one edge.
 ///
@@ -396,6 +403,52 @@ fn check_orphans(
     }
 }
 
+/// Kind-specific containment rule (PR #314 review): every
+/// `DependencyDeclaration` must be the target of a `CONTAINS` edge whose
+/// source is a `File` node — the manifest attribution chain `--repo` scoping
+/// walks. Zero-edge nodes are already flagged as `orphan_node`; this check
+/// catches nodes whose only edges are unrelated ones, which would otherwise
+/// validate clean while repository scoping silently drops them.
+fn check_dependency_containment(
+    records: &[GraphRecord],
+    index: &GraphIndex<'_>,
+    incident: &BTreeSet<&str>,
+    diagnostics: &mut BTreeSet<ValidationDiagnostic>,
+) {
+    let mut contained: BTreeSet<&str> = BTreeSet::new();
+    for record in records {
+        let GraphRecord::Edge {
+            label: EdgeLabel::Contains,
+            source,
+            target,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if index
+            .node_kinds
+            .get(source.as_str())
+            .is_some_and(|kinds| kinds.contains(&NodeKind::File))
+        {
+            contained.insert(target);
+        }
+    }
+    for (id, kinds) in &index.node_kinds {
+        if !kinds.contains(&NodeKind::DependencyDeclaration)
+            || !incident.contains(id)
+            || contained.contains(id)
+        {
+            continue;
+        }
+        let mut diagnostic = ValidationDiagnostic::new(MISSING_CONTAINMENT_EDGE);
+        diagnostic.record_id = Some((*id).to_owned());
+        diagnostic.kind = Some(NodeKind::DependencyDeclaration.as_str());
+        index.cite_node(&mut diagnostic, id);
+        diagnostics.insert(diagnostic);
+    }
+}
+
 /// Validates referential integrity over an already-parsed record set.
 ///
 /// Checks, in one deterministic pass:
@@ -410,7 +463,9 @@ fn check_orphans(
 ///    (`tombstone_strands_live_edge`);
 /// 5. no topology node (`File`, `Module`, `Symbol`, `Import`,
 ///    `DependencyDeclaration`) is orphaned with zero incident edges
-///    (`orphan_node`).
+///    (`orphan_node`);
+/// 6. every `DependencyDeclaration` with incident edges is the target of a
+///    `File —CONTAINS→` attribution edge (`missing_containment_edge`).
 ///
 /// The output is deterministic: diagnostics are deduplicated and sorted in
 /// canonical order, so repeated validation of the same input is identical.
@@ -422,6 +477,7 @@ pub fn validate_records(records: &[GraphRecord]) -> ValidationReport {
     let (incident, stranded_by_deleted) = check_edges(records, &index, &mut diagnostics);
     check_tombstones(&index, &stranded_by_deleted, &mut diagnostics);
     check_orphans(&index, &incident, &mut diagnostics);
+    check_dependency_containment(records, &index, &incident, &mut diagnostics);
 
     ValidationReport {
         diagnostics: diagnostics.into_iter().collect(),
@@ -500,6 +556,26 @@ mod tests {
         ];
         let report = validate_records(&records);
         assert!(report.is_clean(), "got {:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn dependency_declaration_without_file_containment_is_a_defect() {
+        // PR #314 review: any incident edge is not enough — repository
+        // scoping walks specifically File —CONTAINS→ DependencyDeclaration,
+        // so a dependency node with only unrelated edges must be flagged.
+        let records = vec![
+            node("n:dep", NodeKind::DependencyDeclaration),
+            node("n:file", NodeKind::File),
+            node("n:sym", NodeKind::Symbol),
+            edge("e:def", EdgeLabel::Defines, "n:file", "n:sym"),
+            edge("e:mention", EdgeLabel::Mentions, "n:dep", "n:sym"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![MISSING_CONTAINMENT_EDGE]);
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.record_id.as_deref(), Some("n:dep"));
+        assert_eq!(diagnostic.kind, Some("DependencyDeclaration"));
     }
 
     #[test]

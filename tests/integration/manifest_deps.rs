@@ -2116,3 +2116,55 @@ fn uninherited_workspace_dependency_paths_are_not_members() {
         "an uninherited workspace-dependencies path entry is only a template, never a member"
     );
 }
+
+/// PR #314 review: a valid-TOML manifest with dependency tables but no
+/// usable `[package].name` cannot attribute its declarations — a silent
+/// skip would be a coverage hole, so it surfaces as a `skipped_manifest`
+/// diagnostic qualifying every answer (including a `--name` miss).
+#[test]
+fn nameless_manifest_dependencies_surface_as_skipped_manifest() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    fs::create_dir_all(repo.join("noname")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"root-pkg\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+    // Valid TOML, declares dependencies, but no [package].name.
+    fs::write(
+        repo.join("noname/Cargo.toml"),
+        "[package]\nversion = \"0.1.0\"\n\n[dependencies]\ntokio = \"1\"\n",
+    )
+    .expect("nameless manifest");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("nameless-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    // A --name miss for the crate hidden behind the nameless manifest is
+    // qualified, never a silently definitive "no".
+    let parsed = run_query_deps(&graph, &["--name", "tokio"]);
+    assert_eq!(parsed["count"], 0);
+    let diagnostics = skipped_diagnostics(&parsed);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "the unattributable manifest must surface as a coverage hole"
+    );
+    assert_eq!(diagnostics[0]["detail"], "noname/Cargo.toml");
+
+    // The full listing carries the same qualification.
+    let full = run_query_deps(&graph, &[]);
+    assert_eq!(skipped_diagnostics(&full).len(), 1);
+}
