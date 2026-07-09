@@ -65,7 +65,13 @@ must be strings, `optional`/`default-features` (and the deprecated
 `workspace` only the literal `true` (`workspace = false` is
 Cargo-invalid), and `optional` is illegal in `[dev-dependencies]` (dev
 deps cannot be optional; normal and build deps can) — unknown keys stay
-tolerated, since Cargo warns but loads. A version requirement string
+tolerated, since Cargo warns but loads. Cross-field source rules Cargo
+enforces are checked too (each verified against `cargo metadata`):
+`path` and `git` are mutually exclusive, `git` and `registry` are
+mutually exclusive, and `branch`/`tag`/`rev` require `git` with at most
+one of the three — while `registry` beside `version` or `path` stays
+accepted, since Cargo only checks registry *configuration* later. A
+version requirement string
 Cargo cannot parse (`serde = "not a req"`, plain-string or table
 `version`) is the same class: rejected at declaration time, never
 resolved against a lockfile. The same class covers a
@@ -112,11 +118,15 @@ declared entry (manifest key):
   (`"1.0.228"`, `"1"`). Absent when the declaration carries no `version` key
   (pure `path`/`git` dependencies) — never fabricated. A
   `{ workspace = true }` entry resolves through the owning workspace root's
-  `[workspace.dependencies]` table: the real crate name is the root entry's
+  `[workspace.dependencies]` table, looked up by the entry's MANIFEST KEY:
+  the real crate name is the root entry's
   `package` (else the shared key, with `declared_as` recording the member key
   when it differs), the requirement is the root entry's `version` (absent for
-  a path/git-only template), and a member-local `version` beside
-  `workspace = true` — which Cargo rejects — never overrides the root's. An
+  a path/git-only template), a member-local `version` beside
+  `workspace = true` — which Cargo rejects — never overrides the root's,
+  and a member-side `package` beside `workspace = true` (which Cargo
+  accepts and ignores — verified against `cargo metadata`) never
+  overrides the root template either. An
   inherited entry with no resolvable workspace root (or a key missing from
   the root table) yields **no row** — a key-named row would be a
   fabrication — plus a `skipped_manifest` qualification
@@ -146,7 +156,10 @@ declared entry (manifest key):
   `members`/`exclude` pattern is normalized like absolute path deps — repo
   root lexically absolutized and stripped, then re-expressed
   workspace-root-relative — so it matches, excludes, and seeds the closure,
-  while an out-of-repo absolute pattern is a documented skip) **or** the
+  while an out-of-repo absolute pattern is a documented skip; a relative
+  pattern whose literal prefix carries `.`/`..` segments
+  (`crates/../app`) is normalized in the same repo-relative space, glob
+  segments carried literally, with a repo-escaping prefix skipped) **or** the
   workspace reaches it through in-tree `path = "…"` dependencies
   (transitively — Cargo's automatic members; the closure grows from the root
   package and from every glob member, so a virtual root's members contribute

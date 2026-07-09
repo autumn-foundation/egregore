@@ -333,6 +333,24 @@ pub fn parse_manifest_dependencies(
 /// separately as a member-only key. Unknown keys are tolerated: Cargo
 /// warns but loads the manifest.
 fn dependency_table_is_well_typed(spec: &dyn toml_edit::TableLike, optional_allowed: bool) -> bool {
+    // Cross-field source rules Cargo enforces (each verified against
+    // `cargo metadata`, PR #314 review): `path` and `git` are mutually
+    // exclusive, `git` and `registry` are mutually exclusive, and
+    // `branch`/`tag`/`rev` require `git` with at most one of the three.
+    // `registry` beside `version` or `path` is manifest-valid — Cargo only
+    // checks registry *configuration* later — and stays accepted.
+    let has = |key: &str| spec.get(key).is_some();
+    let git_refs = ["branch", "tag", "rev"]
+        .iter()
+        .filter(|key| has(key))
+        .count();
+    if (has("path") && has("git"))
+        || (has("git") && has("registry"))
+        || (git_refs > 0 && !has("git"))
+        || git_refs > 1
+    {
+        return false;
+    }
     spec.iter().all(|(key, item)| match key {
         "version" | "path" | "git" | "registry" | "branch" | "tag" | "rev" | "package" => {
             item.as_str().is_some()
@@ -528,7 +546,17 @@ fn resolve_workspace_inheritance(
             resolved.push(declaration);
             continue;
         }
-        let key = declaration.name.clone();
+        // The lookup uses the original MANIFEST KEY: Cargo accepts
+        // `alias = { workspace = true, package = "serde" }`, and the parse
+        // has already rewritten `name` to the member-side `package` — but
+        // the ROOT template alone determines the real crate name, and a
+        // member-side `package` beside `workspace = true` is ignored by
+        // Cargo entirely (verified against `cargo metadata`; pinned,
+        // PR #314 review).
+        let key = declaration
+            .declared_as
+            .clone()
+            .unwrap_or_else(|| declaration.name.clone());
         let Some(spec) = workspace_deps.and_then(|deps| deps.get(&key)) else {
             uninheritable = true;
             continue;
@@ -1386,9 +1414,6 @@ fn seed_member_pattern(
     exclude: &[String],
     queue: &mut Vec<String>,
 ) {
-    fn is_glob_segment(segment: &str) -> bool {
-        segment.contains(['*', '?', '['])
-    }
     let segments: Vec<&str> = pattern
         .split('/')
         .filter(|s| !s.is_empty() && *s != ".")
@@ -1685,14 +1710,23 @@ fn normalize_in_tree_path(root_segments: &[&str], base: &str, path: &str) -> Opt
     Some(rel_between(root_segments, &stack))
 }
 
+/// Returns whether one `/`-separated pattern segment carries glob syntax.
+fn is_glob_segment(segment: &str) -> bool {
+    segment.contains(['*', '?', '['])
+}
+
 /// Normalizes one `members`/`exclude` pattern to the workspace-root-relative
-/// form used for matching and seeding (PR #314 review): relative patterns
-/// pass through unchanged; an absolute in-repo pattern is normalized like
-/// absolute path dependencies and pointers — the repo root lexically
-/// absolutized and stripped as a prefix (relative scan roots covered), then
-/// re-expressed relative to the workspace root via [`rel_between`] (glob
-/// segments carried through literally). An out-of-repo absolute pattern is
-/// `None` — a documented skip, never a match.
+/// form used for matching and seeding (PR #314 review): a relative pattern
+/// passes through unchanged unless its leading literal prefix carries `..`
+/// segments (`crates/../app`), which resolve lexically against the root's
+/// repo-relative position — the same canonical space as absolute patterns —
+/// with glob segments and everything after them carried literally; an
+/// absolute in-repo pattern is normalized like absolute path dependencies
+/// and pointers — the repo root lexically absolutized and stripped as a
+/// prefix (relative scan roots covered), then re-expressed relative to the
+/// workspace root via [`rel_between`]. An out-of-repo absolute pattern, or
+/// a relative prefix escaping the repository, is `None` — a documented
+/// skip, never a match.
 fn normalize_member_pattern(
     repo_root: &Path,
     root_segments: &[&str],
@@ -1700,7 +1734,38 @@ fn normalize_member_pattern(
 ) -> Option<String> {
     let normalized = pattern.replace('\\', "/");
     if !Path::new(&normalized).is_absolute() {
-        return Some(pattern);
+        let segments: Vec<&str> = normalized
+            .split('/')
+            .filter(|s| !s.is_empty() && *s != ".")
+            .collect();
+        let split = segments
+            .iter()
+            .position(|segment| is_glob_segment(segment))
+            .unwrap_or(segments.len());
+        let (prefix, rest) = segments.split_at(split);
+        if !prefix.contains(&"..") {
+            // Nothing to resolve: the matcher already normalizes plain
+            // `.` segments on both sides.
+            return Some(pattern);
+        }
+        let mut resolved: Vec<&str> = root_segments.to_vec();
+        for segment in prefix {
+            if *segment == ".." {
+                // Escaping the repository is a documented skip.
+                resolved.pop()?;
+            } else {
+                resolved.push(segment);
+            }
+        }
+        let prefix_rel = rel_between(root_segments, &resolved);
+        let rest_rel = rest.join("/");
+        return match (prefix_rel.is_empty(), rest_rel.is_empty()) {
+            // The root itself is never a member pattern.
+            (true, true) => None,
+            (true, false) => Some(rest_rel),
+            (false, true) => Some(prefix_rel),
+            (false, false) => Some(format!("{prefix_rel}/{rest_rel}")),
+        };
     }
     let abs_repo = absolutize_lexical(repo_root);
     let abs_pattern = absolutize_lexical(Path::new(&normalized));

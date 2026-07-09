@@ -3588,3 +3588,209 @@ fn optional_dev_dependencies_are_uninterpretable() {
     assert_eq!(miss["count"], 0);
     assert_eq!(skipped_diagnostics(&miss).len(), 1);
 }
+
+/// PR #314 review: Cargo accepts `alias = { workspace = true, package =
+/// "serde" }` resolved through root `alias = { package = "serde", version =
+/// "1" }` — the workspace-deps lookup must use the original MANIFEST KEY,
+/// not the member-rewritten crate name. Verified against `cargo metadata`:
+/// the ROOT template alone determines the real name (root `package`, else
+/// the shared key); a member-side `package` beside `workspace = true` is
+/// ignored (pinned).
+#[test]
+fn inherited_entries_look_up_by_manifest_key() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("m1/src")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        concat!(
+            "[workspace]\nmembers = [\"m1\"]\n\n",
+            "[workspace.dependencies]\n",
+            "alias = { package = \"serde\", version = \"1\" }\n",
+            "other = \"1\"\n",
+        ),
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\n[[package]]\nname = \"other\"\nversion = \"1.0.1\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(
+        repo.join("m1/Cargo.toml"),
+        concat!(
+            "[package]\nname = \"m1\"\nversion = \"0.1.0\"\n\n",
+            "[dependencies]\n",
+            "alias = { workspace = true, package = \"serde\" }\n",
+            "other = { workspace = true, package = \"different\" }\n",
+        ),
+    )
+    .expect("member manifest");
+    fs::write(repo.join("m1/src/lib.rs"), "pub fn m() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("key-lookup-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let full = run_query_deps(&graph, &[]);
+    let rows = full["declarations"].as_array().expect("declarations");
+    let serde = rows
+        .iter()
+        .find(|d| d["name"] == "serde")
+        .expect("the aliased inherited entry resolves through the root template");
+    assert_eq!(serde["declared_as"], "alias");
+    assert_eq!(serde["declared_requirement"], "1");
+    assert_eq!(serde["resolution"], "locked");
+    assert_eq!(serde["resolved_version"], "1.0.228");
+    // The root template alone determines the real name: a member-side
+    // `package` never overrides (Cargo ignores it — pinned).
+    let other = rows
+        .iter()
+        .find(|d| d["name"] == "other")
+        .expect("member-side package beside workspace = true is ignored");
+    assert!(other["declared_as"].is_null());
+    assert_eq!(other["resolution"], "locked");
+    assert!(
+        skipped_diagnostics(&full).is_empty(),
+        "both entries inherit cleanly — no coverage hole"
+    );
+}
+
+/// PR #314 review: relative `members`/`exclude` patterns may carry `..`
+/// segments in their literal prefix (`crates/../app`); they are normalized
+/// lexically in the same repo-relative canonical space as absolute
+/// patterns, so the member matches, seeds the closure, and `..`-written
+/// excludes are honored.
+#[test]
+fn dot_dot_segments_in_relative_member_patterns_are_normalized() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    for dir in ["app/src", "b/src", "helper/src"] {
+        fs::create_dir_all(repo.join(dir)).expect("dirs");
+    }
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/../app\", \"b\"]\nexclude = [\"crates/../b\"]\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    for (member, dep_extra) in [
+        ("app", "helper = { path = \"../helper\" }\n"),
+        ("b", ""),
+        ("helper", ""),
+    ] {
+        fs::write(
+            repo.join(member).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n{dep_extra}"
+            ),
+        )
+        .expect("member manifest");
+        fs::write(repo.join(member).join("src/lib.rs"), "pub fn f() {}\n").expect("lib");
+    }
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("dotdot-glob-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let rows = parsed["declarations"].as_array().expect("declarations");
+    let by_pkg = |pkg: &str| {
+        rows.iter()
+            .find(|d| d["declaring_package"] == pkg)
+            .unwrap_or_else(|| panic!("row for {pkg}"))
+    };
+    assert_eq!(
+        by_pkg("app")["resolution"],
+        "locked",
+        "a `..`-written relative member pattern admits the member"
+    );
+    assert_eq!(
+        by_pkg("helper")["resolution"],
+        "locked",
+        "a `..`-written member pattern seeds the path-dependency closure"
+    );
+    assert_eq!(
+        by_pkg("b")["resolution"],
+        "no_lockfile",
+        "a `..`-written exclude pattern is honored"
+    );
+}
+
+/// PR #314 review: type-valid but Cargo-invalid source combinations are
+/// rejected (verified against `cargo metadata`): `path` and `git` are
+/// mutually exclusive, `git` and `registry` are mutually exclusive, and
+/// `branch`/`tag`/`rev` require `git` with at most one of the three.
+/// Violations take the `uninterpretable_cargo_dependency` path; `git` with
+/// one ref and `version` with `registry` (manifest-valid — Cargo only
+/// checks registry configuration later) still extract.
+#[test]
+fn cross_field_source_conflicts_are_uninterpretable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        concat!(
+            "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\n\n",
+            "[dependencies]\n",
+            "serde = { version = \"1\", branch = \"main\" }\n",
+            "itoa = { path = \"dep\", git = \"https://example.com/i.git\" }\n",
+            "ryu = { git = \"https://example.com/r.git\", branch = \"b\", tag = \"t\" }\n",
+            "g1 = { git = \"https://example.com/g.git\", branch = \"main\" }\n",
+            "r1 = { version = \"1\", registry = \"alt\" }\n",
+        ),
+    )
+    .expect("root manifest");
+    // serde sits in the lockfile: a git-ref-without-git entry must never
+    // become a row, let alone a `locked` one.
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("cross-field-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let full = run_query_deps(&graph, &[]);
+    let rows = full["declarations"].as_array().expect("declarations");
+    for invalid in ["serde", "itoa", "ryu"] {
+        assert!(
+            rows.iter().all(|d| d["name"] != invalid),
+            "a Cargo-invalid source combination ({invalid}) must not become a row"
+        );
+    }
+    assert!(
+        rows.iter().any(|d| d["name"] == "g1"),
+        "git with one ref is valid and still extracts"
+    );
+    assert!(
+        rows.iter().any(|d| d["name"] == "r1"),
+        "version with registry is manifest-valid and still extracts"
+    );
+    assert_eq!(
+        skipped_diagnostics(&full).len(),
+        1,
+        "the skipped conflicting entries must qualify the answer"
+    );
+
+    let miss = run_query_deps(&graph, &["--name", "serde"]);
+    assert_eq!(miss["count"], 0);
+    assert_eq!(skipped_diagnostics(&miss).len(), 1);
+}
