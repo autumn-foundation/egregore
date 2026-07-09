@@ -758,13 +758,28 @@ fn path_dependency_closure(
     // of `normalize_path_dep` compares against the lexically absolutized
     // form, computed once per workspace root (PR #314 review).
     let abs_root = absolutize_lexical(root_dir);
+    // `[workspace.dependencies]` path templates: a member (or the root
+    // package) inheriting one via `{ workspace = true }` makes its target
+    // an automatic member; the paths are relative to the ROOT (PR #314
+    // review). Uninherited templates never seed anything.
+    let workspace_paths = workspace_dependency_paths(root_doc);
+    let enqueue = |deps: &ManifestPathDeps, base: &str, queue: &mut Vec<String>| {
+        for path in &deps.literal {
+            if let Some(next) = normalize_path_dep(&abs_root, base, path) {
+                queue.push(next);
+            }
+        }
+        for key in &deps.inherited {
+            if let Some(path) = workspace_paths.get(key)
+                && let Some(next) = normalize_path_dep(&abs_root, "", path)
+            {
+                queue.push(next);
+            }
+        }
+    };
     let mut queue: Vec<String> = Vec::new();
     if root_doc.get("package").is_some() {
-        queue.extend(
-            manifest_path_dependency_dirs(root_doc)
-                .into_iter()
-                .filter_map(|path| normalize_path_dep(&abs_root, "", &path)),
-        );
+        enqueue(&manifest_path_dependency_dirs(root_doc), "", &mut queue);
     }
     if !members.is_empty() {
         for rel in manifest_dirs_under(root_dir) {
@@ -798,11 +813,7 @@ fn path_dependency_closure(
         let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
             continue;
         };
-        for path in manifest_path_dependency_dirs(&doc) {
-            if let Some(next) = normalize_path_dep(&abs_root, &rel, &path) {
-                queue.push(next);
-            }
-        }
+        enqueue(&manifest_path_dependency_dirs(&doc), &rel, &mut queue);
     }
     closure.into_iter().collect()
 }
@@ -918,29 +929,50 @@ fn normalize_path_dep(abs_root: &Path, base: &str, raw: &str) -> Option<String> 
     normalize_in_tree_path(base, &normalized)
 }
 
-/// Extracts the `path = "…"` values from a manifest's dependency tables for
-/// the workspace-membership closure: the three plain tables **and** every
-/// `[target.<cfg>.dependencies]` / `dev-` / `build-` variant — Cargo treats
-/// target-specific path dependencies as automatic workspace members too
-/// (PR #314 review). This feeds membership only; target-specific dependency
-/// ROWS stay out of extraction scope as documented.
-fn manifest_path_dependency_dirs(doc: &toml_edit::DocumentMut) -> Vec<String> {
-    fn collect_paths(table: &dyn toml_edit::TableLike, dirs: &mut Vec<String>) {
-        for (_, item) in table.iter() {
-            if let Some(spec) = item.as_table_like()
-                && let Some(path) = spec.get("path").and_then(|value| value.as_str())
+/// Path-dependency references collected from one manifest for the
+/// workspace-membership closure.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ManifestPathDeps {
+    /// Literal `path = "…"` values, relative to the declaring manifest.
+    literal: Vec<String>,
+    /// Table keys declared `{ workspace = true }`: resolved against the
+    /// workspace root's `[workspace.dependencies]` table, whose `path`
+    /// values are relative to the ROOT manifest's directory (PR #314
+    /// review — Cargo makes inherited path deps automatic members too).
+    inherited: Vec<String>,
+}
+
+/// Extracts the path-dependency references from a manifest's dependency
+/// tables for the workspace-membership closure: the three plain tables
+/// **and** every `[target.<cfg>.dependencies]` / `dev-` / `build-` variant —
+/// Cargo treats target-specific and workspace-inherited path dependencies as
+/// automatic workspace members too (PR #314 review). This feeds membership
+/// only; target-specific dependency ROWS stay out of extraction scope as
+/// documented.
+fn manifest_path_dependency_dirs(doc: &toml_edit::DocumentMut) -> ManifestPathDeps {
+    fn collect_paths(table: &dyn toml_edit::TableLike, deps: &mut ManifestPathDeps) {
+        for (key, item) in table.iter() {
+            let Some(spec) = item.as_table_like() else {
+                continue;
+            };
+            if let Some(path) = spec.get("path").and_then(|value| value.as_str()) {
+                deps.literal.push(path.to_owned());
+            } else if spec
+                .get("workspace")
+                .and_then(toml_edit::Item::as_bool)
+                .unwrap_or(false)
             {
-                dirs.push(path.to_owned());
+                deps.inherited.push(key.to_owned());
             }
         }
     }
-    let mut dirs = Vec::new();
+    let mut deps = ManifestPathDeps::default();
     for kind in DEPENDENCY_KINDS {
         if let Some(table) = doc
             .get(kind.table())
             .and_then(toml_edit::Item::as_table_like)
         {
-            collect_paths(table, &mut dirs);
+            collect_paths(table, &mut deps);
         }
     }
     if let Some(targets) = doc.get("target").and_then(toml_edit::Item::as_table_like) {
@@ -953,12 +985,37 @@ fn manifest_path_dependency_dirs(doc: &toml_edit::DocumentMut) -> Vec<String> {
                     .get(kind.table())
                     .and_then(toml_edit::Item::as_table_like)
                 {
-                    collect_paths(table, &mut dirs);
+                    collect_paths(table, &mut deps);
                 }
             }
         }
     }
-    dirs
+    deps
+}
+
+/// Maps `[workspace.dependencies]` keys to their declared `path` values
+/// (relative to the workspace root). Entries without a `path` never feed
+/// membership, and a path entry no member (nor the root package) ever
+/// inherits is only a template — never enqueued from here; inheritance
+/// drives membership (PR #314 review, Cargo semantics).
+fn workspace_dependency_paths(root_doc: &toml_edit::DocumentMut) -> BTreeMap<String, String> {
+    root_doc
+        .get("workspace")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(toml_edit::Item::as_table_like)
+        .map(|table| {
+            table
+                .iter()
+                .filter_map(|(key, item)| {
+                    item.as_table_like()
+                        .and_then(|spec| spec.get("path"))
+                        .and_then(|value| value.as_str())
+                        .map(|path| (key.to_owned(), path.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Joins a `/`-separated base (relative to the workspace root; `""` for the
@@ -1437,15 +1494,19 @@ version = "2.0.0"
     #[test]
     fn path_dependency_dirs_include_target_specific_tables() {
         // PR #314 review: target-specific path deps are automatic workspace
-        // members, so the membership closure must see their `path` values.
+        // members, so the membership closure must see their `path` values;
+        // `{ workspace = true }` entries are collected as inherited keys to
+        // resolve against the root's `[workspace.dependencies]` table.
         let doc: toml_edit::DocumentMut = r#"[package]
 name = "app"
 
 [dependencies]
 plain = { path = "plain-dir" }
+shared = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 unixdep = { path = "unix-dir" }
+tshared = { workspace = true }
 
 [target.'cfg(windows)'.build-dependencies]
 windep = { path = "win-dir" }
@@ -1454,12 +1515,32 @@ windep = { path = "win-dir" }
         .expect("manifest parses");
         assert_eq!(
             manifest_path_dependency_dirs(&doc),
-            vec![
-                "plain-dir".to_owned(),
-                "unix-dir".to_owned(),
-                "win-dir".to_owned()
-            ]
+            ManifestPathDeps {
+                literal: vec![
+                    "plain-dir".to_owned(),
+                    "unix-dir".to_owned(),
+                    "win-dir".to_owned()
+                ],
+                inherited: vec!["shared".to_owned(), "tshared".to_owned()],
+            }
         );
+    }
+
+    #[test]
+    fn workspace_dependency_paths_map_only_path_entries() {
+        let doc: toml_edit::DocumentMut = r#"[workspace]
+members = ["app"]
+
+[workspace.dependencies]
+helper = { path = "helper" }
+serde = "1"
+tokio = { version = "1", features = ["full"] }
+"#
+        .parse()
+        .expect("manifest parses");
+        let paths = workspace_dependency_paths(&doc);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths.get("helper").map(String::as_str), Some("helper"));
     }
 
     #[test]

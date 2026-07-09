@@ -101,7 +101,11 @@ declared entry (manifest key):
   traversal time — neither it nor packages reachable only through it join).
   Target-specific tables (`[target.<cfg>.dependencies]` and the
   `dev-`/`build-` variants) feed this membership closure too, even though
-  target-specific dependency rows stay out of extraction scope.
+  target-specific dependency rows stay out of extraction scope; so do
+  workspace-inherited entries — a `{ workspace = true }` declaration
+  resolves against the root's `[workspace.dependencies]` `path` (relative
+  to the root), while a template no member ever inherits never becomes a
+  member.
   Absolute `path` values pointing inside the
   workspace root are normalized to root-relative member paths (the root is
   lexically absolutized first, so `eg scan .` with a relative repo path

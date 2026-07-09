@@ -1993,3 +1993,126 @@ fn target_specific_path_dependencies_join_the_workspace() {
         "target-specific dependency rows are not extracted"
     );
 }
+
+/// PR #314 review: a member declaring `helper = { workspace = true }` where
+/// the root's `[workspace.dependencies]` maps `helper` to a `path` makes the
+/// helper an automatic workspace member per Cargo — the closure must resolve
+/// inherited entries against the root table (paths relative to the ROOT).
+/// The root package's own inherited entries count too.
+#[test]
+fn workspace_inherited_path_dependencies_join_the_workspace() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    for dir in ["app/src", "helper/src", "helper2/src", "src"] {
+        fs::create_dir_all(repo.join(dir)).expect("dirs");
+    }
+    // Root is BOTH a workspace root and a package: the member inherits
+    // `helper`, the root package itself inherits `helper2`.
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"root-pkg\"\nversion = \"0.1.0\"\n\n[workspace]\nmembers = [\"app\"]\n\n[workspace.dependencies]\nhelper = { path = \"helper\" }\nhelper2 = { path = \"helper2\" }\n\n[dependencies]\nserde = \"1\"\nhelper2 = { workspace = true }\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(repo.join("src/lib.rs"), "pub fn r() {}\n").expect("lib");
+    fs::write(
+        repo.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\nhelper = { workspace = true }\n",
+    )
+    .expect("app manifest");
+    fs::write(repo.join("app/src/lib.rs"), "pub fn a() {}\n").expect("lib");
+    for (dir, pkg) in [("helper", "helper"), ("helper2", "helper2")] {
+        fs::write(
+            repo.join(dir).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{pkg}\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n"
+            ),
+        )
+        .expect("helper manifest");
+        fs::write(repo.join(dir).join("src/lib.rs"), "pub fn h() {}\n").expect("lib");
+    }
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("inherited-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    let by_pkg = |pkg: &str| {
+        declarations
+            .iter()
+            .find(|d| d["declaring_package"] == pkg)
+            .unwrap_or_else(|| panic!("row for {pkg}"))
+    };
+    assert_eq!(
+        by_pkg("helper")["resolution"],
+        "locked",
+        "a member's workspace-inherited path dependency is an automatic member"
+    );
+    assert_eq!(by_pkg("helper")["resolved_version"], "1.0.228");
+    assert_eq!(
+        by_pkg("helper2")["resolution"],
+        "locked",
+        "the root package's own workspace-inherited path dependency counts too"
+    );
+    assert_eq!(by_pkg("helper2")["resolved_version"], "1.0.228");
+}
+
+/// Pin (Cargo semantics): a `[workspace.dependencies]` path entry that no
+/// member (and not the root package) ever inherits is only a template — it
+/// does NOT make the target directory a workspace member.
+#[test]
+fn uninherited_workspace_dependency_paths_are_not_members() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    for dir in ["app/src", "ghost/src"] {
+        fs::create_dir_all(repo.join(dir)).expect("dirs");
+    }
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\"]\n\n[workspace.dependencies]\nghost = { path = \"ghost\" }\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(
+        repo.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("app manifest");
+    fs::write(repo.join("app/src/lib.rs"), "pub fn a() {}\n").expect("lib");
+    fs::write(
+        repo.join("ghost/Cargo.toml"),
+        "[package]\nname = \"ghost\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("ghost manifest");
+    fs::write(repo.join("ghost/src/lib.rs"), "pub fn g() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("uninherited-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    let ghost = declarations
+        .iter()
+        .find(|d| d["declaring_package"] == "ghost")
+        .expect("ghost row");
+    assert_eq!(
+        ghost["resolution"], "no_lockfile",
+        "an uninherited workspace-dependencies path entry is only a template, never a member"
+    );
+}
