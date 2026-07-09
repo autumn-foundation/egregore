@@ -1928,3 +1928,68 @@ fn independently_reachable_deps_survive_an_excluded_sibling_chain() {
         "the excluded package itself stays out"
     );
 }
+
+/// PR #314 review: Cargo treats target-specific path dependencies
+/// (`[target.'cfg(unix)'.dependencies] helper = { path = "…" }`) as
+/// automatic workspace members too. The membership closure must scan target
+/// tables for `path` entries even though target-specific dependency ROWS
+/// stay out of extraction scope.
+#[test]
+fn target_specific_path_dependencies_join_the_workspace() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("app/src")).expect("dirs");
+    fs::create_dir_all(repo.join("helper/src")).expect("dirs");
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\"]\n",
+    )
+    .expect("root manifest");
+    fs::write(
+        repo.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n",
+    )
+    .expect("root lockfile");
+    fs::write(
+        repo.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n\n[target.'cfg(unix)'.dependencies]\nhelper = { path = \"../helper\" }\n",
+    )
+    .expect("app manifest");
+    fs::write(repo.join("app/src/lib.rs"), "pub fn a() {}\n").expect("lib");
+    fs::write(
+        repo.join("helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .expect("helper manifest");
+    fs::write(repo.join("helper/src/lib.rs"), "pub fn h() {}\n").expect("lib");
+
+    let jsonl = scan_repository_at_with_override(&repo, FIXED_TIME, Some("target-dep-fixture"))
+        .expect("fixture should scan")
+        .to_jsonl()
+        .expect("graph should serialize");
+    let graph = temp.path().join("graph.jsonl");
+    fs::write(&graph, jsonl).expect("write graph");
+
+    let parsed = run_query_deps(&graph, &["--name", "serde"]);
+    let declarations = parsed["declarations"].as_array().expect("declarations");
+    let helper = declarations
+        .iter()
+        .find(|d| d["declaring_package"] == "helper")
+        .expect("helper row");
+    assert_eq!(
+        helper["resolution"], "locked",
+        "a target-specific path dependency is an automatic workspace member"
+    );
+    assert_eq!(helper["resolved_version"], "1.0.228");
+    // Target-specific dependency ROWS stay out of extraction scope: app
+    // declares only its plain-table serde, never a `helper` fact.
+    let all_rows = run_query_deps(&graph, &[]);
+    assert!(
+        !all_rows["declarations"]
+            .as_array()
+            .expect("declarations")
+            .iter()
+            .any(|d| d["declaring_package"] == "app" && d["name"] == "helper"),
+        "target-specific dependency rows are not extracted"
+    );
+}

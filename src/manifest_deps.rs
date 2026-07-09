@@ -918,22 +918,43 @@ fn normalize_path_dep(abs_root: &Path, base: &str, raw: &str) -> Option<String> 
     normalize_in_tree_path(base, &normalized)
 }
 
-/// Extracts the `path = "…"` values from a manifest's three captured
-/// dependency tables.
+/// Extracts the `path = "…"` values from a manifest's dependency tables for
+/// the workspace-membership closure: the three plain tables **and** every
+/// `[target.<cfg>.dependencies]` / `dev-` / `build-` variant — Cargo treats
+/// target-specific path dependencies as automatic workspace members too
+/// (PR #314 review). This feeds membership only; target-specific dependency
+/// ROWS stay out of extraction scope as documented.
 fn manifest_path_dependency_dirs(doc: &toml_edit::DocumentMut) -> Vec<String> {
-    let mut dirs = Vec::new();
-    for kind in DEPENDENCY_KINDS {
-        let Some(table) = doc
-            .get(kind.table())
-            .and_then(toml_edit::Item::as_table_like)
-        else {
-            continue;
-        };
+    fn collect_paths(table: &dyn toml_edit::TableLike, dirs: &mut Vec<String>) {
         for (_, item) in table.iter() {
             if let Some(spec) = item.as_table_like()
                 && let Some(path) = spec.get("path").and_then(|value| value.as_str())
             {
                 dirs.push(path.to_owned());
+            }
+        }
+    }
+    let mut dirs = Vec::new();
+    for kind in DEPENDENCY_KINDS {
+        if let Some(table) = doc
+            .get(kind.table())
+            .and_then(toml_edit::Item::as_table_like)
+        {
+            collect_paths(table, &mut dirs);
+        }
+    }
+    if let Some(targets) = doc.get("target").and_then(toml_edit::Item::as_table_like) {
+        for (_, target) in targets.iter() {
+            let Some(target) = target.as_table_like() else {
+                continue;
+            };
+            for kind in DEPENDENCY_KINDS {
+                if let Some(table) = target
+                    .get(kind.table())
+                    .and_then(toml_edit::Item::as_table_like)
+                {
+                    collect_paths(table, &mut dirs);
+                }
             }
         }
     }
@@ -1411,6 +1432,34 @@ version = "2.0.0"
     #[test]
     fn corrupt_lockfile_fails_parse() {
         assert!(LockfileIndex::parse("not [ valid toml").is_none());
+    }
+
+    #[test]
+    fn path_dependency_dirs_include_target_specific_tables() {
+        // PR #314 review: target-specific path deps are automatic workspace
+        // members, so the membership closure must see their `path` values.
+        let doc: toml_edit::DocumentMut = r#"[package]
+name = "app"
+
+[dependencies]
+plain = { path = "plain-dir" }
+
+[target.'cfg(unix)'.dependencies]
+unixdep = { path = "unix-dir" }
+
+[target.'cfg(windows)'.build-dependencies]
+windep = { path = "win-dir" }
+"#
+        .parse()
+        .expect("manifest parses");
+        assert_eq!(
+            manifest_path_dependency_dirs(&doc),
+            vec![
+                "plain-dir".to_owned(),
+                "unix-dir".to_owned(),
+                "win-dir".to_owned()
+            ]
+        );
     }
 
     #[test]

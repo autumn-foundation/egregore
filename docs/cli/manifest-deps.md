@@ -99,6 +99,9 @@ declared entry (manifest key):
   package and from every glob member, so a virtual root's members contribute
   their path dependencies too, while an excluded directory is pruned at
   traversal time — neither it nor packages reachable only through it join).
+  Target-specific tables (`[target.<cfg>.dependencies]` and the
+  `dev-`/`build-` variants) feed this membership closure too, even though
+  target-specific dependency rows stay out of extraction scope.
   Absolute `path` values pointing inside the
   workspace root are normalized to root-relative member paths (the root is
   lexically absolutized first, so `eg scan .` with a relative repo path
