@@ -675,6 +675,11 @@ fn parse_plain(
 /// enters the graph. Capped at [`MAX_FRAMES`]; extra frames are dropped rather
 /// than stored. Frames never participate in signature identity.
 fn parse_frames(full_text: &str, repo_root: &Path) -> Vec<StackFrame> {
+    // Canonicalize the repository root once per occurrence rather than once per
+    // frame location: a deep backtrace can carry dozens of location lines and
+    // canonicalization is a filesystem syscall.
+    let abs_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let root_str = abs_root.to_string_lossy().replace('\\', "/");
     let mut frames: Vec<StackFrame> = Vec::new();
     for line in full_text.lines() {
         let trimmed = line.trim();
@@ -694,7 +699,7 @@ fn parse_frames(full_text: &str, repo_root: &Path) -> Vec<StackFrame> {
             if let Some(frame) = frames.last_mut()
                 && frame.file_path.is_none()
             {
-                frame.file_path = normalize_frame_path(repo_root, file);
+                frame.file_path = normalize_frame_path(&root_str, file);
                 frame.line = line_no;
             }
         }
@@ -763,10 +768,7 @@ fn redact_frame_text(text: &str) -> Option<String> {
 
 /// Truncates frame text to [`FRAME_TEXT_MAX_CHARS`] characters (char-safe).
 fn truncate_frame_text(s: &str) -> String {
-    if s.chars().count() <= FRAME_TEXT_MAX_CHARS {
-        return s.to_owned();
-    }
-    s.chars().take(FRAME_TEXT_MAX_CHARS).collect()
+    truncate_chars(s, FRAME_TEXT_MAX_CHARS)
 }
 
 /// External-toolchain path anchors. A frame path containing one of these
@@ -789,17 +791,15 @@ const EXTERNAL_PATH_ANCHORS: [&str; 5] =
 ///
 /// The result is always additionally passed through the redaction policy and
 /// length-bounded. Returns `None` for empty input.
-fn normalize_frame_path(repo_root: &Path, raw: &str) -> Option<String> {
+fn normalize_frame_path(root_str: &str, raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
 
     // 1) Under the canonical repository root → repo-relative.
-    let abs_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    let root_str = abs_root.to_string_lossy().replace('\\', "/");
     let raw_fwd = raw.replace('\\', "/");
-    if let Some(stripped) = raw_fwd.strip_prefix(&root_str) {
+    if let Some(stripped) = raw_fwd.strip_prefix(root_str) {
         let rel = stripped.trim_start_matches('/');
         if !rel.is_empty() {
             return Some(truncate_frame_text(&redaction::redact_value(rel)));
@@ -896,10 +896,15 @@ fn fingerprint(message: &str) -> (String, bool) {
 
 /// Truncates an excerpt to [`EXCERPT_MAX_CHARS`] characters (char-safe).
 fn truncate_excerpt(s: &str) -> String {
-    if s.chars().count() <= EXCERPT_MAX_CHARS {
+    truncate_chars(s, EXCERPT_MAX_CHARS)
+}
+
+/// Truncates a string to at most `max` characters (char-boundary safe).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
         return s.to_owned();
     }
-    s.chars().take(EXCERPT_MAX_CHARS).collect()
+    s.chars().take(max).collect()
 }
 
 /// Resolves an optional parsed timestamp into the four temporal fields.
