@@ -94,6 +94,7 @@ pub fn scan_repository_incremental_excluding(
     repo_path: impl AsRef<Path>,
     cache_path: impl AsRef<Path>,
     snapshot_exclusions: &[String],
+    raw_literals: bool,
 ) -> Result<IncrementalScan> {
     let transaction_time = Utc::now().to_rfc3339();
     scan_repository_incremental_at_inner(
@@ -101,6 +102,7 @@ pub fn scan_repository_incremental_excluding(
         cache_path,
         &transaction_time,
         snapshot_exclusions,
+        raw_literals,
     )
 }
 
@@ -115,7 +117,7 @@ pub fn scan_repository_incremental_at(
     cache_path: impl AsRef<Path>,
     transaction_time: &str,
 ) -> Result<IncrementalScan> {
-    scan_repository_incremental_at_inner(repo_path, cache_path, transaction_time, &[])
+    scan_repository_incremental_at_inner(repo_path, cache_path, transaction_time, &[], false)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -124,6 +126,7 @@ fn scan_repository_incremental_at_inner(
     cache_path: impl AsRef<Path>,
     transaction_time: &str,
     snapshot_exclusions: &[String],
+    raw_literals: bool,
 ) -> Result<IncrementalScan> {
     std::sync::LazyLock::force(&PROCESS_STARTED_AT);
     let repo_root = repo_path.as_ref();
@@ -143,7 +146,8 @@ fn scan_repository_incremental_at_inner(
     let mut can_reuse_cache_records = previous_cache.schema_version == CACHE_SCHEMA_VERSION
         && previous_cache.repository_id == repository_id
         && previous_cache.producer_egregore_version == current_producer_identity.egregore_version
-        && previous_cache.producer_components == current_producer_identity.producer_components;
+        && previous_cache.producer_components == current_producer_identity.producer_components
+        && previous_cache.raw_literals == Some(raw_literals);
     if can_reuse_cache_records && previous_cache.validate_record_versions().is_err() {
         can_reuse_cache_records = false;
     }
@@ -152,6 +156,8 @@ fn scan_repository_incremental_at_inner(
     let mut rebuilt_files = Vec::new();
     let mut reused_files = Vec::new();
     let mut seen_files = BTreeSet::new();
+    let mut run_redaction_counts = std::collections::HashMap::new();
+    let mut run_redacted_nodes = 0_usize;
 
     // Stamp the store-level source-snapshot identity (issue #82) on the Repository
     // node, mirroring the full-scan path. Without this, refreshing a stale store
@@ -222,17 +228,43 @@ fn scan_repository_incremental_at_inner(
             reused_files.push(source_file.repo_relative_path.clone());
             // Restamp reused records so valid_time reflects this scan's transaction time,
             // not the prior scan's time when they were first extracted.
-            let records = cached
+            let mut records = cached
                 .records
                 .iter()
                 .cloned()
                 .map(|r| r.with_valid_time_inferred(transaction_time))
                 .collect::<Vec<_>>();
+            if !raw_literals {
+                for record in &mut records {
+                    if let GraphRecord::Node {
+                        kind,
+                        summary,
+                        signature,
+                        doc,
+                        ..
+                    } = record
+                        && crate::redaction::is_code_graph_kind(*kind)
+                    {
+                        let counts = crate::redaction::redact_node_text_fields(
+                            summary,
+                            signature,
+                            doc,
+                            "«redacted:secret»",
+                        );
+                        if !counts.is_empty() {
+                            run_redacted_nodes += 1;
+                            for (class, count) in counts {
+                                *run_redaction_counts.entry(class).or_insert(0) += count;
+                            }
+                        }
+                    }
+                }
+            }
             (records, cached.facts.clone())
         } else {
             rebuilt_files.push(source_file.repo_relative_path.clone());
             let (records, facts) = scan_source_file_records(&source_file, &repository_id)?;
-            let records = records
+            let mut records = records
                 .into_iter()
                 .map(|r| r.with_valid_time_inferred(transaction_time))
                 .collect::<Vec<_>>();
@@ -244,6 +276,32 @@ fn scan_repository_incremental_at_inner(
                     transaction_time,
                 ) {
                     graph.push(tombstone);
+                }
+            }
+            if !raw_literals {
+                for record in &mut records {
+                    if let GraphRecord::Node {
+                        kind,
+                        summary,
+                        signature,
+                        doc,
+                        ..
+                    } = record
+                        && crate::redaction::is_code_graph_kind(*kind)
+                    {
+                        let counts = crate::redaction::redact_node_text_fields(
+                            summary,
+                            signature,
+                            doc,
+                            "«redacted:secret»",
+                        );
+                        if !counts.is_empty() {
+                            run_redacted_nodes += 1;
+                            for (class, count) in counts {
+                                *run_redaction_counts.entry(class).or_insert(0) += count;
+                            }
+                        }
+                    }
                 }
             }
             (records, facts)
@@ -325,7 +383,102 @@ fn scan_repository_incremental_at_inner(
     next_cache.repository_id.clone_from(&repository_id);
     next_cache.producer_egregore_version = current_producer_identity.egregore_version;
     next_cache.producer_components = current_producer_identity.producer_components;
+    next_cache.raw_literals = Some(raw_literals);
     next_cache.save(cache_path.as_ref())?;
+
+    // Evidence lives while masked literals remain in the assembled graph, not
+    // merely while THIS run redacted something new (Codex C8). When every
+    // secret-bearing file is unchanged, its reused cache records already carry
+    // the redaction marker, so `run_redaction_counts` is empty even though the
+    // graph still holds masked literals; tombstoning here would silently erase
+    // the audit evidence on a second `eg refresh`.
+    let (masked_nodes, masked_literals) = graph
+        .records()
+        .iter()
+        .filter_map(|record| match record {
+            GraphRecord::Node {
+                kind,
+                summary,
+                signature,
+                doc,
+                ..
+            } if crate::redaction::is_code_graph_kind(*kind) => {
+                let mut hits = summary.matches(crate::redaction::REDACTION_MARKER).count();
+                if let Some(sig) = signature {
+                    hits += sig.matches(crate::redaction::REDACTION_MARKER).count();
+                }
+                if let Some(d) = doc {
+                    hits += d.matches(crate::redaction::REDACTION_MARKER).count();
+                }
+                (hits > 0).then_some(hits)
+            }
+            _ => None,
+        })
+        .fold((0_usize, 0_usize), |(nodes, literals), hits| {
+            (nodes + 1, literals + hits)
+        });
+
+    if !raw_literals && masked_nodes > 0 {
+        let summary = if run_redaction_counts.is_empty() {
+            // No new redactions this run: the masked literals were carried over
+            // from a prior redaction via reused cache records.
+            format!(
+                "Redaction evidence present: {masked_literals} masked literals across {masked_nodes} nodes carried from a prior redaction."
+            )
+        } else {
+            let total_literals: usize = run_redaction_counts.values().sum();
+            let mut class_details = run_redaction_counts
+                .iter()
+                .map(|(class, count)| format!("{}: {}", class.as_str(), count))
+                .collect::<Vec<_>>();
+            class_details.sort();
+            let class_details_str = class_details.join(", ");
+            format!(
+                "Redacted {total_literals} literals across {run_redacted_nodes} nodes. Detector classes: {class_details_str}"
+            )
+        };
+
+        let diag_id =
+            crate::stable_id(&["node", "diagnostic", "redaction_evidence", &repository_id]);
+        // Stamp valid_time from this refresh's transaction time (Codex C9) so the
+        // diagnostic is temporally placed with the Repository/File/Symbol nodes
+        // emitted earlier in the same refresh batch.
+        let mut diag = GraphRecord::node(
+            diag_id,
+            crate::ir::NodeKind::Diagnostic,
+            None,
+            None,
+            Some("redaction_evidence".to_owned()),
+            summary,
+        )
+        .with_valid_time_inferred(transaction_time);
+
+        if let GraphRecord::Node {
+            redaction_policy_version,
+            ..
+        } = &mut diag
+        {
+            *redaction_policy_version = Some(crate::redaction::REDACTION_POLICY_VERSION.to_owned());
+        }
+
+        graph.push(diag);
+    } else {
+        let diag_id =
+            crate::stable_id(&["node", "diagnostic", "redaction_evidence", &repository_id]);
+        graph.push(GraphRecord::Tombstone {
+            id: crate::stable_id(&[
+                "tombstone",
+                "redaction_evidence",
+                &repository_id,
+                transaction_time,
+            ]),
+            schema_version: crate::ir::SCHEMA_VERSION,
+            deleted_id: diag_id,
+            summary: "Stale redaction evidence removed".to_owned(),
+            producer: None,
+        });
+    }
+
     let languages = crate::languages_in_graph(&graph);
     let mut producer = code_graph_producer(&languages);
     producer.producer_kind = ProducerKind::IncrementalCache;
@@ -361,6 +514,11 @@ struct CacheFile {
     /// reuse so re-stamped records never misreport their producer.
     #[serde(default)]
     producer_components: BTreeMap<String, String>,
+    /// Whether the cache was written with `--raw-literals` (issue #101). A
+    /// mismatch with the current run invalidates reuse so redacted and raw
+    /// record sets never mix.
+    #[serde(default)]
+    raw_literals: Option<bool>,
 }
 
 impl Default for CacheFile {
@@ -372,6 +530,7 @@ impl Default for CacheFile {
             cross_file_record_ids: Vec::new(),
             producer_egregore_version: String::new(),
             producer_components: BTreeMap::new(),
+            raw_literals: None,
         }
     }
 }

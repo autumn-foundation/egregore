@@ -5,9 +5,10 @@ marker grammar used by agent-authored records. It is referenced by producer
 schemas such as [`docs/schema/agent-actions.md`](agent-actions.md), which name
 the concrete fields that must pass through this policy.
 
-Code-graph records are explicitly out of scope for redaction. Source-derived
-facts such as repository paths, symbol names, spans, commits, and topology edges
-remain plaintext by construction.
+Structural facts of code-graph records are reproducible and remain plaintext by
+construction (e.g. repository paths, symbol names, spans, commits, and topology edges).
+However, literal payloads captured into node descriptions (such as the `summary` of
+File and Symbol nodes) and vector embeddings are subject to this secret-masking policy.
 
 One code-graph exception exists for PII (issue #116): `Commit` records carry
 the Git author identity as deterministic VCS-derived facts on the
@@ -80,3 +81,23 @@ Producer schemas own their concrete redacted-field lists. For example,
 `PatchArtifact.validation_summary`, `PatchArtifact.patch_handle.inline`,
 `ToolCall.arguments_summary`, `ToolCall.arguments_handle.inline`, and
 `ToolCall.result_handle.inline`.
+
+## Code Facts Redaction Workflow
+
+By default, egregore scans detect and mask secrets in code facts (such as node summaries/descriptions).
+
+To run the workflow offline against a repository:
+
+1. Scan the repository:
+   ```powershell
+   eg scan <repo-path> --out graph.jsonl
+   ```
+2. Ingest the graph into the AletheiaDB store:
+   ```powershell
+   eg ingest graph.jsonl --adapter embedded --embed
+   ```
+
+To retain raw literals and skip redaction, use the `--raw-literals` command-line flag during the scan:
+```powershell
+eg scan <repo-path> --out graph.jsonl --raw-literals
+```

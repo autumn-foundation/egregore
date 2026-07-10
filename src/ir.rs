@@ -159,6 +159,12 @@ impl Graph {
         }
     }
 
+    /// Creates a graph from a vector of records.
+    #[must_use]
+    pub const fn from_records(records: Vec<GraphRecord>) -> Self {
+        Self { records }
+    }
+
     /// Adds a record to the graph.
     pub fn push(&mut self, record: GraphRecord) {
         self.records.push(record);
@@ -1956,7 +1962,7 @@ impl GraphRecord {
 }
 
 /// Git and bitemporal provenance attached to history-backed records.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
 pub struct TemporalMetadata {
     /// Git commit SHA that supplied the valid-time source tree.
     pub git_commit: String,

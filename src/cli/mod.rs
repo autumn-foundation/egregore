@@ -193,6 +193,9 @@ pub(crate) enum Commands {
         /// tests or when the auto-detected remote is wrong (e.g. a mirror).
         #[arg(long)]
         repo_id_override: Option<String>,
+        /// Keep source-embedded secrets in raw form instead of redacting them.
+        #[arg(long)]
+        raw_literals: bool,
     },
     /// Replay Git history and write temporal graph JSONL.
     ScanHistory {
@@ -207,6 +210,9 @@ pub(crate) enum Commands {
         /// tests or when the auto-detected remote is wrong (e.g. a mirror).
         #[arg(long)]
         repo_id_override: Option<String>,
+        /// Keep source-embedded secrets in raw form instead of redacting them.
+        #[arg(long)]
+        raw_literals: bool,
     },
     /// Incrementally refresh an ingested store from working-tree edits.
     ///
@@ -247,6 +253,9 @@ pub(crate) enum Commands {
         #[cfg(feature = "embeddings")]
         #[arg(long)]
         embed: bool,
+        /// Keep source-embedded secrets in raw form instead of redacting them.
+        #[arg(long)]
+        raw_literals: bool,
     },
     /// Inspect a graph JSONL file, an embedded store, or a running daemon.
     ///
@@ -2724,12 +2733,14 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             repo_path,
             out,
             repo_id_override,
-        } => scan(&repo_path, &out, repo_id_override.as_deref()),
+            raw_literals,
+        } => scan(&repo_path, &out, repo_id_override.as_deref(), raw_literals),
         Commands::ScanHistory {
             repo_path,
             out,
             repo_id_override,
-        } => scan_history(&repo_path, &out, repo_id_override.as_deref()),
+            raw_literals,
+        } => scan_history(&repo_path, &out, repo_id_override.as_deref(), raw_literals),
         Commands::Inspect {
             graph,
             #[cfg(feature = "embedded-aletheiadb")]
@@ -2919,6 +2930,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             format,
             #[cfg(feature = "embeddings")]
             embed,
+            raw_literals,
         } => scan_refresh_cmd(
             &repo_path,
             &data_dir,
@@ -2926,6 +2938,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<()> {
             format,
             #[cfg(feature = "embeddings")]
             embed,
+            raw_literals,
         ),
         #[cfg(feature = "embedded-aletheiadb")]
         Commands::Watch {
