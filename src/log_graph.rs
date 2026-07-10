@@ -283,7 +283,7 @@ pub fn scan_log_records(
         )
         .with_domain("log", LOG_SCHEMA_VERSION)
         .with_log(LogPayload::LogSource(LogSourcePayload {
-            source_relative_path: source_relative_path.clone(),
+            source_relative_path,
             source_format_version: source_format_version.to_owned(),
             source_artifact_hash,
             line_count,
@@ -313,20 +313,21 @@ pub fn scan_log_records(
         let excerpt = truncate_excerpt(template);
         let first_seen = occs
             .iter()
-            .map(|o| o.valid_time.clone())
+            .map(|o| o.valid_time.as_str())
             .min()
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_owned();
         let last_seen = occs
             .iter()
-            .map(|o| o.valid_time.clone())
+            .map(|o| o.valid_time.as_str())
             .max()
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_owned();
         // Valid time of the signature = its earliest occurrence.
-        let first_occ = occs
+        let sig_valid_time_source = occs
             .iter()
             .min_by(|a, b| a.valid_time.cmp(&b.valid_time))
-            .expect("signature has at least one occurrence");
-        let sig_valid_time_source = first_occ.valid_time_source;
+            .map_or(VALID_TIME_SOURCE_INFERRED, |occ| occ.valid_time_source);
 
         let mut sig_node = GraphRecord::node(
             signature_id.clone(),
@@ -706,27 +707,30 @@ fn resolve_time(
     transaction_time: &str,
     tx_bucket: &str,
 ) -> (String, &'static str, String, bool) {
-    match parsed {
-        Some(dt) => {
+    parsed.map_or_else(
+        || {
+            (
+                transaction_time.to_owned(),
+                VALID_TIME_SOURCE_INFERRED,
+                tx_bucket.to_owned(),
+                false,
+            )
+        },
+        |dt| {
             let valid_time = dt.to_rfc3339_opts(SecondsFormat::Secs, true);
             let bucket_start = floor_datetime(dt).to_rfc3339_opts(SecondsFormat::Secs, true);
             (valid_time, VALID_TIME_SOURCE_EVENT, bucket_start, true)
-        }
-        None => (
-            transaction_time.to_owned(),
-            VALID_TIME_SOURCE_INFERRED,
-            tx_bucket.to_owned(),
-            false,
-        ),
-    }
+        },
+    )
 }
 
 /// Floors a UTC datetime to the top of its hour.
 fn floor_datetime(dt: DateTime<Utc>) -> DateTime<Utc> {
     dt.date_naive()
         .and_hms_opt(dt.hour(), 0, 0)
-        .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
-        .unwrap_or(dt)
+        .map_or(dt, |naive| {
+            DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
+        })
 }
 
 /// Parses a leading timestamp from a log line header, returning UTC.
@@ -788,8 +792,7 @@ fn repo_relative_path(repo_root: &Path, log_path: &Path) -> String {
     if joined.is_empty() {
         log_path
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "log".to_owned())
+            .map_or_else(|| "log".to_owned(), |n| n.to_string_lossy().into_owned())
     } else {
         joined
     }

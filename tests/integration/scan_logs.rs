@@ -27,16 +27,17 @@ fn egregore() -> Command {
 /// - interleaved INFO/DEBUG noise,
 /// - a distinct WARN shape.
 fn plain_log() -> String {
+    use std::fmt::Write as _;
     let mut s = String::new();
     for i in 0..1000 {
         // Same error shape, only volatile fields vary: minute rolls, PID, UUID,
         // and pointer differ every line but normalize identically.
         let minute = i % 60;
         let pid = 1000 + i;
-        s.push_str(&format!(
-            "2026-01-02T03:{minute:02}:00Z [ERROR] request {:08x}-e29b-41d4-a716-446655440000 failed at 0x{:08x} pid={pid}\n",
-            i, i,
-        ));
+        let _ = writeln!(
+            s,
+            "2026-01-02T03:{minute:02}:00Z [ERROR] request {i:08x}-e29b-41d4-a716-446655440000 failed at 0x{i:08x} pid={pid}",
+        );
         if i % 100 == 0 {
             s.push_str("2026-01-02T03:00:01Z INFO steady state ok\n");
             s.push_str("2026-01-02T03:00:02Z DEBUG cache warm\n");

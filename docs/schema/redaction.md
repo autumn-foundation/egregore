@@ -33,6 +33,13 @@ Coordination: [`docs/schema/user-context.md`](user-context.md) reserves
 `PromotionDecision.decision_rationale`, `PromotionDecision.edited_rule_text`,
 `Preference.rule_text`, `WorkflowRule.rule_text`, `WorkflowRule.action_summary`,
 and `Constraint.constraint_text` as user-context redaction fields.
+Coordination: [`docs/schema/log-graph.md`](log-graph.md) reserves the
+log-signature excerpt fields that pass through this policy before persistence:
+`ErrorSignature.template_excerpt`, `LogEvent.event_excerpt`, and (reserved for
+#322/#323) resolved backtrace-frame text. `scan-logs` applies the policy to the
+normalized `template-v1` fingerprint, so a secret never enters the fingerprint
+hash preimage; excerpts are additionally bounded to 200 characters. A log record
+whose excerpt carries a redaction marker sets `redaction_policy_version`.
 
 ## Secret Classes
 

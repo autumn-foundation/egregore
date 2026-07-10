@@ -15,12 +15,24 @@ Primary commands:
 ```powershell
 cargo run -- scan . --out graph.jsonl
 cargo run -- scan-history . --out history.graph.jsonl
+cargo run -- scan-logs app.log --repo-path . --out log.graph.jsonl
 cargo run -- inspect graph.jsonl
 cargo run -- ingest graph.jsonl --adapter dry-run
 cargo run -- ingest history.graph.jsonl --adapter embedded --data-dir .egregore
 cargo run -- inspect --data-dir .egregore
 cargo run -- query semantic-memory "parser edge case on empty input" --data-dir .egregore
 ```
+
+`eg scan-logs <log> --repo-path <repo>` extracts runtime log signatures from one
+captured log file (issues #319/#320): a `LogSource`, one `ErrorSignature` per
+`template-v1` fingerprint (a 1000×-repeated error collapses to one signature with
+`occurrence_count` == the raw count), capped `LogEvent` exemplars, and hourly
+`LogOccurrenceBucket` counts. Trust class `runtime_observation` — a program's own
+claim, deterministically parsed but never verified. Raw log text never enters the
+graph; excerpts are `template-v1`-normalized, redacted, and bounded. Deterministic
+and byte-stable; CRLF and LF checkouts yield identical IDs. Unrecognized
+(binary/non-UTF-8) input exits 1 with a machine-readable diagnostic and no partial
+output. See `docs/cli/scan-logs.md` and `docs/schema/log-graph.md`.
 
 `eg inspect --data-dir` inspects an embedded store directly — no daemon, no
 network, no embeddings (issue #125, the daemon-free analog of #47). It reports

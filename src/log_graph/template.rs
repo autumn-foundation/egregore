@@ -60,7 +60,7 @@ fn match_any(chars: &[char], i: usize) -> Option<(&'static str, usize)> {
 
 // ── boundary helpers ─────────────────────────────────────────────────────────
 
-fn is_word(c: char) -> bool {
+const fn is_word(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
@@ -411,11 +411,11 @@ fn match_path(chars: &[char], i: usize) -> Option<usize> {
     Some(j)
 }
 
-fn is_path_segment_char(c: char) -> bool {
+const fn is_path_segment_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_')
 }
 
-fn is_path_char(c: char) -> bool {
+const fn is_path_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '\\' | '/' | '.' | '-' | '_')
 }
 

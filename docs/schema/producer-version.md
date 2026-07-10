@@ -91,6 +91,7 @@ top-level `producer` field. The value is a single embedded `Producer` object
 | `observation_writer` | `ObservationWriter` | Agent-memory observation writer. |
 | `task_writer` | `TaskWriter` | Project / task writer. |
 | `drift_engine` | `DriftEngine` | Semantic drift engine. |
+| `log_importer` | `LogImporter` | `scan-logs` log-signature importer (issues #319/#320). |
 | `other` | `Other` | Any producer not enumerated above. |
 
 Adding a new `producer_kind` is **additive** (no schema version bump required).
@@ -122,6 +123,7 @@ version bump.
 | `traj_importer` | `importer_schema_version`, `source_format_version` |
 | `codex_importer` | `importer_schema_version`, `source_format_version` |
 | `claude_code_importer` | `importer_schema_version`, `source_format_version` |
+| `log_importer` | `importer_schema_version`, `source_format_version` (`plain-v1`/`jsonl-v1`), `fingerprint_algorithm` (`template-v1`) |
 
 The `code_graph_extractor` example:
 ```json

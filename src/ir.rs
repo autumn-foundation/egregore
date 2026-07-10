@@ -1233,6 +1233,7 @@ impl GraphRecord {
 
     /// Creates a graph node record.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub const fn node(
         id: String,
         kind: NodeKind,
@@ -1346,6 +1347,7 @@ impl GraphRecord {
 
     /// Creates a syntax-backed node record with language metadata.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn syntax_node(
         id: String,
         kind: NodeKind,
@@ -1460,6 +1462,7 @@ impl GraphRecord {
 
     /// Creates a syntax-backed symbol record.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn symbol(
         id: String,
         symbol_kind: &str,
@@ -1576,7 +1579,7 @@ impl GraphRecord {
     /// Prefer this over [`Self::symbol`] when the language and source-order
     /// disambiguator are known at construction time.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn syntax_symbol(
         id: String,
         symbol_kind: &str,
