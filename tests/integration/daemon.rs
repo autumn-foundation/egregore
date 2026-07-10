@@ -2980,6 +2980,28 @@ fn project_task_json_with_source_kind(
     })
 }
 
+fn project_review_json(id: &str, source_kind: &str) -> serde_json::Value {
+    // Issue #334: a GitHub-imported Review node. The daemon REVIEWS_COMMIT
+    // validator requires source_kind == "github_review".
+    serde_json::json!({
+        "record_type": "node",
+        "id": id,
+        "kind": "Review",
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "domain": "project",
+        "entity_id": id,
+        "review_kind": "pr_review",
+        "review_state": "approved",
+        "author": "octocat",
+        "source_kind": source_kind,
+        "review_commit_sha": "deadbeef",
+        "valid_time": "2026-05-18T05:49:32Z",
+        "valid_time_source": "github_updated_at",
+        "transaction_time": "2026-07-10T00:00:00Z",
+        "summary": "pr_review on #14"
+    })
+}
+
 fn project_acceptance_criterion_json(
     id: &str,
     parent_task_id: &str,
@@ -4355,6 +4377,7 @@ fn all_edge_labels_have_documented_schema() {
         | EdgeLabel::ExternalHandle
         | EdgeLabel::TouchesFile
         | EdgeLabel::MergedAs
+        | EdgeLabel::ReviewsCommit
         | EdgeLabel::FailedOn
         | EdgeLabel::ExplainsChange
         | EdgeLabel::ReferencesTask
@@ -7017,6 +7040,165 @@ fn project_merged_as_rejects_non_github_pr_source() {
                 if id == "project:v1:merged-as-non-pr-task-to-commit"
         )),
         "the rejected MERGED_AS edge must not be persisted"
+    );
+}
+
+// Issue #334: the importer emits REVIEWS_COMMIT as a project:v1: edge
+// (Review->Commit). The daemon project-edge validator must accept and persist
+// the project-domain shape (the review-side mirror of MERGED_AS).
+#[test]
+fn project_reviews_commit_review_to_commit_edge_is_accepted() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let commit_id = "codegraph:v5:reviews-commit-commit";
+    let seed_commit = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "seed-reviews-commit",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "seed-reviews-commit-key",
+            "domain": "codegraph",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": {"records": [codegraph_commit_json(commit_id)]}
+        }),
+    );
+    assert!(
+        seed_commit.starts_with("HTTP/1.1 200"),
+        "codegraph Commit fixture should ingest, got {seed_commit}"
+    );
+
+    let review_id = "project:v1:test-review";
+    let reviews_commit_edge = serde_json::json!({
+        "record_type": "edge",
+        "id": "project:v1:reviews-commit-review-to-commit",
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "label": "REVIEWS_COMMIT",
+        "source": review_id,
+        "target": commit_id,
+        "summary": "review anchored to commit"
+    });
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-reviews-commit-edge",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-reviews-commit-edge-key",
+            "domain": "project",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": {
+                "records": [
+                    project_review_json(review_id, "github_review"),
+                    reviews_commit_edge
+                ]
+            }
+        }),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "project-domain REVIEWS_COMMIT Review→Commit edge should be accepted, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let records = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        records.iter().any(|record| matches!(
+            record,
+            GraphRecord::Edge { label: EdgeLabel::ReviewsCommit, id, .. } if id.starts_with("project:v1:")
+        )),
+        "the project-domain REVIEWS_COMMIT edge should be persisted"
+    );
+}
+
+// Issue #334 (contract #3): the daemon project-edge validator must reject a
+// REVIEWS_COMMIT edge whose source Review node is not stamped
+// source_kind github_review, mirroring MERGED_AS's github_pr rigor — so a
+// forged non-importer node can never be persisted as having reviewed a commit.
+#[test]
+fn project_reviews_commit_rejects_non_github_review_source() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let commit_id = "codegraph:v5:reviews-commit-bad-source-commit";
+    let seed_commit = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "seed-reviews-commit-bad-source",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "seed-reviews-commit-bad-source-key",
+            "domain": "codegraph",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": {"records": [codegraph_commit_json(commit_id)]}
+        }),
+    );
+    assert!(
+        seed_commit.starts_with("HTTP/1.1 200"),
+        "codegraph Commit fixture should ingest, got {seed_commit}"
+    );
+
+    let review_id = "project:v1:test-review-bad-source";
+    let reviews_commit_edge = serde_json::json!({
+        "record_type": "edge",
+        "id": "project:v1:reviews-commit-bad-source-edge",
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "label": "REVIEWS_COMMIT",
+        "source": review_id,
+        "target": commit_id,
+        "summary": "forged review claims a commit"
+    });
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-reviews-commit-bad-source-edge",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-reviews-commit-bad-source-edge-key",
+            "domain": "project",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": {
+                "records": [
+                    // source_kind local_jsonl — NOT an importer-stamped Review.
+                    project_review_json(review_id, "local_jsonl"),
+                    reviews_commit_edge
+                ]
+            }
+        }),
+    );
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "REVIEWS_COMMIT from a non-github_review source should be rejected, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let records = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        !records.iter().any(|record| matches!(
+            record,
+            GraphRecord::Edge { label: EdgeLabel::ReviewsCommit, id, .. }
+                if id == "project:v1:reviews-commit-bad-source-edge"
+        )),
+        "the rejected REVIEWS_COMMIT edge must not be persisted"
     );
 }
 

@@ -29,7 +29,19 @@ use crate::github::{model, records::CommitIndex};
 /// simply treated as "no known prior artifact" (which safely emits no
 /// tombstone). A bump would discard every cached `ETag`/hash and force a heavy
 /// full refetch for zero benefit — the additive field needs no forced refresh.
-pub const STATE_SCHEMA_VERSION: u32 = 2;
+///
+/// Bumped 2 → 3 for issue #334 (the review-side mirror of #333): the importer
+/// began emitting a new first-class `review_commit_sha` `Review` field and
+/// `REVIEWS_COMMIT` anchor edges/diagnostics, but a pre-#334 state file's cached
+/// review-endpoint `ETags` (`/pulls/comments`, `/pulls/{n}/reviews`) would return
+/// HTTP 304 and skip re-emission, silently suppressing the new contract for
+/// unchanged reviews. A version mismatch discards the stale state, forcing
+/// exactly ONE full refresh that re-emits reviews with the anchor field; the
+/// version-3 state written afterward keeps subsequent unchanged re-imports
+/// idempotent. The additive `review_commit_artifacts` field itself is
+/// `#[serde(default)]` and needs no bump — the bump is for the changed emitted
+/// per-resource contract, exactly as #333 bumped 1 → 2.
+pub const STATE_SCHEMA_VERSION: u32 = 3;
 
 /// Per-endpoint update watermarks (inclusive `>=` selection, §5).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -86,6 +98,22 @@ pub struct State {
     /// "no known artifact", which safely emits no tombstone.
     #[serde(default)]
     pub pr_merge_artifacts: BTreeMap<String, String>,
+    /// Maps a review resource key (`"pr_review:<n>:<id>"` or
+    /// `"pr_review_comment:<id>"`) to the record ID of the last-emitted
+    /// `REVIEWS_COMMIT` anchor artifact — the edge ID on a unique resolution, or
+    /// the `github_commit_unresolved` / `github_review_unanchored` Diagnostic ID
+    /// otherwise (issue #334, the review-side mirror of `pr_merge_artifacts`).
+    ///
+    /// Persisting the prior artifact id lets a changed re-import retract the
+    /// superseded record via a `Tombstone` (`deleted_id`) before emitting the
+    /// current one, so a persistent store never surfaces stale + fresh
+    /// review-anchor evidence simultaneously. The full record id (not a lossy
+    /// marker) is stored so a changed `commit_id` under a still-unresolved
+    /// outcome still retracts the diagnostic keyed on the OLD sha. A
+    /// `#[serde(default)]` empty map means legacy state loads as "no known
+    /// artifact" (safely emits no tombstone).
+    #[serde(default)]
+    pub review_commit_artifacts: BTreeMap<String, String>,
     /// Fingerprint of the seeded code graph relevant to PR merge-link resolution
     /// (issue #333, Codex round-5). PR merge-link resolution depends on the local
     /// seed graph, which GitHub's `/pulls` `ETag` cannot see; this gates the
@@ -112,6 +140,7 @@ impl State {
             label_list_hash: None,
             resource_hashes: BTreeMap::new(),
             pr_merge_artifacts: BTreeMap::new(),
+            review_commit_artifacts: BTreeMap::new(),
             code_graph_fingerprint: None,
         }
     }
@@ -189,6 +218,28 @@ impl State {
             }
         }
     }
+
+    /// Returns the record ID of the review-anchor artifact last emitted for
+    /// `key`, or `None` when no artifact is tracked (issue #334).
+    #[must_use]
+    pub fn prior_review_artifact(&self, key: &str) -> Option<&str> {
+        self.review_commit_artifacts.get(key).map(String::as_str)
+    }
+
+    /// Records (`Some`) or clears (`None`) the review-anchor artifact id
+    /// currently emitted for `key`. `None` means the review emits no anchor
+    /// artifact (exempt `issue_comment`, or no seed graph), so no stale record
+    /// can exist to retract on a later change (issue #334).
+    pub fn set_review_artifact(&mut self, key: String, artifact_id: Option<String>) {
+        match artifact_id {
+            Some(id) => {
+                self.review_commit_artifacts.insert(key, id);
+            }
+            None => {
+                self.review_commit_artifacts.remove(&key);
+            }
+        }
+    }
 }
 
 /// Computes the content hash of an issue's emission-affecting key fields (§5).
@@ -249,6 +300,23 @@ pub fn pull_hash(pr: &model::PullRequest, merge_link_marker: &str) -> String {
         "merge_link": merge_link_marker,
     });
     blake3::hash(serde_json::to_string(&key).unwrap_or_default().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// Folds a review's `REVIEWS_COMMIT` resolution marker into its raw-payload
+/// hash (issue #334, the review-side analog of [`pull_hash`]'s `merge_link`
+/// fold).
+///
+/// `payload_hash` is the review item's raw-JSON content hash; `review_marker`
+/// is [`crate::github::records::review_commit_marker`]'s outcome against the
+/// seeded code graph. Folding the marker in means a changed seed graph that now
+/// resolves (or stops resolving) a review's `commit_id` re-emits the anchor
+/// artifact even when the review payload is byte-identical, while an unchanged
+/// seed keeps re-imports idempotent.
+#[must_use]
+pub fn review_hash(payload_hash: &str, review_marker: &str) -> String {
+    blake3::hash(format!("{payload_hash}\u{1}{review_marker}").as_bytes())
         .to_hex()
         .to_string()
 }
@@ -573,5 +641,85 @@ mod tests {
             pull_hash(&p, "resolved:codegraph:v5:commit-0"),
             "an unchanged marker keeps the hash stable (AC8)"
         );
+    }
+
+    #[test]
+    fn review_hash_changes_when_review_marker_changes() {
+        // Issue #334: an unchanged review payload against a seed graph that newly
+        // resolves its commit_id must produce a different change hash so the
+        // REVIEWS_COMMIT anchor is re-emitted; an unchanged marker stays stable.
+        let payload = "payload-hash-abc";
+        let unseeded = review_hash(payload, "none");
+        let resolved = review_hash(payload, "resolved:codegraph:v5:commit-a");
+        assert_ne!(
+            unseeded, resolved,
+            "a changed review-anchor resolution outcome must change the hash"
+        );
+        assert_eq!(
+            resolved,
+            review_hash(payload, "resolved:codegraph:v5:commit-a"),
+            "an unchanged marker keeps the hash stable (idempotency)"
+        );
+    }
+
+    #[test]
+    fn set_and_read_prior_review_artifact_roundtrips() {
+        let mut s = State::fresh("o/r", "x");
+        assert_eq!(s.prior_review_artifact("pr_review:3:7"), None);
+        s.set_review_artifact(
+            "pr_review:3:7".to_owned(),
+            Some("project:v1:edge-r".to_owned()),
+        );
+        assert_eq!(
+            s.prior_review_artifact("pr_review:3:7"),
+            Some("project:v1:edge-r")
+        );
+        s.set_review_artifact("pr_review:3:7".to_owned(), None);
+        assert_eq!(s.prior_review_artifact("pr_review:3:7"), None);
+    }
+
+    #[test]
+    fn legacy_state_without_review_commit_artifacts_loads_empty() {
+        // A version-3 state file lacking `review_commit_artifacts` (the additive
+        // #[serde(default)] field) must load with an empty map rather than fail.
+        let dir = std::env::temp_dir().join(format!("egst-legacy-rca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"schema_version":{STATE_SCHEMA_VERSION},"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"resource_hashes":{{"pr_review:3:7":"abc"}}}}"#
+            ),
+        )
+        .unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert!(
+            s.review_commit_artifacts.is_empty(),
+            "missing review_commit_artifacts loads as an empty map"
+        );
+        assert_eq!(s.prior_review_artifact("pr_review:3:7"), None);
+        assert!(s.is_unchanged("pr_review:3:7", "abc"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_discards_pre_334_state_version() {
+        // A pre-#334 (version-2) state file must be discarded so the #334 review
+        // contract forces exactly one full refresh, mirroring the #333 1→2 bump.
+        let dir = std::env::temp_dir().join(format!("egst-pre334-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":2,"source_repo":"o/r","api_base_url":"x","last_run_at_unix_ms":0,"resource_hashes":{"pr_review:3:7":"abc"}}"#,
+        )
+        .unwrap();
+        let s = State::load_or_fresh(&path, "o/r", "x");
+        assert_eq!(s.schema_version, STATE_SCHEMA_VERSION);
+        assert!(
+            !s.is_unchanged("pr_review:3:7", "abc"),
+            "stale version-2 state is discarded, forcing a review refresh"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

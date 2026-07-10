@@ -345,6 +345,17 @@ The refresh writes a current-version state, so a subsequent unchanged re-import
 is idempotent again (emits zero per-resource records). This is strictly a
 state-cache migration; it never backfills already-persisted AletheiaDB stores.
 
+Issue #334 bumps `STATE_SCHEMA_VERSION` again (`2 → 3`) for the same reason on the
+review side: reviews began emitting a new `review_commit_sha` field and
+`REVIEWS_COMMIT` edge, and a pre-#334 cached review-endpoint ETag
+(`/pulls/comments`, `/pulls/{n}/reviews`) would otherwise 304 and suppress the new
+contract for unchanged reviews. The additive `review_commit_artifacts` state map
+is itself `#[serde(default)]` and needs no bump; the bump is purely for the changed
+emitted contract, and the commit-anchored review endpoints are additionally gated on
+the same `code_graph_fingerprint` as `/pulls` so a later-added code graph still
+re-resolves review anchors in steady state (not only across the one-time
+migration).
+
 ---
 
 ## 6 - GitHub-to-Record-Shape Mapping
@@ -464,8 +475,62 @@ old-SHA diagnostic case retracts correctly; the `pr_merge_artifacts` field is
 `#[serde(default)]`, so legacy state files load without a state-schema bump (an
 absent prior is treated as "no known artifact" and emits no tombstone).
 
+**`review_commit_sha` field + `REVIEWS_COMMIT` edge (issue #334):** the review-side
+mirror of `MERGED_AS`. Every `pr_review` and `pr_review_comment` `Review` record
+carries an optional flat `review_commit_sha` field sourced from the GitHub
+payload's `commit_id` — the exact commit the reviewer looked at. Unlike a PR's
+`merge_commit_sha` (which may be a throwaway *test-merge* SHA and is therefore
+gated on `merged_at`), a review's `commit_id` is a real observed commit, so
+`review_commit_sha` is populated **whenever the payload carries `commit_id`, with
+no gate**. `issue_comment` reviews are general PR-conversation comments with no
+commit anchor: they are **exempt** — `review_commit_sha` stays absent and no
+`REVIEWS_COMMIT` edge or unanchored diagnostic is ever emitted for them.
+
+| Label | FROM | TO | Meaning |
+|-------|------|----|---------|
+| `REVIEWS_COMMIT` | `project.Review` (`source_kind: github_review`) | `codegraph.Commit` | The review was anchored to (looked at) this specific commit. |
+
+Resolution is **resolve-or-diagnose** against a seeded `--code-graph`, with three
+outcomes for a commit-anchored review: (1) `commit_id` matching **exactly one**
+`Commit` (whose `name` equals the SHA) emits one `REVIEWS_COMMIT` edge; (2)
+`commit_id` present but matching **zero or multiple** `Commit`s emits a project
+`Diagnostic` node with code `github_commit_unresolved` carrying the SHA and the
+Review record ID — never a guessed link; (3) `commit_id` **genuinely absent** on a
+commit-anchored review emits a distinct `github_review_unanchored` diagnostic
+(diagnose the gap; never fabricate a SHA). Both diagnostic IDs are **repo-scoped**
+(they key on the already-repo-scoped Review record ID, which embeds `source_repo`),
+so a shared multi-repo store never collides review-anchor diagnostics across
+repositories (contract mirrors `github_commit_unresolved` for `MERGED_AS`). Without
+a seeded `--code-graph`, `review_commit_sha` is still populated but no
+`REVIEWS_COMMIT` edges and no diagnostics are produced. `REVIEWS_COMMIT` is a
+project-only, evidence-class edge label: it is rejected on `agent_memory:v1:`
+edges, exactly like `MERGED_AS`. The edge itself is a **project-domain edge**: its
+own record ID carries the `project:v1:` prefix and `PROJECT_SCHEMA_VERSION`, so the
+daemon project-edge validator sees it (and requires the FROM `Review` node's
+`source_kind` to be `github_review`, the review-side analog of `MERGED_AS`'s
+`github_pr` gate); its `Commit` *target* stays a `codegraph:` node. "Anchored at
+this SHA" is **not** "approved all changes in a range": the edge names the tree the
+review observed, never a verdict on it. Only the `(Review, Commit, REVIEWS_COMMIT)`
+triple identifies the edge, so output stays byte-identical across runs.
+
+The review-anchor resolution outcome is folded into each review's change-detection
+hash and the commit-anchored review endpoints (`/pulls/comments`,
+`/pulls/{n}/reviews`) are gated on the same seed-graph fingerprint as `/pulls`, so
+a code graph added or changed after the reviews were first imported re-resolves and
+re-emits the anchor even across a would-be `304`; an unchanged seed keeps re-imports
+idempotent. Superseded review-anchor artifacts are retracted via a project-domain
+`Tombstone` exactly as for `MERGED_AS` (prior artifact IDs stored per review in
+`review_commit_artifacts`, an additive `#[serde(default)]` state field), and the
+generic revive-after-tombstone rule covers a resolved → superseded → resolved cycle.
+Because reviews now emit a new field + edge that a cached review `ETag` could hide,
+the state-schema version is bumped (see §5 idempotency), forcing exactly one full
+refresh on the first upgraded run.
+
 **`valid_time_source`:** All GitHub-sourced records use `github_updated_at`.
-**`source_kind`:** Issues use `github_issue`; PRs use `github_pr`.
+**`source_kind`:** Issues use `github_issue`; PRs use `github_pr`; every `Review`
+node (issue_comment / pr_review / pr_review_comment) uses `github_review` — the
+daemon `REVIEWS_COMMIT` project-edge validator requires this exact source kind on
+the FROM node (issue #334).
 
 ---
 
@@ -491,6 +556,12 @@ A "thread" is the transitive closure of `Review` records connected by
   records that point TO this `Task`). Group the resulting `Review` records with
   `review_kind: "pr_review_comment"` by the `in_reply_to_id` chain to reconstruct
   threads. Resolution state is not stored in v1.
+- **Commit anchoring (issue #334):** each `pr_review` and `pr_review_comment`
+  `Review` carries `review_commit_sha` (the payload `commit_id` — the exact commit
+  reviewed) and, when a seeded `--code-graph` resolves that SHA, a `REVIEWS_COMMIT`
+  edge to the `codegraph.Commit`. `issue_comment` reviews are exempt (no anchor).
+  A review's anchor SHA commonly differs from the PR head SHA after a force-push;
+  the anchor names the tree the reviewer actually saw, never a range verdict.
 
 ---
 
@@ -513,7 +584,8 @@ These GitHub fields pass through the redaction pipeline defined in
 **Plaintext fields (queryable, never redacted):**
 
 Repo name, issue/PR number, state, author login, `created_at`, `updated_at`,
-`closed_at`, merge commit SHA, head/base branch names.
+`closed_at`, merge commit SHA, head/base branch names, review anchor commit SHA
+(`Review.review_commit_sha`, issue #334).
 
 **First-class plaintext PR `Task` fields (issue #333):** The six promoted flat
 `Task` fields — `head_sha`, `head_ref`, `base_ref`, `merge_commit_sha`,
@@ -524,6 +596,14 @@ redaction gate unchanged: a commit SHA, branch name, merge timestamp, or draft
 flag is non-secret structural metadata that must remain joinable and citable.
 They survive verbatim in a redaction-on export. Downstream consumers #334
 (compliance/evidence) and #338 rely on this plaintext guarantee.
+
+**First-class plaintext `Review.review_commit_sha` (issue #334):** The review
+anchor SHA on `pr_review` / `pr_review_comment` `Review` records is a commit SHA —
+non-secret structural metadata — and inherits the same §8 plaintext-SHA carve-out
+as the #333 PR fields above: it is **deliberately NOT routed through redaction**,
+is not listed in the sensitive-field index (`docs/schema/redaction.md`), and
+survives verbatim in a redaction-on export so review→commit anchors stay joinable
+and citable. `review_side` (LEFT/RIGHT) shares this treatment.
 
 **Redacted body-stored metadata:** Milestone title (`Task.body_handle` field) is
 NOT in the plaintext carve-out. `Task.body_handle.inline` is a redactable field
@@ -602,6 +682,10 @@ The test suite covers:
 | Auth-missing run (token + 404) | Exits with `github_repo_not_found`; no partial state file |
 | Token in body | `ghp_`/`github_pat_` strings absent from `Task.body_handle.inline`; `<REDACTED:api_token:hash>` present |
 | PR review thread | Three `Review` records; incoming `REFERENCES_TASK` traversal from Task; `in_reply_to_id` chain |
+| Review commit anchor (issue #334) | `pr_review`/`pr_review_comment` carry `review_commit_sha` from `commit_id`; a seeded `--code-graph` resolving the SHA emits one `REVIEWS_COMMIT` `project.Review → codegraph.Commit` edge (`project:v1:` id) |
+| Review anchor resolve-or-diagnose (issue #334) | Zero/multiple `Commit` matches → `github_commit_unresolved` diagnostic (repo-scoped); absent `commit_id` → `github_review_unanchored`; `issue_comment` exempt (field absent, no diagnostic); SHA never fabricated |
+| Review anchor seed-graph invalidation (issue #334) | A code graph added/changed after import re-resolves review anchors across a would-be `304`; outcome change tombstones the superseded artifact; resolved→superseded→resolved revives; unchanged seed stays idempotent |
+| Review anchor redaction carve-out (issue #334) | `review_commit_sha` survives a redaction-on export in plaintext; never enumerated as sensitive |
 | Stderr summary | Documented fields present on every run |
 
 Implementation of behaviour tests is deferred to the `eg import github` CLI

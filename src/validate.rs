@@ -89,6 +89,10 @@ const fn allowed_target_kinds(label: EdgeLabel) -> Option<&'static [NodeKind]> {
         ]),
         EdgeLabel::Calls | EdgeLabel::Mentions => Some(&[NodeKind::Diagnostic, NodeKind::Symbol]),
         EdgeLabel::Imports => Some(&[NodeKind::Import]),
+        // A `Review` may only be anchored to a `Commit` (issue #334). The AC
+        // requires this Review→Commit target rule even though the PR-side
+        // `MERGED_AS` is intentionally absent here.
+        EdgeLabel::ReviewsCommit => Some(&[NodeKind::Commit]),
         _ => None,
     }
 }
@@ -815,5 +819,39 @@ mod tests {
         assert!(codes.contains(&DANGLING_EDGE_ENDPOINT));
         assert!(codes.contains(&EDGE_TARGET_KIND_VIOLATION));
         assert!(codes.contains(&ORPHAN_NODE));
+    }
+
+    #[test]
+    fn reviews_commit_edge_to_commit_is_allowed() {
+        // Issue #334: a REVIEWS_COMMIT edge whose target is a Commit passes the
+        // typed target-kind check (Review→Commit is the allowed shape).
+        let records = vec![
+            node("n:review", NodeKind::Review),
+            node("n:commit", NodeKind::Commit),
+            edge("e:anchor", EdgeLabel::ReviewsCommit, "n:review", "n:commit"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            !codes.contains(&EDGE_TARGET_KIND_VIOLATION),
+            "Review→Commit must be allowed, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn reviews_commit_edge_to_wrong_kind_is_rejected() {
+        // Issue #334: a REVIEWS_COMMIT edge targeting a non-Commit node is a
+        // target-kind violation.
+        let records = vec![
+            node("n:review", NodeKind::Review),
+            node("n:sym", NodeKind::Symbol),
+            edge("e:bad", EdgeLabel::ReviewsCommit, "n:review", "n:sym"),
+        ];
+        let report = validate_records(&records);
+        let codes: Vec<_> = report.diagnostics.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&EDGE_TARGET_KIND_VIOLATION),
+            "Review→Symbol must be rejected, got {codes:?}"
+        );
     }
 }
