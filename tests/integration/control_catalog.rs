@@ -154,6 +154,28 @@ fn malformed_json_exits_two() {
 }
 
 #[test]
+fn unknown_field_exits_two_and_reports_malformed_json() {
+    // An off-schema catalog with an extra top-level key must be rejected, not
+    // silently normalized — otherwise its hash-pin would collide with the
+    // shipped document (issue #337).
+    let bad = r#"{
+        "catalog_id": "x",
+        "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+        "controls": [],
+        "extra_field": 1
+    }"#;
+    let (_temp, path) = write_temp("unknown_field.json", bad);
+    let output = egregore()
+        .args(["audit", "control-catalog", "--catalog"])
+        .arg(&path)
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    let err: Value = serde_json::from_slice(&output.stderr).expect("stderr json");
+    assert_eq!(err["code"], "malformed_json");
+}
+
+#[test]
 fn missing_file_exits_two() {
     let output = egregore()
         .args([

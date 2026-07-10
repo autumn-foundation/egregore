@@ -275,14 +275,34 @@ impl std::error::Error for CatalogError {}
 
 /// Raw deserialization target: classes and requirements as strings, so unknown
 /// values become named [`CatalogError`]s rather than opaque serde failures.
+///
+/// `deny_unknown_fields` is load-bearing: an unknown/extra key in a custom
+/// `--catalog` must fail deserialization (mapped to [`CatalogError::Json`])
+/// rather than being silently dropped before `canonical_bytes` hashes the
+/// catalog. Otherwise an off-schema catalog could produce the same
+/// `control_catalog:v1:<hash>` pin as the shipped document, breaking the #337
+/// guarantee that the hash-pin ties an evidence pack to exact catalog content.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawCatalog {
     catalog_id: String,
-    schema_version: CatalogSchemaVersion,
+    schema_version: RawSchemaVersion,
     controls: Vec<RawControl>,
 }
 
+/// Raw schema-version target, distinct from the public [`CatalogSchemaVersion`]
+/// so `deny_unknown_fields` guards the deserialize path without altering the
+/// public model's serde behavior.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSchemaVersion {
+    domain: String,
+    kind: String,
+    version: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawControl {
     control_id: String,
     title: String,
@@ -290,6 +310,7 @@ struct RawControl {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawClassRequirement {
     class: String,
     requirement: String,
@@ -328,6 +349,12 @@ pub fn parse_catalog(text: &str) -> Result<ControlCatalog, CatalogError> {
         });
     }
 
+    let schema_version = CatalogSchemaVersion {
+        domain: raw.schema_version.domain,
+        kind: raw.schema_version.kind,
+        version: raw.schema_version.version,
+    };
+
     let mut controls = Vec::with_capacity(raw.controls.len());
     for raw_control in raw.controls {
         let mut evidence_classes = Vec::with_capacity(raw_control.evidence_classes.len());
@@ -356,7 +383,7 @@ pub fn parse_catalog(text: &str) -> Result<ControlCatalog, CatalogError> {
 
     Ok(ControlCatalog {
         catalog_id: raw.catalog_id,
-        schema_version: raw.schema_version,
+        schema_version,
         controls,
     })
 }
@@ -714,6 +741,69 @@ mod tests {
         let err = parse_catalog("{ not valid json").expect_err("malformed json must fail");
         assert_eq!(err.code(), "malformed_json");
         assert!(matches!(err, CatalogError::Json { .. }));
+    }
+
+    #[test]
+    fn unknown_top_level_field_is_rejected() {
+        let json = r#"{
+            "catalog_id": "x",
+            "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+            "controls": [],
+            "extra_field": 1
+        }"#;
+        let err = parse_catalog(json).expect_err("unknown top-level key must fail");
+        assert_eq!(err.code(), "malformed_json");
+        assert!(matches!(err, CatalogError::Json { .. }));
+    }
+
+    #[test]
+    fn unknown_schema_version_field_is_rejected() {
+        let json = r#"{
+            "catalog_id": "x",
+            "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1, "extra": true },
+            "controls": []
+        }"#;
+        let err = parse_catalog(json).expect_err("unknown schema-version key must fail");
+        assert_eq!(err.code(), "malformed_json");
+        assert!(matches!(err, CatalogError::Json { .. }));
+    }
+
+    #[test]
+    fn unknown_control_field_is_rejected() {
+        let json = r#"{
+            "catalog_id": "x",
+            "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+            "controls": [
+                { "control_id": "CC1.1", "title": "t", "evidence_classes": [], "surprise": 7 }
+            ]
+        }"#;
+        let err = parse_catalog(json).expect_err("unknown control key must fail");
+        assert_eq!(err.code(), "malformed_json");
+        assert!(matches!(err, CatalogError::Json { .. }));
+    }
+
+    #[test]
+    fn unknown_evidence_class_field_is_rejected() {
+        let json = r#"{
+            "catalog_id": "x",
+            "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 1 },
+            "controls": [
+                { "control_id": "CC1.1", "title": "t", "evidence_classes": [
+                    { "class": "commits", "requirement": "required", "weight": 3 }
+                ] }
+            ]
+        }"#;
+        let err = parse_catalog(json).expect_err("unknown evidence-class key must fail");
+        assert_eq!(err.code(), "malformed_json");
+        assert!(matches!(err, CatalogError::Json { .. }));
+    }
+
+    #[test]
+    fn default_catalog_still_parses_with_deny_unknown_fields() {
+        // The shipped soc2-v1 document must carry no extra keys so the default
+        // catalog keeps loading under `deny_unknown_fields`.
+        let catalog = load_default_catalog();
+        assert_eq!(catalog.catalog_id, "soc2-v1");
     }
 
     #[test]
