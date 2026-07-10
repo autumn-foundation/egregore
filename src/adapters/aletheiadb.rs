@@ -1792,7 +1792,14 @@ impl EmbeddedAletheiaSink {
 
     #[allow(clippy::too_many_lines)]
     fn write_node(&mut self, record: &GraphRecord) -> AdapterResult<()> {
-        if self.expected_record_state(record)? == ExpectedRecordState::Matched {
+        // Same revive-after-tombstone guard as `write_edge` (#333 Codex round-7):
+        // a byte-identical node whose stable ID is actively tombstoned must write
+        // a fresh version so the newer NodeId supersedes the tombstone and the
+        // current read view surfaces the node again. Without this, an identical
+        // re-emit would match and short-circuit, leaving the tombstone latest.
+        if self.expected_record_state(record)? == ExpectedRecordState::Matched
+            && !self.active_deleted_ids()?.contains(record.id())
+        {
             #[cfg(feature = "embeddings")]
             self.backfill_embedding_for_matched_node(record)?;
             return Ok(());
@@ -2335,7 +2342,18 @@ impl EmbeddedAletheiaSink {
     }
 
     fn write_edge(&mut self, record: &GraphRecord) -> AdapterResult<()> {
-        if self.expected_record_state(record)? == ExpectedRecordState::Matched {
+        // A re-emitted edge whose bytes match an existing physical edge is
+        // normally a no-op. But when the edge's stable ID is CURRENTLY actively
+        // tombstoned, that matching physical edge is being SUPPRESSED by the
+        // tombstone; short-circuiting would leave the tombstone the latest event
+        // and keep the edge dead (revive-after-tombstone, #333 Codex round-7; cf.
+        // the #318 stale-tombstone fix). Force a fresh write so the new
+        // observation post-dates the tombstone (higher `egregore_seq`) and the
+        // current read view (`read_all_records`) surfaces the edge again. Mirrors
+        // the `write_tombstone` staleness short-circuit convention.
+        if self.expected_record_state(record)? == ExpectedRecordState::Matched
+            && !self.active_deleted_ids()?.contains(record.id())
+        {
             return Ok(());
         }
 
@@ -5313,6 +5331,94 @@ mod tests {
             has_edge,
             "re-ingested edge must appear in read_all_records when tombstone is superseded"
         );
+    }
+
+    #[test]
+    fn read_all_records_revives_edge_on_identical_reemit_after_tombstone() {
+        // Revive-after-tombstone through the embedded CURRENT read view (#333,
+        // Codex round-7): a merge resolution that cycles resolved-A →
+        // unresolved/B → resolved-A re-emits the SAME edge bytes + stable id as
+        // the first run. Across a PERSISTENT store reopened each phase, the third
+        // (byte-identical) re-emit must revive the tombstoned id — otherwise the
+        // matching physical edge is short-circuited, the tombstone stays latest,
+        // and `read_all_records` keeps suppressing the re-resolved merge link.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path().join("edge-revive-identical-store");
+        let task_id = stable_id(&["node", "task", "pr:7"]);
+        let commit_id = stable_id(&["node", "commit", "sha-a"]);
+        // MERGED_AS edge to commit A. Identical bytes are reconstructed below.
+        let edge = GraphRecord::edge(
+            EdgeLabel::MergedAs,
+            task_id.clone(),
+            commit_id.clone(),
+            Some("1.0".to_owned()),
+            "PR #7 merged as commit sha-a".to_owned(),
+        );
+        let edge_id = edge.id().to_owned();
+        let tombstone_id = stable_id(&["tombstone", &edge_id]);
+
+        // Phase 1: resolved-A — endpoints + live edge E_A.
+        {
+            let mut sink =
+                EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should open");
+            sink.write_record(&file_record(&task_id, "task"))
+                .expect("task node should write");
+            sink.write_record(&current_symbol_record(&commit_id, "commit", 10))
+                .expect("commit node should write");
+            sink.write_record(&edge).expect("edge should write");
+        }
+
+        // Phase 2: A → unresolved/B — tombstone E_A. It must now be suppressed.
+        {
+            let mut sink =
+                EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+            sink.write_record(&GraphRecord::Tombstone {
+                id: tombstone_id,
+                schema_version: crate::ir::SCHEMA_VERSION,
+                deleted_id: edge_id.clone(),
+                summary: "merge resolution superseded".to_owned(),
+                producer: None,
+            })
+            .expect("tombstone should write");
+            let records = sink
+                .read_all_records()
+                .expect("read_all_records should succeed");
+            assert!(
+                !records
+                    .iter()
+                    .any(|r| matches!(r, GraphRecord::Edge { id, .. } if id == &edge_id)),
+                "edge must be suppressed while its id is actively tombstoned"
+            );
+        }
+
+        // Phase 3: unresolved/B → resolved-A — re-emit IDENTICAL E_A bytes.
+        {
+            let mut sink =
+                EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+            let reemitted = GraphRecord::edge(
+                EdgeLabel::MergedAs,
+                task_id,
+                commit_id,
+                Some("1.0".to_owned()),
+                "PR #7 merged as commit sha-a".to_owned(),
+            );
+            assert_eq!(
+                reemitted.id(),
+                edge_id,
+                "re-emit must reconstruct the same id"
+            );
+            sink.write_record(&reemitted)
+                .expect("identical edge re-emit should write");
+            let records = sink
+                .read_all_records()
+                .expect("read_all_records should succeed");
+            assert!(
+                records
+                    .iter()
+                    .any(|r| matches!(r, GraphRecord::Edge { id, .. } if id == &edge_id)),
+                "byte-identical re-emit must revive the tombstoned merge edge in the current view"
+            );
+        }
     }
 
     #[test]

@@ -419,8 +419,8 @@ pub fn merge_artifact_id(
                 commit_id,
             ]))
         }
-        // Zero or multiple matches → the seed-independent diagnostic.
-        _ => Some(commit_diagnostic_id(number, sha)),
+        // Zero or multiple matches → the repo-scoped diagnostic.
+        _ => Some(commit_diagnostic_id(source_repo, number, sha)),
     }
 }
 
@@ -500,17 +500,24 @@ fn resolve_merge_commit(
 
 /// The stable `github_commit_unresolved` Diagnostic record ID for a PR/SHA.
 ///
-/// Seed-independent: the zero-match (unresolved) and multiple-match (ambiguous)
-/// cases share ONE id per `(PR, sha)`, so re-emitting either case overwrites the
-/// same record and retracting it needs only `(number, sha)`. Factored out so the
-/// emitter ([`commit_diagnostic`]) and the retraction path
-/// ([`merge_artifact_id`]) agree byte-for-byte on the id.
-fn commit_diagnostic_id(number: u64, sha: &str) -> String {
+/// Repo-scoped (#333, Codex round-7): `source_repo` is part of the id, mirroring
+/// the Task/Review/ExternalLink ids, so a shared multi-repo store never collides
+/// diagnostics for the same PR number + merge SHA across repositories (one repo's
+/// import could otherwise overwrite or tombstone another's merge evidence).
+///
+/// Seed-independent within a repo: the zero-match (unresolved) and multiple-match
+/// (ambiguous) cases share ONE id per `(repo, PR, sha)`, so re-emitting either
+/// case overwrites the same record and retracting it needs only
+/// `(source_repo, number, sha)`. Factored out so the emitter
+/// ([`commit_diagnostic`]) and the retraction path ([`merge_artifact_id`]) agree
+/// byte-for-byte on the id.
+fn commit_diagnostic_id(source_repo: &str, number: u64, sha: &str) -> String {
     let native = format!("pr:{number}");
     project_stable_id(&[
         "project",
         "Diagnostic",
         IMPORTER_ID,
+        source_repo,
         &native,
         "github_commit_unresolved",
         sha,
@@ -527,7 +534,7 @@ fn commit_diagnostic(
     detail: &str,
 ) -> GraphRecord {
     let code = "github_commit_unresolved";
-    let id = commit_diagnostic_id(number, sha);
+    let id = commit_diagnostic_id(ctx.source_repo, number, sha);
     let mut rec = GraphRecord::node(
         id.clone(),
         NodeKind::Diagnostic,
@@ -1148,6 +1155,41 @@ mod tests {
         assert_eq!(
             merge_resolution_marker(&resolves, &merged_pr(None, true)),
             "none"
+        );
+    }
+
+    #[test]
+    fn unresolved_commit_diagnostic_id_is_repo_scoped() {
+        // Two repositories sharing one store, each with a PR of the SAME number
+        // and SAME unresolved merge_commit_sha, must mint DISTINCT diagnostic
+        // record ids so neither import overwrites or tombstones the other's
+        // merge-resolution evidence (#333, Codex round-7). Before the fix the id
+        // omitted `source_repo`, so both collided.
+        let idx = FileIndex::new();
+        let c_a = ctx("acme/repo-a", &idx, &identity);
+        let c_b = ctx("acme/repo-b", &idx, &identity);
+        let sha = "deadbeefcafe";
+        let number = 42;
+        let task_id = "project:v1:task-shared";
+        let detail = "no code-graph Commit record matches this SHA in the seeded store";
+        let diag_a = commit_diagnostic(&c_a, number, sha, task_id, detail);
+        let diag_b = commit_diagnostic(&c_b, number, sha, task_id, detail);
+        assert_ne!(
+            diag_a.id(),
+            diag_b.id(),
+            "same PR number + merge SHA in different repos must not collide"
+        );
+        // The retraction path ([`merge_artifact_id`]) must agree byte-for-byte
+        // with the emitted id, and likewise stay repo-scoped.
+        assert_eq!(
+            diag_a.id(),
+            commit_diagnostic_id("acme/repo-a", number, sha),
+            "emitter and retraction path must agree on the repo-scoped id"
+        );
+        assert_ne!(
+            commit_diagnostic_id("acme/repo-a", number, sha),
+            commit_diagnostic_id("acme/repo-b", number, sha),
+            "diagnostic id must include the source repo"
         );
     }
 

@@ -416,7 +416,12 @@ contains a `Commit` with that exact SHA. For a merged PR,
 a `merge_commit_sha` matching **exactly one** `Commit` (whose `name` equals the
 SHA) emits one `MERGED_AS` edge; **zero or multiple** matches emit a project
 `Diagnostic` node with code `github_commit_unresolved` carrying the SHA and the
-Task record ID — never a guessed link. A merged PR with no `merge_commit_sha`
+Task record ID — never a guessed link. This diagnostic's stable ID is
+**repo-scoped** (issue #333, Codex round-7): `source_repo` is part of the ID
+composition, exactly like the Task/Review/ExternalLink IDs, so a shared
+multi-repo store never collides diagnostics for the same PR number + merge SHA
+across repositories (one repo's import could otherwise overwrite or tombstone
+another repo's merge evidence). A merged PR with no `merge_commit_sha`
 emits neither edge nor diagnostic. Without a seeded
 `--code-graph`, no `MERGED_AS` edges and no unresolved diagnostics are produced.
 `MERGED_AS` is a project-only, evidence-class edge label: it is rejected on
@@ -447,7 +452,14 @@ still-unresolved outcome (the diagnostic keyed on the old SHA is retracted). Whe
 the outcome is **unchanged** the change hash is unchanged, the PR is skipped, and
 no tombstone is emitted (AC8 idempotency preserved). The tombstone's own ID is
 derived deterministically from `(pr, deleted_id)`, so output stays byte-identical
-across runs. The full prior record ID (not a lossy marker) is persisted so the
+across runs. When a resolution **cycles back** to a previously resolved-and-then-
+tombstoned outcome (resolved-A → unresolved/B → resolved-A), the re-emitted
+artifact reconstructs the *same* record ID and bytes as the first run; the
+embedded sink therefore **revives the tombstoned ID** by forcing a fresh
+observation whenever a re-emitted record's stable ID is actively tombstoned
+(issue #333, Codex round-7), so the newer sequence post-dates the tombstone and
+the current read view surfaces the re-resolved merge link again rather than
+leaving it suppressed. The full prior record ID (not a lossy marker) is persisted so the
 old-SHA diagnostic case retracts correctly; the `pr_merge_artifacts` field is
 `#[serde(default)]`, so legacy state files load without a state-schema bump (an
 absent prior is treated as "no known artifact" and emits no tombstone).

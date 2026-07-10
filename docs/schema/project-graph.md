@@ -190,7 +190,14 @@ resolves to a different `Commit`, or the merged `merge_commit_sha` itself change
 artifact's record ID via `deleted_id` before emitting the new one. In a
 persistent store the tombstone suppresses the superseded artifact from the
 current read view, so exactly one merge artifact per PR is ever live at once; an
-unchanged outcome emits no tombstone. See
+unchanged outcome emits no tombstone. The `github_commit_unresolved` Diagnostic's
+stable ID is **repo-scoped** (Codex round-7): `source_repo` is part of the ID, so
+same-PR-number/same-SHA diagnostics never collide across repositories in a shared
+store. When a resolution **cycles back** to a previously tombstoned outcome
+(resolved-A → unresolved/B → resolved-A) the re-emitted artifact reconstructs the
+same record ID and bytes; the embedded sink then **revives the tombstoned ID** by
+forcing a fresh, tombstone-post-dating observation, so the current read view
+surfaces the re-resolved artifact again. See
 [`import-github.md`](import-github.md) §5–6 for the state tracking and the full
 transition matrix.
 
