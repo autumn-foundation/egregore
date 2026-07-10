@@ -1275,6 +1275,18 @@ pub enum GraphRecord {
         /// pair refers to. Plaintext query substrate; never redacted.
         #[serde(skip_serializing_if = "Option::is_none")]
         review_side: Option<String>,
+        /// Commit SHA the review was anchored to for `pr_review` and
+        /// `pr_review_comment` records — the GitHub payload's `commit_id`, the
+        /// exact commit the reviewer looked at (issue #334). Populated whenever
+        /// the payload carries `commit_id`, with no `merged_at`-style gate: a
+        /// review commit is a real observed commit, not a throwaway test-merge.
+        /// Absent on `issue_comment` reviews (general PR-conversation comments
+        /// are not anchored to a commit). Plaintext query substrate per
+        /// `docs/schema/import-github.md` §8 (the plaintext-SHA carve-out);
+        /// never redacted. Legacy records lacking the field deserialize to
+        /// `None`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        review_commit_sha: Option<String>,
         /// User-context domain fields, flattened into node JSON.
         #[serde(flatten)]
         user_context: UserContextFields,
@@ -1472,6 +1484,7 @@ impl GraphRecord {
             author: None,
             diff_hunk_handle: None,
             review_side: None,
+            review_commit_sha: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -1593,6 +1606,7 @@ impl GraphRecord {
             author: None,
             diff_hunk_handle: None,
             review_side: None,
+            review_commit_sha: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -1713,6 +1727,7 @@ impl GraphRecord {
             author: None,
             diff_hunk_handle: None,
             review_side: None,
+            review_commit_sha: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -1838,6 +1853,7 @@ impl GraphRecord {
             author: None,
             diff_hunk_handle: None,
             review_side: None,
+            review_commit_sha: None,
             dependency: None,
             log: None,
             user_context: UserContextFields::empty(),
@@ -2789,6 +2805,14 @@ pub enum EdgeLabel {
     /// `codegraph.Commit`; emitted only when a seeded code graph resolves the
     /// PR's `merge_commit_sha` to exactly one `Commit`.
     MergedAs,
+    /// Project `Review` was anchored to a specific code-graph `Commit`
+    /// (issue #334; the review-side mirror of [`Self::MergedAs`]). FROM
+    /// `project.Review` TO `codegraph.Commit`; emitted only when a seeded code
+    /// graph resolves the review's `review_commit_sha` (the GitHub payload's
+    /// `commit_id`, the exact commit the reviewer looked at) to exactly one
+    /// `Commit`. "Anchored at this SHA" is never "approved all changes in a
+    /// range": it names the tree the review observed, not a verdict on it.
+    ReviewsCommit,
     /// Agent-memory node describes a failure on a code entity.
     FailedOn,
     /// Agent-memory node explains a code change.
@@ -2860,6 +2884,7 @@ impl EdgeLabel {
             "EXTERNAL_HANDLE" => Some(Self::ExternalHandle),
             "TOUCHES_FILE" => Some(Self::TouchesFile),
             "MERGED_AS" => Some(Self::MergedAs),
+            "REVIEWS_COMMIT" => Some(Self::ReviewsCommit),
             "FAILED_ON" => Some(Self::FailedOn),
             "EXPLAINS_CHANGE" => Some(Self::ExplainsChange),
             "REFERENCES_TASK" => Some(Self::ReferencesTask),
@@ -2901,6 +2926,7 @@ impl EdgeLabel {
                 | Self::ExternalHandle
                 | Self::TouchesFile
                 | Self::MergedAs
+                | Self::ReviewsCommit
                 | Self::FailedOn
                 | Self::ExplainsChange
                 | Self::ReferencesTask
@@ -2967,6 +2993,7 @@ impl EdgeLabel {
             Self::ExternalHandle => "EXTERNAL_HANDLE",
             Self::TouchesFile => "TOUCHES_FILE",
             Self::MergedAs => "MERGED_AS",
+            Self::ReviewsCommit => "REVIEWS_COMMIT",
             Self::FailedOn => "FAILED_ON",
             Self::ExplainsChange => "EXPLAINS_CHANGE",
             Self::ReferencesTask => "REFERENCES_TASK",

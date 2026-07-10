@@ -30,6 +30,14 @@ pub const DOMAIN: &str = "project";
 pub const SOURCE_KIND_ISSUE: &str = "github_issue";
 /// `source_kind` for PR-derived tasks.
 pub const SOURCE_KIND_PR: &str = "github_pr";
+/// `source_kind` stamped on every GitHub-derived `Review` node (issue #334).
+///
+/// Review nodes originate solely from this importer, so the daemon's
+/// `REVIEWS_COMMIT` project-edge validator requires this exact value on the FROM
+/// node — the review-side analog of the `MERGED_AS` `github_pr` source-kind gate
+/// (#333). A `REVIEWS_COMMIT` edge can therefore never originate from any node
+/// that is not an importer-stamped Review.
+pub const SOURCE_KIND_REVIEW: &str = "github_review";
 /// `system` value for GitHub external links.
 pub const SYSTEM: &str = "github";
 /// Maximum bytes to inline in a handle (matches `CommandRun.stdout_handle`).
@@ -700,7 +708,10 @@ pub fn issue_comment_records(ctx: &Context<'_>, c: &model::IssueComment) -> Emit
         body,
         &parent,
     );
-    set_review_extra(&mut rec, None, None, None, None, None, None, None);
+    // issue_comment reviews are general PR-conversation comments, never anchored
+    // to a specific commit (issue #334 exemption): review_commit_sha stays None
+    // and no REVIEWS_COMMIT edge or unanchored diagnostic is ever emitted.
+    set_review_extra(&mut rec, None, None, None, None, None, None, None, None);
     edge_and_pack(rec, parent, None)
 }
 
@@ -734,8 +745,23 @@ pub fn pr_review_records(ctx: &Context<'_>, pr_number: u64, r: &model::Review) -
         None,
         None,
         None,
+        r.commit_id.as_deref(),
     );
-    edge_and_pack(rec, parent, None)
+    // REVIEWS_COMMIT resolve-or-diagnose against the seeded code graph (#334,
+    // the review-side mirror of pull_records' MERGED_AS block). A pr_review is a
+    // commit-anchored review kind: a genuinely-absent commit_id is diagnosed
+    // (`github_review_unanchored`), never fabricated.
+    let review_id = review_id_for(ctx, &native);
+    let mut emitted = edge_and_pack(rec, parent, None);
+    if let Some((artifact, is_diag)) =
+        resolve_review_commit(ctx, &review_id, r.commit_id.as_deref())
+    {
+        emitted.records.push(artifact);
+        if is_diag {
+            emitted.link_diagnostics += 1;
+        }
+    }
+    emitted
 }
 
 /// Emits a `pr_review_comment` `Review` plus its edges.
@@ -775,6 +801,7 @@ pub fn review_comment_records(ctx: &Context<'_>, c: &model::ReviewComment) -> Em
         c.start_line,
         diff.as_deref(),
         c.side.as_deref(),
+        c.commit_id.as_deref(),
     );
 
     // File resolution for TOUCHES_FILE (AC7).
@@ -784,6 +811,17 @@ pub fn review_comment_records(ctx: &Context<'_>, c: &model::ReviewComment) -> Em
     if let Some(d) = diag {
         emitted.records.push(d);
         emitted.link_diagnostics += 1;
+    }
+    // REVIEWS_COMMIT resolve-or-diagnose against the seeded code graph (#334).
+    // A pr_review_comment is commit-anchored: an absent commit_id is diagnosed
+    // (`github_review_unanchored`), never fabricated.
+    if let Some((artifact, is_diag)) =
+        resolve_review_commit(ctx, &review_id, c.commit_id.as_deref())
+    {
+        emitted.records.push(artifact);
+        if is_diag {
+            emitted.link_diagnostics += 1;
+        }
     }
     emitted
 }
@@ -883,6 +921,7 @@ fn review_node(
         body_handle: bh,
         system_native_id,
         parent_task_id: pt,
+        source_kind: sk,
         ..
     } = &mut rec
     {
@@ -891,6 +930,10 @@ fn review_node(
         *bh = body.as_deref().map(handle_for);
         *system_native_id = Some(native_id.to_owned());
         *pt = Some(parent_task_id.to_owned());
+        // Stamp the review source kind so the daemon `REVIEWS_COMMIT` validator
+        // can enforce a Review origin (issue #334, mirroring the `MERGED_AS`
+        // `github_pr` source-kind gate).
+        *sk = Some(SOURCE_KIND_REVIEW.to_owned());
     }
     rec
 }
@@ -905,6 +948,7 @@ fn set_review_extra(
     start_line: Option<u32>,
     diff_hunk: Option<&str>,
     side: Option<&str>,
+    review_commit_sha: Option<&str>,
 ) {
     if let GraphRecord::Node {
         review_state: rs,
@@ -913,6 +957,7 @@ fn set_review_extra(
         span,
         diff_hunk_handle,
         review_side,
+        review_commit_sha: rcs,
         ..
     } = rec
     {
@@ -931,6 +976,12 @@ fn set_review_extra(
         }
         *diff_hunk_handle = diff_hunk.map(handle_for);
         *review_side = side.map(str::to_owned);
+        // Anchor SHA (issue #334): the commit_id the reviewer looked at. Set
+        // whenever the payload carries it, with no `merged_at`-style gate — a
+        // review commit is a real observed commit, not a throwaway test-merge.
+        // Plaintext query substrate (§8 carve-out); never routed through
+        // redaction. `issue_comment` reviews pass `None` (commit-anchor exempt).
+        *rcs = review_commit_sha.map(str::to_owned);
     }
 }
 
@@ -964,9 +1015,236 @@ fn task_id_for(ctx: &Context<'_>, kind: &str, number: u64) -> String {
 }
 
 fn review_id_for(ctx: &Context<'_>, native_id: &str) -> String {
+    review_record_id(ctx.source_repo, native_id)
+}
+
+/// The stable `project.Review` record ID for `(source_repo, native_id)`.
+///
+/// Factored out of [`review_id_for`] so the importer's state-side artifact-ID
+/// path ([`review_artifact_id`]) reconstructs the exact same review handle the
+/// emitters use, without threading a full [`Context`] (issue #334).
+fn review_record_id(source_repo: &str, native_id: &str) -> String {
     // native_id is "<review_kind>:<n>:<id>"; the number is the second segment.
     let number = native_id.split(':').nth(1).unwrap_or("0");
-    project_stable_id(&["project", "Review", ctx.source_repo, number, native_id])
+    project_stable_id(&["project", "Review", source_repo, number, native_id])
+}
+
+/// Whether a review kind is commit-anchored (issue #334).
+///
+/// `pr_review` and `pr_review_comment` are anchored to the exact commit the
+/// reviewer looked at, so they populate `review_commit_sha` and resolve a
+/// `REVIEWS_COMMIT` edge (or a diagnostic). `issue_comment` reviews are general
+/// PR-conversation comments with no commit anchor and are exempt.
+#[must_use]
+fn review_kind_is_commit_anchored(review_kind: &str) -> bool {
+    matches!(review_kind, "pr_review" | "pr_review_comment")
+}
+
+/// The stable `REVIEWS_COMMIT` project-edge ID for `(review, commit)` (#334).
+///
+/// Must equal what [`GraphRecord::project_edge`] mints so the emitter and the
+/// state-side artifact-ID path agree byte-for-byte.
+fn reviews_commit_edge_id(review_id: &str, commit_record_id: &str) -> String {
+    project_stable_id(&[
+        "project",
+        "edge",
+        EdgeLabel::ReviewsCommit.as_str(),
+        review_id,
+        commit_record_id,
+    ])
+}
+
+/// The stable review-anchor `Diagnostic` record ID (issue #334).
+///
+/// Keyed on the already-repo-scoped `review_id` (which embeds `source_repo`),
+/// so diagnostics never collide across repositories in a shared multi-repo store
+/// (contract #7, the review-side analog of [`commit_diagnostic_id`]). `sha` is
+/// empty for the `github_review_unanchored` case (no `commit_id` to key on).
+fn review_diagnostic_id(review_id: &str, code: &str, sha: &str) -> String {
+    project_stable_id(&["project", "Diagnostic", IMPORTER_ID, review_id, code, sha])
+}
+
+/// Resolves a commit-anchored review's anchor to an edge or a diagnostic.
+///
+/// Issue #334, the review-side mirror of [`resolve_merge_commit`].
+/// Returns `(record, is_diagnostic)`, or `None` when no seeded code graph is
+/// present (no edge, no diagnostic — the `review_commit_sha` field is still
+/// populated by the caller from the raw payload). Three seeded outcomes:
+///
+/// 1. `commit_id` present + exactly one matching `Commit` → the `REVIEWS_COMMIT`
+///    Review→Commit project edge (`project:v1:` identity).
+/// 2. `commit_id` present + zero/multiple matches → a `github_commit_unresolved`
+///    project `Diagnostic`.
+/// 3. `commit_id` genuinely absent → a `github_review_unanchored` project
+///    `Diagnostic` (diagnose the gap; never fabricate a SHA).
+///
+/// `issue_comment` reviews never reach this resolver (they are exempt).
+fn resolve_review_commit(
+    ctx: &Context<'_>,
+    review_id: &str,
+    commit_id: Option<&str>,
+) -> Option<(GraphRecord, bool)> {
+    if ctx.commit_index.is_empty() {
+        return None;
+    }
+    let Some(sha) = commit_id.filter(|s| !s.is_empty()) else {
+        return Some((
+            review_diagnostic(
+                ctx,
+                review_id,
+                "github_review_unanchored",
+                "",
+                "review carries no commit_id; cannot anchor it to a commit",
+            ),
+            true,
+        ));
+    };
+    let detail = match ctx.commit_index.get(sha).map(Vec::as_slice) {
+        Some([commit_record_id]) => {
+            // REVIEWS_COMMIT is a project-domain Review→Commit relationship
+            // (#334). It must carry a `project:v1:` ID + PROJECT_SCHEMA_VERSION
+            // so the daemon project-edge validator sees it and `project:v1:`
+            // consumers find the anchor. The Commit target stays a codegraph node.
+            let edge = GraphRecord::project_edge(
+                EdgeLabel::ReviewsCommit,
+                review_id.to_owned(),
+                commit_record_id.clone(),
+                None,
+                format!("review {review_id} anchored to commit {sha}"),
+            );
+            return Some((edge, false));
+        }
+        Some(ids) if ids.len() > 1 => {
+            format!("{} code-graph Commit records claim this SHA", ids.len())
+        }
+        // None or empty slice → unresolved (no matching Commit in the seed).
+        _ => "no code-graph Commit record matches this SHA in the seeded store".to_owned(),
+    };
+    Some((
+        review_diagnostic(ctx, review_id, "github_commit_unresolved", sha, &detail),
+        true,
+    ))
+}
+
+/// Builds a project-domain review-anchor `Diagnostic` node (issue #334).
+fn review_diagnostic(
+    ctx: &Context<'_>,
+    review_id: &str,
+    code: &str,
+    sha: &str,
+    detail: &str,
+) -> GraphRecord {
+    let id = review_diagnostic_id(review_id, code, sha);
+    let summary = if sha.is_empty() {
+        format!("[{code}] {detail}; review='{review_id}'")
+    } else {
+        format!("[{code}] {detail}; review_commit_sha='{sha}' review='{review_id}'")
+    };
+    let mut rec = GraphRecord::node(id.clone(), NodeKind::Diagnostic, None, None, None, summary);
+    set_common(&mut rec, &id, ctx.transaction_time, ctx);
+    rec
+}
+
+/// A stable marker of a review's `REVIEWS_COMMIT` resolution outcome.
+///
+/// For the per-review change hash (issue #334, the review-side mirror of
+/// [`merge_resolution_marker`]).
+/// Folded into the review change hash so a seed graph that newly resolves (or
+/// stops resolving) a review's `commit_id` re-emits the anchor edge/diagnostic
+/// even when the review payload is byte-identical, while an unchanged seed keeps
+/// re-imports idempotent. `issue_comment` reviews are commit-anchor-exempt and
+/// no seed graph both map to the stable `"none"` marker (no artifact). A resolved
+/// link carries the target `Commit` record ID so re-resolving the SAME sha to a
+/// DIFFERENT commit also re-emits.
+#[must_use]
+pub fn review_commit_marker(
+    commit_index: &CommitIndex,
+    review_kind: &str,
+    commit_id: Option<&str>,
+) -> String {
+    if !review_kind_is_commit_anchored(review_kind) || commit_index.is_empty() {
+        return "none".to_owned();
+    }
+    commit_id.filter(|s| !s.is_empty()).map_or_else(
+        || "unanchored".to_owned(),
+        |sha| match commit_index.get(sha).map(Vec::as_slice) {
+            Some([commit_record_id]) => format!("resolved:{commit_record_id}"),
+            Some(ids) if ids.len() > 1 => format!("ambiguous:{}", ids.len()),
+            // None or empty slice → unresolved (no matching Commit in the seed).
+            _ => "unresolved".to_owned(),
+        },
+    )
+}
+
+/// The stable record ID of the review-anchor artifact a review would emit.
+///
+/// Issue #334, the review-side mirror of [`merge_artifact_id`].
+/// The `REVIEWS_COMMIT` edge ID on a unique resolution, the
+/// `github_commit_unresolved` Diagnostic ID on a zero/multiple match, the
+/// `github_review_unanchored` Diagnostic ID on an absent `commit_id` — or `None`
+/// when the review emits no anchor artifact at all (exempt `issue_comment`, or
+/// no seeded graph). The importer persists this per-review and, on an outcome
+/// change, retracts the SUPERSEDED prior artifact via [`review_artifact_tombstone`]
+/// before emitting the current one, so a persistent store's current read view
+/// never shows both stale and fresh review-anchor evidence for one review.
+#[must_use]
+pub fn review_artifact_id(
+    commit_index: &CommitIndex,
+    source_repo: &str,
+    native_id: &str,
+    review_kind: &str,
+    commit_id: Option<&str>,
+) -> Option<String> {
+    if !review_kind_is_commit_anchored(review_kind) || commit_index.is_empty() {
+        return None;
+    }
+    let review_id = review_record_id(source_repo, native_id);
+    let Some(sha) = commit_id.filter(|s| !s.is_empty()) else {
+        return Some(review_diagnostic_id(
+            &review_id,
+            "github_review_unanchored",
+            "",
+        ));
+    };
+    match commit_index.get(sha).map(Vec::as_slice) {
+        Some([commit_record_id]) => Some(reviews_commit_edge_id(&review_id, commit_record_id)),
+        // Zero or multiple matches → the repo-scoped unresolved diagnostic.
+        _ => Some(review_diagnostic_id(
+            &review_id,
+            "github_commit_unresolved",
+            sha,
+        )),
+    }
+}
+
+/// Builds a `Tombstone` retracting a superseded review-anchor artifact.
+///
+/// Issue #334, the review-side mirror of [`merge_artifact_tombstone`]; retracts a
+/// prior artifact whose outcome changed on re-import.
+/// The tombstone ID is derived from `(native_id, deleted_id)`, so it is
+/// deterministic and distinct per retracted target. `deleted_id` drives the
+/// embedded adapter's current-view suppression so a persistent store stops
+/// surfacing the stale record.
+#[must_use]
+pub fn review_artifact_tombstone(native_id: &str, deleted_id: &str) -> GraphRecord {
+    let id = project_stable_id(&[
+        "project",
+        "Tombstone",
+        IMPORTER_ID,
+        native_id,
+        "review_anchor_superseded",
+        deleted_id,
+    ]);
+    GraphRecord::Tombstone {
+        id,
+        schema_version: PROJECT_SCHEMA_VERSION,
+        deleted_id: deleted_id.to_owned(),
+        summary: format!(
+            "[review_anchor_superseded] review {native_id} commit-anchor outcome changed; \
+             retracting superseded artifact {deleted_id}"
+        ),
+        producer: None,
+    }
 }
 
 /// Convenience that folds an iterator of [`Emitted`] into one.
@@ -1435,5 +1713,491 @@ mod tests {
             })
             .expect("REFERENCES_TASK edge present");
         assert_eq!(edge_target, issue_task_id, "edge targets the issue Task");
+    }
+
+    // ── Issue #334: review commit anchoring ─────────────────────────────────────
+
+    /// Builds a Context with a populated commit index for anchor-resolution tests.
+    fn ctx_with_commits<'a>(
+        repo: &'a str,
+        files: &'a FileIndex,
+        commits: &'a CommitIndex,
+        redact: &'a Redact<'a>,
+    ) -> Context<'a> {
+        Context {
+            source_repo: repo,
+            transaction_time: "2026-01-01T00:00:00Z",
+            redact,
+            file_index: files,
+            commit_index: commits,
+        }
+    }
+
+    fn sample_review(id: u64, commit_id: Option<&str>) -> model::Review {
+        model::Review {
+            id,
+            body: Some("looks good".to_owned()),
+            state: "APPROVED".to_owned(),
+            user: Some(model::User {
+                login: "rev".to_owned(),
+            }),
+            submitted_at: Some("2026-01-02T00:00:00Z".to_owned()),
+            commit_id: commit_id.map(str::to_owned),
+            html_url: "https://github.com/o/r/pull/3#pullrequestreview-1".to_owned(),
+        }
+    }
+
+    fn sample_review_comment(id: u64, commit_id: Option<&str>) -> model::ReviewComment {
+        model::ReviewComment {
+            id,
+            body: Some("nit".to_owned()),
+            user: None,
+            path: None,
+            line: None,
+            start_line: None,
+            side: None,
+            diff_hunk: None,
+            in_reply_to_id: None,
+            pull_request_url: "https://api.github.com/repos/o/r/pulls/3".to_owned(),
+            commit_id: commit_id.map(str::to_owned),
+            created_at: String::new(),
+            updated_at: "2026-01-02T00:00:00Z".to_owned(),
+            html_url: "https://github.com/o/r/pull/3#discussion_r99".to_owned(),
+        }
+    }
+
+    fn find_review_node(e: &Emitted) -> &GraphRecord {
+        e.records
+            .iter()
+            .find(|r| matches!(r, GraphRecord::Node { kind, .. } if *kind == NodeKind::Review))
+            .expect("a Review node is present")
+    }
+
+    fn reviews_commit_edges(e: &Emitted) -> Vec<&GraphRecord> {
+        e.records
+            .iter()
+            .filter(|r| matches!(r, GraphRecord::Edge { label, .. } if *label == EdgeLabel::ReviewsCommit))
+            .collect()
+    }
+
+    fn diagnostics_with_code<'a>(e: &'a Emitted, code: &str) -> Vec<&'a GraphRecord> {
+        let needle = format!("[{code}]");
+        e.records
+            .iter()
+            .filter(|r| matches!(r, GraphRecord::Node { kind: NodeKind::Diagnostic, summary, .. } if summary.contains(&needle)))
+            .collect()
+    }
+
+    #[test]
+    fn pr_review_resolves_reviews_commit_edge() {
+        // commit_id present + exactly one Commit match → review_commit_sha field
+        // AND a REVIEWS_COMMIT project edge (Review→Commit, project:v1: id).
+        let files = FileIndex::new();
+        let mut commits = CommitIndex::new();
+        commits.insert("sha-a".to_owned(), vec!["codegraph:v5:commit-a".to_owned()]);
+        let c = ctx_with_commits("o/r", &files, &commits, &identity);
+        let e = pr_review_records(&c, 3, &sample_review(100, Some("sha-a")));
+
+        let review = find_review_node(&e);
+        let GraphRecord::Node {
+            review_commit_sha,
+            source_kind,
+            ..
+        } = review
+        else {
+            panic!("expected node");
+        };
+        assert_eq!(review_commit_sha.as_deref(), Some("sha-a"));
+        assert_eq!(source_kind.as_deref(), Some(SOURCE_KIND_REVIEW));
+
+        let edges = reviews_commit_edges(&e);
+        assert_eq!(edges.len(), 1, "exactly one REVIEWS_COMMIT edge");
+        let GraphRecord::Edge {
+            id, source, target, ..
+        } = edges[0]
+        else {
+            panic!("expected edge");
+        };
+        assert!(
+            id.starts_with("project:v1:"),
+            "edge must carry project:v1: identity, got {id}"
+        );
+        assert_eq!(source, &review.id().to_owned(), "edge FROM the Review");
+        assert_eq!(target, "codegraph:v5:commit-a", "edge TO the Commit");
+        assert!(
+            diagnostics_with_code(&e, "github_commit_unresolved").is_empty()
+                && diagnostics_with_code(&e, "github_review_unanchored").is_empty(),
+            "a resolved anchor emits no diagnostic"
+        );
+    }
+
+    #[test]
+    fn pr_review_comment_resolves_reviews_commit_edge() {
+        let files = FileIndex::new();
+        let mut commits = CommitIndex::new();
+        commits.insert("sha-b".to_owned(), vec!["codegraph:v5:commit-b".to_owned()]);
+        let c = ctx_with_commits("o/r", &files, &commits, &identity);
+        let e = review_comment_records(&c, &sample_review_comment(200, Some("sha-b")));
+
+        let GraphRecord::Node {
+            review_commit_sha, ..
+        } = find_review_node(&e)
+        else {
+            panic!("expected node");
+        };
+        assert_eq!(review_commit_sha.as_deref(), Some("sha-b"));
+        let edges = reviews_commit_edges(&e);
+        assert_eq!(edges.len(), 1);
+        let GraphRecord::Edge { target, .. } = edges[0] else {
+            panic!();
+        };
+        assert_eq!(target, "codegraph:v5:commit-b");
+    }
+
+    #[test]
+    fn pr_review_unresolved_commit_emits_diagnostic_not_guess() {
+        // commit_id present but zero match → github_commit_unresolved diagnostic,
+        // no edge, field still carries the raw SHA.
+        let files = FileIndex::new();
+        let mut commits = CommitIndex::new();
+        commits.insert("elsewhere".to_owned(), vec!["codegraph:v5:x".to_owned()]);
+        let c = ctx_with_commits("o/r", &files, &commits, &identity);
+        let e = pr_review_records(&c, 3, &sample_review(101, Some("sha-missing")));
+
+        let GraphRecord::Node {
+            review_commit_sha, ..
+        } = find_review_node(&e)
+        else {
+            panic!();
+        };
+        assert_eq!(
+            review_commit_sha.as_deref(),
+            Some("sha-missing"),
+            "field carries the SHA even when unresolved"
+        );
+        assert!(reviews_commit_edges(&e).is_empty(), "no edge on unresolved");
+        assert_eq!(
+            diagnostics_with_code(&e, "github_commit_unresolved").len(),
+            1,
+            "one unresolved diagnostic"
+        );
+        assert_eq!(e.link_diagnostics, 1);
+    }
+
+    #[test]
+    fn pr_review_ambiguous_commit_emits_diagnostic() {
+        // commit_id present + multiple matches → github_commit_unresolved, no edge.
+        let files = FileIndex::new();
+        let mut commits = CommitIndex::new();
+        commits.insert(
+            "sha-dup".to_owned(),
+            vec!["codegraph:v5:a".to_owned(), "codegraph:v5:b".to_owned()],
+        );
+        let c = ctx_with_commits("o/r", &files, &commits, &identity);
+        let e = pr_review_records(&c, 3, &sample_review(102, Some("sha-dup")));
+        assert!(reviews_commit_edges(&e).is_empty());
+        let diags = diagnostics_with_code(&e, "github_commit_unresolved");
+        assert_eq!(diags.len(), 1);
+        let GraphRecord::Node { summary, .. } = diags[0] else {
+            panic!();
+        };
+        assert!(
+            summary.contains("2 code-graph Commit records claim this SHA"),
+            "diagnostic states the ambiguity count: {summary}"
+        );
+    }
+
+    #[test]
+    fn pr_review_absent_commit_id_emits_unanchored_diagnostic() {
+        // commit_id genuinely absent on a commit-anchored review → the DISTINCT
+        // github_review_unanchored diagnostic (diagnose the gap; never fabricate).
+        let files = FileIndex::new();
+        let mut commits = CommitIndex::new();
+        commits.insert("sha-a".to_owned(), vec!["codegraph:v5:commit-a".to_owned()]);
+        let c = ctx_with_commits("o/r", &files, &commits, &identity);
+        let e = pr_review_records(&c, 3, &sample_review(103, None));
+
+        let GraphRecord::Node {
+            review_commit_sha, ..
+        } = find_review_node(&e)
+        else {
+            panic!();
+        };
+        assert_eq!(review_commit_sha, &None, "no SHA is fabricated");
+        assert!(reviews_commit_edges(&e).is_empty());
+        assert!(
+            diagnostics_with_code(&e, "github_commit_unresolved").is_empty(),
+            "absent commit_id is NOT github_commit_unresolved"
+        );
+        assert_eq!(
+            diagnostics_with_code(&e, "github_review_unanchored").len(),
+            1,
+            "absent commit_id → github_review_unanchored"
+        );
+    }
+
+    #[test]
+    fn issue_comment_review_is_commit_anchor_exempt() {
+        // issue_comment reviews are general PR-conversation comments: field None,
+        // never a REVIEWS_COMMIT edge, never an unanchored diagnostic — even with
+        // a seeded graph.
+        let files = FileIndex::new();
+        let mut commits = CommitIndex::new();
+        commits.insert("sha-a".to_owned(), vec!["codegraph:v5:commit-a".to_owned()]);
+        let c = ctx_with_commits("o/r", &files, &commits, &identity);
+        let comment = model::IssueComment {
+            id: 77,
+            body: Some("looks good".to_owned()),
+            user: None,
+            issue_url: "https://api.github.com/repos/o/r/issues/3".to_owned(),
+            created_at: String::new(),
+            updated_at: "2026-01-02T00:00:00Z".to_owned(),
+            html_url: "https://github.com/o/r/pull/3#issuecomment-77".to_owned(),
+        };
+        let e = issue_comment_records(&c, &comment);
+        let GraphRecord::Node {
+            review_commit_sha, ..
+        } = find_review_node(&e)
+        else {
+            panic!();
+        };
+        assert_eq!(review_commit_sha, &None);
+        assert!(reviews_commit_edges(&e).is_empty());
+        assert!(diagnostics_with_code(&e, "github_review_unanchored").is_empty());
+        assert_eq!(
+            review_commit_marker(&commits, "issue_comment", None),
+            "none",
+            "issue_comment is always the stable none marker"
+        );
+    }
+
+    #[test]
+    fn no_seed_graph_emits_field_but_no_anchor_artifact() {
+        // No seeded commit index → the field is still populated from the payload,
+        // but no edge and no diagnostic (mirrors MERGED_AS's empty-seed None).
+        let files = FileIndex::new();
+        let commits = CommitIndex::new();
+        let c = ctx_with_commits("o/r", &files, &commits, &identity);
+        let e = pr_review_records(&c, 3, &sample_review(104, Some("sha-a")));
+        let GraphRecord::Node {
+            review_commit_sha, ..
+        } = find_review_node(&e)
+        else {
+            panic!();
+        };
+        assert_eq!(review_commit_sha.as_deref(), Some("sha-a"));
+        assert!(reviews_commit_edges(&e).is_empty());
+        assert!(diagnostics_with_code(&e, "github_commit_unresolved").is_empty());
+        assert!(diagnostics_with_code(&e, "github_review_unanchored").is_empty());
+    }
+
+    #[test]
+    fn review_id_unchanged_with_or_without_commit_id() {
+        // commit_id must NOT participate in the Review stable-ID composition.
+        let files = FileIndex::new();
+        let commits = CommitIndex::new();
+        let c = ctx_with_commits("o/r", &files, &commits, &identity);
+        let with = pr_review_records(&c, 3, &sample_review(105, Some("sha-a")));
+        let without = pr_review_records(&c, 3, &sample_review(105, None));
+        assert_eq!(
+            find_review_node(&with).id(),
+            find_review_node(&without).id(),
+            "review record id is independent of commit_id"
+        );
+    }
+
+    #[test]
+    fn review_commit_marker_reflects_seed_graph_outcome() {
+        let sha = "sha-a";
+        let empty = CommitIndex::new();
+        assert_eq!(review_commit_marker(&empty, "pr_review", Some(sha)), "none");
+        let mut resolves = CommitIndex::new();
+        resolves.insert(sha.to_owned(), vec!["codegraph:v5:commit-a".to_owned()]);
+        assert_eq!(
+            review_commit_marker(&resolves, "pr_review", Some(sha)),
+            "resolved:codegraph:v5:commit-a"
+        );
+        assert_eq!(
+            review_commit_marker(&resolves, "pr_review", None),
+            "unanchored"
+        );
+        let mut other = CommitIndex::new();
+        other.insert("elsewhere".to_owned(), vec!["codegraph:v5:z".to_owned()]);
+        assert_eq!(
+            review_commit_marker(&other, "pr_review_comment", Some(sha)),
+            "unresolved"
+        );
+        let mut ambiguous = CommitIndex::new();
+        ambiguous.insert(
+            sha.to_owned(),
+            vec!["codegraph:v5:a".to_owned(), "codegraph:v5:b".to_owned()],
+        );
+        assert_eq!(
+            review_commit_marker(&ambiguous, "pr_review", Some(sha)),
+            "ambiguous:2"
+        );
+    }
+
+    #[test]
+    fn review_artifact_id_matches_emitted_ids_and_is_repo_scoped() {
+        // The state-side artifact id must agree byte-for-byte with the emitted
+        // record's id (edge or diagnostic), and be repo-scoped (contract #7).
+        let files = FileIndex::new();
+        let mut commits = CommitIndex::new();
+        commits.insert("sha-a".to_owned(), vec!["codegraph:v5:commit-a".to_owned()]);
+
+        // Resolved edge case.
+        let c = ctx_with_commits("o/r", &files, &commits, &identity);
+        let e = pr_review_records(&c, 3, &sample_review(200, Some("sha-a")));
+        let edge_id = reviews_commit_edges(&e)[0].id().to_owned();
+        assert_eq!(
+            review_artifact_id(
+                &commits,
+                "o/r",
+                "pr_review:3:200",
+                "pr_review",
+                Some("sha-a")
+            ),
+            Some(edge_id),
+            "artifact id matches the emitted REVIEWS_COMMIT edge id"
+        );
+
+        // Unresolved diagnostic case: emitted id equals artifact id.
+        let mut nomatch = CommitIndex::new();
+        nomatch.insert("z".to_owned(), vec!["codegraph:v5:z".to_owned()]);
+        let c2 = ctx_with_commits("o/r", &files, &nomatch, &identity);
+        let e2 = pr_review_records(&c2, 3, &sample_review(201, Some("gone")));
+        let diag_id = diagnostics_with_code(&e2, "github_commit_unresolved")[0]
+            .id()
+            .to_owned();
+        assert_eq!(
+            review_artifact_id(
+                &nomatch,
+                "o/r",
+                "pr_review:3:201",
+                "pr_review",
+                Some("gone")
+            ),
+            Some(diag_id)
+        );
+
+        // Repo scoping: same review key + sha in different repos → distinct ids.
+        assert_ne!(
+            review_artifact_id(
+                &nomatch,
+                "acme/a",
+                "pr_review:3:201",
+                "pr_review",
+                Some("gone")
+            ),
+            review_artifact_id(
+                &nomatch,
+                "acme/b",
+                "pr_review:3:201",
+                "pr_review",
+                Some("gone")
+            ),
+            "diagnostic ids must be repo-scoped"
+        );
+
+        // Exempt / no-seed cases → no artifact.
+        assert_eq!(
+            review_artifact_id(&commits, "o/r", "issue_comment:3:1", "issue_comment", None),
+            None
+        );
+        assert_eq!(
+            review_artifact_id(
+                &CommitIndex::new(),
+                "o/r",
+                "pr_review:3:200",
+                "pr_review",
+                Some("sha-a")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_review_node_without_commit_field_parses_to_none() {
+        // A Review node with no review_commit_sha (the #333-era shape, since the
+        // field is skip_serializing_if=none) must round-trip with the field
+        // defaulting to None — proving legacy records deserialize cleanly.
+        let files = FileIndex::new();
+        let commits = CommitIndex::new();
+        let c = ctx_with_commits("o/r", &files, &commits, &identity);
+        // No seed graph → review_commit_sha stays None, so it is omitted on the
+        // wire; this is byte-identical to a pre-#334 serialized Review node.
+        let e = pr_review_records(&c, 3, &sample_review(400, None));
+        let node = find_review_node(&e);
+        let json = serde_json::to_string(node).expect("serialize");
+        assert!(
+            !json.contains("review_commit_sha"),
+            "absent field is omitted on the wire: {json}"
+        );
+        let parsed: GraphRecord = serde_json::from_str(&json).expect("legacy Review parses");
+        let GraphRecord::Node {
+            review_commit_sha, ..
+        } = parsed
+        else {
+            panic!("expected node");
+        };
+        assert_eq!(review_commit_sha, None);
+    }
+
+    #[test]
+    fn review_commit_sha_survives_redaction_on_export() {
+        // Issue #334 §8 carve-out: review_commit_sha is plaintext query
+        // substrate and must NOT be enumerated by the redaction engine's
+        // sensitive-field index, so a redaction-on export leaves it in plaintext
+        // even while the body is redacted.
+        let files = FileIndex::new();
+        let commits = CommitIndex::new();
+        let redact = crate::redaction::redact_value;
+        let c = ctx_with_commits("o/r", &files, &commits, &redact);
+        let mut review = sample_review(500, Some("deadbeefcafe"));
+        review.body = Some("token ghp_0123456789abcdefghijklmnopqrstuvwxyzA".to_owned());
+        let e = pr_review_records(&c, 3, &review);
+        let node = find_review_node(&e);
+
+        // The SHA is present in plaintext on the record.
+        let GraphRecord::Node {
+            review_commit_sha,
+            body_handle,
+            ..
+        } = node
+        else {
+            panic!("expected node");
+        };
+        assert_eq!(review_commit_sha.as_deref(), Some("deadbeefcafe"));
+
+        // The redaction engine never enumerates review_commit_sha as sensitive,
+        // so no export pass can rewrite it.
+        let sensitive = crate::redaction::sensitive_fields(node);
+        assert!(
+            !sensitive.iter().any(|(_, v)| *v == "deadbeefcafe"),
+            "review_commit_sha must not be a sensitive field: {sensitive:?}"
+        );
+        // Sanity: the body handle WAS routed through redaction (secret gone).
+        if let Some(h) = body_handle
+            && let Some(inline) = h.inline.as_deref()
+        {
+            assert!(
+                !inline.contains("ghp_0123456789"),
+                "body secret should be redacted: {inline}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_anchor_ids_are_byte_stable_across_runs() {
+        let files = FileIndex::new();
+        let mut commits = CommitIndex::new();
+        commits.insert("sha-a".to_owned(), vec!["codegraph:v5:commit-a".to_owned()]);
+        let c = ctx_with_commits("o/r", &files, &commits, &identity);
+        let a = pr_review_records(&c, 3, &sample_review(300, Some("sha-a")));
+        let b = pr_review_records(&c, 3, &sample_review(300, Some("sha-a")));
+        let ids_a: Vec<_> = a.records.iter().map(|r| r.id().to_owned()).collect();
+        let ids_b: Vec<_> = b.records.iter().map(|r| r.id().to_owned()).collect();
+        assert_eq!(ids_a, ids_b);
     }
 }

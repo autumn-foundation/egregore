@@ -163,6 +163,7 @@ project-domain side of the contract, but the registry remains the one from #6.
 | `EXTERNAL_HANDLE` | `project` | `project` | `Task`, `AcceptanceCriterion` | `ExternalLink` | many:1 | no |
 | `TOUCHES_FILE` | `project` | `codegraph` | `Task`; `Review` | `File` | many:many | no |
 | `MERGED_AS` | `project` | `codegraph` | `Task` *(`source_kind: github_pr`)* | `Commit` | many:1 | no |
+| `REVIEWS_COMMIT` | `project` | `codegraph` | `Review` *(`source_kind: github_review`)* | `Commit` | many:1 | no |
 | `MENTIONS_SYMBOL` | `project` | `codegraph` | `Task` | `Symbol` | many:many | yes |
 
 `REFERENCES_TASK` is promoted from reserved to defined: #6 already reserved the
@@ -180,6 +181,11 @@ serializes under the wrong domain and is skipped by the project-edge validator.
 `source_kind = github_pr`: the validator rejects a `MERGED_AS` whose source Task
 is a `github_issue`, `local_jsonl`, or otherwise-typed task (or carries no
 `source_kind`), so a non-PR task can never be persisted as merge evidence.
+`REVIEWS_COMMIT` (issue #334, the review-side mirror) is validated the same way:
+the FROM node must be a `Review` whose `source_kind = github_review` (Review nodes
+originate solely from the GitHub importer), the TO node a `codegraph.Commit`, so a
+non-Review node can never be persisted as having reviewed a commit. It anchors a
+review to the exact commit it looked at — never a range-approval verdict.
 
 **Merge-resolution lifecycle (issue #333, Codex round-6).** A PR's merge
 evidence is one of two artifacts: a `MERGED_AS` edge (unique `Commit` match) or a

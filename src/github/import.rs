@@ -107,9 +107,11 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     // `None`/"unknown" stored value from a pre-fingerprint state file, and every
     // none→some / some→different / some→none transition), the `/pulls` `ETag` is
     // suppressed below so GitHub returns a full 200 and merge links recompute; an
-    // unchanged fingerprint keeps the 304 fast path. Only `/pulls` is affected —
-    // MERGED_AS lives only on PR tasks — so issues/reviews/other endpoints keep
-    // their conditional fast path.
+    // unchanged fingerprint keeps the 304 fast path. The same fingerprint gate is
+    // extended to the commit-anchored review endpoints (`/pulls/comments` and
+    // `/pulls/{n}/reviews`) for REVIEWS_COMMIT recomputation (#334). Only
+    // `/issues/comments` (exempt issue_comment reviews) and other endpoints keep
+    // their conditional fast path unconditionally.
     let code_graph_fingerprint = state::code_graph_fingerprint(&commit_index);
     let seed_graph_changed =
         state.code_graph_fingerprint.as_deref() != Some(code_graph_fingerprint.as_str());
@@ -268,9 +270,18 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
     }
 
     // ── PR review comments → project.Review (pr_review_comment) ──────────────────
+    // Commit-anchored (#334): a changed seed graph suppresses this endpoint's
+    // conditional `ETag` too, so REVIEWS_COMMIT anchors are recomputed even when
+    // the comment payload is byte-identical. GitHub's `ETag` cannot observe the
+    // local seed, exactly as for `/pulls` (#333, round-5).
     let prc_path = format!("/repos/{}/pulls/comments?per_page=100", opts.source_repo);
+    let prc_prior_etags = if seed_graph_changed {
+        etags_without_prefix(&state.etags, &format!("{prc_path}?page="))
+    } else {
+        state.etags.clone()
+    };
     if let FetchOutcome::Modified { items, etags } =
-        client.fetch_paginated("pr_review_comments", &prc_path, &state.etags)?
+        client.fetch_paginated("pr_review_comments", &prc_path, &prc_prior_etags)?
     {
         state.etags.extend(etags);
         for item in &items {
@@ -278,11 +289,53 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                 continue;
             };
             let key = format!("pr_review_comment:{}", c.id);
-            let hash = blake3_hash_value(item);
+            // Anchor identity (#334) only applies when the parent PR number
+            // parses, matching review_comment_records (which emits nothing
+            // otherwise).
+            let native = model::trailing_number(&c.pull_request_url)
+                .map(|n| format!("pr_review_comment:{n}:{}", c.id));
+            // Fold the REVIEWS_COMMIT resolution outcome into the change hash so
+            // a seed graph that newly resolves this comment's commit_id re-emits
+            // the anchor even when the comment payload is unchanged (#334).
+            let marker = records::review_commit_marker(
+                ctx.commit_index,
+                "pr_review_comment",
+                c.commit_id.as_deref(),
+            );
+            let hash = state::review_hash(&blake3_hash_value(item), &marker);
+            let current_artifact = native.as_deref().and_then(|n| {
+                records::review_artifact_id(
+                    ctx.commit_index,
+                    opts.source_repo,
+                    n,
+                    "pr_review_comment",
+                    c.commit_id.as_deref(),
+                )
+            });
             if state.is_unchanged(&key, &hash) {
+                // Backfill the tracked artifact id without emitting (idempotent
+                // on a store this build already wrote; populates a legacy store
+                // so a LATER outcome change can still retract this artifact).
+                state.set_review_artifact(key, current_artifact);
                 continue;
             }
-            state.record_hash(key, hash);
+            // Retract a superseded anchor artifact whose outcome changed on this
+            // re-import (#334): the importer is otherwise purely additive.
+            if let Some(prior) = state.prior_review_artifact(&key).map(str::to_owned)
+                && Some(prior.as_str()) != current_artifact.as_deref()
+                && let Some(native) = native.as_deref()
+            {
+                push_emitted(
+                    &mut graph,
+                    &mut emitted_count,
+                    Emitted {
+                        records: vec![records::review_artifact_tombstone(native, &prior)],
+                        link_diagnostics: 0,
+                    },
+                );
+            }
+            state.record_hash(key.clone(), hash);
+            state.set_review_artifact(key, current_artifact);
             push_emitted(
                 &mut graph,
                 &mut emitted_count,
@@ -301,8 +354,16 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                 "/repos/{}/pulls/{number}/reviews?per_page=100",
                 opts.source_repo
             );
+            // Commit-anchored (#334): suppress this per-PR reviews `ETag` on a
+            // changed seed graph so REVIEWS_COMMIT anchors recompute even when
+            // the review payload is byte-identical.
+            let reviews_prior_etags = if seed_graph_changed {
+                etags_without_prefix(&state.etags, &format!("{path}?page="))
+            } else {
+                state.etags.clone()
+            };
             if let FetchOutcome::Modified { items, etags } =
-                client.fetch_paginated("pr_reviews", &path, &state.etags)?
+                client.fetch_paginated("pr_reviews", &path, &reviews_prior_etags)?
             {
                 state.etags.extend(etags);
                 for item in &items {
@@ -310,11 +371,44 @@ pub fn run_import(opts: &ImportOptions<'_>, prior_state: State) -> GithubResult<
                         continue;
                     };
                     let key = format!("pr_review:{number}:{}", r.id);
-                    let hash = blake3_hash_value(item);
+                    let native = format!("pr_review:{number}:{}", r.id);
+                    // Fold the REVIEWS_COMMIT resolution outcome into the change
+                    // hash (#334): a seed graph that newly resolves this review's
+                    // commit_id re-emits the anchor even when the payload is
+                    // unchanged.
+                    let marker = records::review_commit_marker(
+                        ctx.commit_index,
+                        "pr_review",
+                        r.commit_id.as_deref(),
+                    );
+                    let hash = state::review_hash(&blake3_hash_value(item), &marker);
+                    let current_artifact = records::review_artifact_id(
+                        ctx.commit_index,
+                        opts.source_repo,
+                        &native,
+                        "pr_review",
+                        r.commit_id.as_deref(),
+                    );
                     if state.is_unchanged(&key, &hash) {
+                        state.set_review_artifact(key, current_artifact);
                         continue;
                     }
-                    state.record_hash(key, hash);
+                    // Retract a superseded anchor artifact whose outcome changed
+                    // on this re-import (#334); otherwise purely additive.
+                    if let Some(prior) = state.prior_review_artifact(&key).map(str::to_owned)
+                        && Some(prior.as_str()) != current_artifact.as_deref()
+                    {
+                        push_emitted(
+                            &mut graph,
+                            &mut emitted_count,
+                            Emitted {
+                                records: vec![records::review_artifact_tombstone(&native, &prior)],
+                                link_diagnostics: 0,
+                            },
+                        );
+                    }
+                    state.record_hash(key.clone(), hash);
+                    state.set_review_artifact(key, current_artifact);
                     push_emitted(
                         &mut graph,
                         &mut emitted_count,
