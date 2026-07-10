@@ -3429,6 +3429,26 @@ fn validate_project_edge(
                 target_kind,
                 &[NodeKind::Commit],
             )?;
+            // The #333 schema constrains MERGED_AS to PR tasks: a merge-evidence
+            // link may only originate from a `github_pr` Task. Reject any other
+            // origin (github_issue, local_jsonl, or an absent source_kind) so a
+            // non-PR task is never persisted as having landed as a commit.
+            let task_source_kind = lookup_node_source_kind(source, records, sink)?;
+            match task_source_kind.as_deref() {
+                Some("github_pr") => {}
+                Some(other) => {
+                    return Err(ApiError::bad_request(format!(
+                        "project edge '{edge_id}' label '{}' requires a github_pr source task, not source_kind '{other}'",
+                        label.as_str()
+                    )));
+                }
+                None => {
+                    return Err(ApiError::bad_request(format!(
+                        "project edge '{edge_id}' label '{}' requires a github_pr source task, but the source task has no source_kind",
+                        label.as_str()
+                    )));
+                }
+            }
         }
         EdgeLabel::MentionsSymbol => {
             validate_project_edge_kinds(
@@ -6136,6 +6156,30 @@ fn lookup_node_kind(
     }
     match sink.read_back(id) {
         Ok(Some(GraphRecord::Node { kind, .. })) => Ok(Some(kind)),
+        Ok(_) => Ok(None),
+        Err(e) => Err(ApiError::internal(e.to_string())),
+    }
+}
+
+// Resolves the `source_kind` field of a node record (e.g. a project Task's
+// origin: `github_pr`, `github_issue`, `local_jsonl`). Returns `None` when the
+// node cannot be resolved or is not a node record. The current batch shadows the
+// persisted store, mirroring `lookup_node_kind`.
+fn lookup_node_source_kind(
+    id: &str,
+    batch: &[GraphRecord],
+    sink: &EmbeddedAletheiaSink,
+) -> WriteResult<Option<String>> {
+    for r in batch.iter().rev() {
+        if r.id() == id {
+            return Ok(match r {
+                GraphRecord::Node { source_kind, .. } => source_kind.clone(),
+                _ => None,
+            });
+        }
+    }
+    match sink.read_back(id) {
+        Ok(Some(GraphRecord::Node { source_kind, .. })) => Ok(source_kind),
         Ok(_) => Ok(None),
         Err(e) => Err(ApiError::internal(e.to_string())),
     }

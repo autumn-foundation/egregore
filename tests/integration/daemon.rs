@@ -2944,6 +2944,15 @@ fn project_external_link_json(id: &str) -> serde_json::Value {
 }
 
 fn project_task_json(id: &str, status: &str, transaction_time: &str) -> serde_json::Value {
+    project_task_json_with_source_kind(id, status, transaction_time, "github_issue")
+}
+
+fn project_task_json_with_source_kind(
+    id: &str,
+    status: &str,
+    transaction_time: &str,
+    source_kind: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "record_type": "node",
         "id": id,
@@ -2958,7 +2967,7 @@ fn project_task_json(id: &str, status: &str, transaction_time: &str) -> serde_js
             "bytes": 31
         },
         "status": status,
-        "source_kind": "github_issue",
+        "source_kind": source_kind,
         "source_external_link_id": PROJECT_EXTERNAL_LINK_ID,
         "assignees": ["markm"],
         "labels": ["spec", "pm"],
@@ -6887,7 +6896,12 @@ fn project_merged_as_task_to_commit_edge_is_accepted() {
             "payload": {
                 "records": [
                     project_external_link_json(PROJECT_EXTERNAL_LINK_ID),
-                    project_task_json(PROJECT_TASK_ID, "closed_completed", "2026-07-10T00:00:01Z"),
+                    project_task_json_with_source_kind(
+                        PROJECT_TASK_ID,
+                        "closed_completed",
+                        "2026-07-10T00:00:01Z",
+                        "github_pr"
+                    ),
                     merged_as_edge
                 ]
             }
@@ -6909,6 +6923,88 @@ fn project_merged_as_task_to_commit_edge_is_accepted() {
             GraphRecord::Edge { label: EdgeLabel::MergedAs, id, .. } if id.starts_with("project:v1:")
         )),
         "the project-domain MERGED_AS edge should be persisted"
+    );
+}
+
+/// Issue #333 / Codex round-3 P2: the #333 schema constrains `MERGED_AS` to PR
+/// tasks (`source_kind: github_pr`). The daemon project-edge validator must
+/// reject a `MERGED_AS` edge whose source Task is not a `github_pr` PR task (e.g.
+/// a `github_issue` Task) even when the Task→Commit endpoint kinds are otherwise
+/// valid, so downstream consumers never treat a non-PR task as landed evidence.
+#[test]
+fn project_merged_as_rejects_non_github_pr_source() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let data_dir = temp.path().join("store");
+    let mut daemon = start_daemon(&data_dir);
+    let metadata = read_metadata(&data_dir);
+
+    let commit_id = "codegraph:v5:merged-as-non-pr-commit";
+    let seed_commit = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "seed-merged-as-non-pr-commit",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "seed-merged-as-non-pr-commit-key",
+            "domain": "codegraph",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": {"records": [codegraph_commit_json(commit_id)]}
+        }),
+    );
+    assert!(
+        seed_commit.starts_with("HTTP/1.1 200"),
+        "codegraph Commit fixture should ingest, got {seed_commit}"
+    );
+
+    let merged_as_edge = serde_json::json!({
+        "record_type": "edge",
+        "id": "project:v1:merged-as-non-pr-task-to-commit",
+        "schema_version": PROJECT_SCHEMA_VERSION,
+        "label": "MERGED_AS",
+        "source": PROJECT_TASK_ID,
+        "target": commit_id,
+        "summary": "non-PR task claimed as merged"
+    });
+    let response = http_json(
+        &metadata,
+        "POST",
+        "/v1/records/ingest",
+        &serde_json::json!({
+            "request_id": "project-merged-as-non-pr-edge",
+            "agent_id": "project-test-agent",
+            "session_id": "project-test-session",
+            "idempotency_key": "project-merged-as-non-pr-edge-key",
+            "domain": "project",
+            "created_at": "2026-07-10T00:00:00Z",
+            "payload": {
+                "records": [
+                    project_external_link_json(PROJECT_EXTERNAL_LINK_ID),
+                    // source_kind github_issue — NOT a github_pr PR task.
+                    project_task_json(PROJECT_TASK_ID, "closed_completed", "2026-07-10T00:00:01Z"),
+                    merged_as_edge
+                ]
+            }
+        }),
+    );
+    assert!(
+        !response.starts_with("HTTP/1.1 200"),
+        "MERGED_AS from a non-github_pr Task should be rejected, got {response}"
+    );
+    daemon.stop();
+
+    let sink = EmbeddedAletheiaSink::open(&data_dir).expect("embedded store should reopen");
+    let records = sink
+        .read_all_records()
+        .expect("read_all_records should succeed");
+    assert!(
+        !records.iter().any(|record| matches!(
+            record,
+            GraphRecord::Edge { label: EdgeLabel::MergedAs, id, .. }
+                if id == "project:v1:merged-as-non-pr-task-to-commit"
+        )),
+        "the rejected MERGED_AS edge must not be persisted"
     );
 }
 

@@ -176,6 +176,10 @@ a `project:v<schema_version>:` record ID and `schema_version = PROJECT_SCHEMA_VE
 — so the daemon project-edge validator applies to them and `project:v1:` readers
 find them. An edge that names a project-only label but carries a `codegraph:` ID
 serializes under the wrong domain and is skipped by the project-edge validator.
+`MERGED_AS` additionally requires the FROM `Task` to have
+`source_kind = github_pr`: the validator rejects a `MERGED_AS` whose source Task
+is a `github_issue`, `local_jsonl`, or otherwise-typed task (or carries no
+`source_kind`), so a non-PR task can never be persisted as merge evidence.
 
 ## 8 - Redaction Call-Out
 
