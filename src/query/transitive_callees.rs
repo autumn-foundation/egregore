@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{MemoryAuditDiagnostic, ResolvedFailureTarget, record_node_kind};
+use super::{ResolvedFailureTarget, record_node_kind};
 use crate::ir::{CallResolution, EdgeLabel, GraphRecord, NodeKind};
 
 // ---------------------------------------------------------------------------
@@ -146,9 +146,6 @@ pub struct TransitiveCalleesContext<'a> {
     pub unresolved: Vec<UnresolvedCalleeRow<'a>>,
     /// Depth-bound truncation diagnostic, when reachable nodes were dropped.
     pub truncation: Option<TransitiveCalleeTruncation>,
-    /// Stable machine-readable diagnostics (dangling edge targets outside the
-    /// unresolved category — currently unused but reserved).
-    pub diagnostics: Vec<MemoryAuditDiagnostic>,
     /// The depth bound used for the walk.
     pub max_depth: usize,
 }
@@ -287,7 +284,6 @@ pub fn transitive_callees<'a>(
     let mut visited: BTreeSet<&str> = BTreeSet::new();
     visited.insert(anchor_id);
     let mut frontier: Vec<&str> = vec![anchor_id];
-    let mut diagnostics: Vec<MemoryAuditDiagnostic> = Vec::new();
 
     // Discovers the next BFS level of *reachable* nodes from `frontier` over
     // outbound edges. For every newly reachable node the minimum
@@ -494,26 +490,11 @@ pub fn transitive_callees<'a>(
             .then_with(|| a.record.id().cmp(b.record.id()))
     });
 
-    diagnostics.sort_by(|a, b| {
-        a.code
-            .cmp(&b.code)
-            .then_with(|| a.source_record_id.cmp(&b.source_record_id))
-            .then_with(|| a.target_handle.cmp(&b.target_handle))
-            .then_with(|| a.relation.cmp(&b.relation))
-    });
-    diagnostics.dedup_by(|a, b| {
-        a.code == b.code
-            && a.source_record_id == b.source_record_id
-            && a.target_handle == b.target_handle
-            && a.relation == b.relation
-    });
-
     Some(TransitiveCalleesContext {
         anchor,
         rows,
         unresolved: unresolved.into_values().collect(),
         truncation,
-        diagnostics,
         max_depth,
     })
 }

@@ -334,18 +334,8 @@ pub(crate) fn query_transitive_callees_cmd(
         std::process::exit(2);
     };
 
-    // ── diagnostics: traversal diagnostics + redaction gate over reached rows ─
-    let mut diagnostics: Vec<AuditDiagnostic<'_>> = ctx
-        .diagnostics
-        .iter()
-        .map(|d| AuditDiagnostic {
-            code: &d.code,
-            source_record_id: &d.source_record_id,
-            target_handle: &d.target_handle,
-            relation: &d.relation,
-            target_domain: &d.target_domain,
-        })
-        .collect();
+    // ── diagnostics: redaction gate over reached rows ────────────────────────
+    let mut diagnostics: Vec<AuditDiagnostic<'_>> = Vec::new();
     for row in &ctx.rows {
         protected_payload_diagnostics(row.record, &mut diagnostics);
     }
