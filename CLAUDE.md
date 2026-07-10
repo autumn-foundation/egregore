@@ -131,6 +131,14 @@ cargo run -- query at src/lib.rs:2 --graph graph.jsonl            # exit 2 (no_e
 cargo run -- query at src/lib.rs:42 --graph history.graph.jsonl --at <sha>  # spans as of that commit
 cargo run -- query at src/lib.rs --graph graph.jsonl              # exit 1 (malformed_location)
 
+# file:line position → innermost symbol + its query-context bundle (issue #212)
+cargo run -- query locate src/lib.rs:42 --graph graph.jsonl       # exit 0, symbol + context bundle
+cargo run -- query locate src/lib.rs:2 --graph graph.jsonl        # exit 2 (no_enclosing_symbol)
+cargo run -- query locate src/lib.rs:9999 --graph graph.jsonl     # exit 2 (line_out_of_range)
+cargo run -- query locate src/lib.rs:42 --graph history.graph.jsonl --at <sha>       # spans as of a commit
+cargo run -- query locate src/lib.rs:42 --graph history.graph.jsonl --as-of <instant> # spans as of an instant
+cargo run -- query locate src/lib.rs --graph graph.jsonl          # exit 1 (malformed_location)
+
 # Declared Cargo dependencies with lockfile resolution (issue #180)
 cargo run -- query manifest-deps --graph graph.jsonl                # exit 0 (even when surface is empty)
 cargo run -- query manifest-deps --graph graph.jsonl --name serde   # direct "do we depend on X?" lookup
@@ -264,6 +272,21 @@ embeddings. A line outside every symbol span is a typed `no_enclosing_symbol` an
 never a nearest-neighbor guess; malformed locations exit 1 (`malformed_location`). The `--at
 <commit>` temporal pin resolves spans as they existed at that commit. Output is a
 deterministic JSON envelope, byte-identical across runs. See `docs/cli/query.md`.
+
+`eg query locate <path>:<line>` is the positional sibling of `query at` and positional entry
+into the `eg query context` contract (issue #212): it resolves the innermost enclosing `Symbol`
+(reusing the #151 span-containment resolver, same innermost-of-nested selection and enclosing
+chain) and returns that symbol's same trust-separated cross-domain bundle as `query context` —
+`source_facts`, `observations`, `project_state`, `artifacts`, `verification_evidence`, and
+`unresolved` — anchored on the located record ID so same-name symbols never bleed in. Absence is
+always typed, never a guess: a line in a gap is `no_enclosing_symbol` (exit 2), a line beyond the
+file's last recorded structural span is `line_out_of_range` (exit 2, carrying `max_known_line` —
+`File` nodes store no line count, so the recorded extent is the deterministic upper bound), and
+an unknown path is `no_match` (exit 2). Both `--at <commit>` and `--as-of <instant>` temporal
+pins select which symbol is located (the bundle itself is not temporally filtered, matching
+`query context`); an unscoped cross-repository path collision fails closed (`ambiguous_repository`,
+exit 1). Read-only over `--graph`/`--data-dir`; output (JSON or `--format text`) is deterministic
+and byte-identical across runs. See `docs/cli/query.md`.
 
 Pre-ingest referential-integrity validation (issue #103):
 

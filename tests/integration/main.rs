@@ -64,6 +64,7 @@ mod query_cycles;
 mod query_debt_markers;
 mod query_implementors;
 mod query_lifeline;
+mod query_locate;
 mod query_orient;
 mod query_ownership;
 mod query_public_api;

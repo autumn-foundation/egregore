@@ -37,6 +37,7 @@ eg query unreferenced     --graph <PATH>   [--repo <SELECTOR>]
 eg query cycles   [SCOPE] --graph <PATH>   [--repo <SELECTOR>] [--format json|text]
 
 eg query at       <PATH>:<LINE> --graph <PATH> [--at <COMMIT>] [--repo <SELECTOR>]
+eg query locate   <PATH>:<LINE> --graph <PATH> [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--format json|text]
 eg query manifest-deps    --graph <PATH>   [--name <CRATE>] [--repo <SELECTOR>] [--format json|text]
 eg query churn            --graph <PATH>    [--repo <SELECTOR>] [--limit N] [--format json|text]
 eg query churn            --data-dir <DIR>  [--repo <SELECTOR>] [--limit N] [--format json|text]
@@ -114,6 +115,12 @@ Evidence-backed audit subcommands have their own pages:
 - `eg query at` — resolve a **`file:line` location to its smallest enclosing
   code symbol**, with the enclosing chain reported outermost → innermost
   ([below](#eg-query-at), issue #151).
+
+- `eg query locate` — resolve a **`file:line` position to its innermost symbol
+  *and* that symbol's trust-separated `eg query context` bundle** (source facts,
+  observations, project state, artifacts, verification evidence) in one call —
+  positional entry into the evidence graph without a name guess
+  ([below](#eg-query-locate), issue #212).
 
 - `eg query manifest-deps` — every **directly-declared Cargo dependency** with its
   declared requirement, lockfile-resolved version (or a documented unresolved
@@ -871,6 +878,139 @@ The returned `record_id` is a stable handle: feed it directly to
 `eg query change-impact`, `eg query failures`, or `eg query context` to pivot
 from a raw location into callers, prior failures, and evidence without ever
 scanning the file's full symbol list.
+
+---
+
+## eg query locate
+
+Positional entry into the `eg query context` contract (issue #212). Where
+`eg query at` returns only the enclosing symbol handle, `eg query locate`
+resolves the innermost symbol at a `file:line` **and** returns that symbol's
+same trust-separated cross-domain bundle as `eg query context` — source facts,
+agent observations, project state, artifacts, and verification evidence — in one
+call. An agent holding a stack-trace frame, `git blame` line, diff hunk, or
+compiler diagnostic gets the evidence graph without first guessing a symbol
+name to enter it.
+
+The span-containment resolution is identical to `eg query at` (it reuses the
+same resolver): innermost-of-nested selection, the outermost → innermost
+enclosing chain, current-state-by-default view with HEAD-snapshot anchoring,
+and the no-guess discipline for lines outside every span. Strictly read-only:
+a `--data-dir` embedded store is read through a throwaway temporary copy, so the
+original store stays byte-for-byte untouched. Rust extraction only.
+
+```text
+eg query locate <PATH>:<LINE> --graph <PATH>   [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--supersession <MODE>] [--format json|text]
+eg query locate <PATH>:<LINE> --data-dir <DIR> [--at <COMMIT> | --as-of <INSTANT>] [--repo <SELECTOR>] [--supersession <MODE>] [--format json|text]
+```
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `<PATH>:<LINE>` | yes | Repo-relative path and 1-based line, e.g. `src/lib.rs:42`. The line is taken after the **last** `:`. |
+| `--graph <PATH>` | one of | Graph JSONL produced by `eg scan` or `eg scan-history`. |
+| `--data-dir <DIR>` | one of | Embedded `AletheiaDB` store. Structural records only — no `--embed` required. |
+| `--at <COMMIT>` | no | Temporal pin: resolve the position against symbol spans **as they existed at this commit** (full SHA or unique prefix). Requires a history-bearing store. Mutually exclusive with `--as-of`. |
+| `--as-of <INSTANT>` | no | Temporal pin: resolve against the most recent commit **at or before** this RFC 3339 instant. Mutually exclusive with `--at`. |
+| `--repo <SELECTOR>` | no | Restrict resolution to one repository (see [Repository scope](#repository-scope---repo-issue-67)). |
+| `--supersession <MODE>` | no | How superseded/contradicted observations are handled in the bundle: `exclude` (default) or `include-but-flag`, matching `eg query context`. |
+| `--format` | no | `json` (default) or `text`. |
+
+### The context bundle
+
+On a successful locate, the envelope carries the located `symbol` and
+`enclosing_chain` (identical shape and fields to `eg query at`) **plus** the
+five trust-separated sections of `eg query context`, anchored on the located
+record ID so only the located symbol (not every same-named symbol) drives the
+answer:
+
+| Section | Trust class | Contents |
+|---------|-------------|----------|
+| `source_facts` | deterministic | The located `Symbol`/`File` code-graph nodes. |
+| `topology_edges` | deterministic | Structural edges (`DEFINES`, etc.) among the source facts. |
+| `observations` | agent-authored | `Observation`/`Decision`/`Failure` nodes citing the symbol. |
+| `project_state` | project | Linked `Task`/`AcceptanceCriterion`/issue/PR nodes. |
+| `artifacts` | artifact | Linked `Artifact`/`PatchArtifact`/`FileEdit` nodes. |
+| `verification_evidence` | verification | Linked `Verification`/`TestRun`/`CommandRun` evidence. |
+| `unresolved` | diagnostic | Evidence-link targets absent from this store slice. |
+
+The bundle is **not** temporally filtered under a commit pin: the pin selects
+*which* symbol is located, and the bundle is everything known about that symbol
+identity — consistent with `eg query context`, which has no temporal selector.
+
+### Resolution semantics
+
+Same as [`eg query at`](#eg-query-at): innermost wins, the enclosing chain is
+reported outermost → innermost, current state is the default view, and an
+unscoped cross-repository path collision fails closed. Two absence answers are
+distinguished:
+
+- `no_enclosing_symbol` — the line sits in a gap inside the file (blank line,
+  file-level `use`, comment, inter-item whitespace).
+- `line_out_of_range` — the line is **beyond the file's last recorded
+  structural span**. `File` nodes carry no span, so the file's true line count
+  is not stored; the recorded extent (`max_known_line`) is the deterministic
+  upper bound, and a line past it is reported as out of range rather than
+  guessed. Both are typed answers carrying the resolved `file_record_id`; a
+  nearest-neighbor symbol is never returned.
+
+### Exit codes and error envelopes
+
+Errors are one-line `{"ok":false,"error":{...}}` envelopes on stdout (repository
+**selector** rejections print to stderr, as elsewhere):
+
+| Code | Error `code` | Meaning |
+|------|--------------|---------|
+| `0` | — | An enclosing symbol was found; the symbol, chain, and context bundle were printed. |
+| `1` | `malformed_location` | Input is not `<path>:<line>` with a positive 1-based line. |
+| `1` | `malformed_timestamp` | `--as-of` is not a valid RFC 3339 instant. |
+| `1` | `ambiguous_commit_prefix` | `--at` prefix matches more than one commit; `candidates` lists them. |
+| `1` | `ambiguous_repository` | Unscoped path exists in more than one repository; re-run with `--repo`. |
+| `1` | `unknown_repository_selector` / `ambiguous_repository_selector` | `--repo` selector failed (stderr diagnostic). |
+| `2` | `no_match` | No record carries the path in the selected view (unknown file, or file absent at the pinned point). |
+| `2` | `missing_commit` | `--at` commit is absent from the store's history. |
+| `2` | `no_commit_at_or_before` | No commit exists at or before the `--as-of` instant. |
+| `2` | `no_enclosing_symbol` | The path is known but no symbol span contains the line. Carries `file_record_id`. |
+| `2` | `line_out_of_range` | The line is beyond the file's last recorded structural span. Carries `max_known_line` and `file_record_id`. |
+
+### Example
+
+```sh
+eg scan . --out g.jsonl
+eg query locate src/lib.rs:412 --graph g.jsonl
+```
+
+```json
+{
+  "ok": true,
+  "path": "src/lib.rs",
+  "line": 412,
+  "symbol": {
+    "record_id": "codegraph:v4:abc...",
+    "kind": "Symbol",
+    "name": "outer::Gadget::method_one",
+    "symbol_kind": "method",
+    "repo_relative_path": "src/lib.rs",
+    "span": {"start_byte": 4096, "end_byte": 5200, "start_line": 409, "end_line": 431}
+  },
+  "enclosing_chain": [ /* module → impl → method, outermost → innermost */ ],
+  "source_facts": [ {"record_id": "codegraph:v4:abc...", "kind": "Symbol", "name": "outer::Gadget::method_one", "repo_relative_path": "src/lib.rs"} ],
+  "observations": [ {"record_id": "agent_memory:v1:...", "text_summary": "method_one panics on empty input"} ],
+  "project_state": [],
+  "artifacts": [],
+  "verification_evidence": [],
+  "unresolved": []
+}
+```
+
+`locate` is the one-call form of `eg query at` followed by
+`eg query context <name>` — but it never needs the intermediate name guess, and
+it anchors on the exact located record, so same-name symbols never bleed in.
+
+> **Note.** An MCP-tool wrapper for `locate` is tracked separately (the issue
+> #181/#182 tool-surface cluster) and can follow once the CLI contract is
+> stable, mirroring how `eg query at` deferred its MCP exposure.
 
 ---
 
