@@ -1457,12 +1457,18 @@ pub fn assemble_pack(
     }
     merged_pr_ids.sort();
     merged_pr_ids.dedup();
-    // A PR is approved when an approving Review references it via REFERENCES_TASK
-    // AND that review resolves inside the same half-open pack window. An
-    // approving review whose valid time falls before `from` or at/after `to`,
-    // or that has no resolvable valid time, is omitted from the windowed
-    // `reviews` section, so it must not count toward approval either — otherwise
-    // the pack would suppress the gap while showing zero in-window approval.
+    // A PR is approved when an approving Review references it via REFERENCES_TASK,
+    // that review resolves inside the same half-open pack window, AND its resolved
+    // valid time is AT OR BEFORE the referenced PR's merge time (`merged_at`). An
+    // approval SUBMITTED AFTER the merge did not gate it — it is post-hoc and must
+    // not count (Codex round-9 Finding 1). An approving review whose valid time
+    // falls before `from` or at/after `to`, or that has no resolvable valid time,
+    // is likewise omitted from the windowed `reviews` section, so it must not
+    // count toward approval either — otherwise the pack would suppress the gap
+    // while showing zero in-window approval. The at-or-before-merge check here
+    // uses fields available today (`merged_at`); it is distinct from the
+    // #334-degraded `approval_precedes_final_head` gap, which compares against the
+    // final HEAD commit and stays capability-unavailable.
     let approving_targets: BTreeSet<String> = records
         .iter()
         .filter_map(|r| match r {
@@ -1472,10 +1478,21 @@ pub fn assemble_pack(
                 target,
                 ..
             } if label.as_str() == "REFERENCES_TASK" => {
+                // The referenced PR's merge time. A target with no resolvable
+                // `merged_at` is not a windowable merged PR, so no approval can be
+                // gated by it.
+                let merged_at = records
+                    .iter()
+                    .find(|rec| rec.id() == target)
+                    .and_then(merged_pr_merge_time)
+                    .and_then(parse_rfc3339)?;
                 let approving = records.iter().any(|rec| {
                     rec.id() == source
                         && is_approving_review(rec)
-                        && resolve_valid_time(rec).is_some_and(|vt| in_window(&vt, window))
+                        && resolve_valid_time(rec).is_some_and(|vt| {
+                            in_window(&vt, window)
+                                && parse_rfc3339(&vt).is_some_and(|rt| rt <= merged_at)
+                        })
                 });
                 approving.then(|| target.clone())
             }
@@ -1660,14 +1677,9 @@ pub fn assemble_pack(
         citation_tallies,
     };
 
-    // --- manifest counts ---
-    let mut included_record_counts: BTreeMap<String, usize> = BTreeMap::new();
-    let mut tuple_counts: BTreeMap<String, usize> = BTreeMap::new();
-    for br in &all_section_rows {
-        let tc = citation_trust_class(&br.record).to_owned();
-        *included_record_counts.entry(tc).or_insert(0) += 1;
-        *tuple_counts.entry(tuple_key(&br.record)).or_insert(0) += 1;
-    }
+    // --- manifest counts (recomputed identically in verify_pack's Integrity
+    // verdict via the shared `compute_manifest_counts`) ---
+    let (included_record_counts, tuple_counts) = compute_manifest_counts(&all_section_rows);
 
     diagnostics.sort_by_key(diagnostic_sort_key);
 
@@ -1708,6 +1720,48 @@ fn tuple_key(record: &GraphRecord) -> String {
         } => format!("{}/v{schema_version}", label.as_str()),
         GraphRecord::Tombstone { schema_version, .. } => format!("Tombstone/v{schema_version}"),
     }
+}
+
+/// Recomputes the manifest's aggregate counts from the actual included section
+/// rows: per-trust-class `included_record_counts` and per-`(kind,schema_version)`
+/// `tuple_counts` (AC8). Shared by `assemble_pack` (the source of truth that
+/// populates the manifest) and `verify_pack`'s Integrity re-check so the two can
+/// never drift — a tampered pack with rows removed but the manifest aggregates
+/// left stale is caught offline.
+fn compute_manifest_counts<'a>(
+    rows: impl IntoIterator<Item = &'a BundleRecord>,
+) -> (BTreeMap<String, usize>, BTreeMap<String, usize>) {
+    let mut included_record_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut tuple_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for br in rows {
+        let tc = citation_trust_class(&br.record).to_owned();
+        *included_record_counts.entry(tc).or_insert(0) += 1;
+        *tuple_counts.entry(tuple_key(&br.record)).or_insert(0) += 1;
+    }
+    (included_record_counts, tuple_counts)
+}
+
+/// Redaction-safe divergence detail: names the aggregate, the first (sorted) key
+/// whose count differs, and the manifest-stored vs recomputed numbers. Keys are
+/// trust-class labels or `(kind, schema_version)` tuple keys and counts are
+/// integers — never a record payload.
+fn manifest_count_divergence_detail(
+    which: &str,
+    manifest: &BTreeMap<String, usize>,
+    recomputed: &BTreeMap<String, usize>,
+) -> String {
+    let mut keys: BTreeSet<&String> = manifest.keys().collect();
+    keys.extend(recomputed.keys());
+    for key in keys {
+        let stored = manifest.get(key).copied().unwrap_or(0);
+        let actual = recomputed.get(key).copied().unwrap_or(0);
+        if stored != actual {
+            return format!(
+                "manifest {which} count diverges from section rows: key '{key}' stored {stored} != recomputed {actual}"
+            );
+        }
+    }
+    format!("manifest {which} count diverges from section rows")
 }
 
 fn diagnostic_sort_key(d: &PackDiagnostic) -> (String, String, String) {
@@ -1967,6 +2021,33 @@ pub fn verify_pack(pack: &EvidencePack) -> PackVerifyReport {
                     format!("section {} rows are not canonically ordered", section.class);
                 break 'integrity;
             }
+        }
+    }
+    // Recompute the manifest aggregates from the actual included section rows and
+    // fail Integrity if they diverge from the stored values. Without this a pack
+    // tampered to drop rows (with the section `record_count` adjusted so the
+    // per-section checks above still match) but the manifest
+    // `included_record_counts` / `tuple_counts` left stale would verify clean
+    // (Codex round-9 Finding 2). Mirrors `src/bundle.rs` `verify_bundle`, and
+    // recomputes via the SAME `compute_manifest_counts` helper `assemble_pack`
+    // populates the manifest with, so the two can never drift.
+    if integrity_passed {
+        let (recomputed_records, recomputed_tuples) =
+            compute_manifest_counts(all_rows.iter().copied());
+        if recomputed_records != pack.manifest.included_record_counts {
+            integrity_passed = false;
+            integrity_detail = manifest_count_divergence_detail(
+                "included_record_counts",
+                &pack.manifest.included_record_counts,
+                &recomputed_records,
+            );
+        } else if recomputed_tuples != pack.manifest.tuple_counts {
+            integrity_passed = false;
+            integrity_detail = manifest_count_divergence_detail(
+                "tuple_counts",
+                &pack.manifest.tuple_counts,
+                &recomputed_tuples,
+            );
         }
     }
     let integrity = VerificationVerdict {
@@ -2281,7 +2362,11 @@ pub(crate) mod fixture {
         }
 
         // Reviews for pr01..pr03 (approved), pr04 (commented), pr06 (changes_requested).
-        // pr05 has no review at all.
+        // pr05 has no review at all. Reviews resolve at 08:00 on merge day, i.e.
+        // AT/BEFORE the 12:00 `merged_at` of the PRs they reference, so the three
+        // approving reviews gated their merges and genuinely count toward approval
+        // (Codex round-9 Finding 1: a post-merge approval does not suppress the
+        // gap).
         let reviews = [
             ("project:v1:rv01", "project:v1:pr01", "approved"),
             ("project:v1:rv02", "project:v1:pr02", "approved"),
@@ -2290,7 +2375,7 @@ pub(crate) mod fixture {
             ("project:v1:rv05", "project:v1:pr06", "changes_requested"),
         ];
         for (rid, pid, state) in reviews {
-            records.push(review(rid, &march(4, 8), state));
+            records.push(review(rid, &march(3, 8), state));
             records.push(references_task(rid, pid));
         }
 
@@ -3335,13 +3420,19 @@ mod pack338_tests {
         );
     }
 
-    /// Positive companion: an in-window approving review DOES suppress the gap.
+    /// Positive companion: an in-window approving review submitted AT/BEFORE the
+    /// PR's merge time DOES suppress the gap.
+    ///
+    /// (Round-9 Finding 1: the review time was previously `2026-03-16` — AFTER
+    /// the `2026-03-15` merge — which encoded the post-hoc-approval bug this fix
+    /// corrects. A genuine gate-passing approval must precede the merge, so the
+    /// review now resolves BEFORE `merged_at`.)
     #[test]
     fn in_window_approving_review_suppresses_gap() {
         use super::fixture::{pr, references_task, review};
         let records = vec![
             pr("project:v1:prX", "2026-03-15T12:00:00Z", "cX"),
-            review("project:v1:rvX", "2026-03-16T08:00:00Z", "approved"),
+            review("project:v1:rvX", "2026-03-14T08:00:00Z", "approved"),
             references_task("project:v1:rvX", "project:v1:prX"),
         ];
         let pack = assemble_pack(
@@ -3371,6 +3462,98 @@ mod pack338_tests {
             .and_then(|s| s.measurement.as_ref())
             .expect("review_coverage measurement");
         assert_eq!(rc.merged_pr_count, 1);
+        assert_eq!(rc.approved_pr_count, 1);
+        assert!(rc.unapproved_pr_ids.is_empty());
+    }
+
+    /// Codex round-9 Finding 1: an approving review whose resolved valid time is
+    /// AFTER the PR's `merged_at` (yet still inside the pack window) did NOT gate
+    /// the merge — it is post-hoc. It must NOT suppress the
+    /// `merged_pr_without_approving_review` gap, and the PR must count as
+    /// unapproved for review coverage. Before the fix the in-window approval
+    /// suppressed the gap regardless of whether it preceded the merge.
+    #[test]
+    fn approval_after_merge_time_does_not_suppress_gap() {
+        use super::fixture::{pr, references_task, review};
+        // PR merged EARLY in-window (merged_at == valid_time == 2026-03-05).
+        // Its only approving review resolves later in-window (2026-03-20), AFTER
+        // the merge.
+        let records = vec![
+            pr("project:v1:prX", "2026-03-05T00:00:00Z", "cX"),
+            review("project:v1:rvX", "2026-03-20T08:00:00Z", "approved"),
+            references_task("project:v1:rvX", "project:v1:prX"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+
+        assert!(
+            pack.gaps
+                .iter()
+                .any(|g| g.gap_class == "merged_pr_without_approving_review"
+                    && g.record_ids.contains(&"project:v1:prX".to_owned())),
+            "post-merge approval must not suppress the gap: gaps={:?}",
+            pack.gaps
+        );
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_ref())
+            .expect("review_coverage measurement");
+        assert_eq!(rc.merged_pr_count, 1);
+        assert_eq!(rc.approved_pr_count, 0);
+        assert!(
+            rc.unapproved_pr_ids.contains(&"project:v1:prX".to_owned()),
+            "PR whose only approval is post-merge must be unapproved"
+        );
+    }
+
+    /// Regression companion to the round-9 fix: an approving review whose valid
+    /// time EQUALS the PR's `merged_at` (the at-or-before boundary) still counts
+    /// as a gate-passing approval and suppresses the gap.
+    #[test]
+    fn approval_at_merge_time_suppresses_gap() {
+        use super::fixture::{pr, references_task, review};
+        let records = vec![
+            pr("project:v1:prX", "2026-03-15T12:00:00Z", "cX"),
+            // Exactly at merged_at (== the PR valid_time set by `pr`).
+            review("project:v1:rvX", "2026-03-15T12:00:00Z", "approved"),
+            references_task("project:v1:rvX", "project:v1:prX"),
+        ];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+
+        assert!(
+            !pack
+                .gaps
+                .iter()
+                .any(|g| g.gap_class == "merged_pr_without_approving_review"
+                    && g.record_ids.contains(&"project:v1:prX".to_owned())),
+            "approval exactly at merge time must suppress the gap: gaps={:?}",
+            pack.gaps
+        );
+        let rc = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "review_coverage")
+            .and_then(|s| s.measurement.as_ref())
+            .expect("review_coverage measurement");
         assert_eq!(rc.approved_pr_count, 1);
         assert!(rc.unapproved_pr_ids.is_empty());
     }
@@ -4034,6 +4217,48 @@ mod pack338_tests {
         let report = verify_pack(&tampered);
         assert!(!report.ok);
         assert!(!report.integrity.passed);
+    }
+
+    /// Codex round-9 Finding 2: a pack tampered by removing a section row and
+    /// decrementing THAT section's `record_count` (so per-section length still
+    /// matches, and remaining rows keep valid hashes + canonical order) while
+    /// leaving `manifest.included_record_counts` / `manifest.tuple_counts` STALE
+    /// must FAIL Integrity. Before the fix, verify never recomputed the manifest
+    /// aggregates from the actual rows, so this self-inconsistent artifact
+    /// verified clean.
+    #[test]
+    fn verify_fails_when_manifest_counts_diverge_from_rows() {
+        let pack = assemble_cc81();
+        assert!(
+            verify_pack(&pack).integrity.passed,
+            "clean pack integrity passes"
+        );
+
+        let mut tampered = pack;
+        // Drop the LAST row of the first non-empty section: canonical ordering is
+        // preserved (sorted list, tail removed) and every remaining row's hash is
+        // unchanged, so the ONLY inconsistency left is the stale manifest total.
+        let section = tampered
+            .sections
+            .iter_mut()
+            .find(|s| !s.records.is_empty())
+            .unwrap();
+        section.records.pop();
+        section.record_count -= 1;
+
+        let report = verify_pack(&tampered);
+        assert!(
+            !report.integrity.passed,
+            "stale manifest included/tuple counts must fail Integrity"
+        );
+        assert!(!report.ok);
+        // Redaction-safe detail: names the divergent aggregate and the numbers,
+        // never a payload.
+        assert!(
+            report.integrity.detail.contains("count"),
+            "detail names the divergent count: {}",
+            report.integrity.detail
+        );
     }
 
     #[test]

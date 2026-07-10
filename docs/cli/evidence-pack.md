@@ -94,6 +94,17 @@ window keeps it in place instead of dropping or misplacing it. (Gap rows whose
 select key already *is* their own valid time — e.g. `commit_outside_any_pr`,
 keyed on the commit's own time — are unaffected.)
 
+An approving `Review` suppresses the gap (and counts toward review coverage)
+**only when its resolved valid time is at or before the referenced PR's
+`merged_at`** merge time. An approval submitted *after* the merge — even if it
+still resolves inside the pack window — did not gate the merge and is treated as
+post-hoc: it does **not** suppress `merged_pr_without_approving_review` and the
+PR counts as unapproved. The comparison uses fields available today (the review's
+`temporal.valid_time -> node valid_time -> executed_at` resolution vs the PR's
+`merged_at`); it is distinct from the #334-dependent `approval_precedes_final_head`
+gap, which compares an approval against the PR's final HEAD commit and stays
+`capability_unavailable` until #334 lands.
+
 ## Catalog integration and the three-way class outcome
 
 Every class the control maps becomes a section. A class is **available** when
@@ -210,7 +221,7 @@ PR/commit/review evidence therefore emits none of those change-management gaps;
 
 | Gap class | Meaning | Emitted when the control requires | Status |
 |-----------|---------|-----------------------------------|--------|
-| `merged_pr_without_approving_review` | A merged PR Task with no linked **in-window** approving `Review` (via `REFERENCES_TASK`). An approving review that resolves outside the pack window — or has no resolvable valid time — is omitted from the `reviews` section and does **not** suppress this gap. | `pull_requests` and/or `reviews`/`review_coverage` | Fully implemented. |
+| `merged_pr_without_approving_review` | A merged PR Task with no linked **in-window** approving `Review` (via `REFERENCES_TASK`) that resolves **at or before** the PR's `merged_at`. An approving review that resolves outside the pack window, has no resolvable valid time, or is submitted **after** the merge (post-hoc) does **not** suppress this gap. | `pull_requests` and/or `reviews`/`review_coverage` | Fully implemented. |
 | `commit_outside_any_pr` | An in-window `Commit` not claimed by any PR via `MERGED_AS`. | `commits` and/or `pull_requests` | Fully implemented. |
 | `missing_valid_time` | A class-relevant record with no resolvable valid time. | *(generic — any control)* | Fully implemented. |
 | `review_unanchored_no_commit_sha` | A review with no anchoring reviewed-commit SHA. | `reviews`/`review_coverage` | **Needs #334.** Always `capability_unavailable`. |
@@ -235,7 +246,15 @@ the two gap classes.
 Re-verifies an assembled pack offline and read-only:
 
 - **Integrity** — recompute the BLAKE3 hash of each scrubbed record and check
-  the per-section `(valid_time, record_id)` canonical order.
+  the per-section `(valid_time, record_id)` canonical order. Integrity also
+  **recomputes the manifest aggregates** `included_record_counts` (per trust
+  class) and `tuple_counts` (per `(kind, schema_version)` tuple) from the actual
+  included section rows — via the same helper `assemble` populates them with — and
+  fails if either diverges from the manifest's stored values. A pack tampered to
+  drop a section row with its section `record_count` adjusted (so the per-section
+  length check still matches) but the manifest aggregates left stale therefore
+  fails Integrity, with a redaction-safe detail naming the divergent aggregate,
+  the first divergent key, and the stored-vs-recomputed numbers (never a payload).
 - **Coverage** — recompute the #65 citation thresholds (>=95% code rows cited;
   100% non-code rows cited).
 - **Safety** — no raw sensitive classes (`redaction::detect_secret`), and every
