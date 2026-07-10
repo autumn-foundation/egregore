@@ -1175,6 +1175,75 @@ fn stored_blob_redacts_quoted_env_secret() {
     );
 }
 
+// Issue #321 (Codex round-8 P1): after a QUOTED env secret is redacted, the
+// redaction loop re-detects the placeholder it just wrote as the quote-stripped
+// env value. The old forward-progress guard `break`-ed out of the whole loop
+// there, so a SECOND, independent env secret after the quoted one was never
+// scanned and was copied into the protected blob unredacted. The scan-cursor fix
+// must skip past the placeholder and keep redacting — BOTH secrets must be absent.
+#[test]
+fn stored_blob_redacts_second_env_secret_after_quoted_placeholder() {
+    const FIRST_QUOTED: &str = "firstSecretValueLong";
+    const SECOND_PLAIN: &str = "secondSecretValueLong";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("two-secrets.log");
+    let mut fixture = String::new();
+    fixture.push_str("2026-01-02T03:00:00Z INFO service starting up nominally\n");
+    fixture.push_str("2026-01-02T03:00:01Z [ERROR] auth bootstrap failed API_KEY=\"");
+    fixture.push_str(FIRST_QUOTED);
+    fixture.push_str("\" PASSWORD=");
+    fixture.push_str(SECOND_PLAIN);
+    fixture.push_str(" reason denied\n");
+    fixture.push_str("2026-01-02T03:00:05Z INFO service ready to accept traffic\n");
+    fs::write(&log, &fixture).expect("write two-secret fixture");
+
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+    scan_logs_capture(&log, temp.path(), &out, &store, "op-1").success();
+
+    let handle = only_manifest_record(&store)["handle"]
+        .as_str()
+        .expect("handle")
+        .to_owned();
+    let got = egregore()
+        .args(["protected", "get"])
+        .arg(&handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let blob = String::from_utf8(got).expect("utf8 blob");
+
+    // Neither secret may survive: the first quoted one, nor the second plain one
+    // that used to leak past the loop `break`.
+    assert!(
+        !blob.contains(FIRST_QUOTED),
+        "the first (quoted) env secret must be redacted, not copied verbatim: {blob}"
+    );
+    assert!(
+        !blob.contains(SECOND_PLAIN),
+        "the second env secret after the quoted placeholder must ALSO be redacted: {blob}"
+    );
+    assert!(
+        blob.contains("<REDACTED:"),
+        "the secrets collapse to redaction markers"
+    );
+    // Non-secret content around the secrets is preserved (no over-redaction).
+    assert!(
+        blob.contains("service starting up nominally"),
+        "normal line before the secrets is preserved"
+    );
+    assert!(
+        blob.contains("service ready to accept traffic"),
+        "normal line after the secrets is preserved"
+    );
+}
+
 // Issue #321 (Codex finding B): the protected blob must be derived from the SAME
 // normalized buffer the scan read — not a second filesystem read that could
 // observe appended/rotated bytes. The scan exposes its normalized buffer, and the

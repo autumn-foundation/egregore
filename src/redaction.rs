@@ -1205,20 +1205,34 @@ pub fn redact_code_text(
     placeholder: &str,
 ) -> (String, std::collections::HashMap<SecretClass, usize>) {
     let mut counts = std::collections::HashMap::new();
-    while let Some((class, start, len)) = detect_secret_span(&value) {
+    // Byte cursor into `value`. Advances only PAST an already-inserted placeholder
+    // that was re-detected as a no-op match; a real replacement leaves it in place
+    // so overlapping/lower-priority secrets that just became contiguous are caught.
+    let mut scan_from = 0;
+    while let Some((class, rel_start, len)) = detect_secret_span(&value[scan_from..]) {
+        let start = scan_from + rel_start;
+        let end = start + len;
         // Forward-progress guard: some span matchers (e.g. `find_env_secret_span`)
         // strip wrapping quotes and re-detect the placeholder they just wrote as
-        // the env value on the next iteration — e.g. `KEY="<REDACTED:secret>"`.
-        // Replacing that slice with the identical placeholder leaves `value`
-        // unchanged, so the loop would spin forever. When the matched slice is
-        // already exactly the placeholder, replacing it is a no-op: stop instead
-        // of looping. This preserves the re-scan-from-0 semantics that fully
-        // redacts overlapping/nested secrets while guaranteeing termination.
-        if &value[start..start + len] == placeholder {
-            break;
+        // the env value on a later iteration — e.g. `KEY="<REDACTED:secret>"`.
+        // Replacing that slice with the identical placeholder is a no-op, so
+        // re-scanning from the same cursor would spin forever. When the matched
+        // slice is already exactly the placeholder, SKIP past it and keep scanning
+        // the rest of the text — do NOT `break`, or a second, independent secret
+        // after an already-redacted quoted placeholder (e.g.
+        // `API_KEY="a" PASSWORD=b`) would never be scanned and would survive into
+        // the protected log payload and every other `redact_code_text` caller.
+        if &value[start..end] == placeholder {
+            scan_from = end;
+            continue;
         }
-        value.replace_range(start..start + len, placeholder);
+        value.replace_range(start..end, placeholder);
         *counts.entry(class).or_insert(0) += 1;
+        // Do NOT advance `scan_from` here: re-detect from the same cursor so an
+        // overlapping lower-priority secret that just became contiguous (its span
+        // now containing this placeholder) is caught and fully redacted. The next
+        // iteration re-detects the placeholder as a no-op and advances the cursor,
+        // so the loop still makes forward progress and always terminates.
     }
     (value, counts)
 }
@@ -1445,6 +1459,31 @@ mod redact_code_text_termination_tests {
         assert!(
             !redacted.contains(SECRET),
             "single-quoted env secret must be fully redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("<REDACTED:"),
+            "a redaction marker must be present: {redacted}"
+        );
+    }
+
+    #[test]
+    fn continues_redacting_after_quoted_placeholder() {
+        // Two INDEPENDENT env secrets, the first quoted. After the first is
+        // redacted the loop re-detects the `<REDACTED:secret>` placeholder it just
+        // wrote as the (quote-stripped) env value. The old forward-progress guard
+        // `break`-ed out of the whole loop there, so the SECOND, unquoted secret
+        // after it was never scanned and survived into the protected log payload
+        // (Codex round-8 P1). The cursor fix must skip PAST the placeholder and
+        // keep scanning, redacting the second secret too.
+        let input = "API_KEY=\"firstSecretValue\" PASSWORD=secondSecretValue".to_owned();
+        let (redacted, _counts) = redact_with_deadline(&input);
+        assert!(
+            !redacted.contains("firstSecretValue"),
+            "the first (quoted) env secret must be redacted: {redacted}"
+        );
+        assert!(
+            !redacted.contains("secondSecretValue"),
+            "the second env secret after the quoted placeholder must ALSO be redacted: {redacted}"
         );
         assert!(
             redacted.contains("<REDACTED:"),
