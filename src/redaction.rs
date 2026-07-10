@@ -27,6 +27,12 @@ use crate::{
 /// Documented in `docs/schema/redaction.md`.
 pub const REDACTION_POLICY_VERSION: &str = "v1";
 
+/// Placeholder written in place of a detected secret in code-graph text fields.
+///
+/// Exposed so callers (e.g. the incremental refresh path) can detect whether an
+/// assembled graph still carries masked literals without re-running detection.
+pub const REDACTION_MARKER: &str = "«redacted:secret»";
+
 /// Number of hex characters taken from the BLAKE3 hash as the audit prefix.
 ///
 /// 12 hex digits = 6 bytes = 48 bits of correlation space. Not reversible to
@@ -36,7 +42,7 @@ const HASH_PREFIX_LEN: usize = 12;
 // ── Secret classes ─────────────────────────────────────────────────────────────
 
 /// Named secret classes defined in `docs/schema/redaction.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SecretClass {
     /// API keys, bearer tokens, OAuth access/refresh tokens.
     ApiToken,
@@ -230,7 +236,7 @@ pub fn validate_record(record: &GraphRecord) -> Result<()> {
 ///
 /// Code-graph records are explicitly exempt from the redaction gate per
 /// `docs/schema/redaction.md`.
-const fn is_code_graph_kind(kind: NodeKind) -> bool {
+pub(crate) const fn is_code_graph_kind(kind: NodeKind) -> bool {
     matches!(
         kind,
         NodeKind::Repository
@@ -572,9 +578,8 @@ fn find_session_cookie(value: &str) -> Option<usize> {
             let abs = search_from + rel;
             let after = &value[abs + prefix.len()..];
             let len = after
-                .chars()
-                .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | ','))
-                .count();
+                .find(|c: char| c.is_whitespace() || matches!(c, ';' | ','))
+                .unwrap_or(after.len());
             if len >= 8 {
                 return Some(abs);
             }
@@ -601,14 +606,20 @@ fn find_api_token(value: &str) -> Option<usize> {
         "xoxp-",       // Slack user token
     ];
     for prefix in PREFIXES {
-        if let Some(pos) = value.find(prefix) {
-            let after = &value[pos + prefix.len()..];
+        let mut search_from = 0_usize;
+        while let Some(rel) = value[search_from..].find(prefix) {
+            let abs = search_from + rel;
+            let after = &value[abs + prefix.len()..];
             let len = after
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
                 .count();
             if len >= 20 {
-                return Some(pos);
+                return Some(abs);
+            }
+            search_from = abs + prefix.len();
+            if search_from >= value.len() {
+                break;
             }
         }
     }
@@ -620,7 +631,9 @@ fn find_api_token(value: &str) -> Option<usize> {
     while let Some(rel) = lower[search_from..].find("bearer ") {
         let abs = search_from + rel;
         let after = &value[abs + 7..];
-        let len = after.chars().take_while(|c| !c.is_whitespace()).count();
+        let len = after
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(after.len());
         if len >= 20 {
             return Some(abs);
         }
@@ -675,15 +688,14 @@ fn find_env_secret(value: &str) -> Option<usize> {
         let remaining = &value[val_start..];
 
         // Already redacted — skip.
-        if remaining.starts_with("<REDACTED:") {
+        if remaining.starts_with("<REDACTED:") || remaining.starts_with("«redacted:secret»") {
             continue;
         }
 
         // Value must be ≥8 non-whitespace chars with no newline/semicolon break.
         let val_len = remaining
-            .chars()
-            .take_while(|c| !matches!(c, '\n' | '\r' | ';' | ' ' | '\t'))
-            .count();
+            .find(['\n', '\r', ';', ' ', '\t'])
+            .unwrap_or(remaining.len());
 
         if val_len >= 8 {
             return Some(key_start);
@@ -781,4 +793,549 @@ fn find_email(value: &str) -> Option<usize> {
         }
     }
     None
+}
+
+// ── Span Matchers ─────────────────────────────────────────────────────────────
+
+fn find_ssh_private_key_span(value: &str) -> Option<(usize, usize)> {
+    const MARKERS: &[&str] = &[
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
+        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    ];
+    const END_MARKERS: &[&str] = &[
+        "-----END RSA PRIVATE KEY-----",
+        "-----END OPENSSH PRIVATE KEY-----",
+        "-----END EC PRIVATE KEY-----",
+        "-----END PRIVATE KEY-----",
+        "-----END ENCRYPTED PRIVATE KEY-----",
+    ];
+    for (i, m) in MARKERS.iter().enumerate() {
+        if let Some(start) = value.find(m) {
+            let end_m = END_MARKERS[i];
+            if let Some(end_pos) = value[start..].find(end_m) {
+                let end = start + end_pos + end_m.len();
+                return Some((start, end - start));
+            }
+            let len = value.len() - start;
+            return Some((start, len));
+        }
+    }
+    None
+}
+
+fn find_database_url_span(value: &str) -> Option<(usize, usize)> {
+    const SCHEMES: &[&str] = &[
+        "postgres://",
+        "postgresql://",
+        "mysql://",
+        "mongodb://",
+        "mongodb+srv://",
+        "redis://",
+        "mssql://",
+    ];
+    let lower = value.to_ascii_lowercase();
+    for scheme in SCHEMES {
+        let mut search_from = 0_usize;
+        while let Some(rel) = lower[search_from..].find(scheme) {
+            let abs = search_from + rel;
+            let after = &value[abs + scheme.len()..];
+            let authority_end = after
+                .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#'))
+                .unwrap_or(after.len());
+            let authority = &after[..authority_end];
+            if let Some(at) = authority.find('@') {
+                let before_at = &authority[..at];
+                if let Some(colon) = before_at.find(':')
+                    && colon + 1 < before_at.len()
+                {
+                    let url_len = value[abs..]
+                        .find(|c: char| {
+                            c.is_whitespace() || matches!(c, '"' | '\'' | '\\' | ',' | ';')
+                        })
+                        .unwrap_or_else(|| value[abs..].len());
+                    return Some((abs, url_len));
+                }
+            }
+            search_from = abs + 1;
+            if search_from >= value.len() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn find_cloud_credential_span(value: &str) -> Option<(usize, usize)> {
+    const PREFIXES: &[&str] = &["AKIA", "ASIA"];
+    for prefix in PREFIXES {
+        let mut haystack = value;
+        let mut base = 0_usize;
+        while let Some(rel) = haystack.find(prefix) {
+            let abs = base + rel;
+            let tail = &value[abs + prefix.len()..];
+            let key16: String = tail.chars().take(16).collect();
+            if key16.len() == 16
+                && key16
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            {
+                let end = abs + prefix.len() + 16;
+                let next = value[end..].chars().next();
+                let word_end = next.is_none_or(|c| !c.is_ascii_alphanumeric());
+                let word_start =
+                    abs == 0 || !value[..abs].ends_with(|c: char| c.is_ascii_alphanumeric());
+                if word_start && word_end {
+                    return Some((abs, prefix.len() + 16));
+                }
+            }
+            base = abs + 1;
+            if base >= value.len() {
+                break;
+            }
+            haystack = &value[base..];
+        }
+    }
+    None
+}
+
+fn find_webhook_secret_span(value: &str) -> Option<(usize, usize)> {
+    let mut search_from = 0_usize;
+    while let Some(rel) = value[search_from..].find("whsec_") {
+        let abs = search_from + rel;
+        let after = &value[abs + 6..];
+        let len = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            .count();
+        if len >= 20 {
+            return Some((abs, 6 + len));
+        }
+        search_from = abs + 1;
+        if search_from >= value.len() {
+            break;
+        }
+    }
+    None
+}
+
+fn find_session_cookie_span(value: &str) -> Option<(usize, usize)> {
+    const SESSION_PREFIXES: &[&str] = &["sessionid=", "session=", "sid=", "connect.sid="];
+    let mut search_from = 0_usize;
+    while let Some(rel) = value[search_from..].find("eyJ") {
+        let abs = search_from + rel;
+        let after = &value[abs + 3..];
+        let len = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/'))
+            .count();
+        if len >= 20 {
+            return Some((abs, 3 + len));
+        }
+        search_from = abs + 1;
+        if search_from >= value.len() {
+            break;
+        }
+    }
+    for prefix in SESSION_PREFIXES {
+        let mut search_from = 0_usize;
+        while let Some(rel) = value[search_from..].find(prefix) {
+            let abs = search_from + rel;
+            let after = &value[abs + prefix.len()..];
+            let len = after
+                .find(|c: char| c.is_whitespace() || matches!(c, ';' | ',' | '"' | '\''))
+                .unwrap_or(after.len());
+            if len >= 8 {
+                return Some((abs, prefix.len() + len));
+            }
+            search_from = abs + 1;
+            if search_from >= value.len() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn find_api_token_span(value: &str) -> Option<(usize, usize)> {
+    const PREFIXES: &[&str] = &[
+        "sk-",
+        "sk_",
+        "rk_",
+        "ghp_",
+        "ghs_",
+        "github_pat_",
+        "glpat-",
+        "xoxb-",
+        "xoxp-",
+    ];
+    for prefix in PREFIXES {
+        let mut search_from = 0_usize;
+        while let Some(rel) = value[search_from..].find(prefix) {
+            let abs = search_from + rel;
+            let after = &value[abs + prefix.len()..];
+            let len = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                .count();
+            if len >= 20 {
+                return Some((abs, prefix.len() + len));
+            }
+            search_from = abs + prefix.len();
+            if search_from >= value.len() {
+                break;
+            }
+        }
+    }
+    let lower = value.to_ascii_lowercase();
+    let mut search_from = 0_usize;
+    while let Some(rel) = lower[search_from..].find("bearer ") {
+        let abs = search_from + rel;
+        let after = &value[abs + 7..];
+        let len = after
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\''))
+            .unwrap_or(after.len());
+        if len >= 20 {
+            return Some((abs, 7 + len));
+        }
+        search_from = abs + 1;
+        if search_from >= lower.len() {
+            break;
+        }
+    }
+    None
+}
+
+fn find_email_span(value: &str) -> Option<(usize, usize)> {
+    const BLOCKED_EXTENSIONS: &[&str] = &[
+        "js", "go", "ts", "cpp", "rb", "json", "yaml", "yml", "toml", "txt", "html", "css", "bat",
+        "lock", "class",
+    ];
+    for (idx, c) in value.char_indices() {
+        if c == '@' {
+            let before = &value[..idx];
+            let username_len = before
+                .chars()
+                .rev()
+                .take_while(|&ch| {
+                    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '%' | '+' | '-')
+                })
+                .count();
+            if username_len == 0 {
+                continue;
+            }
+            let start_idx = idx - username_len;
+            if start_idx > 0 {
+                let prev_char = value[..start_idx].chars().next_back();
+                if prev_char == Some('/') || prev_char == Some('\\') {
+                    continue;
+                }
+            }
+            let after = &value[idx + 1..];
+            let mut domain_len = 0;
+            for ch in after.chars() {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '.' {
+                    domain_len += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let next_char = after[domain_len..].chars().next();
+            if next_char == Some('/') || next_char == Some('\\') {
+                continue;
+            }
+            if next_char == Some(':') {
+                let after_colon = after[domain_len + 1..].chars().next();
+                if after_colon.is_some_and(|ch| !ch.is_whitespace()) {
+                    continue;
+                }
+            }
+            let mut domain_str = &after[..domain_len];
+            while domain_str.ends_with('.') || domain_str.ends_with('-') {
+                domain_str = &domain_str[..domain_str.len() - 1];
+            }
+            let labels: Vec<&str> = domain_str.split('.').collect();
+            if labels.len() >= 2 && labels.iter().all(|l| !l.is_empty()) {
+                let last_label = labels.last().unwrap();
+                let is_punycode = last_label.to_lowercase().starts_with("xn--")
+                    && last_label.len() >= 6
+                    && last_label[4..]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-');
+                let is_alphabetic =
+                    last_label.len() >= 2 && last_label.chars().all(|c| c.is_ascii_alphabetic());
+                if is_alphabetic || is_punycode {
+                    let tld_lower = last_label.to_lowercase();
+                    if !BLOCKED_EXTENSIONS.contains(&tld_lower.as_str()) {
+                        let total_len = idx + 1 + domain_str.len() - start_idx;
+                        return Some((start_idx, total_len));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_env_secret_span(value: &str) -> Option<(usize, usize)> {
+    const KEYWORDS: &[&str] = &[
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASS",
+        "PWD",
+        "PRIVATE_KEY",
+        "ACCESS_KEY",
+        "API_KEY",
+        "AUTH",
+        "COOKIE",
+        "DATABASE_URL",
+        "DB_URL",
+        "WEBHOOK_SECRET",
+    ];
+    for (eq_pos, _) in value.char_indices().filter(|(_, c)| *c == '=') {
+        let key_start = env_key_start(value, eq_pos);
+        let key = &value[key_start..eq_pos];
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            continue;
+        }
+        if !KEYWORDS.iter().any(|kw| key.contains(kw)) {
+            continue;
+        }
+        let val_start = eq_pos + 1;
+        if val_start >= value.len() {
+            continue;
+        }
+        let remaining = &value[val_start..];
+        if remaining.starts_with("<REDACTED:") || remaining.starts_with("«redacted:secret»") {
+            continue;
+        }
+        let val_len = remaining
+            .find(['\n', '\r', ';', ' ', '\t', '"', '\''])
+            .unwrap_or(remaining.len());
+        if val_len >= 8 {
+            return Some((val_start, val_len));
+        }
+    }
+    None
+}
+
+/// Detects the span (class, start byte offset, and length) of the first secret in `value`.
+#[must_use]
+pub fn detect_secret_span(value: &str) -> Option<(SecretClass, usize, usize)> {
+    find_ssh_private_key_span(value)
+        .map(|(start, len)| (SecretClass::SshPrivateKey, start, len))
+        .or_else(|| {
+            find_database_url_span(value).map(|(start, len)| (SecretClass::DatabaseUrl, start, len))
+        })
+        .or_else(|| {
+            find_cloud_credential_span(value)
+                .map(|(start, len)| (SecretClass::CloudCredential, start, len))
+        })
+        .or_else(|| {
+            find_webhook_secret_span(value)
+                .map(|(start, len)| (SecretClass::WebhookSecret, start, len))
+        })
+        .or_else(|| {
+            find_session_cookie_span(value)
+                .map(|(start, len)| (SecretClass::SessionCookie, start, len))
+        })
+        .or_else(|| {
+            find_api_token_span(value).map(|(start, len)| (SecretClass::ApiToken, start, len))
+        })
+        .or_else(|| find_email_span(value).map(|(start, len)| (SecretClass::Email, start, len)))
+        .or_else(|| {
+            find_env_secret_span(value).map(|(start, len)| (SecretClass::EnvSecret, start, len))
+        })
+}
+
+/// Redacts all secrets in `value` by replacing them with `placeholder`.
+/// Returns the redacted string and a map of counts per secret class detected.
+#[must_use]
+pub fn redact_code_text(
+    mut value: String,
+    placeholder: &str,
+) -> (String, std::collections::HashMap<SecretClass, usize>) {
+    let mut counts = std::collections::HashMap::new();
+    while let Some((class, start, len)) = detect_secret_span(&value) {
+        value.replace_range(start..start + len, placeholder);
+        *counts.entry(class).or_insert(0) += 1;
+    }
+    (value, counts)
+}
+
+/// Redacts secrets in every source-bearing text field of a code-graph node.
+///
+/// Scrubs the `summary` plus the issue #124 `signature`/`doc` capture fields in
+/// place — each embeds raw source and can therefore carry an inlined secret.
+/// Returns the accumulated per-class literal counts across all fields (empty when
+/// the node was clean).
+#[must_use]
+pub fn redact_node_text_fields(
+    summary: &mut String,
+    signature: &mut Option<String>,
+    doc: &mut Option<String>,
+    placeholder: &str,
+) -> std::collections::HashMap<SecretClass, usize> {
+    let mut counts: std::collections::HashMap<SecretClass, usize> =
+        std::collections::HashMap::new();
+
+    let (clean, summary_counts) = redact_code_text(std::mem::take(summary), placeholder);
+    *summary = clean;
+    for (class, count) in summary_counts {
+        *counts.entry(class).or_insert(0) += count;
+    }
+
+    for text in [signature, doc].into_iter().flatten() {
+        let (clean, field_counts) = redact_code_text(std::mem::take(text), placeholder);
+        *text = clean;
+        for (class, count) in field_counts {
+            *counts.entry(class).or_insert(0) += count;
+        }
+    }
+
+    counts
+}
+
+/// Post-processes and redacts all code-graph records in place, appending a
+/// `Diagnostic` node recording the redaction evidence count/classes.
+#[allow(clippy::too_many_lines)]
+pub fn redact_code_graph(records: &mut Vec<GraphRecord>, raw_literals: bool, repository_id: &str) {
+    use crate::ir::TemporalMetadata;
+    use std::collections::{BTreeMap, HashMap};
+
+    if raw_literals {
+        return;
+    }
+
+    let existing_producer = records.iter().find_map(|r| match r {
+        GraphRecord::Node { producer, .. }
+        | GraphRecord::Edge { producer, .. }
+        | GraphRecord::Tombstone { producer, .. } => producer.clone(),
+    });
+
+    let mut existing_valid_time = None;
+    let mut existing_valid_time_source = None;
+    for r in &*records {
+        if let GraphRecord::Node {
+            valid_time: Some(vt),
+            valid_time_source,
+            ..
+        } = r
+        {
+            existing_valid_time = Some(vt.clone());
+            existing_valid_time_source.clone_from(valid_time_source);
+            break;
+        }
+    }
+
+    // Ordered maps keyed on the temporal group so the per-commit diagnostics are
+    // built in a deterministic order regardless of record traversal, preserving
+    // the byte-identical scan contract across process runs (Codex C3). The final
+    // `diags.sort_by(id)` still normalizes emission order, but the ordered map
+    // also removes the residual same-id tie ambiguity a `HashMap` could expose.
+    let mut group_counts: BTreeMap<Option<TemporalMetadata>, HashMap<SecretClass, usize>> =
+        BTreeMap::new();
+    let mut group_masked_nodes: BTreeMap<Option<TemporalMetadata>, usize> = BTreeMap::new();
+
+    for record in records.iter_mut() {
+        if let GraphRecord::Node {
+            kind,
+            temporal,
+            summary,
+            signature,
+            doc,
+            ..
+        } = record
+            && is_code_graph_kind(*kind)
+        {
+            let counts = redact_node_text_fields(summary, signature, doc, "«redacted:secret»");
+            if !counts.is_empty() {
+                let t_key = temporal.clone();
+                *group_masked_nodes.entry(t_key.clone()).or_insert(0) += 1;
+                let sub_map = group_counts.entry(t_key).or_default();
+                for (class, count) in counts {
+                    *sub_map.entry(class).or_insert(0) += count;
+                }
+            }
+        }
+    }
+
+    let mut diags = Vec::new();
+    for (temporal, counts) in group_counts {
+        if counts.is_empty() {
+            continue;
+        }
+        let total_nodes = group_masked_nodes.get(&temporal).copied().unwrap_or(0);
+        let total_literals: usize = counts.values().sum();
+
+        let mut class_details = counts
+            .iter()
+            .map(|(class, count)| format!("{}: {}", class.as_str(), count))
+            .collect::<Vec<_>>();
+        class_details.sort();
+        let class_details_str = class_details.join(", ");
+
+        let summary = format!(
+            "Redacted {total_literals} literals across {total_nodes} nodes. Detector classes: {class_details_str}"
+        );
+
+        let commit_sha = temporal.as_ref().map(|t| t.git_commit.as_str());
+        let diag_id = commit_sha.map_or_else(
+            || crate::stable_id(&["node", "diagnostic", "redaction_evidence", repository_id]),
+            |sha| {
+                crate::stable_id(&[
+                    "node",
+                    "diagnostic",
+                    "redaction_evidence",
+                    repository_id,
+                    sha,
+                ])
+            },
+        );
+
+        let mut diag = GraphRecord::node(
+            diag_id,
+            NodeKind::Diagnostic,
+            None,
+            None,
+            Some("redaction_evidence".to_owned()),
+            summary,
+        );
+
+        if let GraphRecord::Node {
+            redaction_policy_version,
+            ..
+        } = &mut diag
+        {
+            *redaction_policy_version = Some(crate::redaction::REDACTION_POLICY_VERSION.to_owned());
+        }
+
+        if let Some(t) = temporal {
+            diag = diag.with_temporal(t);
+        } else if let GraphRecord::Node {
+            valid_time,
+            valid_time_source,
+            ..
+        } = &mut diag
+        {
+            valid_time.clone_from(&existing_valid_time);
+            valid_time_source.clone_from(&existing_valid_time_source);
+        }
+
+        if let Some(ref prod) = existing_producer {
+            diag = diag.with_producer(prod.clone());
+        }
+
+        diags.push(diag);
+    }
+
+    diags.sort_by(|a, b| a.id().cmp(b.id()));
+    records.extend(diags);
 }

@@ -1,12 +1,25 @@
 use super::*;
 
-pub(crate) fn scan(repo_path: &Path, out: &Path, repo_id_override: Option<&str>) -> Result<()> {
+pub(crate) fn scan(
+    repo_path: &Path,
+    out: &Path,
+    repo_id_override: Option<&str>,
+    raw_literals: bool,
+) -> Result<()> {
     // Exclude the graph output and any in-tree egregore store from the dirty probe
     // (PR #186 E/FF1): a pre-existing graph.jsonl or .egregore data-dir from a
     // previous workflow must not stamp `dirty = true` on the new scan output.
     let exclusions = store_exclusions_including_egregore(repo_path, &[Some(out)]);
     let graph = scan_repository_with_exclusions(repo_path, repo_id_override, &exclusions)
         .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
+
+    let repo_identity = identity::compute_repository_identity(repo_path, repo_id_override);
+    let (repository_id, _) = crate::repository_record_from_identity(&repo_identity);
+
+    let mut records = graph.into_records();
+    crate::redaction::redact_code_graph(&mut records, raw_literals, &repository_id);
+    let graph = Graph::from_records(records);
+
     let jsonl = graph
         .to_jsonl()
         .context("failed to serialize graph JSONL")?;
@@ -19,6 +32,7 @@ pub(crate) fn scan_history(
     repo_path: &Path,
     out: &Path,
     repo_id_override: Option<&str>,
+    raw_literals: bool,
 ) -> Result<()> {
     // AC5: Verify git is available in PATH.
     let git_available = std::process::Command::new("git")
@@ -82,6 +96,14 @@ pub(crate) fn scan_history(
     // (TT1 supersedes the earlier CC1/GG1 exclusion machinery).
     let graph = scan_repository_history_with_override(repo_path, repo_id_override)
         .with_context(|| format!("failed to scan Git history for {}", repo_path.display()))?;
+
+    let repo_identity = identity::compute_repository_identity(repo_path, repo_id_override);
+    let (repository_id, _) = crate::repository_record_from_identity(&repo_identity);
+
+    let mut records = graph.into_records();
+    crate::redaction::redact_code_graph(&mut records, raw_literals, &repository_id);
+    let graph = Graph::from_records(records);
+
     let jsonl = graph
         .to_jsonl()
         .context("failed to serialize history graph JSONL")?;
@@ -148,6 +170,7 @@ pub(crate) fn scan_refresh_cmd(
     cache: Option<&Path>,
     format: OutputFormat,
     #[cfg(feature = "embeddings")] embed: bool,
+    raw_literals: bool,
 ) -> Result<()> {
     // AC9: The embedded store must already exist before we can refresh it.
     if !data_dir.exists() {
@@ -195,8 +218,13 @@ pub(crate) fn scan_refresh_cmd(
     // follow-up `eg freshness --data-dir` report `stale_dirty` with no source change.
     let snapshot_exclusions =
         store_exclusions_including_egregore(repo_path, &[Some(data_dir), Some(cache_path)]);
-    let scan = scan_repository_incremental_excluding(repo_path, cache_path, &snapshot_exclusions)
-        .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
+    let scan = scan_repository_incremental_excluding(
+        repo_path,
+        cache_path,
+        &snapshot_exclusions,
+        raw_literals,
+    )
+    .with_context(|| format!("failed to scan repository {}", repo_path.display()))?;
 
     let records = scan.graph.records().to_vec();
 
