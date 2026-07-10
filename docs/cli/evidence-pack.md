@@ -89,7 +89,7 @@ one of three honest families:
 
 | classes | backing | `unavailable_reason` when absent |
 |---------|---------|----------------------------------|
-| `commits` (`Commit`), `pull_requests` (`Task`/`github_pr`), `reviews` (`Review`), `structural_deltas` (`Change`), `verification_evidence` (`Verification`/`CommandRun`/`TestRun`/`CIStatus`/`CommandEvidence`/`BenchmarkRun`/`CoverageReport`/`ProofResult`) | real stored node kind | `<class>_domain_absent` (e.g. `delta_domain_absent`) |
+| `commits` (`Commit`), `pull_requests` (`Task`/`github_pr`), `reviews` (genuine PR `Review` — see below), `structural_deltas` (`Change`), `verification_evidence` (`Verification`/`CommandRun`/`TestRun`/`CIStatus`/`CommandEvidence`/`BenchmarkRun`/`CoverageReport`/`ProofResult`) | real stored node kind | `<class>_domain_absent` (e.g. `delta_domain_absent`) |
 | `public_api_deltas` (#157), `validation_runs` (#103) | computed/derived surface, **no stored node kind** | `derived_class_not_materialized` |
 | `error_signatures` (`ErrorSignature`), `occurrence_buckets` (`LogOccurrenceBucket`), `remediation_links` | log-signature domain (issues #319/#340), not yet emitted | `log_domain_absent` |
 | `review_coverage` | computed over merged PRs (available whenever any PR exists) | `no_pull_requests_to_measure` |
@@ -104,6 +104,21 @@ are derived query surfaces with no stored record kind, so they can never be
 materialized as pack evidence rows — they degrade with the honest
 `derived_class_not_materialized` reason rather than being mislabeled as a missing
 domain. Only the log-signature classes degrade with `log_domain_absent`.
+
+The `reviews` class counts **only genuine PR reviews**. A GitHub import emits three
+`Review` `review_kind` values (`src/github/records.rs`): `issue_comment` (a comment
+on an issue or PR *conversation* — discussion, not a review), `pr_review` (a
+submitted pull-request review), and `pr_review_comment` (an inline PR review-thread
+comment). Only `pr_review` and `pr_review_comment` are `Reviews`-class evidence; an
+`issue_comment` Review — and any `Review` with no recorded `review_kind` — is
+excluded from the `reviews` section and does **not** make the `reviews` class
+available. The filter is an **allow-list** of genuine review kinds, so a future
+non-review `Review` kind cannot silently leak in as review evidence. The same
+allow-list gates approval detection: an `issue_comment` Review never counts as an
+approving review for `merged_pr_without_approving_review` gap suppression, even if
+it carried an `approved` state. This closes a gap where unrelated issue discussion
+could mark the required CC8.1 `Reviews` class available and let a relaxed
+`--min-review-coverage` pack pass without genuine review evidence.
 
 ## Verdicts and exit codes
 

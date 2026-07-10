@@ -1079,11 +1079,33 @@ fn in_window(valid_time: &str, window: &Window) -> bool {
     from <= t && t < to
 }
 
+/// Genuine code-review `review_kind` values that count as `Reviews`-class
+/// evidence.
+///
+/// GitHub imports emit exactly three `Review` kinds (`src/github/records.rs`):
+/// `issue_comment` (a comment on an issue or PR *conversation* — discussion, not
+/// a review), `pr_review` (a submitted pull-request review), and
+/// `pr_review_comment` (an inline PR review-thread comment). Only the latter two
+/// are genuine code-review evidence. This is an allow-list, not a deny-list of
+/// `issue_comment`, so any future non-review `Review` kind (or a Review with no
+/// recorded kind) is excluded until it is deliberately added here.
+const GENUINE_PR_REVIEW_KINDS: [&str; 2] = ["pr_review", "pr_review_comment"];
+
+/// True when a `Review` record is a genuine PR review (by `review_kind`
+/// allow-list), not a GitHub issue comment.
+#[must_use]
+fn is_genuine_pr_review_kind(review_kind: Option<&str>) -> bool {
+    review_kind.is_some_and(|k| GENUINE_PR_REVIEW_KINDS.contains(&k))
+}
+
 /// Maps a record to its catalog evidence class, when it maps to one.
 #[must_use]
 pub fn evidence_class_for_record(record: &GraphRecord) -> Option<EvidenceClass> {
     let GraphRecord::Node {
-        kind, source_kind, ..
+        kind,
+        source_kind,
+        review_kind,
+        ..
     } = record
     else {
         return None;
@@ -1092,7 +1114,12 @@ pub fn evidence_class_for_record(record: &GraphRecord) -> Option<EvidenceClass> 
         "Commit" => Some(EvidenceClass::Commits),
         "PR" => Some(EvidenceClass::PullRequests),
         "Task" if source_kind.as_deref() == Some("github_pr") => Some(EvidenceClass::PullRequests),
-        "Review" => Some(EvidenceClass::Reviews),
+        // Only genuine PR reviews are review evidence. An `issue_comment`-kind
+        // Review (GitHub issue/PR-conversation discussion) — or any Review with
+        // no recorded kind — is NOT review evidence (Codex round-4 P2).
+        "Review" if is_genuine_pr_review_kind(review_kind.as_deref()) => {
+            Some(EvidenceClass::Reviews)
+        }
         // Per-file structural deltas: `scan-history` emits one `Change` node per
         // file touched in a commit (`src/history.rs`), each carrying commit valid
         // time. These are the genuine stored backing for structural deltas.
@@ -1154,15 +1181,24 @@ fn is_merged_pr(record: &GraphRecord) -> bool {
     )
 }
 
-/// True when the record is an approving pull-request review.
+/// True when the record is a genuine approving pull-request review.
+///
+/// Only a genuine PR review (`review_kind` allow-list) with an `approved`
+/// `review_state` counts. An `issue_comment`-kind Review never approves, even if
+/// something forced an `approved` state onto it (Codex round-4 P2). In practice a
+/// GitHub issue comment carries no `review_state` at all, so this is a
+/// defense-in-depth guard consistent with the classifier's allow-list.
 fn is_approving_review(record: &GraphRecord) -> bool {
     matches!(
         record,
         GraphRecord::Node {
             kind,
+            review_kind,
             review_state: Some(state),
             ..
-        } if kind.as_str() == "Review" && state == "approved"
+        } if kind.as_str() == "Review"
+            && state == "approved"
+            && is_genuine_pr_review_kind(review_kind.as_deref())
     )
 }
 
@@ -2085,6 +2121,27 @@ pub(crate) mod fixture {
         r
     }
 
+    /// A `Review` node with an explicit `review_kind` and optional `review_state`,
+    /// used to exercise the genuine-PR-review classifier filter (GitHub imports
+    /// emit `issue_comment` / `pr_review` / `pr_review_comment`).
+    pub fn review_with_kind(id: &str, vt: &str, kind: &str, state: Option<&str>) -> GraphRecord {
+        let mut r = node(id, NodeKind::Review, PROJECT_SCHEMA_VERSION);
+        if let GraphRecord::Node {
+            entity_id,
+            valid_time,
+            review_kind,
+            review_state,
+            ..
+        } = &mut r
+        {
+            *entity_id = Some(format!("review-entity-{id}"));
+            *valid_time = Some(vt.to_owned());
+            *review_kind = Some(kind.to_owned());
+            *review_state = state.map(str::to_owned);
+        }
+        r
+    }
+
     fn verification(id: &str, executed: &str) -> GraphRecord {
         let mut r = node(id, NodeKind::CommandRun, VERIFICATION_SCHEMA_VERSION);
         if let GraphRecord::Node {
@@ -2956,6 +3013,94 @@ mod pack338_tests {
                 .iter()
                 .any(|d| d.code == "evidence_class_unavailable")
         );
+    }
+
+    /// Codex round-4 P2: a GitHub import emits issue comments as `Review`
+    /// (`review_kind == "issue_comment"`) records. Only genuine PR reviews
+    /// (`pr_review` / `pr_review_comment`) are `Reviews`-class evidence; an
+    /// issue comment — and any Review with no/unknown `review_kind` — must not
+    /// be classified as review evidence.
+    #[test]
+    fn only_genuine_pr_reviews_classify_as_reviews() {
+        use super::fixture::review_with_kind;
+        let genuine = |kind: &str| {
+            evidence_class_for_record(&review_with_kind(
+                "project:v1:rvx",
+                "2026-03-04T08:00:00Z",
+                kind,
+                None,
+            ))
+        };
+        assert_eq!(genuine("pr_review"), Some(EvidenceClass::Reviews));
+        assert_eq!(genuine("pr_review_comment"), Some(EvidenceClass::Reviews));
+        // Issue comments are NOT review evidence.
+        assert_eq!(genuine("issue_comment"), None);
+        // A Review missing its kind is not counted (allow-list, not deny-list).
+        assert_eq!(
+            evidence_class_for_record(&review_with_kind(
+                "project:v1:rvx",
+                "2026-03-04T08:00:00Z",
+                "some_future_kind",
+                None
+            )),
+            None
+        );
+    }
+
+    /// Codex round-4 P2: an in-window `issue_comment` Review referencing a PR
+    /// task must not leak into the `reviews` section nor pad its record count.
+    #[test]
+    fn issue_comment_review_does_not_leak_into_reviews_section() {
+        use super::fixture::{references_task, review_with_kind};
+        let mut records = build_seed_records();
+        // An issue comment on pr05 (the PR that has no genuine review at all).
+        records.push(review_with_kind(
+            "project:v1:ic01",
+            "2026-03-04T08:00:00Z",
+            "issue_comment",
+            None,
+        ));
+        records.push(references_task("project:v1:ic01", "project:v1:pr05"));
+
+        let catalog = load_default_catalog();
+        let pack = assemble_pack(&records, &catalog, "CC8.1", &win(), 1.0, "test-0.0.0", None)
+            .expect("assembles");
+        let reviews = pack
+            .sections
+            .iter()
+            .find(|s| s.class == "reviews")
+            .expect("reviews section");
+        // The 5 genuine seed pr_reviews remain; the issue comment is excluded.
+        assert_eq!(reviews.record_count, 5);
+        assert!(
+            !reviews
+                .records
+                .iter()
+                .any(|r| r.record.id() == "project:v1:ic01"),
+            "issue_comment review must not appear in reviews section"
+        );
+    }
+
+    /// Codex round-4 P2: an `issue_comment` Review never counts as an approving
+    /// review for gap suppression, even if it carries an `approved` state.
+    #[test]
+    fn issue_comment_review_never_approves() {
+        use super::fixture::review_with_kind;
+        let issue_comment = review_with_kind(
+            "project:v1:ic02",
+            "2026-03-04T08:00:00Z",
+            "issue_comment",
+            Some("approved"),
+        );
+        assert!(!is_approving_review(&issue_comment));
+        // A genuine approving pr_review still approves.
+        let genuine = review_with_kind(
+            "project:v1:rvz",
+            "2026-03-04T08:00:00Z",
+            "pr_review",
+            Some("approved"),
+        );
+        assert!(is_approving_review(&genuine));
     }
 
     /// Codex round-2 P2: `scan-history` emits per-file structural deltas as
