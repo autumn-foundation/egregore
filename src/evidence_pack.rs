@@ -998,6 +998,34 @@ pub struct ClassCitationTally {
     pub excluded: usize,
 }
 
+/// The review-coverage gate verdict (Codex round-8 P2 Finding 1).
+///
+/// Review coverage is only a meaningful gate for a control that requires review
+/// evidence (`reviews` or `review_coverage`). For any other control (e.g. the
+/// CC7.2/CC7.3 monitoring controls) the verdict is reported as a neutral
+/// `not_applicable` status that never contributes to the pack `ok`, so a
+/// monitoring pack assembled over a shared store that happens to contain an
+/// unapproved in-window merged PR never fails on that unrelated review coverage.
+/// The applicability predicate reuses the same control-scoping `control_requires`
+/// logic that gates the review gap classes — never a hardcoded control-id list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewCoverageVerdict {
+    /// Closed status: `gating` for a review-requiring control, `not_applicable`
+    /// otherwise.
+    pub status: String,
+    /// True when the verdict participates in the pack `ok`. A `not_applicable`
+    /// verdict is never gating.
+    pub applicable: bool,
+    /// Whether coverage met the threshold. Vacuously `true` — and therefore never
+    /// failing the gate — for a `not_applicable` verdict.
+    pub passed: bool,
+    /// Machine-readable reason when `not_applicable`; absent when gating.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub not_applicable_reason: Option<String>,
+    /// Redaction-safe human-readable detail.
+    pub detail: String,
+}
+
 /// The pack's assemble-time verdicts (AC6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackVerdicts {
@@ -1007,8 +1035,9 @@ pub struct PackVerdicts {
     pub required_classes: VerificationVerdict,
     /// Citation thresholds met.
     pub citation: VerificationVerdict,
-    /// Review coverage met `--min-review-coverage`.
-    pub review_coverage: VerificationVerdict,
+    /// Review coverage — only gating for review-requiring controls, neutral
+    /// (`not_applicable`) otherwise.
+    pub review_coverage: ReviewCoverageVerdict,
     /// Structural integrity (hashes + canonical order).
     pub integrity: VerificationVerdict,
     /// Safety (no raw sensitive classes; scrubbed fields None).
@@ -1585,14 +1614,39 @@ pub fn assemble_pack(
             "citation thresholds not met".to_owned()
         },
     };
-    let review_coverage = VerificationVerdict {
-        passed: review_coverage_passed,
-        detail: format!("review coverage {coverage:.4} vs minimum {min_review_coverage:.4}"),
+    // Review coverage only gates a control that requires review evidence. The
+    // predicate REUSES the control-scoping `control_requires` logic that gates the
+    // review gap classes in `derive_gaps` (never a hardcoded control-id list), so
+    // a monitoring pack (CC7.2/CC7.3) whose control maps no review classes reports
+    // a neutral `not_applicable` verdict that never fails the gate (Codex round-8
+    // P2 Finding 1).
+    let requires_review = control_requires(control, EvidenceClass::Reviews)
+        || control_requires(control, EvidenceClass::ReviewCoverage);
+    let review_coverage = if requires_review {
+        ReviewCoverageVerdict {
+            status: "gating".to_owned(),
+            applicable: true,
+            passed: review_coverage_passed,
+            not_applicable_reason: None,
+            detail: format!("review coverage {coverage:.4} vs minimum {min_review_coverage:.4}"),
+        }
+    } else {
+        ReviewCoverageVerdict {
+            status: "not_applicable".to_owned(),
+            applicable: false,
+            passed: true,
+            not_applicable_reason: Some("control_does_not_require_review".to_owned()),
+            detail: "review coverage not applicable: control does not require review coverage or review evidence"
+                .to_owned(),
+        }
     };
+    // A `not_applicable` verdict is vacuously `passed`, so it never fails the gate;
+    // the explicit applicability guard keeps that intent legible.
+    let review_coverage_gate_ok = !review_coverage.applicable || review_coverage.passed;
 
     let ok = required_passed
         && citation_ok
-        && review_coverage_passed
+        && review_coverage_gate_ok
         && integrity.passed
         && safety.passed;
 
@@ -1711,9 +1765,18 @@ fn derive_gaps(
     if want_merged_pr_gap {
         for pr_id in merged_pr_ids {
             if !approving_targets.contains(pr_id) {
+                // Stamp the gap with the SAME merge time (`merged_at`) used to
+                // SELECT the PR as merged-in-window (round-5 `merged_pr_ids`), not
+                // the Task `valid_time` (github_updated_at). A PR merged in-window
+                // but updated after `to` would otherwise carry an out-of-window
+                // timestamp inconsistent with its in-window selection, so a
+                // downstream consumer filtering gaps by the manifest window would
+                // drop or misplace it (Codex round-8 P2 Finding 2). Every id here
+                // came from `merged_pr_ids`, so its merge time always resolves.
                 let vt = by_id
                     .get(pr_id.as_str())
-                    .and_then(|r| resolve_valid_time(r));
+                    .and_then(|r| merged_pr_merge_time(r))
+                    .map(str::to_owned);
                 gaps.push(GapRow {
                     gap_class: GapClass::MergedPrWithoutApprovingReview
                         .as_wire()
@@ -3407,6 +3470,134 @@ mod pack338_tests {
                     && g.record_ids.contains(&"project:v1:prEarly".to_owned())),
             "PR merged before window must not gap: gaps={:?}",
             pack.gaps
+        );
+    }
+
+    /// Codex round-8 P2 (Finding 1): a CC7.2 monitoring pack over a shared store
+    /// that happens to contain an unapproved in-window merged PR must NOT fail its
+    /// gate on unrelated review coverage. CC7.2 requires no review evidence, so
+    /// its review-coverage verdict is a neutral `not_applicable` status that never
+    /// contributes to the pack `ok` and there is no PR/review gap.
+    #[test]
+    fn cc72_review_coverage_is_neutral_and_does_not_fail_gate() {
+        use super::fixture::pr_with_merge_time;
+        let records = vec![pr_with_merge_time(
+            "project:v1:prMon",
+            "2026-03-15T08:00:00Z", // updated_at -> Task valid_time (in window)
+            "2026-03-15T12:00:00Z", // merged_at -> merge time (in window)
+            "cMon",
+        )];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC7.2",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        // A non-review control never fails the gate on review coverage alone.
+        assert!(
+            pack.verdicts.ok,
+            "CC7.2 must not fail solely on unrelated review coverage: {:?}",
+            pack.verdicts
+        );
+        // The review-coverage verdict is neutral / not-applicable.
+        assert!(!pack.verdicts.review_coverage.applicable);
+        assert_eq!(pack.verdicts.review_coverage.status, "not_applicable");
+        assert_eq!(
+            pack.verdicts
+                .review_coverage
+                .not_applicable_reason
+                .as_deref(),
+            Some("control_does_not_require_review")
+        );
+        // No PR/review section and no PR gap for a non-review control.
+        assert!(
+            !pack
+                .gaps
+                .iter()
+                .any(|g| g.gap_class == "merged_pr_without_approving_review"),
+            "non-review control emits no PR gap: gaps={:?}",
+            pack.gaps
+        );
+    }
+
+    /// Codex round-8 P2 (Finding 1, regression): a review-requiring control
+    /// (CC8.1) over the SAME unapproved in-window merged PR still gates on
+    /// coverage — the verdict is `gating`/applicable and the pack fails.
+    #[test]
+    fn cc81_review_coverage_still_gates_on_same_store() {
+        use super::fixture::pr_with_merge_time;
+        let records = vec![pr_with_merge_time(
+            "project:v1:prMon",
+            "2026-03-15T08:00:00Z",
+            "2026-03-15T12:00:00Z",
+            "cMon",
+        )];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        assert!(pack.verdicts.review_coverage.applicable);
+        assert_eq!(pack.verdicts.review_coverage.status, "gating");
+        assert!(
+            pack.verdicts
+                .review_coverage
+                .not_applicable_reason
+                .is_none()
+        );
+        assert!(!pack.verdicts.review_coverage.passed);
+        assert!(
+            !pack.verdicts.ok,
+            "CC8.1 must still fail on unapproved coverage"
+        );
+    }
+
+    /// Codex round-8 P2 (Finding 2): a PR MERGED in-window but whose Task
+    /// `valid_time` (`github_updated_at`) falls AFTER the window is selected as
+    /// merged-in-window by merge time; the emitted
+    /// `merged_pr_without_approving_review` gap ROW must be stamped with that same
+    /// in-window merge time, not the out-of-window update time. Before the fix the
+    /// row was stamped via `resolve_valid_time` = the update-time `valid_time`.
+    #[test]
+    fn merged_pr_gap_row_is_stamped_with_merge_time() {
+        use super::fixture::pr_with_merge_time;
+        let records = vec![pr_with_merge_time(
+            "project:v1:prLate2",
+            "2026-04-15T08:00:00Z", // updated_at -> Task valid_time (after window)
+            "2026-03-15T12:00:00Z", // merged_at -> merge time (in window)
+            "cLate2",
+        )];
+        let pack = assemble_pack(
+            &records,
+            &load_default_catalog(),
+            "CC8.1",
+            &win(),
+            1.0,
+            "test-0.0.0",
+            None,
+        )
+        .expect("assembles");
+        let gap = pack
+            .gaps
+            .iter()
+            .find(|g| {
+                g.gap_class == "merged_pr_without_approving_review"
+                    && g.record_ids.contains(&"project:v1:prLate2".to_owned())
+            })
+            .expect("merged-in-window unapproved PR gaps");
+        assert_eq!(
+            gap.valid_time.as_deref(),
+            Some("2026-03-15T12:00:00Z"),
+            "gap row must be stamped with the in-window merge time, not the out-of-window update time"
         );
     }
 

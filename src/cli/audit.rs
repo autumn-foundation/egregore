@@ -275,12 +275,19 @@ fn render_pack_text(pack: &crate::evidence_pack::EvidencePack) -> String {
     for (name, v) in [
         ("required_classes", &pack.verdicts.required_classes),
         ("citation", &pack.verdicts.citation),
-        ("review_coverage", &pack.verdicts.review_coverage),
         ("integrity", &pack.verdicts.integrity),
         ("safety", &pack.verdicts.safety),
     ] {
         lines.push(format!("  {name}: {} — {}", v.passed, v.detail));
     }
+    // Review coverage carries its own applicability status: `gating` for a
+    // review-requiring control, `not_applicable` (neutral, never failing the
+    // gate) otherwise.
+    let rc = &pack.verdicts.review_coverage;
+    lines.push(format!(
+        "  review_coverage [{}]: {} — {}",
+        rc.status, rc.passed, rc.detail
+    ));
     lines.push("sections:".to_owned());
     for s in &pack.sections {
         lines.push(format!(

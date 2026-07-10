@@ -85,6 +85,15 @@ update time. The `pull_requests` section itself still windows records on
 `valid_time` (the general per-class rule above) — only the coverage/gap
 merged-in-window determination uses `merged_at`.
 
+Consistent with that selection, a `merged_pr_without_approving_review` **gap
+row** is timestamped by the **same `merged_at` merge time** used to select the
+PR as merged-in-window — never the PR `Task`'s `valid_time` (`github_updated_at`).
+A PR merged inside the window but updated after `to` therefore carries an
+in-window gap timestamp, so a downstream consumer filtering gaps by the manifest
+window keeps it in place instead of dropping or misplacing it. (Gap rows whose
+select key already *is* their own valid time — e.g. `commit_outside_any_pr`,
+keyed on the commit's own time — are unaffected.)
+
 ## Catalog integration and the three-way class outcome
 
 Every class the control maps becomes a section. A class is **available** when
@@ -146,8 +155,9 @@ could mark the required CC8.1 `Reviews` class available and let a relaxed
   *vacuous success* (every section explicitly empty, all required classes still
   resolve as available).
 - **1** — a verdict failed: `required_class_unavailable`, citation shortfall,
-  review coverage below `--min-review-coverage` (default `1.0`), or an
-  integrity/safety failure. The full report is still printed.
+  review coverage below `--min-review-coverage` (default `1.0`) **for a control
+  that requires review evidence**, or an integrity/safety failure. The full
+  report is still printed.
 - **2** — usage/load error: `unknown_control` (naming the catalog's known IDs),
   `reversed_window`, `invalid_timestamp`, `conflicting_input_flags`,
   `missing_input_flag`, `invalid_min_review_coverage`, `catalog_read_error`,
@@ -160,6 +170,24 @@ could mark the required CC8.1 `Reviews` class available and let a relaxed
 
 The per-verdict block is: `required_classes`, `citation` (with per-trust-class
 tallies), `review_coverage`, `integrity`, `safety`.
+
+### `review_coverage` gates only review-requiring controls
+
+The `review_coverage` verdict is **only gating for a control that requires review
+evidence** — one whose catalog maps `reviews` or `review_coverage` as
+`Requirement::Required` (the same control-scoping predicate that gates the review
+gap classes, never a hardcoded control-id list). For such a control (e.g. CC8.1)
+the verdict carries `"status":"gating"`, `"applicable":true`, and its `passed`
+folds into the pack `ok` exactly as before.
+
+For any other control — a monitoring pack such as CC7.2/CC7.3 that maps **no**
+review classes — the verdict is a stable **neutral** result:
+`"status":"not_applicable"`, `"applicable":false`, `"passed":true`, and
+`"not_applicable_reason":"control_does_not_require_review"`. A neutral verdict
+**never contributes to the pack `ok`**, so a monitoring pack assembled over a
+shared store that happens to contain an unapproved in-window merged PR does **not**
+fail on that unrelated review coverage. The verdict stays visible in the report
+(it is never silently dropped) — it simply reports as not-applicable.
 
 Each per-trust-class citation tally carries `total`, `cited`, `missing`, and
 `excluded`. `cited` is exactly `eg audit citations`'s satisfying set
