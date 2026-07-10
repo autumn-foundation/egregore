@@ -11,8 +11,8 @@ use serde_json::Value;
 
 use crate::ir::{
     AGENT_MEMORY_SCHEMA_VERSION, ARTIFACT_SCHEMA_VERSION, Domain, EdgeLabel, GraphRecord,
-    PROJECT_SCHEMA_VERSION, SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION, USER_CONTEXT_SCHEMA_VERSION,
-    VERIFICATION_SCHEMA_VERSION,
+    LOG_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION, SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION,
+    USER_CONTEXT_SCHEMA_VERSION, VERIFICATION_SCHEMA_VERSION,
 };
 
 /// Stable error code for default reader rejection of an unknown record version.
@@ -201,6 +201,7 @@ pub fn is_known_record_version(version: &RecordVersion) -> bool {
         "project" => version.version == PROJECT_SCHEMA_VERSION,
         "semantic" => version.version == SEMANTIC_SCHEMA_VERSION,
         "user_context" => version.version == USER_CONTEXT_SCHEMA_VERSION,
+        "log" => version.version == LOG_SCHEMA_VERSION,
         _ => false,
     }
 }
@@ -296,6 +297,7 @@ pub(crate) fn domain_from_record_id(id: &str) -> Option<String> {
         "project" => Some(Domain::Project.as_str().to_owned()),
         "semantic" => Some(Domain::Semantic.as_str().to_owned()),
         "user_context" => Some(Domain::UserContext.as_str().to_owned()),
+        "log" => Some(Domain::Log.as_str().to_owned()),
         _ => None,
     }
 }
@@ -322,6 +324,7 @@ pub(crate) fn domain_for_node_kind(kind: &str) -> &'static str {
         | "FileEdit" | "Failure" | "Decision" | "CostUsage" | "Retraction" => {
             Domain::AgentMemory.as_str()
         }
+        "LogSource" | "ErrorSignature" | "LogEvent" | "LogOccurrenceBucket" => Domain::Log.as_str(),
         _ => Domain::CodeGraph.as_str(),
     }
 }
@@ -339,6 +342,13 @@ pub(crate) fn domain_for_edge_label(label: &str) -> &'static str {
             | EdgeLabel::RevokedBy
             | EdgeLabel::ScopedToRepo,
         ) => Domain::UserContext.as_str(),
+        Some(
+            EdgeLabel::FingerprintedAs
+            | EdgeLabel::CapturedFrom
+            | EdgeLabel::Aggregates
+            | EdgeLabel::FrameResolvesTo
+            | EdgeLabel::EmittedDuring,
+        ) => Domain::Log.as_str(),
         Some(label) if label.is_codegraph_topology_label() => Domain::CodeGraph.as_str(),
         Some(_) | None => Domain::AgentMemory.as_str(),
     }

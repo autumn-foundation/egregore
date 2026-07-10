@@ -5201,6 +5201,12 @@ pub(crate) fn trust_class_for(record: &GraphRecord) -> &'static str {
         | "Project"
         | "Plan" => "project_state",
         "Artifact" | "PatchArtifact" | "FileEdit" => "artifact",
+        // Runtime log-signature observations (issues #319 / #320): a program's
+        // own claim about its execution, deterministically parsed but never
+        // verified — never source truth or verification evidence.
+        "LogSource" | "ErrorSignature" | "LogEvent" | "LogOccurrenceBucket" => {
+            "runtime_observation"
+        }
         _ => "other",
     }
 }

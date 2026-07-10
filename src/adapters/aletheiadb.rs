@@ -1818,6 +1818,7 @@ impl EmbeddedAletheiaSink {
             repository_identity,
             source_snapshot,
             dependency,
+            log,
             text,
             superseded_by,
             agent_id,
@@ -1993,6 +1994,11 @@ impl EmbeddedAletheiaSink {
             && let Ok(json) = serde_json::to_string(payload.as_ref())
         {
             builder = builder.insert("dependency_json", json.as_str());
+        }
+        if let Some(payload) = log
+            && let Ok(json) = serde_json::to_string(payload.as_ref())
+        {
+            builder = builder.insert("log_json", json.as_str());
         }
         builder = insert_optional(builder, "text", text.as_deref());
         builder = insert_optional(builder, "superseded_by", superseded_by.as_deref());
@@ -2704,6 +2710,12 @@ impl EmbeddedAletheiaSink {
             .transpose()
             .map_err(|e| read_back_error(record_id, format!("dependency_json invalid: {e}")))?
             .map(Box::new),
+            log: optional_str_property(record_id, "log_json", node.get_property("log_json"))?
+                .as_deref()
+                .map(serde_json::from_str::<crate::ir::LogPayload>)
+                .transpose()
+                .map_err(|e| read_back_error(record_id, format!("log_json invalid: {e}")))?
+                .map(Box::new),
             valid_time: optional_str_property(
                 record_id,
                 "node_valid_time",
@@ -3861,7 +3873,11 @@ const fn node_label(kind: NodeKind) -> &'static str {
         | NodeKind::Constraint
         | NodeKind::CostUsage
         | NodeKind::Retraction
-        | NodeKind::DependencyDeclaration => kind.as_str(),
+        | NodeKind::DependencyDeclaration
+        | NodeKind::LogSource
+        | NodeKind::ErrorSignature
+        | NodeKind::LogEvent
+        | NodeKind::LogOccurrenceBucket => kind.as_str(),
     }
 }
 

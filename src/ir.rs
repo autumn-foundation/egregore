@@ -31,6 +31,11 @@ pub const SEMANTIC_SCHEMA_VERSION: u32 = 1;
 /// Documented in `docs/schema/user-context.md`.
 pub const USER_CONTEXT_SCHEMA_VERSION: u32 = 1;
 
+/// Schema version for the log-signature domain (`LogSource`, `ErrorSignature`,
+/// `LogEvent`, `LogOccurrenceBucket`). Documented in `docs/schema/log-graph.md`
+/// (issues #319 / #320).
+pub const LOG_SCHEMA_VERSION: u32 = 1;
+
 /// Minimum replay tolerance for semantic drift scores.
 /// Documented in `docs/schema/semantic-drift.md`.
 pub const SEMANTIC_DRIFT_REPLAY_SCORE_TOLERANCE: f64 = 1e-5;
@@ -82,6 +87,8 @@ pub enum ProducerKind {
     TaskWriter,
     /// Semantic drift engine.
     DriftEngine,
+    /// Log-signature importer (`scan-logs` command, issues #319 / #320).
+    LogImporter,
     /// Any other producer not enumerated above, including future additive variants
     /// from newer binary versions read by an older binary.
     #[serde(other)]
@@ -102,6 +109,7 @@ impl ProducerKind {
             Self::ObservationWriter => "observation_writer",
             Self::TaskWriter => "task_writer",
             Self::DriftEngine => "drift_engine",
+            Self::LogImporter => "log_importer",
             Self::Other => "other",
         }
     }
@@ -139,6 +147,8 @@ pub struct Producer {
     /// `drift_engine` MUST populate `embedding_model_id`.
     /// `traj_importer`, `codex_importer`, `claude_code_importer` MUST populate
     /// `importer_schema_version` and `source_format_version`.
+    /// `log_importer` MUST populate `importer_schema_version`,
+    /// `source_format_version`, and `fingerprint_algorithm` (issues #319 / #320).
     pub producer_components: std::collections::BTreeMap<String, String>,
     /// RFC 3339 wall-clock time the producer process started.
     pub producer_started_at: String,
@@ -428,6 +438,105 @@ pub struct DependencyDeclarationPayload {
     /// be read or parsed; an ancestor lockfile is never consulted in its
     /// place).
     pub resolution: String,
+}
+
+/// Per-kind payload stamped on the four log-signature node kinds (issues
+/// #319 / #320).
+///
+/// Carried in one boxed `log` field on `GraphRecord::Node`, mirroring the
+/// `dependency` payload pattern, so log records never widen the flat node
+/// schema. Serialized internally-tagged on `log_kind`, so the concrete
+/// variant's fields sit alongside the tag. All fields are additive per
+/// `docs/schema/schema-versioning.md §2`. Only the fields listed in the
+/// identity part-lists of `docs/schema/log-graph.md` feed a record's stable
+/// ID; the rest are non-identity metadata.
+///
+/// No field ever carries raw log text beyond a bounded, post-redaction excerpt
+/// (`template_excerpt` / `event_excerpt`).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "log_kind", rename_all = "snake_case")]
+pub enum LogPayload {
+    /// A captured log source artifact.
+    LogSource(LogSourcePayload),
+    /// A deduplicated error fingerprint.
+    ErrorSignature(ErrorSignaturePayload),
+    /// A bounded exemplar occurrence of a signature.
+    LogEvent(LogEventPayload),
+    /// An hourly occurrence-count bucket for a signature.
+    LogOccurrenceBucket(LogOccurrenceBucketPayload),
+}
+
+/// Payload for a `LogSource` node: the captured log artifact identity.
+///
+/// Identity inputs (`docs/schema/log-graph.md`): `repository_id`,
+/// `source_relative_path`, `source_artifact_hash`. `line_count`, capture time,
+/// and producer are non-identity.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LogSourcePayload {
+    /// Repository-relative path of the captured log file.
+    pub source_relative_path: String,
+    /// Detected source format: `plain-v1` or `jsonl-v1`.
+    pub source_format_version: String,
+    /// BLAKE3 hex of the newline-normalized (`\r\n` / `\r` → `\n`) file bytes.
+    /// The idempotency anchor; normalizing line endings before hashing makes a
+    /// CRLF and an LF checkout of the same log yield an identical hash.
+    pub source_artifact_hash: String,
+    /// Count of every logical line in the source, including info/debug noise
+    /// that mints no signature. Non-identity.
+    pub line_count: u64,
+}
+
+/// Payload for an `ErrorSignature` node: a deduplicated error fingerprint.
+///
+/// Identity inputs: `repository_id`, `fingerprint_algorithm`,
+/// `normalized_template`, `severity`. `occurrence_count`, `first_seen`,
+/// `last_seen`, capture time, and producer are non-identity.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ErrorSignaturePayload {
+    /// Fingerprint algorithm identifier (`template-v1`).
+    pub fingerprint_algorithm: String,
+    /// Bounded, post-redaction excerpt of the normalized template. Never raw
+    /// log text beyond the documented excerpt bound.
+    pub template_excerpt: String,
+    /// Closed severity class: `fatal`, `error`, or `warn`.
+    pub severity: String,
+    /// Total raw occurrences that fingerprinted to this signature. Non-identity.
+    pub occurrence_count: u64,
+    /// Valid time of the earliest occurrence. Non-identity.
+    pub first_seen: String,
+    /// Valid time of the latest occurrence. Non-identity.
+    pub last_seen: String,
+}
+
+/// Payload for a `LogEvent` node: one bounded exemplar occurrence.
+///
+/// Identity inputs: `repository_id`, `signature_id`, `event_valid_time`,
+/// `event_content_hash`. `source_line`, byte offsets, capture time, and
+/// producer are non-identity.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LogEventPayload {
+    /// Bounded, post-redaction excerpt of the exemplar line(s).
+    pub event_excerpt: String,
+    /// BLAKE3 hex of the newline-normalized exemplar content.
+    pub event_content_hash: String,
+    /// One-based source line the exemplar began on. Non-identity.
+    pub source_line: u64,
+    /// Closed severity class: `fatal`, `error`, or `warn`.
+    pub severity: String,
+}
+
+/// Payload for a `LogOccurrenceBucket` node: an hourly occurrence count.
+///
+/// Identity inputs: `repository_id`, `signature_id`, `bucket_start`,
+/// `bucket_width`. `occurrence_count` and producer are non-identity.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LogOccurrenceBucketPayload {
+    /// RFC 3339 UTC start of the bucket, floored to the hour.
+    pub bucket_start: String,
+    /// Bucket width token (`1h`).
+    pub bucket_width: String,
+    /// Occurrences of the signature within this bucket. Non-identity.
+    pub occurrence_count: u64,
 }
 
 /// A typed citation from an agent-memory node to another graph record.
@@ -799,6 +908,11 @@ pub enum GraphRecord {
         /// (issue #180); absent on all other kinds.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dependency: Option<Box<DependencyDeclarationPayload>>,
+        /// Log-signature payload for the four log-domain node kinds
+        /// (`LogSource`, `ErrorSignature`, `LogEvent`, `LogOccurrenceBucket`);
+        /// absent on all other kinds (issues #319 / #320).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        log: Option<Box<LogPayload>>,
         // ── Agent-memory provenance fields (absent for code-graph nodes) ─────
         /// Observation body text (Observation nodes).
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1224,6 +1338,7 @@ impl GraphRecord {
             diff_hunk_handle: None,
             review_side: None,
             dependency: None,
+            log: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1337,6 +1452,7 @@ impl GraphRecord {
             diff_hunk_handle: None,
             review_side: None,
             dependency: None,
+            log: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1449,6 +1565,7 @@ impl GraphRecord {
             diff_hunk_handle: None,
             review_side: None,
             dependency: None,
+            log: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1567,6 +1684,7 @@ impl GraphRecord {
             diff_hunk_handle: None,
             review_side: None,
             dependency: None,
+            log: None,
             user_context: UserContextFields::empty(),
             producer: None,
         }
@@ -1814,6 +1932,26 @@ impl GraphRecord {
         }
     }
 
+    /// Stamps a [`LogPayload`] on a log-domain node (issues #319 / #320).
+    /// No-op on non-node records.
+    #[must_use]
+    pub fn with_log(mut self, payload: LogPayload) -> Self {
+        if let Self::Node { log, .. } = &mut self {
+            *log = Some(Box::new(payload));
+        }
+        self
+    }
+
+    /// Returns the log-signature payload when this record is a log-domain node
+    /// carrying one; `None` otherwise (issues #319 / #320).
+    #[must_use]
+    pub fn log_payload(&self) -> Option<&LogPayload> {
+        match self {
+            Self::Node { log, .. } => log.as_deref(),
+            Self::Edge { .. } | Self::Tombstone { .. } => None,
+        }
+    }
+
     /// Returns the source-snapshot payload when this record is a `Repository` node
     /// carrying one; `None` otherwise (issue #82).
     #[must_use]
@@ -1998,6 +2136,8 @@ pub enum Domain {
     Semantic,
     /// Authorization-derived operator preference and workflow-policy records.
     UserContext,
+    /// Runtime log-signature observations (issues #319 / #320).
+    Log,
 }
 
 impl Domain {
@@ -2012,6 +2152,7 @@ impl Domain {
             Self::Project => "project",
             Self::Semantic => "semantic",
             Self::UserContext => "user_context",
+            Self::Log => "log",
         }
     }
 }
@@ -2233,6 +2374,18 @@ pub enum NodeKind {
     /// retracted the target, when (transaction time), the reason, and the prior
     /// record handle, so logical retraction never leaves a silent hole.
     Retraction,
+    // ── Log-signature node kinds (docs/schema/log-graph.md, issues #319/#320) ─
+    /// A captured log source artifact (one scanned log file). Carries the
+    /// artifact hash, format, and line count in its `log` payload.
+    LogSource,
+    /// A deduplicated error fingerprint. One `ErrorSignature` per distinct
+    /// `template-v1` normalization; carries the redacted template excerpt,
+    /// severity, and total occurrence count.
+    ErrorSignature,
+    /// A bounded exemplar occurrence of a signature (capped per signature/source).
+    LogEvent,
+    /// An hourly occurrence-count bucket aggregating a signature over time.
+    LogOccurrenceBucket,
 }
 
 impl NodeKind {
@@ -2293,6 +2446,10 @@ impl NodeKind {
             Self::Constraint => "Constraint",
             Self::CostUsage => "CostUsage",
             Self::Retraction => "Retraction",
+            Self::LogSource => "LogSource",
+            Self::ErrorSignature => "ErrorSignature",
+            Self::LogEvent => "LogEvent",
+            Self::LogOccurrenceBucket => "LogOccurrenceBucket",
         }
     }
 }
@@ -2376,6 +2533,20 @@ pub enum EdgeLabel {
     ScopedToRepo,
     /// Generic weak relationship between any two records.
     RelatesTo,
+    // ── Log-signature edge labels (docs/schema/log-graph.md, issues #319/#320) ─
+    /// A `LogEvent` exemplar is fingerprinted as an `ErrorSignature` (structural).
+    FingerprintedAs,
+    /// A `LogEvent` / `ErrorSignature` was captured from a `LogSource` (structural).
+    CapturedFrom,
+    /// A `LogOccurrenceBucket` aggregates an `ErrorSignature` (structural).
+    Aggregates,
+    /// A log backtrace frame resolves to a code-graph `Symbol` (evidence link,
+    /// reserved for #322/#323; declared here as schema groundwork, not emitted
+    /// by `scan-logs`).
+    FrameResolvesTo,
+    /// An `ErrorSignature` was emitted during a verification/agent run (evidence
+    /// link, reserved for #322/#323; declared here, not emitted by `scan-logs`).
+    EmittedDuring,
 }
 
 impl EdgeLabel {
@@ -2420,6 +2591,11 @@ impl EdgeLabel {
             "REVOKED_BY" => Some(Self::RevokedBy),
             "SCOPED_TO_REPO" => Some(Self::ScopedToRepo),
             "RELATES_TO" => Some(Self::RelatesTo),
+            "FINGERPRINTED_AS" => Some(Self::FingerprintedAs),
+            "CAPTURED_FROM" => Some(Self::CapturedFrom),
+            "AGGREGATES" => Some(Self::Aggregates),
+            "FRAME_RESOLVES_TO" => Some(Self::FrameResolvesTo),
+            "EMITTED_DURING" => Some(Self::EmittedDuring),
             _ => None,
         }
     }
@@ -2449,6 +2625,8 @@ impl EdgeLabel {
                 | Self::Contradicts
                 | Self::Supersedes
                 | Self::RelatesTo
+                | Self::FrameResolvesTo
+                | Self::EmittedDuring
         )
     }
 
@@ -2518,6 +2696,11 @@ impl EdgeLabel {
             Self::RevokedBy => "REVOKED_BY",
             Self::ScopedToRepo => "SCOPED_TO_REPO",
             Self::RelatesTo => "RELATES_TO",
+            Self::FingerprintedAs => "FINGERPRINTED_AS",
+            Self::CapturedFrom => "CAPTURED_FROM",
+            Self::Aggregates => "AGGREGATES",
+            Self::FrameResolvesTo => "FRAME_RESOLVES_TO",
+            Self::EmittedDuring => "EMITTED_DURING",
         }
     }
 }
@@ -2662,6 +2845,24 @@ pub fn user_context_stable_id(parts: &[&str]) -> String {
         "user_context:v{USER_CONTEXT_SCHEMA_VERSION}:{}",
         hasher.finalize().to_hex()
     )
+}
+
+/// Builds a stable log-signature record ID (issues #319 / #320).
+///
+/// Uses the `log:v1:` prefix so runtime log-signature records cannot collide
+/// with code, memory, verification, artifact, project, semantic, or
+/// user-context IDs. Parts are hashed verbatim (no lowercasing) so log content
+/// identity is preserved exactly; the producer envelope and its version fields
+/// are never identity inputs, so two binary versions over identical input mint
+/// identical IDs. Documented in `docs/schema/log-graph.md`.
+#[must_use]
+pub fn log_stable_id(parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("log:v{LOG_SCHEMA_VERSION}:{}", hasher.finalize().to_hex())
 }
 
 /// Builds a stable agent-memory record ID.
