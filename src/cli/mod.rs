@@ -51,6 +51,7 @@ mod subsystem;
 mod symbols;
 mod task;
 mod transaction_time;
+mod transitive_callees;
 mod transitive_callers;
 mod undocumented;
 mod unreferenced;
@@ -109,6 +110,7 @@ pub(crate) use subsystem::*;
 pub(crate) use symbols::*;
 pub(crate) use task::*;
 pub(crate) use transaction_time::*;
+pub(crate) use transitive_callees::*;
 pub(crate) use transitive_callers::*;
 pub(crate) use undocumented::*;
 pub(crate) use unreferenced::*;
@@ -1355,6 +1357,70 @@ pub(crate) enum QuerySubcommand {
         #[arg(long)]
         repo: Option<String>,
         /// Inbound walk depth bound (hops from the queried symbol). Reaching
+        /// the bound yields a truncation diagnostic with dropped frontier
+        /// counts per depth rather than silently omitting reachable nodes.
+        #[arg(long, default_value_t = 5)]
+        max_depth: usize,
+        /// Restrict the walk to the graph state at this commit SHA or unique
+        /// prefix (requires a history graph). Mutually exclusive with --as-of.
+        #[arg(long, conflicts_with = "as_of")]
+        at: Option<String>,
+        /// Restrict the walk to the graph state at the most recent commit at
+        /// or before this RFC 3339 instant. Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        as_of: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Walk the transitive outbound callees/dependencies of a symbol with dependency paths (issue #253).
+    ///
+    /// The outbound mirror of `eg query transitive-callers` (#139): given a
+    /// symbol record ID or an exact symbol name, walks the outbound
+    /// `CALLS`/`IMPLEMENTS`/`IMPORTS`/`REFERENCES` closure up to --max-depth
+    /// hops and returns every reachable symbol with its hop distance and one
+    /// concrete shortest connecting dependency path (record-ID/edge-label
+    /// handles). The `--max-depth=1` result is exactly the direct outbound
+    /// dependency set of `eg query deps` (#123). Cycles terminate
+    /// deterministically: each symbol is reported once with its shortest
+    /// discovered path. Call-resolution labels (issues #152/#134) propagate
+    /// along paths: each row carries the weakest resolution on its chain. An
+    /// outbound edge whose target is not in-graph (an unresolved call's
+    /// Diagnostic marker or a missing record) is reported in an explicit
+    /// `unresolved` category rather than silently dropped, and is never counted
+    /// as reachable.
+    ///
+    /// Every row is a reachability LEAD — a dependency path exists in the graph
+    /// — never proof that a change breaks a callee or that a test will fail.
+    ///
+    /// Output is newline-delimited JSON: a summary envelope line (target,
+    /// counts, truncation, diagnostics) followed by one line per reachable
+    /// row, then one line per unresolved target, byte-identical across runs.
+    /// Reaching the depth bound emits a truncation diagnostic counting dropped
+    /// frontier nodes per depth.
+    ///
+    /// Exit codes:
+    ///   0 — walk completed (including an explicit empty reachable set).
+    ///   1 — malformed / ambiguous / unsupported handle or selector
+    ///       (machine-readable JSON on stderr; ambiguous names list all
+    ///       candidate record IDs).
+    ///   2 — handle resolves to no live record, or --at/--as-of names no
+    ///       resolvable commit.
+    ///
+    /// Documented in `docs/cli/transitive-callees.md` and `docs/cli/query.md`.
+    TransitiveCallees {
+        /// Symbol record ID (`codegraph:vN:<hex>`) or exact symbol name.
+        handle: String,
+        /// Graph JSONL path (mutually exclusive with --data-dir).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Embedded `AletheiaDB` data directory (mutually exclusive with --graph).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict symbol resolution to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Outbound walk depth bound (hops from the queried symbol). Reaching
         /// the bound yields a truncation diagnostic with dropped frontier
         /// counts per depth rather than silently omitting reachable nodes.
         #[arg(long, default_value_t = 5)]
@@ -4206,6 +4272,48 @@ pub(crate) fn query_cmd(subcommand: QuerySubcommand) -> Result<()> {
             let index = query::RepositoryIndex::build(&records);
             let selected = resolve_repo_scope(&index, repo.as_deref());
             query_transitive_callers_cmd(
+                &records,
+                &handle,
+                &index,
+                selected.as_deref(),
+                max_depth,
+                at.as_deref(),
+                as_of.as_deref(),
+                format,
+            )
+        }
+        QuerySubcommand::TransitiveCallees {
+            handle,
+            graph,
+            data_dir,
+            repo,
+            max_depth,
+            at,
+            as_of,
+            format,
+        } => {
+            // Validate the bound before any store I/O: a zero-hop walk can
+            // never return the direct-dependency set and is malformed input.
+            if max_depth == 0 {
+                let diag = serde_json::json!({
+                    "code": "invalid_max_depth",
+                    "max_depth": 0,
+                    "message": "--max-depth must be at least 1",
+                });
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            // Temporal selectors need the history-inclusive store view; the
+            // current-state read suffices otherwise. A JSONL graph is read
+            // identically either way.
+            let records = if at.is_some() || as_of.is_some() {
+                load_query_records_history(graph.as_deref(), data_dir.as_deref())?
+            } else {
+                load_query_records(graph.as_deref(), data_dir.as_deref())?
+            };
+            let index = query::RepositoryIndex::build(&records);
+            let selected = resolve_repo_scope(&index, repo.as_deref());
+            query_transitive_callees_cmd(
                 &records,
                 &handle,
                 &index,
