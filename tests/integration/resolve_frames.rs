@@ -133,7 +133,7 @@ fn log_text() -> String {
 fn log_graph_jsonl(repo_root: &Path) -> String {
     let log_path = repo_root.join("app.log");
     fs::write(&log_path, log_text()).expect("write log fixture");
-    let scan = log_graph::scan_log_records(&log_path, repo_root, REPO_ID, FIXED_TIME)
+    let scan = log_graph::scan_log_records(&log_path, repo_root, REPO_ID, FIXED_TIME, false)
         .expect("scan should succeed");
     let producer = log_graph::log_importer_producer(scan.source_format_version, FIXED_TIME);
     let mut g = Graph::new();

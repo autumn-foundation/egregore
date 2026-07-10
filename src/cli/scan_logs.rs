@@ -80,22 +80,29 @@ pub(crate) fn scan_logs(
     let repository_id = identity::compute_repository_identity(repo_path, repo_id_override).id;
     let transaction_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-    let scan =
-        match log_graph::scan_log_records(log_path, repo_path, &repository_id, &transaction_time) {
-            Ok(scan) => scan,
-            Err(LogScanError::UnrecognizedFormat { detail }) => {
-                let envelope = serde_json::json!({
-                    "ok": false,
-                    "error": { "code": "unrecognized_format", "message": detail }
-                });
-                println!("{}", serde_json::to_string(&envelope).unwrap_or_default());
-                process::exit(1);
-            }
-            Err(err @ LogScanError::Read { .. }) => {
-                return Err(anyhow::anyhow!(err.to_string()))
-                    .with_context(|| format!("failed to scan log file {}", log_path.display()));
-            }
-        };
+    let scan = match log_graph::scan_log_records(
+        log_path,
+        repo_path,
+        &repository_id,
+        &transaction_time,
+        // Retain the normalized buffer for capture ONLY when capture is requested;
+        // the default path never keeps a full-log clone alive (issue #321, Codex P2).
+        protected_raw_artifacts,
+    ) {
+        Ok(scan) => scan,
+        Err(LogScanError::UnrecognizedFormat { detail }) => {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": { "code": "unrecognized_format", "message": detail }
+            });
+            println!("{}", serde_json::to_string(&envelope).unwrap_or_default());
+            process::exit(1);
+        }
+        Err(err @ LogScanError::Read { .. }) => {
+            return Err(anyhow::anyhow!(err.to_string()))
+                .with_context(|| format!("failed to scan log file {}", log_path.display()));
+        }
+    };
 
     let producer_envelope =
         log_graph::log_importer_producer(scan.source_format_version, &transaction_time);
@@ -124,8 +131,13 @@ pub(crate) fn scan_logs(
 
         // Redact the SAME normalized buffer the scan read and hashed — never a
         // second filesystem read that could observe appended/rotated bytes
-        // (issue #321, Codex finding B). Raw bytes never leave the helper.
-        let redacted = log_graph::redacted_source_bytes(&scan.normalized_source);
+        // (issue #321, Codex finding B). Retained because capture was requested
+        // (Codex P2). Raw bytes never leave the helper.
+        let normalized_source = scan
+            .normalized_source
+            .as_deref()
+            .expect("capture requested: scan retains the normalized source buffer");
+        let redacted = log_graph::redacted_source_bytes(normalized_source);
         let source_rel = log_graph::source_relative_path(repo_path, log_path);
         let store = ProtectedStore::new(store_dir);
         match store.capture_bytes(

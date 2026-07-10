@@ -86,7 +86,7 @@ fn write_fixtures(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 /// Runs `scan_log_records` directly with a fixed transaction time and returns
 /// the stamped, canonical JSONL.
 fn scan_to_jsonl(log_path: &Path, repo_root: &Path) -> String {
-    let scan = log_graph::scan_log_records(log_path, repo_root, REPO_ID, FIXED_TIME)
+    let scan = log_graph::scan_log_records(log_path, repo_root, REPO_ID, FIXED_TIME, false)
         .expect("scan should succeed");
     let producer = log_graph::log_importer_producer(scan.source_format_version, FIXED_TIME);
     let mut graph = aletheia_egregore::Graph::new();
@@ -504,10 +504,10 @@ fn record_ids_are_stable_across_producer_perturbation() {
 
     // Two different producer-started-at values (simulating different binary runs)
     // must not change any record ID — the producer envelope is non-identity.
-    let scan_a =
-        log_graph::scan_log_records(&plain, temp.path(), REPO_ID, FIXED_TIME).expect("scan a");
-    let scan_b =
-        log_graph::scan_log_records(&plain, temp.path(), REPO_ID, FIXED_TIME).expect("scan b");
+    let scan_a = log_graph::scan_log_records(&plain, temp.path(), REPO_ID, FIXED_TIME, false)
+        .expect("scan a");
+    let scan_b = log_graph::scan_log_records(&plain, temp.path(), REPO_ID, FIXED_TIME, false)
+        .expect("scan b");
 
     let ids_a: Vec<&str> = scan_a
         .records
@@ -547,7 +547,8 @@ fn record_ids_are_stable_across_producer_perturbation() {
 fn exemplar_cap_emits_diagnostic_and_keeps_default_cap() {
     let temp = tempfile::tempdir().expect("temp dir");
     let (plain, _) = write_fixtures(temp.path());
-    let scan = log_graph::scan_log_records(&plain, temp.path(), REPO_ID, FIXED_TIME).expect("scan");
+    let scan =
+        log_graph::scan_log_records(&plain, temp.path(), REPO_ID, FIXED_TIME, false).expect("scan");
 
     // The 1000× error has 1000 distinct timestamps → capped at the default.
     let cap_diag = scan
@@ -1030,6 +1031,69 @@ fn stored_blob_redacts_private_key_block_with_internal_blank_line() {
     );
 }
 
+// Regression (issue #321, Codex P1 "preserve v1 redaction coverage for quoted
+// env secrets"): the byte-span capture path relies on `detect_secret_span`, whose
+// EnvSecret span matcher treated the opening `"` of `KEY="value"` as a value
+// delimiter and returned no span, so a common quoted `.env` secret was copied
+// verbatim into the `log_payload` blob. `redact_value` redacts it; the span
+// matcher must agree so capture stores post-redaction bytes.
+#[test]
+fn stored_blob_redacts_quoted_env_secret() {
+    const QUOTED_SECRET: &str = "hunterSECRETtokenValueLong";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("quoted.log");
+    let mut fixture = String::new();
+    fixture.push_str("2026-01-02T03:00:00Z INFO service starting up nominally\n");
+    fixture.push_str("2026-01-02T03:00:01Z [ERROR] auth bootstrap failed API_KEY=\"");
+    fixture.push_str(QUOTED_SECRET);
+    fixture.push_str("\" reason denied\n");
+    fixture.push_str("2026-01-02T03:00:05Z INFO service ready to accept traffic\n");
+    fs::write(&log, &fixture).expect("write quoted fixture");
+
+    let out = temp.path().join("log.graph.jsonl");
+    let store = temp.path().join("protected");
+    scan_logs_capture(&log, temp.path(), &out, &store, "op-1").success();
+
+    let handle = only_manifest_record(&store)["handle"]
+        .as_str()
+        .expect("handle")
+        .to_owned();
+    let got = egregore()
+        .args(["protected", "get"])
+        .arg(&handle)
+        .arg("--store")
+        .arg(&store)
+        .arg("--operator")
+        .arg("op-1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let blob = String::from_utf8(got).expect("utf8 blob");
+
+    // The quoted env secret value must never survive capture — the exact leak the
+    // quote-as-delimiter span bug produced.
+    assert!(
+        !blob.contains(QUOTED_SECRET),
+        "the quoted env secret must be redacted, not copied verbatim"
+    );
+    // The secret span collapses to a redaction marker.
+    assert!(
+        blob.contains("<REDACTED:"),
+        "the quoted secret must be stored as a redaction marker"
+    );
+    // Non-secret lines around the secret are preserved (no over-redaction).
+    assert!(
+        blob.contains("service starting up nominally"),
+        "normal line before the secret is preserved"
+    );
+    assert!(
+        blob.contains("service ready to accept traffic"),
+        "normal line after the secret is preserved"
+    );
+}
+
 // Issue #321 (Codex finding B): the protected blob must be derived from the SAME
 // normalized buffer the scan read — not a second filesystem read that could
 // observe appended/rotated bytes. The scan exposes its normalized buffer, and the
@@ -1050,18 +1114,23 @@ fn capture_redacts_the_same_normalized_buffer_the_scan_read() {
     )
     .expect("write crlf fixture");
 
-    let scan = log_graph::scan_log_records(&log, temp.path(), REPO_ID, FIXED_TIME)
+    // Capture requested → retain the normalized buffer (issue #321, Codex P2).
+    let scan = log_graph::scan_log_records(&log, temp.path(), REPO_ID, FIXED_TIME, true)
         .expect("scan should succeed");
 
     // The scan exposes the exact normalized buffer it hashed: CRLF collapsed to LF.
+    let normalized_source = scan
+        .normalized_source
+        .as_deref()
+        .expect("retain=true must yield Some(normalized_source)");
     assert!(
-        scan.normalized_source.contains('\n') && !scan.normalized_source.contains('\r'),
+        normalized_source.contains('\n') && !normalized_source.contains('\r'),
         "normalized_source is the CRLF->LF normalized buffer the scan hashed"
     );
 
     // Capture redaction runs over that same in-memory buffer (single read) and
     // matches the redaction of the identical buffer — no second filesystem read.
-    let redacted = log_graph::redacted_source_bytes(&scan.normalized_source);
+    let redacted = log_graph::redacted_source_bytes(normalized_source);
     let redacted_str = String::from_utf8(redacted).expect("utf8 redacted");
     assert!(
         !redacted_str.contains("hunterSECRETtokenValueLong"),
@@ -1073,6 +1142,56 @@ fn capture_redacts_the_same_normalized_buffer_the_scan_read() {
     );
     // Non-secret content from the scanned buffer is preserved verbatim.
     assert!(redacted_str.contains("INFO starting"));
+}
+
+// Regression (issue #321, Codex P2 "avoid cloning raw logs when capture is
+// disabled"): the default scan path (no protected capture) must NOT retain a
+// full-log clone of the normalized buffer past the scan — that is an avoidable
+// large-log allocation for the common CI/runtime case that never needs it. The
+// buffer is still read once and hashed transiently into `source_artifact_hash`;
+// only RETENTION is conditional. When capture IS requested the same single-read
+// buffer is retained and yields the correct redacted blob (no second read).
+#[test]
+fn default_scan_does_not_retain_normalized_source_but_capture_does() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("retain.log");
+    std::fs::write(
+        &log,
+        b"2026-01-02T03:00:00Z INFO starting\n\
+          2026-01-02T03:00:01Z [ERROR] auth failed API_KEY=hunterSECRETtokenValueLong denied\n",
+    )
+    .expect("write fixture");
+
+    // Default path: buffer is dropped, not retained.
+    let default_scan = log_graph::scan_log_records(&log, temp.path(), REPO_ID, FIXED_TIME, false)
+        .expect("default scan should succeed");
+    assert!(
+        default_scan.normalized_source.is_none(),
+        "the default (no-capture) scan must not retain the normalized buffer"
+    );
+    // The scan is otherwise unchanged — records are still produced.
+    assert!(
+        !default_scan.records.is_empty(),
+        "the default scan still produces graph records"
+    );
+
+    // Capture path: buffer retained from the single read, redacted blob correct.
+    let capture_scan = log_graph::scan_log_records(&log, temp.path(), REPO_ID, FIXED_TIME, true)
+        .expect("capture scan should succeed");
+    let normalized_source = capture_scan
+        .normalized_source
+        .as_deref()
+        .expect("retain=true must yield Some(normalized_source)");
+    let redacted =
+        String::from_utf8(log_graph::redacted_source_bytes(normalized_source)).expect("utf8");
+    assert!(
+        !redacted.contains("hunterSECRETtokenValueLong"),
+        "the retained single-read buffer redacts the secret"
+    );
+    assert!(
+        redacted.contains("<REDACTED:"),
+        "carries a redaction marker"
+    );
 }
 
 // AC5/AC7: `protected get` verifies + returns bytes and `list` shows a

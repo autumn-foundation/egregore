@@ -130,7 +130,14 @@ pub struct LogScan {
     /// the captured blob corresponds byte-for-byte (post-redaction) to the bytes
     /// the graph records describe — closing the append/rotate window between the
     /// scan read and a later capture read.
-    pub normalized_source: String,
+    ///
+    /// `Some` only when the caller passes `retain_normalized_source = true` to
+    /// [`scan_log_records`] (i.e. protected capture is actually requested);
+    /// `None` on the default path (issue #321, Codex P2). The scan still hashes
+    /// the normalized buffer transiently for `source_artifact_hash` regardless,
+    /// but never RETAINS a full-log clone past the scan when capture is off — a
+    /// large-log allocation the default path never needs.
+    pub normalized_source: Option<String>,
 }
 
 /// Builds the `log_importer` producer envelope (issues #319 / #320).
@@ -238,6 +245,14 @@ struct Occurrence {
 /// to; `transaction_time` (RFC 3339) is the capture instant threaded through the
 /// deterministic override path (no wall clock enters IDs or canonical output).
 ///
+/// `retain_normalized_source` controls whether the normalized source buffer is
+/// RETAINED on the returned [`LogScan`] (as `normalized_source: Some(_)`). Pass
+/// `true` only when protected capture (issue #321) will redact that same
+/// single-read buffer via [`redacted_source_bytes`]; pass `false` on the default
+/// path so a large-log full-buffer clone is never kept alive past the scan (issue
+/// #321, Codex P2). `source_artifact_hash` is computed from the normalized buffer
+/// either way — only RETENTION is conditional, never the read or the hash.
+///
 /// # Errors
 ///
 /// Returns [`LogScanError::Read`] when the file cannot be read and
@@ -249,6 +264,7 @@ pub fn scan_log_records(
     repo_root: &Path,
     repository_id: &str,
     transaction_time: &str,
+    retain_normalized_source: bool,
 ) -> Result<LogScan, LogScanError> {
     let raw = std::fs::read(log_path).map_err(|source| LogScanError::Read {
         path: log_path.to_path_buf(),
@@ -533,8 +549,10 @@ pub fn scan_log_records(
         diagnostics,
         // Hand back the exact normalized buffer this scan hashed so protected
         // capture (issue #321) redacts these same bytes instead of re-reading the
-        // log file, which could observe appended/rotated bytes.
-        normalized_source: text.to_owned(),
+        // log file, which could observe appended/rotated bytes. Retained ONLY when
+        // capture is requested; on the default path the buffer is dropped rather
+        // than cloned, so a large log is never allocated twice (Codex P2).
+        normalized_source: retain_normalized_source.then(|| text.to_owned()),
     })
 }
 

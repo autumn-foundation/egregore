@@ -1135,12 +1135,35 @@ fn find_env_secret_span(value: &str) -> Option<(usize, usize)> {
         if remaining.starts_with("<REDACTED:") || remaining.starts_with("«redacted:secret»") {
             continue;
         }
+        // Compute the value token EXACTLY as `find_env_secret` does (quotes are NOT
+        // delimiters here), so the span detector and `redact_value` agree on which
+        // env secrets exist. Treating `"`/`'` as delimiters — as an earlier form of
+        // this matcher did — made `KEY="value"` read as a zero-length value, so the
+        // span detector returned `None` while `redact_value` redacted it, and the
+        // #321 protected-capture path (which relies only on this detector) copied
+        // the quoted secret into the blob unredacted (Codex P1).
         let val_len = remaining
-            .find(['\n', '\r', ';', ' ', '\t', '"', '\''])
+            .find(['\n', '\r', ';', ' ', '\t'])
             .unwrap_or(remaining.len());
-        if val_len >= 8 {
-            return Some((val_start, val_len));
+        if val_len < 8 {
+            continue;
         }
+        // Strip a wrapping quote pair so the returned span covers the secret VALUE
+        // bytes and leaves the structural quotes in place — the quote-as-delimiter
+        // convention already used by the database-url and session-cookie span
+        // matchers. The unquoted path is unchanged (span == the whole value token).
+        let token = &remaining[..val_len];
+        let opening = token.chars().next().filter(|&c| c == '"' || c == '\'');
+        let (span_start, span_len) = opening.map_or((val_start, val_len), |quote| {
+            // Drop the leading quote; drop the trailing quote too only when the
+            // token is actually closed within this value token.
+            let closed = token.len() >= 2 && token.ends_with(quote);
+            (val_start + 1, val_len - 1 - usize::from(closed))
+        });
+        if span_len == 0 {
+            continue;
+        }
+        return Some((span_start, span_len));
     }
     None
 }

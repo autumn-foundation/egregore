@@ -2,7 +2,7 @@
 
 use aletheia_egregore::{
     GraphRecord, NodeKind,
-    redaction::{detect_secret_span, redact_code_graph, redact_code_text},
+    redaction::{detect_secret_span, redact_code_graph, redact_code_text, redact_value},
 };
 use assert_cmd::Command as CargoCommand;
 use std::{
@@ -22,6 +22,42 @@ fn test_detect_secret_span_api_token() {
         &text[start..start + len],
         "sk-live-123456789012345678901234567890"
     );
+}
+
+// Regression (issue #321, Codex P1 "preserve v1 redaction coverage for quoted
+// env secrets"): `redact_value` already redacts a quoted `.env`-style secret, but
+// the byte-span capture path relies only on `detect_secret_span`, whose EnvSecret
+// span matcher treated the opening `"` as a value delimiter and returned no span.
+// The two detectors must AGREE: the span matcher must return a span covering the
+// secret value bytes (excluding the wrapping quotes, matching the quote-as-
+// delimiter convention of the database-url/session-cookie span matchers).
+#[test]
+fn test_detect_secret_span_quoted_env_secret_double_quote() {
+    let text = "API_KEY=\"hunterSECRETtokenValueLong\"";
+    let res = detect_secret_span(text);
+    assert!(
+        res.is_some(),
+        "quoted env secret must produce a span (parity with redact_value)"
+    );
+    let (class, start, len) = res.unwrap();
+    assert_eq!(class.as_str(), "env_secret");
+    assert_eq!(&text[start..start + len], "hunterSECRETtokenValueLong");
+    // `redact_value` redacts the same input — the two detectors agree.
+    assert!(redact_value(text).contains("<REDACTED:env_secret:"));
+}
+
+#[test]
+fn test_detect_secret_span_quoted_env_secret_single_quote() {
+    let text = "API_KEY='hunterSECRETtokenValueLong'";
+    let res = detect_secret_span(text);
+    assert!(
+        res.is_some(),
+        "single-quoted env secret must produce a span (parity with redact_value)"
+    );
+    let (class, start, len) = res.unwrap();
+    assert_eq!(class.as_str(), "env_secret");
+    assert_eq!(&text[start..start + len], "hunterSECRETtokenValueLong");
+    assert!(redact_value(text).contains("<REDACTED:env_secret:"));
 }
 
 #[test]

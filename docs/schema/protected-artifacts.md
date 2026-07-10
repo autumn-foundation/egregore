@@ -66,10 +66,19 @@ The `source_class` vocabulary is **open to additive extension**.  Adding a new p
 such as `log_payload` (issue #321) — is a backward-compatible change and does **not** bump
 `PROTECTED_SCHEMA_VERSION`.  The `ProtectedHandle` record shape is unchanged (a new class is a
 new *value* of an existing string field, not a new field), and the handle identity rule is
-frozen, so records written by an older binary keep resolving unchanged.  An older reader that
-does not recognise a new class string simply treats those records as an unknown class rather
-than mis-parsing existing records.  Only a change to the record *shape* (a new or removed field,
-or a changed identity rule) increments the schema version.
+frozen, so records written by an older binary keep resolving unchanged.
+
+What makes the extension truly additive is a **tolerant manifest reader**: when an older binary
+reads `manifest.jsonl` and encounters a record whose `source_class` is a string it does not
+recognise (a class a newer writer added), it **skips that single record** and continues, rather
+than failing the entire read.  So after one `eg scan-logs` capture writes a `log_payload`
+record, an older `protected get`/`protected list` still lists and retrieves every pre-existing
+known-class handle; only the unknown-class record is passed over (it is neither listed nor
+retrievable by that older binary, and its presence never authorizes or affects known records).
+Without this tolerance the closed on-disk class set would make one unknown-class record poison
+the whole-store parse — a rollback/mixed-version hazard — so the tolerant reader is what keeps a
+class addition additive rather than schema-breaking.  Only a change to the record *shape* (a new
+or removed field, or a changed identity rule) increments the schema version.
 
 ## Schema version
 

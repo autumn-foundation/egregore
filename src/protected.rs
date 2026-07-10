@@ -58,8 +58,13 @@ pub(crate) const MAX_STORE_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
 ///
 /// The set is extended additively: adding a variant (e.g. `LogPayload`, issue
 /// #321) is backward-compatible and does NOT bump [`PROTECTED_SCHEMA_VERSION`],
-/// because an older reader that does not recognise a new class string simply
-/// treats its records as unknown rather than mis-parsing existing ones.
+/// because the manifest reader ([`ProtectedStore::read_manifest`]) tolerates an
+/// unknown `source_class` — it skips that single record rather than failing the
+/// whole-store read — so an older binary keeps listing and getting pre-existing
+/// known-class records after a newer writer captures a new class. Without that
+/// tolerant reader the closed enum would make one unknown-class record poison the
+/// entire manifest parse, which is why the tolerance is what makes the extension
+/// truly additive.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtectedPayloadClass {
@@ -943,6 +948,24 @@ impl ProtectedStore {
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() {
+                continue;
+            }
+            // Tolerant unknown-class read (issue #321, Codex P2): a record whose
+            // `source_class` is a well-formed JSON string OUTSIDE the closed
+            // `ProtectedPayloadClass` set (a class a newer writer added) must not
+            // poison the whole-store read. `ProtectedHandle::source_class`
+            // deserializes through the closed enum, so a strict parse of such a
+            // line would fail and every pre-existing known-class record would
+            // become unreadable. Skip only the unknown-class record so known
+            // records stay fully listable/gettable — the tolerance that makes
+            // adding a payload class additive/forward-compatible. Genuinely
+            // malformed JSON (or a record missing/mistyping `source_class`) still
+            // falls through to the strict parse below and errors, so real
+            // corruption is never masked.
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+                && let Some(class) = value.get("source_class").and_then(|c| c.as_str())
+                && parse_class(class).is_none()
+            {
                 continue;
             }
             let h: ProtectedHandle = serde_json::from_str(line).map_err(|e| {
@@ -2272,6 +2295,67 @@ mod tests {
         assert!(class.is_none(), "unknown class must return None");
         let known = parse_class("transcript");
         assert!(known.is_some());
+    }
+
+    // Regression (issue #321, Codex P2 "do not claim additive class compatibility
+    // without a tolerant reader"): a manifest record whose `source_class` is a
+    // class a NEWER writer added (unknown to this binary) must NOT poison the
+    // whole-store read. Older `list`/`get` of pre-existing known-class records
+    // must still work — that tolerance is what makes adding a payload class
+    // additive/forward-compatible.
+    #[test]
+    fn read_manifest_tolerates_unknown_source_class() {
+        let dir = tempdir().unwrap();
+        let store = ProtectedStore::new(dir.path());
+        let bytes = b"redacted known bytes\n";
+        let report = store
+            .capture_bytes(
+                ProtectedPayloadClass::LogPayload,
+                "app.log",
+                bytes,
+                "op-1",
+                "0.1.0",
+                fixed_ts(),
+                true,
+            )
+            .unwrap();
+        let known_handle = report.entries[0].handle.clone();
+
+        // Append a synthetic record whose `source_class` is a FUTURE class this
+        // binary does not know, simulating a newer writer capturing into the store.
+        let manifest_path = dir.path().join("manifest.jsonl");
+        let existing = fs::read_to_string(&manifest_path).unwrap();
+        let future = serde_json::json!({
+            "handle": "protected:v1:0000000000000000000000000000000000000000000000000000000000000000",
+            "schema_version": 1,
+            "source_class": "llm_inference_log",
+            "source_path": "future.log",
+            "content_hash": "aa",
+            "byte_len": 3,
+            "captured_at": "2026-01-01T00:00:00Z",
+            "producer_id": "future-op",
+            "producer_version": "9.9.9"
+        });
+        fs::write(
+            &manifest_path,
+            format!("{existing}{}\n", serde_json::to_string(&future).unwrap()),
+        )
+        .unwrap();
+
+        // list() must not error on the whole store; the known record is still there.
+        let listed = store
+            .list()
+            .expect("list must tolerate an unknown-class record");
+        assert!(
+            listed.iter().any(|h| h.handle == known_handle),
+            "the known-class record must still be listed"
+        );
+
+        // get() of the known handle still round-trips its verified bytes.
+        let got = store
+            .get(&known_handle, "op-1")
+            .expect("get of a known record must still succeed");
+        assert_eq!(got, bytes);
     }
 
     // ── Unit: capture disabled ─────────────────────────────────────────────────
