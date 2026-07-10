@@ -484,6 +484,8 @@ fn symbol_context_edge_linked_node_backing_evidence_is_classified() {
         schema_version: 0,
         confidence: None,
         resolution: None,
+        frame_resolution: None,
+        frame_index: None,
         temporal: None,
         summary: "obs mentions edge_backed_fn".to_owned(),
         producer: None,

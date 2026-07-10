@@ -23,7 +23,7 @@ use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 use crate::ir::{
     EdgeLabel, ErrorSignaturePayload, GraphRecord, LOG_SCHEMA_VERSION, LogEventPayload,
     LogOccurrenceBucketPayload, LogPayload, LogSourcePayload, NodeKind, Producer, ProducerKind,
-    log_stable_id,
+    StackFrame, log_stable_id,
 };
 use crate::redaction::{self, REDACTION_POLICY_VERSION};
 
@@ -44,6 +44,14 @@ pub const BUCKET_WIDTH: &str = "1h";
 
 /// Maximum character length of any stored excerpt.
 pub const EXCERPT_MAX_CHARS: usize = 200;
+
+/// Maximum number of structured backtrace frames captured per signature
+/// (issue #322). Bounds stored size; extra frames beyond the cap are dropped.
+pub const MAX_FRAMES: usize = 64;
+
+/// Maximum character length of any stored frame module/file text (redaction-
+/// and size-bound).
+pub const FRAME_TEXT_MAX_CHARS: usize = 200;
 
 /// `plain-v1` line-oriented text format.
 pub const FORMAT_PLAIN_V1: &str = "plain-v1";
@@ -210,6 +218,10 @@ struct Occurrence {
     bucket_start: String,
     /// `true` when the bucket start came from a parsed timestamp.
     bucket_from_timestamp: bool,
+    /// Structured, redaction-safe backtrace frames parsed from this
+    /// occurrence's grouped multi-line text (issue #322). Empty when the
+    /// occurrence carried no parseable backtrace.
+    frames: Vec<StackFrame>,
 }
 
 /// Scans one log file into deterministic log-signature graph records.
@@ -257,7 +269,7 @@ pub fn scan_log_records(
 
     let occurrences = match source_format_version {
         FORMAT_JSONL_V1 => parse_jsonl(text, transaction_time, &tx_bucket),
-        _ => parse_plain(text, transaction_time, &tx_bucket),
+        _ => parse_plain(text, transaction_time, &tx_bucket, repo_root),
     };
 
     let source_id = log_stable_id(&[
@@ -329,6 +341,16 @@ pub fn scan_log_records(
             .min_by(|a, b| a.valid_time.cmp(&b.valid_time))
             .map_or(VALID_TIME_SOURCE_INFERRED, |occ| occ.valid_time_source);
 
+        // Structured frames: every occurrence of one signature shares the same
+        // normalized template (backtrace included), so their parsed frames are
+        // identical; pick the representative deterministically (smallest source
+        // line) so output is byte-stable regardless of parse order.
+        let frames: Option<Vec<StackFrame>> = occs
+            .iter()
+            .filter(|o| !o.frames.is_empty())
+            .min_by_key(|o| o.source_line)
+            .map(|o| o.frames.clone());
+
         let mut sig_node = GraphRecord::node(
             signature_id.clone(),
             NodeKind::ErrorSignature,
@@ -345,6 +367,7 @@ pub fn scan_log_records(
             occurrence_count,
             first_seen: first_seen.clone(),
             last_seen,
+            frames,
         }))
         .with_valid_time(first_seen, sig_valid_time_source);
         if redacted {
@@ -520,6 +543,8 @@ fn log_edge(
         target: target.to_owned(),
         confidence: None,
         resolution: None,
+        frame_resolution: None,
+        frame_index: None,
         temporal: None,
         summary: summary.to_owned(),
         producer: None,
@@ -594,7 +619,12 @@ fn is_continuation_line(line: &str) -> bool {
 
 /// Parses a plain-v1 log into occurrences, grouping multi-line panic/backtrace
 /// continuations into one logical event.
-fn parse_plain(text: &str, transaction_time: &str, tx_bucket: &str) -> Vec<Occurrence> {
+fn parse_plain(
+    text: &str,
+    transaction_time: &str,
+    tx_bucket: &str,
+    repo_root: &Path,
+) -> Vec<Occurrence> {
     // (start_line, header, joined_text)
     let mut events: Vec<(u64, String, String)> = Vec::new();
     for (idx, line) in text.lines().enumerate() {
@@ -617,6 +647,7 @@ fn parse_plain(text: &str, transaction_time: &str, tx_bucket: &str) -> Vec<Occur
         let (valid_time, valid_time_source, bucket_start, bucket_from_timestamp) =
             resolve_time(parse_timestamp(&header), transaction_time, tx_bucket);
         let (template, redacted) = fingerprint(&full_text);
+        let frames = parse_frames(&full_text, repo_root);
         occurrences.push(Occurrence {
             severity,
             template,
@@ -626,9 +657,176 @@ fn parse_plain(text: &str, transaction_time: &str, tx_bucket: &str) -> Vec<Occur
             valid_time_source,
             bucket_start,
             bucket_from_timestamp,
+            frames,
         });
     }
     occurrences
+}
+
+/// Parses structured backtrace frames from an occurrence's grouped multi-line
+/// text (issue #322).
+///
+/// Recognizes the Rust backtrace shape: a frame line `<n>: module::path`
+/// followed (optionally) by an `at <file>:<line>` location line. Frames are
+/// captured in backtrace order, indexed by the `<n>` position, and are
+/// redaction-safe by construction: module and file text pass through the v1
+/// redaction policy and file paths are normalized to a repository-relative (or
+/// generalized external-toolchain) form so no absolute host path or username
+/// enters the graph. Capped at [`MAX_FRAMES`]; extra frames are dropped rather
+/// than stored. Frames never participate in signature identity.
+fn parse_frames(full_text: &str, repo_root: &Path) -> Vec<StackFrame> {
+    let mut frames: Vec<StackFrame> = Vec::new();
+    for line in full_text.lines() {
+        let trimmed = line.trim();
+        if let Some((index, module)) = parse_frame_header(trimmed) {
+            if frames.len() >= MAX_FRAMES {
+                break;
+            }
+            let module_path = redact_frame_text(module);
+            frames.push(StackFrame {
+                frame_index: index,
+                module_path,
+                file_path: None,
+                line: None,
+            });
+        } else if let Some((file, line_no)) = parse_frame_location(trimmed) {
+            // Attach the location to the most recent frame that still lacks one.
+            if let Some(frame) = frames.last_mut()
+                && frame.file_path.is_none()
+            {
+                frame.file_path = normalize_frame_path(repo_root, file);
+                frame.line = line_no;
+            }
+        }
+    }
+    frames
+}
+
+/// Parses a `<n>: module::path` backtrace frame header, returning the
+/// zero-based-usable frame index and the trimmed module text.
+fn parse_frame_header(line: &str) -> Option<(u32, &str)> {
+    let (num, rest) = line.split_once(':')?;
+    let num = num.trim();
+    if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let index: u32 = num.parse().ok()?;
+    let module = rest.trim();
+    if module.is_empty() {
+        return None;
+    }
+    // A location line (`at file:line`) is not a frame header even though it can
+    // contain a colon; those are handled by `parse_frame_location`.
+    if module.starts_with("at ") {
+        return None;
+    }
+    Some((index, module))
+}
+
+/// Parses an `at <file>:<line>` backtrace location line into `(file, line)`.
+fn parse_frame_location(line: &str) -> Option<(&str, Option<u32>)> {
+    let rest = line.strip_prefix("at ")?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    // Split trailing `:<line>[:<col>]` off the path. A Windows drive prefix
+    // (`C:`) is never confused for a line number because line numbers are
+    // all-digit tokens after the final colon.
+    if let Some((path, tail)) = rest.rsplit_once(':') {
+        // `tail` may itself be `<line>` or `<line>` (col already stripped by a
+        // prior split); accept a purely numeric tail as the line.
+        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+            // Handle `file:line:col` by peeling one more numeric segment.
+            if let Some((path2, mid)) = path.rsplit_once(':')
+                && !mid.is_empty()
+                && mid.chars().all(|c| c.is_ascii_digit())
+            {
+                return Some((path2, mid.parse().ok()));
+            }
+            return Some((path, tail.parse().ok()));
+        }
+    }
+    Some((rest, None))
+}
+
+/// Redacts and length-bounds a frame's module/file text through the v1
+/// redaction policy (the same closure used for excerpts). Returns `None` for
+/// empty input.
+fn redact_frame_text(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let redacted = redaction::redact_value(text);
+    Some(truncate_frame_text(&redacted))
+}
+
+/// Truncates frame text to [`FRAME_TEXT_MAX_CHARS`] characters (char-safe).
+fn truncate_frame_text(s: &str) -> String {
+    if s.chars().count() <= FRAME_TEXT_MAX_CHARS {
+        return s.to_owned();
+    }
+    s.chars().take(FRAME_TEXT_MAX_CHARS).collect()
+}
+
+/// External-toolchain path anchors. A frame path containing one of these
+/// segments is generalized to keep only the substring from the anchor onward,
+/// dropping any absolute host prefix (home directory, username) so the stored
+/// value is redaction-safe.
+const EXTERNAL_PATH_ANCHORS: [&str; 5] =
+    ["/rustc/", "/registry/", "/.cargo/", "/.rustup/", "/git/"];
+
+/// Normalizes a raw backtrace file path into a redaction-safe, repository-
+/// relative (or generalized external-toolchain) form (issue #322).
+///
+/// - A path under the canonical repository root is returned repo-relative.
+/// - An already-relative path is kept as written (assumed repo-relative).
+/// - An absolute external-toolchain path is truncated to the substring from a
+///   recognized anchor (`/rustc/`, `/registry/`, …) onward, dropping the host
+///   prefix so no username leaks.
+/// - Any remaining absolute path (unknown shape) is passed through the v1
+///   redaction policy, which whole-value redacts a filesystem-path secret.
+///
+/// The result is always additionally passed through the redaction policy and
+/// length-bounded. Returns `None` for empty input.
+fn normalize_frame_path(repo_root: &Path, raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    // 1) Under the canonical repository root → repo-relative.
+    let abs_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let root_str = abs_root.to_string_lossy().replace('\\', "/");
+    let raw_fwd = raw.replace('\\', "/");
+    if let Some(stripped) = raw_fwd.strip_prefix(&root_str) {
+        let rel = stripped.trim_start_matches('/');
+        if !rel.is_empty() {
+            return Some(truncate_frame_text(&redaction::redact_value(rel)));
+        }
+    }
+
+    // 2) Already relative → assume repo-relative, keep as written.
+    if !raw_fwd.starts_with('/') && !is_windows_absolute(&raw_fwd) {
+        return Some(truncate_frame_text(&redaction::redact_value(&raw_fwd)));
+    }
+
+    // 3) External toolchain path → keep from a recognized anchor onward.
+    for anchor in EXTERNAL_PATH_ANCHORS {
+        if let Some(pos) = raw_fwd.find(anchor) {
+            let kept = &raw_fwd[pos + 1..]; // drop the leading '/'
+            return Some(truncate_frame_text(&redaction::redact_value(kept)));
+        }
+    }
+
+    // 4) Unknown absolute path → redact whole (may contain a username).
+    Some(truncate_frame_text(&redaction::redact_value(&raw_fwd)))
+}
+
+/// True for a Windows-style absolute path (`C:/…`).
+fn is_windows_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// Parses a jsonl-v1 log into occurrences (one object per line).
@@ -667,6 +865,9 @@ fn parse_jsonl(text: &str, transaction_time: &str, tx_bucket: &str) -> Vec<Occur
             valid_time_source,
             bucket_start,
             bucket_from_timestamp,
+            // A single JSON log line carries no multi-line Rust backtrace to
+            // structure; frame capture is a plain-text concern (issue #322).
+            frames: Vec::new(),
         });
     }
     occurrences
