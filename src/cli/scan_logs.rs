@@ -3,6 +3,19 @@ use super::*;
 use crate::log_graph::{self, LogScanError};
 use crate::protected::{ProtectedPayloadClass, ProtectedStore};
 
+/// Emits the machine-readable `{"ok":false,"error":{"code":..,"detail":..}}`
+/// capture-failure envelope (issue #321) to stderr and exits with `exit_code`,
+/// so every `scan-logs` protected-capture failure path shares one byte-stable
+/// diagnostic shape.
+fn exit_capture_error(code: &str, detail: &serde_json::Value, exit_code: i32) -> ! {
+    let envelope = serde_json::json!({
+        "ok": false,
+        "error": { "code": code, "detail": detail }
+    });
+    eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
+    process::exit(exit_code);
+}
+
 /// Handles `eg scan-logs <log_path> --repo-path <repo> --out <log.graph.jsonl>`.
 ///
 /// Extracts deterministic, redaction-safe log-signature graph records from one
@@ -40,35 +53,27 @@ pub(crate) fn scan_logs(
             (producer.is_some(), "producer", "--producer"),
         ] {
             if !value {
-                let envelope = serde_json::json!({
-                    "ok": false,
-                    "error": {
-                        "code": "missing_field",
-                        "detail": {
-                            "field": field,
-                            "message": format!(
-                                "{flag} is required when --protected-raw-artifacts is set"
-                            )
-                        }
-                    }
-                });
-                eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
-                process::exit(1);
+                exit_capture_error(
+                    "missing_field",
+                    &serde_json::json!({
+                        "field": field,
+                        "message": format!(
+                            "{flag} is required when --protected-raw-artifacts is set"
+                        )
+                    }),
+                    1,
+                );
             }
         }
         if producer.is_some_and(|p| p.trim().is_empty()) {
-            let envelope = serde_json::json!({
-                "ok": false,
-                "error": {
-                    "code": "invalid_field",
-                    "detail": {
-                        "field": "producer",
-                        "message": "--producer must not be empty when --protected-raw-artifacts is set"
-                    }
-                }
-            });
-            eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
-            process::exit(1);
+            exit_capture_error(
+                "invalid_field",
+                &serde_json::json!({
+                    "field": "producer",
+                    "message": "--producer must not be empty when --protected-raw-artifacts is set"
+                }),
+                1,
+            );
         }
     }
 
@@ -124,17 +129,13 @@ pub(crate) fn scan_logs(
             // race; report it as a machine-readable capture failure, never raw
             // bytes.
             Err(err) => {
-                let envelope = serde_json::json!({
-                    "ok": false,
-                    "error": {
-                        "code": "store_io_error",
-                        "detail": {
-                            "message": format!("failed to materialize redacted log bytes: {err}")
-                        }
-                    }
-                });
-                eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
-                process::exit(3);
+                exit_capture_error(
+                    "store_io_error",
+                    &serde_json::json!({
+                        "message": format!("failed to materialize redacted log bytes: {err}")
+                    }),
+                    3,
+                );
             }
         };
         let source_rel = log_graph::source_relative_path(repo_path, log_path);
@@ -165,20 +166,16 @@ pub(crate) fn scan_logs(
                 println!("{}", serde_json::to_string(&envelope).expect("infallible"));
             }
             Err(e) => {
-                let envelope = serde_json::json!({
-                    "ok": false,
-                    "error": {
-                        "code": "store_io_error",
-                        "detail": {
-                            "message": format!(
-                                "protected store I/O failed at {}: {e}",
-                                store_dir.display()
-                            )
-                        }
-                    }
-                });
-                eprintln!("{}", serde_json::to_string(&envelope).expect("infallible"));
-                process::exit(3);
+                exit_capture_error(
+                    "store_io_error",
+                    &serde_json::json!({
+                        "message": format!(
+                            "protected store I/O failed at {}: {e}",
+                            store_dir.display()
+                        )
+                    }),
+                    3,
+                );
             }
         }
     }
