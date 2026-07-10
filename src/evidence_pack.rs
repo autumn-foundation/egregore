@@ -304,12 +304,16 @@ impl std::error::Error for CatalogError {}
 /// Raw deserialization target: classes and requirements as strings, so unknown
 /// values become named [`CatalogError`]s rather than opaque serde failures.
 ///
-/// `deny_unknown_fields` is load-bearing: an unknown/extra key in a custom
-/// `--catalog` must fail deserialization (mapped to [`CatalogError::Json`])
-/// rather than being silently dropped before `canonical_bytes` hashes the
-/// catalog. Otherwise an off-schema catalog could produce the same
-/// `control_catalog:v1:<hash>` pin as the shipped document, breaking the #337
-/// guarantee that the hash-pin ties an evidence pack to exact catalog content.
+/// `deny_unknown_fields` is load-bearing for supported-version catalogs: an
+/// unknown/extra key in a custom `--catalog` must fail deserialization (mapped
+/// to [`CatalogError::Json`]) rather than being silently dropped before
+/// `canonical_bytes` hashes the catalog. Otherwise an off-schema catalog could
+/// produce the same `control_catalog:v1:<hash>` pin as the shipped document,
+/// breaking the #337 guarantee that the hash-pin ties an evidence pack to exact
+/// catalog content. The strict [`RawCatalog`] deserialize runs only after the
+/// lenient [`SchemaVersionProbe`] version gate passes, so unknown fields in an
+/// *unsupported*-version document are reported as
+/// [`CatalogError::UnknownSchemaVersion`], not masked as `malformed_json`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCatalog {
@@ -344,6 +348,27 @@ struct RawClassRequirement {
     requirement: String,
 }
 
+/// Lenient probe extracting only the `schema_version` tuple for the phase-1
+/// version gate. Intentionally *without* `deny_unknown_fields`: serde's default
+/// ignores every other field, so an unsupported-but-well-formed future catalog
+/// (a bumped `version` plus added/renamed fields) still surfaces its tuple and
+/// is reported as [`CatalogError::UnknownSchemaVersion`] rather than being
+/// masked as `malformed_json` by the strict [`RawCatalog`] deserialize.
+#[derive(Debug, Deserialize)]
+struct SchemaVersionProbe {
+    schema_version: SchemaVersionTupleProbe,
+}
+
+/// Lenient schema-version tuple probe. No `deny_unknown_fields`: unknown keys
+/// inside `schema_version` are ignored during the version gate; the strict v1
+/// shape (phase 2) still rejects them for supported-version catalogs.
+#[derive(Debug, Deserialize)]
+struct SchemaVersionTupleProbe {
+    domain: String,
+    kind: String,
+    version: u32,
+}
+
 /// Parses and validates a control catalog document.
 ///
 /// Pure: no I/O. Line endings are normalized (`\r\n` -> `\n`) before parsing as
@@ -365,22 +390,37 @@ struct RawClassRequirement {
 /// input order.
 pub fn parse_catalog(text: &str) -> Result<ControlCatalog, CatalogError> {
     let normalized = text.replace("\r\n", "\n");
-    let raw: RawCatalog =
+
+    // Phase 1 — lenient version gate. Probe only the `schema_version` tuple,
+    // ignoring every other field, so an unsupported-but-well-formed future
+    // catalog is reported as `unknown_schema_version` (with its tuple) rather
+    // than masked as `malformed_json` by the strict `RawCatalog` deserialize.
+    // A structurally broken document or one missing `schema_version` fails the
+    // probe and maps to `malformed_json`.
+    let probe: SchemaVersionProbe =
         serde_json::from_str(&normalized).map_err(|error| CatalogError::Json {
             message: error.to_string(),
         })?;
 
     if !is_known_control_catalog_schema_version(
-        &raw.schema_version.domain,
-        &raw.schema_version.kind,
-        raw.schema_version.version,
+        &probe.schema_version.domain,
+        &probe.schema_version.kind,
+        probe.schema_version.version,
     ) {
         return Err(CatalogError::UnknownSchemaVersion {
-            domain: raw.schema_version.domain,
-            kind: raw.schema_version.kind,
-            version: raw.schema_version.version,
+            domain: probe.schema_version.domain,
+            kind: probe.schema_version.kind,
+            version: probe.schema_version.version,
         });
     }
+
+    // Phase 2 — strict v1 shape. Only after the version gate passes do we hold
+    // the document to the exact v1 body; unknown fields here still map to
+    // `malformed_json`.
+    let raw: RawCatalog =
+        serde_json::from_str(&normalized).map_err(|error| CatalogError::Json {
+            message: error.to_string(),
+        })?;
 
     let schema_version = CatalogSchemaVersion {
         domain: raw.schema_version.domain,
@@ -869,6 +909,54 @@ mod tests {
         }"#;
         let err = parse_catalog(json).expect_err("wrong domain must fail");
         assert_eq!(err.code(), "unknown_schema_version");
+    }
+
+    #[test]
+    fn future_version_with_unknown_fields_reports_unknown_schema_version() {
+        // A future/third-party catalog that bumps the schema version AND adds or
+        // renames fields must still be reported as `unknown_schema_version`
+        // (with its tuple), not masked as `malformed_json` by the strict v1
+        // shape — the version gate runs first (Codex P2, round 3).
+        let json = r#"{
+            "catalog_id": "x",
+            "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 2 },
+            "controls": [
+                { "control_id": "CC1.1", "title": "t", "evidence_classes": [
+                    { "class": "commits", "requirement": "required", "weight": 3 }
+                ], "surprise": 7 }
+            ],
+            "extra_top_level": true
+        }"#;
+        let err = parse_catalog(json).expect_err("future version with extra fields must fail");
+        assert_eq!(err.code(), "unknown_schema_version");
+        assert_ne!(err.code(), "malformed_json");
+        assert_eq!(
+            err,
+            CatalogError::UnknownSchemaVersion {
+                domain: "control_catalog".to_owned(),
+                kind: "ControlCatalog".to_owned(),
+                version: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn future_version_without_extra_fields_still_unknown_schema_version() {
+        let json = r#"{
+            "catalog_id": "x",
+            "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 2 },
+            "controls": []
+        }"#;
+        let err = parse_catalog(json).expect_err("version 2 must fail");
+        assert_eq!(err.code(), "unknown_schema_version");
+        assert_eq!(
+            err,
+            CatalogError::UnknownSchemaVersion {
+                domain: "control_catalog".to_owned(),
+                kind: "ControlCatalog".to_owned(),
+                version: 2,
+            }
+        );
     }
 
     #[test]

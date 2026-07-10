@@ -102,6 +102,14 @@ A future `soc2-v2` catalog would carry a new `schema_version.version` and be
 recognized by a widened recognizer; readers pinned to v1 reject it rather than
 silently misreading it.
 
+The parser gates on this tuple **first**: it probes only the `schema_version`
+tuple leniently and returns `unknown_schema_version` for any unsupported tuple
+before enforcing the strict v1 body shape. So an unsupported/newer catalog that
+also adds or renames fields is still reported as `unknown_schema_version`, not
+`malformed_json` — the version signal is never masked by the strict-shape check.
+Only supported-version documents are then held to the strict v1 shape (where a
+stray field is `malformed_json`).
+
 ## BLAKE3 canonical hash-pin contract
 
 Every catalog has a deterministic content hash. The **canonical form** is:

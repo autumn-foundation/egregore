@@ -201,6 +201,32 @@ fn unknown_field_exits_two_and_reports_malformed_json() {
 }
 
 #[test]
+fn future_version_catalog_exits_two_and_reports_unknown_schema_version() {
+    // A future catalog that bumps schema_version AND adds fields must report
+    // `unknown_schema_version` (version gate runs before the strict v1 shape),
+    // not `malformed_json` (Codex P2, round 3).
+    let bad = r#"{
+        "catalog_id": "x",
+        "schema_version": { "domain": "control_catalog", "kind": "ControlCatalog", "version": 2 },
+        "controls": [],
+        "extra_field": 1
+    }"#;
+    let (_temp, path) = write_temp("future_version_extra.json", bad);
+    let output = egregore()
+        .args(["audit", "control-catalog", "--catalog"])
+        .arg(&path)
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    let err: Value = serde_json::from_slice(&output.stderr).expect("stderr json");
+    assert_eq!(err["code"], "unknown_schema_version");
+    assert_ne!(err["code"], "malformed_json");
+    assert_eq!(err["version"]["domain"], "control_catalog");
+    assert_eq!(err["version"]["kind"], "ControlCatalog");
+    assert_eq!(err["version"]["version"], 2);
+}
+
+#[test]
 fn missing_file_exits_two() {
     let output = egregore()
         .args([

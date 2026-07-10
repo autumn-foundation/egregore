@@ -66,9 +66,19 @@ across repeated runs on the same catalog:
 
 ## Error envelopes (stderr, exit 2)
 
+The parser gates the `schema_version` tuple **first**: any document whose tuple
+is not the supported `(control_catalog, ControlCatalog, 1)` is reported as
+`unknown_schema_version` before the strict v1 body shape is enforced, so an
+unsupported/newer catalog that also adds or renames fields is still reported as
+`unknown_schema_version` (not `malformed_json`). Only supported-version
+documents are then held to the strict v1 shape, where an unknown/stray field is
+`malformed_json`.
+
 - Missing/unreadable `--catalog` file:
   `{ "code": "catalog_read_error", "path": "…", "message": "…" }`
-- Malformed JSON: `{ "code": "malformed_json", "message": "…" }`
+- Malformed JSON (structurally broken, missing `schema_version`, or a stray
+  field in a supported-version document):
+  `{ "code": "malformed_json", "message": "…" }`
 - Unknown schema version:
   `{ "code": "unknown_schema_version", "version": { "domain": "…", "kind": "…", "version": 2 } }`
 - Unknown evidence class:
